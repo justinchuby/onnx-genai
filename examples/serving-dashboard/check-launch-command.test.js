@@ -425,3 +425,36 @@ test('every flag named in any demo document exists in the server CLI', () => {
   }
   assert.ok(checked > 10, `expected to check many flags, checked ${checked}`);
 });
+
+// Every `?scenario=` value the README publishes must be a real SCENARIOS key.
+//
+// This one has no symptom. `currentScenarioId` (scenario-origins.js:275)
+// validates the parameter and SILENTLY FALLS BACK to a locally-servable
+// scenario when it does not recognise it -- correct behaviour for a visitor
+// typing a URL, and precisely why a wrong id in the README is dangerous: the
+// link still loads, still renders a working dashboard, and quietly shows a
+// DIFFERENT scenario than the prose around it describes. No error, no console
+// warning, nothing to notice.
+//
+// The ids are also easy to get wrong because index.html's `data-scenario`
+// attributes are a separate namespace that only partly coincides with them
+// (`paged-kv-block-table` vs `paged-kv`). The URL keys are the ones that must
+// match, so they are the ones asserted here, against the module itself rather
+// than a copy of the list.
+test('every ?scenario= value in the README is a real scenario id', async () => {
+  const { SCENARIOS } = await import('./scenario-origins.js');
+  const ids = Object.keys(SCENARIOS);
+  assert.ok(ids.length >= 3, `expected several scenarios, got ${ids.length}`);
+
+  const cited = [...readme.matchAll(/[?&]scenario=([a-z0-9-]+)/g)].map((m) => m[1]);
+  assert.ok(cited.length > 0, 'expected the README to publish at least one scenario URL');
+
+  for (const id of cited) {
+    assert.ok(
+      Object.hasOwn(SCENARIOS, id),
+      `README publishes ?scenario=${id}, which is not a scenario id ` +
+        `(${ids.join(', ')}).\nThe link will still load and show a working ` +
+        `dashboard -- just not the scenario the surrounding prose describes.`,
+    );
+  }
+});

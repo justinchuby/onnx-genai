@@ -158,21 +158,23 @@ Overridable via environment: `MODELS_DIR`, `SCATTER_MODEL`, `DYNAMIC_MODEL`,
 `SCATTER_PORT`, `DYNAMIC_PORT`, `BIND_HOST`, `ONNX_GENAI_EP`,
 `READY_TIMEOUT_SECONDS`.
 
-**There is no CORS configuration, and no CORS code in the server at all** — not
-a permissive default, not a flag. It is unnecessary by construction: each page
-only ever talks to the server that served it, and switching to a scenario on the
-other server *navigates* rather than fetching. A cross-origin request is never
-made, so there is nothing to authorise.
+**The demo needs no CORS configuration** — not a permissive default, not a flag.
+Not because cross-origin requests could not be authorised, but because the demo
+never makes one: each page only ever talks to the server that served it, and
+switching to a scenario on the other server *navigates* rather than fetching.
+There is nothing to authorise. Whether the server grows a CORS layer for other
+callers is a separate question that does not change anything here.
 
-That is worth stating plainly because the alternative design fails in a way
+That independence is worth having, because the alternative design fails in a way
 almost nobody catches. A cross-origin `GET /v1/status` **is sent, is handled,
 and logs a clean `200 OK`** — the browser then discards the response before
 JavaScript can read it. A `POST /v1/completions` never leaves the browser at
 all: `application/json` plus the `X-Session-Id` header trigger a preflight
-`OPTIONS`, which no route answers. **Neither reproduces under `curl`**, which
-does not implement the same-origin policy, so every endpoint tests perfectly
-from a terminal while the page is dead in a browser. Avoiding the whole class
-structurally is cheaper than debugging one instance of it.
+`OPTIONS`, which must be answered separately. **Neither reproduces under
+`curl`**, which does not implement the same-origin policy, so every endpoint
+tests perfectly from a terminal while the page is dead in a browser. A demo that
+depends on cross-origin fetches is one header away from that failure at all
+times; one that never makes them cannot reach it.
 
 `--enable-admin-endpoints` is **deliberately not used.** The demo never calls
 `/v1/admin/*`, and the server ships without authentication, so enabling an
@@ -270,20 +272,30 @@ http://127.0.0.1:8124/demo/?scenario=prefix-cache
 ```
 
 Both servers serve the same static demo, so each page is always **same-origin
-with the server it is describing**. That is a feature rather than a workaround,
-and it buys four things at once:
+with the server it is describing**. This was chosen over an in-page toggle, not
+settled for, and it buys four things at once:
 
 - Every fetch is same-origin, so a stuck visitor's browser console shows
   something comprehensible instead of an opaque cross-origin failure.
 - **The URL bar becomes the label**, and it is the strongest attribution
   available to us: it is browser chrome, rendered by software this project does
-  not control and cannot fake. Every other label on the page is drawn by us and
-  therefore has to be *trusted*. You cannot misread which server produced a
-  number when the address bar says which server you are talking to.
-- The demo becomes **shareable and bookmarkable** — a URL captures the scenario.
+  not control and cannot fake. A rendered `Mode B` badge is a *claim the page
+  makes about itself*, and claims can be wrong — this demo shipped a bug of
+  exactly that shape, where a field's explanation still described a server state
+  the page had already left. `http://127.0.0.1:8124/demo/` is not a claim about
+  which server the numbers came from; it is the origin every fetch on that page
+  will actually use. It cannot drift out of sync with the page's own behaviour,
+  because it *is* the page's behaviour.
+- The demo becomes **shareable and bookmarkable** — a URL captures the scenario,
+  so you can send a colleague the exact view rather than a list of clicks.
 - No value from the previous server can survive the switch, because the document
   is destroyed. Stale cross-profile numbers are not prevented by discipline;
   they are impossible.
+
+It is also simply **honest about the architecture**. The page genuinely *is*
+talking to a different server. Navigation makes that visible, where a toggle
+would imply one system with a view setting — which is the misconception the two
+servers exist to correct.
 
 On arrival the page re-detects the capability profile from whichever server
 answered. It never assumes capability from the scenario you clicked — so
