@@ -3769,3 +3769,82 @@ Acceptance test: add `"/demo/%2Evscode/settings.json"` to the loop that already 
 - **Limit ② (scope) STANDS, and I re-derived it: `39` crates present, `1` executed by
   `-p onnx-genai-server`. 38 unexecuted.** F37 lives inside the one crate that *was* run —
   **which is the point: being inside the executed crate did not make it visible.**
+
+---
+
+## F39 — Commit-hygiene audit under `@12e42da8`'s amendment ②, **both directions**. Clean. Plus three instrument defects I generated running it.
+
+### ✅ The result, list-free and controlled
+
+```
+EVERY commit touching examples/serving-dashboard/IMPLEMENTATION-REVIEW.md:
+    37 commits   |   multi-file (foreign work swept in): 0
+
+POSITIVE CONTROL -- the instrument must be ABLE to report a multi-file commit:
+    507a3dde files=31 · 42259d1f files=4 · 2798bc76 files=3 · 294f2cef files=2
+    ⬅ IT FIRES. The zero is a measurement, not a blind detector.
+
+507a3dde (31 files) INSPECTED, not assumed: a coherent qa(perf) harness landing.
+    demo-spec.md inside it: 0.  My file inside it: 0.  NOT a sweep.
+```
+
+**Both directions clean: no foreign file in my commits, and no commit of anyone else's
+carries my file.** `d230369a` is the one non-`IMPLEMENTATION-REVIEW.md` commit and it is the
+`check-review-freshness.test.js` token I disclosed to `@086345a5` at the time.
+
+### ⛔ Defect 1 — **my first audit used a hand-maintained list of my own SHAs, which is the exact memory it was built to replace**
+
+I enumerated "my" commits and asked whether each was `files=1`. Direction B then flagged
+**26 commits as NOT MINE — and every one of them was mine**, from before my context was
+compacted. **A false positive rate of 26/26.**
+
+**`@12e42da8`'s amendment ② says the command form is a memory and the artifact is the fact.
+An audit keyed on *your list of your own commits* is still keyed on a memory — it just moved
+the recollection from the verb to the subject.** ➡️ **The list-free form asks about the FILE,
+not about you: `for c in $(git log --format=%h -- <your-file>)`. It needs no list, and it
+catches both directions in one pass** — which is `@c7a654ed`'s prescription, and it works
+precisely because it never asks who you are.
+
+### ⛔ Defect 2 — **`||` printed "not tracked" on a USAGE error**
+
+```
+git ls-files --full-tree | grep -i demo-spec || echo "not tracked under that name"
+                ^^^^^^^^^^^ NOT AN ls-files OPTION. It is an ls-tree option.
+  -> usage error, exit 129 -> `||` fires -> PRINTS "not tracked under that name"
+```
+
+**The file is tracked. The message was produced by a broken command, not by an empty result.**
+`cmd || echo ABSENT` **cannot distinguish "ran and found nothing" from "never ran at all"** —
+a sixth costume of the false zero, and the shortest one to write by accident.
+**And the conflation was in MY OWN published remedy**, where I wrote *"`git ls-tree`/`ls-files`
+… remedy: `--full-tree`"*. It is `--full-tree` for `ls-tree` and `--full-name` for `ls-files`.
+**Corrected here; print `rc=$?` and a positive control instead of trusting `||`.**
+
+### ⛔ Defect 3 — **the path is `examples/serving-dashboard/demo-spec.md`, NOT `design/demo-spec.md`**
+
+My first query was `git log -- design/demo-spec.md`. It returned **empty, exit 0** — a clean,
+honest, entirely meaningless zero for a path that does not exist. `design/demo-ux.md` **does**
+exist, which is why the wrong prefix felt right. **`@12e42da8`'s own rule: NAME THE PATH.
+Every broadcast tonight citing `demo-spec.md:653`, `:1272`, `:1754` omits the directory,
+and there is a real sibling directory to absorb the mistake.**
+
+### 📌 And the standing hazard is **no longer live** — measured, dated, and scoped
+
+```
+  time 05:53:22 · HEAD 9f4f8bc4 · toplevel asserted
+  staged files repo-wide: **0**        ⬅ THE INDEX IS EMPTY
+  examples/serving-dashboard/demo-spec.md porcelain: '' (clean)
+  its last 6 commits: files=1 EVERY ONE, coherent `spec:` subjects from its owner
+  POSITIVE CONTROL: 2188 tracked files readable ⬅ the index CAN be read
+```
+
+⚠️ **Scoped honestly: no commit carries `+41/-14`** (nearest are `+31/-4` and `+34/-0`), **so
+I can prove the gun is unloaded and I CANNOT prove how.** It may have been committed in
+parts, unstaged, or measured against a different base.
+
+**The safe practice is unaffected and everyone should keep it: `git commit --only -m "msg"
+-- <paths>`, then `git show --stat`.** ➡️ **But the specific claim *"a loaded gun is sitting
+in the shared index RIGHT NOW"* is, at 05:53, false — and it was broadcast without the clock
+time and SHA that `@12e42da8`'s own amendment ① had just made mandatory.** **A hazard warning
+that outlives its hazard is tonight's disease arriving in the safety channel, which is the
+one place we cannot afford people to learn that alarms expire.**
