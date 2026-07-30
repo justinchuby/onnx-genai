@@ -165,7 +165,7 @@ describe('the ruled field-state vocabulary', () => {
     // invisible to a de-duplicated value census by construction.
     assert.deepEqual(
       Object.keys(FIELD_STATES).sort(),
-      ['NOT_APPLICABLE', 'OK', 'PENDING', 'STALE', 'UNAVAILABLE'],
+      ['MEASURED', 'NOT_APPLICABLE', 'PENDING', 'STALE', 'UNAVAILABLE'],
       'FIELD_STATES must expose exactly five KEYS. Ruled D160: an alias is ' +
         'deleted, not deprecated. Both spellings shipping together is strictly ' +
         'worse than the landmine it replaced, because the split now carries a ' +
@@ -177,7 +177,7 @@ describe('the ruled field-state vocabulary', () => {
 
     assert.deepEqual(
       [...new Set(Object.values(FIELD_STATES))].sort(),
-      ['not-applicable', 'ok', 'pending', 'stale', 'unavailable'],
+      ['measured', 'not-applicable', 'pending', 'stale', 'unavailable'],
       'FIELD_STATES must carry exactly the five ruled states. NOT_APPLICABLE is ' +
         'not interchangeable with UNAVAILABLE: `unavailable` is a PROMISE (the ' +
         'number could exist once someone plumbs it), `not-applicable` is an ' +
@@ -190,40 +190,66 @@ describe('the ruled field-state vocabulary', () => {
   });
 
   it('gives the measured state a constant whose name equals its wire value', () => {
-    // Reconciles two rulings that pointed in opposite directions. Both agreed
-    // the name/value mismatch was a real landmine; they disagreed on which
-    // side to move. Moving the WIRE to 'measured' would have made the field
-    // contradict itself -- `state: 'measured'` beside `sourceClass:
-    // 'estimated'` is a claim and its own refutation -- and would have touched
-    // every [data-state='ok'] selector, twelve modules and the static
-    // skeleton. Renaming the CONSTANT costs none of that and removes the same
-    // landmine, so that is the direction taken: FIELD_STATES.OK === 'ok'.
-    assert.equal(
-      FIELD_STATES.OK,
-      'ok',
-      "A constant named MEASURED whose value is 'ok' is a landmine with no " +
-        "symptom: `field.state === 'measured'` returns false for every measured " +
-        'field on the dashboard, and the field then renders as a plain number ' +
-        'anyway via the fall-through in formatFieldText -- so the check fails ' +
-        'silently while the output looks correct. This is a TWO-FILE ATOMIC ' +
-        "edit: telemetry-field.js:103 and the [data-state='ok'] selector in " +
-        'styles/shell.css must change together, or every absence treatment on ' +
-        'the page stops matching. Never global-replace the string `ok`: ' +
-        "`status: 'ok'` is the HTTP health payload and renaming it fakes an " +
-        'unreachable server.',
-    );
-
-    // The alias does NOT stay valid. Ruled D160 after this assertion was
-    // written: `MEASURED` is removed, not deprecated. Keeping it costs the
-    // rename its entire point, since the mismatched name is still exported and
-    // still resolves to 'ok'. The same edit must fix telemetry-field.js:63-65,
-    // which says `reason` is "required when state !== 'measured'" -- under the
-    // current constant that condition is ALWAYS true, so the contract read
-    // literally demands an apology attached to every healthy number.
+    // RULED BY @12e42da8: the wire value is 'measured', not 'ok'.
+    //
+    // I argued 'ok' and I was overruled. Recording that here rather than
+    // quietly rewriting the reasoning, because three agents built against my
+    // version: my case was that `state` answers "can I render this?" rather
+    // than "is this good?", so `measured` makes a provenance claim that
+    // `source` already owns and is false for derived/estimated fields. The
+    // Lead's case is that 'ok' names APPROVAL while 'measured' names
+    // PROVENANCE, and beside `source: 'derived'` the honest word is the one
+    // that describes where the number came from. Both are defensible; only one
+    // can be the wire, and the ruling outranks both the code and my document.
+    //
+    // The assertion is written against the RULING, not against disk, and it is
+    // expected to be RED until the rename lands. That is the point: per the
+    // precedence order, a ruling wins on what the system SHOULD do and the code
+    // is then changed to match. A test that tracked disk instead would have
+    // ratified whatever shipped -- which is exactly how four states survived
+    // three ratifications of five.
     assert.equal(
       FIELD_STATES.MEASURED,
-      undefined,
-      'FIELD_STATES.MEASURED must be gone, not aliased. See D160.',
+      'measured',
+      "The measured state's wire value is 'measured' (ruled). A constant whose " +
+        "name and value disagree is a landmine with no symptom: the mismatched " +
+        'comparison returns false for every measured field and the value then ' +
+        'renders as a plain number anyway via the fall-through, so the check ' +
+        'fails silently while the output looks correct.',
+    );
+
+    // THIS IS A TWO-FILE ATOMIC EDIT AND HALF OF IT IS SILENT.
+    //
+    //   telemetry-field.js   OK: 'ok'            -> MEASURED: 'measured'
+    //   styles/shell.css:163 [data-state='ok']   -> [data-state='measured']
+    //
+    // Landing only the first leaves every measured field matching NO rule.
+    // That is invisible in review, because `measured` is styled as the
+    // inherited default -- the page still looks right, and the four ABSENCE
+    // treatments are the ones that break. Per D142 those four sit within
+    // 1.001:1 of each other in grayscale, so their non-colour channel is the
+    // entire signal; losing the selector collapses four distinguishable states
+    // into one undifferentiated grey.
+    //
+    // NEVER global-replace the string 'ok'. There are three unrelated
+    // vocabularies: `status: 'ok'` is the HTTP health payload, and
+    // `.connection-indicator[data-state='connected']` is a third. Renaming the
+    // health payload fakes an unreachable server.
+    const shellCss = readFileSync(
+      fileURLToPath(new URL('./styles/shell.css', import.meta.url)),
+      'utf8',
+    );
+    assert.ok(
+      shellCss.includes("[data-state='measured']"),
+      "styles/shell.css must select [data-state='measured'] once the enum is " +
+        'renamed. If the enum moved and this selector did not, every measured ' +
+        'field silently stops matching its rule.',
+    );
+    assert.ok(
+      !shellCss.includes("[data-state='ok']"),
+      "styles/shell.css still selects [data-state='ok'], which the enum no " +
+        'longer emits. A selector matching nothing is the half-migration this ' +
+        'assertion exists to make impossible.',
     );
   });
 });

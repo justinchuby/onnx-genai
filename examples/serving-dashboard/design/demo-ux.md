@@ -3550,7 +3550,27 @@ The Profile D hero strip, slot 3, still read **`prefix hit rate` `ˢ`**. **A CUT
 **(c) The `@typedef` lists five states, in the same edit.**
 **(d) `stale` gets its own render path — age visible IN THE CELL, never only on hover.**
 
-### 53.1 🔴 D159 — I AM REVERSING MYSELF ON `ok`, AND THE REASON IS NEW, NOT A CHANGE OF TASTE
+### 53.1 🔴 D159 IS OVERRULED. THE WIRE VALUE IS `'measured'`. — @12e42da8, final.
+
+> **RULED AGAINST ME AND I ACCEPT IT WITHOUT RE-ARGUING. Struck in place rather than rewritten, because three agents built against my version and the reasoning record is worth more than a tidy document.**
+>
+> **My case:** `state` answers *"can I render this?"*, not *"is this good?"* — so `measured` makes a provenance claim that `source` already owns, and is **false for `derived`, `estimated` and `client` fields.**
+> **The ruling:** **`ok` names APPROVAL; `measured` names PROVENANCE**, and beside `source: 'derived'` the honest word is the one describing *where the number came from*. **Both are defensible. Only one can be the wire, and a ruling outranks both the code and this document** — which is the precedence order that exists precisely so this stops oscillating. **`MEASURED: 'measured'`, everywhere, including the JSDoc.**
+>
+> **What survives, because it is orthogonal to the name: `state` and `source` are DIFFERENT AXES, and no state value may make a claim the `source` key already owns.** Under `'measured'` that discipline moves from the name into the docs — **the typedef must say `measured` means A CURRENT READING EXISTS, not "this number was obtained by measurement,"** or the two keys read as contradicting each other on every derived field on the page.
+
+**🔴 THE PART THAT BREAKS IF THIS IS DONE CARELESSLY — IT IS A TWO-FILE ATOMIC EDIT AND HALF OF IT IS SILENT:**
+
+```
+telemetry-field.js:119    OK: 'ok'            →  MEASURED: 'measured'
+styles/shell.css:163      [data-state='ok']   →  [data-state='measured']
+```
+
+**Land the first without the second and every measured field matches NO rule** — and it is **invisible in review**, because `measured` is styled as the inherited default, so **the page still looks right.** What breaks is the four ABSENCE treatments, and per **D142** those sit within **1.001:1 of each other in grayscale**: their non-colour channel is *the entire signal*. **The selector loss collapses four distinguishable states into one undifferentiated grey — silently, on the exact mechanism by which this page admits it does not know something.**
+
+> **NEVER GLOBAL-REPLACE `'ok'`. Three unrelated vocabularies share that string:** `status: 'ok'` is the **HTTP health payload** (renaming it fakes an unreachable server), and `.connection-indicator[data-state='connected']` is a third. **`state-channel.test.js` now asserts BOTH halves** — the enum value *and* the presence of `[data-state='measured']` with the absence of `[data-state='ok']` — **so a half-migration cannot pass. It is deliberately RED until both land.**
+
+### 53.1b The withdrawn argument, kept for the record
 
 I withdrew `ok` earlier on the argument that **`ok` names approval while `measured` names provenance.** That argument was wrong, and @d7cf9b84 is the one who exposed it. Stating the correction plainly because I have moved on this twice and a third move needs to be *load-bearing*, not another preference:
 
@@ -3582,8 +3602,8 @@ I published *"FIELD SHAPE IS FINAL — four states"* from `telemetry-field.js:19
 
 | # | Decision | Rationale |
 |---|---|---|
-| D159 | Wire value is `'ok'`; `state` answers "can I render this?", not "is this good?" | `measured` makes a provenance claim `source` owns, and is false for derived/estimated/client fields |
-| D160 | Delete the `MEASURED` alias outright; fix the `reason` contract in the same edit | Both keys is a fork with a deprecation notice; `MEASURED` still resolves to `'ok'` |
+| ~~D159~~ | **OVERRULED by @12e42da8: the wire value is `'measured'`.** Two-file atomic edit — `telemetry-field.js:119` + `styles/shell.css:163` | `ok` names approval, `measured` names provenance. What survives: `state` must not claim what `source` owns, so the typedef must define `measured` as *a current reading exists* |
+| D160 | One spelling only — no alias, in either direction | Both keys is a fork with a deprecation notice. Landed: the enum is five keys. Now re-points at `'measured'` per the ruling |
 | D161 | `classification` never reaches a panel; panels branch on `state` only | It is input, not output; reading it re-derives a mapping already made |
 | D162 | `stale` renders age in the cell; unknown states throw | Stale is 1.001:1 from `ok` in grayscale — fall-through makes them identical, not similar |
 | D163 | Cite the executable line, never the annotation above it | A stale annotation converts "I should check" into "I already know" |
