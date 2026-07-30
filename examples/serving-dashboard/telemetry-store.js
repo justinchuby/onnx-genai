@@ -787,6 +787,36 @@ export function createTelemetryStore({
     console.warn(`[telemetry-store] provenance table is stale: ${warning}`);
   }
 
+  function describeWireValue(value) {
+    if (Array.isArray(value)) return 'an array';
+    if (typeof value === 'number' && !Number.isFinite(value)) return 'a non-finite number';
+    if (value !== null && typeof value === 'object') return 'an object';
+    if (value === '') return 'an empty string';
+    return `a ${typeof value}`;
+  }
+
+  function matchesWireType(entry, value) {
+    if (entry.wireType === 'number') return typeof value === 'number' && Number.isFinite(value);
+    if (entry.wireType === 'string') return typeof value === 'string';
+    if (entry.wireType === 'boolean') return typeof value === 'boolean';
+    return false;
+  }
+
+  function rejectWireType(key, entry, value) {
+    const expected = entry.wireType
+      ? `"${entry.wireType}"`
+      : 'a required wireType declaration that is missing';
+    const warning =
+      `"${key}" expects ${expected} at ${entry.source} path "${entry.path}", but the server ` +
+      `sent ${describeWireValue(value)}. The value was rejected as unavailable; update the ` +
+      'server response type or telemetry-provenance.js before displaying it.';
+    if (!provenanceWarnings.has(key)) {
+      provenanceWarnings.set(key, warning);
+      console.warn(`[telemetry-store] wire type mismatch: ${warning}`);
+    }
+    return unavailableField(warning, fieldMeta(entry));
+  }
+
   /**
    * The one case where per-origin classification can go silently wrong.
    *
@@ -869,6 +899,11 @@ export function createTelemetryStore({
         // and that failure is invisible, because it looks like caution.
         const source = sources[entry.source];
         const observed = source?.ok ? readEntryValue(source.body, entry) : undefined;
+        const hasWireValue = observed !== undefined && observed !== null;
+        if (source?.ok && hasWireValue && entry.path && !matchesWireType(entry, observed)) {
+          fields[key] = rejectWireType(key, entry, observed);
+          continue;
+        }
 
         // Absence is NOT evidence that a field became real: a proxy serving
         // HTML at /metrics, or a build predating the field, both read as
@@ -895,7 +930,7 @@ export function createTelemetryStore({
         // Note `0` and `false` are deliberately still present: they are real
         // readings for a numeric or boolean field, and suppressing them would
         // recreate the absent-versus-zero defect one layer down.
-        const present = observed !== undefined && observed !== null && observed !== '';
+        const present = hasWireValue && observed !== '';
         if (source?.ok && present && !matchesStub(entry, observed)) {
           const warning = describeStaleProvenance(key, entry, observed);
           recordProvenanceWarning(key, warning);
@@ -941,6 +976,20 @@ export function createTelemetryStore({
       if (rawValue === undefined || rawValue === null) {
         fields[key] = unavailableField(
           `${entry.source} responded, but carried no "${entry.metric ?? entry.path}" value. ` +
+            'This server build may predate it.',
+          fieldMeta(entry),
+        );
+        continue;
+      }
+
+      if (entry.path && !matchesWireType(entry, rawValue)) {
+        fields[key] = rejectWireType(key, entry, rawValue);
+        continue;
+      }
+
+      if (rawValue === '') {
+        fields[key] = unavailableField(
+          `${entry.source} responded, but carried no "${entry.path}" value. ` +
             'This server build may predate it.',
           fieldMeta(entry),
         );

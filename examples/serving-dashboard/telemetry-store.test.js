@@ -187,6 +187,112 @@ function storeWith(routes, options = {}) {
   });
 }
 
+function jsonPathRows() {
+  return Object.entries(PROVENANCE).filter(
+    ([, entry]) => !entry.derived && !entry.metric && entry.path,
+  );
+}
+
+function setDottedPath(body, path, value) {
+  const parts = path.split('.');
+  let cursor = body;
+  for (const part of parts.slice(0, -1)) {
+    cursor[part] = {};
+    cursor = cursor[part];
+  }
+  cursor[parts.at(-1)] = value;
+  return body;
+}
+
+test('wrong JSON wire types are rejected as unavailable across the full census', async () => {
+  const rows = jsonPathRows();
+  assert.equal(rows.length, 30, 'the store enforcement census drifted from the declaration guard');
+
+  const numericSentinels = [
+    '',
+    '/Users/operator/models/qwen',
+    'node-operator',
+    { unexpected: true },
+    ['unexpected'],
+    'NaN',
+  ];
+  const wrongValueFor = (key, wireType, index) => {
+    if (wireType === 'number') return numericSentinels[index % numericSentinels.length];
+    if (wireType === 'boolean') return key === 'server.healthy' ? 'false' : 1;
+    if (key === 'server.model_id') return 17;
+    if (key === 'server.node_id') return ['node-0'];
+    return { provider: 'CPU' };
+  };
+
+  for (const [index, [key, entry]] of rows.entries()) {
+    const wrongValue = wrongValueFor(key, entry.wireType, index);
+    const requestPath =
+      entry.source === ENDPOINTS.DEBUG_KV_BLOCKS
+        ? `${entry.source}?start=0&count=1024`
+        : entry.source;
+    const routes = healthyRoutes({
+      [requestPath]: { body: setDottedPath({}, entry.path, wrongValue) },
+    });
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(' '));
+    let store;
+    try {
+      store = storeWith(routes);
+      await store.pollOnce();
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    const field = store.field(key);
+    assert.equal(field.state, FIELD_STATES.UNAVAILABLE, `${key} accepted ${JSON.stringify(wrongValue)}`);
+    assert.equal(field.value, null, `${key} retained a mismatched wire value`);
+    assert.ok(
+      Object.hasOwn(store.provenanceWarnings(), key),
+      `${key} rejected a mismatch without a developer-visible provenance warning`,
+    );
+    assert.ok(
+      warnings.some((warning) => warning.includes('wire type mismatch')),
+      `${key} did not emit a visible wire-type warning`,
+    );
+    assert.ok(
+      !warnings.some((warning) => warning.includes('/Users/operator')),
+      `${key} echoed a rejected sensitive value into the warning`,
+    );
+  }
+});
+
+test('a missing wireType declaration fails closed instead of permitting the value', async () => {
+  const entry = PROVENANCE['queue.depth'];
+  const declaredType = entry.wireType;
+  const warnings = [];
+  const originalWarn = console.warn;
+  delete entry.wireType;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  let store;
+  try {
+    store = storeWith(healthyRoutes());
+    await store.pollOnce();
+  } finally {
+    entry.wireType = declaredType;
+    console.warn = originalWarn;
+  }
+
+  assert.equal(store.field('queue.depth').state, FIELD_STATES.UNAVAILABLE);
+  assert.ok(Object.hasOwn(store.provenanceWarnings(), 'queue.depth'));
+  assert.ok(warnings.some((warning) => warning.includes('wire type mismatch')));
+});
+
+test('valid numeric zero and boolean false still promote as measurements', async () => {
+  const store = storeWith(healthyRoutes());
+  await store.pollOnce();
+
+  assert.equal(store.field('admission.rejections').state, FIELD_STATES.MEASURED);
+  assert.equal(store.field('admission.rejections').value, 0);
+  assert.equal(store.field('server.pipeline').state, FIELD_STATES.MEASURED);
+  assert.equal(store.field('server.pipeline').value, false);
+});
+
 // Endpoint GATING and structural bypass are different facts, and on the scatter
 // server the structural one is deeper: enabling --enable-debug-endpoints there
 // would still yield nothing, because the batching path never consults the prefix
@@ -1501,12 +1607,10 @@ test('an empty string is treated as an absence, not as a stale-table contradicti
   );
 });
 
-// THE CONTROL THAT MUST NOT FIRE. Suppressing `''` must not become suppressing
-// falsy values: `0` and `false` are real readings, and hiding them would
-// recreate the absent-versus-zero defect one layer down. Driven through the
-// same branch, on the same endpoint, so a change that over-suppresses goes red
-// here rather than shipping as caution.
-test('a zero from a not-plumbed field is still promoted, unlike an empty string', async () => {
+// A value can contradict a not-plumbed row only after it satisfies that row's
+// declared wire contract. This path is string-valued; a numeric zero is not
+// evidence that plumbing landed, and promoting it would reopen the type hole.
+test('a wrong-typed zero from a not-plumbed string field is rejected', async () => {
   const store = storeWith(
     healthyRoutes({
       [ENDPOINTS.STATUS]: { body: statusBody({ server: { execution_provider: 0 } }) },
@@ -1515,10 +1619,11 @@ test('a zero from a not-plumbed field is still promoted, unlike an empty string'
 
   await store.pollOnce();
 
-  assert.equal(store.field('server.execution_provider').value, 0);
+  assert.equal(store.field('server.execution_provider').state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(store.field('server.execution_provider').value, null);
   assert.ok(
     Object.hasOwn(store.provenanceWarnings(), 'server.execution_provider'),
-    'a real zero DOES contradict a not-plumbed row and must still be reported',
+    'the type mismatch must be visible to a developer',
   );
 });
 
