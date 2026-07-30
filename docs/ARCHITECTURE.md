@@ -786,6 +786,46 @@ Because `loaded_prompt_prefix` stays `0` under Branch A, the very next statement
 
 **Why this is more dangerous than every stub in §8.3, and why it inverts the section's own premise:** a zero looks broken and invites scrutiny. **95% looks like success.** This field is not a zero to be fixed — it is a **non-zero to be distrusted**, and it defeats every detector this document recommends: it is genuinely computed (so §8.12's name-tracing passes), it moves when you exercise the cache (so §5.14's motion test passes), and it carries a plausible magnitude. It is also **not** fixable by wiring up telemetry: this is a functional gap in prefix reuse, not a reporting gap, so no telemetry change will incidentally close it.
 
+#### 8.4c Measured: prefix reuse is **proven absent**, not merely unobserved 🔴
+
+Source analysis says the reuse cannot happen. QA measured whether it does. **Evidence class: Observed.**
+
+| Arm | Setup | Warm TTFT |
+|---|---|---|
+| **A** | one identical ~900-token prefix, fired 6× | **1341 ms** |
+| **B** (control) | six prefixes differing **from token 0** — sharing impossible | **1254 ms** |
+
+**Requests that shared a 900-token prefix were 7.0% SLOWER than requests that shared nothing.** And
+**every one of the six ARM B controls incremented the hit counter**, which is the counter's
+indictment: it fires when sharing is arithmetically impossible.
+
+**The sensitivity control is what makes this proof rather than absence of evidence, and it is the
+methodological point worth carrying forward.** A null result normally cannot distinguish *"the
+effect is absent"* from *"the instrument could not see it."* So the magnitude of a working cache was
+established independently first: prefill is **~90% of TTFT** (140 ms for a short prompt vs 1380 ms
+for a long one), meaning genuine reuse would collapse TTFT from ~1380 ms to ~140 ms — **a 90% drop,
+impossible to miss.** Observed: **+7.0%**. The effect being looked for is more than an order of
+magnitude larger than the noise, so **the instrument would unquestionably have seen it.**
+
+> **🔒 Ruled: no prefix-cache hit-rate panel ships, in any form, on any server** — not `measured`,
+> not `not-applicable`, not a stark `0%`. The field is removed from the demo, enforced by a tripwire
+> test (`examples/serving-dashboard/check-no-prefix-binding.test.js`).
+
+**The two servers' counters are broken in opposite directions, which is why no single rule rescues
+either:** the batching path reads **0 / 135** (records nothing, §8.4a) and the paged path reads
+**19 / 20** (records everything, §8.4b). **A reviewer who checks one server and generalises will
+draw the wrong conclusion whichever one they pick.**
+
+**How the false green was avoided is the part to reuse.** The first measurement *passed*: cold
+1535 ms → warm 1334 ms, −13.1%, with hits climbing — a clean, publishable result. Two things did not
+fit. The per-pair deltas were **incoherent** (−21.5%, +1.7%, −1.4%, −12.5%; a real cache does not
+help only sometimes), and **from pair 1 onward the *cold* request also scored a hit**, which is
+impossible for a brand-new prefix. The control arm was built on the strength of that doubt.
+
+> **A result that confirms what you hoped for deserves more scrutiny than one that does not.** Both
+> false greens caught tonight (this and the self-built model reference, §8.5) were caught by someone
+> re-examining their own *success*. Nothing in a green result asks to be checked.
+
 ### 8.5 `scripts/build_qwen.sh` produces a model that cannot be loaded
 
 `scripts/build_qwen.sh:32` passes `--runtime ort-genai`, which emits only `genai_config.json`. Loading the result fails because the runtime requires a `model.io.static_cache` declaration in `inference_metadata.yaml`.

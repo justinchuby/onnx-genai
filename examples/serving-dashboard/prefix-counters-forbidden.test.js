@@ -32,7 +32,20 @@ import { join, relative } from 'node:path';
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 
 /** The counters ruled unshippable. `hit_rate` is `hits / completed generations`. */
-const FORBIDDEN = ['prefix_cache_hits', 'prefix_cache_lookups', 'prefix_cache_hit_rate'];
+// BOTH SPELLINGS. The wire format is underscored (`prefix_cache_hits`); the
+// dashboard's internal field keys are DOTTED (`prefix_cache.hits`). This list
+// originally held only the wire spelling, so `dashboard/store-adapter.js:428`
+// bound `prefix_cache.hits` in CAPABILITY_KEYS -- unallowlisted -- and the
+// tripwire passed. A ban that greps for one spelling of a two-spelling field
+// guards the half nobody was going to use.
+const FORBIDDEN = [
+  'prefix_cache_hits',
+  'prefix_cache_lookups',
+  'prefix_cache_hit_rate',
+  'prefix_cache.hits',
+  'prefix_cache.lookups',
+  'prefix_cache.hit_rate',
+];
 
 /**
  * Modules that still reference the counters, with the reason. THIS LIST MAY
@@ -48,6 +61,8 @@ const ALLOWLIST = new Map([
   ['telemetry-store.js', 'debt: store still projects the field'],
   ['dashboard/prefix-cache.js', 'debt: the panel itself is being removed'],
   ['app.js', 'debt: audit-view wiring'],
+  // DEBT — surfaced only once the dotted spelling was added to FORBIDDEN.
+  ['dashboard/store-adapter.js', 'debt: CAPABILITY_KEYS still maps the panel'],
 ]);
 
 /** @returns {string[]} every .js file in the demo, excluding tests and deps */
@@ -88,7 +103,15 @@ describe('the prefix-cache counters are unnameable', () => {
     // that edit is the thing a reviewer can actually see.
     assert.equal(
       ALLOWLIST.size,
-      4,
+      // 4 -> 5 on 2026-xx by @e00032a4. THIS IS NOT NEW DEBT AND THE RATCHET IS
+      // NOT BROKEN. `dashboard/store-adapter.js` was ALREADY binding the fields;
+      // it was invisible because FORBIDDEN held only the underscored wire
+      // spelling and the store adapter uses the dotted key spelling. Widening
+      // the ban DISCLOSED an existing binding rather than permitting a new one.
+      // A ratchet may rise exactly once for this reason, and the reason must be
+      // written down -- otherwise "it only shrinks" is enforced by a number
+      // anyone can edit with a plausible excuse. Resumes shrink-only from 5.
+      5,
       'The allowlist changed size. It may only SHRINK -- if you removed a ' +
         "binding, drop its entry and lower this number. If you added one, don't.",
     );
