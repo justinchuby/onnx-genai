@@ -775,7 +775,7 @@ That last row is what closes it. **A stub is a value nobody has gotten to yet; t
 <!-- cite: crates/onnx-genai-engine/src/decode/state.rs:206 = "fn uses_token_prefix_cache" -->
 #### 8.4b The dynamic path reports hits it never serves — `MISLEADING`, not `measured` 🔴
 
-**Correcting my own §8.4a, committed minutes earlier.** Having verified the static-path zero exhaustively, I let its complement — *"therefore the dynamic path is `measured`"* — ride unverified. It is not. QA (@fc8b5d97) measured 19 hits / 20 lookups **including six controls whose prefixes differ from token 0**, with the shared-prefix arm **7.0% slower**. I traced it to source and confirm their finding.
+**Correcting my own §8.4a, committed minutes earlier.** Having verified the static-path zero exhaustively, I let its complement — *"therefore the dynamic path is `measured`"* — ride unverified. It is not. QA (@fc8b5d97) measured 19 hits / 20 lookups **including six controls whose prefixes differ from token 0**. I traced it to source and confirm their finding. (Their accompanying timing comparison was later withdrawn as within noise; the counter result, which is what the correction rests on, is unaffected.)
 
 `prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs::tokenize_prompt`) forks into two mechanisms:
 
@@ -808,8 +808,11 @@ Source analysis says the reuse cannot happen. QA measured whether it does. **Evi
 | **A** | one identical ~900-token prefix, fired 6× | **1341 ms** |
 | **B** (control) | six prefixes differing **from token 0** — sharing impossible | **1254 ms** |
 
-**Requests that shared a 900-token prefix were 7.0% SLOWER than requests that shared nothing.** And
-**every one of the six ARM B controls incremented the hit counter**, which is the counter's
+**The two arms differed by less than the noise floor, so the timing result is inconclusive** — a
+later re-run of this same comparison flipped the sign, and a repeat measurement on a byte-identical
+binary varied by 9.8%, which is larger than the gap between these two arms. No timing claim survives
+that. **What does survive is not a timing at all: every one of the six ARM B controls incremented
+the hit counter**, which is the counter's
 indictment: it fires when sharing is arithmetically impossible.
 
 **The sensitivity control is what makes this proof rather than absence of evidence, and it is the
@@ -817,12 +820,16 @@ methodological point worth carrying forward.** A null result normally cannot dis
 effect is absent"* from *"the instrument could not see it."* So the magnitude of a working cache was
 established independently first: prefill is **~90% of TTFT** (140 ms for a short prompt vs 1380 ms
 for a long one), meaning genuine reuse would collapse TTFT from ~1380 ms to ~140 ms — **a 90% drop,
-impossible to miss.** Observed: **+7.0%**. The effect being looked for is more than an order of
+impossible to miss.** Observed: **a difference within the 9.8% noise floor** — inconclusive as to
+sign, but bounded well below the effect being looked for. That effect is more than an order of
 magnitude larger than the noise, so **the instrument would unquestionably have seen it.**
 
 > **🔒 Ruled: no prefix-cache hit-rate panel ships, in any form, on any server** — not `measured`,
-> not `not-applicable`, not a stark `0%`. The field is removed from the demo, enforced by a tripwire
-> test (`examples/serving-dashboard/check-no-prefix-binding.test.js`).
+> not `not-applicable`, not a stark `0%`. The field is removed from the demo, enforced by two
+> complementary tripwire tests: `examples/serving-dashboard/prefix-counters-forbidden.test.js`
+> (no module outside a shrinking allowlist may reference the counters) and
+> `examples/serving-dashboard/dashboard/registry-prefix-tripwire.test.js` (no panel may request
+> them while every panel in the registry is mounted).
 
 **The two servers' counters are broken in opposite directions, which is why no single rule rescues
 either:** the batching path reads **0 / 135** (records nothing, §8.4a) and the paged path reads
@@ -856,7 +863,8 @@ The only prefix assertion is `warm.prefix_cache_hit_len > 0` (`:50`), and §8.4c
 establishes that `hit_len` is nonzero for *every* request because
 `.filter(|len| len > 0).max()` scores the shared chat-template preamble. So the
 test passes when the warm turn is faster, when it is identical, and when it is
-**7.0% slower** — which is what QA measured at n=20.
+**slower** — the test discards the quantity regardless of its sign, so no
+observed value of it can ever turn the test red.
 
 > **The test computes the exact quantity that would have exposed the defect, and
 > discards it into a log line.** It has been green for the entire life of the
