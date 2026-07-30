@@ -112,7 +112,7 @@ plain `···` **643 bytes** — **visibly different**. Italic renders.
 *This is the third time tonight a control arm inverted my own verdict, and the
 first where the control was the only reason I didn't publish a false RED.*
 
-## 1.5 🔴 CONFIRMED, P1 — an UNKNOWN or ABSENT state renders PIXEL-IDENTICALLY to `measured`
+## 1.5 🟢 CLOSED — was P1; RE-MEASURED AT `84e7645d` AND THE FIX RENDERS
 
     measured        2219 bytes ┐
     UNKNOWN-STATE   2219 bytes ├─ all three byte-for-byte identical
@@ -135,6 +135,74 @@ maximally-dishonest one.
 Recommendation: `.value:not([data-state])` and any unrecognised value must
 render in a distinct, obviously-wrong treatment. It must never be the treatment
 that means *trust this number*.
+
+### 1.5-R — RE-RUN AT `84e7645d`. The recommendation was implemented, and it renders.
+
+Everything above this line was measured at `5893ce3c`. By the time it was read it
+was **31 commits behind**, and `field-state.js` and `panel-kit.js` — the two files
+that decide this exact question — had both been rewritten underneath it. So the
+finding was re-run rather than re-argued.
+
+    pin           84e7645d      detached worktree, git status --porcelain = 0
+    asset digest  05330d886190d534
+    palette dig.  f95c9ee51a6b599c   ← UNCHANGED since 0d0646a6, so §1.2's hexes still hold
+    served-from   --demo-assets-dir pointed at the PINNED worktree (§7.3's cure)
+    pin proof     index.html / shell.css / field-state.js / panel-kit.js all
+                  200, and byte-identical to the pinned tree. 404 control: 404.
+    containment   git merge-base --is-ancestor 84e7645d feat/... → TRUE, checked
+                  AFTER the measurement (the amend hazard)
+
+**The result reverses.** Same rig for all rows: `span.value[data-source=server] >
+span.value__num`, identical text, differing ONLY in the `data-state` attribute.
+
+    measured             2040 bytes  d45a6d42d3c926bf  ┐
+    measured (duplicate) 2040 bytes  d45a6d42d3c926bf  ┘ CONTROL — identical, as it must be
+    unavailable          2054 bytes  7df167835c0d6146    control — a ruled state, distinct
+    UNKNOWN-STATE        3223 bytes  b17dc59e504505ca  ┐ both DIFFER from measured,
+    NO-STATE-ATTR        3223 bytes  b17dc59e504505ca  ┘ and match each other
+
+**The duplicate row is the load-bearing control.** The original finding's risk was
+a false *identical*; this re-run's claim is *different*, so the harness had to be
+shown capable of returning "identical" before its "different" meant anything. It
+returns byte-equal shas for two rows that differ in nothing, and the `measured`
+sha reproduced exactly across two independent browser sessions.
+
+Landed by **`b43b3923`** — *"stop rendering an unknown state as a trusted
+measurement"*. Computed style on the wrapper: `color rgb(230,159,0)`,
+`underline wavy rgb(230,159,0)`, and `::after { content: "NO STATE" }`. 0 uncaught
+exceptions on the page.
+
+**The fix's own claims about itself were tested, not taken.** It asserts two
+things beyond "it is different", and both hold under measurement:
+
+*It survives colour being switched off.* Re-captured with `filter: grayscale(1)`:
+
+    GREYSCALE  measured 1860b 06895d76   unknown/absent 2795b b869c702   → still distinct
+
+*Neither channel is load-bearing alone.* Suppressing the chip with
+`.value::after { content: none !important }` and re-capturing leaves the wavy
+underline carrying the signal by itself — in colour **and** in greyscale:
+
+    chip suppressed, COLOUR     measured 2040b d45a6d42  unknown/absent 2203b 6e0d6449
+    chip suppressed, GREYSCALE  measured 1860b 06895d76  unknown/absent 2007b b87866f3
+
+So the treatment is genuinely redundantly encoded, rather than nominally so.
+
+🟡 **One residual, disclosed rather than discovered — P3, not a reopening.**
+`.value__num` still computes to `rgb(230,237,243)` in all three rows, including
+the unknown and absent ones: `panels.css:40` sets the child's colour directly and
+a direct rule beats inheritance, so **the digits themselves are still exactly the
+colour of a trusted measurement.** The qualification is carried entirely by the
+chip and the underline around them. This is not a gap in the fix — `shell.css`
+says so itself, in the comment, and the alternative (inverting the wrapper
+background) was rejected on a measurement showing it would render #e6edf3 on
+#e6edf3 at 1.00:1. Recorded so the next reader knows the number's own treatment
+is unchanged and that this was chosen, not missed.
+
+**What is NOT claimed.** That every panel sets `data-state` correctly — this
+measures the CSS backstop for when one does not. And these are screenshot-byte
+comparisons, so they prove *a visible difference exists*, not that a human reads
+it as a warning.
 
 # §2 — Gate item (A): the module graph, in a browser, on both origins
 
@@ -266,7 +334,10 @@ touch a pair that shares its variables. For that pair the border channel is
 still the entire signal, and the border does hold up: three structurally
 distinct patterns, surviving both real-display rasterization and JPEG q40, with
 `measured`/`pending` carrying no border at all.
-**The five-state system is sound. Its DEFAULT (§1.5) is the defect.**
+**The five-state system is sound. Its DEFAULT (§1.5) WAS the defect — and is now
+a SIXTH treatment: see §1.5-R, re-measured at `84e7645d` and closed. The wavy
+underline was deliberately chosen as the sixth pattern precisely so this
+greyscale/projector argument keeps covering it; that was verified, not assumed.**
 
 # §4 — What actually mounts, counted on the running page, both origins
 
