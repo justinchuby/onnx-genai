@@ -34,7 +34,10 @@ const {
   formatNumber,
   metricRow,
   renderField,
+  SOURCE_BADGES,
   sourceBadge,
+  UNKNOWN_SOURCE_BADGE,
+  UNKNOWN_SOURCE_CLASS,
   withAcronyms,
 } = await import('./panel-kit.js');
 
@@ -210,6 +213,47 @@ describe('renderField — AC7 provenance badges', () => {
   it('spells SIMULATED out in full, because a superscript is easy to miss', () => {
     assert.equal(sourceBadge('simulated').textContent, 'SIM');
     assert.match(sourceBadge('simulated').getAttribute('title'), /not measured at all/i);
+  });
+
+  // The four tests below exist because the fallback used to be
+  // `SOURCE_BADGES.derived`, so every value the catalogue could not identify was
+  // rendered as "Derived by arithmetic on measured inputs" — a positive claim
+  // about measurement, handed out on no evidence. It was reachable from three
+  // different directions and no test noticed, because a wrong badge still
+  // renders a badge.
+  it('refuses to answer an unrecognised source class with the derived claim', () => {
+    const badge = sourceBadge('guessed');
+
+    assert.equal(badge.textContent, UNKNOWN_SOURCE_BADGE.glyph);
+    assert.notEqual(badge.textContent, SOURCE_BADGES.derived.glyph);
+    assert.doesNotMatch(badge.getAttribute('title'), /arithmetic on measured inputs/i);
+    assert.match(badge.getAttribute('title'), /unknown provenance/i);
+  });
+
+  it('renders a field carrying no provenance at all as unknown, not as derived', () => {
+    const node = renderField({ value: 41, state: 'measured', label: 'Mystery' });
+
+    assert.equal(node.findByClass('value__src').textContent, UNKNOWN_SOURCE_BADGE.glyph);
+  });
+
+  it('still says derived when there is evidence of the arithmetic', () => {
+    const node = renderField({
+      value: 41,
+      state: 'measured',
+      label: 'Tokens per second',
+      derivedFrom: ['tokens', 'elapsed'],
+    });
+
+    assert.equal(node.findByClass('value__src').textContent, SOURCE_BADGES.derived.glyph);
+  });
+
+  it('keeps the unknown class out of SOURCE_BADGES, which is used as a validity predicate', () => {
+    // `normaliseSourceClass` decides whether a caller-supplied string is a real
+    // source class with `x in SOURCE_BADGES`. If the unknown class were a member
+    // it would validate as a genuine provenance, which is the exact inversion
+    // this constant exists to prevent.
+    assert.equal(UNKNOWN_SOURCE_CLASS in SOURCE_BADGES, false);
+    assert.equal(sourceBadge(UNKNOWN_SOURCE_CLASS).textContent, UNKNOWN_SOURCE_BADGE.glyph);
   });
 });
 

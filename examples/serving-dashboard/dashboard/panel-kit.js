@@ -64,6 +64,39 @@ export const SOURCE_BADGES = Object.freeze({
   simulated: { glyph: 'SIM', title: 'SIMULATED — not measured at all.' },
 });
 
+/**
+ * The badge for a value whose provenance the catalogue cannot identify.
+ *
+ * Deliberately NOT a member of `SOURCE_BADGES`. Two call sites in
+ * `normaliseSourceClass` use `x in SOURCE_BADGES` as the validity predicate for
+ * a source class, so adding a key here would make the literal string
+ * `'unknown'` validate as a real, catalogued provenance — the opposite of what
+ * it means.
+ *
+ * This exists because the previous fallback was `SOURCE_BADGES.derived`, which
+ * answered "we do not know where this number came from" with "derived by
+ * arithmetic on measured inputs". That is a positive claim about measurement,
+ * awarded on the strength of no evidence at all. A fallback must make the
+ * WEAKEST claim available, never a middle one: an unrecognised provenance has
+ * to read as unrecognised, because the one thing we know about it is that we
+ * do not know.
+ */
+export const UNKNOWN_SOURCE_BADGE = Object.freeze({
+  glyph: '?',
+  title:
+    'UNKNOWN PROVENANCE — this value carries no source the dashboard recognises, ' +
+    'so nothing is claimed about how it was obtained.',
+});
+
+/**
+ * The source class used when no catalogued provenance can be identified.
+ *
+ * Kept as a named constant so the string is written once: it is deliberately
+ * absent from `SOURCE_BADGES`, so a typo here would silently reintroduce the
+ * fallback-to-`derived` behaviour this constant exists to remove.
+ */
+export const UNKNOWN_SOURCE_CLASS = 'unknown';
+
 /** Reason copy reused across panels, taken verbatim from demo-ux.md §4.2. */
 export const REASONS = Object.freeze({
   KV_NOT_EXPOSED:
@@ -188,7 +221,7 @@ export function formatDuration(milliseconds) {
  * @returns {HTMLElement}
  */
 export function sourceBadge(sourceClass, detail) {
-  const badge = SOURCE_BADGES[sourceClass] ?? SOURCE_BADGES.derived;
+  const badge = SOURCE_BADGES[sourceClass] ?? UNKNOWN_SOURCE_BADGE;
   const title = detail ? `${badge.title} · ${detail}` : badge.title;
   return element('abbr', {
     className: ['value__src', `value__src--${sourceClass}`],
@@ -1296,16 +1329,23 @@ function normaliseSourceClass(field) {
     return /** @type {SourceClass} */ (candidate);
   }
   const source = typeof field === 'string' ? field : field?.source;
-  if (!source) {
-    return 'derived';
-  }
-  if (source in SOURCE_BADGES) {
+  if (source && source in SOURCE_BADGES) {
     return /** @type {SourceClass} */ (source);
   }
-  if (source.startsWith('/')) {
+  if (source && source.startsWith('/')) {
     return 'server';
   }
-  return 'derived';
+  // Nothing above identified a provenance. `derived` is a CLAIM — arithmetic on
+  // measured inputs — and it is only honest when there is evidence of the
+  // arithmetic, which is what `derivedFrom` records. Awarding it to every
+  // unidentified field, as this function used to, upgrades "we do not know"
+  // into "we computed it from measurements" for free. Everything left is
+  // genuinely unknown and must say so.
+  const derivedFrom = typeof field === 'string' ? undefined : field?.derivedFrom;
+  if (Array.isArray(derivedFrom) && derivedFrom.length > 0) {
+    return 'derived';
+  }
+  return UNKNOWN_SOURCE_CLASS;
 }
 
 /** @param {{source?: string, at?: number, derivedFrom?: string[]}} field */
