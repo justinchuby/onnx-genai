@@ -2889,3 +2889,87 @@ makes them unrunnable outside a checkout, and then chose a review vehicle withou
 **A freeze is a property of an artifact — §0.0 rule 16 stands. But the artifact must
 still be able to answer the questions the suite asks of it.** A tag is the freeze;
 **a detached worktree is the only correct way to stand in it.**
+
+---
+
+## 8.32 — gate item 1 closes: the Rust at `review-0` had never been compiled by anyone
+
+Item 1 (*crates compile + clippy*) sat 🟡 all session as **carried, not re-measured**.
+The Lead published `241 passed / 0 failed / 4 ignored, exit 0` pinned at `14a071f6`.
+**I did not inherit that number, and it is as well I did not.**
+
+```
+git merge-base --is-ancestor 14a071f6 0aac6bb1   -> YES, review-0 contains it
+git merge-base --is-ancestor 0aac6bb1 14a071f6   -> NO  (the relation has a direction)
+commits in the gap: 36        of which touching crates/: 1
+
+git rev-parse 14a071f6:crates = 74283d9f…
+git rev-parse 0aac6bb1:crates = a1f77ae3…        ⛔ DIFFERENT TREE OBJECT
+control — examples/serving-dashboard across the same gap: DIFFERS ✅ (not vacuous)
+```
+
+**The one gap commit is `02b54684`, and it is +287 lines of new Rust plus a
++161-line new integration test file, `tests/demo_dashboard.rs`.** ➡️ **So the Rust
+at the nominated sha was not the Rust anybody had run. His number was true and
+did not transfer — a 15-test difference, all of it in code written to close a
+disclosure defect.**
+
+### the measurement, taken at `review-0` in a detached worktree
+
+```
+pwd=/private/tmp/review-0   sha=0aac6bb1   porcelain=0   (from scratch, cold target)
+
+cargo test -p onnx-genai-server --no-fail-fast   EXIT 0   ✅
+    205 + 13 + 28 + 10 passed = 256 passed · 0 failed · 4 ignored
+    tests/demo_dashboard.rs RAN — the gap commit's new tests are in this number
+
+cargo clippy -p onnx-genai-server --all-targets  EXIT 0   ✅  7 warnings, 0 errors
+    (workspace lint policy is warn-only, so exit 0 is the criterion — and the
+     7 warnings are the positive control that the invocation can speak at all)
+
+cargo test --workspace --no-fail-fast            EXIT 101 ⛔  BUILD FAILURE
+```
+
+### ⚠️ the workspace failure is real, is NOT ours, and must not be read as a regression
+
+`mlas-sys` compiles `qgemm_kernel_avx2.cpp` — an **AVX2 x86 kernel** — with
+`--target=arm64-apple-macosx`. `build.rs:65` lists it in an **unconditional file
+list**. Six `error: no member named 'GemvU8S8Kernel' in 'MLAS_PLATFORM'`, then
+`onnx-runtime-cpuinfo`'s build script fails, then 101.
+
+```
+last commit touching crates/mlas-sys or crates/onnx-runtime-cpuinfo:
+    fbf9dfc7  2026-07-27  chore: add central warn-only workspace lint policy
+
+commits in the last 24h touching those crates :   0
+commits in the last 24h on review-0           : 447
+```
+
+**Zero of tonight's 447 commits go near it. It is a standing property of building
+this workspace on `aarch64-apple-darwin`, three days older than the branch.**
+
+### 🔑 ✅ ITEM 1 → 🟢, SCOPED, WITH THE SCOPE STATED IN THE ROW
+
+**`-p onnx-genai-server` is green on both halves at `review-0`; `--workspace` does
+not build on ARM and never did.** Both numbers are true and **the discriminator is
+scope, not correctness** — which is the only reason the Lead's `241` and my `101`
+can sit in the same document without one of us being wrong. ⛔ **A reviewer who runs
+`cargo test` unqualified will get `101` and must not read it as a defect in this
+work.** *The gate is 10 🟢 / 0 🟡 / 0 🔴 at `0aac6bb1`.*
+
+### ➕ two things the run found that no gate item asks about
+
+1. **I swallowed my own exit code.** My first invocation ended `| tail -40` and
+   printed compiler errors with no status. **That is the Lead's `| tail` defect,
+   committed by the person quoting the rule, ninety seconds after quoting it.**
+   Re-run with the code captured: 101. *A pipeline reports the exit status of its
+   last stage, and `tail` always succeeds.*
+2. **`effective_batch_capacity()` is never called by shipped code.** `state.rs:186`
+   defines it; the only callers are `tests.rs:3875`, `:3889`, `:4025`. The published
+   field reads `occupancy.capacity` (`admin.rs:240`) instead. **This is deliberate
+   — `mod.rs:257` says so explicitly** — but **`state.rs:134` states the value is
+   *"reported against `Self::effective_batch_capacity`"*, and nothing reports against
+   it. ➡️ **Three dedicated tests prove the method computes correctly; not one of
+   them proves anybody calls it, and a docstring asserts a wiring that does not
+   exist.** Same shape as `mod.rs:117-119`. **Minor, disclosed, not a blocker —
+   and it was sitting in a clippy warning that exit 0 invited everyone to skip.**
