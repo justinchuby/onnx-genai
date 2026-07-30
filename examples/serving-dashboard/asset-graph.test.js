@@ -319,7 +319,16 @@ describe('every design token reaches the screen', () => {
 
       const checked = [];
       const failures = [];
-      for (const [, token, claimed, floor, margin] of css['tokens.css'].matchAll(prose)) {
+      // EVERY stylesheet, not just tokens.css. The first version of this
+      // checker read `css['tokens.css']` alone -- a corpus of one where the
+      // directory holds three -- because that is where I happened to have
+      // written the table. Within the hour @bb2ee824 landed a measured ratio
+      // in a shell.css comment, which is precisely the shape this is for and
+      // sat outside its reach. The scoping error is the SAME ONE this test
+      // was written to punish, one level up: I fixed a guard pinned to a
+      // spelling by writing a guard pinned to a filename.
+      for (const [file, text] of Object.entries(css)) {
+      for (const [, token, claimed, floor, margin] of text.matchAll(prose)) {
         const hex = hexOf(token);
         if (!hex) {
           failures.push(`${token} is quoted in a margin table but is not declared in this file`);
@@ -334,22 +343,23 @@ describe('every design token reaches the screen', () => {
 
         if (Math.abs(measured - Number(claimed)) > 0.005) {
           failures.push(
-            `${token} is quoted at ${claimed}:1 but measures ${measured.toFixed(3)}:1`,
+            `${file}: ${token} is quoted at ${claimed}:1 but measures ${measured.toFixed(3)}:1`,
           );
         }
         if (Number(floor) !== expectedFloor) {
           failures.push(
-            `${token} is quoted against a ${floor} floor; a ${
+            `${file}: ${token} is quoted against a ${floor} floor; a ${
               /-(rule|stroke)$/.test(token) ? 'rule/stroke is non-text (3.0)' : 'text token is 4.5'
             }`,
           );
         }
         if (Math.abs(measured - Number(floor) - Number(margin)) > 0.005) {
           failures.push(
-            `${token} is quoted with margin ${margin} but ${measured.toFixed(3)} - ${floor} = ` +
-              `${(measured - Number(floor)).toFixed(3)}`,
+            `${file}: ${token} is quoted with margin ${margin} but ` +
+              `${measured.toFixed(3)} - ${floor} = ${(measured - Number(floor)).toFixed(3)}`,
           );
         }
+      }
       }
 
       // ANTI-VACUITY. The prose table is the only subject this checker has,
