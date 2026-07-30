@@ -94,6 +94,36 @@ test('every review document that declares a measurement SHA declares a real one'
       `entirely stale corpus. Documents seen: ${REVIEW_DOCS.join(', ')}`,
   );
 
+  // DRAINED-CORPUS GUARD. @12e42da8's rule: an exemption is a statement about RAW
+  // EVIDENCE, and the moment an exempt file states a CONCLUSION the exemption is a
+  // suppression. This guard's `adopters` loop silently skips every document that
+  // carries no marker -- and both current abstainers publish verdicts. So the
+  // abstention is recorded here BY NAME with its cost, and it self-expires:
+  // adopting the marker makes this red until the name is removed, and a NEW
+  // abstainer makes it red immediately. Green means the drain has not widened,
+  // never that the corpus is complete.
+  const KNOWN_ABSTAINERS = ['IMPLEMENTATION-REVIEW.md', 'REVIEWER-BRIEF.md'];
+  const unexpected = abstainers.filter((d) => !KNOWN_ABSTAINERS.includes(d));
+  assert.deepEqual(
+    unexpected,
+    [],
+    `${unexpected.join(', ')} publishes review conclusions but declares no ` +
+      `MEASURED-AT, so this guard skips it silently. Either adopt the marker or ` +
+      `add the file to KNOWN_ABSTAINERS with the reason -- an unrecorded skip is ` +
+      `printed in the same column as a pass.`,
+  );
+  const retired = KNOWN_ABSTAINERS.filter((d) => !abstainers.includes(d));
+  assert.deepEqual(
+    retired,
+    [],
+    `${retired.join(', ')} now declares MEASURED-AT, so its entry in ` +
+      `KNOWN_ABSTAINERS is stale. Remove it: an exemption that outlives its ` +
+      `subject is how a corpus drains without any single commit being wrong.`,
+  );
+  console.log(
+    `  corpus: ${adopters.length} checked, ${abstainers.length} abstaining (${abstainers.join(', ') || 'none'})`,
+  );
+
   for (const [doc, declared] of adopters) {
     assert.match(
       declared,

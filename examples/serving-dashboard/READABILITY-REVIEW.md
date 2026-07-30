@@ -2163,3 +2163,89 @@ and a `}`.**
 **📋 R1 — the order asks me to re-cite it by content. **ALREADY DONE AT R38**, verified at
 `35b0ad48`: `dashboard/index.js:59` (`@property {(root: HTMLElement`), with a negative control that
 misses. **9 anchored in this document, 0 unanchored positional citations remaining.**
+
+---
+
+## R42 🔴→✅ **MY OWN GUARD WAS A DRAINED CORPUS AND I HAVE FIXED IT — plus the Lead's brand-new mutation rule has a hole I found by obeying it**
+
+**MEASURED-AT `dadb59e7` · clock `05:21:33` · toplevel asserted.**
+
+### The Lead's drained-corpus class, applied to my own instrument, and it lands
+
+**@12e42da8's rule, verbatim: *an exemption is a statement about RAW EVIDENCE; the moment an exempt
+file states a CONCLUSION, the exemption is a suppression.* My guard skips any review document that
+carries no `MEASURED-AT` marker — a `continue`, printed but not asserted. So I measured the skip:**
+```
+DISCOVERED 4 · CHECKED 2 · ABSTAINING 2
+  ✅ CHECKED   ARCHITECTURE-SECURITY-REVIEW.md   (@f6527cc9 HAS ADOPTED IT -- credit due)
+  ✅ CHECKED   READABILITY-REVIEW.md              (mine)
+  ⛔ SKIPPED   IMPLEMENTATION-REVIEW.md   -> **45 verdict-bearing lines**
+  ⛔ SKIPPED   REVIEWER-BRIEF.md          -> **45 verdict-bearing lines**
+  NEG CONTROL zzz3-unwritten -> 0
+```
+> **☠️ MY GUARD'S GREEN MEANS *"every document that opted in is fresh."* IT IS PRINTED IN THE SAME
+> COLUMN AS *"the review corpus is fresh."* **NINETY VERDICT-BEARING LINES ARE OUTSIDE IT AND
+> NOTHING SAID SO.*** That is @fc8b5d97's law — *an abstention is not a pass and looks identical* —
+> inside the instrument I built to catch staleness.
+
+**⚖️ AND MINE IS WORSE THAN THE LEAD'S SPECIMEN IN ONE WAY AND BETTER IN ANOTHER, BOTH WORTH SAYING:
+their corpus **drained** — each exemption justified when written, the aggregate a suppression, no
+bad commit to find. **Mine was BORN drained, at n=1, and its own header calls this
+"ANTI-VACUITY, NOT COMPLETENESS."** ⛔ **Documenting an exemption honestly does not stop it being a
+suppression — I wrote the disclaimer and then read my own green for three hours anyway.**
+
+### ✅ FIXED, NOT FILED — a self-expiring exemption, @0837fdf9's pattern
+
+**Landed in `check-review-freshness.test.js`: the two abstainers are now named in
+`KNOWN_ABSTAINERS`, and TWO assertions bracket the list so it cannot rot in either direction:**
+```
+A NEW abstainer            -> RED  ("an unrecorded skip is printed in the same column as a pass")
+An abstainer that ADOPTS   -> RED  ("an exemption that outlives its subject is how a corpus
+                                     drains without any single commit being wrong")
+AND IT NOW PRINTS ITS OWN DENOMINATOR EVERY RUN:
+    corpus: 2 checked, 2 abstaining (IMPLEMENTATION-REVIEW.md, REVIEWER-BRIEF.md)
+```
+**MUTATION-PROVED IN BOTH DIRECTIONS, WITH THE MUTATED LINE PRINTED VERBATIM:**
+```
+DROP a name  -> const KNOWN_ABSTAINERS = ['IMPLEMENTATION-REVIEW.md'];
+                tests 3 · pass 2 · **fail 1** ✅
+ADD a false  -> [..., 'READABILITY-REVIEW.md'];
+                tests 3 · pass 2 · **fail 1** ✅
+RESTORED     -> tests 3 · pass 3 · fail 0 ✅
+```
+**⚠️ Green today means only *the drain has not widened.* It has never meant the corpus is complete,
+and now the test says so in its own output instead of in a header comment nobody runs.**
+
+### 🔑 AND THE LEAD'S BRAND-NEW MUTATION RULE HAS A HOLE, FOUND BY OBEYING IT
+
+**The rule issued minutes ago: *`git diff --numstat` your mutation BEFORE you believe its result, in
+either direction — a no-op mutation is byte-identical to a blind guard.* I did exactly that. **It
+proved nothing.**
+```
+MUTATION 1 numstat -> 30  0   examples/.../check-review-freshness.test.js
+MUTATION 2 numstat -> 30  0   examples/.../check-review-freshness.test.js
+                      ^^^^^^ IDENTICAL. AND NEITHER NUMBER IS THE MUTATION.
+```
+> **⛔ `numstat` DIFFS AGAINST HEAD. My new guard is UNCOMMITTED, so numstat reported the size of
+> the whole uncommitted block — the same figure for both mutations, and for no mutation at all.**
+> ➡️ ***A MUTATION INSIDE UNCOMMITTED WORK IS INVISIBLE TO A NUMSTAT AGAINST HEAD. The check
+> confirms your BLOCK exists, and reads as confirming your MUTATION applied.***
+
+**✅ THE HALF THAT ACTUALLY WORKED IS THE OTHER HALF OF THE SAME ORDER — *print the mutated line
+verbatim*. The two lines differed visibly and that is the only reason I know both mutations landed.
+**Both halves were issued together; only one is load-bearing when the baseline is dirty, and the
+dirty baseline is the normal case for anyone mutating their own uncommitted fix.**
+➡️ **AMENDMENT I AM PROPOSING: *diff against the working tree, not HEAD* — `cp` the file, mutate,
+`diff` the copy. Or simply trust the verbatim line, which never depended on a baseline at all.**
+
+**🎖️ @12e42da8 — this is the fourth order tonight that produced a better finding by being executed
+than it would have by being agreed with, and it is the same shape @e00032a4 hit: *the harness never
+stripped fences, so the prescribed fix would have created the blind spot it was meant to close.*
+**An order you cannot falsify is an order you have not run.***
+
+### 📌 ATTRIBUTION COMPLIANCE, under the rule issued this hour
+**Every peer measurement I have cited tonight carries the SHA its author published it at
+(@e00032a4 `079b7c38`, @73e77d95 `1c068b03`, @c0de4c2e `275d443c`, @f6527cc9 `876a9cd7`,
+@732c7548 `38605db2`). **And I have twice declined to accept an attribution *in my own favour*
+that I could not reproduce — R37 and R39. *An attribution is a claim; it needs a SHA like every
+other claim, and that applies hardest when it flatters you.***
