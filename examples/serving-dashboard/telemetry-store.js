@@ -103,12 +103,19 @@ const D88_FAST_ENDPOINTS = Object.freeze([
   ENDPOINTS.DEBUG_KV,
 ]);
 
-const SLOW_ENDPOINTS = Object.freeze([
+const BACKGROUND_SLOW_ENDPOINTS = Object.freeze([
   ENDPOINTS.DEBUG_KV_BLOCKS,
   ENDPOINTS.DEBUG_CONFIG,
+  ENDPOINTS.MODELS,
+]);
+
+// D88/D87/AC95 exclude /metrics and /v1/resources from the production poll
+// loop pending under-load measurement. pollOnce() is a deterministic
+// test/capture operation, not the scheduler used by the shipped dashboard.
+const ONE_SHOT_ENDPOINTS = Object.freeze([
+  ...BACKGROUND_SLOW_ENDPOINTS,
   ENDPOINTS.METRICS,
   ENDPOINTS.RESOURCES,
-  ENDPOINTS.MODELS,
 ]);
 
 /** Poll cadence bounds. The spec fixes the dashboard at 250-500 ms. */
@@ -232,7 +239,7 @@ export function createTelemetryStore({
   let slowPollInFlight = false;
   /** @type {Record<string, SourceResult>} */
   let latestSourceResults = Object.fromEntries(
-    [...D88_FAST_ENDPOINTS, ...SLOW_ENDPOINTS].map((path) => [
+    [...D88_FAST_ENDPOINTS, ...ONE_SHOT_ENDPOINTS].map((path) => [
       path,
       {
         ok: false,
@@ -294,6 +301,8 @@ export function createTelemetryStore({
    * @type {{total: number, atMs: number}|null}
    */
   let lastTokenSample = null;
+  /** @type {import('./telemetry-field.js').TelemetryField|null} */
+  let lastDerivedThroughput = null;
 
   /** @type {TelemetryStore} */
   const store = {
@@ -402,7 +411,7 @@ export function createTelemetryStore({
       if (slowMode === 'await') {
         latestSourceResults = {
           ...latestSourceResults,
-          ...(await fetchSources(SLOW_ENDPOINTS)),
+          ...(await fetchSources(ONE_SHOT_ENDPOINTS)),
         };
         publish(buildSnapshot(latestSourceResults));
       } else if (slowMode === 'background') {
@@ -432,7 +441,7 @@ export function createTelemetryStore({
     try {
       latestSourceResults = {
         ...latestSourceResults,
-        ...(await fetchSources(SLOW_ENDPOINTS)),
+        ...(await fetchSources(BACKGROUND_SLOW_ENDPOINTS)),
       };
       publish(buildSnapshot(latestSourceResults));
     } finally {
@@ -1004,7 +1013,7 @@ export function createTelemetryStore({
         observedAtMs: source.fetchedAtMs ?? timestampMs,
       });
     }
-    addDerivedThroughput(fields, timestampMs);
+    addDerivedThroughput(fields, sources);
     addDerivedBlockTable(fields, sources, timestampMs);
     return Object.freeze(fields);
   }
@@ -1182,10 +1191,12 @@ export function createTelemetryStore({
    * wrongly promise a number that is never coming.
    *
    * @param {Record<string, import('./telemetry-field.js').TelemetryField>} fields
-   * @param {number} timestampMs
+   * @param {Record<string, SourceResult>} sources
    */
-  function addDerivedThroughput(fields, timestampMs) {
+  function addDerivedThroughput(fields, sources) {
     const total = fields['metrics.tokens_generated_total'];
+    const fetchedAtMs = sources[ENDPOINTS.METRICS]?.fetchedAtMs;
+    const sampleAtMs = Number.isFinite(fetchedAtMs) ? fetchedAtMs : null;
     const options = {
       source: ENDPOINTS.METRICS,
       sourceClass: SOURCE_CLASSES.DERIVED,
@@ -1196,40 +1207,62 @@ export function createTelemetryStore({
 
     if (!total || total.state !== FIELD_STATES.MEASURED) {
       lastTokenSample = null;
+      lastDerivedThroughput = null;
       fields['throughput.observed'] = unavailableField(
         'Derived from the cumulative token counter on /metrics, which is not available.',
         options,
       );
       return;
     }
+    if (sampleAtMs === null) {
+      fields['throughput.observed'] =
+        lastDerivedThroughput ??
+        pendingField(
+          'The token counter response has no sample identity, so it cannot establish a rate.',
+          options,
+        );
+      return;
+    }
 
     const previous = lastTokenSample;
-    lastTokenSample = { total: total.value, atMs: timestampMs };
+    if (previous?.atMs === sampleAtMs) {
+      fields['throughput.observed'] =
+        lastDerivedThroughput ??
+        pendingField(
+          'Waiting for a second sample of the token counter to measure a rate.',
+          options,
+        );
+      return;
+    }
+    lastTokenSample = { total: total.value, atMs: sampleAtMs };
 
     if (!previous) {
-      fields['throughput.observed'] = pendingField(
+      lastDerivedThroughput = pendingField(
         'Waiting for a second sample of the token counter to measure a rate.',
         options,
       );
+      fields['throughput.observed'] = lastDerivedThroughput;
       return;
     }
 
-    const elapsedS = (timestampMs - previous.atMs) / 1000;
+    const elapsedS = (sampleAtMs - previous.atMs) / 1000;
     const delta = total.value - previous.total;
     // A restarted server resets the counter; a negative delta is not a rate.
     if (elapsedS <= 0 || delta < 0) {
-      fields['throughput.observed'] = pendingField(
+      lastDerivedThroughput = pendingField(
         'The token counter reset, most likely a server restart. Re-measuring.',
         options,
       );
+      fields['throughput.observed'] = lastDerivedThroughput;
       return;
     }
 
-    fields['throughput.observed'] = measuredField(delta / elapsedS, {
+    lastDerivedThroughput = measuredField(delta / elapsedS, {
       ...options,
-      observedAtMs: timestampMs,
+      observedAtMs: sampleAtMs,
       derivedFrom: ['metrics.tokens_generated_total'],
     });
+    fields['throughput.observed'] = lastDerivedThroughput;
   }
 
   /**

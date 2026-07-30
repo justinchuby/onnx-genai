@@ -873,7 +873,7 @@ test('a stalled slow endpoint cannot block the fast lane or retain stale values'
     requestTimeoutMs: 30,
     pollIntervalMs: 100,
     fetchImpl: (url, options = {}) => {
-      if (new URL(url).pathname !== ENDPOINTS.METRICS) {
+      if (new URL(url).pathname !== ENDPOINTS.DEBUG_CONFIG) {
         return fakeFetch(routes)(url);
       }
       return new Promise((_resolve, reject) => {
@@ -891,7 +891,7 @@ test('a stalled slow endpoint cannot block the fast lane or retain stale values'
   });
   const failedSlowSnapshot = new Promise((resolve) => {
     const unsubscribe = store.subscribe((candidate) => {
-      const field = candidate.fields['metrics.ttft'];
+      const field = candidate.fields['server.context_length'];
       if (!/no response within 30 ms/.test(field.reason ?? '')) return;
       unsubscribe();
       resolve(candidate);
@@ -905,7 +905,7 @@ test('a stalled slow endpoint cannot block the fast lane or retain stale values'
 
   assert.equal(beforeSlowTimeout.fields['queue.depth'].state, FIELD_STATES.MEASURED);
   assert.equal(afterSlowTimeout.fields['queue.depth'].state, FIELD_STATES.MEASURED);
-  assert.equal(afterSlowTimeout.fields['metrics.ttft'].state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(afterSlowTimeout.fields['server.context_length'].state, FIELD_STATES.UNAVAILABLE);
 });
 
 test('an HTML error page served at /metrics does not crash the store', async () => {
@@ -970,6 +970,109 @@ test('throughput is derived from the delta of the cumulative token counter', asy
   assert.equal(field.value, 100);
   // It must disclose that we computed it rather than read it.
   assert.deepEqual(field.derivedFrom, ['metrics.tokens_generated_total']);
+});
+
+test('start() differentiates each metrics body once and preserves the rate between samples', async () => {
+  let tokens = 1000;
+  let clock = 10_000;
+  let metricsRequests = 0;
+  let statusRequests = 0;
+  const publishedStates = [];
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    pollIntervalMs: 100,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname;
+      if (path === ENDPOINTS.METRICS) {
+        metricsRequests += 1;
+        return fakeFetch({
+          [ENDPOINTS.METRICS]: { text: metricsBody({ tokens }) },
+        })(url);
+      }
+      if (path === ENDPOINTS.STATUS) statusRequests += 1;
+      return fakeFetch(routes)(url);
+    },
+  });
+  const unsubscribe = store.subscribe((candidate) => {
+    publishedStates.push(candidate.fields['throughput.observed']);
+  });
+  const waitFor = (predicate, message) =>
+    new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        stop();
+        reject(new Error(message));
+      }, 2_000);
+      const stop = store.subscribe((candidate) => {
+        if (!predicate(candidate)) return;
+        clearTimeout(timeout);
+        stop();
+        resolve(candidate);
+      });
+    });
+
+  try {
+    await store.pollOnce();
+    assert.equal(metricsRequests, 1);
+    assert.equal(store.field('throughput.observed').state, FIELD_STATES.PENDING);
+
+    clock = 10_250;
+    store.start();
+    const statusAfterFirstSample = statusRequests;
+    await waitFor(
+      () => statusRequests >= statusAfterFirstSample + 4,
+      'the fast lane did not publish between metrics samples',
+    );
+    assert.equal(metricsRequests, 1, 'the cadence should still be reusing the first metrics body');
+    assert.equal(
+      publishedStates.some((field) => field.state === FIELD_STATES.MEASURED),
+      false,
+      'one metrics request produced a differentiated rate',
+    );
+    store.stop();
+
+    tokens = 1200;
+    clock = 12_000;
+    const secondSample = await store.pollOnce();
+    assert.equal(metricsRequests, 2);
+    assert.equal(secondSample.fields['throughput.observed'].state, FIELD_STATES.MEASURED);
+    assert.equal(secondSample.fields['throughput.observed'].value, 100);
+
+    clock = 12_250;
+    store.start();
+    const statusAfterSecondSample = statusRequests;
+    const reusedSample = await waitFor(
+      (candidate) =>
+        statusRequests >= statusAfterSecondSample + 2 &&
+        candidate.fields['throughput.observed'].state === FIELD_STATES.MEASURED,
+      'the fast lane did not preserve the derived rate between metrics samples',
+    );
+    assert.equal(metricsRequests, 2, 'the second metrics body should still be cadence-reused');
+    assert.equal(reusedSample.fields['throughput.observed'].value, 100);
+  } finally {
+    unsubscribe();
+    store.stop();
+  }
+});
+
+test('throughput never differentiates metrics bodies without a finite sample identity', async () => {
+  let tokens = 1000;
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => Number.NaN,
+    fetchImpl: async (url) =>
+      fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: { text: metricsBody({ tokens }) } }))(url),
+  });
+
+  await store.pollOnce();
+  tokens = 1200;
+  await store.pollOnce();
+
+  const field = store.field('throughput.observed');
+  assert.equal(field.state, FIELD_STATES.PENDING);
+  assert.equal(field.value, null);
+  assert.match(field.reason, /no sample identity/);
 });
 
 test('a counter reset re-measures instead of reporting a negative rate', async () => {
