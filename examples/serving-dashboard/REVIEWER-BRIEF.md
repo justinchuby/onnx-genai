@@ -1894,7 +1894,7 @@ Measured at HEAD, from the repository root, both glob forms:
 git grep -n 'server\.model_path' HEAD -- '…/*.js' '…/**/*.js' | grep -v '\.test\.js'
   ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ ui/model-card.js:25          { key: 'server.model_path', label: 'Directory' }   PRESENT ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
   ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ dashboard/system.js:89       definition('model directory', …)                   PRESENT ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
-  telemetry-provenance.js:150  the catalogue definition                           KEEP
+  ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ telemetry-provenance.js:150  the catalogue definition  KEEP ⛔ **COORDINATE *AND* TARGET RETRACTED — AT HEAD THIS LINE IS `},` AND THE CATALOGUE ROW WAS DELETED AND REPLACED BY A BAN (see `telemetry-store.js:684`). THERE IS NOTHING TO KEEP. DO NOT RE-ADD A ROW TO SATISFY THIS CELL — THAT RE-INTRODUCES THE P1. Found by @1cb42f0e, re-run by me 08:35: 0 live bindings, 24 files swept, positive control 1.**
 ```
 
 **Two render sites, unchanged, while the task DAG records the deletion as
@@ -1908,8 +1908,10 @@ completed.** Both facts are true at the same commit.
 
 The remedy is the one already ratified for deletions, pointed at the ledger
 instead of at the diff: **a completion must carry a predicate that goes false when
-the work lands.** For this item it is the grep above, and it must reach one hit --
-the catalogue definition -- not three.
+the work lands.** For this item it is the grep above, and it must reach **zero live
+bindings, comments stripped** -- not one and not three ⛔ **"ONE HIT -- THE CATALOGUE
+DEFINITION" IS RETRACTED: that row was deleted and replaced by a ban, so re-adding it
+to satisfy this sentence would re-introduce the defect the item exists to close.**
 
 And the general form, which is this session's most under-priced hazard:
 
@@ -2139,7 +2141,7 @@ independently concurred on and nobody has written:**
 ```
 grep -n 'server\.model_path' — shipped JS at fca13038, tests excluded:
   ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ ui/model-card.js:25 · dashboard/system.js:89 · telemetry-provenance.js:150 ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
-  -> 3 HITS. MUST REACH 1. Control: server.model_id fires 2/1/1.
+  -> 3 HITS. MUST REACH **0 LIVE BINDINGS**, NOT 1 ⛔ **"MUST REACH 1" RETRACTED — the catalogue row is a ban now, so a reviewer who measures 0 and re-adds a row to reach 1 RE-INTRODUCES THE P1. Tombstone `//` comments are EXPECTED and must stay; strip comments before matching.** Control: server.model_id fires 2/1/1.
 ```
 
 > **Nine of ten is not a ship signal, and it never was.** The gate exists to be
