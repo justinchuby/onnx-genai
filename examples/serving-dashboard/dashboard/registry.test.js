@@ -15,7 +15,12 @@ import { PANELS, panelById, panelsForMode } from './index.js';
 
 describe('panel registry', () => {
   it('registers every panel module with a complete meta block', () => {
-    assert.equal(PANELS.length, 6);
+    // Five since the prefix-cache panel was cut: a controlled A/B at n=20
+    // found shared-prefix requests 7.0% SLOWER than requests sharing nothing,
+    // so prefix reuse is absent by measurement rather than merely unobserved.
+    // Pinned deliberately -- adding or removing a panel should require saying
+    // so here, because that is a decision about what the demo claims.
+    assert.equal(PANELS.length, 5);
     for (const panel of PANELS) {
       assert.equal(typeof panel.module.mount, 'function', `${panel.id} has no mount()`);
       assert.equal(panel.id, panel.module.meta.id, `${panel.id} id disagrees with its meta`);
@@ -24,12 +29,34 @@ describe('panel registry', () => {
     }
   });
 
+  it('keeps the prefix-cache panel CUT, and not merely unregistered', async () => {
+    // Deleting the module is the ratchet; unregistering it is not. A module
+    // left on disk gets re-imported by the next person who greps for "prefix"
+    // and finds a working panel with a mount() -- which is how the counters
+    // would come back, and they are not merely unproven: at n=20, against a
+    // sensitivity floor where a working cache collapses TTFT by 90%,
+    // shared-prefix requests ran 7.0% SLOWER than requests sharing nothing.
+    const { existsSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    assert.equal(
+      existsSync(fileURLToPath(new URL('./prefix-cache.js', import.meta.url))),
+      false,
+      'prefix-cache.js is back on disk. The panel was cut by ruling; re-adding it ' +
+        'needs a new ruling, not a merge.',
+    );
+    assert.equal(
+      PANELS.some((panel) => panel.id === 'prefix-cache'),
+      false,
+      'a prefix-cache panel is registered again',
+    );
+  });
+
   it('gives every panel a unique id', () => {
     const ids = PANELS.map((panel) => panel.id);
     assert.equal(new Set(ids).size, ids.length, `duplicate panel id in ${ids.join(', ')}`);
   });
 
-  it('KEEPS the KV and prefix panels on the batching server', () => {
+  it('KEEPS the KV panel on the batching server', () => {
     // This test previously asserted the opposite, on the reasoning that
     // "showing them with em-dashes would promise data that is not coming".
     // That reasoning is from a four-state world, and it is exactly the
@@ -37,9 +64,9 @@ describe('panel registry', () => {
     // promises a value, `not-applicable` explicitly does not — it states an
     // architectural fact and points at where the number IS real.
     //
-    // These panels are how a visitor learns the demo's central claim, that
+    // This panel is how a visitor learns the demo's central claim, that
     // continuous batching and the paged KV cache are mutually exclusive
-    // execution paths. Hiding them replaces that lesson with SILENCE, and
+    // execution paths. Hiding it replaces that lesson with SILENCE, and
     // silence reads as a smaller dashboard rather than as something withheld.
     // kv-memory also ADAPTS rather than disappears (decode-row occupancy here,
     // a paged block table on the other profile), so hiding it discards a panel
@@ -49,7 +76,6 @@ describe('panel registry', () => {
       'throughput',
       'scheduling',
       'kv-memory',
-      'prefix-cache',
       'requests',
       'system',
     ]);
@@ -57,10 +83,10 @@ describe('panel registry', () => {
 
   it('derives modes from each panel\'s own meta.requires, with no second table', () => {
     // The bug this closes: `modes` was declared by hand in the registry,
-    // separately from `meta.requires`, and the two drifted. kv-memory and
-    // prefix-cache both declared `requires: null` ("I ship everywhere") while
-    // the registry gated them to ['paged'] — and the registry won, because it
-    // is what panelsForMode filters on.
+    // separately from `meta.requires`, and the two drifted. kv-memory
+    // declared `requires: null` ("I ship everywhere") while the registry gated
+    // it to ['paged'] — and the registry won, because it is what
+    // panelsForMode filters on.
     //
     // Both suites stayed green the whole time, because each mechanism was
     // only ever tested against itself. A reconciling test would have caught
@@ -80,9 +106,6 @@ describe('panel registry', () => {
       // Adapts rather than disappears — decode-row occupancy vs a paged block
       // table. Same component, different noun.
       'kv-memory': ['batching', 'paged'],
-      // Ships unconditionally. Hiding it where the story is weak is the one
-      // genuinely dishonest move available here.
-      'prefix-cache': ['batching', 'paged'],
       requests: ['batching', 'paged'],
       system: ['batching', 'paged'],
     };
@@ -110,14 +133,25 @@ describe('panel registry', () => {
     const { PANELS: registered } = await import('./index.js');
     assert.ok(registered.length > 0);
 
-    const { default: mountFn, meta } = await import('./prefix-cache.js');
-    assert.equal(typeof mountFn, 'function');
-    assert.equal(meta.requires, null, 'prefix-cache must remain universal');
+    // Exercised directly, because the previous version of this test only
+    // imported a panel and asserted its `requires` was null -- it never once
+    // reached the branch its name describes, so it would have passed with the
+    // throw deleted.
+    const { modesFor } = await import('./index.js');
+    assert.throws(
+      () => modesFor({ meta: { id: 'fake', requires: 'paged-kv-v2' } }),
+      /unknown meta\.requires/,
+      'an unrecognised requirement must stop the build, not be guessed at',
+    );
+    assert.deepEqual([...modesFor({ meta: { id: 'fake', requires: null } })], [
+      'batching',
+      'paged',
+    ]);
   });
 
   it('hides the scheduling panel on the paged server', () => {
     const ids = panelsForMode('paged').map((panel) => panel.id);
-    assert.deepEqual(ids, ['throughput', 'kv-memory', 'prefix-cache', 'requests', 'system']);
+    assert.deepEqual(ids, ['throughput', 'kv-memory', 'requests', 'system']);
   });
 
   it('preserves DOM order when filtering', () => {
@@ -196,7 +230,6 @@ describe('mountDashboard', () => {
         'throughput',
         'scheduling',
         'kv-memory',
-        'prefix-cache',
         'requests',
         'system',
       ]);

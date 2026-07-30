@@ -28,7 +28,6 @@ import { createRovingGroup, setPanelView } from './panel-kit.js';
 import { adaptStore } from './store-adapter.js';
 
 import * as kvMemory from './kv-memory.js';
-import * as prefixCache from './prefix-cache.js';
 import * as requests from './requests.js';
 import * as scheduling from './scheduling.js';
 import * as system from './system.js';
@@ -60,9 +59,9 @@ const BOTH = Object.freeze(['batching', 'paged']);
  *
  * This used to be declared here by hand, separately from each panel's
  * `meta.requires`, and the two drifted -- silently, and in the worst possible
- * direction. `kv-memory` and `prefix-cache` both declare `requires: null`
- * ("I ship everywhere"), and this table gated both to `['paged']`. The table
- * won, because it is what `panelsForMode` filters on.
+ * direction. `kv-memory` declared `requires: null` ("I ship everywhere") and
+ * this table gated it to `['paged']`. The table won, because it is what
+ * `panelsForMode` filters on.
  *
  * The consequence was that on the batching server -- the profile the default
  * model runs -- neither panel mounted AT ALL. A visitor never saw the prefix
@@ -81,7 +80,7 @@ const BOTH = Object.freeze(['batching', 'paged']);
  * @param {PanelModule} module
  * @returns {ReadonlyArray<ServerMode>}
  */
-function modesFor(module) {
+export function modesFor(module) {
   switch (module.meta.requires) {
     case 'continuous-batch':
       return Object.freeze(['batching']);
@@ -91,9 +90,7 @@ function modesFor(module) {
     case undefined:
       // Universal. Note this is the answer for every panel that ADAPTS rather
       // than disappears -- kv-memory draws a paged block table on one profile
-      // and decode-row occupancy on the other, and prefix-cache ships
-      // unconditionally because hiding it where the story is weak is the one
-      // genuinely dishonest move available here.
+      // and decode-row occupancy on the other.
       return BOTH;
     default:
       throw new Error(
@@ -113,7 +110,7 @@ function modesFor(module) {
  * @type {ReadonlyArray<RegisteredPanel>}
  */
 export const PANELS = Object.freeze(
-  [throughput, scheduling, kvMemory, prefixCache, requests, system].map((module) =>
+  [throughput, scheduling, kvMemory, requests, system].map((module) =>
     Object.freeze({ id: module.meta.id, module, modes: modesFor(module) }),
   ),
 );
@@ -220,4 +217,4 @@ export function mountDashboard({ telemetryStore, resolveRoot, mode, requests }) 
   };
 }
 
-export { kvMemory, prefixCache, requests, scheduling, system, throughput };
+export { kvMemory, requests, scheduling, system, throughput };

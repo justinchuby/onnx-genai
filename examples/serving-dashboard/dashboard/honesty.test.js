@@ -276,16 +276,6 @@ describe('panels declare their capability requirement', () => {
     assert.equal(meta.requires, null);
   });
 
-  it('keeps the prefix panel universal, because it ships showing whatever is true', async () => {
-    const { meta } = await import('./prefix-cache.js');
-    assert.equal(
-      meta.requires,
-      null,
-      'The prefix panel ships unconditionally, including a stark 0%. Gating it ' +
-        'behind a capability would hide the panel exactly where its answer is ' +
-        'least flattering, which is the one genuinely dishonest move here.',
-    );
-  });
 });
 
 describe('honesty lint — the measured state is never compared as a literal', () => {

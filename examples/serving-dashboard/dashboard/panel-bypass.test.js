@@ -129,9 +129,9 @@ describe('panel-level not-applicable (§31/D89)', () => {
   });
 
   it('does nothing to a panel with no fields at all', () => {
-    // prefix-cache binds zero telemetry and kv-memory can render its own
-    // capability notice. Neither is bypassed -- both are already speaking for
-    // themselves, and overwriting that would delete the better message.
+    // kv-memory renders its own capability notice and requests its own empty
+    // state. Neither is bypassed -- both are already speaking for themselves,
+    // and overwriting that would delete the better message.
     const root = element('div', {
       children: [element('p', { className: 'own-message', text: 'KV block introspection is off' })],
     });
@@ -253,8 +253,8 @@ describe('panel-level not-applicable (§31/D89)', () => {
       });
     }
 
-    it('leaves the panels that speak for themselves alone', async () => {
-      for (const name of ['prefix-cache', 'requests']) {
+    it('leaves a panel that renders its own empty state alone', async () => {
+      for (const name of ['requests']) {
         const panel = await import(`./${name}.js`);
         const root = element('div', {});
         const handle = panel.mount(root, bypassedStore());

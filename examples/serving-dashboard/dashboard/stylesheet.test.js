@@ -40,16 +40,32 @@ const PANEL_FILES = [
   'throughput.js',
   'scheduling.js',
   'kv-memory.js',
-  'prefix-cache.js',
   'requests.js',
   'system.js',
 ];
+
+/**
+ * Look a panel up by its own `meta.id` rather than by position.
+ *
+ * This read `panels[4]` until the prefix-cache panel was cut, at which point
+ * index 4 silently became a different panel and the assertion failed with
+ * "expected a rendered streaming row" -- a message pointing at the requests
+ * panel, which was not the thing that changed. Positional lookup into a list
+ * that panels are added to and removed from is the same defect as the `modes`
+ * table: a second place that has to be updated in step, with nothing to say so.
+ *
+ * @param {string} id
+ */
+function panelById(id) {
+  const found = panels.find((panel) => panel.meta?.id === id);
+  assert.ok(found, `no panel module with meta.id "${id}" -- was it renamed or removed?`);
+  return found;
+}
 
 const panels = [
   await import('./throughput.js'),
   await import('./scheduling.js'),
   await import('./kv-memory.js'),
-  await import('./prefix-cache.js'),
   await import('./requests.js'),
   await import('./system.js'),
 ];
@@ -346,7 +362,7 @@ describe('stylesheet contract', () => {
     // markup. Checking the rendered text is the honest version of this test:
     // asserting on CSS alone would pass even if the glyphs were removed.
     const root = document.createElement('div');
-    const handle = panels[4].mount(root, fullStore());
+    const handle = panelById('requests').mount(root, fullStore());
     flushAnimationFrames();
     for (const state of ['streaming', 'done', 'error', 'cancelled', 'sent']) {
       const cell = root.findByClass(`request-state--${state}`);

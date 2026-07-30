@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 //
-// Tests for the throughput, KV memory, prefix cache, requests and system panels.
+// Tests for the throughput, KV memory, requests and system panels.
 //
 // One file rather than five because the assertions worth writing are the same
 // shape in each: does this panel refuse to render a number it was not given,
@@ -21,7 +21,6 @@ after(() => uninstallDom());
 
 const throughput = await import('./throughput.js');
 const kvMemory = await import('./kv-memory.js');
-const prefixCache = await import('./prefix-cache.js');
 const requests = await import('./requests.js');
 const system = await import('./system.js');
 
@@ -235,100 +234,6 @@ describe('kv-memory panel', () => {
   });
 });
 
-describe('prefix-cache panel — the finding, not a metric', () => {
-  // This panel binds NO telemetry. The counters it used to read were ruled
-  // unshippable after a controlled A/B proved prefix reuse absent on both
-  // execution paths while the engine's hit counter reported ~95% regardless.
-  // These tests pin the two properties that matter: it reads nothing from the
-  // store, and it still says something true when the server is unreachable.
-
-  it('mounts and renders the finding without touching the store at all', () => {
-    // A store that THROWS on every access. If the panel reads any field, this
-    // test fails loudly rather than quietly succeeding against a stub that
-    // happens to return undefined.
-    const hostileStore = new Proxy(
-      {},
-      {
-        get(_target, prop) {
-          if (prop === 'subscribe') {
-            throw new Error('prefix-cache must not subscribe: it renders static content');
-          }
-          throw new Error(`prefix-cache must not read the store (attempted: ${String(prop)})`);
-        },
-      },
-    );
-
-    const { root, handle } = mountPanel(prefixCache, hostileStore);
-
-    assert.match(root.textContent, /not happening on either execution path/i);
-    handle.unmount();
-  });
-
-  it('renders no telemetry field element at all — there is no value to be wrong', () => {
-    const { root, handle } = mountPanel(prefixCache, {});
-
-    // The structural property, not a string match: a bound field always
-    // renders a `.value` node carrying a `data-state`. No such node means
-    // there is nothing on this panel that could render a fabricated number,
-    // in any state. Prose ABOUT the hit rate is fine and necessary; a rendered
-    // hit rate is what was ruled out.
-    assert.equal(root.findByClass('value'), null, 'panel must render no telemetry field');
-    assert.doesNotMatch(root.textContent, /\d+(\.\d+)?\s*%\s*hit/i);
-    handle.unmount();
-  });
-
-  it('shows the control arm, because the control is what makes it a finding', () => {
-    const { root, handle } = mountPanel(prefixCache, {});
-
-    // Without the control, "1341 ms" is just a number. The control is the
-    // evidence, so it must be on screen and not buried in a hover.
-    assert.match(root.textContent, /1341 ms/);
-    assert.match(root.textContent, /1254 ms/);
-    assert.match(root.textContent, /differing from token 0/i);
-    handle.unmount();
-  });
-
-  it('states the sensitivity control, so absence reads as PROVEN rather than merely unobserved', () => {
-    const { root, handle } = mountPanel(prefixCache, {});
-
-    assert.match(root.textContent, /90%|90 percent/i);
-    handle.unmount();
-  });
-
-  it('labels the evidence as recorded rather than live, so it cannot read as stale telemetry', () => {
-    const { root, handle } = mountPanel(prefixCache, {});
-
-    // A fixed number with no age, sitting on a live dashboard, otherwise reads
-    // as a metric that stopped updating.
-    assert.match(root.textContent, /not live telemetry|recorded once, not polled/i);
-    handle.unmount();
-  });
-
-  it('cites the engine line that makes the counter false', () => {
-    const { root, handle } = mountPanel(prefixCache, {});
-
-    assert.match(root.textContent, /runtime\.rs:1017-1024/);
-    handle.unmount();
-  });
-
-  it('describe() carries the finding AND the control for a screen-reader user', () => {
-    const { handle } = mountPanel(prefixCache, {});
-
-    const described = handle.describe();
-    assert.match(described, /absent/i);
-    assert.match(described, /1341/);
-    assert.match(described, /1254/);
-    // The counter warning is the part most likely to be dropped from a summary,
-    // and it is the part that stops someone re-adding the panel later.
-    assert.match(described, /95 percent/i);
-    handle.unmount();
-  });
-
-  it('is mode-agnostic: the gap is real on BOTH paths, for two different reasons', () => {
-    assert.equal(prefixCache.meta.requires, null);
-  });
-});
-
 describe('requests panel', () => {
   const requestOf = (overrides) => ({
     id: 1,
@@ -530,7 +435,6 @@ describe('every panel — the contract the shell relies on', () => {
   const panels = [
     ['throughput', throughput],
     ['kv-memory', kvMemory],
-    ['prefix-cache', prefixCache],
     ['requests', requests],
     ['system', system],
   ];
