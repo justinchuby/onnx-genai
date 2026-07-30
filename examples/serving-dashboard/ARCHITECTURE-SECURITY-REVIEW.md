@@ -1,5 +1,18 @@
 # Architecture & Security Review — `feat/genai-demo-dashboard`
 
+MEASURED-AT: 1f8d3f94
+
+**What that header does and does not promise.** It is the SHA of my most recent
+measurement, so the freshness guard can prove this document describes a tree this
+branch actually passed through. It is **not** a claim that every section was
+measured there. This document spans six hours; §7 is hours older than §22. A
+single header on a long document is a **lower bound on staleness**, and the
+oldest section is the real exposure. Each section names its own SHA — those are
+the load-bearing dates. I adopt the header because being the holdout costs the
+crew more than the imprecision costs me, and I state the imprecision because a
+document-wide assertion that outruns its evidence is the defect this branch
+exists to catch.
+
 **Reviewer:** Critical Reviewer (agent `f6527cc9`) — architecture, security, structural
 design, performance, failure modes.
 **Not in scope for this document:** implementation correctness (Code Reviewer) and
@@ -1471,3 +1484,70 @@ measurement was rigorous, their intent was to relieve me of a debt, and the
 result was that a real open item was very nearly retired by agreement. Two
 parties agreeing that a limit is paid is not the same as the limit being paid.
 The Lead's rule applies verbatim: **name the path, never say "the suite".**
+
+---
+
+## §22 — @1cb42f0e's duplicate-key exposure: 2 of 4, and the other 2 are immune BY DESIGN
+
+Measured at `1f8d3f94`. @1cb42f0e shipped `dashboard/testing/object-keys.js` and
+named four unguarded literals — `NEVER_BIND`, `CARD_FIELDS`, `STATE_ALIASES`,
+`DECLARED_ROUTING_VIOLATIONS` — addressing me directly as the measurable answer
+to my *a shared helper is only as good as its adoption*. I took it because
+`NEVER_BIND` is the list holding P1 closed, and a silently dropped ban there is a
+disclosure.
+
+### The result, and it is better news than the ask
+
+    NEVER_BIND      Object.freeze([ …   ARRAY   -> IMMUNE, cannot silently overwrite
+    CARD_FIELDS     Object.freeze([ …   ARRAY   -> IMMUNE
+    PROVENANCE      Object.freeze({ …   OBJECT  -> exposed · 35 keys · duplicates 0
+    STATE_ALIASES   Object.freeze({ …   OBJECT  -> exposed ·  6 keys · duplicates 0
+
+    POSITIVE CONTROL on STATE_ALIASES: inject a duplicate of an existing key
+      clean    keys=6  duplicates 0
+      mutated  keys=7  duplicates REPORTED   ⬅ the helper fires
+
+**The two security-critical lists are structurally immune.** `NEVER_BIND` and
+`CARD_FIELDS` are arrays of frozen records, and an array has no key to overwrite.
+That is not luck — an array-of-records was the right shape for an ordered ban
+list with a `why` per row, and choosing it **removed the entire silent-overwrite
+class instead of guarding against it.** This is the single best structural
+decision I have reviewed on this branch: the defect cannot be reintroduced by a
+careless edit, because the container does not have the failure mode. Praise where
+it is due, and it belongs to whoever wrote `NEVER_BIND`, not to a guard.
+
+### The defect I found instead, and it is in the instrument
+
+`findLiteralOpener(src, 'NEVER_BIND')` **does not refuse.** It returns an opener,
+`declaredKeys` returns **7**, and `duplicatesAmong` returns **0** — which reads
+exactly like a clean audit of a seven-entry ban list. It is the property names of
+the *first record inside the array*: `endpoint`, `field`, `why`, …
+
+I caught it only because my positive control failed. I injected a duplicate
+`'server.model_path': true` into a copy of `NEVER_BIND` and the count stayed
+**7 → 7**. Under @732c7548's rule — *a mutation is evidence only if you proved it
+landed on the subject* — that mutation was void, so the zero was void, and **I
+was one broadcast away from publishing "the ban list holding P1 closed is
+duplicate-free" on evidence that had never touched the ban list.**
+
+The helper's own header says it throws rather than returning a clean answer when
+it loses sync. **It should throw on an array too.** An object-key auditor handed
+an array has not lost sync — it has been asked a question its subject cannot be
+asked, and answering is worse than failing, because the answer is a plausible
+zero. @1cb42f0e's own law, applied one level up:
+
+> A control is only as wide as the instrument it controls — it proves the
+> instrument is looking, never that it is looking everywhere.
+
+**And a control is only as valid as the KIND of subject it was taken on.** My
+`STATE_ALIASES` control transfers to `PROVENANCE` because both are
+`Object.freeze({`. It transfers to `NEVER_BIND` not at all. Stated so that my
+`PROVENANCE` zero is read with the right warrant.
+
+### Disposition
+
+Not a defect in the dashboard. Two of the four named call sites need no guard and
+should be recorded as immune rather than as unaudited — **an unguarded structure
+and an unguardable-because-immune structure render identically on a coverage
+list, and only one of them is a gap.** The remaining work is one `throw` in the
+helper.
