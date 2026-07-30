@@ -1746,3 +1746,53 @@ is worse than doing nothing.**
 other agents — three artefacts with the same filename, different inodes, different build times,
 one of them from a tree that lacks a fix this PR ships. I verified the launcher half at the pin
 and take responsibility only for that half, and for the prescription it corrects, which was mine.
+
+## The law is sound. The example the project lead used to illustrate it was false.
+
+One of the most-quoted findings of this session is real and belongs in this PR:
+
+> **Every instrument we built checks that what is *present* is *true*. Not one checked
+> that what is *true* is *present*.**
+
+The illustration attached to it was a count of `model_path` in `demo-spec.md`, published as
+**0** and offered as evidence that a fact had gone missing from the spec. **That zero is
+wrong.** Measured, twice, at two revisions:
+
+```
+grep -cF 'model_path' examples/serving-dashboard/demo-spec.md
+  @ HEAD 34ea441d ....... 20
+  @ the review point 37d0d72e ... 20
+  [POS CTL] 'AC' in the same file @ HEAD ... 767
+  [NEG CTL] ................................ 0
+```
+
+**The count is 20 at both revisions, which bounds the error more tightly than the author's own
+diagnosis did.** They attributed the zero to reading a stale tree; that is consistent, but it
+requires a tree older than 05:48, because the number was already 20 at the review point this
+document is measured against. The mechanism is right and the tree was older than the account
+suggested.
+
+**This correction is published at the author's explicit instruction.** They found it, called it,
+and asked for it to be recorded here rather than quietly dropped — which is the only reason
+anyone knows.
+
+### Why an overstated confession is worse than an overstated claim
+
+The zero appeared *inside an admission of error about stale trees*. The confession was the thing
+that was false, and it was believed instantly, by everyone, including the person who wrote it.
+
+> **A false claim in your own favour has adversaries — everyone who loses by it. A false claim
+> against yourself has none. It is read as candour, candour is read as evidence of care, and
+> checking it looks like refusing someone's honesty. Nobody audits humility.**
+
+This session produced six attribution events aimed at this document's author alone — five of them
+credit, one a request to withdraw a correct measurement. **All six were wrong, and all six were
+socially cheaper to accept than to check.** The generous reading, the self-critical admission and
+the graceful acceptance of a correction share one property: they are the claims that arrive
+pre-armoured against scrutiny.
+
+**What follows from it, concretely, and it is the reason this section exists rather than a
+footnote:** a retraction, a confession and a self-assigned error rate are all *measurements*, and
+they get the same treatment as any other measurement in this PR — a positive control, a stated
+instrument, and a revision. Several in this document have been re-measured for exactly that
+reason. **The ones that survived are cited. The one that did not is the paragraph you just read.**
