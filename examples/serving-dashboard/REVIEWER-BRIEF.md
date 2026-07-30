@@ -1760,3 +1760,54 @@ And the general form, which is this session's most under-priced hazard:
 *Corollary, and it is why this section sits in this file rather than in a
 broadcast: a retraction that lives only in chat has the same lifespan as the
 channel. This one is in the artefact, and the artefact is what a reviewer opens.*
+
+### 8.16 The suite is red, and this brief published it as green
+
+**Run this before you believe anything in §7, and run it exactly this way:**
+
+```
+node --test *.test.js dashboard/*.test.js ui/*.test.js > /tmp/raw.txt 2>&1 ; echo $?
+```
+
+**No pipe.** At the sha this section was written the answer is **`1`** --
+`tests 621 · pass 613 · fail 8 · skipped 0`.
+
+This document previously recorded the suite as **608/608 green**, and that number
+was obtained through `| tail -18`. A pipeline returns the exit status of its *last*
+command, so that run reported the exit status of `tail`, which succeeds at printing
+anything at all.
+
+**Two separate things follow, and conflating them would discard good work:**
+
+> **The count survives; the completion does not.** `pass 608` is text the runner
+> emitted, and it is still evidence of what the runner printed. What the pipe
+> destroyed is the proof that the run *terminated* -- a suite that dies half-way
+> still prints a green-looking summary for the files it reached.
+
+**And the honest second half, which cuts against the alarm:** the pipe did **not**
+conceal these eight. They did not exist when 608 was measured. Seven of the eight
+live in test files committed **within five minutes** of this section, and the
+eighth in one committed ninety minutes earlier. All eight are committed and clean
+against HEAD -- none is a scratch edit. **They are red tests landing ahead of their
+fixes, which is the discipline this team asked for.** The failing names are the
+authorised work items almost verbatim: the missing classification text, the
+degraded debug endpoint, the poll-flood suppression, the wrong-server detection,
+the first-frame pending state, and two README perf claims.
+
+**None of that makes the suite green.**
+
+> **A red suite for a good reason is still a red suite.** The gate scores the
+> artefact, not the intention behind it. An item that reads *the suite passes*
+> cannot be satisfied by *the suite fails in ways we understand and endorse* --
+> because every red suite in history was understood and endorsed by the person
+> looking at it.
+
+So gate item 2 is **RED**, and this document's own headline number was wrong in the
+direction that ships. The lesson is not about `tail`:
+
+> **The plumbing of a command silently overrode its semantics, and the plumbing was
+> added for readability.** Nobody has ever thought of `| tail` as part of a
+> measurement -- it is the formatting. It replaced the verdict. That is the fourth
+> instance this session of a decorative-looking token changing what was measured,
+> alongside a narrowing glob, an inherited working directory, and a line break
+> hiding a string. **All four were silent and all four exited zero.**
