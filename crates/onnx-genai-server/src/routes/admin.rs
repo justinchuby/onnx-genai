@@ -146,15 +146,12 @@ pub(crate) async fn debug_kv(
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let snapshot = crate::metrics::snapshot();
-    let prefix_cache_hit_rate = if snapshot.prefix_cache_lookups == 0 {
-        0.0
-    } else {
-        snapshot.prefix_cache_hits as f64 / snapshot.prefix_cache_lookups as f64
-    };
+    let generation_prefix_reuse_rate =
+        crate::metrics::defined_ratio(snapshot.prefix_cache_hits, snapshot.prefix_cache_lookups);
     Ok(Json(DebugKvResponse {
-        prefix_cache_hits: snapshot.prefix_cache_hits,
-        prefix_cache_lookups: snapshot.prefix_cache_lookups,
-        prefix_cache_hit_rate,
+        generations_with_prefix_reuse: snapshot.prefix_cache_hits,
+        generations_completed: snapshot.prefix_cache_lookups,
+        generation_prefix_reuse_rate,
         active_batch_size: snapshot.current_batch_size,
         pending_queue_depth: snapshot.pending_requests,
         available_admission_slots: handle.engine.generation_capacity.available_permits(),

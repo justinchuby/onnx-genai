@@ -1365,7 +1365,8 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
     assert_eq!(cache.status(), StatusCode::OK);
     let cache: Value =
         serde_json::from_slice(&to_bytes(cache.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(cache["prefix_cache_hits"].is_u64());
+    assert!(cache["generations_with_prefix_reuse"].is_u64());
+    assert!(cache["generations_completed"].is_u64());
     assert!(cache["pending_queue_depth"].is_u64());
     assert!(cache["available_admission_slots"].is_u64());
 
@@ -1541,7 +1542,12 @@ async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
     assert!(body.contains("onnx_genai_sessions_active"));
     assert!(body.contains("onnx_genai_requests_waiting"));
     assert!(body.contains("onnx_genai_batch_size_current"));
-    assert!(body.contains("onnx_genai_prefix_cache_hit_rate"));
+    // The counters are unconditional; the derived rate is not. Asserting the
+    // rate here would couple this test to whether some earlier test in the
+    // process happened to complete a generation, because the registry is
+    // process-global -- it passes today only by that accident.
+    assert!(body.contains("onnx_genai_prefix_cache_hits_total"));
+    assert!(body.contains("onnx_genai_prefix_cache_lookups_total"));
     assert!(body.contains("onnx_genai_rejections_total"));
     assert!(body.contains("onnxgenai_vram_used_bytes"));
     assert!(body.contains("onnxgenai_vram_limit_bytes"));
@@ -3627,4 +3633,20 @@ fn batch_utilization_of_a_zero_capacity_is_zero_not_nan() {
     let value = crate::routes::admin::batch_utilization(3, 0);
     assert!(value.is_finite(), "got {value}");
     assert_eq!(value, 0.0);
+}
+
+/// `0/0` is not `0.0`. An undefined ratio must be omitted so downstream cannot
+/// confuse "never measured" with "measured, and it was the worst reading" --
+/// the two are indistinguishable once a real zero is a legitimate value.
+#[test]
+fn an_undefined_ratio_is_none_rather_than_zero() {
+    assert_eq!(crate::metrics::defined_ratio(0, 0), None);
+    assert_eq!(crate::metrics::defined_ratio(5, 0), None);
+}
+
+#[test]
+fn a_defined_ratio_is_computed_including_a_genuine_zero() {
+    assert_eq!(crate::metrics::defined_ratio(0, 4), Some(0.0));
+    assert_eq!(crate::metrics::defined_ratio(1, 4), Some(0.25));
+    assert_eq!(crate::metrics::defined_ratio(4, 4), Some(1.0));
 }

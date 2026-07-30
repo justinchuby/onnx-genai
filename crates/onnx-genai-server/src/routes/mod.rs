@@ -159,9 +159,23 @@ pub(crate) struct DebugSessionsResponse {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DebugKvResponse {
-    prefix_cache_hits: u64,
-    prefix_cache_lookups: u64,
-    prefix_cache_hit_rate: f64,
+    /// Completed generations that reused a cached prefix.
+    ///
+    /// Named for generations, not tokens or lookups, because that is what the
+    /// counter actually increments on: once per completed generation, when the
+    /// reused-prefix length was greater than zero. See ARCHITECTURE.md §5.13.
+    generations_with_prefix_reuse: u64,
+    /// Completed generations, the denominator of the reuse rate.
+    ///
+    /// This was `prefix_cache_lookups`, which was a real measurement of the
+    /// wrong quantity: it increments unconditionally on every completed
+    /// generation, including on models that never consult the prefix cache at
+    /// all, so it would read non-zero on a build with the cache deleted.
+    generations_completed: u64,
+    /// Fraction of completed generations that reused a prefix. Omitted entirely
+    /// when no generation has completed -- 0/0 is not a 0% reuse rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_prefix_reuse_rate: Option<f64>,
     active_batch_size: u64,
     pending_queue_depth: u64,
     available_admission_slots: usize,

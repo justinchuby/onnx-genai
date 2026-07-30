@@ -205,6 +205,19 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
     }
 }
 
+/// A ratio that only exists once its denominator does.
+///
+/// `0/0` is not `0.0`. Emitting zero for an undefined ratio reports "we have
+/// never measured this" as "we measured this and it was the worst possible
+/// value" -- and the two are indistinguishable downstream, because a genuine
+/// 0.0 is a legitimate reading. Callers omit the field when this returns `None`.
+pub(crate) fn defined_ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        return None;
+    }
+    Some(numerator as f64 / denominator as f64)
+}
+
 pub(crate) struct MetricsSnapshot {
     pub(crate) active_sessions: u64,
     pub(crate) pending_requests: u64,
@@ -296,14 +309,18 @@ pub(crate) fn encode_prometheus() -> String {
         "Generation requests checked for prefix-cache reuse.",
         lookups,
     );
-    output.push_str("# HELP onnx_genai_prefix_cache_hit_rate Prefix-cache hit ratio.\n");
-    output.push_str("# TYPE onnx_genai_prefix_cache_hit_rate gauge\n");
-    let rate = if lookups == 0 {
-        0.0
-    } else {
-        hits as f64 / lookups as f64
-    };
-    writeln!(output, "onnx_genai_prefix_cache_hit_rate {rate}").expect("String write");
+    // Emitted only when the ratio is defined. A gauge of 0/0 is not a 0% hit
+    // rate; publishing one would show a cache that has never been consulted as
+    // a cache that always misses, and would do it in a time series that looks
+    // identical to a genuinely cold cache under load.
+    if let Some(rate) = defined_ratio(hits, lookups) {
+        output.push_str(
+            "# HELP onnx_genai_prefix_cache_hit_rate \
+             Fraction of completed generations that reused a cached prefix.\n",
+        );
+        output.push_str("# TYPE onnx_genai_prefix_cache_hit_rate gauge\n");
+        writeln!(output, "onnx_genai_prefix_cache_hit_rate {rate}").expect("String write");
+    }
     counter(
         &mut output,
         "onnx_genai_rejections_total",
