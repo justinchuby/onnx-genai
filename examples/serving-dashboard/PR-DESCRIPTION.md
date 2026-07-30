@@ -192,6 +192,32 @@ because the machine is at 100% disk and creating a worktree currently fails
 part-way and silently, which is the exact condition that manufactures a
 plausible wrong number.
 
+### Where the variance lives
+
+We do not claim this suite is deterministic. We claim something more specific
+and more useful, because it tells a maintainer what to do rather than only what
+to fear.
+
+```
+SHARED CHECKOUT     non-reproducible results observed by three authors
+DETACHED WORKTREE   flakes observed by anyone, all session ................ 0
+```
+
+Every non-reproducible result this session occurred in a shared checkout where
+many processes commit and save concurrently. Two mechanisms were identified: a
+test that resolves `HEAD` twice can straddle another commit landing between the
+two reads, and a test that reads a file can catch it mid-save. **Score the gate
+only in a detached worktree at a pinned revision.**
+
+The honest limit: the detached-run denominator is small — a handful of runs
+across three authors, not the many dozens the shared-tree figure rests on. This
+says where the variance lives. It does not say variance is absent.
+
+One caveat that matters more at the end of a quiet period than at the start:
+when concurrent editing stops, the shared checkout starts returning green too.
+**That green means the writing stopped, not that the race was fixed** — and it
+arrives exactly when a reader is most inclined to believe it.
+
 ### Rust suite
 
 ```
