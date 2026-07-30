@@ -4024,3 +4024,46 @@ Both corrections in that message were verified against a pre-rename file. At HEA
 | D197 | A rule contradicting universal domain knowledge ships with its evidence, in the panel's `meta` | A bare prohibition invites repair by anyone competent; the file:line is what stops the helpful fix |
 | D198 | All four KV page fields are `not-applicable` on the batching profile, including `kv_pages_total` | A real denominator is not a licence to draw — it is the half that makes the fabrication persuasive |
 | D199 | Provenance is keyed by (field, capability profile), never by field name | The same field is a measurement on one server and structurally absent on the other |
+
+---
+
+## 63. ACCESSIBLE PARITY FOR THE HONESTY LAYER (D200–D203)
+
+### 63.1 ✅ D200 — THE CONTRACT LINE @bb2ee824 CAUGHT IS WRONG, AND WRONG TWICE
+
+They report that my *"value is null unless `state === 'ok'`"* is false, because **`stale` carries the last good value — that is the entire point of the state.** Correct, ratified: **`value` is non-null when `state` is `measured` OR `stale`.**
+
+> **D200 — and the line was carrying TWO errors, which is the interesting part: the literal was stale (`'ok'` → `'measured'`, landed `24d831a2`) AND the state list was incomplete.** The correction offered fixes one while its premise would have restored the other. **A line with two independent defects is not twice as likely to be caught — it is LESS likely, because whoever finds one reports it and stops looking.** Fixing a line is the moment to re-derive it, not to patch it.
+
+**On the `'ok'` premise:** verified with dates, because that is now the standing rule. `telemetry-field.js:129` reads `MEASURED: 'measured'` at HEAD. **The rename is `24d831a2` at 01:17 — authored by @bb2ee824 themselves. Their message describes `ab0a08ee` at 00:12, sixty-five minutes earlier.** Not a disagreement: **an agent's own uncommitted-then-committed work outran their own message.** Third stale premise of the session, and the second where the sender's own commit is the counter-evidence.
+
+### 63.2 🔴 D201 — A TEST CAN CERTIFY THE DATA EXISTS WHILE THE CONSUMER READS A DIFFERENT PATH
+
+Their AC28 report is **real, with a stale line.** Not `dashboard/index.js:140` (that is `panelById`) — the live site is **`dashboard/index.js:179`**:
+```js
+const roving = createRovingGroup(root, { label: panel.title });   // undefined
+```
+`registry.test.js:22` asserts `panel.module.meta.title` — **so the correct path is `panel.module.meta.title`, and `panel.title` is `undefined`. Every roving-group gets an empty accessible label.**
+
+> **D201 — AND THE TEST IS WHAT MAKES IT INVISIBLE. `registry.test.js:22` proves every panel HAS a title; `index.js:179` reads it from the wrong path. The suite is green, the data is present, and the label is empty.** A test that validates the SOURCE certifies nothing about the CONSUMER. **This is the exact shape of D191 one layer up — there I found CSS that was matched but never emitted; here is data that exists but is never reached.** Both are the gap between *a thing is correct* and *a thing is used*, and **no static check I own spans it.** Reported, not edited — @c8d9a40e's file.
+
+**Their `store-adapter` report is already fixed:** `:211` handles `not-applicable` and `unavailable` together. Verified at HEAD.
+
+### 63.3 🔴 D202 — EVERY HONESTY TREATMENT MUST HAVE AN ACCESSIBLE EQUIVALENT, AND THE GAUGE RULES APPLY IN AUDIO
+
+Everything §21/§31/§48 specify — em-dash, dotted vs double underline, grayscale separation, the on-screen caption — is **VISUAL**. A screen-reader user receives **none of it.** `panel-kit.js` is already right (`:290/:330/:353` produce *"not applicable here"*, *"too old to show"*, *"not measurable yet"*), and `kv-memory.js:229` already announces **"X percent, N of M blocks"** — **D180's name-both-terms rule, satisfied in audio before I ruled it.** Credit where due.
+
+> **D202 — THE ABSENCE STATES ARE THE PART THAT MUST NOT DEGRADE, BECAUSE A SIGHTED USER SEES A GLYPH THAT LOOKS ODD AND INVESTIGATES, WHILE A SCREEN-READER USER HEARS A NUMBER AND MOVES ON.** Absence is *conspicuous* visually and *silent* in audio: an unstyled `—` still reads as "dash", but a field that announces its value with no state word is **indistinguishable from a live measurement.** So the accessible name is not a translation of the visual treatment — **it is the only channel that carries the state at all, and it must lead with the state, never append it.**
+
+**TWO SITES WHERE THE GAUGE RULES LEAK, both in `kv-memory.js`:**
+1. **`:229` — `numericValueOf(x) ?? '?'` announces `"0.0 percent, ? of ? blocks"`.** Per D180 a percentage whose terms are unknown must not be announced **at all**; `'?'` is the audio equivalent of drawing a bar and inventing half of it. **If either term is `null`, the field is `unavailable` — not a percentage with a shrug.**
+2. **`:227-228` — `aria-valuemin: 0`, `aria-valuemax: 100` on a `progressbar`.** That is **D182 in audio, and worse than on screen:** a clamped bar at least looks pinned, but a screen reader flatly announces **"100 percent"** for a 240% oversubscription. **`role="progressbar"` is a dial by definition, so a ratio that can exceed 1 must not use it.**
+
+> **D203 — AN ARIA ATTRIBUTE IS A CLAIM WITH THE SAME PROVENANCE OBLIGATIONS AS A RENDERED NUMBER, AND IT IS AUDITED BY NOBODY.** We have spent the session on what panels *draw*. `aria-valuenow` is a machine-readable assertion of a measured quantity, **consumed by assistive tech that cannot see the dotted underline, the caption, or the badge that would have qualified it.** Every rule in §58 and §60 applies verbatim to the accessible name — **and this is the one surface where no reviewer, no screenshot and no test of mine has ever looked.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D200 | `value` is non-null for `measured` AND `stale` | Stale carrying the last good value is the point of the state; the line held two defects and one report closed the search |
+| D201 | A test validating the source certifies nothing about the consumer | `registry.test.js` proves the title exists while `index.js:179` reads the wrong path — green suite, empty label |
+| D202 | Absence states must lead the accessible name, never append it | Absence is conspicuous visually and silent in audio; a value announced with no state word reads as measured |
+| D203 | ARIA attributes carry the same provenance obligations as rendered numbers | `aria-valuenow` asserts a measurement to a consumer who cannot see any qualifier we drew |
