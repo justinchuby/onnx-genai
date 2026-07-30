@@ -1,46 +1,19 @@
-# Mariette — History
+# Mariette — History (compacted 2026-07-29)
 
-## 2026-07-12: Joined
-Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime (`../onnxruntime-mps`). Owns the heavy compute kernels: MatMulNBits (int4, the decode hot path — target llama.cpp Metal parity), GroupQueryAttention, softmax, RoPE, RMSNorm. Reference ExecuTorch (`backends/apple/mps`) + PyTorch (`aten/src/ATen/native/mps`). Correctness vs CPU reference first, then optimize with simdgroup matrix ops / threadgroup tiling. Tested via onnx-genai. Key prior context: onnx-genai's CPU recipe (accuracy_level=4 + quantized head) already beats LM Studio short-context; the Metal EP aims to beat everyone on Apple Silicon.
+**Role:** Metal/MPS kernel engineer for the Apple Metal EP, owning heavy kernels such as MatMulNBits, GQA, softmax, RoPE, and RMSNorm. Correctness against CPU reference comes first, then simdgroup/threadgroup optimization, using ExecuTorch/PyTorch MPS references and onnx-genai end-to-end tests.
 
-- 2026-07-14T19:05:00Z — Offline per-EP ONNX conformance harness and `docs/EP_CONFORMANCE.md` merged to origin/main in `1dfab0d`; process-bridge design recorded in decisions.
+## Durable lessons
+- Offline per-EP ONNX conformance harness and `docs/EP_CONFORMANCE.md` merged in `1dfab0d`; process-bridge design is recorded in decisions.
+- Vendored `cpuinfo` beneath its crate so cargo publish succeeds.
+- Mobius native block reviews require exact `BlockQuantizedMatMul` format/dimension/byte-preservation contracts, 4-bit/block-32 mixed-native scaffold, genai opset v1, and unchanged pure-Q8 behavior.
+- Attention, CUDA CSA, and MTP reviews needed rejection/fix cycles before approval; keep reviewer-lockout corrections canonical.
+- Omitted-optional dtype trap: reject CUDA standard-Attention optional past-KV claim regressions; Nabil's `8eb23f1` fix passed CUDA/session/CPU gates.
+- CUDA claim-gate hardening must avoid GLM over-rejection, handle omitted optionals, scope standard-domain checks, and preserve CPU/GLM/CUDA parity.
+- Perf campaign inbox decisions were consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+- Wave-3 SwiGLU fusion halved activation launches from 48 to 24/token, merged as `12e48b8`, and measured about 673→689 tok/s at 256 tokens with zero fallbacks.
+- WP-B2 engine runtime is the accepted presence/fallback/gating implementation feeding the completed epic.
 
-- 2026-07-15 — Vendored cpuinfo beneath its crate so cargo publish succeeds (merged `65cc851`).
+## Recent work (current wave, ~2026-07-28/29)
+- Latest live item is 2026-07-22: WP-B landed; Mariette's WP-B2 engine runtime remains the accepted implementation.
 
-## 2026-07-15T00:00:00Z — Cross-agent session update
-
-- Applied final CUDA DLPack review fixes and documented the honest CPU-executor boundary; merged in the GPU-DLPack wave.
-
-## 2026-07-16T15:39:27Z — Scribe session update
-
-- Extended Mobius PR #404 with GLM-5.2 IndexShare DSA and improved-MTP export; it remains open and rebased on merged #398.
-
-## 2026-07-16T18:11:48+0000 — Mobius full-IQ export review
-
-- 🟢 Cleared Pris's Mobius PR #406 update: all ten native block formats match the onnx-genai `BlockQuantizedMatMul` format, dimension, and byte-preservation contract.
-- PR #406 remains awaiting user action.
-
-## 2026-07-16T19-27-57+0000 — Scribe session update
-
-- 🟢 Cleared Pris's Mobius `797fff9` PR #406 fixes: mixed-native export uses a 4-bit/block-32 scaffold, native IQ bytes remain exact, serialized genai opset v1 is present, and pure-Q8 behavior remains unchanged (238 tests).
-
-- 2026-07-18: Attention review cycle completed: initial rejection corrected and final revision approved.
-
-- 2026-07-18: Completed CUDA CSA review chain (two rejections followed by final approval) and MTP review chain (rejection then approval).
-
-## 2026-07-18T04-55-00Z — Scribe session update
-
-- Reviewed the omitted-optional dtype contract batch: 🔴 rejected Wallace's first pass due to CUDA standard-Attention optional past-KV claim regression, then 🟢 approved Nabil's `8eb23f1` fix after CUDA/session/CPU gates passed.
-
-## 2026-07-18T06:30:00Z — CUDA claim-gate hardening review
-
-- 🟢 Approved Holden's `030faa1` after verifying no GLM over-rejection, correct omitted-optional handling, standard-domain scoping, and CPU/GLM/CUDA parity for audited ops.
-- Reported CUDA EP suite success: 238 passed, 0 failed.
-
-- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
-
-## 2026-07-21T11:15:00Z — Wave-3 SwiGLU fusion
-- Fused `silu(gate) * up` into one capture-safe CUDA kernel, halving activation launches from 48 to 24/token. Pris approved; `12e48b8` merged and measured about 673→689 tok/s at 256 tokens with zero fallbacks.
-
-### 2026-07-22T14:59:36+0000 — WP-B landed
-WP-B landed: Mariette's WP-B2 engine runtime remains the accepted presence/fallback/gating implementation feeding the completed epic.
+Full pre-compaction history in `history-archive.md`.
