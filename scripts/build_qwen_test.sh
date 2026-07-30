@@ -278,6 +278,18 @@ assert_derives_io() {
   TESTS_RUN=$((TESTS_RUN + 1))
   local name="$1" model_dir="$2" truth="$3"
   local derived
+  # A missing committed input and a wrong generator are opposite diagnoses that
+  # otherwise land as the same opaque traceback: one means "the ground truth is
+  # gone", the other means "the code under test is broken". Name which input
+  # vanished, or the reader debugs the generator while the fixture is the fault.
+  if [ ! -d "$model_dir" ]; then
+    fail "$name" "model dir is absent, so nothing was compared: $model_dir"
+    return
+  fi
+  if [ ! -f "$truth" ]; then
+    fail "$name" "ground-truth metadata is absent, so nothing was compared: $truth"
+    return
+  fi
   if ! derived="$("$GENERATOR_PYTHON" "$GENERATOR" "$model_dir" --check 2>&1)"; then
     fail "$name" "generator failed: $derived"
     return
@@ -293,6 +305,17 @@ sys.exit(0 if derived == truth else 1)
     fail "$name" "derived io block does not match $truth"
   fi
 }
+
+# These two cover the precondition branches above. They deliberately sit OUTSIDE
+# the GENERATOR_PYTHON guard: the checks run before the generator is invoked, so
+# a fresh clone with no onnx/yaml installed still proves the diagnostics work.
+assert_contains "absent model dir is reported as a missing input, not a generator bug" \
+  "$( (assert_derives_io "probe" "$ROOT/no-such-model-dir" "$ROOT/no-such-truth.yaml") 2>&1 )" \
+  "model dir is absent"
+
+assert_contains "absent ground truth is named, and distinguished from a mismatch" \
+  "$( (assert_derives_io "probe" "$ROOT/scripts" "$ROOT/no-such-truth.yaml") 2>&1 )" \
+  "ground-truth metadata is absent"
 
 if [ -n "$GENERATOR_PYTHON" ] &&
   "$GENERATOR_PYTHON" -c 'import onnx, yaml' >/dev/null 2>&1; then
