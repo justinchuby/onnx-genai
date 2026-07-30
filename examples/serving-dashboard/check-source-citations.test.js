@@ -902,6 +902,12 @@ const DECLARED_UNCOVERED = [
   'IMPLEMENTATION-REVIEW.md',
   'READABILITY-REVIEW.md',
   'REVIEWER-BRIEF.md',
+  // Added 07:39 by another lane as a retraction artifact and still live. It
+  // carries only 3 citation tokens today, so DECLARING it costs almost no
+  // coverage -- but ADOPTING a document somebody else is actively writing would
+  // redden this branch on their in-flight edits, which is how a guard gets
+  // deleted. PROMOTE IT to OWNED_DOCS once its owner stops appending.
+  'REVIEW-POINT.md',
   'browser-render-verification.md',
   'demo-spec.md',
   'design/demo-ux.md',

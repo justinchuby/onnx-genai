@@ -316,8 +316,14 @@ visible text, on BOTH origins.**
 draft of this section cited a shared-prefix slowdown percentage and my own
 Scenario B TTFT delta. Both are struck. The slowdown figure was **withdrawn by
 its author** — an interleaved re-run came back with the **opposite sign** — and
-this machine's ambient noise floor is **9.8% on a byte-identical binary**, which
-exceeds either effect. I took my own TTFT figure at loadavg 30.40 while
+this machine's noise floor exceeds either effect. **That floor is not the 9.8 %
+an earlier draft of this line carried.** That figure was retracted as evidence
+by its own author (`perf-baseline.md` §6f): the run window overlapped two
+CPU-heavy ONNX exports, so the swing had a *cause* and was never ambient. The
+clean replacement is roughly **five times larger** — a 95 % CI on the paired
+delta of **−35.28 % … +34.73 %**, per-arm CV **~28.9 %**. **Correcting it makes
+this section's verdict stronger, not weaker:** 7 % and 17 % are not near the
+floor, they are deep inside it. I took my own TTFT figure at loadavg 30.40 while
 refusing to publish timings elsewhere in this same report. *A number I would not
 accept from someone else does not become admissible because I measured it.*
 

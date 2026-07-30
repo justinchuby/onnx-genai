@@ -1021,32 +1021,34 @@ test('no document attributes a hit RATE to the twelve-request block', () => {
 
   const offenders = [];
   let inspected = 0;
-  // ONE KNOWN SITE, EXEMPTED BY ITS EXACT WORDING RATHER THAN BY FILENAME, so
-  // that any OTHER rate appearing in that file still reddens and so that this
-  // exemption stops matching the moment the line is fixed. A file-level
-  // exemption would have hidden the next one too.
+  // HISTORY, KEPT BECAUSE THE DEFECT CLASS IS THE POINT AND THE EXEMPTION IS NOW GONE:
   //
-  // browser-render-verification.md:256 is @fc8b5d97's QA evidence document and
-  // is not mine to edit under the freeze. I have reported it with its
-  // provenance, which is the uncomfortable part and the reason it is only
-  // exempt rather than forgiven:
+  //   This block used to exempt one paragraph of @fc8b5d97's QA evidence
+  //   document by its exact wording. THAT SENTENCE WAS VERBATIM THE REMEDIATION
+  //   STRING THIS VERY FILE USED TO PRINT. A reader who tripped my check was
+  //   handed "twelve hits and a 0.9375 rate" as the CORRECT replacement text and
+  //   pasted it faithfully. The guard did not merely fail to catch the defect --
+  //   IT AUTHORED IT, and in the one register nobody proofreads, because
+  //   remediation text is read only by someone who has already been told they
+  //   are wrong.
   //
-  //   THAT SENTENCE IS VERBATIM THE REMEDIATION STRING THIS VERY FILE USED TO
-  //   PRINT. A reader who tripped my check was handed "twelve hits and a
-  //   0.9375 rate" as the CORRECT replacement text and pasted it faithfully.
-  //   The guard did not merely fail to catch the defect -- IT AUTHORED IT, and
-  //   in the one register nobody proofreads, because remediation text is read
-  //   only by someone who has already been told they are wrong.
+  // The owner fixed their line at 603d2b68 ("quote the +12 delta, not a
+  // cumulative-counter rate"), so the exemption was removed here. MEASURED
+  // BEFORE DELETING: the exempted wording has ZERO occurrences in that document
+  // at HEAD.
   //
-  // Both of this file's remediation strings now quote the delta. DELETE THIS
-  // EXEMPTION once :256 does too.
-  const KNOWN = 'produced twelve hits and a 0.9375 rate';
+  // ⛔ AND THE RESIDUAL DEFECT WAS MINE, NOT THEIRS. The exemption was a bare
+  // `continue` with NO staleness assertion, while this file's DEFERRED block
+  // insists an exemption that cannot expire is a suppression. So it would have
+  // sat here silently exempting a paragraph that no longer existed, for as long
+  // as the file lived, and nothing would ever have gone red to say so. An
+  // exemption whose removal condition lives only in a COMMENT is not expiring --
+  // it is waiting for someone to happen to read it.
   for (const doc of docs) {
     for (const para of shipped(doc).split(/\n\s*\n/)) {
       if (!BLOCK.test(para)) continue;
       inspected += 1;
       if (WITHDRAWN.test(para)) continue;
-      if (doc === 'browser-render-verification.md' && para.includes(KNOWN)) continue;
       const hit = para.match(RATE);
       if (hit) {
         offenders.push(`${doc}: "${hit[0]}" in — ${para.trim().slice(0, 160).replace(/\s+/g, ' ')}`);
@@ -1267,15 +1269,31 @@ test('continuous batching still accepts exactly the two decode paths the README 
     'the static-cache accepting arm is gone from `continuous_batch_manager`. ' +
       'README: "`ModelDecodePath::StaticCache { .. }` -- batches."',
   );
+  // ORDER-INDEPENDENT BY CONSTRUCTION. An earlier form of this pattern required
+  // `shared_buffer: true` to be the FIRST field after the brace. Rust does not
+  // care about field order in a match pattern and rustfmt may insert a comment,
+  // so a purely cosmetic edit made this assertion fail while the arm was fully
+  // present -- and the failure message then told the author, with total
+  // confidence, that the capability had been removed. MUTATION-PROVEN over six
+  // shapes: as-shipped, reordered, comment-inserted and single-line all match;
+  // a genuine deletion does not, and neither does an arm that offers only
+  // `shared_buffer: false`, which is the anti-vacuity arm proving this pattern
+  // did not simply become permissive.
   assert.ok(
-    /ModelDecodePath::PastPresent\s*\{\s*\n?\s*shared_buffer:\s*true/.test(body),
-    'the SHARED-BUFFER accepting arm is gone from `continuous_batch_manager`. ' +
-      'This is the arm that makes the README say a static cache is SUFFICIENT ' +
-      'BUT NOT NECESSARY. With it removed, "does the model declare ' +
-      'static_cache?" becomes the correct predicate after all, and the README ' +
-      'paragraph -- which exists specifically to refute that predicate -- is ' +
-      'now itself the error. Replacement: state that static cache is the sole ' +
-      'supported continuous-batch decode path.',
+    /ModelDecodePath::PastPresent\s*\{[^}]*shared_buffer:\s*true/.test(body),
+    'the SHARED-BUFFER accepting arm no longer MATCHES in ' +
+      '`continuous_batch_manager`. This is the arm that makes the README say a ' +
+      'static cache is SUFFICIENT BUT NOT NECESSARY.\n\n' +
+      'FIRST establish WHICH of these happened -- this check cannot tell them ' +
+      'apart and must not be read as if it could:\n' +
+      '  (a) the arm was genuinely removed, or\n' +
+      '  (b) the arm is still there and only its FORMATTING changed.\n\n' +
+      'If (b), fix this pattern and change NO prose. If (a), the README ' +
+      'paragraph that refutes the static-cache predicate has to be re-derived ' +
+      'from `batched.rs` -- state the accepting arms this function actually ' +
+      'has, and name them. Deliberately NOT supplying a replacement sentence ' +
+      'here: a sentence pasted from a failing check asserts a capability that ' +
+      'nobody re-measured, and this message cannot see which case it is in.',
   );
 
   // And the refusal. The README quotes this string verbatim inside a fenced
