@@ -47,7 +47,20 @@ export function mountModelCard(rootElement, telemetryStore) {
     term.textContent = label;
 
     const value = document.createElement('dd');
-    value.className = 'model-card__value';
+    // `value` FIRST, and it is load-bearing, not cosmetic. shell.css's no-state
+    // backstop -- the rule that paints an absent or unrecognised `data-state`
+    // as OBVIOUSLY WRONG -- is scoped to `.value` on purpose, because
+    // `.connection-indicator` carries a different vocabulary on the same
+    // attribute. The five POSITIVE state rules are unscoped `[data-state='x']`,
+    // so they already reached this element and every VALID state rendered
+    // correctly here. Only the backstop did not reach it, so the single case
+    // that fell through was the one nobody looks at: no state, or a typo.
+    // Measured in a browser before this class was added -- absent, unknown and
+    // `measured` computed byte-identically on this element (same colour, no
+    // underline, no chip) while the same three differed correctly on `.value`.
+    // Joining the governed population is better than widening the selector:
+    // the next BEM class gets the guarantee for free instead of re-earning it.
+    value.className = 'value model-card__value';
     value.dataset.field = key;
     value.textContent = '···';
 
@@ -87,6 +100,17 @@ export function mountModelCard(rootElement, telemetryStore) {
 function renderCardField(element, field, format) {
   const rendered = format ? formatField(field, { format }) : formatField(field);
   element.textContent = rendered.text;
+  // WRITTEN RAW, DELIBERATELY, AND THIS DECLINES A STANDING REVIEW REQUEST.
+  // R9/F14 both ask that this route through `renderStateOf` like every other
+  // `data-state` write. Normalising HERE would defeat the guarantee it is meant
+  // to provide: `renderStateOf` maps an unrecognised word to `unavailable`, so
+  // a typo'd or renamed state would be laundered into a legitimate, ruled word
+  // and render as an ordinary em-dash -- indistinguishable from a value that is
+  // honestly absent, and invisible to the shell.css backstop, which can only
+  // fire on a word it does not recognise. Passing the state through UNCHANGED
+  // is what lets the CSS see that something is wrong and say so out loud.
+  // The normaliser is the right tool where a state must be CONSUMED; this is a
+  // pure hand-off to the stylesheet, which does its own deny-by-default.
   element.dataset.state = field.state;
 
   element.title = rendered.title;
