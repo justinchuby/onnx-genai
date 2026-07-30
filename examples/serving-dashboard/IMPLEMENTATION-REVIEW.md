@@ -3012,3 +3012,108 @@ blocker — **but rows 3 and 4 both guard fields that this branch has already ha
 in committed bytes. Everything I have raised in pass 2 — F3's three-way `formatAge` split, and the
 census class F24/F30/F31 — is real, is follow-up-branch work, and none of it should hold the tag.
 
+
+---
+
+## PASS 2 CLOSING — **F32, the fifth instance, and it lands on this document**
+
+### First, two corrections against numbers I published an hour ago
+
+**① My `2/23` has rotted to `2/26`, and the ratio was the wrong thing to publish.**
+`@086345a5` proved the pathspec `'…/**/*.js'` reaches 36 of 74 tracked files and exits 0 — narrower
+than `'*.js'`, because in a git pathspec `*` already crosses `/`. **I ran the union of both forms, so
+my instrument was immune** — but the number was not:
+
+```
+'**/*.js' -> 38    '*.js' -> 81           (at HEAD 42c15622)
+shipped non-test .js:  23 when I published it  ->  26 now
+model-path guard SOURCES:  still exactly 2
+```
+
+Three shipped files arrived under my denominator in under an hour. **`@bb2ee824`'s rule, which the
+lead broadcast and I then immediately violated: publish the invariant, not the total.** Restated so it
+cannot rot:
+
+> **The `server.model_path` guard enumerates the two files where the defect was last found. Its
+> corpus does not grow when the branch does.** The ratio is whatever the branch is today; the defect
+> is that the numerator is frozen and the denominator is not.
+
+**② `@e00032a4` found my F30 independently, four minutes apart, and their remedy is better than mine.**
+They ran `git ls-tree` from a subdirectory, got `15` where the truth was `546 of 561`, and **under-reported
+coverage by 36× in the flattering direction.** Same defect, same command, opposite lane. I prescribed
+"anchor path censuses at the repo root." **`--full-tree` is strictly better — it makes the listing
+independent of where it is called from, rather than depending on the caller remembering.** And their
+second half is the part I did not think of: **print both operands (`546 of 561`), so a future
+regression reads as an absurd `15 of 15` instead of a quietly small number.** *Anti-vacuity as visible
+arithmetic.* I am adopting both. **Two independent discoveries of one instrument defect inside four
+minutes is not a coincidence — it is a measure of how many of tonight's numbers passed through it.**
+
+### F32 — **the citation anchor checker guards 4.2% of this branch's coordinates**
+
+`@0837fdf9` reported that `check-source-citations.test.js` reads exactly one document, after their own
+`telemetry-field.js:63-65` citation rotted into a different property. **Confirmed by execution at HEAD,
+and the asymmetry is worse than they stated.** Measured with a negative control (a fabricated path
+returns 0, so the counter can say no):
+
+```
+DOCUMENTS CARRYING `file.ext:NNN` CITATIONS: 13 · TOTAL CITATIONS: 563 · GUARDED: 24 (4.2%)
+
+  183  demo-spec.md                 <- ungoverned
+  137  design/demo-ux.md            <- ungoverned; cited by 30 files, 11 guards
+   91  IMPLEMENTATION-REVIEW.md     <- **THIS FILE. UNGOVERNED.**
+   37  QA-PLAN.md                   <- ungoverned
+   31  REVIEWER-BRIEF.md            <- ungoverned
+   24  README.md                    <- THE ONLY GUARDED DOCUMENT. SIXTH LARGEST.
+   16  ARCHITECTURE-SECURITY-REVIEW.md · 11 · 11 · 10 · 6 · 5 · …
+```
+
+**The document with the anchor checker is the sixth-largest citer on the branch.** The five above it —
+including the two rank-1 documents everyone quotes, and **my own review** — have none.
+
+**This is the fifth instance of one class**, after `resolveStaleCeilingMs`, the `server.model_path` ban
+(2 files), the Rust `may_disclose_model_paths` ban (3 files), and now a corpus of **one**. It is the
+same shape every time: *a correct mechanism, guarded over the places the defect was last found.*
+
+**And it is the most consequential instance, because coordinates are the one kind of evidence that gets
+more dangerous as it ages** — `@c0de4c2e`'s formulation, proven twice tonight: a stale count reads as
+odd, a stale line number **still resolves**, to somebody else's work, attached to a deletion verb.
+`ui/model-card.js:25` was ordered deleted and by then held the live **context length** field. **563
+unguarded coordinates on a branch moving at 1.4 commits per minute.**
+
+### Correcting `@0837fdf9`'s cost estimate — it is not one line, and the reason matters
+
+They offered *"one line of corpus in a file I do not own"* and deliberately did **not** fork the
+extractor, which was exactly right (`D303`, duplicate vocabulary). But I read the file and the estimate
+is optimistic in a way that would produce a vacuous guard:
+
+1. `citations()` closes over a **module-level `const readme`** (`:63`). It takes no argument. Making it
+   corpus-driven means parameterising the function, not adding a list entry — ~5 lines.
+2. **The floor is the real hazard.** `:152` asserts `citations().length >= 10` — the anti-vacuity floor
+   that makes this guard trustworthy. **Aggregated across a corpus, that floor becomes satisfiable by
+   `demo-spec.md` alone, and a document contributing zero citations would pass silently** — which is
+   precisely the failure the floor exists to prevent, reintroduced by the fix. **The floor must be
+   per-document, or the census must assert every document in the corpus contributed.**
+
+That second point is the whole lesson of tonight in one refactor: **widening a census without widening
+its anti-vacuity floor converts a strong guard into a weak one while every number goes green.**
+
+### What is good, and it is this file
+
+`check-source-citations.test.js` is the **best-reasoned guard on the branch** and I want that on the
+record while I criticise its corpus. It already carries the scars of two defects it fixed and
+documented: a regex character class `[a-z_]+` that silently excluded every citation into the hyphenated
+crates (7 of 27), and a basename fallback that "rescued" `.../src/engine/batched.rs` — a path whose
+directory does not exist — because some `batched.rs` lived elsewhere. Its comment names the exact
+disease: ***an existence check standing in for an identity check.*** **This guard has already learned
+the lesson the other four census sites have not. It just never had its corpus widened.**
+
+### Standing limits, dated
+
+- Rust: `onnx-genai-server` only, **264/0/4, raw exit 0, at HEAD `23f4da0d`**. The other 38 crates are
+  unexecuted; `crates compile+clippy` remains `@c7a654ed`'s carried 🟡.
+- **91 citations in this document are unguarded by any anchor checker.** They are hints, not
+  coordinates, and F32 is the mechanism that would make them coordinates. **I am filing the finding
+  that indicts my own deliverable rather than the four that do not.**
+
+**Verdict unchanged: APPROVE. Blocking set empty.** F32, like F24/F30/F31, is follow-up-branch work.
+
