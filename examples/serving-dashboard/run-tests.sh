@@ -118,7 +118,16 @@ echo "head:   $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')
 echo "dirty:  $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted file(s) in this tree"
 echo "node:   $(node --version)"
 echo "floors: ${MIN_TESTS} tests / ${MIN_FILES} files (defaults 500/40; an override is printed here so a lowered floor cannot pass unnoticed)"
-echo "ratchet: $( [[ -f $BASELINE_FILE ]] && echo "baseline $(tr -cd '0-9' < "$BASELINE_FILE") from ${BASELINE_FILE}" || echo "no baseline yet (${BASELINE_FILE} absent; will be seeded)" )"
+# THIS LINE STATES A CONDITION, NEVER AN OUTCOME, AND THAT IS A BUG FIX.
+# It used to read "will be seeded" -- an unconditional promise printed on
+# STDOUT, while the code that declines to seed (a red run banks a number
+# nobody can reproduce) reports on STDERR. So `run-tests.sh > out.txt` on a
+# failing suite captured the promise and dropped the retraction, and out.txt
+# said a baseline was coming that never arrived. A claim and its withdrawal
+# MUST NOT travel on different streams: whoever reads only one of them reads
+# the half that is wrong. The outcome is reported once, at the end, by the
+# code that actually decides it.
+echo "ratchet: $( [[ -f $BASELINE_FILE ]] && echo "baseline $(tr -cd '0-9' < "$BASELINE_FILE") from ${BASELINE_FILE}" || echo "no baseline yet (${BASELINE_FILE} absent; seeds at the end of this run ONLY if 0 tests fail -- see the closing ratchet line for what actually happened)" )"
 
 # Discover, never enumerate.
 test_files=()
@@ -428,10 +437,18 @@ elif [[ $failed -eq 0 ]]; then
   echo "$tests" > "$BASELINE_FILE"
   echo "ratchet: no baseline yet; seeded ${BASELINE_FILE} at ${tests} (commit it)."
 else
-  # Say so out loud. A guard that declined to arm itself must not be
-  # indistinguishable from a guard that armed and was satisfied.
-  echo "ratchet: NOT seeded -- ${failed} test(s) failed, and a baseline banked" >&2
-  echo "         from a red run is a number nobody can reproduce." >&2
+  # Say so out loud, ON STDOUT, where the seeded/advanced lines also go.
+  # A guard that declined to arm itself must not be indistinguishable from a
+  # guard that armed and was satisfied -- and it must not be distinguishable
+  # ONLY to whoever happened to capture stderr. Reporting success on one
+  # stream and refusal on another makes the ABSENCE of a line carry the
+  # meaning, and an absence reads identically to "no ratchet ran at all".
+  echo "ratchet: NOT seeded -- ${failed} test(s) failed; ${BASELINE_FILE} is still absent and the ratchet remains unarmed."
+  # The RATIONALE goes to stderr; the OUTCOME above does not. Note this line
+  # deliberately does NOT begin with "ratchet:" -- a stderr-only line wearing
+  # the outcome prefix reads as a second outcome that stdout readers never see,
+  # which is the exact defect this block was just fixed for.
+  echo "        why: a baseline banked from a red run is a number nobody can reproduce." >&2
 fi
 
 if [[ $failed -ne 0 ]]; then

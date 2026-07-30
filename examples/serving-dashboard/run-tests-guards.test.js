@@ -125,7 +125,20 @@ function runRunner(root, options = {}) {
     encoding: 'utf8',
     env,
   });
-  return { status: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+  // `out` CONCATENATES BOTH STREAMS AND THAT IS A REAL LIMIT, NOT A CONVENIENCE.
+  // A test asserting the runner "says X out loud" is satisfied by X on EITHER
+  // stream -- so it cannot distinguish a message a `> file.txt` reader receives
+  // from one only a stderr reader receives. That blind spot certified a live
+  // defect in this very file: the ratchet printed its PROMISE ("will be seeded")
+  // on stdout and its REFUSAL on stderr, and the test named "says out loud that
+  // it declined to" passed the whole time. `stdout` and `stderr` are exposed
+  // separately so a claim ABOUT A STREAM can be asserted against that stream.
+  return {
+    status: result.status,
+    out: `${result.stdout ?? ''}${result.stderr ?? ''}`,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+  };
 }
 
 /** The baseline the runner wrote into a scratch repo, or null if it wrote none. */
@@ -362,4 +375,50 @@ test('a RED run never seeds a baseline, and says out loud that it declined to', 
   assert.equal(status, 1, out);
   assert.match(out, /ratchet: NOT seeded/);
   assert.equal(baselineIn(root), null);
+});
+
+test('no ratchet outcome is visible only on stderr', () => {
+  // THE INVARIANT, AND IT IS DELIBERATELY NOT A STRING MATCH: whatever the
+  // ratchet reports, a reader who captured ONLY stdout -- `run-tests.sh > log`,
+  // the single most common way this script is run -- must see all of it.
+  // Reporting the seed on stdout and the refusal on stderr made the ABSENCE of
+  // a line carry the meaning, and an absence is indistinguishable from "the
+  // ratchet never ran". Keyed on the set of lines, so rewording cannot rot it.
+  const root = repo({ ...healthyFiles(), 'broken.test.js': FAILING_SUITE });
+  const { stdout, stderr } = runRunner(root, { args: ['--allow-untracked'] });
+  const ratchetLines = (s) =>
+    s.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('ratchet:'));
+  const onOut = new Set(ratchetLines(stdout));
+  const missing = ratchetLines(stderr).filter((l) => !onOut.has(l));
+
+  // ANTI-VACUITY: a run that emitted no ratchet line at all would satisfy the
+  // check above trivially, which is the failure mode this whole file exists for.
+  assert.ok(
+    onOut.size >= 2,
+    `expected the pre-run ratchet line AND its outcome on stdout, saw ${onOut.size}: ` +
+      `${[...onOut].join(' | ')} -- a parser that matches nothing reports a clean bill of health`,
+  );
+  assert.deepEqual(
+    missing,
+    [],
+    'these ratchet lines reached stderr but never stdout, so `run-tests.sh > log` loses them:\n' +
+      missing.map((l) => `  ${l}`).join('\n'),
+  );
+});
+
+test('the pre-run ratchet line promises no outcome it cannot guarantee', () => {
+  // It runs BEFORE the tests, so it cannot know whether the suite will be
+  // green -- and the seed happens only when it is. It must state the condition.
+  const root = repo({ ...healthyFiles(), 'broken.test.js': FAILING_SUITE });
+  const { stdout } = runRunner(root, { args: ['--allow-untracked'] });
+  const preRun = stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.startsWith('ratchet:'));
+  assert.ok(preRun, 'no pre-run ratchet line on stdout at all');
+  assert.doesNotMatch(
+    preRun,
+    /will be seeded/,
+    `the pre-run line promised a seed that this red run then refused: "${preRun}"`,
+  );
 });
