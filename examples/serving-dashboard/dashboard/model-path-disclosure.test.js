@@ -61,6 +61,7 @@ function measuredField(value, options = {}) {
 // A path shaped like the real one: absolute, with a home directory in it. The
 // test is worthless if this looks like the sanitised fixture everywhere else.
 const HOME_PATH = '/Users/presenter/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b';
+const NAMESPACED_MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct';
 
 // The two surfaces the defect was actually found on. These stay named because
 // they are the regression, and they get the STRICT predicate below: not one
@@ -138,11 +139,11 @@ before(() => {
 });
 after(() => uninstallDom());
 
-function storeReportingHomePath() {
+function storeReportingHomePath(modelId = 'qwen-scatter') {
   return createFakeStore({
     fields: {
       'server.model_path': measuredField(HOME_PATH, { source: 'server' }),
-      'server.model_id': measuredField('qwen-scatter', { source: 'server' }),
+      'server.model_id': measuredField(modelId, { source: 'server' }),
       'server.context_length': measuredField(32768, { source: 'server' }),
       'server.execution_provider': measuredField('CPU', { source: 'server' }),
     },
@@ -169,9 +170,9 @@ function visibleStrings(node, collected = []) {
   return collected;
 }
 
-async function mountAndCollect(mount) {
+async function mountAndCollect(mount, modelId) {
   const root = document.createElement('div');
-  const store = storeReportingHomePath();
+  const store = storeReportingHomePath(modelId);
   const mounted = mount(root, store);
   // Surfaces paint placeholders on mount and fill in on the first poll tick.
   // Collecting before this would sweep a card of "···" and score it clean.
@@ -213,6 +214,19 @@ describe('the model directory never reaches a rendered surface', () => {
       [],
       'the model card rendered an absolute filesystem path',
     );
+  });
+
+  it('keeps a legitimate namespaced model id intact on both protected surfaces', async () => {
+    const { mount: mountSystem } = await import('./system.js');
+    const { mountModelCard } = await import('../ui/model-card.js');
+
+    for (const [surface, mount] of [
+      ['system panel', mountSystem],
+      ['model card', mountModelCard],
+    ]) {
+      const { text } = await mountAndCollect(mount, NAMESPACED_MODEL_ID);
+      assert.ok(text.includes(NAMESPACED_MODEL_ID), `${surface} rendered: ${text}`);
+    }
   });
 
   it('the detector can actually fire, so a clean run means something', async () => {
