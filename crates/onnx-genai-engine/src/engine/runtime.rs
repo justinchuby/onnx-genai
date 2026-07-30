@@ -252,6 +252,18 @@ impl Engine {
         self.kv_cache.page_table.stats()
     }
 
+    /// Attach a lock-free telemetry mirror to this engine's KV page pool.
+    ///
+    /// [`page_usage`](Self::page_usage) cannot serve a live dashboard: it is
+    /// `O(pages)` and allocates, and reaching it requires `&self` on an engine
+    /// that is mutably borrowed for the whole of a generation. The mirror is
+    /// updated incrementally at the pool's mutation sites and read from any
+    /// thread, so a KV panel can move *during* generation, which is the only
+    /// time paged-KV behaviour is worth watching.
+    pub fn attach_kv_telemetry(&mut self, telemetry: std::sync::Arc<onnx_genai_kv::KvTelemetry>) {
+        self.kv_cache.page_table.attach_telemetry(telemetry);
+    }
+
     /// External KV connector activity from the most recent generation.
     ///
     /// Reflects lookups, would-be prefix extensions, tokens actually fetched and

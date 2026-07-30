@@ -860,6 +860,24 @@ impl PipelineEngine {
             .map(|paged| paged.cache.page_table.usage())
     }
 
+    /// Attach a lock-free telemetry mirror to the paged KV pool.
+    ///
+    /// Returns `false` when this decoder's KV cannot be paged, so a caller can
+    /// report the panel as not-applicable rather than rendering a pool that
+    /// will never move as one that is merely idle.
+    pub fn attach_kv_telemetry(
+        &mut self,
+        telemetry: std::sync::Arc<onnx_genai_kv::KvTelemetry>,
+    ) -> bool {
+        match self.paged.as_mut() {
+            Some(paged) => {
+                paged.cache.page_table.attach_telemetry(telemetry);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Counters describing what the pipeline's reuse caches did.
     pub fn cache_stats(&self) -> PipelineCacheStats {
         self.component_cache.borrow().stats()

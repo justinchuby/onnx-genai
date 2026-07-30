@@ -497,9 +497,18 @@ named `reconfigure_lower_reports_overage_without_evicting`.
 
 So the slider would have been a **fabricated interaction** — the same failure as
 a fabricated number, wearing a costume you can drag. Instead the demo fills the
-pool the honest way: **more concurrent sequences and longer prompts, until
-allocation genuinely runs out of blocks.** Slower to reach, harder to stage, and
-every stall you see actually happened.
+pool the honest way: **a long shared prefix, then sequential requests branching
+off it, until allocation genuinely runs out of blocks.** Slower to reach, harder
+to stage, and every stall you see actually happened.
+
+> **Concurrency is not the lever here, and that is a fact about this runtime
+> rather than a staging preference.** The dynamic server runs generation
+> *inline* on the driver thread (`driver.rs:696`), so concurrent requests
+> **queue rather than overlap** — raising concurrency against the paged-KV
+> server adds waiting, not pressure. Concurrency drives Scenario A, on the
+> scatter server, which has no block table at all. Pressure on the pool comes
+> from **prompt length and sequential branching**, both of which work with a
+> single request in flight.
 
 ---
 

@@ -28,6 +28,7 @@ pub mod local_tiered;
 pub mod page_table;
 pub mod paged_cache;
 pub mod prefix_cache;
+pub mod telemetry;
 pub mod tiered;
 
 pub use backing_store::{DiskKvBackingStore, InMemoryKvBackingStore, KvBackingStore};
@@ -45,6 +46,7 @@ pub use page_table::{
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;
+pub use telemetry::{KvTelemetry, KvTelemetrySnapshot};
 
 /// Sequence identifier.
 pub type SequenceId = u64;

@@ -6,6 +6,9 @@ use crate::{
 };
 use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use crate::telemetry::KvTelemetry;
 
 /// Unique page identifier.
 pub type PageId = u32;
@@ -657,6 +660,10 @@ pub struct PageTable {
     next_page_id: PageId,
     /// Cumulative page activity, for reporting.
     stats: PageStats,
+    /// Optional lock-free mirror of this pool's counters, readable from another
+    /// thread while a generation is in flight. `None` on every path that has no
+    /// reader, which is the default.
+    telemetry: Option<Arc<KvTelemetry>>,
 }
 
 impl PageTable {
@@ -829,7 +836,41 @@ impl PageTable {
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
+            telemetry: None,
         }
+    }
+
+    /// Attach a lock-free telemetry mirror to this pool.
+    ///
+    /// Post-construction rather than a constructor parameter because every
+    /// constructor funnels here and only the demo server wants a reader; making
+    /// it opt-in keeps the cost at one `Option` check for everyone else.
+    pub fn attach_telemetry(&mut self, telemetry: Arc<KvTelemetry>) {
+        telemetry.set_geometry(self.hot_capacity, self.page_size);
+        telemetry.publish_counters(&self.stats);
+        // Adopt the pool's current occupancy so attaching to a warm pool does
+        // not start the gauges from a false zero.
+        let (in_use, shared) = self.live_page_counts();
+        telemetry.set_live_gauges(in_use, shared);
+        self.telemetry = Some(telemetry);
+    }
+
+    /// `(pages_in_use, pages_shared)`, computed directly from the pages.
+    ///
+    /// `O(pages)`; used only when attaching telemetry and by tests that check
+    /// the incrementally-maintained gauges have not drifted from the truth.
+    pub fn live_page_counts(&self) -> (usize, usize) {
+        let mut in_use = 0;
+        let mut shared = 0;
+        for page in self.pages.values() {
+            if page.ref_count > 0 {
+                in_use += 1;
+            }
+            if page.ref_count > 1 {
+                shared += 1;
+            }
+        }
+        (in_use, shared)
     }
 
     /// Allocate a new page on the specified device.
@@ -839,7 +880,18 @@ impl PageTable {
             Some(_) => self.stats.allocations += 1,
             None => self.stats.allocation_failures += 1,
         }
+        self.publish_counters();
         allocated
+    }
+
+    /// Mirrors the cumulative counters into the telemetry view, if attached.
+    ///
+    /// Called after every `stats` mutation. Copying the whole set is a handful
+    /// of relaxed stores and makes it impossible for a counter to drift.
+    fn publish_counters(&self) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.publish_counters(&self.stats);
+        }
     }
 
     /// Cumulative page activity since this table was created.
@@ -903,6 +955,7 @@ impl PageTable {
     /// cannot tell a reclaim from an ordinary release, so the owner reports it.
     pub fn note_prefix_eviction(&mut self, pages: u64) {
         self.stats.prefix_evictions += pages;
+        self.publish_counters();
     }
 
     fn allocate_page(&mut self, device: Device) -> Option<PageId> {
@@ -923,6 +976,9 @@ impl PageTable {
                 self.clock += 1;
                 page.last_access = self.clock;
             }
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.note_ref_count_change(0, 1);
+            }
             return Some(page_id);
         }
         if matches!(device, Device::Gpu(_)) && self.hot_used_count() < self.hot_capacity {
@@ -939,6 +995,9 @@ impl PageTable {
             self.clock += 1;
             page.last_access = self.clock;
             self.pages.insert(page_id, page);
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.note_ref_count_change(0, 1);
+            }
             return Some(page_id);
         }
         None
@@ -947,12 +1006,18 @@ impl PageTable {
     /// Free a page (decrement ref_count; actually free when it hits 0).
     pub fn free(&mut self, page_id: PageId) {
         if let Some(page) = self.pages.get_mut(&page_id) {
+            let previous = page.ref_count;
             page.ref_count = page.ref_count.saturating_sub(1);
+            let current = page.ref_count;
             if page.ref_count == 0 {
                 page.reset_storage(self.tensor_config);
                 let device = page.device;
                 self.free_pages.entry(device).or_default().push(page_id);
                 self.stats.frees += 1;
+            }
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.note_ref_count_change(previous, current);
+                telemetry.publish_counters(&self.stats);
             }
         }
     }
@@ -960,9 +1025,14 @@ impl PageTable {
     /// Increment a page reference for CoW/prefix sharing.
     pub fn retain(&mut self, page_id: PageId) -> bool {
         if let Some(page) = self.pages.get_mut(&page_id) {
+            let previous = page.ref_count;
             page.ref_count = page.ref_count.saturating_add(1);
+            let current = page.ref_count;
             self.clock += 1;
             page.last_access = self.clock;
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.note_ref_count_change(previous, current);
+            }
             true
         } else {
             false
@@ -1085,6 +1155,7 @@ impl PageTable {
             .ok_or(KvError::PageNotFound(victim_id))?;
         victim.device = Device::Cpu;
         self.stats.hot_evictions += 1;
+        self.publish_counters();
         Ok(victim_id)
     }
 
@@ -1115,6 +1186,7 @@ impl PageTable {
             }
         }
         self.stats.hot_evictions += demoted as u64;
+        self.publish_counters();
         demoted
     }
 
