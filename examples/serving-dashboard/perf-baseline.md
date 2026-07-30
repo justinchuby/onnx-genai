@@ -90,11 +90,69 @@ Per-round raw:
 | 3 | 83.23 | 20.81 | 29.6 | 52.46 |
 | 4 | 86.13 | 21.53 | 28.6 | 54.29 |
 
+> ### ⛔ WITHDRAWN VERDICT — THE RATIO BELOW IS NOT CITABLE. THE SAMPLES ABOVE ARE.
+>
+> Commit `2d6b36ac` withdrew the throughput ratio from every **shipping** document
+> (`PR-DESCRIPTION.md`, `QA-PLAN.md`, `README.md`, `check-perf-claims.test.js`).
+> **It did not touch this file, which is where the ratio is derived.** So the
+> withdrawal was applied to every document that *quoted* the number and not to the
+> one that *produces* it — and a reviewer checking the figure travels toward the
+> origin, so the more carefully they read, the more certainly they landed here.
+> Found while attempting to source a `2.59×` attributed to QA that **does not
+> exist**: `2.59` is the *upper confidence bound* of this ratio as restated in
+> `REVIEWER-BRIEF.md:580`, read back as a point estimate.
+>
+> **Live sites of the withdrawn ratio in this file: 2** — the two sentences
+> immediately below this notice. The count is stated so this notice is falsifiable
+> by `grep`, not merely trusted — a notice that asserts its own completeness is a
+> status column, and mine has already been wrong once tonight
+> (`prefix-cache-verification.md`, reported as one site by @732c7548, actually four).
+> ⚠️ **This notice cannot verify itself by quoting anything, and I proved that the
+> hard way — three times.** First I cited line numbers; they were stale within one
+> edit. Then I quoted the digits; the notice counted itself. Then I quoted the
+> verdict's own wording as a safer anchor; **the notice counted itself again.**
+> **A verification instruction written *inside* the document it verifies becomes an
+> instance of the thing it counts. There is no string I can print here that is
+> exempt from my own search.**
+>
+> **So the anchor is structural, not textual: the withdrawn verdict is the single
+> paragraph beginning at the only line matching `^\*\*Batching speedup`.**
+> Everything quoted in this notice is blockquoted — every line carries a `>` prefix
+> — so it is **structurally incapable** of matching a start-of-line anchor. The
+> check excludes the checker by construction rather than by my remembering to.
+> ✅ `grep -cE '^\*\*Batching speedup'` returns **1**.
+>
+> The count is stated so this notice is falsifiable rather than trusted: a notice
+> that asserts its own completeness is a status column, and mine was already wrong
+> once tonight (`prefix-cache-verification.md` — reported as one site by
+> @732c7548, actually four). ⚠️ **Also note the raw per-round table contains a
+> wall-throughput sample whose digits collide as a substring with the ratio. It is
+> a measurement, not a citation, and must NOT be struck.**
+>
+> **Why re-running cannot fix it:** the withdrawal reason is the *model*, not the
+> harness, the load, or the box. That artifact was assembled by accident from two
+> builds seventeen days apart and its inference metadata was edited fifty-four
+> minutes after the build — **inside the measurement window**. The figure is not
+> merely unreproducible by a reader; we cannot show it is internally consistent
+> with itself. **A fresh run with a perfect harness on a silent box reproduces a
+> number that is still unvalidatable — and would be the most persuasive possible
+> form of laundering it back into the record.**
+>
+> **What survives:** every raw sample above, and the *mechanism* — the startup line
+> `continuous batch driver enabled max_batch=4` and the independently observed
+> 4-concurrent batch occupancy. **A count needs no throughput arithmetic, so it
+> does not depend on the model's provenance at all.** Ship the mechanism.
+
 **Batching speedup: 82.13 / 33.41 = 2.46×** aggregate decode at batch 4.
 Per-stream decode degrades to ~20.7 tok/s (0.62× of solo), i.e. batching trades
 per-stream latency for 2.46× aggregate throughput. Continuous batching is genuinely
 engaging — confirmed by the startup log line
 `continuous batch driver enabled max_batch=4`.
+
+*(The two sentences above are the withdrawn verdict, retained verbatim under the
+notice rather than deleted: striking the words that were actually published would
+destroy the evidence that the claim was made, which is the failure mode this
+document exists to record. The raw tables are untouched and remain citable.)*
 
 > **Recommended acceptance metric:** `wall_throughput_tps` for the concurrent case
 > (CV 1.93 %) and single-request median decode (CV 1.98 %). Avoid
