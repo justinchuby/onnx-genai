@@ -425,6 +425,19 @@ test('no source file states the withdrawn prefix timing result as a live finding
 
   // The withdrawn artefacts, by content rather than by digits alone: the
   // 7.0% delta and the 1341/1254 ms arm pair it was computed from.
+  //
+  // KNOWN AND DELIBERATE LIMIT -- do not "fix" this by widening the matcher.
+  // A site can state the withdrawn claim with NO DIGITS AT ALL: @376a0297
+  // found `store-adapter.js` asserting the counters were cut "after a
+  // controlled A/B proved prefix reuse absent", which is the timing arm
+  // wearing prose. This checker cannot see that class, and matching phrases
+  // like "controlled A/B" would be worse than useless, because the SAME words
+  // describe the counter arm, which is correct and needs no stopwatch --
+  // `registry-prefix-tripwire.test.js` and `honesty.test.js` both use them
+  // legitimately. A matcher that reddens on the true statement and the false
+  // one alike teaches people to ignore it, and a false positive is worse than
+  // no lint. The digit-free class is a PROSE REVIEW obligation, recorded here
+  // so it is an acknowledged gap rather than an assumed absence.
   const WITHDRAWN = /\b7\.0\s*%|\b1341\s*ms|\b1254\s*ms/;
 
   // A citation being BURIED is not a citation being MADE. @376a0297 raised
