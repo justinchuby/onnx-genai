@@ -679,6 +679,56 @@ export function replaceChildren(container, children) {
   }
 }
 
+/**
+ * Switch every chart in a panel between the canvas and its table alternative.
+ *
+ * demo-ux.md §3 gives the shell a uniform "view as table" toggle, but the panel
+ * contract only hands the shell `describe()` — a sentence. A sentence is not
+ * tabular data, so the shell cannot build the real <table> with scoped headers
+ * that §10 requires. The data lives here, so the toggle has to be driven from
+ * here; this is the hook the shell calls.
+ *
+ * Walking the DOM rather than tracking slot handles means it works for any
+ * panel, including ones written later that never heard of this function.
+ *
+ * @param {HTMLElement} rootElement The panel body.
+ * @param {'chart'|'table'} view
+ * @returns {number} How many charts were switched.
+ */
+export function setPanelView(rootElement, view) {
+  const figures = collectSparkFigures(rootElement);
+  for (const figure of figures) {
+    const asTable = view === 'table';
+    figure.setAttribute('data-view', asTable ? 'table' : 'chart');
+    for (const child of figure.children ?? []) {
+      const isTable = child.tagName === 'TABLE';
+      const isCanvas = child.tagName === 'CANVAS';
+      if (!isTable && !isCanvas) continue;
+      if (isTable === asTable) {
+        child.removeAttribute('hidden');
+      } else {
+        child.setAttribute('hidden', '');
+      }
+    }
+  }
+  return figures.length;
+}
+
+/**
+ * @param {HTMLElement} container
+ * @param {HTMLElement[]} [into]
+ * @returns {HTMLElement[]}
+ */
+function collectSparkFigures(container, into = []) {
+  for (const child of container.children ?? []) {
+    if (child.tagName === 'FIGURE' && child.hasAttribute?.('data-view')) {
+      into.push(child);
+    }
+    collectSparkFigures(child, into);
+  }
+  return into;
+}
+
 /** Attribute marking an element as a stop on a roving cursor (AC29). */
 export const ROVING_ITEM_ATTR = 'data-roving-item';
 

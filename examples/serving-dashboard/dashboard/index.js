@@ -24,7 +24,7 @@
 // one multi-model server, `modes` becomes the only thing that changes and no
 // panel is touched.
 
-import { createRovingGroup } from './panel-kit.js';
+import { createRovingGroup, setPanelView } from './panel-kit.js';
 import { adaptStore } from './store-adapter.js';
 
 import * as kvMemory from './kv-memory.js';
@@ -138,11 +138,31 @@ export function mountDashboard({ telemetryStore, resolveRoot, mode, requests }) 
     // screen would look wrong. One group per panel means the dashboard costs a
     // keyboard user one Tab per panel, with arrows to read within it.
     const roving = createRovingGroup(root, { label: panel.title });
-    mounted.push({ id: panel.id, handle, roving });
+    mounted.push({ id: panel.id, handle, roving, root });
   }
 
   return {
     mounted: Object.freeze(mounted.map((entry) => entry.id)),
+
+    /**
+     * Drive the shell's uniform "view as table" toggle (AC28).
+     *
+     * The shell owns the control; the data lives in the panels, so it cannot
+     * build the table itself from describe() alone.
+     *
+     * @param {'chart'|'table'} view
+     * @param {string} [panelId] Omit to switch every panel at once.
+     * @returns {number} Charts switched, so the shell can hide a toggle that
+     *   would do nothing on a panel with no charts.
+     */
+    setView(view, panelId) {
+      let switched = 0;
+      for (const entry of mounted) {
+        if (panelId && entry.id !== panelId) continue;
+        switched += setPanelView(entry.root, view);
+      }
+      return switched;
+    },
     unmount() {
       for (const entry of mounted) {
         // One panel failing to unmount must not strand the subscriptions of the

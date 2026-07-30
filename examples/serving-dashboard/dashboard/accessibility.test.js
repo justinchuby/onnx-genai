@@ -33,6 +33,7 @@ const {
   renderSparkline,
   replaceChildren,
   rovingItems,
+  setPanelView,
 } = await import('./panel-kit.js');
 const { planSparkline, tabulateSparkline } = await import('./sparkline.js');
 const throughput = await import('./throughput.js');
@@ -361,5 +362,64 @@ describe('AC29 — composite widgets are one tab stop with a roving cursor', () 
     roving.destroy();
     assert.equal(container.hasAttribute('tabindex'), false);
     assert.equal(container.hasAttribute('role'), false);
+  });
+});
+
+describe('the shell can drive the table toggle it owns', () => {
+  it('switches every chart in a panel and reports how many', () => {
+    // demo-ux.md §3 gives the shell the toggle but hands it only describe(),
+    // a sentence. The data lives in the panel, so the shell needs a hook.
+    setReducedMotion(false);
+    const store = createFakeStore({ series: { 'queue.depth': samples(5) } });
+    const root = document.createElement('div');
+    const handle = scheduling.mount(root, store);
+    flushAnimationFrames();
+
+    const switched = setPanelView(root, 'table');
+    assert.ok(switched > 0, 'the panel exposed no charts to switch');
+
+    for (const figure of collectByTag(root, 'FIGURE')) {
+      assert.equal(figure.getAttribute('data-view'), 'table');
+      const [canvas] = collectByTag(figure, 'CANVAS');
+      const [table] = collectByTag(figure, 'TABLE');
+      assert.equal(canvas.hasAttribute('hidden'), true, 'canvas still shown in table view');
+      assert.equal(table.hasAttribute('hidden'), false, 'table still hidden in table view');
+    }
+
+    setPanelView(root, 'chart');
+    for (const figure of collectByTag(root, 'FIGURE')) {
+      assert.equal(figure.getAttribute('data-view'), 'chart');
+      assert.equal(collectByTag(figure, 'CANVAS')[0].hasAttribute('hidden'), false);
+      assert.equal(collectByTag(figure, 'TABLE')[0].hasAttribute('hidden'), true);
+    }
+    handle.unmount();
+  });
+
+  it('reports zero for a panel with no charts, so the shell can hide the toggle', () => {
+    const root = document.createElement('div');
+    assert.equal(setPanelView(root, 'table'), 0);
+  });
+
+  it('keeps the table view across a re-render', () => {
+    // The toggle is a user decision. A poll arriving 250ms later must not
+    // silently throw them back to the chart they chose to leave.
+    setReducedMotion(false);
+    const store = createFakeStore({ series: { 'queue.depth': samples(5) } });
+    const root = document.createElement('div');
+    const handle = scheduling.mount(root, store);
+    flushAnimationFrames();
+
+    const switched = setPanelView(root, 'table');
+    store.tick();
+    flushAnimationFrames();
+
+    const figures = collectByTag(root, 'FIGURE');
+    assert.equal(figures.length, switched);
+    assert.ok(figures.length > 0, 'no figures: this test would pass vacuously');
+    for (const figure of figures) {
+      assert.equal(figure.getAttribute('data-view'), 'table', 'a poll reverted the chosen view');
+      assert.equal(collectByTag(figure, 'TABLE')[0].hasAttribute('hidden'), false);
+    }
+    handle.unmount();
   });
 });
