@@ -975,3 +975,135 @@ test('the README per-pane row counts match the measurement record', () => {
       'be withdrawn. A caveat that outlives its cause is a claim, not a caution.',
   );
 });
+
+// ---------------------------------------------------------------------------
+// The README now states a CAUSE, and a cause is a claim about source code that
+// can be refactored out from under the prose without touching the prose. These
+// three guards exist because the paragraph they protect corrects an UNDERclaim
+// -- it says more than the previous version, not less -- and an underclaim
+// corrected in the direction of confidence is the one nobody re-audits.
+//
+// Note what is deliberately NOT pinned: line numbers. The arms move; the
+// semantics are what the README describes.
+
+// Rust source lives above this directory, so it is addressed from the repo
+// root. `HEAD:./x` resolves relative to cwd and would need `../../`; the
+// root-anchored form says what it means.
+function shippedFromRoot(path) {
+  return execFileSync('git', ['show', `HEAD:${path}`], {
+    cwd: HERE,
+    maxBuffer: 64 * 1024 * 1024,
+  }).toString();
+}
+
+const BATCHED_RS = 'crates/onnx-genai-engine/src/batched.rs';
+const DECODE_META_RS = 'crates/onnx-genai-engine/src/decode/metadata.rs';
+
+// Slice out `continuous_batch_manager`'s body rather than scanning the whole
+// file: `ModelDecodePath::StaticCache` appears in a dozen unrelated matches,
+// and a whole-file grep would score GREEN off any one of them while the arm the
+// README describes had been deleted.
+function continuousBatchManagerBody() {
+  const src = shippedFromRoot(BATCHED_RS);
+  const start = src.indexOf('pub fn continuous_batch_manager(');
+  assert.ok(
+    start !== -1,
+    `${BATCHED_RS} no longer defines \`continuous_batch_manager\`. The README ` +
+      'names it as the decision point for batch capability; if it has been ' +
+      'renamed or removed, that section describes a function that is not there.',
+  );
+  const next = src.indexOf('\n    pub fn ', start + 1);
+  const body = src.slice(start, next === -1 ? src.length : next);
+  // Vacuity floor. A zero-length or truncated slice makes every `includes`
+  // below trivially false, which would read as a loud failure -- but a slice
+  // that is merely SHORT could pass a negative check by accident.
+  assert.ok(
+    body.length > 400,
+    `extracted \`continuous_batch_manager\` body is only ${body.length} bytes; ` +
+      'the slicing heuristic has drifted and these assertions are not ' +
+      'inspecting what they claim to inspect.',
+  );
+  return body;
+}
+
+test('continuous batching still accepts exactly the two decode paths the README enumerates', () => {
+  const body = continuousBatchManagerBody();
+
+  // The README's load-bearing word is "sufficient, not necessary": a static
+  // cache is ONE of two accepting shapes. If the shared-buffer arm is ever
+  // removed, the README's correction of the crew's "only static_cache batches"
+  // reading becomes the wrong one, and it must go red HERE rather than in a
+  // reader's head.
+  assert.ok(
+    /ModelDecodePath::StaticCache\s*\{/.test(body),
+    'the static-cache accepting arm is gone from `continuous_batch_manager`. ' +
+      'README: "`ModelDecodePath::StaticCache { .. }` -- batches."',
+  );
+  assert.ok(
+    /ModelDecodePath::PastPresent\s*\{\s*\n?\s*shared_buffer:\s*true/.test(body),
+    'the SHARED-BUFFER accepting arm is gone from `continuous_batch_manager`. ' +
+      'This is the arm that makes the README say a static cache is SUFFICIENT ' +
+      'BUT NOT NECESSARY. With it removed, "does the model declare ' +
+      'static_cache?" becomes the correct predicate after all, and the README ' +
+      'paragraph -- which exists specifically to refute that predicate -- is ' +
+      'now itself the error. Replacement: state that static cache is the sole ' +
+      'supported continuous-batch decode path.',
+  );
+
+  // And the refusal. The README quotes this string verbatim inside a fenced
+  // block; a reader will search their own logs for it.
+  const BAIL =
+    'continuous batching requires a STATIC-CACHE or shared-buffer past/present model';
+  assert.ok(
+    body.includes(BAIL),
+    `the README quotes this refusal verbatim and it is no longer in ${BATCHED_RS}:\n` +
+      `  ${BAIL}\n` +
+      'A quoted error message is the one piece of documentation a reader ' +
+      'matches CHARACTER BY CHARACTER against their own terminal, so a stale ' +
+      'one fails them at their least sceptical moment.',
+  );
+  assert.ok(
+    shipped('README.md').includes(BAIL),
+    'the README no longer quotes the refusal message that this section is ' +
+      'built around.',
+  );
+});
+
+test('the refused arms are still exactly the two the README says are refused', () => {
+  const body = continuousBatchManagerBody();
+  // The README narrows the open question to a TWO-WAY ambiguity -- Legacy, or
+  // PastPresent without a shared buffer. That width is a claim. If a third arm
+  // starts bailing, the README understates what is unknown.
+  const refusal = /ModelDecodePath::PastPresent\s*\{\s*\.\.\s*\}\s*\|\s*ModelDecodePath::Legacy\s*=>\s*\{\s*\n\s*anyhow::bail!/;
+  assert.ok(
+    refusal.test(body),
+    'the refusing match arm is no longer `PastPresent { .. } | Legacy => bail!`. ' +
+      'The README tells the reader the unresolved question is exactly two ways ' +
+      'wide ("which of those two it lands on has not been observed"). If the ' +
+      'set of refused paths has changed, that stated width is wrong -- and it ' +
+      'is wrong in the direction of claiming MORE certainty than we have.',
+  );
+});
+
+test('shared-buffer batching is still gated on an execution-provider capability, not on the model file', () => {
+  const src = shippedFromRoot(DECODE_META_RS);
+  // This is the single most transferable sentence in that README section --
+  // batch capability is a property of (model, EP, environment), not of a
+  // directory -- and it is TRUE ONLY BECAUSE this predicate is consulted here.
+  assert.ok(
+    src.includes('supports_fixed_capacity_present_binding()'),
+    `${DECODE_META_RS} no longer consults ` +
+      '`supports_fixed_capacity_present_binding()`. The README uses this exact ' +
+      'call to justify its central claim that batch capability CANNOT be ' +
+      'predicted by reading `inference_metadata.yaml`, because it depends on ' +
+      'the execution provider and an env opt-in. If the gate is gone, the ' +
+      'capability may now be a pure function of the model directory -- which ' +
+      'would make a metadata-reading check CORRECT and the README wrong.',
+  );
+  assert.ok(
+    /shared_buffer:\s*true/.test(src) && src.includes('DecodeKvMode::SharedBuffer'),
+    `${DECODE_META_RS} no longer resolves a shared-buffer decode path, so the ` +
+      'README\'s "sufficient, not necessary" argument has no second path to ' +
+      'point at.',
+  );
+});

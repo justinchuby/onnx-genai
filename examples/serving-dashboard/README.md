@@ -639,11 +639,50 @@ always."
 > *dynamic* is the one where dynamic batching does not happen. Read each pane on
 > its own terms; the demo does not license a head-to-head.
 >
-> **Why the dynamic model has no continuous-batch manager is NOT YET
-> EXPLAINED.** It has been *measured* not to engage; the cause has not been
-> established, and we are not going to infer one from a model's name. Stated
-> here rather than left for you to discover, because it bounds what the
-> side-by-side layout can be used to argue.
+> **Why the dynamic model does not batch is now established — and it is not a
+> property of the model file alone.** `continuous_batch_manager`
+> (`crates/onnx-genai-engine/src/batched.rs`) accepts exactly two decode paths
+> and refuses the rest with a message that names both:
+>
+> ```
+> continuous batching requires a STATIC-CACHE or shared-buffer past/present model
+> ```
+>
+> - `ModelDecodePath::StaticCache { .. }` — batches.
+> - `ModelDecodePath::PastPresent { shared_buffer: true, max_len: Some(_) }` —
+>   batches.
+> - `ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy` — `bail!`.
+>
+> **So a static cache is sufficient, not necessary.** "Does this directory
+> declare `static_cache`?" is the wrong question to ask of a model whose
+> batching you are trying to predict: a shared-buffer past/present model
+> batches with no static cache anywhere.
+
+> **🔑 And `shared_buffer` is not read off the model — it is negotiated with
+> the execution provider at load time.** In `resolve_decode_path`
+> (`crates/onnx-genai-engine/src/decode/metadata.rs`) the shared-buffer path is
+> taken only when the metadata requests it **and**
+> `session.supports_fixed_capacity_present_binding()` agrees — which is a
+> function of the session's execution providers plus an environment opt-in. The
+> source comment is explicit that this predicate is deliberately *not*
+> `is_metal()`, and that the Metal plugin declares no such support by default.
+>
+> **The consequence is the part worth carrying away: batch capability is a
+> property of the (model, execution provider, environment) triple, not of the
+> model directory.** The same artifact can batch on one host and refuse on
+> another with nothing in the file changed. **A check that predicts batching by
+> reading `inference_metadata.yaml` will be right on the machine it was written
+> on and quietly wrong elsewhere** — which is why the only sound way to know is
+> to ask the running server.
+
+> **What remains open, stated at its true width.** The measurement puts
+> `qwen2.5-0.5b` on a *refused* arm, and the source says the refused arms are
+> `PastPresent { shared_buffer: false, .. }` and `Legacy`. **Which of those two
+> it lands on has not been observed**, because the server does not report its
+> decode path. That is a two-way ambiguity rather than an open question, and it
+> is narrower than the "not yet explained" this paragraph carried until
+> `d4ea31a4` — **corrected here in the direction of claiming more, which is the
+> direction nobody audits.**
 
 **You do not have to trust the log for this, because the number is on the
 page.** The fallback path is one row wide however large the configured ceiling
@@ -664,14 +703,11 @@ expected to be running.
 > **The limit of that evidence, stated because it bounds every claim above.**
 > The decision is `engine.continuous_batch_manager(max_batch).is_ok()` — the
 > reason is discarded one line before it could be logged. So the log and the
-> capacity field tell you **which** path ran; **neither can tell you why**. A
-> run that unexpectedly reports capacity 1 is a fact you can act on and not yet
-> a diagnosis, and no log we currently ship will close that gap for you.
-> The decision is `engine.continuous_batch_manager(max_batch).is_ok()` — the
-> reason is discarded one line before it could be logged. So the log and the
-> capacity field tell you **which** path ran; **neither can tell you why**. A
-> run that unexpectedly reports capacity 1 is a fact you can act on and not yet
-> a diagnosis, and no log we currently ship will close that gap for you.
+> capacity field tell you **which** path ran; **neither can tell you why**, and
+> the enumeration above is something you read out of the source rather than
+> anything the running server hands you. A run that unexpectedly reports
+> capacity 1 is a fact you can act on, and the diagnosis costs you a source
+> dive that one `match` arm would have saved.
 
 **Continuous batching** (`crates/onnx-genai-engine/src/batched.rs`) keeps one
 decode batch running and edits its membership *between steps* rather than
