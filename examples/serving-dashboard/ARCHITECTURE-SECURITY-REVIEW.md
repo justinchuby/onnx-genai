@@ -257,7 +257,7 @@ Two consequences worth carrying past this PR:
 | **C7/C8** | `ServeDir` publishes the whole assets directory; no CSP header | minor | read |
 | **C5** | `may_disclose_model_paths()` keys on **bind address rather than peer** — and the demo binds `127.0.0.1` by default, so the disclosure branch is the **default path for every demo run**, not an edge case | 🔴 **LIVE AT `review-0`** · closed at HEAD by `2da3e851` (after the tag) — see §7.2 and §7.7 | executed |
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
-| **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `crates/onnx-genai-server/src/tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
+| **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `crates/onnx-genai-server/src/tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `crates/onnx-genai-server/src/state.rs`, `crates/onnx-genai-server/src/routes/admin.rs` or `crates/onnx-genai-server/src/cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
 | **C12** | ~~`fetchWithDeadline` is the only network path by discipline, not by construction; nothing asserts it~~ | **RETRACTED — false when filed. See §7.6** | executed |
 | **C15** | `fetchWithDeadline` **silently discards a caller-supplied `signal`** — `{ ...init, signal: controller.signal }` spreads the caller's key and then overwrites it. The docstring promises *"everything else is passed through to the underlying fetch untouched"*; that promise is false for the one key that controls cancellation. Executed at `review-0`: caller's `abort()` leaves the request **PENDING**. 🟡 latent — zero shipped callers pass a signal today | 🟡 NEW, latent, structural — see §8.1 | executed |
 
@@ -754,4 +754,27 @@ I repaired these by locating each symbol first and asserting the expected occurr
 before substituting, because the mechanical version of this exact repair put *"X hardcodes
 X"* into the README an hour ago. The substitution is the easy half; knowing which of ten
 `tests.rs` you meant is the whole job.
+
+### 11.1 The repair caught me one step short, twice, and both are worth recording
+
+**First:** after qualifying three citations I re-counted the bare tokens expecting zero and
+got *more than I started with*. §11 itself discusses `tests.rs` and `state.rs` by name, so
+the section warning about bare basenames manufactures bare basenames. That is @c8d9a40e's
+obituary pattern arriving inside the repair for it, and it means the ratchet I would have
+been tempted to write — *count of bare basenames must not increase* — would go red on the
+document that fixes the problem. **Separating the two required a line-number split against
+the section boundary, i.e. exactly the coordinate-based reasoning we spent the night
+proving unreliable.** The honest form of that guard scores citations, not occurrences, and
+we do not currently have one.
+
+**Second, and worse:** I resolved the last ambiguous `state.rs` by searching for
+`may_disclose_model_paths` and `bind_addr` — and got **0 in the server's `state.rs` and 0
+in the router's**. The symbol had been deleted by the C5 fix. A zero in both arms is not a
+resolution; it is an instrument that cannot see. I had already written the qualified path
+by then, and it happened to be right. I only learned it was right afterwards, from
+`effective_batch_capacity` and `default_node_id` (2 and 2 in the server, 0 in both others).
+**Note that `AppState` would not have discriminated either — 3 in the server, 5 in the
+router.** The lesson is not *check your work*; it is that **the symbol most natural to
+search for is the one the fix removed**, so resolving a citation by the defect it discusses
+is guaranteed to fail exactly when the defect has been repaired.
 
