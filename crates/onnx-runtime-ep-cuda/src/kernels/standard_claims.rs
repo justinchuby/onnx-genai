@@ -43,6 +43,9 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
         "LpNormalization" => lp_normalization(node, input_dtypes),
         "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
+        "LpPool" => lp_pool(node, input_dtypes),
+        "CenterCropPad" => center_crop_pad(node, input_dtypes),
+        "Col2Im" => col2im(node, input_dtypes),
         _ => return None,
     };
     result
@@ -119,7 +122,26 @@ fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     if input_dtypes[1] != input_dtypes[0] || input_dtypes[2] != input_dtypes[0] {
         return Err("scale and bias dtypes must match X".into());
     }
+
     Ok(())
+}
+
+fn lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+}
+
+fn center_crop_pad(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_fixed_width(input_dtypes, 0, "input")?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "shape")
+}
+
+fn col2im(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 3, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "input")?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "image_shape")?;
+    require_dtype(input_dtypes, 2, DataType::Int64, "block_shape")
 }
 
 fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

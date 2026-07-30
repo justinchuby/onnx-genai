@@ -55,6 +55,7 @@ pub mod group_normalization;
 pub mod group_query_attention;
 pub mod hardmax;
 pub mod index_share;
+pub mod index_transform;
 pub mod indexing;
 pub mod log_softmax;
 pub mod matmul;
@@ -176,6 +177,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Conv",
     "MaxPool",
     "AveragePool",
+    "LpPool",
     "Relu",
     "Sqrt",
     "Erf",
@@ -314,6 +316,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "LpNormalization",
     "InstanceNormalization",
     "GroupNormalization",
+    "CenterCropPad",
+    "Col2Im",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -758,6 +762,24 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    reg.register(
+        OpKey::new("LpPool", "", 18),
+        Box::new(pooling::LpPoolFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("CenterCropPad", "", 18),
+        Box::new(index_transform::CenterCropPadFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Col2Im", "", 18),
+        Box::new(index_transform::Col2ImFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // Elementwise unary activations (NVRTC pointwise). The loop includes the
     // contrib Gelu/Silu forms; standard Gelu is registered separately below so
