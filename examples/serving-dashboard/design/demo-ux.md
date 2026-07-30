@@ -1942,7 +1942,7 @@ Renaming it `model` would be more accurate under one server and less accurate un
 
 | # | Decision | Rationale |
 |---|---|---|
-| D59 | The prefix metric is a **windowed delta from scenario start**, never a lifetime total | A process-global denominator is inflated by traffic structurally unable to contribute to the numerator — a real number quietly corrupted, with no observable symptom |
+| ~~D59~~ | 🔴 **WITHDRAWN by @12e42da8 — see §65.** ~~The prefix metric is a windowed delta from scenario start, never a lifetime total~~ | **The reasoning was sound and the SUBJECT does not exist.** A window makes a corrupted denominator honest; it cannot make a numerator mean anything. `runtime.rs:1017-1024` computes `cross_session_hit_len` and never sets `loaded_prompt_prefix`, so **no prefill is skipped and the counter responds to nothing.** A windowed delta of a quantity that does not move with the feature is **a hero metric that animates while nothing works.** |
 | D60 | Zero lookups in the window renders **`pending`**, never `0%` | The server sends a literal `0.0` when `lookups == 0`; on the wire "no data" and "0%" are identical. Only the client can separate them |
 | D61 | The window resets on **scenario entry only** | A reset on poll failure would make a bad rate look freshly measured |
 | D62 | `server` keeps its name and carries a model id under one-server | The key was designed opaque precisely for this. A fourth revision to improve a name is churn |
@@ -2071,7 +2071,9 @@ else if (lookupsDelta === 0)       -> 'pending'          // dynamic, nothing ask
 else                               -> 'ok'               // only here may a stark 0% render
 ```
 
-Note this also **upgrades** the Mode A case from `unavailable` to `not-applicable` — correctly, since nothing is broken. And it keeps @376a0297's rule as the inner branch where it is right. Combined with §19's windowed delta, `lookupsDelta === 0` is `pending` rather than `unavailable`, because within a *dynamic* scenario the number genuinely is coming.
+Note this also **upgrades** the Mode A case from `unavailable` to `not-applicable` — correctly, since nothing is broken. And it keeps @376a0297's rule as the inner branch where it is right. ~~Combined with §19's windowed delta, `lookupsDelta === 0` is `pending` rather than `unavailable`, because within a *dynamic* scenario the number genuinely is coming.~~
+
+> 🔴 **STRUCK — THIS SENTENCE IS WHAT D59 AUTHORISED, AND IT IS THE REASON THE WITHDRAWAL NEEDED A GREP RATHER THAN AN EDIT.** With D59 withdrawn and no prefix field bindable in any form, **`pending` here would promise a number that is never coming** — the precise failure `pending` exists to prevent. **The whole derivation is moot: per @376a0297's AC81 the field is NOT BINDABLE AT ALL, so it has no state, because it has no cell.** See §65.
 
 **Standing rule I'd like added to the reviewer checklist:** *a guard keyed on a field's value can only catch faults in that field.* When a ratio is suspect, check the **numerator and denominator separately** — they usually have different provenance, and ours do: real count over hardcoded constant.
 
@@ -4110,3 +4112,42 @@ Both *"the allocator evicts"* and *"the allocator does not evict"* are wrong, be
 | D205 | When a claim is false in both directions, replace the adjective with the mechanism | Two claims a reader can verify in halves beat one they must accept whole |
 | D206 | On self-correction, grep your own document for what the old belief authorised | Learning a fact does not retract what you said before you knew it |
 | D207 | Every absence keeps its frame and states its reason | Omission is the only outcome that leaves nothing to review |
+
+---
+
+## 65. D59 WITHDRAWN — AND THE FIRST RUN OF MY OWN RETRACTION RULE (D208–D211)
+
+@12e42da8 withdrew **D59** (windowed prefix delta). Accepted without argument. **I wrote D206 twenty minutes ago — *"when I correct myself, grep my own document for what the old belief authorised"* — so this is its first live test, and it found something a strike alone would have missed.**
+
+### 65.1 D208 — THE WITHDRAWAL TOOK TWO EDITS, NOT ONE
+
+`grep D59` returns **one** line. But D59 had a **dependant** 130 lines away: §55's AC69 derivation read *"Combined with §19's windowed delta, `lookupsDelta === 0` is `pending` rather than `unavailable`, because within a dynamic scenario the number genuinely is coming."*
+
+> **D208 — WITH D59 GONE, THAT SENTENCE PROMISES A NUMBER THAT IS NEVER COMING — WHICH IS EXACTLY WHAT `pending` EXISTS TO PREVENT.** Withdrawing the premise silently **inverted** the conclusion, from "honest, the value is en route" to "a spinner for a field that will never fill." **Striking only the line named in the ruling would have left the more harmful half live**, and it does not contain the string "D59." **A retraction is a graph traversal, not a text edit — and the dependants are exactly the places where the old belief has been converted into an instruction, which is where it does damage.** Both struck in place.
+
+### 65.2 🔴 D209 — THE LEAD'S REASON IS BETTER THAN MY DESIGN, AND IT IS ABOUT THE SUBJECT, NOT THE SHAPE
+
+D59's logic was correct: a process-global denominator is inflated by traffic that cannot contribute to the numerator, so window it. **The flaw is that a window repairs a DENOMINATOR and D59's numerator means nothing.** @376a0297 verified `runtime.rs:1017-1024`: branch A computes `cross_session_hit_len` and **never sets `loaded_prompt_prefix`** — the full prompt is queued and prefill recomputes every token. **The counter has no compute saving behind it.**
+
+> **D209 — A WINDOW MAKES A CORRUPTED DENOMINATOR HONEST; IT CANNOT MAKE A NUMERATOR MEAN ANYTHING.** And the failure would have been **maximally convincing**: a windowed delta *moves*, it *resets per scenario*, it *responds to traffic* — **it would have animated beautifully while the feature did nothing.** @12e42da8's phrasing is the one to keep: **a hero metric that moves when nothing works is the worst artifact we could ship.** My repair was aimed at the half I could see, and **the half I could see was the half that was fine** — AC69's lesson (*a guard derived from an incident is shaped like the incident*) applied to my own fix.
+
+### 65.3 D210 — WE HAD A DETECTOR FOR STILLNESS AND NONE FOR SPURIOUS MOTION
+
+@376a0297's `created: now_unix()` finding closes the loop: a field that changes **every call** and is a **wall clock**.
+
+> **D210 — EVERY REFLEX THIS CREW BUILT TREATS MOTION AS EVIDENCE OF LIFE.** `stale` exists because a frozen value is suspicious; AC20 forbids a metric that cannot move; §48's treatments all trigger on absence. **A reviewer hunting fabrications scans for a literal that never changes — and both of tonight's worst fields change constantly.** The mirror rule, adopted verbatim in substance: **ask what would have to happen IN THE ENGINE for this number to move. If the answer is "nothing," it is a clock, not a measurement.** **Design consequence: a sparkline is the strongest liveness claim on the page, so no sparkline may be drawn over a series whose motion we cannot attribute to the mechanism it is captioned with.** Motion is a claim, and it is the one claim we never made anyone justify.
+
+### 65.4 D211 — "NOT BINDABLE" IS A DESIGN STATE, NOT AN ABSENCE OF ONE
+
+Adopting AC81: `prefix_cache_hits` is **not a zero to be fixed — it is a nonzero to be distrusted**, and it must NOT become a sixth enum value.
+
+> **D211 — @376a0297's reason is the design argument and I want it recorded in my own vocabulary: A `misleading` STATE WOULD STILL PUT THE NUMBER ON SCREEN WEARING A BADGE.** Every one of my five states resolves to **a cell that renders something**; the envelope's whole premise is that a field always has a presentation. **A field that must never be spoken has no state because it has no cell** — it is removed at the registry, not styled at the panel. **The five states describe fields we DISPLAY; "not bindable" is a decision made one layer above the enum, and pretending it is a state would smuggle the value back onto the page through the very system built to keep it honest.** Enforced by tripwire, per D183 — and this is why my `prefix-counters-forbidden.test.js` allowlist must reach zero rather than gain a `misleading` exemption.
+
+**AND THE STRONGEST THING IN THAT BROADCAST IS AC82, WHICH IS ABOUT TESTS, NOT FIELDS:** `prefix_speedup.rs` asserts `hit_len > 0` and that greedy output matches. **Neither asserts prefill got shorter.** Under this defect **both pass while zero work is saved** — an always-nonzero counter trivially satisfies `> 0`, and recomputing a prefix trivially yields identical output. **The shipped test for prefix speedup cannot detect the absence of prefix speedup: it tests the REPORTING of the optimisation instead of its EFFECT, and being green it was stronger evidence than no test at all.** This is my own standard — *a test that has never been shown to fail has never been shown to work* — arriving from the repo rather than from us, and it is why every mechanical check I ship gets its mutation proven red first.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D208 | A retraction is a graph traversal, not a text edit | The dependants are where the old belief became an instruction, and they never contain its name |
+| D209 | A window repairs a denominator; it cannot make a numerator mean anything | A windowed delta of a dead counter animates convincingly while the feature does nothing |
+| D210 | No sparkline over a series whose motion we cannot attribute to its captioned mechanism | Motion is our only liveness heuristic and the one claim we never made anyone justify |
+| D211 | "Not bindable" is decided above the enum, never inside it | Every state renders a cell; a sixth state would smuggle the value back on screen wearing a badge |
