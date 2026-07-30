@@ -8,8 +8,8 @@
 // claims a scheduling property it does not have.
 //
 // THE TRAP THIS PANEL AVOIDS: batch occupancy is a ratio. Its numerator
-// (`active_batch_size`) is genuinely measured; its denominator (max batch size)
-// is not surfaced by the server today. The tempting move is to read
+// (`active_batch_size`) is genuinely measured; its denominator (the engine's
+// batch limit) is not surfaced by the server today. The tempting move is to read
 // `DEFAULT_MAX_BATCH = 4` out of `state.rs:25` and divide by it. That would be
 // a fabricated measurement wearing a division sign, and it is the subtlest AC6
 // violation available anywhere on this page — the server may have been built or
@@ -17,9 +17,14 @@
 // absolute count renders as a real number with its sparkline, and the
 // PERCENTAGE renders as an em-dash until the server states its own limit.
 //
-// Adjacent to it, `rejections: 0` (a real, good zero at full contrast) sits
-// beside `preemptions: —` (an honest absence). That single line is the clearest
-// teaching example of the unavailable-data language anywhere in the UI.
+// `rejections: 0` is a real, good zero and renders at full contrast — the
+// clearest example on the page that a measured zero is not an absence.
+//
+// PREEMPTION IS NOT SHOWN AT ALL, and that is a ruling rather than an omission.
+// ContinuousBatchManager holds no Scheduler, so preemption is not disabled --
+// the component is absent. A counter pinned at zero would read as a HEALTHY
+// SYSTEM ("nothing was preempted") rather than as an impossible field, which is
+// the one misreading an honest absence cannot correct.
 
 import { isRenderable, numericValueOf, ratioField } from './field-state.js';
 import {
@@ -101,7 +106,6 @@ export default function mount(rootElement, telemetryStore) {
     const batchSize = telemetryStore.field('batch.active_size');
     const maxBatch = telemetryStore.field('scheduler.max_batch');
     const queueDepth = telemetryStore.field('queue.depth');
-    const preemptions = telemetryStore.field('scheduler.preemptions_total');
     const rejections = telemetryStore.field('admission.rejections');
     const allocationFailures = telemetryStore.field('kv.allocation_failures');
 
@@ -115,7 +119,6 @@ export default function mount(rootElement, telemetryStore) {
     replaceChildren(queue, [renderQueueSummary(telemetryStore, queueDepth)]);
 
     replaceChildren(footer, [
-      metricRow('preemptions', withReason(preemptions, REASONS.NO_PREEMPTION_COUNTER)),
       metricRow('rejections', rejections),
       renderAllocationFailures(allocationFailures),
     ]);
@@ -135,7 +138,6 @@ export default function mount(rootElement, telemetryStore) {
       batchSize,
       maxBatch,
       queueDepth,
-      preemptions,
       rejections,
     });
   };
@@ -189,7 +191,7 @@ function renderOccupancy(batchSize, maxBatch) {
 
   if (isRenderable(maxBatch)) {
     row.append(element('span', { className: 'occupancy__of', text: 'of' }));
-    row.append(renderField(maxBatch, { label: 'Maximum batch size' }));
+    row.append(renderField(maxBatch, { label: 'Batch limit' }));
     row.append(element('span', { className: 'occupancy__max-label', text: 'max' }));
     row.append(renderField(percentage, { label: 'Batch occupancy' }));
     row.append(renderCapacityBar(batchSize, maxBatch));
@@ -341,12 +343,11 @@ function buildDescription(fields) {
         'batch limit, so occupancy as a percentage is not available.',
     );
   } else {
-    parts.push('Batch size is not measurable yet.');
+    parts.push('The engine does not report how many sequences it stepped together.');
   }
 
   parts.push(`${describeFieldText('Queue depth', fields.queueDepth)}.`);
   parts.push(`${describeFieldText('Rejections', fields.rejections)}.`);
-  parts.push(`${describeFieldText('Preemptions', fields.preemptions)}.`);
   return parts.join(' ');
 }
 

@@ -69,11 +69,9 @@ export const REASONS = Object.freeze({
     'KV page statistics are computed by the engine but not yet exposed over HTTP. ' +
     '`Engine::page_usage()` exists; the server does not call it.',
   DEBUG_GATED: 'Requires debug endpoints. Restart the server with `--enable-debug-endpoints`.',
-  NO_PREEMPTION_COUNTER:
-    'The scheduler performs preemption but keeps no counter for it. Not measurable today.',
   NO_MAX_BATCH:
-    "Occupancy needs the server's max batch size, which isn't surfaced. " +
-    "The current batch size is real; the denominator isn't.",
+    "Occupancy needs the engine's batch limit, which the server does not " +
+    'surface. The sequence count is real; the denominator is not.',
   STATUS_DOCUMENTED_ZERO:
     '`/v1/status` reports this as a documented zero — the server records cumulative token ' +
     'totals only. This page derives throughput client-side instead.',

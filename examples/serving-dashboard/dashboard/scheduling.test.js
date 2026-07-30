@@ -8,6 +8,7 @@
 // nobody reported.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { after, before, describe, it } from 'node:test';
 
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
@@ -133,40 +134,42 @@ describe('scheduling panel — the batch occupancy denominator', () => {
 });
 
 describe('scheduling panel — a real zero next to an honest absence', () => {
-  it('renders rejections 0 as a number and preemptions as an em-dash, in the same row group', () => {
-    // demo-ux.md §5.3 calls this the clearest teaching example of the
-    // unavailable-data language anywhere in the UI. It must not regress.
+  it('renders rejections 0 as a real number, not as an absence', () => {
+    // demo-ux.md §5.3: a measured zero is a FINDING and renders at full
+    // contrast. The panel's job here is to make "nothing was rejected"
+    // visibly different from "we cannot tell you".
     const { root, handle } = mountPanel(storeWith());
 
     const footer = root.findByClass('panel-scheduling__footer');
-    const rows = footer.children;
-    const rejectionsRow = rows.find((row) => row.textContent.includes('rejections'));
-    const preemptionsRow = rows.find((row) => row.textContent.includes('preemptions'));
+    const rejectionsRow = footer.children.find((row) => row.textContent.includes('rejections'));
 
     assert.equal(rejectionsRow.findByClass('value').getAttribute('data-state'), 'measured');
     assert.match(rejectionsRow.findByClass('value__num').textContent, /^0$/);
-    assert.equal(preemptionsRow.findByClass('value').getAttribute('data-state'), 'unavailable');
-    assert.equal(preemptionsRow.findByClass('value__num--unavailable').textContent, '—');
     handle.unmount();
   });
 
-  it('supplies a reason for preemptions even if the store forgot to attach one', () => {
-    const { root, handle } = mountPanel(
-      storeWith({
-        fields: {
-          'scheduler.preemptions_total': { value: null, state: 'unavailable', source: 'server' },
-        },
-      }),
-    );
-
-    const footer = root.findByClass('panel-scheduling__footer');
-    const row = footer.children.find((child) => child.textContent.includes('preemptions'));
-    assert.match(
-      row.findByClass('value').getAttribute('title'),
-      /keeps no counter for it/,
-      'every em-dash must have something to say when a visitor reaches for it',
+  it('RATCHET — preemption is absent from the panel entirely, not shown as an em-dash', () => {
+    // RULING (final, after one round of pushback from me): preemption is not
+    // merely uncounted, the COMPONENT IS ABSENT — ContinuousBatchManager holds
+    // no Scheduler field at all. An em-dash says "we cannot measure this yet",
+    // which implies the mechanism exists and might fill in. Worse, a counter
+    // pinned at 0 reads as a HEALTHY SYSTEM ("nothing was preempted") rather
+    // than as an impossible field, and that is the one misreading an honest
+    // absence cannot correct. So the row does not ship in any form.
+    const { root, handle } = mountPanel(storeWith());
+    assert.ok(
+      !root.textContent.toLowerCase().includes('preempt'),
+      'the word "preempt" must not appear anywhere in the scheduling panel',
     );
     handle.unmount();
+
+    // Belt and braces: the binding must be gone from SOURCE, so it cannot
+    // return via a store that happens to publish the field.
+    const source = readFileSync(`${import.meta.dirname}/scheduling.js`, 'utf8');
+    assert.ok(
+      !/preemptions_total/.test(source),
+      'scheduling.js must not bind scheduler.preemptions_total',
+    );
   });
 
   it('escalates allocation failures with a word, not only a colour (AC25)', () => {
@@ -234,7 +237,10 @@ describe('scheduling panel — describe() for AC28', () => {
 
     const text = handle.describe();
     assert.match(text, /does not report a batch limit/);
-    assert.match(text, /Preemptions is not measurable yet/);
+    assert.ok(
+      !/preempt/i.test(text),
+      'the spoken description must not raise preemption either (see RATCHET above)',
+    );
     handle.unmount();
   });
 

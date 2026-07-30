@@ -398,6 +398,36 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
         'client-side substitute either: the TTFT delta measures the same absent effect.',
     },
     {
+      // `prefix_hashes` is NOT in the prefix_cache.* namespace, so the ban
+      // above never covered it. It is the same story wearing a different name:
+      // /v1/status publishes a `prefix_hashes` array, and a panel showing how
+      // many prefixes are "cached" asserts reuse that the controlled A/B
+      // disproved. Named separately because the namespace ban was shaped like
+      // the counters we found, not like the fault.
+      pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*prefix_hashes[\w.]*['"`]/i,
+      what: 'status.prefix_hashes',
+      why:
+        'it names the same disproven mechanism from outside the prefix_cache namespace. ' +
+        'A count of tracked prefixes reads as evidence of reuse, and reuse was measured ' +
+        'and found absent on both execution paths.',
+      instead: 'nothing — no prefix field ships in any form, on either server.',
+    },
+    {
+      // A bare `hit_rate` on any namespace. The prefix ratio is the one we
+      // caught, but the shape is what is dangerous: every hit-rate on this
+      // server divides a real count by a denominator that counts something
+      // else, and the ruling is to audit numerator and denominator separately
+      // because they usually have different provenance.
+      pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*hit_rate[\w.]*['"`]/i,
+      what: 'any hit_rate field',
+      why:
+        'the only hit-rate on the wire divides hits (a statically-dead numerator) by ' +
+        'lookups (which increments once per COMPLETED GENERATION, so it would read 135 ' +
+        'with the cache deleted). A ratio of two differently-wrong numbers is the most ' +
+        'authoritative-looking value we could put on screen.',
+      instead: 'nothing. If a future rate is real, bind its numerator and denominator separately.',
+    },
+    {
       pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*tokens_per_second['"`]/,
       what: 'status.tokens_per_second',
       why: 'the server hardcodes it to a literal 0.0 (routes/admin.rs:63) — it is a stub, not a measurement.',
@@ -450,6 +480,16 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
       "telemetryStore.field('prefix_cache.time_saved_ms')",
       "telemetryStore.series('prefix_cache.hits', WINDOW_MS)",
       "const tps = telemetryStore.field('status.tokens_per_second');",
+      // prefix_hashes — lives OUTSIDE the prefix_cache namespace and was
+      // uncovered until now. It is on the live /v1/status payload, so it is
+      // the single most likely poisoned field for someone to bind by accident.
+      "const hashes = telemetryStore.field('status.prefix_hashes');",
+      'const hashes = store.field(`prefix_hashes`);',
+      "telemetryStore.series('status.prefix_hashes', WINDOW_MS)",
+      "telemetryStore.field('kv.prefix_hashes_tracked')",
+      // A hit_rate on any namespace, not just prefix_cache.
+      "telemetryStore.field('cache.hit_rate')",
+      "telemetryStore.field('kv.block_hit_rate')",
     ];
     for (const line of wouldBind) {
       assert.ok(
@@ -471,6 +511,83 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
         !FORBIDDEN.some((entry) => entry.pattern.test(line)),
         `tripwire fired on a legitimate binding: ${line}`,
       );
+    }
+  });
+});
+
+// AC59 — THE WORDS "BATCH SIZE" MUST NEVER REACH THE SCREEN.
+//
+// Not a style rule. `onnx_genai_batch_size_current` is NAMED "batch size" and
+// documented "Current generation batch size", and it is neither: it is
+// fetch_add(1) on generation start, decremented in Drop, so it counts HTTP
+// requests in flight and never consults ContinuousBatchManager. Fire 8
+// concurrent requests at max_batch=4 and it reads 8.
+//
+// So the phrase is ambiguous between a number we can measure (sequences the
+// engine stepped) and a number we cannot, and a viewer cannot tell which one a
+// label means. Every on-screen string names what it actually counts instead.
+// This lint reads STRING LITERALS ONLY — comments (including this one) and
+// identifiers are unaffected, because explaining the trap is the panel's job.
+describe('AC59 — "batch size" never appears in UI copy', () => {
+  const BANNED = /batch[\s_-]*size/i;
+
+  // Extract single/double/backtick literals from comment-stripped source.
+  const STRING_LITERAL = /'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+
+  // `${fields.batchSize.value}` is an IDENTIFIER, not copy — it renders as the
+  // number, never as the word. Interpolations are stripped so the lint reads
+  // what reaches the screen rather than the code that produces it. Without
+  // this, the lint's own first run flagged two honest strings, which is how it
+  // was found: the check must be aimed at the rendered text, not the source.
+  const stringLiteralsOf = (source) =>
+    (stripComments(source).match(STRING_LITERAL) ?? []).map((literal) =>
+      literal.replace(/\$\{[^}]*\}/g, ''),
+    );
+
+  it('no rendered string in any panel says "batch size"', () => {
+    const offenders = [];
+    for (const file of sourceFiles()) {
+      const source = readFileSync(`${DASHBOARD_DIR}${file}`, 'utf8');
+      for (const literal of stringLiteralsOf(source)) {
+        if (BANNED.test(literal)) offenders.push(`${file}: ${literal}`);
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      `AC59: "batch size" is ambiguous between the engine batch and the ` +
+        `in-flight request gauge. Name what the number counts:\n${offenders.join('\n')}`,
+    );
+  });
+
+  it('MUTATION TEST — the lint fires on every spelling it must catch', () => {
+    const wouldFail = [
+      "label: 'Maximum batch size'",
+      "parts.push('Batch size is not measurable yet.')",
+      '`current batch size is real`',
+      "'BATCH SIZE'",
+      "'batch-size'",
+      "'batch_size'",
+    ];
+    for (const literal of wouldFail) {
+      assert.ok(BANNED.test(literal), `AC59 lint missed: ${literal}`);
+    }
+
+    // Must NOT fire on the permitted vocabulary — these are the replacements
+    // actually shipping, and a lint that also banned them would be unusable.
+    const permitted = [
+      "'Batch limit'",
+      "'Sequences in the current batch'",
+      "'Batch occupancy'",
+      "'Generations in flight'",
+      "'The engine does not report how many sequences it stepped together.'",
+      // Interpolated identifiers are code, not copy. These two are real
+      // strings from scheduling.js that the lint flagged on its first run.
+      '`Batch occupancy  of  slots.`',
+      '` sequences in the current batch; the server does not report a `',
+    ];
+    for (const literal of permitted) {
+      assert.ok(!BANNED.test(literal), `AC59 lint over-fired on: ${literal}`);
     }
   });
 });
