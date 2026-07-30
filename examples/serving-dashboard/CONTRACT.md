@@ -522,8 +522,12 @@ exists rather than as a second copy of it.
 > - **One glob.** `dashboard/` holds roughly half the suite. One glob silently
 >   omitted all of it.
 > - **Two globs.** Also wrong, and this is the instructive one: `'*.test.js'
->   'dashboard/*.test.js'` reaches **583 of 588** tests, because `ui/` is a
->   third test directory. Four reviewers independently proposed exactly that
+>   'dashboard/*.test.js'` silently omits an entire test directory, `ui/`.
+>   The size of the miss is the only stable part: **583 of 588 at `c71ed21e`,
+>   595 of 600 at `10537446`** -- the totals drift with every commit and the
+>   *gap* does not. Any absolute count written here is false within the hour,
+>   which is why the runner asserts a floor and prints its own numbers instead
+>   of this paragraph promising them. Four reviewers independently proposed exactly that
 >   two-glob fix and **all four missed `ui/`** — so the script *discovers* test
 >   files instead of listing them. A hardcoded list stops covering whatever was
 >   added last, which is always the thing most likely to be wrong.
