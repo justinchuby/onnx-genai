@@ -1165,7 +1165,7 @@ lives:
 | `dashboard/honesty.test.js` | ❌ wrong file type — **assertion message** |
 | `dashboard/registry.test.js` | ❌ wrong file type |
 | `check-perf-claims.test.js` (the guard itself) | ❌ wrong file type |
-| `READABILITY-REVIEW.md` | ✅ in scope — and clean |
+| `READABILITY-REVIEW.md` | ✅ in scope — carries no withdrawn timing figure |
 
 The corpus is `git ls-files '*.md'` minus two named files minus `design/`. **Of the files carrying the
 figure, every one is unreachable except the one that does not carry the defect.** The guard's own
@@ -1556,3 +1556,125 @@ Per F20 this is the wide scope. The narrow `dashboard/` scope is 289 and exclude
 **This is the dashboard suite only.** F1 is a Rust blocker in `driver.rs` and no
 node suite at any scope will ever surface it. A green board here is not a green
 product.
+
+## F21 (MAJOR, new) — one quantity, two namespaces, neither side knowing the other exists
+
+Locate by symbol, not by line: `git grep -nF "'metrics.e2e_latency'" -- telemetry-provenance.js`.
+
+```
+telemetry-provenance.js   'metrics.e2e_latency'   classification: 'MEASURED'
+                          metric: 'onnx_genai_e2e_request_latency_seconds'
+  consumers in shipped JS ..................................... 0
+  (the only hit is its own definition)
+
+dashboard/throughput.js   asks for prefix 'latency.e2e_server'
+  occurrences in the catalogue ................................ 0
+```
+
+Executed against three live origins (`:9451`, `:9452`, `:8133`): **17 series each, with real
+observations** — `:8133` reports `_count 46`, `_sum 1461.96`, a mean of ~31.8 s. The metric is
+plumbed, served, and carrying data. The panel renders an em-dash over it.
+
+**A producer with no consumer and a consumer with no producer, describing the same quantity, in
+one repository.** This is the only defect found in this review that fails in *our* favour — every
+other one over-claimed; this one hides a real measurement. It was findable only because someone
+asked the question in the other direction: we had searched the consumer's vocabulary and concluded
+the producer did not exist.
+
+### Do not "just rename the key"
+
+`metrics.e2e_latency` is a **full-generation** latency — the catalogue says so itself: *observed in
+`Drop for GenerationMetrics`, so it covers the full generation lifetime.* The row that would
+consume it sits in a panel captioned `Throughput & latency` beside TTFT/ITL/TPOT, which are
+per-token quantities in the millisecond range. Wiring the two together puts `31.78 s` next to
+numbers ~1000× smaller, correctly formatted, under a caption that makes it false.
+
+That is the same caption-versus-value defect as `Directory` and `Batch limit`, and it would be the
+worst instance of the three: the others show a wrong *label*, which a reader can dispute. This one
+shows a plausible *number*, which a reader cannot. The audience sees a slow server.
+
+The correct fix is its own row with its own caption. The catalogue's existing label —
+`'End-to-end latency (mean)'` — is already right.
+
+## F22 (MINOR, new) — `fetchWithDeadline` promises pass-through and silently overwrites `signal`
+
+`request-deadline.js` is the best code reviewed in this pass, and this is the one seam in it. Its
+JSDoc describes the options object as passed through to `fetch`. It is — except for `signal`, which
+the wrapper constructs from its own `AbortController` and writes over any caller-supplied value.
+
+No current caller passes one, so this is latent, not live. It is filed because the failure mode is
+silent and arrives at the worst moment: the first caller that wants *both* a deadline and its own
+cancellation gets the deadline only, with no error and no warning, and the bug surfaces as a
+request that would not cancel. Either compose the two signals or document that `signal` is owned by
+the wrapper. Naming it costs a line; discovering it costs an afternoon.
+
+## B1 — a regression caught after the review tag, and fixed inside eight minutes
+
+Recorded because the *shape* is reusable, not because the bug is interesting.
+
+`telemetry-store.test.js` was **60 pass / 0 fail at `review-0` (`6ecd9183`)** and **5 fail** eight
+minutes later. The commit between them was a genuinely good refactor — it hoisted three hand-rolled
+`{source, unit}` literals into one `catalogueMeta()` helper, fixing a real defect where every field
+on a no-data frame dropped its `label` and rendered as the literal word `"value"`. For
+never-measurable fields there is no second frame, so a documented zero announced itself as `"value"`
+permanently.
+
+The collateral was that the per-origin catalogue resolution changed which arm the
+`pending` / never-measured ternary selected. The four surviving failures were not four bugs:
+
+```
+:639   the same zero means opposite things on the two servers
+:926   a hit rate with zero lookups is undefined, not 0%
+:949   a hit rate with real lookups and no hits IS a measured 0%
+:1386  the same field IS pending on the first frame of the dynamic server
+```
+
+**One invariant, asserted from four directions by an author who knew how fragile it was** —
+`:926`/`:949` a matched pair on undefined-zero versus measured-zero, `:639`/`:1386` a matched pair
+on same-bytes-two-origins. That is the same defect the Rust server documents as *"a zero ratio and
+'no batch has ever run' are the same bytes"*, and the same one the router re-creates on
+deserialisation with bare `serde(default)`. **Three layers, three languages, three authors, one
+solved problem re-created each time.** Nobody anywhere can spell *I have no value* without reaching
+for a number that already means something.
+
+Resolved at 64 pass / 0 fail — fixed *and* the suite grew 60 → 62 → 64. The fix added coverage
+rather than deleting the assertions that caught it, which is the right direction and worth naming.
+
+### The process finding, which outlives the bug
+
+The regression author added **68 lines of new, passing tests to the very file they broke**. They
+validated the behaviour they added and never ran the file they edited. The runner that catches this
+(`run-tests.sh`) had already landed. It was not run.
+
+`review-0` was green while the branch was red, and nothing re-scores a tag when the branch moves
+past it. Reviewing from a tag solves drift and creates this. One line closes it: **run
+`bash run-tests.sh` before landing and put its `PASS:` line in the report.**
+
+## Correction: C2 is closed, and two reviewers' boards say otherwise
+
+Measured by outcome, not by marker — a marker tied to one implementation cannot detect a different
+and better implementation of the same outcome:
+
+```
+app.js               :18  import { fetchWithDeadline } from './request-deadline.js';
+                    :189  await fetchWithDeadline(new URL('/health', location.origin), {…})
+telemetry-store.js   :44 / :448   same helper, same import
+bare fetch( in either file ................................... 0
+control: request-deadline.js exists at HEAD ✅ · its own suite 7/7 ✅
+```
+
+`app.js:180` is not bare and has not been since `6ecd9183`. Any verdict still carrying it as a
+blocker is scoring a fix that landed.
+
+## Self-audit of this document, and the instrument that flattered it
+
+Run at another reviewer's instruction: `grep -cF` six of this review's findings against this file.
+The instrument returned 5 of 6. Opening every hit returned **3 confirmed, 1 false positive, 1
+unverified, 1 genuinely absent**.
+
+The false positive was `e2e_latency`, which appears in a list of catalogue keys — byte-identical to
+the same string appearing in a finding. **A `grep -c` audit of a frame-blind corpus is itself
+frame-blind, and it fails toward *you are fine*.** A narrow red gets argued down by the next reader;
+a narrow green stops the next reader looking.
+
+F21 and F22 above close the two real gaps that audit exposed.
