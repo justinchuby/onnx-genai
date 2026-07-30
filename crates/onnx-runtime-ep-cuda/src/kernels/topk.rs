@@ -1,4 +1,4 @@
-//! Deterministic f32 `TopK`, optimized for small router K values.
+//! Deterministic floating-point `TopK`, optimized for small router K values.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,9 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 __device__ bool before(float a, float b, long long ia, long long ib, int largest) {
   int ka = __float_as_int(a);
   int kb = __float_as_int(b);
@@ -20,8 +23,10 @@ __device__ bool before(float a, float b, long long ia, long long ib, int largest
   if (ka == kb) return ia < ib;
   return largest ? ka > kb : ka < kb;
 }
-extern "C" __global__ void topk_f32(
-    const float* input, float* values, long long* indices,
+
+template <typename T>
+__device__ void topk_float(
+    const T* input, T* values, long long* indices,
     unsigned long long slices, unsigned long long width,
     unsigned long long inner, unsigned long long k, int largest) {
   for (unsigned long long slice = blockIdx.x * blockDim.x + threadIdx.x; slice < slices;
@@ -30,22 +35,46 @@ extern "C" __global__ void topk_f32(
     for (unsigned long long out = 0; out < k; ++out) {
       long long best_index = -1;
       float best = 0.0f;
+      T best_value{};
       for (unsigned long long candidate = 0; candidate < width; ++candidate) {
         bool used = false;
         for (unsigned long long prior = 0; prior < out; ++prior)
           if (indices[(outer * k + prior) * inner + i] == (long long)candidate) used = true;
         if (used) continue;
-        float value = input[(outer * width + candidate) * inner + i];
+        T raw_value = input[(outer * width + candidate) * inner + i];
+        float value = static_cast<float>(raw_value);
         if (best_index < 0 || before(value, best, (long long)candidate, best_index, largest)) {
           best = value;
+          best_value = raw_value;
           best_index = (long long)candidate;
         }
       }
       unsigned long long offset = (outer * k + out) * inner + i;
-      values[offset] = best;
+      values[offset] = best_value;
       indices[offset] = best_index;
     }
   }
+}
+
+extern "C" __global__ void topk_f32(
+    const float* input, float* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  topk_float(input, values, indices, slices, width, inner, k, largest);
+}
+
+extern "C" __global__ void topk_f16(
+    const __half* input, __half* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  topk_float(input, values, indices, slices, width, inner, k, largest);
+}
+
+extern "C" __global__ void topk_bf16(
+    const __nv_bfloat16* input, __nv_bfloat16* values, long long* indices,
+    unsigned long long slices, unsigned long long width,
+    unsigned long long inner, unsigned long long k, int largest) {
+  topk_float(input, values, indices, slices, width, inner, k, largest);
 }
 "#;
 
@@ -109,8 +138,14 @@ impl Kernel for TopKKernel {
         {
             return Err(not_implemented("TopK with non-contiguous tensors"));
         }
-        if input.dtype != DataType::Float32 || outputs[0].dtype != DataType::Float32 {
-            return Err(not_implemented("TopK currently supports Float32 values"));
+        if !matches!(
+            input.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || outputs[0].dtype != input.dtype
+        {
+            return Err(not_implemented(
+                "TopK currently supports matching Float32, Float16, or BFloat16 values",
+            ));
         }
         if outputs[1].dtype != DataType::Int64 {
             return Err(EpError::KernelFailed(
@@ -194,9 +229,15 @@ impl Kernel for TopKKernel {
         let inner = input.shape[axis + 1..].iter().product::<usize>();
         let outer = input.shape[..axis].iter().product::<usize>();
         let slices = outer * inner;
-        let func = self.runtime.nvrtc_function("topk", SOURCE, "topk_f32")?;
-        let input_ptr = cuptr(input.data_ptr::<f32>() as *const c_void);
-        let values_ptr = cuptr(outputs[0].data_ptr_mut::<f32>() as *const c_void);
+        let function = match input.dtype {
+            DataType::Float32 => "topk_f32",
+            DataType::Float16 => "topk_f16",
+            DataType::BFloat16 => "topk_bf16",
+            _ => unreachable!("dtype validated above"),
+        };
+        let func = self.runtime.nvrtc_function("topk", SOURCE, function)?;
+        let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+        let values_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let indices_ptr = cuptr(outputs[1].data_ptr_mut::<i64>() as *const c_void);
         let slices = slices as u64;
         let width = width as u64;

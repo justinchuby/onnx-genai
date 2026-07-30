@@ -380,6 +380,20 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
         .collect()
 }
 
+fn f16s(bytes: &[u8]) -> Vec<f16> {
+    bytes
+        .chunks_exact(2)
+        .map(|v| f16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())))
+        .collect()
+}
+
+fn bf16s(bytes: &[u8]) -> Vec<bf16> {
+    bytes
+        .chunks_exact(2)
+        .map(|v| bf16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())))
+        .collect()
+}
+
 #[test]
 fn topk_non_final_axes_match_cpu_layout_and_are_deterministic() {
     let axis_zero = || {
@@ -467,6 +481,57 @@ fn topk_deepseek_router_k6_of_64_is_deterministic() {
     );
     assert_eq!(f32s(&out[0]), vec![10., 10., 10., 10., 10., 9.]);
     assert_eq!(i64s(&out[1]), vec![10, 21, 32, 43, 54, 9]);
+}
+
+#[test]
+fn topk_fp16_and_bf16_router_values_match_cpu_order() {
+    let input = [4.0_f32, 7.0, 7.0, -2.0, 6.0];
+    let expected_indices = vec![1, 2, 4];
+
+    let fp16_input = input.map(f16::from_f32);
+    let fp16_inputs = [
+        tensor(DataType::Float16, &[1, 5], &fp16_input),
+        tensor(DataType::Int64, &[], &[3_i64]),
+    ];
+    let fp16_outputs = [
+        (DataType::Float16, vec![1, 3]),
+        (DataType::Int64, vec![1, 3]),
+    ];
+    let attrs = [("axis", Attribute::Int(-1))];
+    let fp16_out = run("TopK", 10, &fp16_inputs, &fp16_outputs, &attrs);
+    assert_eq!(
+        fp16_out,
+        run_cpu("TopK", 10, &fp16_inputs, &fp16_outputs, &attrs)
+    );
+    assert_eq!(
+        f16s(&fp16_out[0]),
+        vec![f16::from_f32(7.0), f16::from_f32(7.0), f16::from_f32(6.0)]
+    );
+    assert_eq!(i64s(&fp16_out[1]), expected_indices);
+
+    let bf16_input = input.map(bf16::from_f32);
+    let bf16_inputs = [
+        tensor(DataType::BFloat16, &[1, 5], &bf16_input),
+        tensor(DataType::Int64, &[], &[3_i64]),
+    ];
+    let bf16_outputs = [
+        (DataType::BFloat16, vec![1, 3]),
+        (DataType::Int64, vec![1, 3]),
+    ];
+    let bf16_out = run("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs);
+    assert_eq!(
+        bf16_out,
+        run_cpu("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs)
+    );
+    assert_eq!(
+        bf16s(&bf16_out[0]),
+        vec![
+            bf16::from_f32(7.0),
+            bf16::from_f32(7.0),
+            bf16::from_f32(6.0)
+        ]
+    );
+    assert_eq!(i64s(&bf16_out[1]), expected_indices);
 }
 
 #[test]
