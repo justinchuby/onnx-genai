@@ -308,3 +308,73 @@ test('app.js applies the citation transform rather than the raw evidence', () =>
       'every other cell in the row would still be correct.',
   );
 });
+
+// ─── A TOP-LEVEL CLASSIFICATION IS WHAT THE LEAST-INFORMED READER SEES ───────
+//
+// `resolveForOrigin(entry, origin)` returns an override ONLY when `origin` is
+// truthy and names a declared arm. Every other case -- a null origin before
+// /health resolves, or a server that is neither `scatter` nor `dynamic` --
+// renders the TOP-LEVEL classification.
+//
+// So an entry whose every declared arm disqualifies it, while its top level
+// says MEASURED, shows its most confident claim to the reader who has the
+// LEAST information about which server answered. Two entries shipped exactly
+// that: `prefix_cache.hits` and `metrics.prefix_cache_hits`, the second found
+// only by censusing the register rather than by searching for the first.
+//
+// WHY THIS IS A RULE AND NOT TWO FIXES: the defect is invisible at the site.
+// Each arm is individually correct and carefully reasoned, and the top-level
+// line reads as a harmless default. It is only wrong in relation to its arms,
+// which is precisely the shape no code review catches by reading a diff.
+
+function entriesWithClassifiedArms() {
+  return Object.entries(PROVENANCE).filter(([, entry]) => {
+    const arms = Object.values(entry?.byOrigin ?? {});
+    return arms.length > 0 && arms.every((arm) => arm && arm.classification);
+  });
+}
+
+test('no top-level classification is contradicted by every one of its origins', () => {
+  const offenders = entriesWithClassifiedArms()
+    .filter(([, entry]) =>
+      Object.values(entry.byOrigin).every((arm) => arm.classification !== entry.classification),
+    )
+    .map(([key, entry]) => {
+      const arms = Object.entries(entry.byOrigin)
+        .map(([origin, arm]) => `${origin}=${arm.classification}`)
+        .join(' ');
+      return `  ${key}: top-level ${entry.classification}, but ${arms}`;
+    });
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'A top-level classification that every origin overrides is a claim true on no ' +
+      'server we point at, and it is what renders when the origin is unknown — to the ' +
+      'reader with the least information. State what is true EVERYWHERE at the top ' +
+      'level and let each arm make it more specific:\n' +
+      offenders.join('\n'),
+  );
+});
+
+test('CAN RUN: entries with per-origin classifications exist, so the check above is not vacuous', () => {
+  // Without this, deleting `byOrigin` from the whole register would make the
+  // assertion above pass over an empty list — a green earned by having nothing
+  // left to check, which is the failure this suite exists to refuse.
+  const denominator = entriesWithClassifiedArms();
+  assert.ok(
+    denominator.length >= 3,
+    `expected at least 3 entries with fully-classified origin arms, found ${denominator.length}`,
+  );
+
+  // And the predicate must be able to say NO. A checker that cannot fail is not
+  // a checker, and every arm above would pass against a broken one.
+  const contrived = {
+    classification: 'MEASURED',
+    byOrigin: { scatter: { classification: 'MISATTRIBUTED' }, dynamic: { classification: 'NOT_PLUMBED' } },
+  };
+  assert.ok(
+    Object.values(contrived.byOrigin).every((a) => a.classification !== contrived.classification),
+    'the offender predicate failed to flag a hand-built offender',
+  );
+});

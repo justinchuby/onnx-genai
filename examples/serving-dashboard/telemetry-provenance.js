@@ -453,7 +453,21 @@ export const PROVENANCE = Object.freeze({
   'prefix_cache.hits': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_hits',
-    classification: 'MEASURED',
+    // ⛔ NOT `MEASURED`, AND THE TOP LEVEL IS NOT DECORATION.
+    // `resolveForOrigin(entry, origin)` returns an override ONLY when `origin`
+    // is truthy AND names a declared arm. A null origin -- before the first
+    // /health resolves, or on any server that is neither `scatter` nor
+    // `dynamic` -- renders THIS line. Both declared arms disqualify this
+    // counter, so `MEASURED` here was a claim true on no server we have ever
+    // pointed at, shown to exactly the reader who had the least information.
+    //
+    // MISATTRIBUTED rather than STRUCTURALLY_BYPASSED because the defect is
+    // ORIGIN-INDEPENDENT: metrics.rs:232-237 scores exactly one hit for any
+    // nonzero match on every server, so the counter counts the wrong thing
+    // wherever it runs. `scatter` then SHARPENS this to STRUCTURALLY_BYPASSED,
+    // which is the correct direction for an override -- the top level states
+    // what is true everywhere and an arm may only make it more specific.
+    classification: 'MISATTRIBUTED',
     unit: 'count',
     evidence:
       'crates/onnx-genai-server/src/routes/admin.rs:132 (snapshot.prefix_cache_hits) — a real ' +
@@ -718,7 +732,13 @@ export const PROVENANCE = Object.freeze({
     source: ENDPOINTS.METRICS,
     metric: 'onnx_genai_prefix_cache_hits_total',
     kind: 'scalar',
-    classification: 'MEASURED',
+    // ⛔ NOT `MEASURED`, for the same reason as `prefix_cache.hits` above and
+    // found the same way: a census of the register, not a search for this key.
+    // Both declared arms disqualify this counter, so a null or unrecognised
+    // origin rendered a classification true on no server we have ever pointed
+    // at. The miscount is origin-independent (metrics.rs:232-237 scores one hit
+    // for any nonzero match); `scatter` sharpens it to STRUCTURALLY_BYPASSED.
+    classification: 'MISATTRIBUTED',
     unit: 'count',
     evidence:
       'crates/onnx-genai-server/src/metrics.rs:136-138 — incremented when prefix_cache_hit_len > 0.',
