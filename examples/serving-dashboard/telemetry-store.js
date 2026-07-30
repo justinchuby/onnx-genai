@@ -163,7 +163,7 @@ export function createTelemetryStore({
   const subscribers = new Set();
 
   /** @type {TelemetrySnapshot} */
-  let snapshot = initialSnapshot(baseUrl, now());
+  let snapshot = initialSnapshot(baseUrl, now(), origin);
 
   let running = false;
   /** True while a poll cycle is in flight. Guarantees at most one outstanding
@@ -760,9 +760,7 @@ export function createTelemetryStore({
       // Client-derived fields are produced after this loop, from other fields.
       if (entry.derived) continue;
 
-      const suppressed =
-        entry.classification === 'STRUCTURALLY_BYPASSED' ||
-        NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification);
+      const suppressed = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification);
 
       if (suppressed) {
         // Do NOT return here without looking at the wire first. This table is a
@@ -793,10 +791,7 @@ export function createTelemetryStore({
           continue;
         }
 
-        fields[key] =
-          entry.classification === 'STRUCTURALLY_BYPASSED'
-            ? notApplicableField(entry.reason, fieldMeta(entry))
-            : unavailableField(entry.reason, fieldMeta(entry));
+        fields[key] = neverMeasuredField(entry, fieldMeta(entry));
         continue;
       }
 
@@ -1028,7 +1023,7 @@ export function createTelemetryStore({
       // Never-measurable fields keep their permanent explanation — it is true
       // regardless of whether the server is up.
       aged[key] = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)
-        ? unavailableField(entry.reason, { source: entry.source, unit: entry.unit })
+        ? neverMeasuredField(entry, { source: entry.source, unit: entry.unit })
         : pendingField(
             `The server at ${baseUrl} is not responding, so no measurement has arrived for this ` +
               'field yet. It will fill in when the server returns.',
@@ -1063,21 +1058,48 @@ export function createTelemetryStore({
 }
 
 /**
+ * Build the field for a classification that can never yield a number.
+ *
+ * The mapping from classification to state lived in three places and had
+ * already drifted in two of them, which is exactly the failure this collapses:
+ * a bypassed field rendered `not-applicable` after a poll, `unavailable` on the
+ * first frame, and `pending` when the server was down -- three answers for one
+ * unchanging architectural fact, depending only on WHEN you looked.
+ *
+ * The distinction it encodes is the one @0837fdf9 and the Lead both insist on:
+ * `unavailable` is a PROMISE (someone will plumb this), `not-applicable` is a
+ * FACT (this path never consults that subsystem). Same em-dash, different
+ * sentence, and only one of them is owed future work.
+ *
+ * @param {{classification: string, reason: string}} entry
+ * @param {object} meta
+ */
+function neverMeasuredField(entry, meta) {
+  return entry.classification === 'STRUCTURALLY_BYPASSED'
+    ? notApplicableField(entry.reason, meta)
+    : unavailableField(entry.reason, meta);
+}
+
+/**
  * @param {string} baseUrl
  * @param {number} timestampMs
+ * @param {string} origin Capability profile of the server this store polls.
+ *   Required: classification is keyed on (field, profile), so a snapshot built
+ *   without it mis-classifies every per-profile field on the FIRST frame — the
+ *   one frame a visitor always sees.
  * @returns {TelemetrySnapshot}
  */
-function initialSnapshot(baseUrl, timestampMs) {
+function initialSnapshot(baseUrl, timestampMs, origin) {
   /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
   const fields = {};
   for (const key of allFieldKeys()) {
-    const entry = PROVENANCE[key];
+    const entry = resolveForOrigin(PROVENANCE[key], origin);
     // A measurable field before the first poll is PENDING — it will resolve on
     // its own. A documented zero is UNAVAILABLE from the very first frame,
     // because no amount of waiting will ever produce a value for it, and
     // showing a spinner for it would promise something that is never coming.
     fields[key] = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)
-      ? unavailableField(entry.reason, { source: entry.source, unit: entry.unit })
+      ? neverMeasuredField(entry, { source: entry.source, unit: entry.unit })
       : pendingField('Waiting for the first poll to complete.', {
           source: entry.source,
           unit: entry.unit,

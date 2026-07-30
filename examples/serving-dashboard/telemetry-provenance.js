@@ -658,8 +658,28 @@ export const PROVENANCE = Object.freeze({
   },
 });
 
-/** Field keys whose classification means they can never render as a number. */
-export const NEVER_MEASURED_CLASSIFICATIONS = Object.freeze(['DOCUMENTED_ZERO', 'NOT_PLUMBED']);
+/**
+ * Classifications that can never yield a number, so a field carrying one is
+ * UNAVAILABLE from the first frame rather than pending.
+ *
+ * STRUCTURALLY_BYPASSED belongs here for the reason @0837fdf9 ratified about
+ * `pending`: pending resolves on its own, unavailable never will, and telling
+ * a visitor to wait for a number that is never coming is its own small
+ * dishonesty. A bypassed subsystem is not slow — it is not in this
+ * configuration's execution path at all, so no amount of waiting produces a
+ * value on this server.
+ *
+ * It was previously omitted here and special-cased at ONE of the three call
+ * sites, which meant the other two treated a bypassed field as merely
+ * un-arrived: on the scatter server the prefix-cache fields rendered a spinner
+ * promising a number that could never arrive. Keeping the rule in one list is
+ * what stops the three sites from disagreeing again.
+ */
+export const NEVER_MEASURED_CLASSIFICATIONS = Object.freeze([
+  'DOCUMENTED_ZERO',
+  'NOT_PLUMBED',
+  'STRUCTURALLY_BYPASSED',
+]);
 
 /**
  * Wire fields that must NEVER be bound to a panel, whatever they are named.

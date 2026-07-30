@@ -539,9 +539,14 @@ test('every field is present in the very first snapshot, before any poll', () =>
   const store = storeWith(healthyRoutes());
   const snapshot = store.getSnapshot();
   for (const field of Object.values(snapshot.fields)) {
+    // Stated as what must NOT be true, rather than an allow-list of permitted
+    // states. The invariant is "nothing claims a measurement before one has
+    // happened"; an allow-list expresses that only accidentally, and has to be
+    // edited every time a non-measuring state is added -- which quietly turns a
+    // real invariant into a list someone maintains.
     assert.ok(
-      field.state === FIELD_STATES.PENDING || field.state === FIELD_STATES.UNAVAILABLE,
-      'no field may claim to be measured before the first poll',
+      field.state !== FIELD_STATES.OK && field.state !== FIELD_STATES.STALE,
+      `no field may claim to be measured before the first poll (saw ${field.state})`,
     );
     assert.equal(field.value, null);
     assert.ok(field.reason);
@@ -1306,4 +1311,86 @@ test('the model directory going live is detected rather than em-dashed forever',
   );
   assert.match(warnings['server.model_path'], /out of date/);
   assert.equal(store.field('server.model_path').value, '/models/scatter');
+});
+
+// --- Bypassed fields are never PENDING -------------------------------------
+//
+// These three tests exist because the rule "a bypassed subsystem can never
+// produce a number" was enforced at ONE of its three call sites. The poll path
+// special-cased STRUCTURALLY_BYPASSED inline; the first-frame path and the
+// server-down path consulted only NEVER_MEASURED_CLASSIFICATIONS, which omitted
+// it. So on the scatter server the prefix-cache fields rendered a spinner
+// promising a measurement that could never arrive on that server.
+//
+// The distinction being protected: PENDING is a promise that resolves itself,
+// UNAVAILABLE never will. Showing a spinner for a subsystem that is not in this
+// configuration's execution path tells the visitor to wait for something that
+// is not coming -- and unlike a wrong number, a spinner never looks wrong.
+
+test('a structurally bypassed field is not-applicable on the very first frame, not pending', () => {
+  const store = storeWith(healthyRoutes(), { origin: 'scatter' });
+
+  // No poll: this is the frame every visitor sees before the network answers.
+  const field = store.field('prefix_cache.hit_rate');
+
+  assert.equal(
+    field.state,
+    FIELD_STATES.NOT_APPLICABLE,
+    'the batching path never consults the prefix cache, so no poll can fill this in',
+  );
+  assert.notEqual(field.state, FIELD_STATES.PENDING);
+});
+
+test('the same field IS pending on the first frame of the dynamic server', () => {
+  const store = storeWith(healthyRoutes(), DYNAMIC);
+
+  // Same field, same instant, opposite treatment -- decided by which model
+  // loaded. This is the pair that a table keyed on field name alone cannot
+  // represent, so it is asserted as a pair.
+  assert.equal(store.field('prefix_cache.hit_rate').state, FIELD_STATES.PENDING);
+});
+
+test('a bypassed field keeps one state across every path that can build it', async () => {
+  // The bug was three paths disagreeing about one unchanging architectural
+  // fact: not-applicable after a poll, unavailable on the first frame, pending
+  // when the server was down -- the answer depended only on WHEN you looked.
+  const store = storeWith({}, { origin: 'scatter' });
+
+  const firstFrame = store.field('prefix_cache.hit_rate').state;
+  await store.pollOnce();
+  const afterFailedPoll = store.field('prefix_cache.hit_rate');
+
+  assert.equal(
+    afterFailedPoll.state,
+    FIELD_STATES.NOT_APPLICABLE,
+    'a dead server does not make a bypassed subsystem start existing',
+  );
+  assert.equal(firstFrame, afterFailedPoll.state, 'every path must agree on one state');
+  assert.doesNotMatch(
+    afterFailedPoll.reason ?? '',
+    /will fill in when the server returns/,
+    'the down-server explanation promises arrival, which is false for a bypassed field',
+  );
+});
+
+test('every non-measured classification is listed in NEVER_MEASURED_CLASSIFICATIONS', () => {
+  // Guards the direction this bug came from: a classification was added to the
+  // vocabulary and not to the list, so it silently defaulted to "measurable".
+  // Adding a classification must be a deliberate choice about this list, and
+  // forgetting must fail loudly here rather than render a spinner on stage.
+  const seen = new Set();
+  for (const key of allFieldKeys()) {
+    for (const origin of ['scatter', 'dynamic']) {
+      seen.add(resolveForOrigin(PROVENANCE[key], origin).classification);
+    }
+  }
+
+  for (const classification of seen) {
+    if (classification === 'MEASURED') continue;
+    assert.ok(
+      NEVER_MEASURED_CLASSIFICATIONS.includes(classification),
+      `${classification} is in use but absent from NEVER_MEASURED_CLASSIFICATIONS, so fields ` +
+        'carrying it will render as pending -- a promise of a number that is never coming',
+    );
+  }
 });

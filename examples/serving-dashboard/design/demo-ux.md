@@ -902,7 +902,7 @@ Per-request rows use the sequence marker + colour + id, tying to swimlanes and b
 ┌ Scheduling & batching ──────────────────────────── 60 s ─ ⓘ ▾ ┐
 │   running  6 ˢ    waiting  2 ˢ    admission slots  248 ˢ      │
 │                                                               │
-│   batch occupancy      ▂▄▆███▇▆▄▂▁▂▄▆██▇▆▄▃▂▁                 │
+│   active decode rows  ▂▄▆███▇▆▄▂▁▂▄▆██▇▆▄▃▂▁   (count, no %) │
 │     6 of 4 max  ← if max_batch unavailable: "6 sequences ᴰ"   │
 │                   and the % form is em-dashed, not guessed    │
 │                                                               │
@@ -1442,7 +1442,7 @@ The Secretary framed this as "two mutually-exclusive modes." I want to sharpen t
 | | **Profile S — static cache** (`qwen2.5-0.5b-scatter-v2`) | **Profile D — dynamic** (`qwen2.5-0.5b`) |
 |---|---|---|
 | Continuous batching | ✅ live, `max_batch=4` | ❌ per-request path |
-| KV panel | ✅ **row occupancy** — active rows / `max_batch` | ✅ **paged block table** — 14 612 pages |
+| KV panel | ✅ **active decode rows** — a count; no denominator exists (D156) | ✅ **paged block table** — 14 612 pages |
 | Prefix caching | ❌ hardcoded `0` → `unavailable` | ✅ genuine measurement |
 | Scenarios live | A (batching) | B (paged KV), C (prefix) |
 
@@ -1488,18 +1488,24 @@ So: the profile is announced as a **statement of what is live**, never as an err
 
 One dignified card > six dead panels. `auto-fill` means the grid reflows with no hole (§1.2), so this costs no layout work.
 
-**(d) KV panel, Profile S — redefined as row occupancy.** Adopting the Architect's proposal: `active rows / max_batch`. **This is real, measurable, and it moves under load**, which is what the demo needs. It also resolves the §5.3 concern I raised about batch occupancy having no honest denominator: with `--max-batch` approved and surfaced, the denominator becomes real and **occupancy upgrades from em-dash to a genuine percentage.** Net win.
+**(d) KV panel, Profile S — redefined as row occupancy.** Adopting the Architect's proposal: `active rows`. **This is real, measurable, and it moves under load**, which is what the demo needs.
 
-Visually it is the block grid at small `capacity` — `max_batch` cells (4, or whatever the flag is set to), in **detail** density (§7.2), each cell a decode row showing its owning sequence and fill. **The same component, a different noun.** Title: **"Static KV decode rows"**, never "block table", because they are not pages and calling them pages would re-import exactly the confusion this addendum exists to remove.
+> 🔴 **STRUCK, AND THIS PARAGRAPH IS THE EXHIBIT.** It previously read: *"with `--max-batch` approved and surfaced, the denominator becomes real and occupancy upgrades from em-dash to a genuine percentage. Net win."* **`--max-batch` DOES NOT EXIST. It was announced as delivered twice and was never built** (`cli.rs` has no such arg; `admin.rs:64` says so in a comment: *"max batch size not surfaced to the server"*).
+> **I did not fabricate a measurement — I reasoned from an APPROVAL, and an approval is a record of intent that our tooling renders identically to a record of fact.** It is the one input class none of my rules covered: I had *verify the field*, *verify the instrument*, *cite the executable line* — **and none of them fire on the sentence "that's approved," because approval sounds like something that already happened.** D156.
+> **Until `max_batch` is in the payload, `batch_utilization` renders as an ABSOLUTE COUNT or as `unavailable`. NEVER a percentage.** A client-side hardcoded `4` from `state.rs:25` would be **a constant wearing the costume of a measurement, on the panel carrying our headline 2.46× number, in the scenario that ships first and alone.**
+
+Visually it is the block grid at small `capacity` — one cell per active decode row, in **detail** density (§7.2), each cell showing its owning sequence and fill. **The same component, a different noun.** Title: **"Static KV decode rows"**, never "block table", because they are not pages and calling them pages would re-import exactly the confusion this addendum exists to remove.
 
 **(e) Hero strip is profile-aware.** `auto-fit` already guarantees no hole (§1.2 — the property is now earning its keep twice). Slot mapping:
 
 | Slot | Profile S | Profile D |
 |---|---|---|
 | 1 | aggregate tok/s `ᴰ` | aggregate tok/s `ᴰ` |
-| 2 | **row occupancy %** `ᴰ` | **KV block utilization %** `ᴰ` |
-| 3 | **tokens / decode step** `ᴰ` | **prefix hit rate** `ˢ` |
+| 2 | **active decode rows** (count) `ˢ` | **KV block utilization %** `ᴰ` |
+| 3 | **tokens / decode step** `ᴰ` | **pages allocated / freed** `ˢ` |
 | 4 | running / waiting `ˢ` | running / waiting `ˢ` |
+
+> 🔴 **TWO SLOTS STRUCK ABOVE.** Slot 2/Profile S was **row occupancy %** — no denominator exists, so it is now a count. Slot 3/Profile D was **prefix hit rate `ˢ`** — **a CUT field, and the single most dangerous binding instruction this document ever contained**, because it sat in the *hero strip*, the four numbers a visitor reads first. **Replaced with paged-KV page allocation, which @e00032a4 verified directly (allocated 3, freed 3, 14612 pages).**
 
 §8.2's hero-fallback provision (`tokens per decode step`) was designed for the prefix cut and now does exactly this job unmodified. The cut-cleanly work paid for itself sooner than expected.
 
@@ -3475,3 +3481,31 @@ Every other panel polls. **This one cannot** — it needs a controlled 20-reques
 | D153 | Discusses the mechanism, reports TTFT, names no counter | The counter is the artifact that lied; this is where the names would creep back |
 | D154 | No competitive claim about other runtimes | A null result is credible because it costs us something; a competitive one costs nothing |
 | D155 | Lead with this panel, don't bury it | It is the only evidence on the page that we report what we'd rather not |
+
+---
+
+## 52. 🔴 D156 — I REASONED FROM AN APPROVAL, AND NONE OF MY RULES COVERED THAT
+
+`--max-batch` **does not exist**. It was announced as delivered twice, and I built the Profile S hero slot and the KV panel's denominator on it. `cli.rs` has no such argument; `admin.rs:64` carries the comment *"max batch size not surfaced to the server."* **One grep, never run — by me or by anyone.**
+
+**I want to be precise about the failure, because "I should have checked" is the useless version.** I had four habits by then and I applied all of them: cite the executable line, never the comment; verify the counter, not the name; check evidence class; re-read before broadcasting. **Every one operates on a CLAIM ABOUT THE SYSTEM.** *"`--max-batch` is approved and surfaced"* is not a claim about the system — **it is a claim about a DECISION**, and it arrived from the one source with the standing to make it true.
+
+- **D156:** **an APPROVAL is a record of intent that our tooling renders identically to a record of fact — and it is the most dangerous of the class, because it is phrased in the past tense.** *"That's approved"* sounds like something that already happened. **A rule invites checking; an approval closes it.** Sibling to a lock table recording intent, a `COMPLETE_TASK` that stages nothing, a SKIP satisfying a gate, and a declared contract with no implementation. **Add to the citation rule: when the input is a decision rather than an observation, the check is not "who said it" but "does the artifact exist yet."**
+
+### 52.1 What it would have shipped
+
+The denominator would have been a client-side `4` read from `state.rs:25` — **a compile-time constant wearing the costume of a measurement, rendered as a percentage, on the panel carrying the 2.46× hero number, in the scenario that ships first and alone.** It would have moved under load (the numerator is live), so it would have looked perfect. **The most flattering possible failure, on the most watched pixel on the page.**
+
+**Corrected in place (D131), three sites:** the Profile S hero slot is now an **absolute count**, the KV panel is **"active decode rows"** with no ratio, and the profile matrix no longer divides by `max_batch`. **Until `max_batch` is in the payload, `batch_utilization` is a count or `unavailable` — never a percentage.**
+
+### 52.2 🔴 And the same edit caught a worse one I had not been told about
+
+The Profile D hero strip, slot 3, still read **`prefix hit rate` `ˢ`**. **A CUT field — bound in the HERO STRIP**, which is the four numbers a visitor reads before anything else, marked `ˢ` (server-measured) with no qualification. **My own tripwire could never have caught it**: it bans the identifiers `prefix_cache_hits`/`_lookups`/`_hit_rate` in modules, and this is prose in a design document spelling the name in plain English — **the identical blind spot as the `<meta>` description, found the same way, twenty minutes apart.**
+
+- **The pattern is now unmistakable: our enforcement covers CODE and FIELDS. It does not cover PROSE THAT INSTRUCTS — design specs, meta tags, READMEs, commit messages, approvals in chat. That is where every remaining lie is, because it is the only surface left that nothing executes.** Slot 3 is now **pages allocated / freed**, which @e00032a4 verified directly.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D156 | Treat an approval as an unverified claim; check that the artifact exists, not who said it | An approval is intent phrased in the past tense — a rule invites checking, an approval closes it |
+| D157 | `batch_utilization` is a count or `unavailable`, never a percentage, until `max_batch` is on the wire | A hardcoded denominator is a constant wearing the costume of a measurement |
+| D158 | Enforcement covers code and fields, not prose that instructs — audit specs, meta tags and READMEs by hand before the PR | Two cut-field bindings found in prose in twenty minutes, both invisible to every test we have |
