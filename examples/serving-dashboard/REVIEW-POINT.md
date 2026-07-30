@@ -93,11 +93,40 @@ better fix and it belongs to whoever owns the tags; this file is the cheap one a
 Any finding measured before this point describes a tree the review has moved past:
 
 ```sh
-git merge-base --is-ancestor <the-sha-you-measured-at> "$(git rev-parse fca13038)" \
+# Read the boundary FROM THIS FILE. Do not retype it.
+BOUNDARY=$(git show HEAD:examples/serving-dashboard/REVIEW-POINT.md \
+             | sed -n 's/^REVIEW-POINT-SHA:[[:space:]]*//p')
+git merge-base --is-ancestor <the-sha-you-measured-at> "$(git rev-parse "${BOUNDARY}^{commit}")" \
   && echo 'PREDATES THE REVIEW POINT — re-derive before it counts' \
   || echo 'AT-OR-AFTER — stands'
 ```
 
 Note the `git rev-parse` around the SHA rather than the tag name. **Comparing against a name
 means the boundary can move under you, so the run that condemned your finding is not
-reproducible from its own output.**
+reproducible from its own output.** Note `^{commit}` too: `rev-parse` on an *annotated* tag
+returns the tag object, not the commit, and `--is-ancestor` peels while `rev-parse` does not.
+
+**This snippet reads the boundary out of this file instead of restating it, and that is a
+repair, not a flourish.** It previously hardcoded `fca13038` while the header four lines from
+the top of this file declared `0bc86726` — **two different review points in the one document
+that exists to stop there being two.** The header was right and the snippet was the part
+people copy. A worked example is not documentation *about* the source of truth; it is a
+second copy of it, and it drifts exactly like any other duplicate.
+
+## ⚠️ If you re-point this file, the ORDER matters and the wrong order is the obvious one
+
+Re-pointing the boundary forward makes every document whose newest `MEASURED-AT` is a strict
+ancestor of the new pin go **red**. Priced against committed bytes at the time of writing,
+moving to `37d0d72e` would redden **four of the five** adopting documents — not because their
+authors have not re-measured, but because they published the re-measurement **in chat and not
+in the document**. Every SHA those reviewers have publicly re-derived at is at-or-after that
+pin and would clear it instantly.
+
+**So: collect the one-line `MEASURED-AT` updates FIRST, then move the boundary.** Reversed,
+the same two actions produce four true-but-useless alarms aimed at people who already did the
+work. The guard is not wrong in that state — the documents genuinely are behind — but a red
+that four compliant authors cannot act on faster than one line of chat is a red that teaches
+people to ignore the guard.
+
+MEASURED-AT: 049da5f8 — this file's own boundary declaration is unchanged by that measurement;
+what was measured is the snippet defect and the re-point pricing above.
