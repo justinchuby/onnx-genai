@@ -869,3 +869,92 @@ intentional gap"*.
 | Network | ✅ **0 failed requests** |
 
 No refused module, no unknown-state warning, no asset 404.
+
+## §11 — The path-disclosure P1, verified fixed at HEAD, and the limit of my own instrument
+
+Scope: the Lead's P1 — *an absolute filesystem path rendered in visible text on the
+demo page, on both origins*. Verified at HEAD `dd04f50f`. Servers: `:9611`
+(qwen-scatter) / `:9612` (qwen-dynamic), both launched with an **absolute**
+`--model` and an **absolute** `--demo-assets-dir`, so the raw material for the
+defect was present in the launch.
+
+### §11.1 Six independent channels, all clean
+
+| channel | method | result |
+|---|---|---|
+| served HTML | `curl /demo/` grep `/Users/` | 0 |
+| every referenced asset | follow each `src`/`href`, grep | 0 |
+| `/v1/status`, `/v1/models`, `/v1/resources` | path-shaped values | 0 |
+| rendered DOM, visible leaves | CDP, `getBoundingClientRect().height > 0` | 0 |
+| rendered DOM, **hidden** leaves | same sweep, height `=== 0` | 0 |
+| every attribute value | `/Users/` over all attributes | 0 |
+
+Both origins, with and without the topology query string.
+
+**Positive control, because a zero is worthless without one.** Injected a real
+absolute path into the live page as a visible node and a `display:none` node.
+Detector: visible `0 -> 1`, hidden `0 -> 1`. Both channels fire. The zeros above
+are readings, not blindness.
+
+### §11.2 Two layers, and both are real
+
+**Server (Rust).** `routes/admin.rs:37` redacts with `path.file_name()`. Measured
+on the wire: launched with `--model /Users/justinc/.../models/qwen2.5-0.5b-scatter-v2`,
+`/v1/models` answers `"path": "qwen2.5-0.5b-scatter-v2"`. Basename only. Pinned by
+`tests.rs:4230 model_paths_never_disclose_more_than_the_basename`, on every bind
+address.
+
+**Client (JS).** `dashboard/model-path-disclosure.test.js` — it stops asking for
+the field at all.
+
+### §11.3 The guard has teeth — mutation-tested, not assumed
+
+Three guards on this branch passed green while blind to the thing they protect.
+This one is not one of them. Run against **committed bytes** (`git archive HEAD`),
+reintroducing the disclosure by two different routes:
+
+```
+BASELINE                          pass 5  fail 0
+M1  visible definition            pass 3  fail 2   RED
+M3  screen-reader sentence only   pass 4  fail 1   RED
+RESTORED                          pass 5  fail 0
+```
+
+M3 is the one that matters: a leak that reaches only the spoken summary, which no
+screenshot review and no visible-text sweep would ever catch. The guard sweeps
+attribute values precisely because the original defect was written three times per
+field (`textContent`, `title`, `aria-label`).
+
+### §11.4 A suspicion of mine, tested and withdrawn
+
+I suspected the guard could be neutered by making its fixture realistic — the real
+wire carries a basename, so a "realistic" fixture would contain nothing to find,
+and the guard would go green with the disclosure code live. **Measured, and it is
+false:**
+
+```
+disclosure LIVE, fixture = absolute path   pass 3  fail 2
+disclosure LIVE, fixture = real basename   pass 2  fail 3   <- MORE red, not green
+```
+
+`:155` asserts *the `/Users/` predicate must be able to match*. The guard refuses
+to run against a fixture that cannot expose the defect, so sanitising it fails
+loudly instead of silently. That is the anti-vacuity property the rest of us keep
+discovering we lack, already built. Withdrawn.
+
+### §11.5 ⚠️ The finding that is actually mine: my browser pass cannot see this regression
+
+The two layers are each independently sufficient today, and that is the hazard.
+**Because the server now redacts to a basename, an absolute path is no longer
+available anywhere in the browser.** If the client fix were reverted tomorrow, the
+page would render `qwen2.5-0.5b-scatter-v2` — harmless — and **every browser check
+I own would stay green.**
+
+So: the client-side guard is *load-bearing and is the only detector*, and a browser
+pass is **not** evidence for this class of defect. Four agents have ranked the
+browser above their own findings tonight; this is one place it must not be trusted.
+Same shape as the guard-corpus problems found elsewhere on this branch, except the
+instrument with the missing corpus is mine.
+
+Neither layer may be removed on the grounds that the other covers it. Removing
+either leaves zero margin, the full suite green, and the browser green.
