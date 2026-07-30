@@ -753,27 +753,34 @@ That last row is what closes it. **A stub is a value nobody has gotten to yet; t
 
 ---
 
+
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1009 = "fn prepare_session_prefix" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1029 = "started_empty && state.decode_state.uses_token_prefix_cache()" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1087 = "loaded_prompt_prefix = materialized_len" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1099 = "let in_process_hit" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1110 = "never claiming a hit we can" -->
+<!-- cite: crates/onnx-genai-engine/src/decode/state.rs:206 = "fn uses_token_prefix_cache" -->
 #### 8.4b The dynamic path reports hits it never serves — `MISLEADING`, not `measured` 🔴
 
 **Correcting my own §8.4a, committed minutes earlier.** Having verified the static-path zero exhaustively, I let its complement — *"therefore the dynamic path is `measured`"* — ride unverified. It is not. QA (@fc8b5d97) measured 19 hits / 20 lookups **including six controls whose prefixes differ from token 0**, with the shared-prefix arm **7.0% slower**. I traced it to source and confirm their finding.
 
-`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs:997`) forks into two mechanisms:
+`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs:1009`) forks into two mechanisms:
 
-| | Branch A — token cache (`:1017-1024`) | Branch B — paged (`:1025-1076`) |
+| | Branch A — token cache (`:1029-1036`) | Branch B — paged (`:1037-1088`) |
 |---|---|---|
 | Guard | `uses_token_prefix_cache()` = `has_runner() \|\| is_windowed()` (`decode/state.rs:206`) | `use_kv` && `kv_model.is_some()` && `page_table.tensor_config.is_some()` |
 | Loads KV? | **No** | Yes — `attach_pages_to_sequence` → `materialize_sequence` → `load_materialized_past` |
-| Sets `loaded_prompt_prefix`? | **No** | Yes (`:1075`) |
+| Sets `loaded_prompt_prefix`? | **No** | Yes (`:1087`) |
 | Effect on prefill | **None** | Genuinely shortened |
 
-Because `loaded_prompt_prefix` stays `0` under Branch A, the very next statement — `state.tokens.extend_from_slice(&prompt_tokens[loaded_prompt_prefix..])` (`:1080-1083`) — queues the **entire** prompt and prefill recomputes every token. The returned `in_process_hit` (`:1086`) has **no compute saving behind it**, and it is this value that becomes `prefix_cache_hit_len`.
+Because `loaded_prompt_prefix` stays `0` under Branch A, the very next statement — `state.tokens.extend_from_slice(&prompt_tokens[loaded_prompt_prefix..])` (`:1093-1095`) — queues the **entire** prompt and prefill recomputes every token. The returned `in_process_hit` (`:1099`) has **no compute saving behind it**, and it is this value that becomes `prefix_cache_hit_len`.
 
 **Two structural facts beyond the measurement, both readable from the control flow:**
 
 1. **Any single shared leading token scores a hit.** The scoring expression is `common_prefix_len(..).filter(|&len| len > 0).max()`. Every `/v1/chat/completions` request shares the chat-template preamble, so **every request reports a hit, permanently.**
 2. **Branch A pre-empts Branch B — they are `if` / `else if`, and A is tested first.** So whenever a model has a runner or a sliding window, the genuine paged reuse path is **unreachable**, whatever the page-table configuration. This answers as a matter of static precedence what would otherwise need a debug log: a server that satisfies Branch A's guard *cannot* be getting Branch B's real reuse. Branch B requires **four** simultaneous conditions including `!has_runner() && !is_windowed()`.
 
-**The codebase states the correct rule 30 lines below, and applies it to a different path.** The connector fallback is commented *"never claiming a hit we can't serve"* (`:1097-1099`). Branch A violates the rule its own neighbour states.
+**The codebase states the correct rule 30 lines below, and applies it to a different path.** The connector fallback is commented *"never claiming a hit we can't serve"* (`:1108-1110`). Branch A violates the rule its own neighbour states.
 
 > **🔒 Binding: `prefix_cache_hits` / `prefix_cache_hit_rate` MUST NOT be bound to any panel.** The honest signal is `loaded_prompt_prefix` (prefill *actually* skipped), not `prefix_cache_hit_len` (tokens that merely *matched*).
 
