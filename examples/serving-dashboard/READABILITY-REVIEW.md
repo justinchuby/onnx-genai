@@ -343,6 +343,48 @@ That is also why R13 and R14 must be fixed together: deleting the launcher URL r
 one known bad link, but any typo, stale bookmark, or README edit re-creates a silent substitution
 tomorrow. R13 is the instance; R14 is the reason instances are silent.
 
+### R15 — the QA plan instructs the tester to perform the silent substitution and record it as a pass
+
+`QA-PLAN.md`, item **B1**, already ticked `[x]` and marked **RESOLVED**:
+
+> *"**Test deep-linking directly**: paste `?scenario=prefix-cache` into a fresh tab and confirm it
+> opens on the right panel against the right origin."*
+
+The tester will paste it. They will get a page that loads, renders completely, and is honest in
+every field — the paged-KV scenario, with correct provenance badges and correct states. It looks
+exactly like a pass, so they will tick it.
+
+**This instruction is incapable of failing.** It asks for confirmation of "the right panel"
+without saying which panel is right, against a route the code deliberately refuses to make
+addressable (R13) via a resolver that cannot report having substituted (R14).
+
+The distinction from R13 matters, and it is why this is filed separately rather than as another
+site:
+
+| | who reads it | what it costs |
+|---|---|---|
+| R13 | the operator | one misleading link |
+| R15 | **the verifier** | a signed-off pass certifying the defect as correct behaviour |
+
+R13 misleads someone. R15 recruits our own quality process into ratifying the thing the product
+exists to refuse. It is the one prose defect that actively converts a blind spot into evidence of
+soundness — and it sits inside the document whose entire purpose is to catch what the automated
+checks miss.
+
+The sentence two lines above this item reads: *"guesses will record a false pass."* The document
+diagnosed the failure mode and then committed it in the next paragraph. That is not carelessness —
+it is the same proximity blindness R11 shows in the design record: **the author of a warning is the
+person least able to see themselves violating it, because they have just finished thinking about
+it and feel covered.**
+
+Two smaller defects in the same item: the URL cites `:8124`, an origin that predates the
+resources-freeze fix, and the step gives no expected value — no panel name, no field, no number —
+so any rendered page satisfies it.
+
+The fix is to make the step falsifiable, which also converts it into a regression test for R13/R14:
+*paste `?scenario=prefix-cache` and confirm the page states that the scenario is unavailable and
+names what it is showing instead.* Written that way it fails today, which is the point.
+
 ---
 
 ## Withdrawn by me
