@@ -28,7 +28,8 @@
  * How a server field is classified. This is not a UI state — it is a statement
  * about the server's code.
  *
- * @typedef {'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'STRUCTURALLY_BYPASSED'} Classification
+ * @typedef {'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'STRUCTURALLY_BYPASSED'
+ *   | 'MISATTRIBUTED'} Classification
  *
  * - `MEASURED`        — the server computes this from real runtime state.
  * - `DOCUMENTED_ZERO` — the server writes a constant `0` / `""` / `[]` into the
@@ -43,14 +44,46 @@
  *                       asked. Renders `not-applicable`. No amount of plumbing
  *                       would fix it; it is a true statement about the
  *                       architecture, not a gap in it.
+ * - `MISATTRIBUTED`   — the server DOES run this code path and DOES compute a
+ *                       real number from real runtime state, but the quantity
+ *                       it computes is not the quantity its name denotes.
+ *                       Renders `unavailable`. This is the only classification
+ *                       where the wire value is both live and correct and the
+ *                       field is still dishonest, so it is the only one that
+ *                       cannot be diagnosed by looking at the number.
+ *
+ *                       WHY IT EXISTS AS A WORD. Before it, the table had
+ *                       `DOCUMENTED_ZERO` (a constant), `NOT_PLUMBED` (absent)
+ *                       and `STRUCTURALLY_BYPASSED` (never asked) — and nothing
+ *                       for ASKED, ANSWERED, ANSWERING SOMETHING ELSE. Three
+ *                       prefix-cache fields were therefore `MEASURED` because
+ *                       it was the only remaining option, not because anyone
+ *                       judged them measured. A missing word in a vocabulary
+ *                       does not read as a gap; it reads as agreement.
+ *
+ *                       NOT EVERY WRONG NAME LANDS HERE. If the true quantity
+ *                       is itself worth showing, the honest fix is to RELABEL
+ *                       and keep it `MEASURED` — `prefix_cache.lookups` counts
+ *                       completed generations, so it is labelled "Completed
+ *                       generations" and still renders. `MISATTRIBUTED` is for
+ *                       the ones with no honest label worth rendering.
  *
  * CLASSIFICATION CAN DEPEND ON WHICH SERVER WE ASKED. The demo runs two, and
  * they differ structurally: the scatter server batches (bypassing the page
  * table and prefix trie) while the dynamic server pages KV (disabling
  * continuous batching). An entry may therefore carry `byOrigin` to override
- * its classification per server. `prefix_cache_hits: 0` is a genuine measured
- * zero on the dynamic server and not-applicable on the scatter server — the
- * SAME wire value, opposite treatments, and only this table knows which.
+ * its classification per server. `prefix_cache_lookups` is a genuine measured
+ * count of completed generations on the dynamic server and not-applicable on
+ * the scatter server — the SAME wire value, opposite treatments, and only this
+ * table knows which.
+ *
+ * ⚠️ THIS PARAGRAPH USED TO SAY `prefix_cache_hits: 0` IS A GENUINE MEASURED
+ * ZERO ON THE DYNAMIC SERVER. That was false in a way worth recording, because
+ * a doc comment was the PRODUCER of a false classification on the rendered
+ * page rather than a stale description of one: it justified `MEASURED` on the
+ * premise that the value would be 0, and the value is not 0. It is ~0.95. The
+ * premise was never checked against the wire because a sentence about a zero
+ * invites no arithmetic.
  */
 
 /**
@@ -370,57 +403,68 @@ export const PROVENANCE = Object.freeze({
 
   // ---------------------------------------------------------------- prefix cache
   //
-  // 🔴 OPEN FINDING, @bb2ee824 — THE DYNAMIC ORIGIN IS STILL CLASSIFIED
-  // `MEASURED` FOR ALL THREE COUNTERS, AND @fc8b5d97's CONTROL ARM SAYS IT
-  // SHOULD NOT BE.
+  // ⚖️ RULED AND CLOSED, @12e42da8 — THE THREE HIT-DERIVED FIELDS ARE
+  // `MISATTRIBUTED` ON THE DYNAMIC ORIGIN. The two `lookups` counters are NOT,
+  // and the difference is the whole point of the new word.
   //
-  // The scatter side is handled: STRUCTURALLY_BYPASSED, because that path
-  // never consults the cache. The dynamic side is not. There the cache IS
-  // consulted, so `MEASURED` looks obviously right -- and it is the one place
-  // the disproven number can still reach a panel as a genuine measurement.
+  // WHAT IS ACTUALLY WRONG. Not a stub, and not a dead counter. On dynamic the
+  // cache IS consulted and the counter IS live -- it is precisely computed,
+  // beautifully behaved, and answering a different question than its name:
   //
-  // The evidence that it is false needs no stopwatch, which is why it
-  // survives every re-run: twelve requests -- six repeated, six DELIBERATELY
-  // UNIQUE -- produced +12 hits, one per completed generation. A counter that
-  // reads the same with and without reuse is not measuring reuse. It reports ~95%
-  // because it increments on ANY nonzero token match and every
-  // /v1/chat/completions request shares the chat-template preamble.
+  //   metrics.rs:232-237  prefix_reuse_increments(len) -> (0,0) if len == 0
+  //                                                       (1, len) OTHERWISE
   //
-  // So this is not a stub and not a mislabelled-but-real number. It is
-  // precisely computed, beautifully behaved, and entirely false -- and every
-  // other safeguard in this tree hunts fabricated ZEROS. A 95% invites no
-  // scrutiny at all, which is exactly what makes it the dangerous one.
+  // One hit for ANY nonzero token match. Every /v1/chat/completions request
+  // shares the ~24-token chat-template preamble, so every request scores a hit
+  // whether or not a single prompt was reused. Measured, not reasoned: twelve
+  // requests with six DELIBERATELY UNIQUE prompts produced +12 hits -- one per
+  // completed generation, unique prompts included. A COUNTER THAT READS THE
+  // SAME WITH AND WITHOUT REUSE IS NOT MEASURING REUSE.
   //
-  // WHY IT IS NOT FIXED HERE. The accurate home is NEVER_BIND, whose own
-  // definition is "a REAL, CORRECTLY-COMPUTED value under a name that
-  // describes a different quantity". But never-bind.test.js enforces that no
-  // PROVENANCE entry may read a never-bind field, so promoting these three
-  // DELETES their table entries -- and that takes 28 tests with it across
-  // three agents, including the ratified per-origin behaviour ("the same zero
-  // means opposite things on the two servers") and the zero-denominator hit
-  // rate guard. Measured, not guessed: I ran it.
+  // THE DELTA IS THE EVIDENCE, NEVER A RATE (@12e42da8, ruled; reasoning in
+  // prefix-counters-forbidden.test.js). Both counters are CUMULATIVE SINCE
+  // BOOT, so their ratio is a property of the process rather than of the
+  // experiment -- diluted by warm-up and tunable to any value by sending more
+  // traffic. Four different rates for this one finding appear across our
+  // documents, every one honestly transcribed and not one of them evidence.
   //
-  // That is a ruling about which mechanism owns the field, not a refactor,
-  // so it is recorded here rather than decided unilaterally.
+  // The server's own docstring concedes it at metrics.rs:230-231 -- "the hit
+  // count cannot express value: reusing 8 tokens of a 900-token prompt and
+  // reusing 890 are both exactly one hit". The defect was documented upstream
+  // and classified as MEASURED downstream, which is the entire failure in one
+  // sentence.
   //
-  // CONTAINMENT TODAY: no panel binds these, and prefix-counters-forbidden.test.js
-  // fails any NEW module that names them, in either the underscored wire
-  // spelling or the dotted store key. That test is the executable half and is
-  // the only half worth citing -- an earlier version of this comment argued
-  // safety from "dashboard/prefix-cache.js does not exist", which was true when
-  // written and would silently have become a reassurance the moment anyone
-  // re-added that module. A safety argument premised on a file's absence rots
-  // into a false all-clear; one premised on a test goes red instead.
+  // WHY THIS IS THE DANGEROUS DIRECTION. Every other safeguard in this tree
+  // hunts fabricated ZEROS -- suppressUndefinedHitRate, the stubValue pins, the
+  // 0/0 correction. A confident ~95% trips none of them and invites no scrutiny
+  // at all. The honesty apparatus is asymmetric and this is the side it misses.
   //
-  // ESCALATED, NOT DECIDED: on the DYNAMIC origin these stay MEASURED below,
-  // and that is very probably wrong -- metrics.rs `prefix_reuse_increments`
-  // scores a hit whenever prefix_cache_hit_len > 0, and every chat request
-  // shares the ~24-token chat-template preamble, so the counters report the
-  // same numbers whether or not a prompt was reused (twelve requests with six
-  // deliberately unique prompts gave twelve hits, 0.9375). Reclassifying them
-  // was MEASURED at a cost of 7 failing tests across three agents' files, so
-  // the mechanism is the Lead's call, not a unilateral edit. The defect is
-  // latent: no panel binds these and the ratchet blocks new ones.
+  // WHY NOT NEVER_BIND, WHICH IS WHERE THIS WAS HEADED. NEVER_BIND is the
+  // accurate description, but never-bind.test.js forbids any PROVENANCE entry
+  // from naming a never-bind field, so promoting these DELETES their table
+  // entries -- and takes 28 tests across three agents' files with them,
+  // including the ratified per-origin rule and the zero-denominator guard.
+  // Measured, not guessed: I ran it. Under freeze that is a demolition, not a
+  // fix. MISATTRIBUTED keeps the entry, keeps the evidence, keeps the tests,
+  // and still refuses to render. The ban list is for fields with no entry to
+  // hang the reason on; this table can hold its own reason.
+  //
+  // WHY THE lookups PAIR IS UNTOUCHED. `prefix_cache_lookups` increments once
+  // per completed generation unconditionally -- so it is an honest count of
+  // COMPLETED GENERATIONS, and it is already labelled that. A true number with
+  // a fixable name is a RELABEL, not a reclassification. Reclassifying it would
+  // suppress a working measurement and teach the next reader that the word
+  // means "the name is wrong" rather than "there is nothing honest to show".
+  //
+  // CONTAINMENT WAS ALREADY LOAD-BEARING AND STAYS: prefix-counters-forbidden.test.js
+  // fails any NEW module naming these in either the underscored wire spelling or
+  // the dotted store key. That test is the executable half and the only half
+  // worth citing -- an earlier version of this comment argued safety from
+  // "dashboard/prefix-cache.js does not exist", which was true when written and
+  // would have become a false all-clear the moment anyone re-added that module.
+  // A safety argument premised on a file's absence rots; one premised on a test
+  // goes red instead.
+  //
   'prefix_cache.hits': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_hits',
@@ -445,7 +489,17 @@ export const PROVENANCE = Object.freeze({
           'every batched result. A 0 here would imply a cache that tried and missed.',
       },
       // On the dynamic server the cache IS consulted, so 0 is genuine data.
-      dynamic: { classification: 'MEASURED' },
+      dynamic: {
+        unfalsifiable:
+          'This counter is not pinned -- it rises on every completed generation, so no '
+          + 'value on the wire can confirm or deny that it is counting the wrong thing. '
+          + 'The disqualifying evidence is in the SERVER SOURCE, not in the reading: '
+          + 'metrics.rs:232-237 returns one hit for any nonzero match. If that function '
+          + 'ever weights a hit by reuse length, this classification is stale.',
+        classification: 'MISATTRIBUTED',
+        reason:
+          'The counter is live and correct on this server -- and it counts GENERATIONS WITH AT LEAST ONE MATCHING TOKEN, not cache hits. crates/onnx-genai-server/src/metrics.rs:232-237 scores exactly one hit for any prefix_cache_hit_len > 0, and every /v1/chat/completions request shares the ~24-token chat-template preamble, so it reads the same with and without reuse (measured: 12 requests, 6 deliberately unique prompts, +12 hits). metrics.rs:230-231 concedes it upstream: reusing 8 tokens of a 900-token prompt and reusing 890 are both exactly one hit.',
+      },
     },
   },
   'prefix_cache.lookups': {
@@ -698,7 +752,17 @@ export const PROVENANCE = Object.freeze({
           'batched result. Showing 0% here would imply a cache that tried and failed.',
       },
       // On the dynamic server the cache IS consulted, so 0 is real data.
-      dynamic: { classification: 'MEASURED' },
+      dynamic: {
+        unfalsifiable:
+          'This counter is not pinned -- it rises on every completed generation, so no '
+          + 'value on the wire can confirm or deny that it is counting the wrong thing. '
+          + 'The disqualifying evidence is in the SERVER SOURCE, not in the reading: '
+          + 'metrics.rs:232-237 returns one hit for any nonzero match. If that function '
+          + 'ever weights a hit by reuse length, this classification is stale.',
+        classification: 'MISATTRIBUTED',
+        reason:
+          'The counter is live and correct on this server -- and it counts GENERATIONS WITH AT LEAST ONE MATCHING TOKEN, not cache hits. crates/onnx-genai-server/src/metrics.rs:232-237 scores exactly one hit for any prefix_cache_hit_len > 0, and every /v1/chat/completions request shares the ~24-token chat-template preamble, so it reads the same with and without reuse (measured: 12 requests, 6 deliberately unique prompts, +12 hits). metrics.rs:230-231 concedes it upstream: reusing 8 tokens of a 900-token prompt and reusing 890 are both exactly one hit.',
+      },
     },
   },
   'metrics.prefix_cache_lookups': {    source: ENDPOINTS.METRICS,
@@ -755,7 +819,17 @@ export const PROVENANCE = Object.freeze({
           'crates/onnx-genai-engine/tests/batched_static_decode.rs:53 requires ' +
           'prefix_cache_hit_len == 0 for every batched result.',
       },
-      dynamic: { classification: 'MEASURED' },
+      dynamic: {
+        unfalsifiable:
+          'This counter is not pinned -- it rises on every completed generation, so no '
+          + 'value on the wire can confirm or deny that it is counting the wrong thing. '
+          + 'The disqualifying evidence is in the SERVER SOURCE, not in the reading: '
+          + 'metrics.rs:232-237 returns one hit for any nonzero match. If that function '
+          + 'ever weights a hit by reuse length, this classification is stale.',
+        classification: 'MISATTRIBUTED',
+        reason:
+          'The counter is live and correct on this server -- and it counts GENERATIONS WITH AT LEAST ONE MATCHING TOKEN, not cache hits. crates/onnx-genai-server/src/metrics.rs:232-237 scores exactly one hit for any prefix_cache_hit_len > 0, and every /v1/chat/completions request shares the ~24-token chat-template preamble, so it reads the same with and without reuse (measured: 12 requests, 6 deliberately unique prompts, +12 hits). metrics.rs:230-231 concedes it upstream: reusing 8 tokens of a 900-token prompt and reusing 890 are both exactly one hit.',
+      },
     },
   },
 
@@ -814,11 +888,19 @@ export const PROVENANCE = Object.freeze({
  * un-arrived: on the scatter server the prefix-cache fields rendered a spinner
  * promising a number that could never arrive. Keeping the rule in one list is
  * what stops the three sites from disagreeing again.
+ *
+ * MISATTRIBUTED belongs here for a DIFFERENT reason than the other three, and
+ * the difference matters if anyone ever tries to render it. The other three
+ * have no number, or a fake one. This one has a real, live, correct number —
+ * it is suppressed because the number answers a question nobody asked. So it
+ * is the only member of this list where the wire value looks perfect, and the
+ * only one whose suppression cannot be justified by pointing at the value.
  */
 export const NEVER_MEASURED_CLASSIFICATIONS = Object.freeze([
   'DOCUMENTED_ZERO',
   'NOT_PLUMBED',
   'STRUCTURALLY_BYPASSED',
+  'MISATTRIBUTED',
 ]);
 
 /**

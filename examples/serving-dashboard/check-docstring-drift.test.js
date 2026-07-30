@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { FIELD_STATES } from './telemetry-field.js';
+import { NEVER_MEASURED_CLASSIFICATIONS } from './telemetry-provenance.js';
 import { assertShippingTree } from './shipping-tree.mjs';
 
 // Provenance before content. Every path below is resolved from import.meta.url,
@@ -424,5 +425,82 @@ test('CONTRACT.md cites lines that exist in the files it names', () => {
     `CONTRACT.md points panel authors at dashboard/index.js:${cited[1]} for the teardown call, ` +
       `but that line is something else now. The line the shell actually calls it on is ` +
       `${shellLines.findIndex((l) => l.includes('handle.unmount()')) + 1}.`,
+  );
+});
+
+// The same defect class, one level up, and this one actually shipped a false
+// number: the @typedef listing the CLASSIFICATIONS drifted from the table below
+// it, and a doc comment at the top of telemetry-provenance.js asserted that
+// `prefix_cache_hits: 0` was "a genuine measured zero on the dynamic server".
+// That sentence was the PRODUCER of a false classification rather than a stale
+// description of one -- it justified MEASURED on the premise that the value
+// would be 0, and the value is never 0 on a server doing work. The premise was
+// never checked against the wire because a sentence about a zero invites no
+// arithmetic, and it was then copied verbatim into a test comment, where it was
+// ratified as intent.
+//
+// So the vocabulary is now checked in all three places it is written down.
+test('every classification is documented wherever the vocabulary is restated', () => {
+  const provenance = readFileSync(join(demoDir, 'telemetry-provenance.js'), 'utf8');
+
+  // The @typedef union may span lines; take everything up to the closing brace.
+  const union = provenance.match(/@typedef \{([^}]*)\} Classification/);
+  assert.ok(union, 'the Classification @typedef is gone or no longer parseable');
+  const documented = [...union[1].matchAll(/'([A-Z_]+)'/g)].map((m) => m[1]).sort();
+
+  // The classifications the TABLE actually uses -- the artifact, not a list.
+  const used = [
+    ...new Set([...provenance.matchAll(/classification: '([A-Z_]+)'/g)].map((m) => m[1])),
+  ].sort();
+
+  const undocumented = used.filter((c) => !documented.includes(c));
+  assert.deepEqual(
+    undocumented,
+    [],
+    'the provenance table uses a classification the @typedef does not list, so a reader ' +
+      `following our own documentation would never handle it:\n  ${undocumented.join('\n  ')}`,
+  );
+
+  // Every classification must have a visitor-facing sentence. app.js derives the
+  // required keys from the table, so this pins the OTHER half: that the sentence
+  // exists at all. A new classification must not reach a visitor unlabelled.
+  const app = readFileSync(join(demoDir, 'app.js'), 'utf8');
+  const missingText = used.filter((c) => !new RegExp(`\\b${c}:`).test(app));
+  assert.deepEqual(
+    missingText,
+    [],
+    `CLASSIFICATION_TEXT in app.js has no sentence for:\n  ${missingText.join('\n  ')}`,
+  );
+
+  // And CONTRACT.md is normative for panel authors: a suppressed classification
+  // it does not map to a STATE is one a panel author meets at runtime with no
+  // guidance about which of unavailable/not-applicable it renders as.
+  //
+  // Scoped to the paragraph that does the mapping, NOT to the whole file. The
+  // first version of this assertion searched the entire document, and a passing
+  // mention anywhere -- including the one-word list in §1 -- satisfied it. That
+  // is the defect this whole file exists to catch, committed inside its own
+  // guard: a check that cannot fail is indistinguishable from one that passes.
+  // Caught by mutation: renaming the term in the mapping paragraph left the
+  // guard green.
+  const contract = readFileSync(join(demoDir, 'CONTRACT.md'), 'utf8');
+  const absence = contract.slice(contract.indexOf('**Absence is not one thing.**'));
+  const mapping = absence.slice(0, absence.indexOf('\n---'));
+  assert.ok(
+    mapping.length > 0 && mapping.length < absence.length,
+    'the "Absence is not one thing" paragraph in CONTRACT.md is gone or unterminated',
+  );
+  // Matched as a BACKTICKED WHOLE TERM, not as a substring. `includes(c)` is
+  // satisfied by any longer identifier containing it -- MISATTRIBUTED_X counts
+  // as MISATTRIBUTED -- which made the first version of this check survive a
+  // rename of the very term it was pinning. Both the check and the mutation
+  // that was supposed to disprove it shared the flaw, so it read as verified.
+  const named = (c) => new RegExp('`' + c + '`').test(mapping);
+  const missingDoc = NEVER_MEASURED_CLASSIFICATIONS.filter((c) => !named(c));
+  assert.deepEqual(
+    missingDoc,
+    [],
+    'CONTRACT.md maps classifications to field states for panel authors, but omits:\n  ' +
+      `${missingDoc.join('\n  ')}\nAdd it to the "Absence is not one thing" paragraph in §3.`,
   );
 });

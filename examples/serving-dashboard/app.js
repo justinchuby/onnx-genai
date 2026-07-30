@@ -55,6 +55,8 @@ const CLASSIFICATION_TEXT = Object.freeze({
   NOT_PLUMBED: 'Exists in the process, not yet exposed over HTTP',
   STRUCTURALLY_BYPASSED:
     'This server never runs the code path that would produce it — see the evidence',
+  MISATTRIBUTED:
+    'The server computes this, but it does not count what its name says — see the evidence',
 });
 
 /**

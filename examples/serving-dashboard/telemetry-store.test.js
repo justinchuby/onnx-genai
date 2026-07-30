@@ -353,7 +353,10 @@ test('a disabled debug endpoint degrades only its own fields, with the exact fix
   assert.equal(snapshot.connection.state, CONNECTION_STATES.CONNECTED);
   assert.equal(store.field('queue.depth').state, FIELD_STATES.MEASURED, '/v1/status still works');
 
-  const gated = store.field('prefix_cache.hits');
+  // batch.active_size, NOT a prefix-cache field: those are MISATTRIBUTED and so
+  // are unavailable whatever the endpoint does, which would make this assertion
+  // pass for the wrong reason and keep passing if the gating broke entirely.
+  const gated = store.field('batch.active_size');
   assert.equal(gated.state, FIELD_STATES.UNAVAILABLE);
   assert.match(gated.reason, /--enable-debug-endpoints/);
 });
@@ -451,7 +454,7 @@ test('a failing endpoint is not re-requested on every poll (no console flood)', 
 
   assert.equal(debugKvRequests, 1, 'the failing endpoint was requested exactly once');
   // The explanation must survive suppression — panels still need it.
-  const field = store.field('prefix_cache.hits');
+  const field = store.field('batch.active_size');
   assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
   assert.match(field.reason, /--enable-debug-endpoints/);
   // Healthy endpoints keep polling normally.
@@ -489,7 +492,7 @@ test('a suppressed endpoint recovers once its retry window elapses', async () =>
   clock += 11_000;
   await store.pollOnce();
   assert.equal(requests, 2, 'retried after the window elapsed');
-  assert.equal(store.field('prefix_cache.hits').state, FIELD_STATES.MEASURED);
+  assert.equal(store.field('batch.active_size').state, FIELD_STATES.MEASURED);
 });
 
 test('an unavailable field never inherits an explanation from an unrelated earlier state', async () => {
@@ -634,12 +637,23 @@ test('the in-flight gauge is NEVER exposed as the engine batch size', async () =
 });
 
 test('the same zero means opposite things on the two servers', async () => {
-  // THE THREE KINDS OF ZERO, on one wire value. prefix_cache_hits is 0 on both
-  // servers and byte-identical in the response. On the dynamic server the cache
-  // WAS consulted and hit nothing, so 0 is real data. On the scatter server the
-  // batching path never consults the cache at all, so 0 is not an observation
-  // and rendering "0%" would imply a cache that tried and failed.
-  const routes = healthyRoutes();
+  // THE THREE KINDS OF ZERO, on one wire value. prefix_cache_lookups is 0 on
+  // both servers and byte-identical in the response. On the dynamic server the
+  // counter DOES run, so 0 is real data -- zero completed generations. On the
+  // scatter server the batching path never consults the cache at all, so 0 is
+  // not an observation and rendering it would imply a cache that tried.
+  //
+  // THIS TEST USED TO ASSERT THE PAIR ON prefix_cache_hits AND ITS COMMENT SAID
+  // "on the dynamic server the cache WAS consulted and hit nothing, so 0 is real
+  // data". That sentence was copied from the docstring at the top of
+  // telemetry-provenance.js, and it was FALSE: the hits counter never reads 0 on
+  // a server doing work -- it scores a hit for ANY nonzero token match, and every
+  // chat request shares the template preamble. A false premise in a doc comment
+  // was ratified here as a test, which is how it survived review. The hits
+  // counter is now MISATTRIBUTED; the pair moved to the counter that is honest.
+  const routes = healthyRoutes({
+    [ENDPOINTS.METRICS]: { text: metricsBody({ lookups: 0 }) },
+  });
   const dynamic = createTelemetryStore({
     baseUrl: BASE_URL,
     origin: 'dynamic',
@@ -652,17 +666,30 @@ test('the same zero means opposite things on the two servers', async () => {
   });
   await Promise.all([dynamic.pollOnce(), scatter.pollOnce()]);
 
-  const onDynamic = dynamic.getSnapshot().fields['metrics.prefix_cache_hits'];
+  const onDynamic = dynamic.getSnapshot().fields['metrics.prefix_cache_lookups'];
   assert.equal(onDynamic.state, FIELD_STATES.MEASURED);
   assert.equal(onDynamic.value, 0, 'a real zero must survive as zero, not be hidden');
 
-  const onScatter = scatter.getSnapshot().fields['metrics.prefix_cache_hits'];
+  const onScatter = scatter.getSnapshot().fields['metrics.prefix_cache_lookups'];
   assert.equal(onScatter.state, FIELD_STATES.NOT_APPLICABLE);
   assert.equal(onScatter.value, null);
   // The reason must explain WHY the path bypasses it, not merely that it did.
   assert.match(onScatter.reason, /never consults/i);
-});
 
+  // THE THIRD KIND, and the one that has no zero at all: the hits counter is
+  // live on dynamic and counts the wrong quantity, so it is suppressed on BOTH
+  // servers -- for two DIFFERENT reasons, which must not collapse into one.
+  const hitsDynamic = dynamic.getSnapshot().fields['metrics.prefix_cache_hits'];
+  const hitsScatter = scatter.getSnapshot().fields['metrics.prefix_cache_hits'];
+  assert.equal(hitsDynamic.state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(hitsScatter.state, FIELD_STATES.NOT_APPLICABLE);
+  assert.notEqual(
+    hitsDynamic.state,
+    hitsScatter.state,
+    'suppressed for different reasons must not render as the same state',
+  );
+  assert.match(hitsDynamic.reason, /not cache hits|matching token/i);
+});
 test('not-applicable is distinct from unavailable, not a synonym', async () => {
   // One says "the server does not compute this yet" (fixable by plumbing); the
   // other says "asking this of this server is meaningless" (permanent, and a
@@ -920,47 +947,78 @@ test('the two stores poll independently and do not share a snapshot', async () =
   assert.equal(scatter.getSnapshot().fields['queue.depth'].state, FIELD_STATES.MEASURED);
 });
 
-test('a hit rate with zero lookups is undefined, not 0%', async () => {
-  // Both endpoints emit a literal 0.0 when lookups == 0 (metrics.rs:301-305,
-  // routes/admin.rs:126-130), so "nothing looked up yet" and "looked and missed
-  // everything" are the same bytes. Only the store can tell them apart, because
-  // only here is the denominator still in scope.
-  const store = createTelemetryStore({
-    baseUrl: BASE_URL,
-    origin: 'dynamic',
-    fetchImpl: fakeFetch(
-      healthyRoutes({
-        [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_hit_rate: 0 } },
-        [ENDPOINTS.METRICS]: { text: metricsBody({ lookups: 0 }) },
-      }),
-    ),
-  });
-  await store.pollOnce();
+test('the hit rate is suppressed whatever the denominator does', async () => {
+  // These two cases used to be a matched pair: 0 lookups -> unavailable
+  // ("undefined, not zero"), 11 lookups -> a MEASURED 0%. The pair was correct
+  // arithmetic built on a wrong numerator. prefix_cache_hit_rate is
+  // hits/lookups where hits counts GENERATIONS WITH ANY MATCHING TOKEN, so the
+  // ratio is not a cache hit rate at any denominator and a nonzero denominator
+  // does not rescue it. Both arms are asserted together so nobody restores one
+  // half and concludes the field is healthy.
+  for (const lookups of [0, 11]) {
+    const store = createTelemetryStore({
+      baseUrl: BASE_URL,
+      origin: 'dynamic',
+      fetchImpl: fakeFetch(
+        healthyRoutes({
+          [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_hit_rate: 0 } },
+          [ENDPOINTS.METRICS]: { text: metricsBody({ lookups }) },
+        }),
+      ),
+    });
+    await store.pollOnce();
 
-  const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
-  assert.equal(rate.state, FIELD_STATES.UNAVAILABLE);
-  assert.equal(rate.value, null);
-  assert.match(rate.reason, /undefined, not zero/i);
+    const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
+    assert.equal(rate.state, FIELD_STATES.UNAVAILABLE, `lookups=${lookups}`);
+    assert.equal(rate.value, null, `lookups=${lookups}`);
+    assert.match(rate.reason, /not cache hits|matching token/i, `lookups=${lookups}`);
+  }
 });
 
-test('a hit rate with real lookups and no hits IS a measured 0%', async () => {
-  // The mirror. Once the denominator is nonzero, 0% is a genuine and important
-  // measurement -- suppressing it would hide a real cache miss rate.
-  const store = createTelemetryStore({
-    baseUrl: BASE_URL,
-    origin: 'dynamic',
-    fetchImpl: fakeFetch(
-      healthyRoutes({
-        [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_hit_rate: 0 } },
-        [ENDPOINTS.METRICS]: { text: metricsBody({ lookups: 11 }) },
-      }),
-    ),
-  });
-  await store.pollOnce();
+test('the zero-denominator correction is retained as a dormant second line', async () => {
+  // suppressUndefinedHitRate() in telemetry-store.js is now UNREACHABLE: it
+  // returns early unless prefix_cache.hit_rate is MEASURED, and the field is
+  // MISATTRIBUTED on every origin. It is deliberately NOT deleted -- it is the
+  // only thing standing between a 0/0 and a rendered "0%" if anyone ever
+  // reclassifies the rate back to MEASURED, and that reclassification would
+  // otherwise silently re-open a defect we already fixed once.
+  //
+  // Dead code that nobody can see is a maintenance hazard, so its dormancy is
+  // asserted rather than commented: THIS test is what goes red when the
+  // precondition changes, and it names the file to look in.
+  for (const origin of ['dynamic', 'scatter']) {
+    const entry = provenanceFor('prefix_cache.hit_rate', origin);
+    assert.notEqual(
+      entry.classification,
+      'MEASURED',
+      `prefix_cache.hit_rate became MEASURED on ${origin}. suppressUndefinedHitRate() ` +
+        'in telemetry-store.js is live again -- confirm the 0/0 case is still covered ' +
+        'before deleting it, and re-read the MISATTRIBUTED ruling in ' +
+        'telemetry-provenance.js first.',
+    );
+  }
+});
 
-  const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
-  assert.equal(rate.state, FIELD_STATES.MEASURED);
-  assert.equal(rate.value, 0);
+test('no prefix-cache hit field is MEASURED on any origin', async () => {
+  // The property, not the three named keys. The last time this defect was
+  // fixed per-key, the override existed on the /metrics copy and panels read
+  // the /v1/debug/kv copy -- the test passed while the page lied. A new hit
+  // field added tomorrow, from either endpoint, fails here without edits.
+  const offenders = [];
+  for (const [key, raw] of Object.entries(PROVENANCE)) {
+    if (!/hit/i.test(key) || !/prefix/i.test(key)) continue;
+    for (const origin of ['dynamic', 'scatter']) {
+      const entry = provenanceFor(key, origin);
+      if (entry.classification === 'MEASURED') offenders.push(`${key} (${origin})`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    'a prefix-cache hit field is classified MEASURED. The counter scores one hit ' +
+      'for ANY nonzero token match (metrics.rs:232-237), so it reads the same with ' +
+      'and without reuse:\n' + offenders.join('\n'),
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1370,7 +1428,10 @@ test('a structurally bypassed field is not-applicable on the very first frame, n
   const store = storeWith(healthyRoutes(), { origin: 'scatter' });
 
   // No poll: this is the frame every visitor sees before the network answers.
-  const field = store.field('prefix_cache.hit_rate');
+  // prefix_cache.lookups, not hit_rate: the rate is MISATTRIBUTED on every
+  // origin now, so it would be suppressed here for a reason that has nothing to
+  // do with the structural bypass this test exists to pin.
+  const field = store.field('prefix_cache.lookups');
 
   assert.equal(
     field.state,
@@ -1386,7 +1447,22 @@ test('the same field IS pending on the first frame of the dynamic server', () =>
   // Same field, same instant, opposite treatment -- decided by which model
   // loaded. This is the pair that a table keyed on field name alone cannot
   // represent, so it is asserted as a pair.
-  assert.equal(store.field('prefix_cache.hit_rate').state, FIELD_STATES.PENDING);
+  assert.equal(store.field('prefix_cache.lookups').state, FIELD_STATES.PENDING);
+});
+
+test('a misattributed field is unavailable on the first frame, never pending', () => {
+  // The distinction is the whole point of the five-state vocabulary: PENDING
+  // promises a number is coming. A misattributed field HAS its number already
+  // -- it arrives on the very first poll, correct and useless -- so promising
+  // one is a lie in the one state a visitor is guaranteed to see.
+  const store = storeWith(healthyRoutes(), DYNAMIC);
+
+  const field = store.field('prefix_cache.hit_rate');
+  assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
+  assert.notEqual(field.state, FIELD_STATES.PENDING);
+  // NOT not-applicable either: this server DOES run the code path. Collapsing
+  // it into the bypass state would claim the dynamic server never asks.
+  assert.notEqual(field.state, FIELD_STATES.NOT_APPLICABLE);
 });
 
 test('a bypassed field keeps one state across every path that can build it', async () => {

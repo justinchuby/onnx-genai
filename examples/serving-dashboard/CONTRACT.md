@@ -25,9 +25,10 @@ number" would be an instruction nobody could actually follow. The envelope makes
 the difference a property of the data, so the rule can be obeyed mechanically
 instead of remembered.
 
-`telemetry-provenance.js` enforces it: fields classified `DOCUMENTED_ZERO` or
-`NOT_PLUMBED` are emitted as `unavailable` **even when the response carried a
-parseable number for them.** You cannot accidentally bind a panel to a lie.
+`telemetry-provenance.js` enforces it: fields classified `DOCUMENTED_ZERO`,
+`NOT_PLUMBED` or `MISATTRIBUTED` are emitted as `unavailable` **even when the
+response carried a parseable number for them.** You cannot accidentally bind a
+panel to a lie.
 
 ---
 
@@ -302,9 +303,20 @@ sourceClass: 'client', origin })` at the point of measurement.
 **Absence is not one thing.** Before binding a missing path to
 `unavailableField`, check the classification in the registry:
 `NOT_PLUMBED` and `DOCUMENTED_ZERO` mean *unavailable* (plumbing would fix it);
-`STRUCTURALLY_BYPASSED` means *not-applicable* (plumbing would not). Use
-`neverMeasuredField()` rather than deciding per call site — the mapping was
-copied three times before and drifted in two of them.
+`STRUCTURALLY_BYPASSED` means *not-applicable* (plumbing would not);
+`MISATTRIBUTED` means *unavailable* for the reason no plumbing addresses — the
+server computes a real, correct number that answers a different question than
+the field name asks. Use `neverMeasuredField()` rather than deciding per call
+site — the mapping was copied three times before and drifted in two of them.
+
+`MISATTRIBUTED` is the only classification whose wire value looks perfect, so it
+is the only one you cannot diagnose by looking at the number. It exists because
+the vocabulary had no word for it: the three prefix-cache hit fields were
+`MEASURED` because that was the only remaining option, not because anyone judged
+them measured. **A missing word in a vocabulary does not read as a gap; it reads
+as agreement.** If the true quantity is itself worth showing, RELABEL and keep it
+`MEASURED` instead — `prefix_cache.lookups` genuinely counts completed
+generations and is labelled that way.
 
 ---
 
