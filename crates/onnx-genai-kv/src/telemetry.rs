@@ -78,6 +78,14 @@ pub struct KvTelemetry {
     /// Sized once, on attach, because the pool's capacity is not known when the
     /// telemetry is constructed.
     blocks: OnceLock<Box<[AtomicU64]>>,
+    /// Pages the POOL has, as opposed to the number this mirror can describe.
+    ///
+    /// Kept because `size_blocks` caps the mirror and used to discard the
+    /// requested size, which destroyed the only evidence that anything had
+    /// been truncated. A client comparing `pages_in_use` (a true reading of
+    /// the whole pool) against the mirror length (a capped one) would see
+    /// pages-in-use exceed the total and have no way to learn why.
+    pool_blocks: AtomicUsize,
     /// Whether the paged pool this mirrors is the one the decoder actually
     /// uses. Continuous batching and paged KV are mutually exclusive, so on a
     /// batching model every counter here is a truthful reading of a pool that
@@ -256,6 +264,9 @@ impl KvTelemetry {
     /// allocation unbounded; pages beyond the cap are simply not mirrored,
     /// which a reader detects as an absent block rather than a wrong one.
     pub(crate) fn size_blocks(&self, pages: usize) {
+        // Recorded BEFORE the cap. The cap is correct; discarding what it
+        // capped is what made the truncation unobservable.
+        self.pool_blocks.store(pages, Ordering::Relaxed);
         let capped = pages.min(Self::MAX_MIRRORED_BLOCKS);
         let _ = self.blocks.set(
             (0..capped)
@@ -332,6 +343,21 @@ impl KvTelemetry {
     /// How many pages the mirror can describe.
     pub fn mirrored_block_capacity(&self) -> usize {
         self.blocks.get().map_or(0, |blocks| blocks.len())
+    }
+
+    /// Pages the pool holds, whether or not this mirror can describe them all.
+    ///
+    /// Distinct from [`Self::mirrored_block_capacity`], and the difference is
+    /// the whole point: `pages_in_use` is measured against THIS number, so a
+    /// client handed only the mirror length can compute an occupancy greater
+    /// than one and be unable to tell whether that is overload or truncation.
+    pub fn pool_block_count(&self) -> usize {
+        self.pool_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Whether the mirror describes fewer pages than the pool holds.
+    pub fn block_mirror_is_truncated(&self) -> bool {
+        self.pool_block_count() > self.mirrored_block_capacity()
     }
 
     /// Seeds the live gauges from a directly-computed count.
@@ -902,6 +928,42 @@ mod tests {
             telemetry.mirrored_block_capacity(),
             KvTelemetry::MAX_MIRRORED_BLOCKS
         );
+    }
+
+    /// The cap must not destroy the evidence that it fired.
+    ///
+    /// `size_blocks` used to keep only the capped length, so a pool larger than
+    /// the mirror became indistinguishable from one that fit exactly. No
+    /// endpoint downstream could recover the difference, which is what let the
+    /// block table publish a total smaller than its own `pages_in_use`.
+    #[test]
+    fn a_capped_mirror_still_remembers_the_pool_it_could_not_hold() {
+        let telemetry = KvTelemetry::default();
+        let oversized = KvTelemetry::MAX_MIRRORED_BLOCKS * 3;
+        telemetry.size_blocks(oversized);
+
+        assert_eq!(
+            telemetry.mirrored_block_capacity(),
+            KvTelemetry::MAX_MIRRORED_BLOCKS,
+            "the cap must still bite"
+        );
+        assert_eq!(
+            telemetry.pool_block_count(),
+            oversized,
+            "the requested size must survive the cap"
+        );
+        assert!(telemetry.block_mirror_is_truncated());
+    }
+
+    /// A pool that fits must not claim truncation, or the flag is decorative.
+    #[test]
+    fn a_mirror_that_holds_the_whole_pool_reports_no_truncation() {
+        let telemetry = KvTelemetry::default();
+        telemetry.size_blocks(40);
+
+        assert_eq!(telemetry.pool_block_count(), 40);
+        assert_eq!(telemetry.mirrored_block_capacity(), 40);
+        assert!(!telemetry.block_mirror_is_truncated());
     }
 
     /// Packing must round-trip, including the boundary values that would

@@ -284,6 +284,19 @@ pub(crate) struct NodeStatus {
     ///
     /// A stable token rather than prose, so a client branches on it instead of
     /// parsing [`Self::batch_driver_detail`].
+    /// WHICH model's batch the four `batch_*` occupancy fields describe.
+    ///
+    /// The occupancy is read from one engine's driver -- the node's default
+    /// model -- while `active_batch_size` above is node-wide. With a single
+    /// model loaded the distinction is invisible, which is precisely why it
+    /// needs to be on the wire: the shipped topology is one model per server,
+    /// so a scope error here would never surface in the demo and would surface
+    /// immediately for the first operator who loads a second model.
+    ///
+    /// A client rendering the batch panel should title it with this id rather
+    /// than with the node's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_driver: Option<&'static str>,
     /// Why that driver is the one running, in the engine's own words when it
@@ -359,6 +372,19 @@ pub(crate) struct DebugKvResponse {
     /// produce the identical rate, so the rate alone cannot show whether prefix
     /// caching is doing anything worth having.
     prefix_tokens_reused: u64,
+    /// Generations in flight ACROSS THE WHOLE NODE, counted by the HTTP layer.
+    ///
+    /// **This is not the numerator of `batch_utilization`, and dividing it by
+    /// `batch_capacity` produces a ratio of two different populations.** It
+    /// counts every in-flight generation on every loaded model, bounded by
+    /// `max_queue_depth`; `batch_in_flight` counts rows in ONE driver's batch,
+    /// bounded by that driver's capacity. With two models loaded they can
+    /// differ by more than a factor of the batch width, and the node-wide one
+    /// is the larger -- so the naive ratio saturates and renders a busy node
+    /// and a saturated one identically.
+    ///
+    /// Kept because it is the honest answer to "how much work is this process
+    /// doing", which is a different question from "how full is the batch".
     active_batch_size: u64,
     pending_queue_depth: u64,
     available_admission_slots: usize,
@@ -805,7 +831,26 @@ pub(crate) struct BlockWindow {
     /// demo runs. It is a fact about our KNOWLEDGE, not about occupancy.
     observed: usize,
     /// Pages the mirror can describe, so a client knows when it has them all.
+    ///
+    /// This is the MIRROR's reach, not the pool's size. Paging to `total` walks
+    /// everything this endpoint can show and may still be a fraction of the
+    /// pool -- see `pool_total` and `truncated`.
     total: usize,
+    /// Pages the POOL holds.
+    ///
+    /// Published because `pages_in_use` is measured against this number while
+    /// `total` is the capped mirror, so the two are not commensurable when the
+    /// cap bites: a client rendering "pages_in_use of total" could show more
+    /// pages in use than exist on screen -- a visible arithmetic contradiction
+    /// with no explanation available anywhere in the response.
+    pool_total: usize,
+    /// Whether the mirror stops short of the pool.
+    ///
+    /// A derived boolean rather than something the client infers from
+    /// `pool_total > total`, because the inference is exactly what a client
+    /// renders a contradiction by failing to make. The cap is correct and
+    /// deliberate; what was wrong was that it was invisible on the wire.
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -893,6 +938,7 @@ impl BlockTableResponse {
         snapshot: onnx_genai_engine::KvTelemetrySnapshot,
         start: usize,
         total: usize,
+        pool_total: usize,
         states: Vec<Option<onnx_genai_engine::BlockState>>,
     ) -> Self {
         // `scanned` is derived from what was actually examined, never from the
@@ -942,6 +988,8 @@ impl BlockTableResponse {
                 scanned,
                 observed,
                 total,
+                pool_total,
+                truncated: pool_total > total,
             }),
             blocks: Some(blocks),
         }

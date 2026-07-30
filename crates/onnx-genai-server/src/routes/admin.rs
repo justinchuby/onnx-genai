@@ -239,6 +239,10 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
         // endpoint confirms. Same reading as the ratio above.
         batch_capacity: occupancy.map(|o| u32::try_from(o.capacity).unwrap_or(u32::MAX)),
         batch_queued: occupancy.map(|o| u32::try_from(o.queued).unwrap_or(u32::MAX)),
+        // Named from the SAME handle the occupancy was read from, not from
+        // `default_id`, so the id cannot drift from the numbers it labels if
+        // the default changes between the two resolves.
+        batch_model_id: handle.as_ref().map(|handle| handle.id.clone()),
         batch_driver: batch_driver.as_ref().map(|driver| driver.kind()),
         batch_driver_detail: batch_driver.as_ref().map(|driver| driver.explain()),
         // Session ids are real, and redacted because full ids are bearer
@@ -704,6 +708,7 @@ pub(crate) async fn debug_kv_blocks(
         telemetry.snapshot(),
         query.start,
         telemetry.mirrored_block_capacity(),
+        telemetry.pool_block_count(),
         states,
     )))
 }

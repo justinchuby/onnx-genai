@@ -4783,6 +4783,7 @@ fn a_block_table_keeps_its_columns_the_same_length() {
         onnx_genai_engine::KvTelemetrySnapshot::default(),
         0,
         4096,
+        4096,
         states,
     );
     let value = serde_json::to_value(&response).expect("serialise");
@@ -4826,6 +4827,7 @@ fn every_block_position_is_its_page_id_so_a_grid_can_draw_by_index() {
         Some("m".into()),
         onnx_genai_engine::KvTelemetrySnapshot::default(),
         40,
+        4096,
         4096,
         states,
     );
@@ -4879,6 +4881,7 @@ fn a_block_window_distinguishes_pages_scanned_from_pages_observed() {
         onnx_genai_engine::KvTelemetrySnapshot::default(),
         0,
         4096,
+        4096,
         states,
     );
     let value = serde_json::to_value(&response).expect("serialise");
@@ -4928,6 +4931,7 @@ fn every_tier_on_the_wire_has_a_served_name() {
         onnx_genai_engine::KvTelemetrySnapshot::default(),
         0,
         4096,
+        4096,
         states,
     );
     let value = serde_json::to_value(&response).expect("serialise");
@@ -4960,6 +4964,7 @@ fn a_block_table_serves_the_denominator_for_its_own_fill_ratio() {
         Some("m".into()),
         snapshot,
         0,
+        4096,
         4096,
         vec![Some(onnx_genai_engine::BlockState {
             page_id: 0,
@@ -5356,5 +5361,110 @@ fn the_continuous_batch_probe_never_discards_its_error() {
     assert!(
         source.contains("BatchDriver::PerRequest"),
         "expected the probe to record its refusal as a value"
+    );
+}
+
+/// C3: the block mirror caps its window, and the cap used to be invisible on
+/// the wire.
+///
+/// `pages_in_use` is a true reading of the WHOLE pool while the mirror stops at
+/// `MAX_MIRRORED_BLOCKS`, so a client rendering "in use of total" against the
+/// window length can paint more pages in use than exist on screen -- a visible
+/// arithmetic contradiction with no explanation anywhere in the response. The
+/// cap is correct; publishing it is what was missing.
+#[test]
+fn a_truncated_block_mirror_says_that_it_is_truncated() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = (0..8)
+        .map(|i| {
+            Some(onnx_genai_engine::BlockState {
+                page_id: i,
+                ref_count: 1,
+                filled_slots: 1,
+                tier: 0,
+            })
+        })
+        .collect();
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,
+        4096,
+        9000,
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    let window = &value["window"];
+
+    assert_eq!(
+        window["pool_total"].as_u64(),
+        Some(9000),
+        "the pool size must be published, not the capped mirror length; a \
+         client that only ever sees 4096 cannot tell a full pool from a \
+         truncated view of a larger one"
+    );
+    assert_eq!(
+        window["total"].as_u64(),
+        Some(4096),
+        "`total` must remain the mirror's reach, because it is what bounds \
+         pagination"
+    );
+    assert_eq!(
+        window["truncated"].as_bool(),
+        Some(true),
+        "truncation must be stated, not left for the client to infer from \
+         `pool_total > total` -- failing to make that inference is exactly how \
+         the contradiction gets rendered"
+    );
+}
+
+/// The flag must not be stuck on: a pool that fits reports no truncation.
+///
+/// Without this, `truncated: true` hardcoded would pass the test above while
+/// making every honest window claim it was hiding something.
+#[test]
+fn an_untruncated_block_mirror_does_not_claim_truncation() {
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,
+        40,
+        40,
+        vec![None; 40],
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    assert_eq!(value["window"]["truncated"].as_bool(), Some(false));
+    assert_eq!(value["window"]["pool_total"].as_u64(), Some(40));
+}
+
+/// C4: the four `batch_*` occupancy fields describe ONE driver's batch, while
+/// `active_batch_size` beside them is node-wide. The shipped topology is one
+/// model per server, so a scope error here is invisible in the demo and fires
+/// for the first operator who loads a second model.
+#[tokio::test]
+async fn batch_occupancy_names_the_model_whose_batch_it_describes() {
+    let state = tiny_state();
+    let value = get_json(app(state), "/v1/status").await;
+
+    assert!(
+        value.get("batch_model_id").is_some()
+            || value["unavailable"].get("batch_capacity").is_some(),
+        "status must either name the model its batch occupancy describes or \
+         declare the occupancy unavailable; an unlabelled batch reading on a \
+         multi-model node silently attributes one engine's numbers to the node"
+    );
+}
+
+/// The truncation tests above construct the response directly, so they cannot
+/// see the route handing `mirrored_block_capacity()` in for BOTH arguments --
+/// which is the original defect exactly, and would make `truncated` a constant
+/// `false` while every unit test stayed green.
+#[test]
+fn the_block_table_route_reports_the_pool_size_not_the_mirror_length_twice() {
+    let source = include_str!("routes/admin.rs");
+    assert!(
+        source.contains("telemetry.pool_block_count()"),
+        "the block-table route must publish the POOL size alongside the mirror \
+         length; passing the mirror length for both collapses `truncated` to a \
+         constant false and restores the contradiction C3 fixed"
     );
 }
