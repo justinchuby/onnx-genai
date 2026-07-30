@@ -134,6 +134,16 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
 | `--model` | The server takes a model **directory**, not a config file. Unlike the CLI it does not normalise the path for you, so passing `.../genai_config.json` is a real footgun. |
 | `--demo-assets-dir` | Where the dashboard's static files live. Without it the server looks for `./examples/serving-dashboard` **relative to its working directory**, so a server started from anywhere else serves an explanatory error at `/demo` instead of the page. `run-demo.sh` always passes it, so it works from any directory. |
 | `--enable-debug-endpoints` | The dashboard polls `/v1/debug/kv` (KV and prefix-cache fields) and `/v1/debug/config` (context length on the model card). Without it those fields correctly degrade to unavailable — nothing breaks, there is just much less to see. |
+
+The dashboard polls **`/v1/status`, `/v1/debug/kv` and `/health`**, and
+deliberately **not `/metrics` or `/v1/resources`**, even though both expose
+genuinely measured data. Those two answer in under a millisecond when the server
+is idle and **block for the entire duration of a generation** when it is not —
+around 15 seconds on the reference machine — because each one round-trips a
+command to the driver thread that is busy decoding. Polling them would freeze
+the dashboard during exactly the activity it exists to show, and it would look
+perfect in every idle test. If you add a panel, check what your endpoint costs
+*under load*; the fast path and the slow path are indistinguishable at rest.
 | `--addr` | Defaults to `127.0.0.1:8080`. The demo uses `:8123` and `:8124` so it does not collide with a server you already have running. |
 
 Overridable via environment: `MODELS_DIR`, `SCATTER_MODEL`, `DYNAMIC_MODEL`,
@@ -460,9 +470,29 @@ An empty field is not one situation, and your next action differs in each:
 | **`—`** *unavailable* | We cannot measure this here. Stubbed, not plumbed, or structurally fabricated on this profile. | The runtime may well do this; the telemetry does not report it. Hover for the specific reason. |
 | **greyed number + age** *stale* | We measured it, but the most recent poll did not refresh it. | The number is real but old. The age is shown so you can judge it. |
 | **`···`** *pending* | Measurable; no sample has arrived yet. | Wait a moment. This one resolves on its own. |
+| **`—` + a visible caption** *not applicable* | Meaningless on this execution path — the question was never asked. | Not a gap in our work. This is the architecture, and the caption says which part. |
 
 `pending` and `unavailable` are deliberately different states: telling you to
-wait for a number that is never coming would be its own small dishonesty.
+wait for a number that is never coming would be its own small dishonesty. And
+`not-applicable` is deliberately distinct from `unavailable` — one is our gap,
+the other is a fact about the runtime. It is the **only** state whose
+explanation is always on screen rather than behind a hover, because a fact
+nobody hovers over is a fact nobody learns, and this is the one most worth
+reading.
+
+**Staleness is tracked per server, not per panel** — which matters here because
+there are two. One server can stall or die while the other stays perfectly
+healthy, and the dead half would otherwise keep showing its last good frame
+indefinitely. A frozen chart and a saturated one are pixel-identical, so a stall
+marks **every** panel fed by that origin, and past a per-panel age ceiling a
+stale field stops rendering as a number at all: an unbounded age suffix is still
+a number on screen. The ceiling differs by panel because the tolerable ages do —
+a 4 Hz sparkline is worthless at three seconds old, while a page-table total is
+fine at thirty.
+
+That is the honesty rule arriving through the transport layer rather than the
+data: every panel can be individually truthful and the page can still lie,
+because correctness was enforced per field while the failure is per connection.
 
 **A metric that is meaningless on the running profile is not shown as a zero**,
 and the reason is worth knowing, because it is the more interesting design
@@ -485,7 +515,6 @@ static one, because there it is a hardcoded literal rather than a reading.
 The page footer renders the full field-by-field provenance table, generated from
 `telemetry-provenance.js` so it cannot drift from the code. A few of the traps
 that table exists to prevent:
-
 - **`active_sessions`** counts persistent `X-Session-Id` sessions, not in-flight
   requests. Four concurrent requests show `0` unless the client opted in.
 - **`prefix_cache_lookups`** increments on every completed generation, whether or
@@ -495,6 +524,14 @@ that table exists to prevent:
   is labelled "KV bytes reserved", never "GPU memory used".
 - **`host_ram`** is whole-machine capacity, including every other process.
   Attributing it to onnx-genai would be a fabrication of attribution.
+- **An uncomputed field is `null` on the wire, never `0`.** This one is a rule
+  rather than a trap, and it is the rule that makes the rest of them expire
+  correctly. While a stub emits a literal `0.0`, "no data" and "measured zero"
+  are *byte-identical* in the response, so every client has to carry a
+  hardcoded list of fields it distrusts — a copy of server state that drifts the
+  moment the server improves. The failure is guaranteed and silent: **the day a
+  field becomes real, a stale distrust-list hides it.** A nullable field cannot
+  be accidentally summed, averaged or plotted; a `0.0` silently can.
 - **`/v1/resources` page counts are degenerate on the static-cache profile**,
   where the endpoint reports a page size of 16 bytes and `total_pages` in the
   hundreds of millions. That is not a small-but-real number, it is arithmetic
@@ -586,6 +623,7 @@ drifted between its four appearances.
 | KV and prefix panels show `n/a` on the batching scenario. | Correct and expected — see [Why two servers](#why-two-servers). Those metrics are meaningless on that execution path, which is why they read `n/a` rather than `—`. |
 | A panel shows `—` where you expected a number. | That field is not measurable today. Hover it: the reason is specific, and it is never "we forgot". |
 | Numbers are greyed out with an age next to them. | The last poll did not land. The values are real but stale; the connection indicator in the header shows the reconnect state. |
+| **Every panel on one server freezes while the other keeps updating.** | That server stalled or died. Correct behaviour, not a rendering bug — staleness is marked per origin precisely so half a demo cannot keep showing a confident last frame. |
 | "Opened from disk" blocks the page. | The page was opened as a `file://` URL. It has to be served by the server; open the printed URL. |
 | The script says a model directory does not exist. | Models are gitignored. Build them, or set `MODELS_DIR`. |
 | Port already in use. | `SCATTER_PORT` / `DYNAMIC_PORT`, or stop the server still holding it. |
