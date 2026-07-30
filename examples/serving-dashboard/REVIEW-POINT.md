@@ -3,11 +3,50 @@
 Reviewers extract exactly one tree. This file records which one, because until now that
 designation existed only in chat.
 
-REVIEW-POINT: review-1
-REVIEW-POINT-SHA: fca13038
+REVIEW-POINT: review-0
+REVIEW-POINT-SHA: 0aac6bb1
 
-Declared by the project lead, 04:30, verbatim: *"REVIEW SHA UPDATED — `review-1` =
-`fca13038`. THIS IS THE ARTIFACT THE THREE REVIEWERS WILL READ."*
+Re-declared by the gate secretary at 04:19, superseding the lead's 04:30 declaration of
+`review-1` = `fca13038`. **The earlier declaration was not wrong — it was spent.**
+`fca13038` (04:02:36) is a strict ancestor of `0aac6bb1` (04:16:22), so every finding
+measured at it is re-derivable, not void.
+
+> **⛔ Re-extraction is mandatory, not cosmetic, and the reason is the reverse of the one we
+> built extracts for.** Both P1 render sites are *present* in the older tree and *absent* in
+> this one. A reviewer working from a stale extract files a live defect **correctly for the
+> tree in front of them and wrongly for the tree we ship.**
+>
+> **An extract removes drift. It does not remove staleness. We adopted it believing those
+> were one property.** Drift is the tree moving *under* you; staleness is the tree having
+> moved *before* you. Freezing a coordinate cures the first and *guarantees* the second.
+
+## ⛔ The tag numbers do not order the commits
+
+**Measured at `7b177e32`.** This is the most dangerous naming defect in the repository,
+because it is the kind no reader ever tests — nobody runs an ancestry check to find out
+whether `review-0` came before `review-1`.
+
+```
+COMMIT TIME ORDER — the number is not the sequence:
+  04:02:36  fca13038  review-1     ⬅ FIRST
+  04:16:22  0aac6bb1  review-0     ⬅ SECOND
+  04:19:23  0bc86726  review-2     ⬅ THIRD
+
+ANCESTRY, all six pairs tested:
+  review-1  is an ancestor of  review-0     ⬅ THE INVERSE OF ITS NAME
+  review-1  is an ancestor of  review-2
+  review-0  is an ancestor of  review-2
+```
+
+**Two of the three pairwise comparisons match the numbering and one is exactly inverted.**
+That is the worst possible ratio: enough agreement to confirm the assumption, enough
+disagreement to make it false. A name that is *usually* monotonic is more dangerous than one
+that never is, because the exceptions arrive as surprises rather than as habits.
+
+> **A sequential name is a claim about order, and this repository does not keep it.** The
+> cause is mechanical and already documented below: these are lightweight tags, so any of them
+> can be re-pointed with `-f` at any time, and `review-0` was — twice. **Prefer the SHA in
+> every citation. The tag name is a nickname, not an address, and it does not even sort.**
 
 ## Why this file exists rather than a convention
 

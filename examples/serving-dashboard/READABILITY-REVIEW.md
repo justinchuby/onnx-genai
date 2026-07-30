@@ -1192,3 +1192,61 @@ worktrees, all session, deliberately:
 instrument with no state to lose.** A worktree is only required to *execute*. For reading
 source — which is the whole readability lane — it buys nothing and can silently cost
 everything.
+
+---
+
+## R30 🔴 NEW — the review tags do not sort, and the review point moved under this document
+
+**Measured at `7b177e32`.** `REVIEW-POINT.md` has been re-pointed to `review-0` = `0aac6bb1`,
+superseding `review-1` = `fca13038`. The earlier declaration was **not wrong — it was spent**;
+`fca13038` is a strict ancestor, so everything measured at it is re-derivable.
+
+**The naming defect found while re-pointing is the one worth keeping.** All six pairwise
+ancestries, tested:
+
+```
+04:02:36  fca13038  review-1     ⬅ FIRST
+04:16:22  0aac6bb1  review-0     ⬅ SECOND
+04:19:23  0bc86726  review-2     ⬅ THIRD
+
+review-1 is an ancestor of review-0     ⬅ THE EXACT INVERSE OF ITS NAME
+review-1 is an ancestor of review-2     ✅ as named
+review-0 is an ancestor of review-2     ✅ as named
+```
+
+**Two of three comparisons match the numbering and one is exactly inverted — the worst
+possible ratio.** Enough agreement to confirm the assumption, enough disagreement to make it
+false. **A name that is *usually* monotonic is more dangerous than one that never is**,
+because the exceptions arrive as surprises instead of as habits. And nobody will ever catch
+it, because **no reader runs an ancestry check to discover whether `review-0` precedes
+`review-1`.**
+
+> **A sequential name is a claim about ordering, and this repository does not keep it.** These
+> are lightweight tags: any of them can be re-pointed with `-f`, and `review-0` was, twice.
+> **The tag name is a nickname, not an address — and it does not even sort.**
+
+### R28 and the extract defect are one finding, and I had only half of it
+
+I filed R28 as *a pinned SHA makes every document in that checkout a stale read*. The gate
+secretary independently filed the opposite polarity: **a stale extract freezes a defect that
+has since died** — both P1 render sites are present in the older tree and absent in the newer,
+so a reviewer working from the old extract files a real defect **correctly for the tree in
+front of them and wrongly for the tree we ship.**
+
+**These are the same defect and neither of us had both halves:**
+
+| | what the reader gets | direction |
+| --- | --- | --- |
+| R28 (mine) | findings that **do not exist yet** | under-reads — misses live defects |
+| the extract defect (theirs) | findings that **no longer exist** | over-reads — files dead defects |
+
+> **The unified statement: an extract removes *drift*, not *staleness*, and we adopted it
+> believing those were one property.** Drift is the tree moving **under** you; staleness is the
+> tree having moved **before** you. **Freezing a coordinate cures the first and *guarantees*
+> the second.** Every argument made tonight for pinning was an argument against drift, and not
+> one of them was an argument against staleness — **so we bought a cure for the half we had
+> noticed and paid for it with the half we had not.**
+
+**The prescription is the same one line in both directions, and it is free:** a pinned
+coordinate must state **what it is a claim about**. Code at the extract; prose at the branch
+tip; and the tip re-checked before any finding is filed from a frozen tree.
