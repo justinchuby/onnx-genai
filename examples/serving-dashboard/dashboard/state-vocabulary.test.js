@@ -167,3 +167,39 @@ describe('the exported state constants agree with the ruling', () => {
     );
   });
 });
+
+describe('the field shape the panels actually read', () => {
+  // A proposed shape is in circulation that renames `source` to `provenance`
+  // and `endpoint`, and adds `classification`. None of it has landed. This
+  // matters because a rename here fails SILENTLY in the worst way: reading a
+  // property that no longer exists yields undefined, so the source badge and
+  // the origin attribution simply stop rendering. No error, no crash — the
+  // provenance affordances just quietly disappear, which is the one category
+  // of bug this dashboard exists to prevent.
+  //
+  // If the rename does land, this test fails and names the property instead of
+  // letting six panels lose their badges unnoticed.
+  it('exposes source, origin and observedAtMs on a real polled field', async () => {
+    const store = createTelemetryStore({ origin: 'scatter', fetchImpl: respondingServer() });
+    await store.pollOnce();
+
+    const field = store.field('queue.depth');
+    for (const key of ['value', 'state', 'source', 'origin', 'observedAtMs', 'reason']) {
+      assert.ok(key in field, `TelemetryField lost the "${key}" property the panels read`);
+    }
+
+    store.stop();
+  });
+
+  it('attributes a field to an engine, not to a URL', async () => {
+    // `origin` answers WHICH ENGINE, and it is carried on client-measured
+    // fields too. It must never be inferred from the base URL that was
+    // fetched, or the derived metrics end up unattributed.
+    const store = createTelemetryStore({ origin: 'dynamic', fetchImpl: respondingServer() });
+    await store.pollOnce();
+
+    assert.equal(store.field('queue.depth').origin, 'dynamic');
+
+    store.stop();
+  });
+});
