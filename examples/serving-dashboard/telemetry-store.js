@@ -677,38 +677,26 @@ export function createTelemetryStore({
     return { modelIds: [], primary: null };
   }
 
-    /**
-   * Expose the ONE model this page is about at a fixed path on the /v1/models
-   * body, so provenance entries can address it as `served.*`.
-   *
-   * WHY A PROJECTION RATHER THAN A DOTTED PATH. /v1/models returns a LIST, and
-   * no dotted path can express "the entry for the model this page is actually
-   * watching". `data.0.path` would be a guess, and @12e42da8 established that
-   * the implicit default is the ALPHABETICALLY FIRST id -- which in the
-   * two-model demo is the dynamic model, not the scatter one. A panel reading
-   * index 0 would therefore describe the wrong model on the scatter server
-   * while looking entirely correct.
-   *
-   * So the entry is selected by the id this page is attributed to, and only
-   * falls back to the server's own `is_default` flag. If neither identifies a
-   * single entry, nothing is projected and the fields stay unavailable -- an
-   * absent directory is a gap, but a CONFIDENT WRONG directory would be a
-   * fabricated fact about the visitor's machine.
-   *
-   * @param {Record<string, SourceResult>} sources
-   */
-  function projectServedModel(sources) {
-    const models = sources[ENDPOINTS.MODELS];
-    if (!models?.ok || !Array.isArray(models.body?.data)) return;
-
-    const entries = models.body.data;
-    const served =
-      entries.find((entry) => entry?.id === attribution.primary) ??
-      entries.find((entry) => entry?.is_default === true) ??
-      (entries.length === 1 ? entries[0] : null);
-
-    if (served) models.body.served = served;
-  }
+    // ⛔ `projectServedModel()` STOOD HERE AND IS DELETED ON PURPOSE.
+  //
+  // Its entire job was to copy the served /v1/models entry onto
+  // `models.body.served` so a PROVENANCE row could address `served.*`. Exactly
+  // ONE row ever did: `server.model_path`. That row is now a ban in
+  // NEVER_BIND, because the directory is TRUE and must still never be shown --
+  // on loopback it is the operator's absolute home path.
+  //
+  // With the row gone this function had no consumer, and keeping it would have
+  // been worse than useless: it LIFTED the absolute path out of a list nobody
+  // addresses and pinned it at a fixed, guessable location on the parsed body,
+  // where the next panel to read the raw body would find it sitting ready. The
+  // ban stops a field being BOUND; deleting this stops it being ADDRESSABLE.
+  //
+  // Nothing about model attribution was lost. `readAttribution()` above is a
+  // separate function, still called on every cycle, and it is what carries
+  // @12e42da8's finding that the implicit default is the ALPHABETICALLY FIRST
+  // id -- so a reader of index 0 describes the wrong model on the scatter
+  // server while looking entirely correct. That knowledge is load-bearing and
+  // it did not live here.
 
   /**
    * Explain, in terms a developer can act on, that this file's audit is stale.
@@ -798,7 +786,6 @@ export function createTelemetryStore({
     // attribution, rather than some fields having it and others not.
     attribution = readAttribution(sources);
     warnOnAttributionMismatch();
-    projectServedModel(sources);
 
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const fields = {};

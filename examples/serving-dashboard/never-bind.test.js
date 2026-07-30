@@ -69,7 +69,7 @@ test('no shell module reads a never-bind field off a response body', () => {
   const sources = shellSources();
   assert.ok(sources.length > 5, `expected to scan several files, found ${sources.length}`);
 
-  for (const { field, why } of NEVER_BIND) {
+  for (const { field, why, exemptions = [] } of NEVER_BIND) {
     const patterns = [
       new RegExp(`\\.${field}\\b`),
       new RegExp(`\\[['"]${field}['"]\\]`),
@@ -78,12 +78,53 @@ test('no shell module reads a never-bind field off a response body', () => {
     for (const { rel, text } of sources) {
       // The declaration itself names the field, which is the point of it.
       if (rel === 'telemetry-provenance.js') continue;
+      // Remove the declared safe tokens FIRST, so any OTHER occurrence of the
+      // field still fires. This is a subtraction of exact strings, never of
+      // whole files -- excusing a file would excuse the one place most likely
+      // to bind the field.
+      let scanned = text;
+      for (const { token } of exemptions) scanned = scanned.split(token).join('');
       for (const pattern of patterns) {
         assert.ok(
-          !pattern.test(text),
+          !pattern.test(scanned),
           `${rel} appears to read "${field}", which must never be bound. ${why}`,
         );
       }
     }
+  }
+});
+
+// An exemption is a HOLE in the ban above, and a hole nobody can see is how a
+// guard quietly stops guarding. Two ways that happens: the reason goes
+// unwritten, or the code the exemption was granted for is deleted and the hole
+// outlives it -- still subtracting a token, now from files it was never
+// examined against. So every exemption must justify itself AND still be load
+// bearing. When the last `entry.path` disappears, this goes red and the
+// exemption gets deleted rather than inherited.
+test('every never-bind exemption is justified and still earning its keep', () => {
+  const sources = shellSources();
+  const granted = NEVER_BIND.flatMap((entry) =>
+    (entry.exemptions ?? []).map((exemption) => ({ ...exemption, field: entry.field })),
+  );
+
+  for (const { field, token, why } of granted) {
+    assert.ok(
+      typeof why === 'string' && why.length > 40,
+      `the "${token}" exemption on "${field}" must say why it is safe`,
+    );
+    assert.ok(
+      token.includes(field),
+      `the "${token}" exemption on "${field}" does not mention the field it excuses`,
+    );
+
+    const users = sources.filter(
+      ({ rel, text }) => rel !== 'telemetry-provenance.js' && text.includes(token),
+    );
+    assert.ok(
+      users.length > 0,
+      `the "${token}" exemption on "${field}" no longer matches any shipping source. ` +
+        'Delete it: an exemption for code that no longer exists is a permanent hole in ' +
+        'the ban, granted for a reason nobody can check.',
+    );
   }
 });

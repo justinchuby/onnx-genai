@@ -1334,17 +1334,30 @@ test('no reason string promises an endpoint that does not exist', () => {
 // wrong model while looking entirely correct.
 // ---------------------------------------------------------------------------
 
-test('the served model is selected by attribution, not by list position', async () => {
+// THESE THREE TESTS USED TO DRIVE `server.model_path` THROUGH THE STORE. That
+// row is gone -- the directory is TRUE and still unshowable, so it is a ban in
+// NEVER_BIND rather than a classification -- and `projectServedModel()` went
+// with it. Two of the three went red when it did. THE THIRD WENT GREEN, which
+// is the one worth remembering: 'an unidentifiable served model yields no
+// value rather than a guess' asserted the value was null-or-undefined, and a
+// field that no longer exists is undefined. IT PASSED BECAUSE ITS SUBJECT HAD
+// BEEN DELETED. A test whose assertion is satisfied by absence cannot tell you
+// the difference between "correctly declined to guess" and "nothing here at
+// all", so it is replaced below by one that must first prove the store is
+// answering.
+
+test('the absolute model directory is not addressable through the store at all', async () => {
+  // The real shape, from a live probe of all four demo origins: on loopback
+  // the server sends an operator's absolute path, username included.
+  const HOME_PATH = '/Users/someone/GitHub/onnx-genai-demo/../onnx-genai/models/qwen2.5-0.5b';
   const store = storeWith(
     healthyRoutes({
       [ENDPOINTS.MODELS]: {
         body: {
           object: 'list',
           data: [
-            // Alphabetically first, and NOT the model this page is attributed
-            // to. A projection reading index 0 picks this one and is wrong.
             { id: 'qwen2.5-0.5b', object: 'model', path: '/models/dynamic', is_default: true },
-            { id: 'qwen-scatter', object: 'model', path: '/models/scatter', is_default: false },
+            { id: 'qwen-scatter', object: 'model', path: HOME_PATH, is_default: false },
           ],
         },
       },
@@ -1352,62 +1365,50 @@ test('the served model is selected by attribution, not by list position', async 
   );
 
   await store.pollOnce();
-  const field = store.field('server.model_path');
+  const fields = store.getSnapshot().fields;
 
-  assert.equal(field.value, '/models/scatter');
-  assert.equal(field.state, FIELD_STATES.MEASURED);
-});
+  // POSITIVE CONTROL, DELIBERATELY FIRST. Without it this test passes on a
+  // store that answered nothing at all, which is the failure mode that looks
+  // most like success -- and is exactly how the test this one replaces went
+  // green while its subject was being deleted.
+  assert.equal(fields['server.model_id'].value, 'qwen-scatter');
+  assert.equal(fields['server.model_id'].state, FIELD_STATES.MEASURED);
 
-test('an unidentifiable served model yields no value rather than a guess', async () => {
-  const store = storeWith(
-    healthyRoutes({
-      [ENDPOINTS.HEALTH]: { body: { status: 'ok' } },
-      [ENDPOINTS.MODELS]: {
-        body: {
-          object: 'list',
-          // Two models, neither matching attribution and neither flagged
-          // default. A confident wrong directory is worse than a gap.
-          data: [
-            { id: 'a', object: 'model', path: '/models/a' },
-            { id: 'b', object: 'model', path: '/models/b' },
-          ],
-        },
-      },
-    }),
+  // Not "no field named model_path" -- no field carrying the VALUE, whatever
+  // it is called. The ban is on the bytes reaching a visitor, and renaming the
+  // row must not be a way to satisfy it.
+  const leaking = Object.entries(fields)
+    .filter(([, field]) => typeof field.value === 'string' && field.value.includes('/'))
+    .map(([key]) => key);
+  assert.deepEqual(
+    leaking,
+    [],
+    'no field may carry a filesystem path: on loopback that is the operator home directory',
   );
-
-  await store.pollOnce();
-  const field = store.field('server.model_path');
-
-  assert.equal(field.value === null || field.value === undefined, true);
-  assert.notEqual(field.state, FIELD_STATES.MEASURED);
 });
 
-test('the model directory going live is detected rather than em-dashed forever', async () => {
+test('a provenance row that has gone stale is detected rather than em-dashed forever', async () => {
+  // Vehicle swapped to another NOT_PLUMBED row. The property under test is the
+  // STALENESS MACHINERY, never the model directory: a row that asserts its
+  // path carries NOTHING must notice the day the server starts sending
+  // something, instead of hiding a real measurement behind an em-dash forever.
   const store = storeWith(
     healthyRoutes({
-      [ENDPOINTS.MODELS]: {
-        body: {
-          object: 'list',
-          data: [{ id: 'qwen-scatter', object: 'model', path: '/models/scatter' }],
-        },
+      [ENDPOINTS.STATUS]: {
+        body: statusBody({ server: { execution_provider: 'CUDAExecutionProvider' } }),
       },
     }),
   );
 
   await store.pollOnce();
 
-  // The entry is classified NOT_PLUMBED, which asserts the path carries
-  // NOTHING. The server now sends a directory, so the table is provably stale
-  // and must say so -- displaying the value rather than hiding a real
-  // measurement behind an em-dash.
   const warnings = store.provenanceWarnings();
   assert.ok(
-    Object.hasOwn(warnings, 'server.model_path'),
+    Object.hasOwn(warnings, 'server.execution_provider'),
     'arrival of a real value must be flagged',
   );
-  assert.match(warnings['server.model_path'], /out of date/);
-  assert.equal(store.field('server.model_path').value, '/models/scatter');
+  assert.match(warnings['server.execution_provider'], /out of date/);
+  assert.equal(store.field('server.execution_provider').value, 'CUDAExecutionProvider');
 });
 
 // --- Bypassed fields are never PENDING -------------------------------------

@@ -180,27 +180,30 @@ export const PROVENANCE = Object.freeze({
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:95 (handle.pipeline)',
     label: 'Pipeline model',
   },
-  'server.model_path': {
-    source: ENDPOINTS.MODELS,
-    path: 'served.path',
-    classification: 'NOT_PLUMBED',
-    unit: null,
-    evidence:
-      'No route returns the model directory today. /v1/debug/config exposes id, pipeline ' +
-      'and context only — crates/onnx-genai-server/src/routes/admin.rs:93-100, and the ' +
-      '/v1/models entry carries id/object/created/owned_by — routes/mod.rs:96-101.',
-    label: 'Model directory',
-    reason:
-      'The server does not expose the model directory path on any endpoint yet. @d7cf9b84 is ' +
-      'adding it to /v1/models, which is ungated and already polled, so it will appear ' +
-      'here without a flag on a visitor\'s first run.',
-    // POINTED AT THE ENDPOINT IT WILL ARRIVE ON, DELIBERATELY. This entry was
-    // previously aimed at /v1/status, where `path` is never going to appear.
-    // A NOT_PLUMBED entry is checked by asserting its path carries NOTHING, so
-    // an entry aimed at the wrong endpoint can never notice the field going
-    // live -- it would em-dash a real measurement forever, silently. Aimed
-    // here, the staleness check fires the moment the server ships it.
-  },
+  // ⛔ `server.model_path` USED TO LIVE HERE, CLASSIFIED `NOT_PLUMBED`, READING
+  // `served.path` OFF /v1/models. IT IS GONE ON PURPOSE. DO NOT RE-ADD IT.
+  //
+  // The classification was false and getting falser: its evidence read "No
+  // route returns the model directory today", and by the time anyone checked,
+  // four live origins were returning an absolute path in three seconds. But
+  // the fix is NOT to correct the classification, and that is the whole point
+  // of this tombstone.
+  //
+  // EVERY classification in this file answers ONE question: IS THIS VALUE
+  // TRUE? `MEASURED`, `DOCUMENTED_ZERO`, `NOT_PLUMBED`, `STRUCTURALLY_BYPASSED`
+  // and `MISATTRIBUTED` are five different answers to it. The model directory
+  // is perfectly, verifiably TRUE -- so no classification, present or future,
+  // can ever reach it. The reason it must not render is not honesty at all. It
+  // is DISCLOSURE: on loopback the server sends the operator's absolute path,
+  // so the field puts a developer's home directory and username on a
+  // projector. A true value we must never show is not a classification, it is
+  // a BAN -- so it lives in NEVER_BIND, below, beside `created`.
+  //
+  // Deleting the row is what makes the ban enforceable: NEVER_BIND asserts
+  // that no PROVENANCE entry reads a banned field, so a row here and a ban
+  // there cannot coexist. Correcting the classification instead would have
+  // left the field addressable and traded a loud true alarm for a quiet true
+  // statement about a defect still on the screen.
   'server.execution_provider': {
     source: ENDPOINTS.STATUS,
     path: 'server.execution_provider',
@@ -928,6 +931,36 @@ export const NEVER_BIND = Object.freeze([
       'recomputed on every request. It is not a creation date and it ticks if polled. ' +
       'Rendered as "created", it would be a confident, precise, wrong fact about when ' +
       'the model was built.',
+  }),
+  Object.freeze({
+    endpoint: ENDPOINTS.MODELS,
+    field: 'path',
+    why:
+      'The configured model directory at crates/onnx-genai-server/src/routes/mod.rs:116-120. ' +
+      'Unlike every other banned field this one is entirely TRUE, and that is exactly why no ' +
+      'classification in this file can reach it -- they all answer "is this value true?". The ' +
+      'ban is about DISCLOSURE. Its own doc comment says "Absolute on loopback; the basename ' +
+      'otherwise", and the demo is loopback on every origin we ship, so the permitted branch ' +
+      'of that defence is 100% of our deployment: the server sends the operator username, home ' +
+      'directory and filesystem layout, verbatim, to anything that polls it. Defensible on the ' +
+      'wire for an operator asking what is loaded; never defensible on a projector. The page ' +
+      'wants IDENTITY, and `server.model_id` already carries it.',
+    // WHY THIS ONE NEEDS EXEMPTIONS AND `created` DOES NOT. The broad scan below
+    // looks for the field NAME being read off a parsed body. `created` is a
+    // distinctive word; `path` is not -- it is also the name of the property on
+    // a PROVENANCE row that holds the dotted lookup path. So `entry.path` is a
+    // read of THIS TABLE, not of a response body, and the scan cannot tell the
+    // difference. Listing the exact safe tokens keeps the ban narrow and honest
+    // rather than silently excusing whole files.
+    exemptions: Object.freeze([
+      Object.freeze({
+        token: 'entry.path',
+        why:
+          'Reads the dotted-path DESCRIPTOR on a PROVENANCE row (telemetry-store.js resolves ' +
+          'and reports fields through it). It is this table addressing itself, not a panel ' +
+          'reading `path` off a /v1/models body.',
+      }),
+    ]),
   }),
 ]);
 

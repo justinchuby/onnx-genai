@@ -221,7 +221,30 @@ first poll because a rate needs two samples.
 Unavailable today (documented zeros / not plumbed): `kv.usage`, `kv.pages_used`,
 `kv.pages_total`, `kv.pages_shared`, `kv.introspection`, `batch.utilization`,
 `throughput.tokens_per_second`, `sessions.paused`, `prefix_cache.hashes`,
-`server.model_path`, `server.execution_provider`, `batch.effective_size`.
+`server.execution_provider`, `batch.effective_size`.
+
+### A true value the page must never show
+
+Every classification above answers one question: **is this value true?** Some
+wire fields are perfectly true and must still never reach a visitor, so no
+classification can ever describe them. Those are listed in `NEVER_BIND` in
+`telemetry-provenance.js`, and the rule is a **ban, not a state**:
+
+- `/v1/models` → `created` is `now_unix()`, recomputed per request. True, and a
+  wrong fact about when the model was built.
+- `/v1/models` → `path` is the configured model directory. Its own Rust doc
+  comment says *"Absolute on loopback; the basename otherwise"* — and every
+  origin this demo ships is loopback, so the protective branch never runs here.
+  The page wants **identity**, and `server.model_id` already carries it.
+
+Two properties make the ban enforceable rather than advisory. First, no
+`PROVENANCE` row may read a banned field, so a row and a ban cannot coexist —
+which is why `server.model_path` was **deleted** rather than reclassified.
+Second, no shipping module may read the field name off a response body. A
+banned field may declare narrow `exemptions` naming exact safe tokens (`path`
+collides with the `path` descriptor on a provenance row); each must justify
+itself and must still match live source, so a hole cannot outlive the code it
+was granted for.
 
 > ⚠️ **Do not build a "batch size" panel on `batch.in_flight`.**
 > `onnx_genai_batch_size_current` is documented "Current generation batch size"
