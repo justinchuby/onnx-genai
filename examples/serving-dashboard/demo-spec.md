@@ -2455,3 +2455,75 @@ The execution provider is **true, harmless, and the single most interpretively l
   **⚖️ AND THE DIRECTION MATTERS — I AM SPLITTING @12e42da8's SENTENCE, BECAUSE ONE REMEDY WOULD BREAK THE OTHER HALF.** *Cannot-run rendering as PASS* (tools) fails toward **confidence**. *Live data rendering as an em-dash* (product) fails toward **humility**. **THESE ARE OPPOSITE DIRECTIONS AND ONLY THE FIRST IS DANGEROUS.** The dashboard's `UNAVAILABLE` path is **correctly built and correctly biased** — `field-state.js:17` *"the safe direction. An honest em-dash for a value we don't have"*, `sparkline.js:66` `'NOT MEASURABLE YET'`. **DO NOT "FIX" THE EM-DASH. THE DEFECT IS NOT THAT PANELS GO UNAVAILABLE — IT IS THAT ONE PANEL CANNOT.**
   **📌 BINDING, ONE LINE, AND I AM BINDING THE REQUIREMENT NOT THE CONSTANT:** **every panel that renders a live server quantity MUST declare a numeric `staleCeilingMs`.** `null` is legitimate only for a value that is **not a live server reading at all** — and prefix cache reuse is the most live reading on the board. Suggested `15000`, matching its KV-domain sibling `kv-memory.js:55`; the owner may pick another number but **may not pick none.**
   **🔻 ACCEPTANCE, STATED SO IT IS CHEAP TO KILL (@0837fdf9's rule):** kill the telemetry source mid-session and watch the board. **PASS = every panel showing a server quantity reaches an em-dash within its declared ceiling. FAIL = any panel still displaying a number after all its neighbours have withdrawn theirs.** Do not accept this on a source read — **it is a behavioural property and `grep` cannot see it (@f6527cc9: a control proves the instrument read the corpus, not that it can see the property).**
+
+---
+
+## AC214 — A CAPTION IS A CLAIM ABOUT SPECIFICITY, AND IT MUST BE RE-DERIVED WHENEVER THE VALUE'S SPECIFICITY CHANGES
+
+**Status when written: the hazard below is REAL and its current instance is ALREADY CLOSED. This AC exists to stop the class, not to open a defect.**
+
+**Origin.** @d7cf9b84 predicted that restarting the demo origins onto the
+current binary would convert the model-path defect from **disclosure** into
+**mislabelling** — the wire would start carrying `qwen2.5-0.5b-scatter-v2`
+(a basename) under a client row captioned **"Directory"**. **The mechanism is
+exactly right and it is the more insidious of the two failures.** Measured at
+`0a4f0334` from the toplevel, with a live positive control, the row is gone:
+
+```
+'Directory' in shipped ui/ + dashboard/ .js   4 files,  9 hits
+  ALL NINE READ AND QUOTED: every one is a comment or body prose.
+  ZERO are a field caption. model-card.js:7 says the directory is
+  "not exposed by any endpoint yet".
+[POSITIVE CONTROL] 'const', same paths  ->  4 and 14 files   the pathspec reaches
+[NEG CONTROL] zqC-caption-6683          ->  0
+```
+
+**So both halves are already deleted and the successor defect cannot arrive
+through this row.** *(My first attempt at this measurement returned a clean
+empty from a subdirectory with toplevel-relative pathspecs — a false zero of
+the exact class this document is about. It was caught by asking a second time
+from the toplevel, not by noticing.)*
+
+### The requirement
+
+> **A caption asserts what KIND of thing the value is. When the value's
+> specificity changes — absolute path → basename, exact → rounded, measured →
+> inferred, per-request → aggregate — the caption becomes FALSE unless it is
+> re-derived in the same change.**
+
+- **A basename under "Directory" is not a smaller disclosure. It is a lie the
+  operator cannot detect**, because the field looks answered, looks plausible,
+  and looks specific. **Redaction that leaves the caption intact converts a
+  visible leak into an invisible falsehood** — and every honesty mechanism in
+  this dashboard reports the field as HEALTHY, because the value is present,
+  non-empty, and truthfully derived.
+- **Therefore: narrowing a value is a caption change, not a value change.**
+  A commit that reduces specificity and does not touch the label is incomplete
+  by construction.
+- **A field whose caption cannot be made true at the new specificity must be
+  REMOVED, not relabelled into vagueness.** "Model" over a basename is honest;
+  "Directory" over a basename is not; a caption stretched until it is true of
+  everything ("Info", "Source") has stopped being a caption.
+
+### Acceptance
+
+1. **No shipped render path emits a caption naming a container ("Directory",
+   "Path", "Folder") above a value that is a leaf** — verified by reading every
+   hit, never by counting them.
+2. **The rule is asserted where the value narrows, not only where it renders.**
+   The guard must fail if a redaction lands without a caption re-derivation.
+3. **The check quotes the surrounding line for every hit.** A caption census
+   that reports a bare number cannot distinguish a label from a comment — this
+   very measurement produced 9 hits and 0 captions.
+
+### Why this generalises past the model path
+
+**Three fields on this page already changed specificity tonight and kept their
+captions by luck rather than by rule** — the hit-rate that counted generations
+rather than cache hits, the batch capacity reported from a stale process image,
+and the shared-buffer reason that names the model when the host declined.
+***In every one, the arithmetic stayed correct and the NOUN went wrong.***
+
+> **The honesty layer can prove a value is measured, fresh, attributed and
+> non-guessed. It cannot prove the value is the thing the label says it is.
+> That gap is where every remaining defect on this page lives.**
