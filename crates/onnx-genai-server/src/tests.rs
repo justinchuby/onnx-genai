@@ -5248,3 +5248,88 @@ async fn generations_parked_before_a_batch_starts_share_its_rows() {
         deferred.len()
     );
 }
+
+/// `/v1/status` must say WHICH decode driver is running.
+///
+/// Every other field on that response stays honest across the continuous-batch
+/// fallback: a serialising engine truthfully reports one row of one, 100%
+/// utilised, and nothing in the payload contradicts a presenter saying the
+/// words "continuous batching". This contract defends against fabricated
+/// numbers and does nothing about TRUE numbers describing a different machine.
+#[tokio::test]
+async fn status_names_the_decode_driver_that_is_actually_running() {
+    let state = tiny_state();
+    let body = get_json(app(state), "/v1/status").await;
+
+    let kind = body["batch_driver"]
+        .as_str()
+        .expect("a node with a loaded model must name its decode driver");
+    assert!(
+        matches!(kind, "continuous_batch" | "per_request" | "pipeline"),
+        "unrecognised driver token {kind:?}: clients branch on this value"
+    );
+
+    // Present in BOTH directions. A detail string that appears only when
+    // something is wrong trains a reader to treat silence as success, and
+    // silence is also what an unwired field looks like.
+    let detail = body["batch_driver_detail"]
+        .as_str()
+        .expect("the driver must explain itself whether or not it is batching");
+    assert!(
+        !detail.is_empty(),
+        "empty driver detail is indistinguishable from an absent one"
+    );
+}
+
+/// The refusal reason must reach the wire, not just a boolean.
+///
+/// `tiny_state()` runs the per-request fallback, so this asserts the engine's
+/// own words survive the trip. Knowing the driver is off is not actionable;
+/// knowing it is off *because the model has no static-cache or shared-buffer
+/// decode path* tells an operator whether to change a flag or change a model.
+#[tokio::test]
+async fn a_disabled_batcher_publishes_why_it_is_disabled() {
+    let state = tiny_state();
+    let body = get_json(app(state), "/v1/status").await;
+
+    let kind = body["batch_driver"].as_str().unwrap();
+    let detail = body["batch_driver_detail"].as_str().unwrap();
+
+    if kind == "per_request" {
+        assert!(
+            detail.contains("INACTIVE"),
+            "a disabled batcher must say so unmistakably, got {detail:?}"
+        );
+        // The engine's reason, not a summary of it.
+        assert!(
+            detail.contains("refused it:") && detail.len() > "refused it:".len() + 20,
+            "the engine's refusal reason was dropped on the way to the wire: \
+             {detail:?}"
+        );
+    } else {
+        assert!(
+            detail.contains("active"),
+            "an enabled batcher must still explain itself, got {detail:?}"
+        );
+    }
+}
+
+/// The selection is never re-derived downstream from a field that lost it.
+///
+/// The original defect was `.is_ok()`: a `Result` carrying the only
+/// description of why the headline capability was off, collapsed to a bool at
+/// the one site that had it. Nothing downstream could reconstruct it, because
+/// the engine does not record it either.
+#[test]
+fn the_continuous_batch_probe_never_discards_its_error() {
+    let source = include_str!("driver.rs");
+    assert!(
+        !source.contains("continuous_batch_manager(max_batch).is_ok()"),
+        "the continuous-batch probe is collapsing its Err to a bool again; \
+         the refusal reason exists nowhere else and cannot be recovered later"
+    );
+    assert!(
+        source.contains("BatchDriver::PerRequest"),
+        "expected the probe to record its refusal as a value"
+    );
+}

@@ -96,6 +96,12 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
     // handed the raw row count would render "3 of 4" on a server whose real
     // ceiling is one. Admission also bounds the numerator, so the pair stays
     // commensurable after the narrowing.
+    // Resolved from the same handle as the occupancy so the driver named here
+    // is the driver that produced the numbers beside it.
+    let handle = state.registry.resolve("").ok().flatten();
+    let batch_driver = handle
+        .as_ref()
+        .map(|handle| handle.engine.batch_driver().clone());
     let occupancy = state
         .registry
         .resolve("")
@@ -121,6 +127,22 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
                     "no generation has run on this node yet, so the driver has \
                      published no batch occupancy; a zero here would be \
                      indistinguishable from an idle batch",
+                ),
+            );
+        }
+    }
+
+    // The driver selection is a property of a loaded engine. With no model
+    // resolved there is no driver, and naming one would describe a machine
+    // that is not running.
+    if batch_driver.is_none() {
+        for field in ["batch_driver", "batch_driver_detail"] {
+            unavailable.insert(
+                field,
+                FieldUnavailable::pending(
+                    "no model is loaded on this node, so no decode driver has \
+                     been selected; naming one would describe an engine that \
+                     does not exist",
                 ),
             );
         }
@@ -216,6 +238,8 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
         // endpoint confirms. Same reading as the ratio above.
         batch_capacity: occupancy.map(|o| u32::try_from(o.capacity).unwrap_or(u32::MAX)),
         batch_queued: occupancy.map(|o| u32::try_from(o.queued).unwrap_or(u32::MAX)),
+        batch_driver: batch_driver.as_ref().map(|driver| driver.kind()),
+        batch_driver_detail: batch_driver.as_ref().map(|driver| driver.explain()),
         // Session ids are real, and redacted because full ids are bearer
         // tokens (see session.rs). The per-session detail fields are omitted
         // rather than filled with "unknown".

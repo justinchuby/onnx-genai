@@ -14,6 +14,7 @@ use onnx_genai_engine::{
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
+use crate::batch_driver::BatchDriver;
 use crate::batch_telemetry::BatchTelemetry;
 
 use crate::metrics::GenerationMetrics;
@@ -37,6 +38,9 @@ pub(crate) struct EngineDriver {
     /// thread. Shared for the same reason as `kv_telemetry`: the status route
     /// must answer while that thread is blocked inside a generation.
     batch_telemetry: Arc<BatchTelemetry>,
+    /// Which decode driver this engine actually runs. Decided once, before
+    /// the engine moves to its thread, so it cannot drift from reality.
+    batch_driver: Arc<BatchDriver>,
 }
 
 pub(crate) enum DriverCommand {
@@ -137,7 +141,20 @@ impl EngineDriver {
         // means the width published below is the width that will actually run,
         // so there is one publisher and one decision rather than a fast wrong
         // answer racing a slow right one.
-        let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+        // The probe's `Err` is KEPT, not discarded. `.is_ok()` here used to
+        // throw away the only description of why the headline capability was
+        // switched off, leaving the question unanswerable from logs, from
+        // `/v1/status`, or from a debugger attached afterwards -- the engine
+        // never records it, so nothing downstream can reconstruct it.
+        let batch_driver = Arc::new(match engine.continuous_batch_manager(max_batch) {
+            Ok(_) => BatchDriver::Continuous {
+                capacity: max_batch,
+            },
+            Err(err) => BatchDriver::PerRequest {
+                reason: format!("{err:#}"),
+            },
+        });
+        let continuous_batch_supported = batch_driver.batches_continuously();
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         let kv_telemetry = Arc::new(KvTelemetry::default());
         let driver_telemetry = Arc::clone(&kv_telemetry);
@@ -160,6 +177,7 @@ impl EngineDriver {
         };
         batch_telemetry.publish(0, 0, published_capacity);
         let driver_batch = Arc::clone(&batch_telemetry);
+        let driver_selection = Arc::clone(&batch_driver);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
             .spawn(move || {
@@ -167,7 +185,7 @@ impl EngineDriver {
                     owner,
                     rx,
                     max_batch,
-                    continuous_batch_supported,
+                    driver_selection,
                     driver_telemetry,
                     driver_batch,
                 )
@@ -179,6 +197,7 @@ impl EngineDriver {
             kv_telemetry,
             governor,
             batch_telemetry,
+            batch_driver,
         }
     }
 
@@ -195,6 +214,9 @@ impl EngineDriver {
             // No driver thread, so nothing ever publishes: the status route
             // omits the batch fields, which is the truth about this handle.
             batch_telemetry: Arc::new(BatchTelemetry::default()),
+            // No engine was ever consulted, so no driver was selected. Reported
+            // as a pipeline rather than a refusal: nothing refused anything.
+            batch_driver: Arc::new(BatchDriver::Pipeline),
         }
     }
 
@@ -216,6 +238,7 @@ impl EngineDriver {
             kv_telemetry: Arc::new(KvTelemetry::default()),
             governor: Some(engine.governor_handle()),
             batch_telemetry: Arc::new(BatchTelemetry::default()),
+            batch_driver: Arc::new(BatchDriver::Pipeline),
         }
     }
 
@@ -231,6 +254,11 @@ impl EngineDriver {
     /// Live batch occupancy, or `None` until a driver loop has published one.
     pub(crate) fn batch_telemetry(&self) -> &Arc<BatchTelemetry> {
         &self.batch_telemetry
+    }
+
+    /// Which decode driver is running, and why, for disclosure on the wire.
+    pub(crate) fn batch_driver(&self) -> &BatchDriver {
+        &self.batch_driver
     }
 
     pub(crate) fn start_pipeline(engine: PipelineEngine, max_queue_depth: usize) -> Self {
@@ -249,7 +277,16 @@ impl EngineDriver {
         let driver_batch = Arc::clone(&batch_telemetry);
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, 1, false, driver_telemetry, driver_batch))
+            .spawn(move || {
+                run_engine_driver(
+                    owner,
+                    rx,
+                    1,
+                    Arc::new(BatchDriver::Pipeline),
+                    driver_telemetry,
+                    driver_batch,
+                )
+            })
             .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
@@ -259,6 +296,7 @@ impl EngineDriver {
             // keeps the command path and its honest "not available" error.
             governor: None,
             batch_telemetry,
+            batch_driver: Arc::new(BatchDriver::Pipeline),
         }
     }
 
@@ -618,10 +656,15 @@ fn run_engine_driver(
     // the batch width. Passed rather than recomputed: two evaluations of the
     // same predicate is a divergence waiting to happen, and the published
     // capacity would be the thing that diverged.
-    continuous_batch_supported: bool,
+    //
+    // Passed as the whole decision rather than a bool because the bool has
+    // already discarded the reason, and this thread is where the reason gets
+    // logged.
+    batch_driver: Arc<BatchDriver>,
     kv_telemetry: Arc<KvTelemetry>,
     batch_telemetry: Arc<BatchTelemetry>,
 ) {
+    let continuous_batch_supported = batch_driver.batches_continuously();
     let mut engine = match owner.0 {
         EngineBackend::Single(engine) => *engine,
         EngineBackend::Pipeline(mut pipeline) => {
@@ -645,7 +688,12 @@ fn run_engine_driver(
         tracing::info!(max_batch, "continuous batch driver enabled");
         run_static_engine_driver(&mut engine, rx, max_batch, &batch_telemetry);
     } else {
-        tracing::info!("continuous batch driver disabled; using per-request engine path");
+        // Logged WITH the reason. "disabled" alone told an operator that the
+        // headline capability was off and nothing about what to change.
+        tracing::warn!(
+            reason = %batch_driver.explain(),
+            "continuous batch driver disabled; using per-request engine path"
+        );
         run_fallback_engine_driver(&mut engine, rx, &batch_telemetry);
     }
 }

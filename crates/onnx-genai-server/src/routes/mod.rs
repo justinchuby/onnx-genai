@@ -270,6 +270,30 @@ pub(crate) struct NodeStatus {
     /// which renders as "6 of 4".
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_queued: Option<u32>,
+    /// WHICH DECODE DRIVER IS ACTUALLY RUNNING: `continuous_batch`,
+    /// `per_request`, or `pipeline`.
+    ///
+    /// Published because every other field on this response stays honest
+    /// across the fallback -- a serialising engine truthfully reports one row
+    /// of one, 100% utilised -- and that is precisely the hazard. The rest of
+    /// this contract defends against fabricated numbers; nothing in it
+    /// defends against TRUE numbers describing a different machine than the
+    /// one a presenter is describing aloud. Without this field a visitor
+    /// cannot tell a server demonstrating continuous batching from one that
+    /// silently switched it off.
+    ///
+    /// A stable token rather than prose, so a client branches on it instead of
+    /// parsing [`Self::batch_driver_detail`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_driver: Option<&'static str>,
+    /// Why that driver is the one running, in the engine's own words when it
+    /// refused continuous batching.
+    ///
+    /// Populated in the enabled case too. A reason present only on failure
+    /// teaches a reader that silence means success -- and silence is also what
+    /// a field that was never wired up looks like.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_driver_detail: Option<String>,
     sessions: Vec<SessionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_hashes: Option<Vec<String>>,

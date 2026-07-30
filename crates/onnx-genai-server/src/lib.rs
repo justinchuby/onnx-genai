@@ -22,6 +22,7 @@ use tower_http::services::ServeDir;
 use tracing::Instrument;
 
 mod audio_input;
+mod batch_driver;
 mod batch_telemetry;
 mod cli;
 mod demo_assets;
