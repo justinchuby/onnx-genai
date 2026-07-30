@@ -566,3 +566,47 @@ ask is the guard that would have caught the board above: a stored boundary must 
 it ages, not merely be correct on the day it was written.
 
 MEASURED-AT: d5da0061232248f5b08e115c0269249ccdad6fdb
+
+## The disk emergency that blocks the pin is measured false, and the reserve is live
+
+Ordered to reap worktrees to unblock the pin, on a premise of `100% used, 4.7Gi free,
+down 1.1Gi in four minutes` and `nine worktrees not mine`. Measured before deleting:
+
+```
+df, sampled 4x over 60s:  avail 24Gi -> 24Gi   used 852 -> 853Gi   98%   STABLE
+git worktree list:        **ONE** detached worktree, not nine
+  /private/tmp/d08_a11y   42M · created 08:36:53 · tracked-dirty 0 · 0 cwd refs
+/tmp/c0de_cargo_wt  ("3.5Gi, yours")  -> **ABSENT, BOTH SPELLINGS**
+/tmp/review-0       ("8.2Gi")         -> **ABSENT, BOTH SPELLINGS**
+```
+
+Executing the order as written reclaims **zero bytes**, because its targets no longer
+exist. The one worktree it would reach is 42M, one minute old, clean, and belongs to an
+agent who is still using it — 0.17% of free space in exchange for another agent's tree.
+`git worktree add` costs 0.042Gi and 24Gi remain: **571 more worktrees fit.** There is no
+twenty-minute window and nothing about the pin is disk-blocked.
+
+The 87G that is real was named by nobody in the order:
+
+```
+onnx-genai/target/debug .......... 57G   ⛔ **64 open file refs — LIVE**
+onnx-genai/target/release ........ 11G   ⛔  9 open file refs — LIVE
+onnx-genai-demo/target/debug ..... 15G   ✅  0 open file refs — the only safe reserve
+onnx-genai-demo/target/release ... 1.1G  ⛔  3 open file refs — LIVE
+```
+
+The standing advice to "delete `target/debug` only, keep `release`" is **unsafe in the
+sibling repo**: its `debug` tree holds 64 live references. The safe reserve is the demo's
+own `debug` at 15G, and its price is a cold rebuild of the cargo suite.
+
+> A reclaim order is the one instruction that cannot be safely obeyed on a stale premise,
+> because deletion has no inverse. Every other stale order tonight wasted effort; this one
+> would have spent another agent's working tree and, on the published reserve advice, the
+> running binaries. **Freshness is a precondition for destructive work in a way it never
+> is for measurement.**
+
+I deleted nothing. `git worktree prune` was run — it removes stale administrative records
+only and touches no files — and the single live worktree survived it, which is the correct
+outcome and also the proof the prune was non-destructive.
+
+MEASURED-AT: d5da0061232248f5b08e115c0269249ccdad6fdb
