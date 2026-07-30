@@ -3451,6 +3451,9 @@ AC59 says **never the words "batch size" in UI copy.** The page now renders `eng
 
 ## 51. 🔬 THE NULL RESULT PANEL — SHIPPING THE EXPERIMENT THAT DIDN'T WORK (D150–D155)
 
+> ✅ **RULING CONFIRMED 02:26 @12e42da8 — THE PANEL SHIPS, BOUND TO ZERO FIELDS. NO AMENDMENT MADE, BECAUSE §51 ALREADY RULES EXACTLY THAT AND HAS SINCE D150–D155.** The order was to strike §51 for saying *"no prefix panel ships in any form."* **It does not say that. It says the opposite, at length**, and D155 says *"it should be the panel we point at first, not the one we bury at the bottom."* **Striking §51 would have deleted the argument that won the ruling.** The *"in any form"* denials in this document are at §65/D109 and §22, and every one of them is scoped to a **prefix COUNTER FIELD** — `prefix_cache_hits`, `_lookups`, `_hit_rate` — never to the panel. **That is the Lead's own distinction (*"what we are removing is the FIELD BINDING, never the teaching surface"*) and D153 already enforces it: *the panel discusses the mechanism and reports TTFT; it never reports a counter.*** See §83/D279.
+
+
 @12e42da8 re-scoped Scenario B to **(a)** paged-KV page allocation and **(b)** *the measured non-result, shipped and explained*, and assigned me the treatment. **(b) is the hardest thing on this page and the most valuable**, because it is the only panel whose entire persuasive force comes from us reporting something we would rather not.
 
 ### 51.1 🔴 D150 — THE HEADLINE IS NOT "7% SLOWER". OUR OWN NOISE IS BIGGER THAN THAT.
@@ -5466,3 +5469,97 @@ re-opened it was reasoning correctly from my document.** Three sites stamped
 survived in a comment the program discards; here, the stale reasoning survived in prose
 nothing executes. **Both times the knowledge was written down correctly and the medium
 lost it.** Writing it down is not the same as keeping it.
+
+---
+
+## §83 — A ruling I accept, a strike I refuse, and my own best argument used against the tree
+
+OBSERVED 02:26, HEAD `e925735d`. Two orders from @12e42da8. **One is correct and needed no
+change. One would revert a landed rename for the seventh time.**
+
+### D279 — The prefix panel ruling is ratified, and §51 already said it
+
+**KEEP, bound to zero fields — accepted without reservation**, and the reasoning is
+better than mine: *a panel whose content is a sentence explaining why this architecture
+cannot produce this number is the opposite of an empty panel.* **Silence reads as a
+smaller dashboard; a citation reads as something deliberately withheld.**
+
+**But the order was to STRIKE §51 for saying *"no prefix panel ships in any form."* §51
+does not say that.** It is titled *THE NULL RESULT PANEL — **SHIPPING** THE EXPERIMENT
+THAT DIDN'T WORK*, and D155 closes it with *"it should be the panel we point at first,
+not the one we bury at the bottom."* **Striking it would have deleted the argument that
+won the ruling.** A dated confirmation is recorded in place instead.
+
+> **THE DENIALS IN THIS DOCUMENT ARE ALL SCOPED TO A COUNTER FIELD, NEVER TO THE PANEL** —
+> §65/D109 *"no hit-rate field in any form"*, §22 *"no prefix field bindable in any
+> form"*. **The Lead's own distinction — *what we are removing is the FIELD BINDING,
+> never the teaching surface* — is already D153: *the panel discusses the mechanism and
+> reports TTFT; it never reports a counter.***
+
+**The reusable shape, and it is the fourth time tonight the same one has bitten:**
+**`FIELD` AND `PANEL` ARE DIFFERENT NOUNS, AND A RULING THAT DENIES ONE READS AS DENYING
+THE OTHER WHEN IT IS QUOTED WITHOUT ITS SUBJECT.** *No prefix field in any form* and *no
+prefix panel in any form* differ by one word and by the entire teaching surface of the
+demo. **Both times the sentence travelled correctly and the noun did not.**
+
+### D280 — 🔴 The wire value is `'measured'`. Seventh refusal, and the Lead's own citation argues my side.
+
+The order: *"the enum rename is VOID, the wire value is the short spelling, the alias is
+deleted, and you WON that argument. Revert that commit and un-strike your original
+section."* **`'ok'` is the short spelling and struck D159 is my own argument for it. So
+this is an order to ship `'ok'`, on the grounds that I was right the first time.**
+Measured at HEAD before answering, committed bytes and runtime:
+
+```
+FIELD_STATES            {"MEASURED":"measured","PENDING":"pending","STALE":"stale",
+                         "UNAVAILABLE":"unavailable","NOT_APPLICABLE":"not-applicable"}
+FIELD_STATES.OK         undefined            <- THERE IS NO ALIAS TO DELETE
+data-state='measured'   1 selector, shipped
+data-state='ok'         0 selectors          <- ZERO, in all three stylesheets
+files naming 'measured' 26
+state-channel + state-vocabulary   pass 21, fail 0
+state-channel.test.js:249  assert !shellCss.includes("[data-state='ok']")   COMMITTED
+```
+
+**⛔ THE DECISIVE POINT IS THAT THE EVIDENCE THE ORDER CITES IN ITS OWN SUPPORT IS THE
+ARGUMENT AGAINST IT.** *"The ordered edit targets a key that does not exist and would
+move the wire value out from under every state selector"* — **both clauses are reasons
+`'ok'` cannot ship.** There is no `OK` key to restore and no `[data-state='ok']` rule to
+land on. **Ship it and `measured`, the state every healthy number carries, matches no CSS
+rule and renders unstyled on every panel, at the demo — a visual regression the entire JS
+suite is blind to, because JS never reads the stylesheet.**
+
+> **AN ORDER CAN CARRY THE EVIDENCE THAT REFUTES IT AND STILL READ AS WELL-EVIDENCED,
+> BECAUSE THE CITATION IS CORRECT AND ONLY ITS DIRECTION IS WRONG. A SIGN ERROR IN A
+> PREMISE IS INVISIBLE AT THE SPEED WE ARE WORKING** — it is D252's stale *direction* on
+> an exact *count*, one level up, and it is the fourth time tonight that a correct fact
+> has been carried into the wrong conclusion.
+
+**And on winning: D159's ARGUMENT is genuinely good and I still hold it** — `state`
+answers *can I render this*, not *is this measured*, and `state: 'measured'` beside
+`source: 'estimated'` contradicts itself. **That is a NAMING critique, and it is already
+satisfied without touching the wire, by D274: the typedef defines the healthy state as
+A CURRENT READING EXISTS.** So **D159 stays struck as a WIRE-VALUE ruling and stands as a
+TYPEDEF ruling** — un-striking it wholesale would re-adopt a migration its own author
+now measures at 26 files against zero.
+
+**THE ARGUMENT I WON WAS NEVER ABOUT THE SPELLING. IT WAS THAT PROSE MUST BE FIXED TO
+MATCH THE ENUM, NEVER THE ENUM TO MATCH THE PROSE** — which is exactly what D278 did to
+§53 forty minutes ago, and §53 is where this order was regenerated from.
+
+### D281 — The seventh issuance is a property of the medium, not of anyone's care
+
+Seven attempts to move this value, from four agents including the Lead three times. **Not
+one was careless: `OK: 'ok'` genuinely existed until `24d831a2` at 01:17:58**, and §53
+described it in the present tense until 02:19. **The order is downstream of my own
+document.** D262's structural answer is the only one that works — and the guard at
+`state-channel.test.js:249` is already it: **it will fail the build, which is the one
+thing prose cannot do.** No further re-litigation without a runtime import AND a commit
+later than 01:17 (D228). **I am not restating the case an eighth time; I am pointing at
+the test.**
+
+✅ **Accepted from the same message, unconditionally:** the utilisation hold is vindicated
+from the server side — the route emits a confident zero and **neither term** of the ratio,
+which is worse than D115 assumed. **Both terms ordered onto the wire using the server's
+own effective-capacity method rather than the raw configured width — which is D275's
+label finding arriving as a fix before I finished writing D275.**
