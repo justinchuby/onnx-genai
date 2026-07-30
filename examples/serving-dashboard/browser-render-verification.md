@@ -444,3 +444,80 @@ precisely why they contradicted each other — I was measuring a file being writ
   neither they nor @0837fdf9 is right, because the rule is live in CSS and nothing renders an
   element matching it. That is @12e42da8's *styled-but-never-emitted* gap, second instance,
   measured. The only `not-applicable` element on the page is a `scenario-switcher__note`.
+
+---
+
+## §8 — Scenario switching across origins, and the missing-assets failure that is not a page
+
+Assigned directly by @12e42da8: *"START BOTH, SWITCH SCENARIOS, CONFIRM A DASHBOARD AND NOT
+THE 404 PAGE."* Run at HEAD `0c387cf2`, Chrome 150.0.7871.187 over CDP, loadavg **37.85**.
+Servers: `:9452` (`qwen-scatter`) and `:9451` (`qwen-dynamic`), both on the post-`d08d44b8`
+binary, both launched with `--demo-assets-dir` pointed at a detached worktree pinned to
+`fb718b2c`. Harness `/tmp/qa_switch3.mjs`.
+
+### 8.1 Result — the gate item PASSES on a correctly-launched pair
+
+| tab | lands on | panels | body len | verdict |
+|---|---|---|---|---|
+| Continuous batching | `127.0.0.1:9452` | 36 | 12455 | DASHBOARD |
+| Paged KV block table | `127.0.0.1:9451` | 36 | 12136 | DASHBOARD |
+| Memory pressure | `127.0.0.1:9451` | 36 | 12076 | DASHBOARD |
+
+Two of the three tabs are **cross-origin** — they navigate to the *dynamic* origin, not the
+one serving the page. That is the mechanism behind the hazard: the landing pane is served by
+the scatter origin and looks perfect regardless of how the dynamic origin was launched.
+
+### 8.2 The control, and why the first two versions of this test were worthless
+
+**Arm B replaced the dynamic origin with `:8151`, which was launched WITHOUT the asset flag:**
+
+| tab | lands on | panels | verdict |
+|---|---|---|---|
+| Continuous batching | `127.0.0.1:9452` | 36 | DASHBOARD |
+| Paged KV block table | `null` | **0** | **NOT-A-DASHBOARD** |
+| Memory pressure | `null` | **0** | **NOT-A-DASHBOARD** |
+
+**My first two attempts at this test were green in BOTH arms — including the arm engineered to
+fail.** I constructed each scenario URL by hand from the topology template instead of clicking
+the tab. Because I wrote the origin into the URL myself, every probe landed on the flagged
+scatter origin and the broken origin was never contacted. The test named *scenario switching*
+and measured *string formatting*.
+
+> That is @086345a5's **R15** reproduced exactly, by me, in my own lane, ninety minutes after I
+> read it. R15 objects to `QA-PLAN.md` B1 instructing the tester to paste `?scenario=…` and
+> "confirm it opens on the right panel" — because pasting the URL **silently substitutes for
+> the navigation** and cannot fail. I now have that as a measurement rather than an argument:
+> **URL-constructed = 3/3 green on a origin that 404s; tab-clicked = 2/3 red on the same
+> origin.** Same servers, same scenarios, same minute. **The substitution does not weaken the
+> check, it inverts the result.**
+> **A control that does not fire has not passed. It has abstained, and it looks identical.**
+
+### 8.3 🔴 P2 — there is no missing-assets page. There is nothing at all.
+
+`--demo-assets-dir` absent does not produce an explanatory in-product page:
+
+```
+GET http://127.0.0.1:8151/demo/    ->  HTTP/1.1 404 Not Found
+                                       content-length: 0        <- ZERO BYTES
+GET http://127.0.0.1:9452/demo/    ->  HTTP/1.1 200 OK          content-length: 5917
+```
+
+With a zero-byte body the **browser** supplies the page. `location.origin` reads `null`; the
+audience sees Chrome's built-in network-error screen, **in the operating system's locale** —
+on this machine it rendered in Chinese — with the full raw URL and query string printed on
+screen, no product branding, no explanation, and **no route back to the dashboard**.
+
+The standing description of this failure ("shows the missing-assets page") implies the product
+explains itself. It does not. **Severity is P2 and not higher only because `run-demo.sh` gets
+it right; on a hand-started server it is the worst-looking thing in the demo.**
+
+### 8.4 What is NOT claimed
+
+- I did **not** find a defect in `run-demo.sh`. It passes `--demo-assets-dir` on **both**
+  launches (`:238`, `:247`), and `SCRIPT_DIR` (`:31`, `cd … && pwd`) is **absolute**, so
+  @12e42da8's absolute-path requirement is **already satisfied in the script**. The README is
+  a separate artifact and I did not check it — @732c7548's item.
+- I did not test a launch where the **scatter** origin lacks the flag. That failure is not
+  silent — it appears on the landing page — so it is the less dangerous direction.
+- Arm A proves the tabs work between **two origins that both have assets**. It says nothing
+  about whether the two panes should differ in batching behaviour (see `perf-baseline.md` §11).
