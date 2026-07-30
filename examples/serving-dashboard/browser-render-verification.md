@@ -1,4 +1,52 @@
 
+# Provenance — RE-DERIVE THESE THREE LINES BEFORE TRUSTING ANY COLOUR NUMBER BELOW
+
+    code SHA        0d0646a6          git rev-parse --short HEAD
+    asset digest    5be77d2cb2785561  the bytes actually SERVED (32 files, all 200)
+    palette digest  f95c9ee51a6b599c  styles/tokens.css alone
+    measured        2026-07-30 07:29 PDT
+
+These are the values **at measurement time** and are meant to be compared
+against, not kept current. Within four minutes of writing them the branch
+produced a live demonstration of why they are split in two:
+
+    07:29  code 0d0646a6  asset 5be77d2cb2785561  palette f95c9ee51a6b599c
+    07:33  code 9d2f0408  asset 678b22200f0a18d2  palette f95c9ee51a6b599c
+                          ^^ MOVED                        ^^ HELD
+
+**The asset digest moved and the palette digest did not — so every colour number
+below is still valid, and only structural claims needed re-checking.** A single
+combined digest would have flagged the whole document as expired and told a
+reader nothing about which half to distrust.
+
+Re-derive, from `examples/serving-dashboard`:
+
+    find index.html *.js styles dashboard ui -type f ! -name '*.test.js' \
+      | sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-16     # asset digest
+    shasum -a 256 styles/tokens.css | cut -c1-16                     # palette digest
+
+**Why an ASSET digest and not just a code SHA.** Assets are served from disk at
+request time, not snapshotted at boot. That is what makes these render claims
+robust to a stale *binary* — and it is exactly what makes them fragile to a
+fresh *commit*: a stylesheet can land underneath a finished measurement and
+nothing anywhere goes red. **A colour has no `git status`. `#7e8fa0` looks every
+bit as authoritative as `#8597ab`.** This document has already expired that way
+once: every hex in §1 was measured at a palette that no longer exists.
+
+**What each digest governs.** If the *palette* digest differs, the colour
+arithmetic in §1.2 and §3.4 is EXPIRED — re-measure it. If the *asset* digest
+differs but the palette digest matches, the colours still hold and only
+structural claims need review. **Everything that is not a colour — the 21
+modules, 160 responses, 0 uncaught exceptions, the `[data-state]` node census,
+the whole module-graph result — is unaffected by either digest moving**, because
+none of it reads a hex value.
+
+The digest covers 32 served files; the page's module graph imports 27 of them.
+It is deliberately a **superset**: it can raise a false alarm, it cannot miss a
+change. Control run before publishing — the digest is byte-stable across repeat
+runs, moves on a single-hex edit to one token, and returns to `5be77d2c…` when
+that edit is reverted.
+
 # §1 — AC52: The Five State Treatments, Seen In A Browser
 
 **Method.** Real Chrome 150 (CDP), the assembled page from `GET /demo/`, both origins.
@@ -19,7 +67,7 @@ Both origins, identical:
                     76 rules  shell.css
                    137 rules  panels.css      <- live in the CSSOM
     ES modules      21 loaded
-    tokens resolve  --og-na-fg=#7e8fa0  --og-unavail-fg=#758493
+    tokens resolve  --og-na-fg=#8597ab  --og-unavail-fg=#72869d
 
 The orphaned-stylesheet defect is **closed with the evidence class that would
 have caught it**: not a 404 (a never-referenced sheet is never requested), but
@@ -29,12 +77,19 @@ resolving on `:root`. Verified on **both** origins.
 ## 1.2 All ten pairs of the five ruled states are distinct
 
     measured         #e6edf3   normal   no border
-    pending          #748494   italic   no border
-    stale            #7a8794   normal   1px dashed #4a5560
-    unavailable      #758493   normal   1px dotted #3d4855
-    not-applicable   #758493   normal   3px double #3d4855
+    pending          #788ca2   italic   no border
+    stale            #7f91a6   normal   1px dashed #5e6a76
+    unavailable      #72869d   normal   1px dotted #566a7b
+    not-applicable   #72869d   normal   3px double #566a7b
 
 Ten of ten pairs distinct. ✅
+
+**Read the two right-hand columns together, not the left one alone.**
+`unavailable` and `not-applicable` do not merely resolve to equal hexes — they
+name the *same two variables*, `--og-unavail-fg` and `--og-unavail-rule`. Their
+colour distance is therefore **1.0000:1 by identity, not by coincidence**, and
+no palette re-tune can ever separate them. The pair is distinct through the
+border alone. See §3.4.
 
 ## 1.3 🟢 D232 REFUTED — not-applicable does NOT render in unavailable's tokens
 
@@ -187,10 +242,30 @@ establish it stays comfortably legible in a heavily recompressed slide.
 
 ## 3.4 Consequence for the grayscale finding
 
-The four absence tokens measuring 1.001:1 in grayscale is confirmed as serious —
-colour carries nothing. But the border channel **does** carry the whole signal
-and it holds up: three structurally distinct patterns, surviving both real-display
-rasterization and JPEG q40, with `measured`/`pending` carrying no border at all.
+**The arithmetic in this section was re-measured at palette `f95c9ee5…`; the
+earlier `1.001:1` figure belonged to a palette that no longer exists.**
+Greyscale values sampled through Chrome's own `filter: grayscale(1)` (canvas
+`getImageData`, not a formula), then WCAG-rated:
+
+    pending-fg  #788ca2 -> 137   stale-fg    #7f91a6 -> 143
+    unavail-fg  #72869d -> 131   na-fg       #8597ab -> 149
+
+    closest pair  stale-fg / na-fg        1.0797:1
+    widest pair   unavail-fg / na-fg      1.2657:1
+    each vs --og-bg-raised, greyscale:    4.59 – 5.81:1  (all legible)
+
+So the four absence tokens are **no longer near-identical**: the closest pair
+moved from `1.001:1` to `1.0797:1`, roughly **80× further from identity**. That
+is a real improvement and it should be recorded as one.
+
+**It does not change this section's conclusion, because the conclusion never
+rested on the palette.** `unavailable` and `not-applicable` are separated by
+**1.0000:1** — not a small distance but *no* distance — because both selectors
+name `--og-unavail-fg` and `--og-unavail-rule`. Widening the palette cannot
+touch a pair that shares its variables. For that pair the border channel is
+still the entire signal, and the border does hold up: three structurally
+distinct patterns, surviving both real-display rasterization and JPEG q40, with
+`measured`/`pending` carrying no border at all.
 **The five-state system is sound. Its DEFAULT (§1.5) is the defect.**
 
 # §4 — What actually mounts, counted on the running page, both origins
@@ -335,7 +410,7 @@ refutation:
   confirmed in real pixels and surviving JPEG q40.
 - ✅ **The claim "`not-applicable` takes `--og-unavail-*` instead of its own
   `--og-na-*`" is TRUE, and my measurement confirms it rather than refuting it.**
-  `--og-na-fg` resolves to `#7e8fa0` on `:root` — the token exists, it is
+  `--og-na-fg` resolves to `#8597ab` on `:root` — the token exists, it is
   brighter, and **the state's own bare selector does not use it.**
 
 **I answered "are they distinguishable" when the filed defect was "does the
@@ -344,8 +419,10 @@ The state *is* distinguishable — through **one channel only**, the border — 
 the redundancy the design intended is genuinely absent.
 
 **That makes the fix worth doing, on my measurement rather than despite it.**
-With the four absence tokens at 1.001:1 in grayscale, the border is not
-reinforcement — it is the entire signal, single-channel, no redundancy. Pointing
+The palette re-tune moved the four absence tokens from `1.001:1` to `1.0797:1`
+in greyscale — but it did **not** move this pair, and could not have: at
+`1.0000:1` they share the variables themselves. The border is not reinforcement
+here — it is the entire signal, single-channel, no redundancy. Pointing
 `[data-state='not-applicable']` at `--og-na-*` restores the second channel and
 costs one line.
 
