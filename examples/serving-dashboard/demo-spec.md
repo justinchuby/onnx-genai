@@ -2795,3 +2795,59 @@ one sentence from reporting *"the file this spec cites does not exist."*
 elsewhere.** *A non-recursive listing answers a different question than the one
 I asked, and answers it with a zero.* **Caught by re-asking, never by noticing —
 the fourth time tonight that has been the only thing that saved a claim.**
+
+---
+
+### AC218 — THE RECORD CANNOT SAY WHO DID ANYTHING
+
+**Measured at HEAD, 06:1x, over the last 200 commits:**
+
+```
+distinct commit AUTHORS     **1**   Justin Chu <justinchuby@users.noreply.github.com>
+distinct COMMITTERS         **1**   Justin Chu
+[CONTROL] commits examined  200
+commit messages naming an agent id   **65 / 200**
+```
+
+**Fourteen agents worked this tree tonight and the permanent record shows one
+person.** Every credit, every blame and every "whose measurement is this"
+question asked in the last twelve hours was answered **from chat and from
+memory** — and `git` cannot arbitrate a single one of them, because the field
+that would arbitrate it is constant.
+
+**The instance that produced this AC:** I was credited, in writing, with the P1
+fix `1133a874` and with authoring the regression guard
+`dashboard/model-path-disclosure.test.js`. **Both belong to someone else.**
+
+```
+git show --name-only 1133a874   -> model-path-disclosure.test.js · system.js · model-card.js
+                                   **NONE of my two deliverables**
+1133a874 among the 47 commits touching my files?   **0**
+```
+
+**I did not decline the credit out of modesty. I declined it because I ran the
+command** — and the same command is the only thing that could have stopped it.
+
+> **AC218 — ATTRIBUTION IS A MEASUREMENT, NOT A MEMORY. A claim that names a
+> person must carry the SHA and the pathspec that establish it, or it must name
+> no one.**
+
+**This is `MISATTRIBUTED` — the release's own defect class — arriving on the
+crew instead of on the product.** The dashboard's engine blames the model, the
+dashboard blames the server, and here **the record blames whoever was talking
+most recently.** *In all three cases the mechanism is identical: a confident
+specific cause asserted by a system that never measured causation.*
+
+**And the failure direction is generous, which is why nobody catches it.** A
+misattribution that **hands** you credit produces no complaint from the person
+receiving it and no alarm from the person giving it. **Every incentive in the
+loop is to let it stand.** ⛔ *The defects we caught tonight were the ones that
+cost somebody something.*
+
+**Corollary, and it is the operational half:** the **bare tag name** has the same
+defect as the bare agent name — `review-0` moved 60 commits under six readers.
+**This document cites `0aac6bb1` and `1133a874` and contains the string
+`review-0` exactly ZERO times, in either deliverable** (positive control:
+both SHAs resolve here; negative control 0). **That is not diligence — it is
+AC216 applied to identifiers instead of to numbers: *a name is a variable, a
+SHA is a fact,* and the smallest quotable fragment must still be true.**
