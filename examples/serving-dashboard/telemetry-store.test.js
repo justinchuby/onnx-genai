@@ -608,6 +608,13 @@ test('the in-flight gauge is NEVER exposed as the engine batch size', async () =
   // was rebound to /v1/status. Inject through the endpoint the catalogue actually
   // reads: feeding the old route does not error, it silently supplies nothing and
   // the store returns the other endpoint's value instead.
+  //
+  // What actually defends this test's title is the `source` binding, and that is
+  // mutation-proven: flip 'batch.in_flight' to ENDPOINTS.METRICS in
+  // telemetry-provenance.js and this goes red. Note it fails with 'unavailable'
+  // rather than with a gauge value -- nothing parses onnx_genai_batch_size_current
+  // into this field, so also feeding /metrics here adds no discriminating power.
+  // That was measured all four ways, not assumed.
   const store = createTelemetryStore({
     baseUrl: BASE_URL,
     fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.STATUS]: { body: statusBody({ batch_in_flight: 8 }) } })),
