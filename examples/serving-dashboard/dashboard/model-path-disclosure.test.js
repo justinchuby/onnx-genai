@@ -27,8 +27,10 @@
 // has no word for: MAY THIS BE SHOWN.
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import os from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, describe, it } from 'node:test';
 
@@ -59,10 +61,78 @@ function measuredField(value, options = {}) {
 // test is worthless if this looks like the sanitised fixture everywhere else.
 const HOME_PATH = '/Users/presenter/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b';
 
+// The two surfaces the defect was actually found on. These stay named because
+// they are the regression, and they get the STRICT predicate below: not one
+// mention of the key survives in either, in any form.
 const SOURCES = Object.freeze([
   ['dashboard/system.js', new URL('./system.js', import.meta.url)],
   ['ui/model-card.js', new URL('../ui/model-card.js', import.meta.url)],
 ]);
+
+// WHY THIS FILE DISCOVERS ITS CORPUS INSTEAD OF LISTING IT.
+//
+// `SOURCES` above is the two files where the disclosure was last found, and for
+// a while it was also the entire corpus of the sweep. That made the guard pin
+// the INSTANCE and miss the CLASS: a binding appended to a third shipped module
+// left the suite fully green at 646/646, proven by mutation, not argued. A
+// hardcoded list stops covering whatever was added last, and the render surface
+// that leaks tomorrow is by definition the one nobody has written down yet.
+//
+// The same defect was found the same night in `run-tests.sh`, where four
+// independent reviewers converged on a two-glob test command and all four
+// missed a third test directory. Agreement between readers of the same
+// incomplete map is not corroboration.
+const REPO_ROOT = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+  cwd: fileURLToPath(new URL('.', import.meta.url)),
+  encoding: 'utf8',
+}).trim();
+
+/**
+ * Every shipped dashboard module, from the index rather than from the disk.
+ *
+ * `git ls-files` and not `readdirSync`: the question this guard answers is
+ * "what do we SHIP", and an untracked scratch file on one agent's desk is not
+ * shipped while a tracked file someone deleted locally still is. Both pathspec
+ * forms are required together -- `:(top)` because a bare path resolves relative
+ * to CWD and silently matches nothing when the runner starts in a subdirectory,
+ * and `--full-name` because otherwise the names print `../`-prefixed and every
+ * downstream join is wrong.
+ */
+function shippedDashboardModules() {
+  const listed = execFileSync(
+    'git',
+    ['ls-files', '--full-name', '--', ':(top)examples/serving-dashboard/**/*.js', ':(top)examples/serving-dashboard/*.js'],
+    { cwd: REPO_ROOT, encoding: 'utf8' },
+  );
+  return listed
+    .split('\n')
+    .filter(Boolean)
+    .filter((path) => !path.includes('/node_modules/'))
+    // Tests and their fixtures MUST be excluded: this very file, and the fake
+    // store it drives, both spell the key on purpose. A guard that reddens on
+    // its own fixture teaches the next author to weaken the predicate.
+    .filter((path) => !path.endsWith('.test.js') && !path.includes('/testing/'));
+}
+
+/**
+ * Source with comments removed, so a tombstone cannot be mistaken for a defect.
+ *
+ * Two shipped modules carry a comment naming this key -- `telemetry-provenance`
+ * records where the row used to live, `telemetry-store` records why the row is
+ * now a ban. Both are correct and both should stay. A text scanner cannot tell
+ * a warning about a defect from the defect, so the scanner has to stop reading
+ * the prose rather than the prose being made to hide from the scanner.
+ */
+function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
+// A BINDING, not a mention. `{ key: 'server.model_path' }` and
+// `field('server.model_path')` are the two shapes that put the value on a
+// screen; `NEVER_BIND` listing the same string is the opposite of the defect.
+// Matching the bare key would make the ban that prevents this bug indis-
+// tinguishable from the bug.
+const BINDS_MODEL_PATH = /(?:key\s*:\s*|field\s*\(\s*)['"`]server\.model_path['"`]/;
 
 let uninstallDom;
 before(() => {
@@ -201,6 +271,62 @@ describe('the model directory never reaches a rendered surface', () => {
         `${label} binds server.model_path again. The store will hand back the absolute path with state='measured' -- reclassifying the catalogue entry does NOT suppress it, so the binding is the only thing standing between a home directory and a projector.`,
       );
     }
+  });
+
+  it('NO shipped dashboard module binds server.model_path, discovered not enumerated', () => {
+    const modules = shippedDashboardModules();
+
+    // ANTI-VACUITY FLOOR. A universal claim over an empty corpus is true and
+    // worthless, and an empty corpus is exactly what a mis-resolved pathspec
+    // produces -- silently, with exit 0. This floor is not ceremony: the first
+    // run of this sweep returned 0 files because the pathspec resolved against
+    // the runner's CWD instead of the repo root.
+    assert.ok(
+      modules.length >= 8,
+      `the shipped-module sweep found ${modules.length} files, which means the pathspec is wrong, not that the dashboard is small`,
+    );
+
+    // SUBJECT REQUIREMENT. The corpus must contain the files the defect was
+    // actually found on. A sweep that reaches many files but not these two
+    // would go green while pinning nothing that ever broke.
+    for (const [label] of SOURCES) {
+      assert.ok(
+        modules.some((path) => path.endsWith(label)),
+        `${label} is missing from the discovered corpus, so this sweep cannot see the surface the bug shipped on`,
+      );
+    }
+
+    // POSITIVE CONTROL FOR THE COMMENT STRIPPER, and it is the reason this
+    // guard can afford to ignore comments at all. `telemetry-provenance.js`
+    // carries a tombstone naming the key. If the raw read stops finding it the
+    // reader is broken; if the stripped read still finds it the stripper is.
+    // Both halves are asserted, because either one alone passes on a corpse.
+    const tombstone = readFileSync(join(REPO_ROOT, 'examples/serving-dashboard/telemetry-provenance.js'), 'utf8');
+    assert.ok(
+      tombstone.includes('server.model_path'),
+      'control failed: the tombstone comment is gone, so a zero below proves nothing about the reader',
+    );
+    assert.ok(
+      !stripComments(tombstone).includes('server.model_path'),
+      'control failed: the comment stripper left the tombstone behind, so every result below is a false positive waiting to happen',
+    );
+
+    // POSITIVE CONTROL FOR THE PREDICATE. A regex that matches nothing passes
+    // every negative assertion forever. This proves it still recognises the
+    // shape of the bug that shipped.
+    assert.ok(
+      BINDS_MODEL_PATH.test("{ key: 'server.model_path', label: 'Directory' }"),
+      'control failed: the binding predicate no longer matches the exact line that reached a projector',
+    );
+
+    const offenders = modules.filter((path) =>
+      BINDS_MODEL_PATH.test(stripComments(readFileSync(join(REPO_ROOT, path), 'utf8'))),
+    );
+    assert.deepEqual(
+      offenders,
+      [],
+      `these shipped modules bind server.model_path: ${offenders.join(', ')}. The store hands back the absolute path with state='measured', so the binding is the only thing between a presenter's home directory and a projector. Reclassifying the catalogue entry does NOT suppress it.`,
+    );
   });
 });
 
