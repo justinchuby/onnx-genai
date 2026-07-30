@@ -226,11 +226,11 @@ The spine of the system. Following one `POST /v1/chat/completions` from socket t
 ### 3.1 Startup — before any request
 
 1. `main()` (`crates/onnx-genai-cli/src/main.rs::main`) → `run(argv)` in `crates/onnx-genai-cli/src/lib.rs`.
-2. `Commands::Serve` (`crates/onnx-genai-cli/src/lib.rs::Commands`) → `run_serve` (`crates/onnx-genai-server/src/cli.rs::ServeArgs`). The standalone `onnx-genai-server` binary calls the same function — **one serving path, not two**.
+2. `Commands::Serve` (`crates/onnx-genai-cli/src/lib.rs::Commands`) → `run_serve` (`crates/onnx-genai-server/src/cli.rs::run_serve`). The standalone `onnx-genai-server` binary calls the same function — **one serving path, not two**.
 3. Model source resolution (`crates/onnx-genai-server/src/cli.rs::run_serve`). A clap `ArgGroup` (`crates/onnx-genai-server/src/cli.rs::ServeArgs`) requires exactly one of `--model` / `--models-dir` / `--models-config`, producing `Vec<ModelSpec>`.
 4. `AppState::load_from_specs` (`crates/onnx-genai-server/src/cli.rs::run_serve`) → `build_handle` per spec (`crates/onnx-genai-server/src/state.rs::with_default_fim_config`) — **the single shared construction path** for both eager startup and lazy load.
 5. `build_handle` resolves the directory (`ModelDirectory::load`, `crates/onnx-genai-ort/src/loader.rs::load`), loads the tokenizer, then `Engine::from_dir` (`crates/onnx-genai-engine/src/engine/load.rs::from_dir`).
-6. `EngineDriver::start(engine, DEFAULT_MAX_BATCH, max_queue_depth)` (`crates/onnx-genai-server/src/state.rs::load_chat_template`) spawns the engine thread.
+6. `EngineDriver::start(engine, DEFAULT_MAX_BATCH, max_queue_depth)` (`crates/onnx-genai-server/src/driver.rs::start`) spawns the engine thread.
 7. `app(state)` builds the router (`crates/onnx-genai-server/src/lib.rs::app`).
 
 ### 3.2 Arrival and admission
@@ -292,7 +292,7 @@ flowchart TD
 
 Case (b) is the one to watch, and it is not a rejection: the model reached the *capable* arm and fell out of it over missing metadata, not missing capability. Labelling the `Err` branch "dynamic-cache model" would infer a property of the **model** from an **error arm** — the same inference defect this project has hit before, and the reason the branch label above states only that the manager was not built.
 
-> ⚠️ **The most commonly missed line in this file is `crates/onnx-genai-server/src/driver.rs::resource_snapshot`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every model that takes the `Err` branch — for *either* reason above — goes through the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
+> ⚠️ **The most commonly missed line in this file is `crates/onnx-genai-server/src/driver.rs::run_engine_driver`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every model that takes the `Err` branch — for *either* reason above — goes through the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
 
 ### 3.4 The decode step loop (continuous batch path)
 
@@ -355,7 +355,7 @@ For each boundary: what the **caller** must guarantee, what the **callee** guara
 ### 4.5 Model directory boundary
 
 - **`ModelDirectory::load`** (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
-- **Canonical errors:** `model directory does not exist: {}` (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`), `tokenizer.json not found in {}` (`crates/onnx-runtime-loader/tests/loader.rs::i64_initializer`).
+- **Canonical errors:** `model directory does not exist: {}` (`crates/onnx-genai-ort/src/loader.rs::load`), `tokenizer.json not found in {}` (`crates/onnx-genai-ort/src/loader.rs::load_flat`).
 - ✅ **Duplication removed:** the server's `--models-dir` fan-out previously ran a *second, laxer* filter that accepted `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory could pass admission and then fail at load. It now delegates to the loader (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`). See §5.12 and §8.6.
 
 ### 4.6 Tokenizer boundary
@@ -374,7 +374,7 @@ This is the clearest example in the codebase of a wire contract constraining an 
 - **Consumer:** the cluster router, not just local tooling. It is a shared contract, not an internal detail.
 - **Guarantee:** every field describes *the node*. There is no field identifying which model a number came from, and no place to put one without changing the struct.
 
-**The consequence, spelled out.** Multi-model mode gives each model its **own** `EngineDriver` (`crates/onnx-genai-server/src/state.rs::load_chat_template`), so two models really do run in one process. But `/v1/status` has no model dimension, so with two drivers behind one node it can only report one engine's numbers or blend them — and **a consumer cannot tell which**. Blending is the dangerous outcome precisely because the response still looks well-formed and plausible.
+**The consequence, spelled out.** Multi-model mode gives each model its **own** `EngineDriver` (`crates/onnx-genai-server/src/state.rs::build_handle`), so two models really do run in one process. But `/v1/status` has no model dimension, so with two drivers behind one node it can only report one engine's numbers or blend them — and **a consumer cannot tell which**. Blending is the dangerous outcome precisely because the response still looks well-formed and plausible.
 
 Adding a model dimension is possible but is a **breaking change to a contract another component consumes**. Running one server per model instead makes `/v1/status` unambiguous *by construction*: one engine per origin, no new fields, no migration, and no way to misattribute a number.
 
@@ -405,7 +405,7 @@ Adding a model dimension is possible but is a **breaking change to a contract an
 - **Guarantee:** these numbers describe *the process*, never a particular model.
 - **Deliberate design:** the registry is a lock-free static specifically so recording a metric costs a relaxed atomic add and never allocates. That property is why it is safe to touch from the decode path at all (§5.10).
 
-**The consequence for multi-model serving.** Loading two models gives each its own `Engine` and its own `EngineDriver` on its own thread (`crates/onnx-genai-server/src/state.rs::load_chat_template`, `:376`) — so the two genuinely run concurrently, one batching and one paging. **But they share this one registry.** Their counters are summed, and nothing in the response says so.
+**The consequence for multi-model serving.** Loading two models gives each its own `Engine` and its own `EngineDriver` on its own thread (`crates/onnx-genai-server/src/state.rs::build_handle`, `:376`) — so the two genuinely run concurrently, one batching and one paging. **But they share this one registry.** Their counters are summed, and nothing in the response says so.
 
 The sharpest instance follows from §5.13: `prefix_cache_lookups` increments on **every completed generation** (`crates/onnx-genai-router/src/metrics.rs::encode`), so in a two-model process, generations served by a *static-cache* model — which never consults the prefix cache at all — inflate the denominator of the *dynamic* model's prefix hit rate. **The displayed rate is not merely blended; it is actively depressed by unrelated traffic**, while looking authoritative.
 
@@ -663,7 +663,7 @@ Implement the `onnx-runtime-ep-api` traits; follow `onnx-runtime-ep-cpu` (simple
 
 ### Adding a sampler
 
-Sampling lives in the generation core. Model authors' declared defaults are captured before the engine moves into the driver (`crates/onnx-genai-server/src/state.rs::load_chat_template`), specifically so a model shipping `do_sample: true` is not silently forced to greedy.
+Sampling lives in the generation core. Model authors' declared defaults are captured before the engine moves into the driver (`crates/onnx-genai-server/src/state.rs::build_handle`), specifically so a model shipping `do_sample: true` is not silently forced to greedy.
 **Must not break:** that defaults capture. Overriding it makes model-declared generation config unreachable.
 
 ### Adding a scheduling policy
@@ -786,7 +786,7 @@ That last row is what closes it. **A stub is a value nobody has gotten to yet; t
 
 **Correcting my own §8.4a, committed minutes earlier.** Having verified the static-path zero exhaustively, I let its complement — *"therefore the dynamic path is `measured`"* — ride unverified. It is not. QA (@fc8b5d97) measured 19 hits / 20 lookups **including six controls whose prefixes differ from token 0**. I traced it to source and confirm their finding. (Their accompanying timing comparison was later withdrawn as within noise; the counter result, which is what the correction rests on, is unaffected.)
 
-`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs::tokenize_prompt`) forks into two mechanisms:
+`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs::prepare_session_prefix`) forks into two mechanisms:
 
 | | Branch A — token cache (`:1029-1036`) | Branch B — paged (`:1037-1088`) |
 |---|---|---|
