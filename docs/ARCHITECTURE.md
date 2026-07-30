@@ -65,7 +65,7 @@ The upstream C++ `onnxruntime-genai` is a generation library. This project targe
    HTTP client
         │  POST /v1/chat/completions  (SSE stream)
 ┌───────▼─────────────────────────────────────────────┐
-│ onnx-genai-server        axum router, lib.rs:60-107 │
+│ onnx-genai-server        axum router, crates/onnx-genai-server/src/lib.rs:62-135 │
 │   AppState → ModelRegistry → ModelHandle            │
 └───────┬─────────────────────────────────────────────┘
         │  mpsc DriverCommand  +  oneshot / mpsc replies
@@ -218,11 +218,11 @@ The spine of the system. Following one `POST /v1/chat/completions` from socket t
 4. `AppState::load_from_specs` (`cli.rs:152`) → `build_handle` per spec (`state.rs:348-390`) — **the single shared construction path** for both eager startup and lazy load.
 5. `build_handle` resolves the directory (`ModelDirectory::load`, `onnx-genai-ort/src/loader.rs:35`), loads the tokenizer, then `Engine::from_dir` (`onnx-genai-engine/src/engine/load.rs:7`).
 6. `EngineDriver::start(engine, DEFAULT_MAX_BATCH, max_queue_depth)` (`state.rs:379`) spawns the engine thread.
-7. `app(state)` builds the router (`crates/onnx-genai-server/src/lib.rs:60-107`).
+7. `app(state)` builds the router (`crates/onnx-genai-server/src/lib.rs:62-135`).
 
 ### 3.2 Arrival and admission
 
-- Axum matches `POST /v1/chat/completions` (`lib.rs:71`); every request passes `trace_request` middleware (`lib.rs:107`).
+- Axum matches `POST /v1/chat/completions` (`crates/onnx-genai-server/src/lib.rs:76`); every request passes `trace_request` middleware (`crates/onnx-genai-server/src/lib.rs:131`).
 - The handler resolves a `ModelHandle` from the `ModelRegistry`, applies the chat template, and tokenizes.
 - The request is submitted to the driver over the `DriverCommand` mpsc channel. **Backpressure lives here:** the channel is bounded by `max_queue_depth`; over-depth submissions are rejected rather than queued without limit, and the rejection is counted in `metrics.rs`.
 
@@ -651,11 +651,11 @@ Extend `PriorityPolicy` / `PreemptionPolicy` in `onnx-genai-scheduler`.
 
 ### Adding an HTTP endpoint
 
-Register in `app()` (`crates/onnx-genai-server/src/lib.rs:60-107`). Choose a gate deliberately:
+Register in `app()` (`crates/onnx-genai-server/src/lib.rs:62-135`). Choose a gate deliberately:
 
 - ungated — safe for anonymous callers;
-- `enable_debug_endpoints` (`lib.rs:77`, flag `--enable-debug-endpoints`, `cli.rs:74`) — introspection;
-- `enable_admin_endpoints` (`lib.rs:88`) — mutating operations.
+- `enable_debug_endpoints` (`crates/onnx-genai-server/src/lib.rs:101`, flag `--enable-debug-endpoints`, `cli.rs:74`) — introspection;
+- `enable_admin_endpoints` (`crates/onnx-genai-server/src/lib.rs:113`) — mutating operations.
 
 **Gated routes return `404`, not `403`**, because the route is never registered. Clients must treat 404 on a debug path as "disabled", not "missing".
 
@@ -862,6 +862,6 @@ different provenance, and here one is a live count and the other is a compile-ti
 | How does a request become tokens? | §3, then `driver.rs:407-421` |
 | Why is my batching panel flat? | §5.6 — check whether your model is static-cache |
 | Why is this metric zero? | §8.3, then the per-field comments in `admin.rs:41-86` |
-| Where do I add an endpoint? | §7, `lib.rs:60-107` |
+| Where do I add an endpoint? | §7, `crates/onnx-genai-server/src/lib.rs:62-135` |
 | Can I call this from the engine thread? | §4.2 — check whether the accessor takes `&self` |
 | Is this invariant enforced or assumed? | §5 — assumed ones are marked ⚠️ |
