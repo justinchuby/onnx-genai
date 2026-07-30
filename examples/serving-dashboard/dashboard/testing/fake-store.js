@@ -10,6 +10,8 @@
 //
 // This is a TEST HELPER, never loaded by the browser.
 
+import { FIELD_STATES } from '../../telemetry-field.js';
+
 /**
  * Build a measured field.
  *
@@ -23,7 +25,7 @@
 export function measured(value, options = {}) {
   return {
     value,
-    state: 'ok',
+    state: FIELD_STATES.MEASURED,
     source: options.source ?? 'server',
     unit: options.unit ?? '',
     label: options.label ?? '',
