@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 import { createTelemetryStore, CONNECTION_STATES } from './telemetry-store.js';
 import { FIELD_STATES } from './telemetry-field.js';
-import { ENDPOINTS, allFieldKeys } from './telemetry-provenance.js';
+import { ENDPOINTS, allFieldKeys, provenanceFor } from './telemetry-provenance.js';
 
 const BASE_URL = 'http://127.0.0.1:8123';
 
@@ -154,12 +154,20 @@ function healthyRoutes(overrides = {}) {
   };
 }
 
-function storeWith(routes) {
+function storeWith(routes, options = {}) {
   return createTelemetryStore({
     baseUrl: BASE_URL,
     fetchImpl: fakeFetch(routes),
+    ...options,
   });
 }
+
+// Endpoint GATING and structural bypass are different facts, and on the scatter
+// server the structural one is deeper: enabling --enable-debug-endpoints there
+// would still yield nothing, because the batching path never consults the prefix
+// cache. Tests about gating therefore use the dynamic server, where the gate
+// really is the only thing in the way.
+const DYNAMIC = { origin: 'dynamic' };
 
 test('a genuinely measured field is reported as measured with its source', async () => {
   const store = storeWith(healthyRoutes());
@@ -299,6 +307,7 @@ test('a disabled debug endpoint degrades only its own fields, with the exact fix
         body: { error: { message: 'not found', type: 'server_error' } },
       },
     }),
+    DYNAMIC,
   );
   const snapshot = await store.pollOnce();
 
@@ -386,6 +395,7 @@ test('a failing endpoint is not re-requested on every poll (no console flood)', 
   const routes = healthyRoutes();
   const store = createTelemetryStore({
     baseUrl: BASE_URL,
+    ...DYNAMIC,
     fetchImpl: async (url) => {
       if (url.endsWith(ENDPOINTS.DEBUG_KV)) {
         debugKvRequests += 1;
@@ -417,6 +427,7 @@ test('a suppressed endpoint recovers once its retry window elapses', async () =>
   const routes = healthyRoutes();
   const store = createTelemetryStore({
     baseUrl: BASE_URL,
+    ...DYNAMIC,
     now: () => clock,
     fetchImpl: async (url) => {
       if (url.endsWith(ENDPOINTS.DEBUG_KV)) {
@@ -891,4 +902,50 @@ test('a hit rate with real lookups and no hits IS a measured 0%', async () => {
   const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
   assert.equal(rate.state, FIELD_STATES.MEASURED);
   assert.equal(rate.value, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Structural guard, added after a browser check found what these tests missed.
+//
+// `prefix_cache.hits` rendered as a measured 0 on the SCATTER server. The
+// byOrigin override existed -- but only on the /metrics copy of the metric, and
+// panels read the /v1/debug/kv copy. The per-key test passed while the page
+// lied, because it asserted the wrong key.
+//
+// So these assert a PROPERTY over the whole table rather than named keys: any
+// prefix-cache field, wherever it is sourced from and whenever it is added,
+// must be structurally bypassed on the batching server.
+// ---------------------------------------------------------------------------
+
+test('EVERY prefix-cache field is not-applicable on the scatter server', () => {
+  const keys = allFieldKeys().filter((key) => key.includes('prefix_cache'));
+  assert.ok(keys.length >= 4, 'expected the table to carry several prefix-cache fields');
+
+  for (const key of keys) {
+    const entry = provenanceFor(key, 'scatter');
+    assert.notEqual(
+      entry.classification,
+      'MEASURED',
+      `${key} is MEASURED on the scatter server, whose batching path never consults the ` +
+        'prefix cache. Its zero would render as a measurement.',
+    );
+    assert.ok(
+      entry.reason && entry.reason.length > 20,
+      `${key} must explain WHY it is unavailable on the scatter server`,
+    );
+  }
+});
+
+test('no field claims to count prefix cache lookups', () => {
+  // metrics.rs:132-134 increments that counter on every completed generation,
+  // consulted cache or not. The upstream name is wrong; ours must not repeat it.
+  for (const key of allFieldKeys()) {
+    const label = provenanceFor(key, 'dynamic').label ?? '';
+    assert.equal(
+      /lookup/i.test(label),
+      false,
+      `${key} is labelled "${label}", but the underlying counter counts generations, ` +
+        'not cache lookups.',
+    );
+  }
 });

@@ -101,14 +101,16 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
             Panel mounts, owned by the dashboard developer. The shell only
             supplies the element and the store; it never draws inside these.
           -->
-          <div class="dashboard__grid">
-            <div data-panel="throughput"></div>
-            <div data-panel="latency"></div>
-            <div data-panel="batching"></div>
-            <div data-panel="kv-blocks"></div>
-            <div data-panel="prefix-cache"></div>
-            <div data-panel="system"></div>
-          </div>
+          <!--
+            Panel hosts are GENERATED from dashboard/index.js's PANELS registry,
+            not listed here. Hard-coding them meant this list could disagree with
+            the registry — and it did: these ids were latency/batching/kv-blocks
+            while the registry defined scheduling/kv-memory/requests, so three
+            panels would silently never have mounted. The registry is the single
+            source of panel identity, and which panels appear depends on which
+            server is answering, which is a runtime fact this file cannot know.
+          -->
+          <div class="dashboard__grid" id="panel-grid"></div>
         </section>
       </main>
 

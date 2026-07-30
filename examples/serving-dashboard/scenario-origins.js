@@ -68,6 +68,64 @@ export const SCENARIOS = Object.freeze({
 });
 
 /**
+ * Which classes THIS server can serve, when the launcher did not say.
+ *
+ * The server exposes no cache-type field — DebugConfigResponse
+ * (routes/mod.rs:144-151) carries model_id, pipeline and context length, and
+ * nothing that distinguishes a static-cache model from a dynamic one. So there
+ * is no authoritative signal, and the launcher's query parameters are the only
+ * declaration. This is the fallback for a hand-started server.
+ *
+ * The inference is deliberately narrow: it decides only WHICH LOCAL SCENARIOS
+ * to offer. It can never invent a peer origin, so a wrong guess cannot make one
+ * server's numbers appear under the other server's name — the worst case is
+ * that a scenario is offered which then reports honest structural zeros.
+ *
+ * @param {string|null} modelId  From /health, which is never gated.
+ * @returns {{classes: string[], confidence: 'inferred'|'unknown', reason: string}}
+ */
+export function selfClassesFromModelId(modelId) {
+  if (typeof modelId !== 'string' || modelId === '') {
+    return {
+      classes: [],
+      confidence: 'unknown',
+      reason: 'The server did not report a model id, so its engine configuration is unknown.',
+    };
+  }
+
+  // Continuous batching engages only on static-cache models, which are built
+  // and named with a -scatter suffix. The documented launch command and
+  // run-demo.sh both use it.
+  const isScatter = /scatter/i.test(modelId);
+  return {
+    classes: [isScatter ? SERVER_CLASSES.SCATTER : SERVER_CLASSES.DYNAMIC],
+    confidence: 'inferred',
+    reason:
+      `Inferred from the model id "${modelId}" because the server exposes no cache-type field. ` +
+      'Start the demo with run-demo.sh to declare this explicitly.',
+  };
+}
+
+/**
+ * Translation to the dashboard registry's vocabulary.
+ *
+ * @c8d9a40e's dashboard/index.js names the two engine configurations by what
+ * they can DEMONSTRATE ('batching', 'paged'); this module names them by what
+ * they ARE ('scatter', 'dynamic'), because the model's cache type is the root
+ * cause of the exclusivity and stays meaningful if the two servers are ever
+ * collapsed into one multi-model server.
+ *
+ * Rather than either of us silently renaming the other's strings, the seam is
+ * this one map. It is the only place the two vocabularies meet.
+ *
+ * @type {Readonly<Record<string, 'batching'|'paged'>>}
+ */
+export const SERVER_MODE_BY_CLASS = Object.freeze({
+  [SERVER_CLASSES.SCATTER]: 'batching',
+  [SERVER_CLASSES.DYNAMIC]: 'paged',
+});
+
+/**
  * Query parameter naming the origin for a server class, e.g.
  * `?dynamic-origin=http://host:port`. run-demo.sh prints a URL carrying these
  * because it is the process that actually bound the ports.

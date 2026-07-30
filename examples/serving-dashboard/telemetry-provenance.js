@@ -301,14 +301,44 @@ export const PROVENANCE = Object.freeze({
       'lives in the paged-KV manager, which the continuous-batch path does not use. The ' +
       'counter is honest; the path simply never hits it.',
     label: 'Prefix cache hits',
+    byOrigin: {
+      scatter: {
+        classification: 'STRUCTURALLY_BYPASSED',
+        reason:
+          'This server uses static-cache batching, and that path never consults the prefix ' +
+          'cache, so the question is never asked. The engine asserts it: ' +
+          'crates/onnx-genai-engine/tests/batched_static_decode.rs:53 and ' +
+          'engine_continuous_batch_scheduled.rs:82 require prefix_cache_hit_len == 0 for ' +
+          'every batched result. A 0 here would imply a cache that tried and missed.',
+      },
+      // On the dynamic server the cache IS consulted, so 0 is genuine data.
+      dynamic: { classification: 'MEASURED' },
+    },
   },
   'prefix_cache.lookups': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_lookups',
     classification: 'MEASURED',
     unit: 'count',
-    evidence: 'crates/onnx-genai-server/src/routes/admin.rs:133 (snapshot.prefix_cache_lookups)',
-    label: 'Prefix cache lookups',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs:133 reads the SAME counter that ' +
+      'metrics.rs:132-134 increments unconditionally on every completed generation, whether ' +
+      'or not a cache was consulted. The upstream name is wrong: it counts generations.',
+    // Deliberately NOT "Prefix cache lookups". Labelling it that would report a
+    // cache being consulted on a server that never consults one.
+    label: 'Completed generations',
+    byOrigin: {
+      scatter: {
+        classification: 'STRUCTURALLY_BYPASSED',
+        reason:
+          'This server uses static-cache batching, and that path never consults the prefix ' +
+          'cache, so the question is never asked. The engine asserts it: ' +
+          'crates/onnx-genai-engine/tests/batched_static_decode.rs:53 and ' +
+          'engine_continuous_batch_scheduled.rs:82 require prefix_cache_hit_len == 0 for ' +
+          'every batched result. A 0 here would imply a cache that tried and missed.',
+      },
+      dynamic: { classification: 'MEASURED' },
+    },
   },
   'prefix_cache.hashes': {
     source: ENDPOINTS.STATUS,
@@ -500,6 +530,19 @@ export const PROVENANCE = Object.freeze({
     // lookups" would report a cache being consulted on a server whose code path
     // never consults one. It is labelled for what it actually counts.
     label: 'Completed generations',
+    byOrigin: {
+      // Even though the counter itself is unconditional, it lives in the
+      // prefix-cache family and a visitor reads it in that context. On the
+      // batching server there is no cache activity to contextualise it.
+      scatter: {
+        classification: 'STRUCTURALLY_BYPASSED',
+        reason:
+          'This server batches with a static cache and never consults the prefix cache, so ' +
+          'this counter describes generations that bypassed it entirely. The engine asserts ' +
+          'the bypass: crates/onnx-genai-engine/tests/batched_static_decode.rs:53.',
+      },
+      dynamic: { classification: 'MEASURED' },
+    },
   },
   'prefix_cache.hit_rate': {
     source: ENDPOINTS.DEBUG_KV,

@@ -15,6 +15,14 @@
 
 import { createTelemetryStore } from './telemetry-store.js';
 import { CONNECTION_STATES } from './telemetry-store.js';
+import { mountDashboard } from './dashboard/index.js';
+import {
+  SERVER_MODE_BY_CLASS,
+  currentScenarioId,
+  planScenario,
+  resolveOrigins,
+  selfClassesFromModelId,
+} from './scenario-origins.js';
 import { mountFailureStates } from './ui/failure-state.js';
 import { mountModelCard } from './ui/model-card.js';
 import { PROVENANCE, allFieldKeys } from './telemetry-provenance.js';
@@ -37,7 +45,7 @@ const CLASSIFICATION_TEXT = Object.freeze({
   NOT_PLUMBED: 'Exists in the process, not yet exposed over HTTP',
 });
 
-function main() {
+async function main() {
   const fileGuard = document.getElementById('file-protocol-guard');
   const app = document.getElementById('app');
 
@@ -51,18 +59,94 @@ function main() {
   if (fileGuard) fileGuard.hidden = true;
   if (app) app.hidden = false;
 
-  const telemetryStore = createTelemetryStore({ pollIntervalMs: POLL_INTERVAL_MS });
+  // WHICH SERVER IS THIS? It has to be settled before the store exists, because
+  // the provenance table classifies several fields differently per server --
+  // prefix_cache_hits is a real measured zero on the dynamic server and
+  // structurally not-applicable on the scatter one, from identical bytes.
+  const selfClasses = await determineSelfClasses();
+  const origins = resolveOrigins({ href: location.href, selfClasses });
+  const scenarioId = currentScenarioId(location.href, selfClasses);
+  const plan = planScenario(scenarioId, origins, location.origin);
+
+  // Panels only ever read the server that served this page. A scenario backed
+  // by the other server is a NAVIGATION, which is why no CORS config exists.
+  const serverClass = selfClasses[0] ?? null;
+
+  const telemetryStore = createTelemetryStore({
+    pollIntervalMs: POLL_INTERVAL_MS,
+    origin: serverClass,
+  });
 
   mountFailureStates(requireElement('failure-state'), telemetryStore);
   mountModelCard(requireElement('model-card'), telemetryStore);
   mountConnectionIndicator(requireElement('connection-indicator'), telemetryStore);
   renderProvenanceFooter(requireElement('provenance-table'));
 
+  const dashboard = mountPanels(telemetryStore, serverClass);
+
   telemetryStore.start();
 
   // Exposed for the dashboard developer's modules and for manual poking in
-  // DevTools. One store for the page — panels must never create their own.
-  globalThis.onnxGenAiDemo = { telemetryStore };
+  // DevTools. One store for the page -- panels must never create their own.
+  globalThis.onnxGenAiDemo = { telemetryStore, origins, plan, serverClass, dashboard };
+}
+
+/**
+ * Which engine configurations this origin can serve.
+ *
+ * Declared by run-demo.sh in the URL it prints, because it is the process that
+ * bound the ports. Falls back to inferring from the model id, since the server
+ * exposes no cache-type field anywhere (routes/mod.rs:144-151).
+ *
+ * @returns {Promise<string[]>}
+ */
+async function determineSelfClasses() {
+  // Parameters only: passing no selfClasses means same-origin defaults are not
+  // applied yet, so this reads exactly what the launcher declared.
+  const declared = resolveOrigins({ href: location.href, selfClasses: [] });
+  const fromUrl = Object.entries(declared)
+    .filter(([, origin]) => origin === location.origin)
+    .map(([serverClass]) => serverClass);
+  if (fromUrl.length > 0) return fromUrl;
+
+  try {
+    // /health is never gated and is the only ungated identity endpoint.
+    const response = await fetch(new URL('/health', location.origin), {
+      headers: { accept: 'application/json' },
+    });
+    if (!response.ok) return [];
+    const body = await response.json();
+    return selfClassesFromModelId(body?.model ?? null).classes;
+  } catch {
+    // Unreachable server. The failure states own this case and render the
+    // launch command; mounting no panels is correct until it comes back.
+    return [];
+  }
+}
+
+/**
+ * Create a host element per registered panel and mount into it.
+ *
+ * Hosts are generated rather than written in index.html so the shell cannot
+ * disagree with the registry about which panels exist -- it previously did.
+ *
+ * @param {object} telemetryStore
+ * @param {string|null} serverClass
+ */
+function mountPanels(telemetryStore, serverClass) {
+  const grid = document.getElementById('panel-grid');
+  if (!grid) return null;
+
+  return mountDashboard({
+    telemetryStore,
+    mode: serverClass ? SERVER_MODE_BY_CLASS[serverClass] : undefined,
+    resolveRoot(panel) {
+      const host = document.createElement('div');
+      host.dataset.panel = panel.id;
+      grid.append(host);
+      return host;
+    },
+  });
 }
 
 /**
@@ -194,4 +278,9 @@ function requireElement(id) {
 // Called last: every module-level `const` above must be initialised before the
 // shell mounts. Calling main() at the top of the file put the constants in the
 // temporal dead zone and threw on first render.
-main();
+// main() is async because the server's engine configuration must be known
+// before the store is created. An unhandled rejection here would leave the page
+// on the loading state with nothing in the console.
+main().catch((error) => {
+  console.error('[shell] the dashboard failed to start', error);
+});
