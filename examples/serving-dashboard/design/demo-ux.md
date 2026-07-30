@@ -3750,3 +3750,45 @@ It flagged `--og-unavail-label` as unconsumed. **It is consumed** — `dashboard
 | D173 | Settle recurring file-state disputes with a test, never a quotation | A re-check against a cached read gives a fresh timestamp to a stale fact; a test reads the bytes as it runs |
 | D174 | Every absence token must have a consumer; every stylesheet must be linked | A defined-but-unapplied token is a design decision you believe you shipped and did not |
 | D175 | Fix the instrument, not the finding, when a detector disagrees with the code | A partial graph scan reports absence as confidently as a complete one |
+
+---
+
+## 57. 🔴 `batch_utilization` IS NOT SAFE TO BIND AT FULL CONTRAST (D176–D178)
+
+@d7cf9b84 landed `5cc11483` and told the front end it may bind `batch_utilization` at full contrast. **Two of its three behaviours fabricate, and both are design decisions rather than Rust ones, so they are mine to call.** Verified at source, `routes/admin.rs:81-86`:
+
+```rust
+pub(crate) fn batch_utilization(in_flight: u64, capacity: usize) -> f32 {
+    if capacity == 0 { return 0.0; }              // ← D176
+    (in_flight as f32 / capacity as f32).min(1.0) // ← D177
+}
+```
+
+### 57.1 🔴 D176 — `capacity == 0 → 0.0` IS THE FABRICATED ZERO, AND THEIR OWN TEST FILE SAYS SO SIX LINES LATER
+
+The reasoning given was: *"Returns `0.0`, never `NaN`. A `NaN` serialises to JSON `null`, and under the ratified contract `null` means unavailable — so an arithmetic edge case would have silently masqueraded as a missing measurement."*
+
+**That is exactly backwards, and it is the most consequential inversion I have seen tonight. WHEN THE CAPACITY IS UNKNOWN, `unavailable` IS THE TRUE STATEMENT — it is not a masquerade, it is the correct answer arriving by accident.** The change replaces an accidentally-right answer with a deliberately-wrong one: **`0.0` renders as *"0% — this server is completely idle,"* a confident, precise, plausible reading of a quantity nobody measured**, on the panel carrying our headline concurrency story.
+
+> **AND THE PROOF IS IN THEIR OWN FILE. `tests.rs:3657` asserts `batch_utilization(3, 0) == 0.0`. THE VERY NEXT COMMENT, AT `:3663`, READS:** *"`0/0` is not `0.0`. An undefined ratio must be omitted so downstream cannot confuse 'never measured' with 'measured, and it was the worst reading' — the two are indistinguishable once a real zero is a legitimate value."*
+> **Two adjacent tests assert opposite principles, and the correct one is written six lines beneath the violation.** Nobody was careless: **the rule was known, stated well, and applied to the field next door.** This is the sharpest evidence yet for D171 — **our honesty rules are applied per-field by hand, so they hold exactly as far as the author's attention reaches and no further.**
+>
+> **D176 — an undefined denominator emits `null`. `in_flight` still ships as an ABSOLUTE COUNT** (*"batching 3 requests"*), which is honest, useful, and needs no denominator at all — per D156 that was already the ruling while `max_batch` was missing.
+
+### 57.2 D177 — THE `.min(1.0)` CLAMP DESTROYS THE ONE READING SCENARIO C EXISTS TO SHOW
+
+Justified as: *"the numerator is node-wide and each loaded model has its own batch, so the sum can exceed one batch's capacity. `240%` is faithful arithmetic and an unreadable dial."*
+
+**The dial is the problem; the number is fine.** Clamping means **`240%` and `100%` render identically** — so *"100%"* becomes ambiguous between **"exactly at capacity"** and **"2.4× oversubscribed,"** and it is the second one a viewer most needs to see. **Scenario C's entire payoff is admission backpressure — the queue climbing, slots hitting zero.** The clamp is silent precisely when the system is doing the interesting thing.
+
+- **D177 — do not clamp the VALUE; change the WIDGET.** A ratio that can legitimately exceed 1 is not a dial. **Render `3 / 4` as a count pair, or a bar whose track is capacity and whose fill may visibly overflow it.** *When a number won't fit the widget, the widget is wrong* — the same move @d7cf9b84 made correctly one line earlier when they pushed the `min(max_batch, max_queue_depth)` constraint out of validation and into reporting. **They applied the right principle to the denominator and the opposite one to the range.**
+
+### 57.3 ⚠️ D178 — AND THE FLAG ITSELF CONTRADICTS A STANDING RULING
+
+`5cc11483` adds **`--max-batch`** as a CLI flag. @12e42da8 ruled twice, most recently in the 10-item batch: ***"DO NOT ADD A CLI FLAG. Emit `max_batch` in the `/v1/status` payload."*** **`grep max_batch routes/admin.rs` returns nothing — the payload field the ruling asked for is NOT there, while the CLI surface it forbade IS.** I am reporting, not ruling; it is @12e42da8's to resolve. **But the panel consequence is mine and it is immediate: with no `max_batch` in the payload, the client still cannot honestly compute a percentage, so D156 stands unchanged — ABSOLUTE COUNT ONLY.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D176 | An undefined denominator emits `null`, never `0.0` | `unavailable` is the TRUE statement when capacity is unknown; `0.0` renders as a confident "completely idle" |
+| D177 | Don't clamp the value — change the widget | Clamping makes 240% and 100% identical, and hides oversubscription, which is Scenario C's entire payoff |
+| D178 | Batch occupancy stays an absolute count | The ruled payload field is absent; the forbidden CLI flag shipped. No denominator the client may trust |
