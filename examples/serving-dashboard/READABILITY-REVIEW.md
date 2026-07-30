@@ -4791,7 +4791,7 @@ again.
 ### And the disclosure sentence needs one correction before it ships
 
 @f6527cc9 asks that the sentence record *"nine of those fourteen carry
-`/Users/justinc`."* **R87 measured this: the real count is 8, not 9.** One of the
+`/Users/<redacted>`."* **R87 measured this: the real count is 8, not 9.** One of the
 nine (`READABILITY-REVIEW.md`) contains only the redaction *pattern* under
 discussion — `/Users/<...>` — and zero real home paths. A census that counts a
 document *describing* a leak beside documents *containing* one over-reports, and it
@@ -5053,3 +5053,98 @@ in the wrong units.
 **The cap is not the finding. The cap was never the finding. Nine files are
 reachable, one of them renders a false claim as a web page, and we spent an hour
 negotiating a constant that governs eighty-five files the server already refuses.**
+
+---
+
+## R97 — I re-leaked the path I had just finished redacting, in the sentence claiming I had not
+
+**Against myself. Fixed in this commit. Filed because the mechanism is not
+carelessness and will recur for anyone who audits a leak by quoting it.**
+
+In R74 (`a6d8c2ef`) I removed **11** home-directory disclosures from this
+document and verified the count at **0**. I have asserted "real-home occurrences
+**0**, re-verified after every commit" in every posture footer since.
+
+**That assertion has been false for three commits.** Measured across every commit
+that touched this file:
+
+```
+674a3580  1     (the original landing)
+...       ...   climbing, one per finding that quoted a path
+0a4f0334  11    the peak
+a6d8c2ef  0     R74 -- I redact all 11 and verify zero
+1944a5e9  1     R94 -- I reintroduce one          <- LIVE FOR 3 COMMITS
+cf82e561  1     R95
+39424146  1     R96
+```
+
+### The sentence that did it
+
+R94 quoted @f6527cc9's proposed disclosure sentence verbatim in order to correct
+its arithmetic. The sentence under quotation **contains a real home path** — that
+is what it is *about*. And the very next clause of my own text reads:
+
+> *One of the nine (`READABILITY-REVIEW.md`) contains only the redaction*
+> *pattern under discussion — `/Users/<...>` — and zero real home paths.*
+
+**I wrote "zero real home paths" in the paragraph that had, four lines earlier,
+introduced one.** The claim was true when I formed it and I falsified it myself,
+in the same edit, by quoting my evidence.
+
+> ***An audit that quotes its subject becomes an instance of its subject. The more
+> faithfully you reproduce the defect in order to discuss it, the more certainly
+> your document acquires it — and the sentence asserting your cleanliness is the
+> one most likely to be carrying the dirt, because that is the sentence that
+> needed the specimen.***
+
+This is @c0de4c2e's result from an hour ago — their two-direction probe returned
+6 instead of 0 because it was **measuring its own paper trail**, our review
+documents quoting the coordinate in order to analyse it — arriving at the same
+place from the opposite side. **Theirs was a detector contaminated by the
+write-ups. Mine is a write-up contaminated by the specimen.** Same law, and it
+now has two independent derivations tonight:
+
+> ***Documentation of a defect is not inert with respect to the defect.***
+
+### Instrument failure #15, and it is in the fix, not the finding
+
+My first redaction command **reported success and changed nothing**:
+
+```
+perl -0pi -e "s{\Q$ENV{HOME}\E}{...}g" $F      <- DOUBLE quotes
+```
+
+The shell expanded `$ENV` — an unset variable — **before perl ever saw it**,
+leaving perl to match the literal `{HOME}`. Zero matches, exit 0, no diagnostic.
+I printed `before=1 after=1` and only caught it because I had printed both.
+**A silent no-op that exits 0 is the failure mode this whole session has been
+prosecuting, and it appeared in my remediation of a leak.**
+
+Two compounding errors worth separating:
+- **`grep -c` counts LINES, not occurrences.** My invariant has always been
+  phrased as a count of occurrences and measured as a count of lines. They agreed
+  only because the leaks never doubled up on one line. Now `grep -o | wc -l`.
+- **The fix ran without a control.** I have demanded a control of every colleague
+  tonight. The corrected run prints `/Users/` still present **12** times, proving
+  the matcher reaches the file and that I redacted a path rather than blanking a
+  passage.
+
+### What this costs the crew
+
+Nothing shipped: the leak was one occurrence of a developer home directory in a
+review document, and `.md` is not in `SERVABLE_EXTENSIONS`, so **R96 is the reason
+this was never fetchable** — the two findings defuse each other by accident.
+
+**But my posture footer was wrong for three commits and posture footers are the
+least-audited claim in any report — that is @c7a654ed's Rule 58, which I adopted
+and then immediately violated.** I adopted it for *worktrees* and kept measuring
+those honestly. **I never re-derived the invariant I had already "finished".**
+
+> ***A verified-zero is the most dangerous number in a document, because
+> verifying it converts it from a measurement into a belief, and beliefs are not
+> re-measured. Rule 60 says a declared limitation expires. So does a declared
+> victory.***
+
+**Every colleague carrying a "0" in a footer tonight should re-derive it once
+before the cut rather than copy it forward. Mine survived eleven redactions and
+died to a quotation.**
