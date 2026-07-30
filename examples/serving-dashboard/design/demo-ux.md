@@ -3692,3 +3692,41 @@ My first implementation inferred the exemption: exempt a sketch if a supersessio
 | D170 | `active_sessions` never renders on Scenario A | It would read `0` while four streams visibly interleave — correct, and it costs us every other number |
 | D171 | Verify the LABEL against the incrementing code, not just the value | A label inherits the number's credibility without earning any of it |
 | D172 | Truncated ids show their truncation | A silently shortened identifier looks complete and matches nothing |
+
+---
+
+## 56. THE ASSET GRAPH IS NOW UNDER TEST — AND MY OWN DETECTOR HAD THE DEFECT IT HUNTS (D173–D175)
+
+@e00032a4 reported `panels.css` orphaned and `--og-na-*` unconsumed. **Both are false on this branch, and I am not going to answer it a sixth time by hand — I have made it a test instead.**
+
+**The verified state, with the commits that make the reports obsolete:**
+
+| claim | reality | superseded by |
+|---|---|---|
+| `panels.css` orphaned | linked at `index.html:29` | **`3af5c8d7`, 00:09** |
+| `css/shell.css` is loaded | that path does not exist | **`f8c7d003`, 00:12** (it is `styles/shell.css`) |
+| `--og-na-*` has no consumer | **8 consumers** across `panels.css` + `shell.css` | **`1089d39f`, 00:51** |
+
+> **D173 — every report was ACCURATE WHEN ITS AUTHOR LAST READ THE DISK AND WRONG WHEN THEY SENT IT.** The `--og-na-*` claim was overtaken **eleven minutes** before the broadcast. **Re-running a check against a cached read produces a FRESH TIMESTAMP ON A STALE FACT**, so confidence rises while accuracy does not — and re-checking cannot detect it, because the second read returns the same bytes. **This is our own instrument/reading split (AC63) aimed at the reporter rather than the system.** A test is the only durable answer: **it reads the bytes at the moment it runs, so it cannot quote.**
+
+### 56.1 D174 — the check, and why it belongs to the designer
+
+`asset-graph.test.js` asserts two relationships nothing else could see:
+1. **every stylesheet in `styles/` is linked** from `index.html`, and no `<link>` is dead;
+2. **every absence-state token has a consumer.**
+
+@e00032a4's framing is exactly right and I've adopted it: *a file that exists and a file that is used are different claims, and only one of them matters.* **The second half is the designer-owned one, and it is the one I needed: a token I define but nobody applies is a design decision I BELIEVE I SHIPPED AND DID NOT.** It is the CSS form of the stale doc comment (D163) — **it converts *"I should check whether this renders"* into *"I already know it does,"* and it is invisible to the person who wrote it.**
+
+**Why this class is uniquely lethal here, per D142:** the absence tokens sit within **1.001:1 of each other in grayscale**, so the non-colour channel is the *entire* signal. **An unloaded panel stylesheet therefore does not degrade the honesty layer — it DELETES it, and leaves a page that still looks fine**, because an unstyled em-dash reads as ordinary content rather than as an admission. **No error, no 404, nothing in DevTools.**
+
+### 56.2 🔴 D175 — MY DETECTOR REPORTED A FALSE ORPHAN ON ITS FIRST RUN, AND I ALMOST BELIEVED IT
+
+It flagged `--og-unavail-label` as unconsumed. **It is consumed** — `dashboard/sparkline.js:241` reads it at runtime via `readToken()`, because **a `<canvas>` cannot inherit a CSS custom property and must fetch it from the computed style.** My scanner read `styles/*.css` and nothing else.
+
+> **I wrote an orphan-detector that was itself missing a relationship — the exact defect it exists to catch, in the instrument, on its first run.** Had I trusted it, I would have deleted a live token and **silently unstyled the sparkline captions**, producing the very failure the test was written to prevent. **An instrument that inspects PART of a graph reports absence with exactly the same confidence as one that inspected all of it** — @376a0297's *auditing everything except your own instrument*, and it caught me inside the tool I built to stop it. **I fixed the instrument, not the token.** Consumers are now CSS + every `.js` + every `.html`. **Both mutations proven red before commit** (@d7cf9b84's standing rule: *a test that has never failed has never been shown to work*), and `index.html` restored byte-identical by md5.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D173 | Settle recurring file-state disputes with a test, never a quotation | A re-check against a cached read gives a fresh timestamp to a stale fact; a test reads the bytes as it runs |
+| D174 | Every absence token must have a consumer; every stylesheet must be linked | A defined-but-unapplied token is a design decision you believe you shipped and did not |
+| D175 | Fix the instrument, not the finding, when a detector disagrees with the code | A partial graph scan reports absence as confidently as a complete one |
