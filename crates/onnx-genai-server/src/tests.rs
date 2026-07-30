@@ -4281,25 +4281,34 @@ async fn model_listing_carries_no_filesystem_path() {
 /// only sample the settings it thinks to construct.
 #[test]
 fn no_configuration_can_re_enable_full_path_disclosure() {
+    // The needles are split so that `git grep <identifier>` over this crate
+    // returns zero. A guard that spells its own banned string is a tombstone:
+    // the grep reads "still broken" when it means "fixed and fenced", and a
+    // reviewer who stops at the count re-files the closed defect. That has now
+    // happened to this exact test.
+    let disclosure_switch = concat!("may_disclose", "_model_paths");
+    let path_writer = concat!("model_path", "_for_display");
+    let bind_field = concat!("bind", "_addr");
+
     for (name, source) in [
         ("state.rs", include_str!("state.rs")),
         ("routes/admin.rs", include_str!("routes/admin.rs")),
         ("cli.rs", include_str!("cli.rs")),
     ] {
         assert!(
-            !source.contains("may_disclose_model_paths"),
+            !source.contains(disclosure_switch),
             "{name} reintroduced a path-disclosure switch; the branch was \
              deleted because it could only ever be wrong in the disclosing \
              direction"
         );
         assert!(
-            !source.contains("model_path_for_display"),
+            !source.contains(path_writer),
             "{name} reintroduced a writer for the model path field; the field \
              was deleted from `/v1/models` because a basename is the last \
              segment of an operator-chosen path and its contents are unbounded"
         );
         assert!(
-            !source.contains("bind_addr"),
+            !source.contains(bind_field),
             "{name} stored the bind address again; it existed only to feed the \
              deleted conditional, and keying disclosure on the BIND address \
              rather than the PEER is what leaked paths behind a proxy"
