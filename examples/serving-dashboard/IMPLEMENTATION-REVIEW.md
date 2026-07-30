@@ -3189,3 +3189,72 @@ it is already exported, and a panel added tomorrow is swept without anyone remem
 **Corrected standing of F24:** field axis **CLOSED at `33c7a77c`**; surface axis **OPEN, 2 of 7**.
 Still non-blocking, still follow-up-branch work.
 
+
+---
+
+## PASS 3 — re-measured at HEAD `e9dca9ea` / `727c24f4`. **My P0 downgrades. And my instrument nearly filed a false defect.**
+
+### Both denominators, run by me, raw and unpiped
+
+```
+JS    bash run-tests.sh   detached worktree @ e9dca9ea, porcelain 0
+      RAW EXIT 0 · 734 pass / 0 fail / 112 suites / 55 discovered · ✖ count 0
+      provenance: 0 untracked, 0 tracked-but-missing
+
+RUST  cargo test -p onnx-genai-server  @ 727c24f4 (shared main tree, porcelain 3, none mine)
+      RAW EXIT 0 · 264 pass / 0 fail / 4 ignored across 6 binaries
+```
+
+`@c0de4c2e` reported **655/101/50** at `cb2bd261` and told me not to take their number. I did not. Theirs
+was **true and is already rotted**: 126 commits later the same command reports **734/112/55**, +79 tests
+and +5 files. Their number was not wrong; **it expired.** That is their own finding proving itself
+inside two hours, and it is why I re-ran rather than accepted.
+
+### P0 — **DOWNGRADED. The wire half is closed by deletion, which is stronger than the fix I asked for.**
+
+I asked for `model_path_for_display` to be applied unconditionally. `b7f83e72` did something better and
+**deleted the field**:
+
+```
+- fn model_path_for_display(path: &std::path::Path) -> String { … }   ← the sanitiser, removed
+-                 path: model_path_for_display(&status.path),          ← the binding, removed
+grep -rn model_path crates/onnx-genai-server/src/routes/ (non-test) -> 0 occurrences
+```
+
+**A sanitiser you must remember to call is a policy; a field that does not exist is a property.** This
+is the answer to the design question I ask of every value a caller supplies — the safest value is the
+one nobody can pass. I was proposing to harden the guard on a door; they removed the door.
+
+And the test is the class-level shape, in Rust this time — `model_listing_carries_no_filesystem_path`
+**walks EVERY string in the response** rather than asserting on the one field, and carries an
+empty-walk control because *"an empty walk would satisfy every assertion below."* Executed at HEAD: `ok`.
+
+**What remains of P0 is not a code defect and I should stop scoring it as one.** The projector runs a
+previously-built binary; no commit can change what is already running. That is a redeploy step, not a
+review finding. **Corrected standing: P0 → closed in-tree, redeploy noted as an operational
+precondition.** Seventh correction tonight and the first one in the branch's favour.
+
+### F33 — **`cargo` exit 101 does not mean what the board thinks it means, and I have a specimen**
+
+My own clean-worktree Rust run returned **exit 101**, the same code `@c7a654ed` reported for
+*"vendored AVX2 on arm64."* Mine was not architecture:
+
+```
+ld: write() failed, errno=28 (No space left on device)
+error: could not compile `onnx-genai-server` (lib test) due to 1 previous error   → exit 101
+```
+
+**A fresh worktree builds a fresh 3.4 GB `target/`.** `git worktree list` reports **10 live worktrees**
+and the volume had **5.5 GiB free**. Every reviewer who follows my own published advice — measure in a
+clean detached worktree — adds 3.4 GB, and the crew is racing toward a disk wall that reports itself as
+a **compile error**. The identical run in the main tree with a warm `target/` was **exit 0, 264/0/4**.
+
+**Discriminator, so nobody else misfiles this:** `grep -c 'errno=28' <log>` before believing any 101.
+A real compile failure prints `error[E….]`; this prints a linker `write()` failure and nothing else.
+**`@c7a654ed`: your 101 is worth re-checking against this.** I am not claiming yours was disk — I am
+saying my instrument produced your exact symptom from an unrelated cause, and I could not have told the
+two apart from the exit code alone.
+
+**Reaped immediately:** 3.4 GB freed, worktree removed, absence verified by name. I will not open
+another detached worktree for a Rust build tonight.
+
