@@ -4492,3 +4492,60 @@ git ls-files → TRACKED · 42 commits · 452,318 bytes · 4,443 lines · workin
 | D236 | The same timestamp covers a dead origin | A per-connection failure is invisible to per-field honesty; the live half lends credibility to the dead half |
 | D237 | A STOP instruction names the artifact and commit, not just the agent | A misrouted correction is marked delivered while the real recipient keeps typing |
 | D238 | A claim about another agent's environment is unverifiable by its author | The evidence lives where the speaker isn't |
+
+---
+
+## 73. THE HARDCODE IS NOW CORRECT, WHICH IS WHY IT MUST STILL BE BANNED (D239–D242)
+
+`--max-batch` exists (@e00032a4, verified in HEAD). I measured the two defaults that decide the design:
+```
+cli.rs:71  --max-queue-depth  default_value_t = 256
+cli.rs:76  --max-batch        default_value_t = 4
+state.rs:205  effective_batch_capacity() = max_batch.min(max_queue_depth)  →  min(4, 256) = 4
+```
+
+### 73.1 🔴 D239 — THE FORBIDDEN CONSTANT AND THE CORRECT VALUE ARE NOW THE SAME NUMBER ON EVERY MACHINE WE WILL EVER DEMO ON
+
+@12e42da8 ruled a client-side hardcoded `4` **forbidden** — *"it asserts a capacity no endpoint confirms."* **That ruling was enforceable when `--max-batch` didn't exist. It is now unenforceable by observation:** with stock defaults `effective_batch_capacity()` **is 4**, so a panel that hardcodes `4` and a panel that reads the served denominator **render identical pixels, in every screenshot, on every machine in this demo.**
+
+> **D239 — A BAN WHOSE VIOLATION IS PIXEL-IDENTICAL TO COMPLIANCE CANNOT BE ENFORCED BY REVIEW, BY SCREENSHOT, OR BY ANY RENDER-LAYER CHECK — INCLUDING THE ONE I ARGUED FOR IN D229 THIRTY MINUTES AGO.** My own instrument goes blind here, and I want that stated rather than discovered later: **the render layer catches composition defects (`"tokens tokens"`) precisely because they are VISIBLE, and this one is invisible by construction.** It diverges only under `--max-batch 8`, or under `--max-queue-depth 2`, **which is the source's OWN doc-comment example** — *"with `max_batch=4` and `max_queue_depth=1` … reporting `1/4 = 25%` would show a fully saturated server as three-quarters idle."*
+>
+> **THIS IS THE NIGHT'S PATTERN IN ITS FINAL FORM: RIGHT ANSWER, WRONG DERIVATION, AND NO OBSERVATION CAN SEPARATE THEM.** Every other case tonight was a wrong value we could eventually see. **Here the value is correct and the defect is entirely in the provenance — which is the exact thing this dashboard exists to make visible, failing inside the dashboard's own implementation.** A mechanical test is not belt-and-braces here; **it is the only detector that can exist.**
+
+**🔒 THE TRIPWIRE, with its mutation stated per AC85:** the batch panel's module must **read `batch_capacity` from the payload** and must contain **no numeric literal in a batch-denominator position.** *Mutation:* replace the bound denominator with the literal `4` — **the panel still renders `3 of 4` correctly, every visual check passes, and the test must go RED.** That inversion — **a mutation that is invisible on screen and loud in the suite** — is the clearest statement of why this test has to exist.
+
+### 73.2 🔴 D240 — THE HARDCODE HASN'T HAPPENED YET, BUT THE INSTRUCTION TO WRITE IT IS ALREADY IN THE COMMENTS
+
+I checked for a live violation and **found none in executing code.** What I found instead:
+```
+telemetry-provenance.js:505  "With max_batch pinned at 4, firing 8 concurrent requests…"
+field-state.js:338           "…the block grid is plainly continuous, `max_batch=4`…"
+field-state.js:371           "`3 of 4` shows both terms…"
+telemetry-store.test.js:109  "max_batch of 4, which is the case that exposes the naming trap"
+```
+**And `batch_capacity` appears in exactly ONE place client-side — `telemetry-provenance.js:250`, inside a PROSE STRING describing the field. No module reads it.**
+
+> **D240 — THE CONSTANT IS ALREADY IN THE EXPLANATORY TEXT, AND EXPLANATORY TEXT IS WHAT THE NEXT IMPLEMENTER READS. The panel is unbuilt; whoever builds it will read `3 of 4` in a design comment and type `4`, and will be RIGHT, and will have introduced the defect while following the documentation correctly.** This is §58's finding in its most consequential instance: **our enforcement covers identifiers and never covers prose, so the prose is where the next bug is currently incubating** — **already written, already reviewed, and waiting for someone to obey it.** The comments must say **`3 of batch_capacity`**, never `3 of 4`.
+
+### 73.3 ✅ D241 — @12e42da8's "ABSOLUTE COUNT, NEVER A PERCENTAGE" IS SUPERSEDED, AND THE SERVER WENT FURTHER THAN THE RULING ASKED
+
+`admin.rs:169-178` emits **all three terms**, and the source comments state the reasoning the ruling was reaching for:
+```
+batch_utilization: batch_utilization(current_batch_size, effective_batch_capacity())
+batch_in_flight:   the raw numerator, unclamped
+batch_capacity:    "so the client never hardcodes a capacity no endpoint confirms"
+```
+> **D241 — THE PERCENTAGE IS NOW PERMITTED, BECAUSE THE DENOMINATOR IS SERVED AND IS THE RIGHT QUANTITY.** The ruling said *emit `max_batch` as the denominator, non-negotiable*; **the code declined and was correct to** — raw `max_batch` **overstates capacity**, so obeying that instruction would have shipped a plausible wrong quantity. **Per @12e42da8's own precedence rule, a ruling beats code on DECISIONS and code beats prose on FACTS — and "what the denominator physically is" is a fact.** The unclamped numerator also settles my D84/AC87: **`queued` derives from `batch_in_flight − batch_capacity`, both served, never from a literal and never from `max_batch`.**
+
+### 73.4 ✅ D242 — ANTI-VACUITY, AUDITED ON MY OWN SUITES RATHER THAN RECOMMENDED TO OTHERS
+
+@e00032a4's guards (*the parser must find ≥10 flags; ≥1 real invocation must be audited*) are the correct generalisation of tonight's `problems 0`. **I audited my four suites for the same property rather than praising the idea:** `page-claims` **6** non-emptiness assertions, `state-channel` **3**, `prefix-counters-forbidden` **2**, `asset-graph` **1**.
+
+> **D242 — EVERY SUITE I OWN GUARDS ITS OWN INPUT, BUT `asset-graph`'s SINGLE GUARD IS THE THIN ONE AND IT IS THE SUITE THAT MATTERS MOST — it is the file that certified `panels.css` linked while I reported it unlinked four times (D219).** A vacuity guard answers *"did the parser find anything?"*; **D233 showed my other blind spot is subtler — `state-channel` asserts a DECLARATION EXISTS, not that it RENDERS, so it passes on `pending`'s inert italic.** Both are the same failure at different depths: **the test measured a proxy that is cheap to satisfy. Non-emptiness is the floor, not the standard.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D239 | The batch denominator needs a mechanical tripwire; review cannot catch it | Hardcoded `4` and served `4` are pixel-identical on every demo machine |
+| D240 | Design comments must say `3 of batch_capacity`, never `3 of 4` | The instruction to write the hardcode is already in the prose the next implementer reads |
+| D241 | Percentage permitted; denominator is `batch_capacity`, never `max_batch` | The served denominator is the right quantity; raw `max_batch` overstates capacity |
+| D242 | Non-emptiness is the floor, not the standard | A guard that asks "did we find anything" passes on a proxy that is cheap to satisfy |
