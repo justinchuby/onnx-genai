@@ -12,6 +12,7 @@ import {
   describeFieldText,
   SOURCE_CLASS_BADGES,
   ABSENT_TEXT,
+  NOT_APPLICABLE_TEXT,
   PENDING_TEXT,
 } from './format.js';
 import {
@@ -41,18 +42,25 @@ test('a measured zero renders as a stark 0, never as absence', () => {
   assert.notEqual(out.text, ABSENT_TEXT);
 });
 
-test('unavailable and not-applicable both render an em-dash but read differently', () => {
+test('unavailable and not-applicable differ on the surface, not just in the hover', () => {
   const unavailable = formatField(unavailableField('The server hardcodes 0.0.'), { nowMs: NOW });
   const notApplicable = formatField(notApplicableField('This path never consults the cache.'), {
     nowMs: NOW,
   });
 
-  // Identical on the surface: absence looks the same everywhere in the page.
+  // This test previously asserted both rendered `—`, with the distinction
+  // carried entirely by `title`. That was the pre-ruling design and it fails
+  // the bar the rest of this file is held to: a hover is invisible to a
+  // visitor scanning the page, invisible on touch, invisible in a grayscale
+  // screenshot, and absent from the text a table view or clipboard copy emits.
+  // Putting the ONLY copy of a distinction there is the same error class as
+  // encoding it in colour.
   assert.equal(unavailable.text, ABSENT_TEXT);
-  assert.equal(notApplicable.text, ABSENT_TEXT);
+  assert.equal(notApplicable.text, NOT_APPLICABLE_TEXT);
+  assert.notEqual(unavailable.text, notApplicable.text);
 
-  // ...but the hover must not collapse the distinction between "not built yet"
-  // and "meaningless to ask here". One is a gap, the other is architecture.
+  // The hover still carries the full prose — surfacing the distinction did not
+  // remove the explanation, it just stopped the explanation being the only copy.
   assert.match(unavailable.title, /Unavailable/);
   assert.match(notApplicable.title, /Not applicable/);
   assert.notEqual(unavailable.title, notApplicable.title);
@@ -225,4 +233,66 @@ test('a custom formatter owns the whole string; the unit is not appended twice',
 
   // ...and an explicit request still wins, in either direction.
   assert.equal(formatField(field, { withUnit: false }).text, '32768');
+});
+
+// ---------------------------------------------------------------------------
+// The five ratified states must be distinguishable IN TEXT.
+//
+// The bar is the grayscale screenshot rule, automated: these assertions read
+// `.text` only, so a pair of states separated by nothing but a colour token
+// fails here even though it would look fine on a developer's monitor.
+// ---------------------------------------------------------------------------
+
+test('not-applicable does not render as unavailable', () => {
+  const base = { value: null, unit: 'reqs', label: 'prefix reuse' };
+
+  const notApplicable = formatField({ ...base, state: 'not-applicable' });
+  const unavailable = formatField({ ...base, state: 'unavailable' });
+
+  // `—` is an apology for a metric we failed to collect. `n/a` is the statement
+  // that the metric is meaningless on this execution path BY DESIGN — the
+  // prefix cache is never consulted on the scatter engine, so a hit rate there
+  // is not missing, it is inapplicable. Collapsing them makes a correctly
+  // empty panel read as a broken one.
+  assert.equal(notApplicable.text, 'n/a');
+  assert.equal(unavailable.text, '—');
+  assert.notEqual(notApplicable.text, unavailable.text);
+});
+
+test('all five states render distinct text, so none relies on colour', () => {
+  const texts = ['ok', 'pending', 'stale', 'unavailable', 'not-applicable'].map(
+    (state) =>
+      formatField(
+        {
+          value: state === 'ok' || state === 'stale' ? 41 : null,
+          state,
+          unit: 'reqs',
+          label: 'queue depth',
+          observedAtMs: 0,
+        },
+        { nowMs: 12_000 },
+      ).text,
+  );
+
+  assert.equal(new Set(texts).size, texts.length, `states collapsed: ${texts.join(' | ')}`);
+});
+
+test('an undated stale reading admits its age is unknown rather than claiming 0s', () => {
+  // The old default aged an undated field against `now`, producing "0s old":
+  // a value asserting perfect freshness on the one path that already knows it
+  // is stale. That is a stronger false claim than showing no age at all.
+  const undated = formatField(
+    { value: 41, state: 'stale', unit: 'reqs', label: 'queue depth' },
+    { nowMs: 900_000 },
+  );
+
+  assert.equal(undated.text, '41 reqs · age unknown');
+  assert.doesNotMatch(undated.text, /0s/);
+
+  // A dated one still reports real age, so this did not disable the treatment.
+  const dated = formatField(
+    { value: 41, state: 'stale', unit: 'reqs', label: 'queue depth', observedAtMs: 888_000 },
+    { nowMs: 900_000 },
+  );
+  assert.equal(dated.text, '41 reqs · 12s old');
 });

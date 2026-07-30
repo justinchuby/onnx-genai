@@ -61,6 +61,29 @@ export const ABSENT_TEXT = '—';
 export const PENDING_TEXT = '···';
 
 /**
+ * Shown when a metric is meaningless on THIS execution path by design.
+ *
+ * Deliberately not `ABSENT_TEXT`. `—` is apologetic: it says we could not
+ * measure something we intended to, and it resolves when someone does the
+ * work. `n/a` says the question does not apply here — asking how often a cache
+ * was reused on an engine that never consults that cache. Rendering them identically tells a
+ * first-time visitor that half a correctly-working dashboard is broken, which
+ * is why `not-applicable` was ratified as a state of its own rather than
+ * folded into `unavailable`.
+ */
+export const NOT_APPLICABLE_TEXT = 'n/a';
+
+/**
+ * Shown when a reading is known to be stale but carries no timestamp.
+ *
+ * The alternative is worse than it looks: `nowMs - (observedAtMs ?? nowMs)` is
+ * zero, which renders "0s old" — an undated value ASSERTING that it is
+ * perfectly fresh, on the one code path that already knows it is not. An
+ * unknown age must read as unknown.
+ */
+export const UNKNOWN_AGE_TEXT = 'age unknown';
+
+/**
  * Human age for a stale reading. Seconds up to a minute, then minutes: a
  * dashboard that has been dead for six minutes should not say "374s old",
  * which reads as precision about something we are admitting we do not know.
@@ -140,7 +163,11 @@ export function formatField(field, { format, withUnit, nowMs = Date.now() } = {}
   let ageText = null;
 
   if (!present) {
-    text = field.state === FIELD_STATES.PENDING ? PENDING_TEXT : ABSENT_TEXT;
+    // Three distinguishable absences, distinguishable IN TEXT rather than in
+    // colour, so the difference survives grayscale and a screen reader.
+    if (field.state === FIELD_STATES.PENDING) text = PENDING_TEXT;
+    else if (field.state === FIELD_STATES.NOT_APPLICABLE) text = NOT_APPLICABLE_TEXT;
+    else text = ABSENT_TEXT;
   } else {
     const unit = appendUnit && field.unit ? ` ${field.unit}` : '';
     // The tilde is not decoration. An estimate that looks identical to a
@@ -152,7 +179,15 @@ export function formatField(field, { format, withUnit, nowMs = Date.now() } = {}
       // AC25: the age must be in WORDS. A colour shift alone disappears in
       // grayscale and for colourblind readers, and "this number is 12 seconds
       // out of date" is information, not styling.
-      ageText = formatAge(nowMs - (field.observedAtMs ?? nowMs));
+      //
+      // An undated stale field says so. Defaulting its age to `nowMs` renders
+      // "0s old", which is the field asserting perfect freshness at the exact
+      // moment we know it is not fresh — a stronger false claim than the one
+      // the staleness treatment exists to prevent.
+      ageText =
+        typeof field.observedAtMs === 'number'
+          ? formatAge(nowMs - field.observedAtMs)
+          : UNKNOWN_AGE_TEXT;
       text = `${text} · ${ageText}`;
     }
   }
