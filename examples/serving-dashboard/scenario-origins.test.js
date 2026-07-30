@@ -180,6 +180,42 @@ test('the widening does NOT make non-loopback hosts interchangeable', () => {
   );
 });
 
+test('a host that merely ENDS WITH ours is a stranger, not a sibling', () => {
+  // NOT redundant with the "CONTAINS ours" arms above, and the difference is
+  // the whole point. Those cases put our hostname at the START of the
+  // attacker's (`127.0.0.1.evil.example`), which survives almost any sloppy
+  // comparison. This one puts it at the END, which is the single direction a
+  // suffix test lets through.
+  //
+  // FOUND BY A MUTATION THAT LANDED AND STAYED GREEN. Replacing the exact
+  // comparison in sameHost with `a.endsWith(b)` -- a one-line change, and a
+  // plausible one, since "allow subdomains of our own host" is a reasonable-
+  // sounding request -- passed all 30 tests in this file. Executed against the
+  // mutant, `parseOrigin('http://evil-demo.corp.example', 'demo.corp.example')`
+  // returned the attacker's origin INTACT.
+  //
+  // It matters because BIND_HOST is not always an IP. On loopback the relaxation
+  // is nearly harmless: no resolver hands you a name ending in `127.0.0.1`. Serve
+  // the demo on a real hostname -- which run-demo.sh permits -- and
+  // `notdemo.corp.example` becomes registrable by anyone, and it is then polled
+  // and rendered under our chrome with a provenance badge naming a server we
+  // never contacted.
+  const PAGE = 'demo.corp.example';
+
+  assert.equal(parseOrigin('http://evil-demo.corp.example', PAGE), null);
+  assert.equal(parseOrigin('http://notdemo.corp.example:8134', PAGE), null);
+  assert.equal(parseOrigin('https://xdemo.corp.example', PAGE), null);
+
+  // The positive control, in the same test, so a comparison that rejects
+  // EVERYTHING cannot masquerade as a fix. A guard that fails closed on the
+  // legitimate peer is a broken dashboard, and this file has already shipped
+  // that exact regression once (C13, the loopback-spellings test above).
+  assert.equal(
+    parseOrigin('http://demo.corp.example:8134', PAGE),
+    'http://demo.corp.example:8134',
+  );
+});
+
 test('a differing PORT on our own host is allowed -- that is the real topology', () => {
   const HOST = '127.0.0.1';
   assert.equal(parseOrigin('http://127.0.0.1:9999', HOST), 'http://127.0.0.1:9999');
