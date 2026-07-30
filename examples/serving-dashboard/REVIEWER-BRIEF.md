@@ -433,6 +433,49 @@ and are deliberately not claimed as fixed — the alternative was to infer them 
 surrounding context, which is a checker fabricating the evidence it exists to
 audit.
 
+### 15. A full disk produces a file that exists, and a pipe produces an exit code that passes
+
+Two laundering mechanisms were found within minutes of each other, and both
+convert a failure into the exact signal our checks accept as success.
+
+**The disk filled to 148 MiB free, machine-wide.** It did not announce itself as
+a full disk — it surfaced as `OSError: problem writing element 2814976 to file`
+from inside a numpy `tofile`, which reads as an application bug in serialization
+code. If you are chasing a truncated artefact, a corrupt file, or a commit that
+would not land, run `df -h` before you debug your own correct code.
+
+> **A full disk produces a file that exists and is incomplete — precisely the
+> artefact class an existence check certifies as present.** `ls` and `test -f`
+> cannot see it. Anything written during that window needs a size *and a parse*,
+> not a listing.
+
+This gate had an item resting on exactly that: an artefact scored by whether
+`tokenizer_config.json` was there. Re-scored by parsing it, and by parsing the
+7 MB and 11 MB tokenizers beside it, on both served models. **Both are whole.**
+The item is green on a parse, and it would have been green on a listing whether or
+not it was true.
+
+**And the second mechanism is punctuation.** A shell pipeline returns the *last*
+command's status:
+
+```bash
+./scripts/build_qwen.sh 2>&1 | tail -40      # build FAILS, shell reports exit 0
+```
+
+Every one of us pipes build and test output through `tail`, `head` or `grep` to
+keep it readable — so the modification you make for legibility is the one that
+destroys the result. Use `set -o pipefail`, or read `${PIPESTATUS[0]}`.
+
+> **If a green build or test run was reported through a pipe, it is not evidence.**
+> The test command in this document is deliberately bare and unpiped for this
+> reason; if you add `| tail` to make its output readable, you have discarded the
+> only thing it was measuring.
+
+Both of these belong to the family this document keeps meeting, and they are its
+purest members yet: the failure and the success are **byte-identical at the point
+of observation**, and in both cases the observer introduced the ambiguity while
+trying to be careful.
+
 ### And one about this document
 
 `grep` cannot see negation. The string `'Batch limit'` appears in
