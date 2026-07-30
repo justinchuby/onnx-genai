@@ -317,7 +317,7 @@ you conclude that half the dashboard is broken.
 **Continuous batching and paged KV are mutually exclusive in this runtime
 today.** `ContinuousBatchManager` holds a batched decode session, a tokenizer
 and its rows — and never touches `engine.kv_cache`
-(`crates/onnx-genai-engine/src/batched.rs:101-110`). Static-cache models
+(`crates/onnx-genai-engine/src/batched.rs`, `struct ContinuousBatchManager`). Static-cache models
 use runtime-owned in-place KV buffers, which bypass the page table and the
 prefix trie entirely.
 
@@ -400,7 +400,7 @@ directions**, each time expecting something different:
 | What we set out to show | How the exclusivity killed it |
 | --- | --- |
 | Prefix caching on the batching server | The paged KV cache owns *both* the page table and the prefix trie. Bypass the cache and you bypass the trie — one cause, two symptoms. |
-| A `preempted` state in the swimlane | Dead on **both** profiles, for four independent reasons — any one sufficient. Batching: `batched.rs:759` hardcodes `PreemptionPolicy::Disabled` (`:713-717` calls it structural — a batch owns its KV in physical rows that cannot be swapped out and resumed in place), and more decisively, `ContinuousBatchManager` (`batched.rs:101-110`) **has no scheduler field at all**, so the component that could preempt is not present. Dynamic: the server enters via the single-request FCFS path, and its driver runs generations serially, so there is never a second sequence to preempt. |
+| A `preempted` state in the swimlane | Dead on **both** profiles, for four independent reasons — any one sufficient. Batching: `crates/onnx-genai-engine/src/batched.rs`, `PreemptionPolicy::Disabled` hardcodes `PreemptionPolicy::Disabled` (`:713-717` calls it structural — a batch owns its KV in physical rows that cannot be swapped out and resumed in place), and more decisively, `ContinuousBatchManager` (`crates/onnx-genai-engine/src/batched.rs`, `struct ContinuousBatchManager`) **has no scheduler field at all**, so the component that could preempt is not present. Dynamic: the server enters via the single-request FCFS path, and its driver runs generations serially, so there is never a second sequence to preempt. |
 | A memory-pressure knob that shrinks the KV budget | Not merely ineffective — **unreachable**. `EngineConfig::from_yaml` is the only code that can set a KV limit or flip `allow_runtime_override`, and it has **no callers outside its own unit tests**. The server builds its config at `cli.rs:127-133` from two fields plus `..Default::default()`, so `allow_runtime_override` is always `false` (`crates/onnx-genai-engine/src/config.rs`). There is no flag, file, or env var that reaches it. |
 
 Three features, three investigations, one root cause. That is not bad luck —
@@ -488,11 +488,11 @@ as a visible staircase.
 
 **The lane has four states, permanently, on both profiles — and that is a fact
 rather than a gap.** There is no `preempted` state anywhere in this demo. On the
-batching path, `batched.rs:759` hardcodes `PreemptionPolicy::Disabled` and the
+batching path, `crates/onnx-genai-engine/src/batched.rs`, `PreemptionPolicy::Disabled` hardcodes `PreemptionPolicy::Disabled` and the
 comment above it explains why that is structural rather than a default — a batch
 owns its KV in physical decode rows that cannot be swapped out and resumed in
 place. That alone would be enough, but the stronger fact is that
-`ContinuousBatchManager` (`batched.rs:101-110`) **holds no scheduler at all**:
+`ContinuousBatchManager` (`crates/onnx-genai-engine/src/batched.rs`, `struct ContinuousBatchManager`) **holds no scheduler at all**:
 preemption is not disabled here so much as absent. On the dynamic path the
 server enters through the single-request FCFS entry point and its driver runs
 generations serially, so there is never a second sequence to preempt.
@@ -1126,7 +1126,7 @@ call site it reads `with_rng(0, rng, …)`, which is easy to mistake for a seed)
 So the zero is not the answer to a question nobody could answer differently —
 **it is a constant that was never a measurement at all.** It is also not
 `unavailable`, because nobody will ever instrument it: `ContinuousBatchManager`
-(`batched.rs:101-110`) has no prefix-cache field at all, so a lookup there is
+(`crates/onnx-genai-engine/src/batched.rs`, `struct ContinuousBatchManager`) has no prefix-cache field at all, so a lookup there is
 not merely absent but *impossible*. That is what `not-applicable` is for.
 
 **So our flagship example of a real measurement was a fabricated number, sitting
