@@ -83,23 +83,59 @@ function git(...args) {
  *
  *   SHIPPING_TREE_REF=review-1 node --test './*.test.js'
  *
+ * REVIEW_SHA is accepted as an equal spelling of the same thing, because that
+ * is the name that was broadcast to reviewers. Two NAMES resolved at ONE point
+ * cannot disagree; two independent implementations reading two names would,
+ * and that is the distinction worth holding. Honouring only the name this
+ * module happened to pick first is the worse failure: a reviewer sets
+ * REVIEW_SHA, nothing reads it, nothing errors, and they score a moving branch
+ * believing they are pinned to a tag. A silent no-op is worse than an
+ * unsupported variable, because it is trusted.
+ *
+ * Both set to different commits is REFUSED rather than resolved by precedence.
+ * A precedence rule silently discards one of two explicit instructions and the
+ * caller never learns which one lost.
+ *
  * An unresolvable ref throws HERE, at load, naming itself — rather than
  * surfacing later as a confusing per-file "path does not exist in HEAD".
  */
 export const SHIPPING_REF = (() => {
-  const requested = process.env.SHIPPING_TREE_REF?.trim() || 'HEAD';
-  try {
-    return git('rev-parse', requested);
-  } catch {
-    throw new Error(
-      `SHIPPING_TREE_REF is set to '${requested}', which this repository cannot ` +
-        `resolve to a commit.\n` +
-        `  Checks read their inputs from that commit, so there is nothing to read ` +
-        `and no honest result to report.\n` +
-        `  Unset it to score the current HEAD, or name a ref that exists ` +
-        `(e.g. a review tag).`,
-    );
+  const fromTreeRef = process.env.SHIPPING_TREE_REF?.trim();
+  const fromReviewSha = process.env.REVIEW_SHA?.trim();
+
+  const resolve = (ref, name) => {
+    try {
+      return git('rev-parse', `${ref}^{commit}`);
+    } catch {
+      throw new Error(
+        `${name} is set to '${ref}', which this repository cannot resolve to a ` +
+          `commit.\n` +
+          `  Checks read their inputs from that commit, so there is nothing to ` +
+          `read and no honest result to report.\n` +
+          `  Unset it to score the current HEAD, or name a ref that exists ` +
+          `(e.g. a review tag).`,
+      );
+    }
+  };
+
+  if (fromTreeRef && fromReviewSha) {
+    const a = resolve(fromTreeRef, 'SHIPPING_TREE_REF');
+    const b = resolve(fromReviewSha, 'REVIEW_SHA');
+    if (a !== b) {
+      throw new Error(
+        `SHIPPING_TREE_REF='${fromTreeRef}' and REVIEW_SHA='${fromReviewSha}' name ` +
+          `different commits (${a.slice(0, 8)} vs ${b.slice(0, 8)}).\n` +
+          `  They are two spellings of one setting, so there is no correct way to ` +
+          `choose between two explicit instructions.\n` +
+          `  Unset one.`,
+      );
+    }
+    return a;
   }
+
+  if (fromTreeRef) return resolve(fromTreeRef, 'SHIPPING_TREE_REF');
+  if (fromReviewSha) return resolve(fromReviewSha, 'REVIEW_SHA');
+  return resolve('HEAD', 'HEAD');
 })();
 
 let announced = false;
@@ -126,10 +162,16 @@ let announced = false;
 export function announceShippingRef() {
   if (announced) return SHIPPING_REF;
   announced = true;
-  const overridden = Boolean(process.env.SHIPPING_TREE_REF?.trim());
-  const via = overridden
-    ? `SHIPPING_TREE_REF=${process.env.SHIPPING_TREE_REF.trim()}`
-    : 'default (HEAD at load)';
+  // Names the variable actually consulted, not just that an override happened:
+  // a reviewer debugging an unexpected ref needs to know WHICH of the two
+  // spellings the process read, and REVIEW_SHA exists precisely because people
+  // reach for the other name.
+  const treeRef = process.env.SHIPPING_TREE_REF?.trim();
+  const reviewSha = process.env.REVIEW_SHA?.trim();
+  let via = 'default (HEAD at load)';
+  if (treeRef && reviewSha) via = `SHIPPING_TREE_REF=${treeRef} (REVIEW_SHA agrees)`;
+  else if (treeRef) via = `SHIPPING_TREE_REF=${treeRef}`;
+  else if (reviewSha) via = `REVIEW_SHA=${reviewSha}`;
   process.stderr.write(`# shipping ref: ${SHIPPING_REF} [${via}]\n`);
   return SHIPPING_REF;
 }

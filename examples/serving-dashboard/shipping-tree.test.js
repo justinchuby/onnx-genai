@@ -134,8 +134,53 @@ describe('a reviewer can pin the checks to a named tag', () => {
     );
   });
 
-  it('a ref that cannot be resolved fails at load, naming itself', () => {
-    const result = probe({ SHIPPING_TREE_REF: 'zz-no-such-ref' }, PRINT_REF);
+  // REVIEW_SHA is the spelling that was broadcast to the reviewers. Before
+  // these tests it was read by nothing: setting it produced no ref change, no
+  // warning and no error, so a reviewer would have scored a moving branch while
+  // believing they were pinned to a tag. A silent no-op is the failure mode
+  // worth a test, because unlike an unsupported variable it is TRUSTED.
+  it('honours REVIEW_SHA, the name reviewers were actually given', () => {
+    const previous = git('rev-parse', 'HEAD~1');
+    const result = probe({ REVIEW_SHA: 'HEAD~1' }, PRINT_REF);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      result.stdout.trim(),
+      previous,
+      'REVIEW_SHA was ignored — a reviewer setting it gets a silent no-op',
+    );
+    assert.notEqual(result.stdout.trim(), SHIPPING_REF);
+  });
+
+  it('accepts both spellings when they agree', () => {
+    const previous = git('rev-parse', 'HEAD~1');
+    const result = probe(
+      { SHIPPING_TREE_REF: 'HEAD~1', REVIEW_SHA: previous },
+      PRINT_REF,
+    );
+
+    // Deliberately spelled differently -- a symbolic ref and a raw SHA naming
+    // one commit. Agreement is about the COMMIT, not about the string.
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), previous);
+  });
+
+  it('refuses two spellings that name different commits', () => {
+    const result = probe(
+      { SHIPPING_TREE_REF: 'HEAD', REVIEW_SHA: 'HEAD~1' },
+      PRINT_REF,
+    );
+
+    assert.notEqual(
+      result.status,
+      0,
+      'two conflicting explicit instructions must not be silently reconciled',
+    );
+    assert.match(result.stderr, /SHIPPING_TREE_REF/);
+    assert.match(result.stderr, /REVIEW_SHA/, 'the error must name BOTH variables');
+  });
+
+  it('a ref that cannot be resolved fails at load, naming itself', () => {    const result = probe({ SHIPPING_TREE_REF: 'zz-no-such-ref' }, PRINT_REF);
 
     assert.notEqual(result.status, 0, 'an unresolvable ref must not be ignored');
     assert.match(result.stderr, /zz-no-such-ref/);
