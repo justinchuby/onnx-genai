@@ -39,10 +39,18 @@ SERVER_BIN="${TARGET_DIR}/release/onnx-genai-server"
 # Models are gitignored (.gitignore:2) and are not part of a clone. They also
 # commonly live in a primary checkout rather than a worktree, so fall back to a
 # sibling checkout before giving up. MODELS_DIR overrides both.
+#
+# A candidate must CONTAIN the models, not merely exist. This directory is a
+# shared dumping ground -- `.hf_cache`, and a `.scratch` that torchinductor
+# creates on its own -- so an empty-but-present `models/` is the normal state of
+# a fresh worktree, and testing `[[ -d ]]` would select it and defeat the
+# fallback entirely. That is not hypothetical: this script ran green earlier
+# tonight, then began failing with no edit to it, because an unrelated tool
+# created models/.scratch and the worktree directory started winning.
 default_models_dir() {
   local candidate
   for candidate in "${REPO_ROOT}/models" "${REPO_ROOT}/../onnx-genai/models"; do
-    if [[ -d "${candidate}" ]]; then
+    if [[ -d "${candidate}/qwen2.5-0.5b-scatter-v2" ]] || [[ -d "${candidate}/qwen2.5-0.5b" ]]; then
       printf '%s' "${candidate}"
       return 0
     fi
@@ -95,6 +103,31 @@ require_model() {
     "See examples/serving-dashboard/README.md, 'Getting the models'."
 }
 
+port_is_free() {
+  # A health check cannot tell OUR server from a stranger's. If something is
+  # already listening, `wait_until_ready` will happily curl it, get a 200, and
+  # report green while our own server is dead -- which is exactly what happened
+  # when this was written: another agent's server held :8123, ours exited with
+  # "Address already in use", and the script printed the success banner anyway.
+  ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+require_free_port() {
+  local port="$1" label="$2"
+  port_is_free "${port}" && return 0
+  fail "port ${port} (${label}) is already in use." \
+    "" \
+    "Something is already listening there, so this script cannot start its own" \
+    "${label} server -- and a health check could not tell the difference." \
+    "It would report success while serving you an unrelated process with" \
+    "unknown flags, an unknown model, and an unknown build of the dashboard." \
+    "" \
+    "Find it, or pick another port:" \
+    "" \
+    "  lsof -nP -iTCP:${port} -sTCP:LISTEN" \
+    "  SCATTER_PORT=9123 DYNAMIC_PORT=9124 ./examples/serving-dashboard/run-demo.sh"
+}
+
 wait_until_ready() {
   local port="$1" label="$2" pid="$3"
   local deadline=$((SECONDS + READY_TIMEOUT_SECONDS))
@@ -106,6 +139,15 @@ wait_until_ready() {
         "Its output is above — the server prints why it could not load the model."
     fi
     if curl --silent --fail --max-time 2 "http://${BIND_HOST}:${port}/health" >/dev/null 2>&1; then
+      # Re-check liveness AFTER the health probe. A 200 proves something is
+      # listening, not that it is ours; if our process died during the probe,
+      # the answer came from whatever took the port.
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        printf '\n'
+        fail "the ${label} server on :${port} answered /health, but our own" \
+          "server process is not running — the reply came from a DIFFERENT" \
+          "process holding that port. Refusing to report success."
+      fi
       printf ' ready\n'
       return 0
     fi
@@ -156,6 +198,11 @@ require_model "${SCATTER_MODEL}" "static-cache (scatter)" \
 require_model "${DYNAMIC_MODEL}" "dynamic" \
   "The paged KV allocator and the prefix cache live on the dynamic path, so this one drives those scenarios."
 require_static_cache "${SCATTER_MODEL}"
+
+# Check the ports BEFORE starting anything, for the same reason the models are
+# checked first: a clear refusal now beats an ambiguous success later.
+require_free_port "${SCATTER_PORT}" "static-cache (scatter)"
+require_free_port "${DYNAMIC_PORT}" "dynamic"
 
 if [[ ! -x "${SERVER_BIN}" ]]; then
   printf 'building onnx-genai-server (release)...\n'
