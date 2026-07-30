@@ -166,6 +166,53 @@ answer at read time and cannot be stale by construction. *(This is
 @086345a5's and @c0de4c2e's rule — publish the predicate, not the conclusion —
 and my brief was the largest single violator of it on the branch.)*
 
+### 11. A green suite may belong to a tree that has never existed
+
+Run the suite twice at the same commit, sixty seconds apart, and it can disagree
+with itself:
+
+```
+sha 26c0b38a, node v25.6.1, the SAME commit both times
+
+  shared working tree,  porcelain 7   ->  584 tests  584 pass  0 fail   PASS
+  detached worktree,    porcelain 0   ->  584 tests  583 pass  1 FAIL   FAIL
+```
+
+The failure is real and it is in the branch: `check-source-citations.test.js`
+reports that `README.md` cites `driver.rs:1083` while that file has 1077 lines.
+The reason the shared tree hides it is one uncommitted edit — `driver.rs` is
+**1133 lines on a desk and 1076 lines in `HEAD`**. The citation is valid on
+exactly one machine in the world.
+
+This is the inverse of every staleness problem in this document. A stale
+measurement was true once and decayed. **This one was never true of the branch
+at all** — it describes a tree that exists nowhere in history and never will,
+assembled from the branch plus whatever one person had not committed yet. A
+clean worktree at a stale commit is a spotless measurement of the past; a dirty
+worktree at the current commit is a confident measurement of a future nobody has
+agreed to.
+
+It generalises past this one run, because the corpus is the default rather than
+the exception: **of the guards in this suite, the overwhelming majority read the
+working tree via `readFileSync` and only a handful consult `HEAD`.** So a green
+total is, for most of the suite, a statement about the disk of whoever ran it.
+That is tolerable in normal work and inverts under a commit freeze, when several
+people are deliberately holding fixes uncommitted: every one of those fixes is
+counted as shipped by the disk-reading majority and correctly ignored by the
+rest.
+
+> **So: `git worktree add --detach` at `porcelain 0` is not tidiness, it is the
+> only thing that makes a disk-reading guard mean anything.** Quote the porcelain
+> beside the count or the count is about your desk. And note the asymmetry before
+> concluding HEAD-reading guards are simply better — they cannot warn an author
+> *before* a commit, so they only ever redden once the defect is already in the
+> history. The two kinds answer different questions, *is my desk clean* and *is
+> the branch clean*, and this suite mixes both into one number that is labelled
+> as neither.
+
+I caught this only by discarding my own result. I had `584/584 fail 0`, from the
+real suite, at the real sha, and threw it away because `porcelain` said 7.
+
 ### And one about this document
 
 `grep` cannot see negation. The string `'Batch limit'` appears in
@@ -901,6 +948,24 @@ It never fired, because the item closed on other evidence. That is the part wort
 carrying: **a defective check that gets routed around is indistinguishable from a
 correct one.** It has no failures to its name and no successes either. Nothing in
 a green run, or in a closed checklist, marks the difference.
+
+**The repaired criterion, stated here because deleting a bad check is not the
+same as having a good one.** It must name the **static/scatter** origin and
+require an active batch of **at least two**. Both halves are load-bearing and
+neither is obvious from the failure: naming the origin is what stops the
+per-request arm from answering, and `>= 2` is what stops `1` — the value that
+*proves batching absent* — from reading as success. Measured on both arms in one
+minute, same binary, same flags, only the model differing: static reached an
+active batch of **4**, dynamic reached **1**, with **4 of 4 completions on both**.
+The denominator is not decoration; an earlier run of the same probe read zero on
+both origins, which looks exactly like *batching is broken* and was in fact *all
+four requests failed*.
+
+The reason this section is not simply deleted along with the check: a retired
+criterion that vanishes leaves nothing to stop the next person deriving the same
+one from the same reasoning. **A wrong check and no check are indistinguishable
+in a green run — but a wrong check that has been replaced in writing is the only
+one of the three that cannot come back.**
 
 The mirror of this is the pattern documented throughout §8: a check that cannot
 fail, and a check that can only fail wrongly, are the same defect measured from
