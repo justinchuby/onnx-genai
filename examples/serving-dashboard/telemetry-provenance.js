@@ -157,8 +157,8 @@ export const PROVENANCE = Object.freeze({
       'context only — crates/onnx-genai-server/src/routes/admin.rs:93-100.',
     label: 'Model directory',
     reason:
-      'The server does not expose the model directory path on any endpoint yet. It is ' +
-      'planned for the /v1/debug/live `server` block.',
+      'The server does not expose the model directory path on any endpoint yet. If it is ' +
+      'added, it will appear on /v1/status, which is ungated and already polled.',
   },
   'server.execution_provider': {
     source: ENDPOINTS.STATUS,

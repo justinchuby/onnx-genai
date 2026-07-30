@@ -1199,3 +1199,25 @@ test('every suppressed field can be checked against the wire, or says why not', 
       suppressed.join('\n'),
   );
 });
+
+test('no reason string promises an endpoint that does not exist', () => {
+  // A reason is shown to a VISITOR, so it is a promise the project has to keep.
+  // /v1/debug/live was designed, referenced here, and then retired in favour of
+  // /v1/status -- leaving the honesty layer directing people to a 404. An
+  // honesty mechanism that misleads is worse than none, because it is trusted.
+  const live = new Set(Object.values(ENDPOINTS));
+  const offenders = [];
+  for (const [key, entry] of Object.entries(PROVENANCE)) {
+    for (const text of [entry.reason, entry.caveat]) {
+      if (!text) continue;
+      for (const mentioned of text.match(/\/v1\/[a-z0-9/_-]+|\/metrics|\/health/gi) ?? []) {
+        if (!live.has(mentioned)) offenders.push(`${key}: "${mentioned}"`);
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these reasons name endpoints this demo does not poll:\n${offenders.join('\n')}`,
+  );
+});

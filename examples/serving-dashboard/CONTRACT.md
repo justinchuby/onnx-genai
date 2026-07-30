@@ -35,34 +35,64 @@ parseable number for them.** You cannot accidentally bind a panel to a lie.
 
 ```js
 {
-  value:        3,              // null unless state is 'measured' or 'stale'
-  state:        'measured',     // 'measured' | 'pending' | 'stale' | 'unavailable'
-  source:       '/v1/status',   // or 'client' | 'derived' | endpoint path
-  reason:       null,           // required sentence whenever state !== 'measured'
+  value:        3,              // null unless state is 'ok' or 'stale'
+  state:        'ok',           // see the five states below
+  source:       '/v1/status',   // the ENDPOINT -- precise enough to curl
+  sourceClass:  'server',       // the CLASS -- 'server'|'client'|'derived'|'estimated'
+  origin:       'scatter',      // which server we asked: 'scatter' | 'dynamic'
+  originModelId:'qwen2.5-0.5b-scatter-v2',  // what that server CALLED ITSELF
+  label:        'Queue depth',
+  reason:       null,           // required sentence whenever state !== 'ok'
   unit:         'requests',     // or null
-  observedAtMs: 1785390093123,  // null when unavailable or pending
-  derivedFrom:  null            // field keys, when source === 'derived'
+  observedAtMs: 1785390093123,  // null when absent; ORIGINAL time when stale
+  derivedFrom:  null,           // field keys, when sourceClass === 'derived'
+  provenanceWarning: null       // set when the wire contradicted the audit
 }
 ```
 
+> ⚠️ **`state` for a good reading is the string `'ok'`, not `'measured'`.**
+> The constant is named `FIELD_STATES.MEASURED` because *measured* names
+> provenance while *ok* names approval — but the ratified wire value is `'ok'`.
+> **Always compare against `FIELD_STATES.*`, never a string literal**, and this
+> mismatch can never bite you.
+
 | `state` | Meaning | Render as |
 |---|---|---|
-| `measured` | The server computed this, just now. Includes a genuine zero. | The number, full contrast, no apology. |
+| `ok` | The server computed this, just now. **Includes a genuine zero.** | The number, full contrast, no apology. |
 | `pending` | Measurable, but no sample has arrived yet. **Resolves on its own.** | `···` |
-| `stale` | Was measured; the latest poll did not refresh it. `value` is the last good reading. | The number, visibly de-emphasised, with its age. |
-| `unavailable` | No value exists and **none is coming** without a server or config change. | **Em-dash `—`** with `reason` in the tooltip. Never `0`, never blank, never `undefined`. |
+| `stale` | Was measured; the latest poll did not refresh it. `value` is the last good reading. | The number, de-emphasised, **with its age in words** (`41 · 12s old`). |
+| `unavailable` | The server hardcodes a placeholder and never computes it. **Plumbing would fix it.** | **Em-dash `—`** + `reason` on hover. Never `0`, never blank. |
+| `not-applicable` | The subsystem exists but **this code path never consults it**, so the question is never asked. Plumbing would *not* fix it. | **Em-dash `—`** + `reason` explaining *why*. |
 
-`pending` and `unavailable` are deliberately separate. Pending resolves by
-itself; unavailable never will. Telling a visitor to wait for a number that is
-never coming is its own small dishonesty — so `kv.usage` is `unavailable` from
-the very first frame, while `queue.depth` is `pending` until the first poll
-lands. (Vocabulary resolved with the dashboard developer: `pending` was their
-proposal and it is a genuine improvement; `measured` is kept over `ok` because it
-names the property that actually matters — provenance, not approval.)
+### The three kinds of zero (demo-spec.md §3, binding)
+
+A `0` on the wire is byte-identical in all three cases, so neither the wire nor
+a panel can tell them apart. Only the provenance table can:
+
+1. **`ok` with value `0`** — the question was asked, the answer really is zero.
+   This is DATA. Hiding it is as dishonest as fabricating it.
+2. **`unavailable`** — a hardcoded stub (`tokens_per_second: 0.0`,
+   `admin.rs:63`). A gap in the server.
+3. **`not-applicable`** — e.g. the prefix cache on the scatter server, whose
+   batching path bypasses the trie entirely. A property of the architecture,
+   and often the most interesting thing on the page.
+
+Collapsing 2 and 3 turns our single most interesting finding into an apologetic
+"not implemented yet". **The same wire value lands in different buckets on
+different servers**, so classification depends on `origin`, not on the number.
+
+`pending` and `unavailable` are also deliberately separate: pending resolves by
+itself, unavailable never will, and telling a visitor to wait for a number that
+is never coming is its own small dishonesty.
 
 `observedAtMs` on a stale field is the **original** observation time, so age
-keeps growing across repeated failed polls instead of resetting. That is what
-lets a panel say "12s old" honestly.
+keeps growing across repeated failed polls instead of resetting.
+
+`provenanceWarning` is set when a field the audit classified as a placeholder
+arrived carrying something else — meaning the server plumbing landed and
+`telemetry-provenance.js` is out of date. The value is **shown** (hiding a real
+measurement is the mirrored fabrication), with the contradiction attached.
+`store.provenanceWarnings()` lists them for the AC10 footer.
 
 Build fields with the helpers in `telemetry-field.js` — `measuredField`,
 `pendingField`, `unavailableField`, `staleField`, `derivedField`. Never
@@ -172,18 +202,69 @@ Unavailable today (documented zeros / not plumbed): `kv.usage`, `kv.pages_used`,
 
 ---
 
-## 4. The panel contract
+## 3b. Rendering — `format.js`
 
-Every file in `dashboard/` default-exports **exactly this**:
+**Do not branch on `field.state` in a panel.** Every `if (field.state === '…')`
+is a place the next state gets missed, and that has already happened twice in
+this codebase: one branch checking only `unavailable` silently swallowed
+`not-applicable`, and a unit test asserting a single key passed while the page
+displayed a fabricated zero.
 
 ```js
+import { formatField, describeFieldText } from '../format.js';
+
+const { text, badge, title, hasValue } = formatField(store.field('queue.depth'));
+valueEl.textContent = text;      // '3 requests' | '—' | '···' | '41 · 12s old'
+valueEl.title = title;           // AC7 provenance sentence
+badgeEl.textContent = badge;     // ˢ | ᶜ | ᴰ | ᴱ
+```
+
+`formatField()` handles all five states in one place and gives you, free:
+
+- a stark `0` for a measured zero — **never** hidden;
+- `—` for absent vs `···` for pending;
+- `~` + `ᴱ` for an estimate, visible **without hovering** (an estimate that
+  looks like a measurement *is* a fabricated measurement — nobody hovers);
+- `41 · 12s old` for stale — age in **words**, because colour alone fails
+  grayscale and colourblind readers (AC25);
+- the AC7 source-class badge from `SOURCE_CLASS_BADGES`.
+
+Use `describeFieldText(name, field)` for prose and aria-labels.
+
+**Rule for estimates:** if we cannot state the formula, we do not show the
+number.
+
+---
+
+## 4. The panel contract
+
+Every file in `dashboard/` provides **a named `meta` export and a named
+`mount`** (shape ratified by @0837fdf9, who owns the panel seam):
+
+```js
+/** The shell reads this BEFORE mounting, to build the panel host and grid. */
+export const meta = {
+  id: 'kv-memory',
+  title: 'Paged KV block table',
+  group: 'memory',
+  span: 2,               // grid columns
+  cadence: 250,          // ms; how often this panel wants to repaint
+  defaultOpen: true,
+  acronyms: { KV: 'key/value attention cache' },  // AC30
+};
+
 /**
  * @param {HTMLElement} rootElement   Empty element the panel owns entirely.
  * @param {TelemetryStore} telemetryStore
- * @returns {{ unmount: () => void }}
+ * @returns {{ destroy: () => void, describe: () => string }}
  */
-export default function mount(rootElement, telemetryStore) { /* … */ }
+export function mount(rootElement, telemetryStore) { /* … */ }
 ```
+
+`describe()` returns a plain-English sentence describing the panel's **current**
+state. It is **not optional**: it powers the chart `aria-label` (AC28) and the
+"view as table" affordance. Build it from `describeFieldText()` in `format.js`
+so phrasing cannot drift between panels.
 
 ### Lifecycle
 
@@ -191,7 +272,7 @@ export default function mount(rootElement, telemetryStore) { /* … */ }
    `rootElement` and call `telemetryStore.subscribe(...)`.
 2. **update** — there is no `update()` function. Your subscriber callback *is*
    the update path. It fires immediately on subscribe and once per poll.
-3. **`unmount()`** — you **must** return this and it **must** call your
+3. **`destroy()`** — you **must** return this and it **must** call your
    `unsubscribe`, cancel any `requestAnimationFrame`/timer, and release canvas
    references. A panel that leaks a subscription fails AC22 (no memory growth
    over a 60 s run).
