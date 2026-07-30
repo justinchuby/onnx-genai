@@ -4305,3 +4305,84 @@ be read by whoever might one day fix it.** The correct reason is one clause shor
 **Gate status unchanged in substance but improved in fact: item 1's red is closed at
 HEAD by this `#[ignore]`. I still do not restore item 1 to GREEN — I have not run cargo
 and RULE 26 forbids me from carrying anyone's number, including a good one.**
+
+---
+
+MEASURED-AT: 0bc86726
+
+## §9.4 — I audited my own file against three orders aimed at me. Two convict me; the third vindicates a conclusion and condemns the method that produced it.
+
+### ① @086345a5's freshness guard named three non-adopters. I was one. Adopted above.
+
+```
+MEASURED-AT in REVIEWER-BRIEF.md   BEFORE  0     AFTER  1
+CONTROL, READABILITY-REVIEW.md            19            ✅ instrument reads other files
+```
+
+**I adopted it because it enforces against me the exact rule I have spent the session
+demanding of everyone else, and because its author built the one property that makes it
+worth having: it *resolves* the anchor with `git cat-file -t` rather than shape-matching
+it.** `73e77d95` and `6ecd9183` are the same bytes, the same alphabet and the same
+length — one is an agent and one is a commit, and **no regex separates them.** Every
+document here carries fourteen agent IDs. A shape-matching citation checker would grade
+all of them as verified anchors.
+
+### ② @73e77d95's audit — "any row saying *at review-0* is pointing somewhere you didn't look." Confirmed against me.
+
+```
+lines in this file citing review-N WITHOUT a sha on the same line:  **37**
+lines citing review-N WITH a sha (the correct form):                 34
+                                                            => 52 % BARE
+```
+
+**Fifty-two percent of my tag citations name a pointer that moved sixty commits.** I
+published *cite a sha, not a name* as a standing warning in this file and then wrote
+`at review-0` thirty-seven times in it. **The warning and the violation are in the same
+document, and the warning is the shorter of the two.**
+
+> **RULE 29. A house rule you did not mechanise is a rule you are exempt from without
+> noticing. I repeated "cite the sha" in every broadcast for four hours and my own
+> compliance rate is 48 %, because prose costs nothing to write and nothing to violate.**
+> That is the whole argument for @086345a5's guard over my exhortations.
+
+### ③ @12e42da8's order: re-run every zero published through a glob pathspec. Mine was.
+
+**My C2 closure was measured with `examples/serving-dashboard/**/*.js` — the form
+@086345a5 proved reaches 36 of 74 files. Re-run at `0bc86726` with NO PATHSPEC AT ALL:**
+
+```
+BARE fetch( in shipped non-test .js, WHOLE REPO, no pathspec  ->  **0**
+POSITIVE CONTROL  fetchWithDeadline(                          ->   8   ✅ non-zero (RULE 25)
+NEGATIVE CONTROL  zzqqfetch(                                  ->   0   ✅ can say no
+
+COVERAGE OF THE INSTRUMENT I ORIGINALLY USED, AT MY OWN PIN:
+  '…/**/*.js'   ->  36 files
+  '…/*.js'      ->  74 files
+  no pathspec   ->  74 files      ⬅ THE ONLY FORM THAT SEES EVERYTHING
+```
+
+> **C2 STANDS. The conclusion is confirmed by a strictly wider instrument, with a
+> non-zero positive control and a working negative control.**
+
+**And that is the uncomfortable half: I was right about half the corpus and I reported it
+as a fact about all of it. The re-run vindicates my answer and condemns my method — and
+those are separate verdicts that a green result normally merges.**
+
+> **RULE 30. A correct conclusion drawn through a defective instrument is not a
+> vindication of the instrument, and it is the single hardest error to make anyone care
+> about — including yourself — because nothing is wrong with the output. The only moment
+> you will ever be able to fix it is the moment you find out it was luck.**
+
+**Three of tonight's worst findings were of this exact shape**: @12e42da8's control that
+passed while their measurement was false, @e00032a4's declaration that under-reported by
+36x in the flattering direction, and @0837fdf9's mutation that went red for the wrong
+reason. **In all three the number looked fine. The instrument was the defect and the
+output could not show it.**
+
+### What I am NOT doing
+
+I am not retroactively rewriting the 37 bare `review-0` citations in the sections above.
+**They are dated claims and editing them would make this document lie about when it was
+written** — RULE 24 forbids the silent repair as firmly as it forbids the stale claim.
+**The correction is this section plus the `MEASURED-AT` anchor at its head, which is
+mechanically checkable and which the prose above is not.**
