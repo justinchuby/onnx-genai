@@ -51,6 +51,7 @@ pub mod gemm;
 pub mod global_reduction;
 mod gqa_decode;
 mod gqa_decode_fp16;
+pub mod group_normalization;
 pub mod group_query_attention;
 pub mod hardmax;
 pub mod index_share;
@@ -311,6 +312,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "GlobalLpPool",
     "GlobalMaxPool",
     "LpNormalization",
+    "InstanceNormalization",
+    "GroupNormalization",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -437,6 +440,21 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("InstanceNormalization", "", 6),
+        Box::new(group_normalization::InstanceNormalizationFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for since_version in [18, 21] {
+        reg.register(
+            OpKey::new("GroupNormalization", "", since_version),
+            Box::new(group_normalization::GroupNormalizationFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        );
+    }
     for (op, kind) in [
         (
             "GlobalAveragePool",

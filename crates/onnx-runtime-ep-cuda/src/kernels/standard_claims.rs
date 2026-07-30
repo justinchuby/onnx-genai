@@ -42,6 +42,7 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "GlobalAveragePool" | "GlobalMaxPool" => global_pool(node, input_dtypes),
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
         "LpNormalization" => lp_normalization(node, input_dtypes),
+        "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
         _ => return None,
     };
     result
@@ -110,6 +111,15 @@ fn lp_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
         Some(attribute) if matches!(attribute.as_int(), Some(1 | 2)) => Ok(()),
         Some(_) => Err("attribute 'p' must be 1 or 2".into()),
     }
+}
+
+fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 3, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    if input_dtypes[1] != input_dtypes[0] || input_dtypes[2] != input_dtypes[0] {
+        return Err("scale and bias dtypes must match X".into());
+    }
+    Ok(())
 }
 
 fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
