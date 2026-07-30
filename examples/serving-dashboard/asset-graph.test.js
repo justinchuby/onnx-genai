@@ -892,3 +892,77 @@ describe('the field-state grammar stays on fields', () => {
     );
   });
 });
+
+// A withdrawn figure is not removed from this document -- 14 sites are left
+// visible, because a correction that silently patches the record is
+// indistinguishable from never having been wrong. What must never happen is the
+// sites outliving the notice that they are withdrawn.
+//
+// The banner is delimited by HTML comments so the guard can tell a WITHDRAWAL
+// from a CLAIM. Without that, the banner (which must name the figure to be
+// useful) is byte-identical to the thing it withdraws -- the defect class found
+// five times tonight in four languages: documenting a defect trips the guard
+// against the defect. The delimiter is the markdown analogue of `isCommand()`
+// and of `grep -v '^\s*///'`.
+describe('a withdrawn figure keeps its withdrawal notice', () => {
+  const WITHDRAWN = '2.46';
+  const START = 'WITHDRAWN-METRIC-BANNER:START';
+  const END = 'WITHDRAWN-METRIC-BANNER:END';
+  const doc = read('./design/demo-ux.md');
+
+  // Strip the banner, then count. Counting the raw document would include the
+  // banner's own mention and could never reach zero, so the retirement arm
+  // below would be unreachable -- a guard that cannot retire is a guard that
+  // becomes fiction.
+  const outsideBanner = () => {
+    const s = doc.indexOf(START);
+    const e = doc.indexOf(END);
+    if (s === -1 || e === -1) return doc;
+    return doc.slice(0, s) + doc.slice(e + END.length);
+  };
+  const liveSites = () => outsideBanner().split(WITHDRAWN).length - 1;
+
+  it('can still find the document and the figure (anti-vacuity)', () => {
+    assert.ok(
+      doc.length > 10000,
+      `design/demo-ux.md read as ${doc.length} bytes. The path is wrong or the ` +
+        `file moved, and every assertion below would pass vacuously.`,
+    );
+    assert.ok(
+      doc.includes(WITHDRAWN),
+      `The string ${WITHDRAWN} does not appear in demo-ux.md at all -- not even ` +
+        `in the banner. Either the figure was fully removed (in which case delete ` +
+        `this whole describe block and the banner together) or the matcher broke.`,
+    );
+  });
+
+  it('names the withdrawal wherever the figure still stands', () => {
+    if (liveSites() === 0) return; // the retirement arm below owns this case
+    assert.ok(
+      doc.includes(START) && doc.includes(END),
+      `demo-ux.md states the withdrawn figure ${WITHDRAWN} in ${liveSites()} ` +
+        `place(s), but carries no WITHDRAWN-METRIC-BANNER. The figure was ` +
+        `withdrawn at its source in 2d6b36ac for a reason that RE-RUNNING CANNOT ` +
+        `FIX (model provenance, not arithmetic). Restore the banner or remove ` +
+        `every site -- shipping the sites without the notice is the only ` +
+        `unacceptable state.`,
+    );
+    assert.ok(
+      doc.includes('four sequences decoded in one step'),
+      `The withdrawal banner exists but no longer names its replacement. A ` +
+        `withdrawal that leaves a hole gets refilled with the withdrawn value ` +
+        `by the next author. Name the count, not the ratio.`,
+    );
+  });
+
+  it('retires the banner once the figure is gone', () => {
+    if (liveSites() > 0) return;
+    assert.ok(
+      !doc.includes(START),
+      `No live site states ${WITHDRAWN} any more, but the withdrawal banner is ` +
+        `still here. It now warns about nothing and is the ONLY remaining source ` +
+        `of the figure in this document -- delete it. An expired notice does not ` +
+        `merely stop teaching, it re-teaches the thing it retracted.`,
+    );
+  });
+});

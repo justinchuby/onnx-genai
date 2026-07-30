@@ -9,6 +9,37 @@
 >
 > Normative beyond this document: `examples/serving-dashboard/CONTRACT.md` and `telemetry-field.js`. **Code on disk wins over prose, including mine.**
 
+<!-- WITHDRAWN-METRIC-BANNER:START -->
+> 🔴 **THE THROUGHPUT RATIO IN THIS DOCUMENT IS WITHDRAWN AT ITS SOURCE. DO NOT SHIP IT, QUOTE IT, OR RE-RUN IT.**
+>
+> This document states a `2.46x` aggregate speedup in **14 places**. @fc8b5d97 withdrew
+> that verdict at its origin (`2d6b36ac`), which cleaned `PR-DESCRIPTION.md`,
+> `QA-PLAN.md`, `README.md` and `check-perf-claims.test.js` — **and reached no document
+> that *specifies* the number, including this one.**
+>
+> **The reason is immune to re-running.** The model under test was assembled from two
+> builds seventeen days apart, with inference metadata edited fifty-four minutes
+> post-build, *inside the measurement window*. **A fresh benchmark produces a
+> cleaner-looking number resting on the same broken artefact.** This is not an
+> arithmetic error and no amount of re-measurement fixes it.
+>
+> **The 14 sites are not 14 mistakes.** They are one act of compliance: `perf-baseline.md`
+> -> @376a0297's `AC50` (which made the figure binding, and is itself now withdrawn) ->
+> this document. **They are left visible rather than silently patched**, per this
+> document's own standing rule that a correction must be legible as a correction.
+>
+> **SHIP THIS INSTEAD, and it is stronger:** *"four sequences decoded in one step;
+> onnxruntime-genai decodes one."* A **count**, directly observable on the page — no
+> baseline, no arithmetic, no model provenance, and nothing for a visitor's hardware to
+> contradict. **The ratio was only ever a consequence of the capability; the count IS
+> the capability.**
+>
+> **What survives untouched:** every honesty rule these sections exist to state — that an
+> aggregate figure without its per-stream companion is a lie of omission, that rounding
+> to `~2.5x` *looks* like modesty while widening the claim, and that type size is itself
+> a claim about importance. **None of them depend on the ratio being valid.**
+<!-- WITHDRAWN-METRIC-BANNER:END -->
+
 > **How to use this document.** §1–§3 are the *unblocking trio* — layout skeleton, design tokens, panel contract. Two developers can start from those alone. §4 is the honesty design language and is **non-negotiable**; read it before writing a single render function. §5–§7 are the three scenario visualizations. §8 is accessibility. §9 is the file/ownership seam.
 
 ---
