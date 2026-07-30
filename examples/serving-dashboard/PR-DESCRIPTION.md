@@ -192,6 +192,36 @@ because the machine is at 100% disk and creating a worktree currently fails
 part-way and silently, which is the exact condition that manufactures a
 plausible wrong number.
 
+### What this file's freshness stamp does and does not mean
+
+`MEASURED-AT` names the revision **every figure below was re-derived at**. It does
+not claim this file existed there — it did not; a description of a reviewed
+revision is necessarily written after it. The distinction matters because the two
+readings are indistinguishable in the marker itself, and only one of them is true.
+
+### The guard that enforces that marker cannot see this file
+
+```
+freshness-guard corpus predicate ......... /(REVIEW|BRIEF)/ && .md
+matches 'PR-DESCRIPTION.md' ..............  0
+matches 'READABILITY-REVIEW.md' ..........  1   <- control, fires
+documents in the corpus / documents present ... 4 of 15
+positional citations in the 11 it cannot open .. 598
+```
+
+This file adopted the marker the guard enforces and receives no protection from
+it, and nothing anywhere reports that. **An exemption ledger cannot record what
+the corpus filter already excluded** — the skips it documents are the ones that
+got past the filter, so a ledger reading empty means *no exemptions among the
+files I chose to open*. The largest document in the tree complied and was
+excluded for its name.
+
+The fix is one predicate: discover by the marker, not by the filename. Any
+document containing the marker is in scope, so a document opts in by making a
+dateable claim rather than by being christened correctly. **A corpus selected by
+filename encodes what documents happened to be called on the day the guard was
+written.**
+
 ### A dated document that cites an undated one is not dated
 
 It is a fresh wrapper around an unknown. *(Project Lead)*
