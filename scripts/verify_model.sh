@@ -251,6 +251,23 @@ refresh_plain_log
 
 # --- Check 1: continuous batching actually engaged -------------------------
 # Both outcomes log at INFO, so absence of an error means nothing here.
+#
+# The two lines are checked INDEPENDENTLY rather than as if/elif. A server can
+# load more than one model, and each driver logs its own outcome: an "enabled"
+# line for one model and a "disabled" line for another both appear, and an
+# if/elif would report the first and never look at the second. That is the D2
+# shape again - a real signal, correctly read, that does not mean what the
+# reader assumes. Requiring the "disabled" line to be ABSENT is a strictly
+# stronger claim than requiring "enabled" to be present.
+if grep -q "continuous batch driver disabled" "$PLAIN_LOG"; then
+  printf 'FAIL a continuous batch driver was DISABLED\n' >&2
+  printf '     The server logged: continuous batch driver disabled; using per-request engine path\n' >&2
+  printf '     Some model on this server is not batching, even if another one is.\n' >&2
+  printf '     Usually a dynamic-cache model, or a static-cache model whose\n' >&2
+  printf '     inference_metadata.yaml has no model.io.static_cache block.\n' >&2
+  FAILURES=$((FAILURES + 1))
+fi
+
 if grep -q "continuous batch driver enabled" "$PLAIN_LOG"; then
   # The driver logs the width it actually built with. Assert it matches what we
   # asked for, so --max-batch proves something instead of just being printed.
@@ -264,14 +281,7 @@ if grep -q "continuous batch driver enabled" "$PLAIN_LOG"; then
     printf '     unset it, or pass the same value to --max-batch.\n' >&2
     FAILURES=$((FAILURES + 1))
   fi
-elif grep -q "continuous batch driver disabled" "$PLAIN_LOG"; then
-  printf 'FAIL continuous batching did NOT engage\n' >&2
-  printf '     The server logged: continuous batch driver disabled; using per-request engine path\n' >&2
-  printf '     This model loads and answers correctly but is NOT batching. Usually it\n' >&2
-  printf '     is a dynamic-cache model, or a static-cache model whose\n' >&2
-  printf '     inference_metadata.yaml has no model.io.static_cache block.\n' >&2
-  FAILURES=$((FAILURES + 1))
-else
+elif ! grep -q "continuous batch driver disabled" "$PLAIN_LOG"; then
   printf 'FAIL could not determine batching state from the log\n' >&2
   printf '     Expected a "continuous batch driver ..." line at INFO. Is RUST_LOG filtering it?\n' >&2
   FAILURES=$((FAILURES + 1))

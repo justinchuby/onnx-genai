@@ -285,5 +285,41 @@ else
   fail "--max-batch is forwarded to the server, not just printed"
 fi
 
+# --- both driver outcomes are checked independently -------------------------
+# A server can load several models; each driver logs its own outcome. An
+# if/elif reports the first line it finds and never looks at the second, so a
+# log containing BOTH "enabled" and "disabled" would pass while a model on that
+# server is not batching. Assert the structure that prevents it.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'elif grep -q "continuous batch driver disabled"' "$VERIFY"; then
+  fail "the disabled-line check is independent, not an elif branch of enabled" \
+    "the disabled check is chained to the enabled check, so a log with BOTH lines reports only the first"
+else
+  pass "the disabled-line check is independent, not an elif branch of enabled"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^if grep -q "continuous batch driver disabled"' "$VERIFY"; then
+  pass "a DISABLED driver line is treated as a failure on its own"
+else
+  fail "a DISABLED driver line is treated as a failure on its own" \
+    "nothing asserts the absence of a 'continuous batch driver disabled' line"
+fi
+
+# The mixed-log case, exercised against the same grep logic the script uses.
+mixed="$tmp/mixed.log"
+printf '%s\n' \
+  'INFO continuous batch driver enabled max_batch=4' \
+  'INFO continuous batch driver disabled; using per-request engine path' \
+  >"$mixed"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "continuous batch driver enabled" "$mixed" &&
+  grep -q "continuous batch driver disabled" "$mixed"; then
+  pass "a log can contain BOTH outcomes, which is why they are checked separately"
+else
+  fail "a log can contain BOTH outcomes, which is why they are checked separately" \
+    "fixture is wrong: it does not contain both lines"
+fi
+
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 [ "$TESTS_FAILED" -eq 0 ]

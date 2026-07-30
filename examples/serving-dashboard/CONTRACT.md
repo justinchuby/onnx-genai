@@ -135,6 +135,26 @@ in `+` and `<`, which is precisely how a fabricated zero reaches the screen.
 is unavailable, and `pending` if any input is pending. A ratio computed from a
 documented zero is still a fabricated number.
 
+**And it has a PRECEDENCE, not just propagation.** When inputs disagree:
+
+```
+not-applicable  >  unavailable  >  pending  >  stale  >  measured
+```
+
+`not-applicable` dominates **everything**, and the asymmetry is the point.
+`unavailable`, `pending` and `stale` are all statements about our MEASUREMENT
+PIPELINE — "not plumbed", "not polled yet", "poll failed" — and every one of
+them implies the number could still arrive, so a derivation over them may yet
+succeed. `not-applicable` is a statement about the EXECUTION PATH: the question
+is not being asked at all, so the derivation can never succeed either.
+
+Reporting `pending` for a quantity that can never exist is a small lie with a
+spinner on it — the same argument that won `pending` its place against
+`unavailable`.
+
+`stale` is the one that binds LAST rather than first: it is applied to a result
+that computed successfully, so it never suppresses a value, it only ages it.
+
 ---
 
 ## 3. The store

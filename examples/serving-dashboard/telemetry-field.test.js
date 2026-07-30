@@ -13,6 +13,8 @@ import {
   unavailableField,
   notApplicableField,
   pendingField,
+  staleField,
+  derivedField,
   describeField,
   FIELD_STATES,
   SOURCE_CLASSES,
@@ -106,4 +108,54 @@ test('a client or derived measurement may legitimately have no endpoint', () => 
   // measured it against a particular engine, and these are the hero metrics --
   // if origin were set only on server-sourced fields they would be unattributed.
   assert.equal(client.origin, 'scatter');
+});
+
+test('not-applicable dominates EVERY other state through derivation', () => {
+  // The precedence question, asked explicitly by @c0de4c2e and @c7a654ed: when
+  // a derivation mixes states, which one describes the result?
+  //
+  // not-applicable wins over all of them, and the reason is not symmetry --
+  // unavailable, pending and stale are all statements about our MEASUREMENT
+  // PIPELINE ('not plumbed', 'not polled yet', 'poll failed'), and every one of
+  // them implies the number could still arrive. not-applicable is a statement
+  // about the EXECUTION PATH: the question is not being asked at all, so no
+  // amount of waiting or plumbing changes it.
+  //
+  // Reporting `pending` for a quantity that can never exist is a small lie with
+  // a spinner on it -- the same argument that won `pending` its place.
+  const na = () => notApplicableField('This path never consults the allocator.');
+  const others = {
+    unavailable: unavailableField('Not plumbed through yet.'),
+    pending: pendingField('Waiting for the first poll.'),
+    stale: staleField(
+      measuredField(41, { source: '/v1/status', label: 'Queue depth' }),
+      'The last poll did not refresh this.',
+    ),
+  };
+
+  for (const [name, other] of Object.entries(others)) {
+    const derived = derivedField({ 'kv.pages_used': na(), 'queue.depth': other }, () => 7, {});
+    assert.equal(
+      derived.state,
+      FIELD_STATES.NOT_APPLICABLE,
+      `a not-applicable input lost to ${name}; the result would promise a value that cannot exist`,
+    );
+    assert.equal(derived.value, null, `${name}: a dominated derivation must not carry a number`);
+    assert.ok(derived.reason, `${name}: the result must still explain itself`);
+  }
+});
+
+test('a derivation over healthy inputs is unaffected by the precedence rule', () => {
+  // The meta-guard. Every assertion above passes if derivedField simply always
+  // returned not-applicable, so this pins that the dominance is conditional.
+  const derived = derivedField(
+    {
+      a: measuredField(10, { source: '/v1/status', label: 'a' }),
+      b: measuredField(2, { source: '/v1/status', label: 'b' }),
+    },
+    ({ a, b }) => a / b,
+    { unit: 'ratio' },
+  );
+  assert.equal(derived.state, FIELD_STATES.MEASURED);
+  assert.equal(derived.value, 5);
 });
