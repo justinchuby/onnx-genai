@@ -3087,3 +3087,78 @@ IN the identifier.** *Naming a frozen artifact after its position rather than it
 content is the same defect as citing a line number instead of a symbol —
 @086345a5 and @f6527cc9 spent the night proving that about citations, and a
 review tag is a citation with one entry and fourteen readers.*
+
+---
+
+## 8.35 — 🛑 the P1 is fixed and guarded, and four agents are being dispatched at it
+
+**The Lead scored item 10 red and dispatched four agents. @086345a5, @376a0297 and
+@c0de4c2e each measured the P1 live and each said so. They are all measuring the
+same tree, and it is not a current one.**
+
+```
+toplevel ASSERTED by absolute path
+
+TRUE HEAD                      964cad4a
+what four agents call "HEAD"   c1323e7f   ⬅ 131 COMMITS BEHIND TRUE HEAD
+the scored tag                 0aac6bb1   ⬅ 42 ahead of c1323e7f, 89 behind HEAD
+
+SAME PREDICATE, THE TWO RENDER SITES:
+                         c1323e7f     0aac6bb1 (tag)    964cad4a (true HEAD)
+  ui/model-card.js           1              0                  0
+  dashboard/system.js        1              0                  0
+  control ZZmodel_pathZZ     —              0                  0     (not matching all)
+  control 'key:' present     —              3                  3     (file retrieved)
+```
+
+### ✅ and it is not merely deleted — a regression guard landed with it
+
+`dashboard/model-path-disclosure.test.js`, present at the tag **and** at true HEAD.
+Executed at `0aac6bb1`, `pwd=/private/tmp/review-0/...`, porcelain 0, **unpiped exit 0,
+4 tests / 1 suite / 4 pass / 0 fail / 0 skipped.** It carries three anti-vacuity
+assertions rather than one:
+
+```
+:121  assert.ok(strings.length > 5, 'system panel rendered almost nothing')
+:132  assert.ok(strings.length > 3, 'model card rendered almost nothing')
+:153  assert.equal(found.length, 2, 'the collector must see BOTH the text
+                                     and the attribute copy')
+:157  it('no shipped render path asks the store for server.model_path')
+```
+
+**➡️ `:153` is @086345a5's third copy — the `aria-label` — which the Lead called
+"the leak only a screen reader speaks, that no reviewer will catch by looking."
+The guard asserts the collector sees *both* copies, so a fix that cleans the text
+and leaves the attribute FAILS this test.** ✅ **And `:169`'s failure message
+pre-refutes the cheap close @376a0297 warned about: *"reclassifying the catalogue
+entry does NOT suppress it, so the binding is the only thing standing between a
+home directory and a projector."***
+
+### ☠️ the cost, and it is happening right now
+
+**The Lead dispatched @1cb42f0e, @bb2ee824, @d7cf9b84 and @0837fdf9 at a defect that
+is absent at the tag and absent at true HEAD, and whose regression guard already
+passes.** ⛔ **And the tree is red *because of that dispatch*: `panel-kit.js` and
+`field-state.js` are mid-edit, the suite fell 583 → 430 with ~150 tests failing to
+load, and the accessibility failures the Lead correctly told everyone to ignore are
+collateral from it.**
+
+**@f6527cc9 named this exact hazard an hour ago and was right twice over:** *a false
+green gets work skipped, which somebody eventually notices; a stale red gets work
+**redone**, and if two agents write the same mechanism we ship the duplicate-mechanism
+defect as the fix for a closed bug.* ➡️ **Here it is worse than redone work: the
+redundant fix broke the suite that would have shown the fix was unnecessary.**
+
+### 🔑 the rule, and it is not "check your sha" — everybody did that
+
+**Every one of these agents published a sha. All four published `c1323e7f` and
+labelled it `HEAD`.** ⛔ **`HEAD` is not a sha; it is a *pointer read at a time*, and
+in a fourteen-agent tree it moves 131 commits inside an hour. A published `HEAD`
+is the least reproducible identifier we used tonight and it looks like the most
+rigorous, because it comes with a hex string attached.**
+
+➡️ **`git merge-base --is-ancestor <your-sha> HEAD` costs nothing and answers *am I
+current* — the one question none of the four asked.** *We spent the session proving
+a finding must carry a sha. The missing half is that a sha must carry a **distance**:
+`c1323e7f` was honest, precise, verifiable, and 131 commits stale, and nothing in
+the way it was written could reveal that.*
