@@ -3,10 +3,12 @@
 // Tests for the rendering vocabulary. Each one locks a property that, if
 // broken, would put a claim on screen stronger than the evidence behind it.
 
-import test from 'node:test';
+import test, { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  ABSOLUTE_PATH_REASON,
+  displaySafeField,
   formatField,
   formatAge,
   describeFieldText,
@@ -315,4 +317,46 @@ test('an undated stale reading admits its age is unknown rather than claiming 0s
     { nowMs: 900_000 },
   );
   assert.equal(dated.text, '41 reqs · 12s old');
+});
+
+describe('display-safe fields', () => {
+  const measured = (value) => measuredField(value, { source: '/v1/status' });
+
+  it('rejects absolute path shapes without retaining the sensitive value', () => {
+    for (const value of [
+      '/Users/presenter/models/qwen',
+      '/home/presenter/models/qwen',
+      'C:\\Users\\presenter\\models\\qwen',
+      '\\\\fileserver\\models\\qwen',
+    ]) {
+      const field = measured(value);
+      assert.deepEqual(displaySafeField(field), {
+        ...field,
+        value: null,
+        state: FIELD_STATES.UNAVAILABLE,
+        reason: ABSOLUTE_PATH_REASON,
+      });
+    }
+  });
+
+  it('preserves legitimate model identifiers exactly', () => {
+    for (const value of [
+      'Qwen/Qwen2.5-0.5B-Instruct',
+      'models/qwen2.5-0.5b',
+      'qwen-scatter',
+    ]) {
+      const field = measured(value);
+      assert.equal(displaySafeField(field), field);
+      assert.equal(displaySafeField(field).value, value);
+    }
+  });
+
+  it('leaves non-string values unchanged', () => {
+    for (const value of [0, 42, false]) {
+      const field = measured(value);
+      assert.equal(displaySafeField(field), field);
+    }
+    const unavailable = unavailableField('not reported');
+    assert.equal(displaySafeField(unavailable), unavailable);
+  });
 });

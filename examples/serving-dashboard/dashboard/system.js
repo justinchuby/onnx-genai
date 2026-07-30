@@ -27,6 +27,7 @@
 //     unless the client opted into sessions, which looks like a bug and is not.
 
 import { isRenderable, numericValueOf } from './field-state.js';
+import { displaySafeField } from '../format.js';
 import {
   createRepaintScheduler,
   describeFieldText,
@@ -85,45 +86,62 @@ export default function mount(rootElement, telemetryStore) {
 
   const paint = () => {
     replaceChildren(model, [
-      ...definition('model id', telemetryStore.field('server.model_id')),
-      ...definition('context length', telemetryStore.field('server.context_length')),
-      ...definition('execution provider', telemetryStore.field('server.execution_provider')),
-      ...definition('decode backend', telemetryStore.field('server.decode_backend')),
-      ...definition('quantization', telemetryStore.field('server.quantization')),
-      ...definition('server version', telemetryStore.field('server.version')),
-      ...definition('uptime', telemetryStore.field('server.uptime_ms'), (value) => formatDuration(value)),
+      ...definition('model id', displaySafeField(telemetryStore.field('server.model_id'))),
+      ...definition(
+        'context length',
+        displaySafeField(telemetryStore.field('server.context_length')),
+      ),
+      ...definition(
+        'execution provider',
+        displaySafeField(telemetryStore.field('server.execution_provider')),
+      ),
+      ...definition(
+        'decode backend',
+        displaySafeField(telemetryStore.field('server.decode_backend')),
+      ),
+      ...definition('quantization', displaySafeField(telemetryStore.field('server.quantization'))),
+      ...definition('server version', displaySafeField(telemetryStore.field('server.version'))),
+      ...definition(
+        'uptime',
+        displaySafeField(telemetryStore.field('server.uptime_ms')),
+        (value) => formatDuration(value),
+      ),
     ]);
 
     replaceChildren(resources, [
       renderBudgetRow(
         'VRAM limit',
-        telemetryStore.field('resources.vram_limit_bytes'),
+        displaySafeField(telemetryStore.field('resources.vram_limit_bytes')),
         'The configured VRAM ceiling the scheduler plans against. It is a limit, not a ' +
           'reading: the server does not query the device, so this is what it was told it may ' +
           'use, not what it is using.',
       ),
       renderBudgetRow(
         'derived KV budget',
-        telemetryStore.field('resources.kv_budget_bytes'),
+        displaySafeField(telemetryStore.field('resources.kv_budget_bytes')),
         'The VRAM limit minus reserved bytes — the ceiling on cross-session KV. Also a budget ' +
           'rather than a measurement, and not the number nvidia-smi would show.',
       ),
-      renderDiskSpill(telemetryStore.field('resources.disk_spill_bytes')),
-      metricRow('persistent sessions', telemetryStore.field('sessions.active'), {
-        label:
-          'Persistent sessions \u2014 clients using an X-Session-Id header. This is not the number of ' +
-          'in-flight requests, and it is legitimately 0 unless a client opted in.',
-      }),
+      renderDiskSpill(displaySafeField(telemetryStore.field('resources.disk_spill_bytes'))),
+      metricRow(
+        'persistent sessions',
+        displaySafeField(telemetryStore.field('sessions.active')),
+        {
+          label:
+            'Persistent sessions \u2014 clients using an X-Session-Id header. This is not the number of ' +
+            'in-flight requests, and it is legitimately 0 unless a client opted in.',
+        },
+      ),
     ]);
 
     replaceChildren(selfReport, [
-      metricRow('poll round-trip', telemetryStore.field('client.poll_rtt_ms'), {
+      metricRow('poll round-trip', displaySafeField(telemetryStore.field('client.poll_rtt_ms')), {
         format: (value) => formatDuration(value),
       }),
-      metricRow('poll interval', telemetryStore.field('client.poll_interval_ms'), {
+      metricRow('poll interval', displaySafeField(telemetryStore.field('client.poll_interval_ms')), {
         format: (value) => formatDuration(value),
       }),
-      metricRow('dropped frames', telemetryStore.field('client.dropped_frames')),
+      metricRow('dropped frames', displaySafeField(telemetryStore.field('client.dropped_frames'))),
       renderConnection(telemetryStore.connection?.()),
     ]);
 
@@ -306,16 +324,34 @@ export function formatBytes(bytes) {
  */
 function buildDescription(telemetryStore) {
   const parts = ['System:'];
-  parts.push(`${describeFieldText('model', telemetryStore.field('server.model_id'))}.`);
-  parts.push(`${describeFieldText('Context length', telemetryStore.field('server.context_length'))}.`);
   parts.push(
-    `${describeFieldText('Execution provider', telemetryStore.field('server.execution_provider'))}.`,
+    `${describeFieldText('model', displaySafeField(telemetryStore.field('server.model_id')))}.`,
   );
   parts.push(
-    `${describeFieldText('KV bytes reserved', telemetryStore.field('resources.vram_limit_bytes'), formatBytes)}.`,
+    `${describeFieldText(
+      'Context length',
+      displaySafeField(telemetryStore.field('server.context_length')),
+    )}.`,
   );
   parts.push(
-    `${describeFieldText('Telemetry poll round-trip', telemetryStore.field('client.poll_rtt_ms'), formatDuration)}.`,
+    `${describeFieldText(
+      'Execution provider',
+      displaySafeField(telemetryStore.field('server.execution_provider')),
+    )}.`,
+  );
+  parts.push(
+    `${describeFieldText(
+      'KV bytes reserved',
+      displaySafeField(telemetryStore.field('resources.vram_limit_bytes')),
+      formatBytes,
+    )}.`,
+  );
+  parts.push(
+    `${describeFieldText(
+      'Telemetry poll round-trip',
+      displaySafeField(telemetryStore.field('client.poll_rtt_ms')),
+      formatDuration,
+    )}.`,
   );
   return parts.join(' ');
 }

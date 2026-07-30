@@ -15,8 +15,32 @@
 // does not hover, and AC25 forbids encoding meaning in colour alone.
 
 import { FIELD_STATES, SOURCE_CLASSES, hasValue, describeField } from './telemetry-field.js';
+import { isAbsolutePathValue } from './absolute-path.mjs';
 
 export { describeField };
+
+export const ABSOLUTE_PATH_REASON =
+  'Hidden because the server reported an absolute filesystem path instead of a display-safe identifier.';
+
+/**
+ * Prevent a field from disclosing a filesystem path at the display boundary.
+ *
+ * Relative and namespaced strings, numbers, booleans, and absent values are
+ * returned unchanged. Absolute paths become explicitly unavailable rather
+ * than being silently truncated into a misleading identifier.
+ *
+ * @param {import('./telemetry-field.js').TelemetryField} field
+ * @returns {import('./telemetry-field.js').TelemetryField}
+ */
+export function displaySafeField(field) {
+  if (!isAbsolutePathValue(field?.value)) return field;
+  return {
+    ...field,
+    value: null,
+    state: FIELD_STATES.UNAVAILABLE,
+    reason: ABSOLUTE_PATH_REASON,
+  };
+}
 
 /**
  * The AC7 source-class badge: one glyph per provenance class, rendered beside
