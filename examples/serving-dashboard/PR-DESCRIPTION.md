@@ -1561,3 +1561,64 @@ We built many controls against falsehood and none against staleness. The missing
 field was never rigour — it was an expiry date. That is why every claim in this
 document carries the revision it was measured at, and why the ones this author
 could not re-derive are labelled *carried* rather than quietly adopted.
+
+---
+
+## A readiness check proves the server is listening. It does not prove the demo has anything to show.
+
+`run-demo.sh` waits for the server by polling `/health` until it returns 200 (`:141`). That is
+the only gate between "launch" and "the operator opens a browser." Measured at the review point:
+
+```
+generation requests issued by the launcher .... 0
+  'chat/completions' in run-demo.sh ........... 0
+  'completions'      in run-demo.sh ........... 0
+  'warm'             in run-demo.sh ........... 0
+  [POS CTL] 'curl'   in run-demo.sh ........... 3   <- all three are readiness probes
+```
+
+An idle server answers `/health` with a 200 immediately. Every telemetry counter on a freshly
+started process is zero — measured on a live origin by another agent:
+
+```
+onnx_genai_e2e_request_latency_seconds_count   0
+onnx_genai_prefix_cache_hits_total             0
+onnx_genai_prefix_cache_lookups_total          0
+[CONTROL] histogram bucket lines exported     15   <- present, and genuinely empty
+```
+
+**So the launcher declares the demo ready at precisely the moment it has nothing to demonstrate.**
+The two headline claims of this branch — continuous batching and KV cache paging — are both
+things you can only see *in flight*. A viewer who opens the dashboard the second the launcher
+says "ready" sees an accurate, well-labelled picture of a server that has done no work.
+
+This is not a rendering bug, and the UI deserves to be defended here: the dashboard has a real
+empty-state vocabulary ("no data", "awaiting", "no requests" across five files, positive control
+`renderField` = 13 files, negative control 0). The panels will say *nothing has happened yet*
+rather than drawing a flat line at zero and calling it a measurement. That is the honest
+behaviour and it is the behaviour we specified.
+
+**The gap is that honest emptiness is still emptiness on a projector.** The failure is not in the
+panel, it is in the definition of "ready" — and it is a product defect, not a code defect:
+
+> **We defined readiness as a property of the process. The user's definition of readiness is a
+> property of the screen. `/health` cannot tell those apart, and it returns 200 for both.**
+
+The fix is one request, not one redesign: after `wait_until_ready` succeeds, issue a single short
+generation and *then* declare the demo up. That moves every counter off zero, populates the
+histogram the latency panel reads, and exercises the prefix-cache path so the second request has
+something to hit. It also converts the launcher's readiness gate from *the port answers* to
+*the pipeline completed end to end*, which is a strictly stronger claim and the one the operator
+actually wanted.
+
+**Known gap, stated rather than fixed:** this is filed, not shipped. Nothing in this branch warms
+the demo, and a warm-up added under a commit freeze would be an unreviewed change to the launch
+path — the highest-blast-radius file we have. It is the first thing to land after the freeze
+lifts, and it is deliberately listed here so that the first person to run this demo in front of
+an audience is not the person who discovers it.
+
+**And the generalisation is the part worth keeping**, because it outlives this launcher:
+
+> **Every liveness check we write asks whether the system can answer. No liveness check we write
+> asks whether the system has anything to say. For a demo, the second question is the entire
+> product, and it is the one nobody writes a probe for.**
