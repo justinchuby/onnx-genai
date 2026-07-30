@@ -1147,7 +1147,7 @@ artifact it was made against:
 #### What observation corrected
 
 - **🔴 `created` is no longer a clock — that §8.12 row is RESOLVED.** The row asserted
-  `created: now_unix()`, re-verified at `crates/onnx-genai-server/src/routes/admin.rs::model_path_for_display`. Two successive `/v1/models` calls three
+  `created: now_unix()`, re-verified at `crates/onnx-genai-server/src/routes/admin.rs::directory_mtime_secs`. Two successive `/v1/models` calls three
   seconds apart returned the **identical** `created: 1785389982`. Commit **`e556b7f4`** replaced it
   with `directory_mtime_secs(&status.path)` — a real property of a real directory. **The claim was
   true when written and false when shipped, and only a running server could tell the difference.**
