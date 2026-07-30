@@ -1924,7 +1924,15 @@ came from someone reading `ps` while I was reading `find`.
 
 ---
 
-## 15. ✅ AC33 EXECUTED — both arms, real binaries, with a matched null beside it
+## 15. ⚠️ AC33 EXECUTED — both arms, real binaries, with a matched null beside it
+
+> 🔻 **DIRECTION RETRACTED BY §16.** The AFTER arm here is the **7-field build, which
+> carries `path` and DISCLOSES it** — it is not the shipping build, and it no longer exists on
+> this machine. The identity assertion in §15.1 used a probe with three false positives, all in
+> the direction of waving a binary through. **Re-measured against the shipping (6-field) build,
+> the effect reverses: 118.13 %, sign 5/12, p = 0.774.** The **method** in this section stands —
+> the matched null, the same-window rule, and the §13.4 correction are all still good. **The
+> 91.04 % figure and the recommendation not to certify are withdrawn.** See §16.
 
 §13 declined AC33 partly on the belief that the BEFORE arm was gone. §14 retracted that. **So I
 ran it.** This section supersedes §13's decline: **AC33 is no longer declined, it is MEASURED and
