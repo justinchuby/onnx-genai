@@ -93,7 +93,7 @@ function textResponse(status, text) {
  * tests need. `batch_size_current` is deliberately larger than the hardcoded
  * max_batch of 4, which is the case that exposes the naming trap.
  */
-function metricsBody({ inFlight = 3, tokens = 5048, ttftSum = 20.7, ttftCount = 10 } = {}) {
+function metricsBody({ inFlight = 3, tokens = 5048, ttftSum = 20.7, ttftCount = 10, lookups = 11 } = {}) {
   return `# HELP onnx_genai_tokens_generated_total Total prompt and completion tokens processed.
 # TYPE onnx_genai_tokens_generated_total counter
 onnx_genai_tokens_generated_total ${tokens}
@@ -108,6 +108,9 @@ onnx_genai_time_to_first_token_seconds_count ${ttftCount}
 # HELP onnx_genai_prefix_cache_hits_total Generation requests with a prefix-cache hit.
 # TYPE onnx_genai_prefix_cache_hits_total counter
 onnx_genai_prefix_cache_hits_total 0
+# HELP onnx_genai_prefix_cache_lookups_total Generation requests checked for prefix-cache reuse.
+# TYPE onnx_genai_prefix_cache_lookups_total counter
+onnx_genai_prefix_cache_lookups_total ${lookups}
 `;
 }
 
@@ -560,19 +563,55 @@ test('the in-flight gauge is NEVER exposed as the engine batch size', async () =
   assert.match(fields['batch.effective_size'].reason, /does not report/i);
 });
 
-test('a genuinely measured zero from /metrics survives as zero', async () => {
-  // prefix_cache_hits is 0 on a static-cache server because the batching path
-  // bypasses the prefix trie. That zero is a real observation about the
-  // architecture, and flattening it to "unavailable" would hide the finding.
+test('the same zero means opposite things on the two servers', async () => {
+  // THE THREE KINDS OF ZERO, on one wire value. prefix_cache_hits is 0 on both
+  // servers and byte-identical in the response. On the dynamic server the cache
+  // WAS consulted and hit nothing, so 0 is real data. On the scatter server the
+  // batching path never consults the cache at all, so 0 is not an observation
+  // and rendering "0%" would imply a cache that tried and failed.
+  const routes = healthyRoutes();
+  const dynamic = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'dynamic',
+    fetchImpl: fakeFetch(routes),
+  });
+  const scatter = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'scatter',
+    fetchImpl: fakeFetch(routes),
+  });
+  await Promise.all([dynamic.pollOnce(), scatter.pollOnce()]);
+
+  const onDynamic = dynamic.getSnapshot().fields['metrics.prefix_cache_hits'];
+  assert.equal(onDynamic.state, FIELD_STATES.MEASURED);
+  assert.equal(onDynamic.value, 0, 'a real zero must survive as zero, not be hidden');
+
+  const onScatter = scatter.getSnapshot().fields['metrics.prefix_cache_hits'];
+  assert.equal(onScatter.state, FIELD_STATES.NOT_APPLICABLE);
+  assert.equal(onScatter.value, null);
+  // The reason must explain WHY the path bypasses it, not merely that it did.
+  assert.match(onScatter.reason, /never consults/i);
+});
+
+test('not-applicable is distinct from unavailable, not a synonym', async () => {
+  // One says "the server does not compute this yet" (fixable by plumbing); the
+  // other says "asking this of this server is meaningless" (permanent, and a
+  // true statement about the architecture). Collapsing them loses a fact.
   const store = createTelemetryStore({
     baseUrl: BASE_URL,
+    origin: 'scatter',
     fetchImpl: fakeFetch(healthyRoutes()),
   });
   await store.pollOnce();
   const { fields } = store.getSnapshot();
 
-  assert.equal(fields['metrics.prefix_cache_hits'].state, FIELD_STATES.MEASURED);
-  assert.equal(fields['metrics.prefix_cache_hits'].value, 0);
+  assert.equal(fields['metrics.prefix_cache_hits'].state, FIELD_STATES.NOT_APPLICABLE);
+  // A hardcoded stub is unavailable, NOT not-applicable.
+  assert.equal(fields['throughput.tokens_per_second'].state, FIELD_STATES.UNAVAILABLE);
+  assert.notEqual(
+    fields['metrics.prefix_cache_hits'].state,
+    fields['throughput.tokens_per_second'].state,
+  );
 });
 
 test('an idle server reports no latency rather than zero latency', async () => {
@@ -809,4 +848,47 @@ test('the two stores poll independently and do not share a snapshot', async () =
   assert.equal(scatter.getSnapshot().connection.state, CONNECTION_STATES.CONNECTED);
   assert.equal(dynamic.getSnapshot().connection.state, CONNECTION_STATES.UNREACHABLE);
   assert.equal(scatter.getSnapshot().fields['queue.depth'].state, FIELD_STATES.MEASURED);
+});
+
+test('a hit rate with zero lookups is undefined, not 0%', async () => {
+  // Both endpoints emit a literal 0.0 when lookups == 0 (metrics.rs:301-305,
+  // routes/admin.rs:126-130), so "nothing looked up yet" and "looked and missed
+  // everything" are the same bytes. Only the store can tell them apart, because
+  // only here is the denominator still in scope.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'dynamic',
+    fetchImpl: fakeFetch(
+      healthyRoutes({
+        [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_hit_rate: 0 } },
+        [ENDPOINTS.METRICS]: { text: metricsBody({ lookups: 0 }) },
+      }),
+    ),
+  });
+  await store.pollOnce();
+
+  const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
+  assert.equal(rate.state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(rate.value, null);
+  assert.match(rate.reason, /undefined, not zero/i);
+});
+
+test('a hit rate with real lookups and no hits IS a measured 0%', async () => {
+  // The mirror. Once the denominator is nonzero, 0% is a genuine and important
+  // measurement -- suppressing it would hide a real cache miss rate.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'dynamic',
+    fetchImpl: fakeFetch(
+      healthyRoutes({
+        [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_hit_rate: 0 } },
+        [ENDPOINTS.METRICS]: { text: metricsBody({ lookups: 11 }) },
+      }),
+    ),
+  });
+  await store.pollOnce();
+
+  const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
+  assert.equal(rate.state, FIELD_STATES.MEASURED);
+  assert.equal(rate.value, 0);
 });

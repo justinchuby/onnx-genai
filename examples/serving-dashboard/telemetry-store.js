@@ -19,6 +19,7 @@
 import {
   measuredField,
   unavailableField,
+  notApplicableField,
   pendingField,
   staleField,
   FIELD_STATES,
@@ -26,6 +27,7 @@ import {
 } from './telemetry-field.js';
 import {
   ENDPOINTS,
+  resolveForOrigin,
   DEBUG_GATED_ENDPOINTS,
   DEBUG_ENDPOINTS_FLAG,
   TEXT_ENDPOINTS,
@@ -522,10 +524,19 @@ export function createTelemetryStore({
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const fields = {};
     for (const key of allFieldKeys()) {
-      const entry = PROVENANCE[key];
+      // Resolve per-server overrides first: the same field can be a genuine
+      // measurement on one server and structurally meaningless on the other.
+      const entry = resolveForOrigin(PROVENANCE[key], origin);
 
       // Client-derived fields are produced after this loop, from other fields.
       if (entry.derived) continue;
+
+      if (entry.classification === 'STRUCTURALLY_BYPASSED') {
+        // Distinct from unavailable: this path never asks the question, so no
+        // amount of server plumbing would produce a value here.
+        fields[key] = notApplicableField(entry.reason, fieldMeta(entry));
+        continue;
+      }
 
       if (NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)) {
         fields[key] = unavailableField(entry.reason, fieldMeta(entry));
@@ -556,7 +567,42 @@ export function createTelemetryStore({
       fields[key] = measuredField(rawValue, { ...fieldMeta(entry), observedAtMs: timestampMs });
     }
     addDerivedThroughput(fields, timestampMs);
+    suppressUndefinedHitRate(fields);
     return Object.freeze(fields);
+  }
+
+  /**
+   * A hit rate computed from zero lookups is emitted as a literal 0.0 by BOTH
+   * endpoints that report it — metrics.rs:301-305 and routes/admin.rs:126-130
+   * each do `if lookups == 0 { 0.0 }`. So "nothing has been looked up yet" and
+   * "we looked and hit nothing" are the SAME BYTES on the wire.
+   *
+   * Nothing downstream can recover the difference, so it has to be corrected
+   * here, where the denominator is still in scope. Rendering an unqualified
+   * "0% hit rate" for an idle server is a fabricated measurement.
+   *
+   * @param {Record<string, import('./telemetry-field.js').TelemetryField>} fields
+   */
+  function suppressUndefinedHitRate(fields) {
+    const rate = fields['prefix_cache.hit_rate'];
+    if (!rate || rate.state !== FIELD_STATES.MEASURED) return;
+
+    const denominator = fields['metrics.prefix_cache_lookups'] ?? fields['prefix_cache.lookups'];
+    if (!denominator || denominator.state !== FIELD_STATES.MEASURED) return;
+    if (Number(denominator.value) !== 0) return;
+
+    fields['prefix_cache.hit_rate'] = unavailableField(
+      'The server reports a 0.0 hit rate, but nothing has been looked up yet, and it emits the ' +
+        'same 0.0 in both cases (metrics.rs:301-305). A rate with a zero denominator is ' +
+        'undefined, not zero.',
+      {
+        source: rate.source,
+        sourceClass: rate.sourceClass,
+        origin: rate.origin,
+        label: rate.label,
+        unit: rate.unit,
+      },
+    );
   }
 
   /**
@@ -681,7 +727,9 @@ export function createTelemetryStore({
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const fields = {};
     for (const key of allFieldKeys()) {
-      const entry = PROVENANCE[key];
+      // Resolve per-server overrides first: the same field can be a genuine
+      // measurement on one server and structurally meaningless on the other.
+      const entry = resolveForOrigin(PROVENANCE[key], origin);
       fields[key] = unavailableField(reason, { source: entry.source, unit: entry.unit });
     }
     return Object.freeze(fields);
@@ -704,7 +752,9 @@ export function createTelemetryStore({
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const aged = {};
     for (const key of allFieldKeys()) {
-      const entry = PROVENANCE[key];
+      // Resolve per-server overrides first: the same field can be a genuine
+      // measurement on one server and structurally meaningless on the other.
+      const entry = resolveForOrigin(PROVENANCE[key], origin);
       const field = fields[key];
 
       if (field && (field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE)) {

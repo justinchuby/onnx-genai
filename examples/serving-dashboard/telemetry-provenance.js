@@ -24,7 +24,7 @@
  * How a server field is classified. This is not a UI state — it is a statement
  * about the server's code.
  *
- * @typedef {'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED'} Classification
+ * @typedef {'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'STRUCTURALLY_BYPASSED'} Classification
  *
  * - `MEASURED`        — the server computes this from real runtime state.
  * - `DOCUMENTED_ZERO` — the server writes a constant `0` / `""` / `[]` into the
@@ -33,6 +33,20 @@
  * - `NOT_PLUMBED`     — the data exists inside the process but no endpoint
  *                       returns it yet. Also `unavailable`, but the reason
  *                       differs and so does the fix.
+ * - `STRUCTURALLY_BYPASSED`
+ *                       — the subsystem exists and works, but THIS server's
+ *                       code path never consults it, so the question is never
+ *                       asked. Renders `not-applicable`. No amount of plumbing
+ *                       would fix it; it is a true statement about the
+ *                       architecture, not a gap in it.
+ *
+ * CLASSIFICATION CAN DEPEND ON WHICH SERVER WE ASKED. The demo runs two, and
+ * they differ structurally: the scatter server batches (bypassing the page
+ * table and prefix trie) while the dynamic server pages KV (disabling
+ * continuous batching). An entry may therefore carry `byOrigin` to override
+ * its classification per server. `prefix_cache_hits: 0` is a genuine measured
+ * zero on the dynamic server and not-applicable on the scatter server — the
+ * SAME wire value, opposite treatments, and only this table knows which.
  */
 
 /**
@@ -457,20 +471,55 @@ export const PROVENANCE = Object.freeze({
     evidence:
       'crates/onnx-genai-server/src/metrics.rs:136-138 — incremented when prefix_cache_hit_len > 0.',
     label: 'Prefix-cache hits',
-    // Genuinely measured, and genuinely zero on a static-cache server: the
-    // batching path bypasses the prefix trie entirely. That zero is a real
-    // observation about the architecture, not a missing measurement, which is
-    // why this stays MEASURED. Panels must caption it, not debug it.
+    // The same 0 means two opposite things depending on which server answered.
+    byOrigin: {
+      scatter: {
+        classification: 'STRUCTURALLY_BYPASSED',
+        reason:
+          'This server uses static-cache batching, and that path never consults the prefix ' +
+          'cache — so the question is never asked. The engine asserts this: ' +
+          'crates/onnx-genai-engine/tests/batched_static_decode.rs:53 and ' +
+          'engine_continuous_batch_scheduled.rs:82 require prefix_cache_hit_len == 0 for every ' +
+          'batched result. Showing 0% here would imply a cache that tried and failed.',
+      },
+      // On the dynamic server the cache IS consulted, so 0 is real data.
+      dynamic: { classification: 'MEASURED' },
+    },
   },
-  'metrics.prefix_cache_lookups': {
-    source: ENDPOINTS.METRICS,
+  'metrics.prefix_cache_lookups': {    source: ENDPOINTS.METRICS,
     metric: 'onnx_genai_prefix_cache_lookups_total',
     kind: 'scalar',
     classification: 'MEASURED',
     unit: 'count',
     evidence:
-      'crates/onnx-genai-server/src/metrics.rs:132-134 — incremented once per generation result.',
-    label: 'Prefix-cache lookups',
+      'crates/onnx-genai-server/src/metrics.rs:132-134 — fetch_add(1) runs unconditionally in ' +
+      'GenerationMetrics::result(), whether or not any cache was consulted.',
+    // ⚠️ THE METRIC NAME IS A LIE, and it is upstream of us. This counter is
+    // called `prefix_cache_lookups_total`, but it increments once per COMPLETED
+    // GENERATION regardless of whether a lookup happened. Labelling it "cache
+    // lookups" would report a cache being consulted on a server whose code path
+    // never consults one. It is labelled for what it actually counts.
+    label: 'Completed generations',
+  },
+  'prefix_cache.hit_rate': {
+    source: ENDPOINTS.DEBUG_KV,
+    path: 'prefix_cache_hit_rate',
+    classification: 'MEASURED',
+    unit: 'ratio',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs:126-130 — hits/lookups, but emits a literal ' +
+      '0.0 when lookups == 0, so an undefined rate and a genuine 0% are the same bytes. The ' +
+      'store corrects this where the denominator is still in scope.',
+    label: 'Prefix-cache hit rate',
+    byOrigin: {
+      scatter: {
+        classification: 'STRUCTURALLY_BYPASSED',
+        reason:
+          'This server batches with a static cache, and that path never consults the prefix ' +
+          'cache, so there is no rate to report. A 0% here would imply a cache that tried.',
+      },
+      dynamic: { classification: 'MEASURED' },
+    },
   },
 
   // ── GET /v1/resources ───────────────────────────────────────────────────
@@ -521,8 +570,22 @@ export const NEVER_MEASURED_CLASSIFICATIONS = Object.freeze(['DOCUMENTED_ZERO', 
  * @param {string} key
  * @returns {ProvenanceEntry|null}
  */
-export function provenanceFor(key) {
-  return Object.prototype.hasOwnProperty.call(PROVENANCE, key) ? PROVENANCE[key] : null;
+export function provenanceFor(key, origin = null) {
+  if (!Object.prototype.hasOwnProperty.call(PROVENANCE, key)) return null;
+  return resolveForOrigin(PROVENANCE[key], origin);
+}
+
+/**
+ * Collapse an entry's per-origin overrides against the server we actually
+ * asked, yielding a plain entry the store can use without knowing about
+ * origins.
+ *
+ * @param {object} entry
+ * @param {string|null} origin
+ */
+export function resolveForOrigin(entry, origin) {
+  const override = entry.byOrigin && origin ? entry.byOrigin[origin] : null;
+  return override ? Object.freeze({ ...entry, ...override, byOrigin: undefined }) : entry;
 }
 
 /** Every field key, for the footer "What's real, what's not" table (AC10). */

@@ -91,7 +91,33 @@ export const FIELD_STATES = Object.freeze({
   PENDING: 'pending',
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',
+  NOT_APPLICABLE: 'not-applicable',
 });
+
+/**
+ * THE THREE KINDS OF ZERO (demo-spec.md §3, binding).
+ *
+ * A `0` on the wire is byte-identical in all three cases below, so the wire
+ * cannot tell them apart and neither can a panel. Only the provenance table
+ * can, which is why this distinction lives in the type rather than in copy:
+ *
+ * 1. `ok` with value 0 — the question was asked and the answer really is zero.
+ *    Renders as a stark `0`. This is DATA and must not be hidden.
+ * 2. `unavailable` — the server hardcodes a stub and never computes it
+ *    (e.g. tokens_per_second at routes/admin.rs:63). Em-dash, hover names the
+ *    stub. It could be fixed by plumbing it.
+ * 3. `not-applicable` — the subsystem exists but THIS code path never consults
+ *    it, so the question is never asked (e.g. the prefix cache on a
+ *    static-cache server, where the batching path bypasses the trie entirely).
+ *    Em-dash, hover explains WHY. Plumbing would not fix it; it is a true
+ *    statement about the architecture.
+ *
+ * Collapsing 2 and 3 into one bucket destroys a fact the visitor needs: one is
+ * a gap in the server, the other is a property of it. The same wire value can
+ * land in different buckets on different servers — prefix-cache hits are a
+ * genuine measured 0 on the dynamic server and not-applicable on the scatter
+ * server — so the classification depends on origin, not on the number.
+ */
 
 /**
  * Build a genuinely-measured field.
@@ -141,6 +167,43 @@ export function measuredField(
     // off a response. Still a real measurement, but a panel showing it owes the
     // viewer the inputs — a number we derived needs more disclosure, not less.
     derivedFrom,
+  });
+}
+
+/**
+ * Build a not-applicable field: the subsystem exists, but this code path never
+ * consults it, so the question is never asked.
+ *
+ * This is NOT a degraded `unavailable`. `unavailable` says "the server does not
+ * compute this yet", which implies it could. `not-applicable` says "asking this
+ * of this server is meaningless", which is a permanent, true statement about
+ * the architecture and is often the most interesting thing on the page.
+ *
+ * @param {string} reason Must explain WHY the path bypasses it.
+ * @param {object} [options]
+ * @returns {TelemetryField}
+ */
+export function notApplicableField(
+  reason,
+  { source = 'unavailable', sourceClass = SOURCE_CLASSES.SERVER, origin = null, label = null, unit = null } = {},
+) {
+  if (!reason) {
+    throw new TypeError(
+      'notApplicableField() requires a reason explaining why this path never consults the ' +
+        'subsystem. Without it the state is indistinguishable from a missing feature.',
+    );
+  }
+  return Object.freeze({
+    value: null,
+    state: FIELD_STATES.NOT_APPLICABLE,
+    source,
+    sourceClass,
+    origin,
+    label,
+    reason,
+    unit,
+    observedAtMs: null,
+    derivedFrom: null,
   });
 }
 
@@ -228,7 +291,12 @@ export function pendingField(
  * @returns {TelemetryField}
  */
 export function staleField(field, reason) {
-  if (field.state === FIELD_STATES.UNAVAILABLE || field.state === FIELD_STATES.PENDING) {
+  if (
+    field.state === FIELD_STATES.UNAVAILABLE ||
+    field.state === FIELD_STATES.PENDING ||
+    field.state === FIELD_STATES.NOT_APPLICABLE
+  ) {
+    // Absence has no age, and a question never asked cannot become stale.
     return field;
   }
   return Object.freeze({
@@ -353,7 +421,9 @@ export function numericValueOf(field) {
  * @returns {string}
  */
 export function formatFieldText(field, { format = defaultFormat } = {}) {
-  if (field.state === FIELD_STATES.UNAVAILABLE) {
+  if (field.state === FIELD_STATES.UNAVAILABLE || field.state === FIELD_STATES.NOT_APPLICABLE) {
+    // Both render an em-dash; the hover text is what distinguishes them, and
+    // describeField() is where that difference is spelled out.
     return '—';
   }
   if (field.state === FIELD_STATES.PENDING) {
@@ -372,8 +442,14 @@ export function formatFieldText(field, { format = defaultFormat } = {}) {
  * @returns {string}
  */
 export function describeField(field, nowMs = Date.now()) {
+  const on = field.origin ? ` on the ${field.origin} server` : '';
+  if (field.state === FIELD_STATES.NOT_APPLICABLE) {
+    // Deliberately NOT phrased as "unavailable": nothing is missing here. The
+    // wording has to make clear that plumbing would not produce a value.
+    return `Not applicable${on} — ${field.reason}`;
+  }
   if (field.state === FIELD_STATES.UNAVAILABLE) {
-    return `Unavailable — ${field.reason} (would come from ${field.source})`;
+    return `Unavailable — ${field.reason} (would come from ${field.source}${on})`;
   }
   if (field.state === FIELD_STATES.PENDING) {
     return `Waiting for the first measurement — ${field.reason} (from ${field.source})`;
@@ -386,7 +462,7 @@ export function describeField(field, nowMs = Date.now()) {
   const provenance = field.derivedFrom
     ? `derived from ${field.derivedFrom.join(', ')}`
     : `source ${field.source}`;
-  return `${field.value}${unitSuffix} — measured, ${provenance}`;
+  return `${field.value}${unitSuffix} — measured${on}, ${provenance}`;
 }
 
 /** @param {any} value */

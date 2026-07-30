@@ -166,8 +166,7 @@ body[data-blocked] .app {
   cursor: help;
 }
 
-[data-state='unavailable'] {
-  color: var(--og-unavail-fg);
+[data-state='unavailable'] {  color: var(--og-unavail-fg);
   /* The dotted underline is the second channel: absence is legible in
      greyscale, in a compressed screenshot, and on a projector. */
   border-bottom: 1px dotted var(--og-unavail-rule);
@@ -175,6 +174,28 @@ body[data-blocked] .app {
   /* Reserve the space a real value would occupy, so nothing reflows on the day
      the server learns to measure it. Layout shift on data arrival makes a page
      feel unreliable at exactly the moment it becomes more reliable. */
+  min-width: var(--og-value-slot);
+  display: inline-block;
+}
+
+/*
+ * `not-applicable` — the subsystem exists but this server's code path never
+ * consults it, so the question is never asked. It shares the em-dash and the
+ * muted colour with `unavailable`, but takes a HATCHED underline rather than a
+ * dotted one, because the two are different facts: `unavailable` is a gap that
+ * plumbing could close, `not-applicable` is a permanent property of the
+ * architecture. The hover text carries the full explanation.
+ *
+ * This rule must exist. Without it the state falls through to default contrast
+ * and renders like a measurement, which is the exact failure this file guards.
+ */
+[data-state='not-applicable'] {
+  color: var(--og-unavail-fg);
+  /* DOUBLE, not dashed: `stale` already owns the dashed underline, and those
+     two colours sit within a few RGB values of each other. Distinguishing them
+     by colour alone would fail in greyscale and for colourblind viewers. */
+  border-bottom: 3px double var(--og-unavail-rule);
+  cursor: help;
   min-width: var(--og-value-slot);
   display: inline-block;
 }
