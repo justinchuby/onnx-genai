@@ -4212,7 +4212,7 @@ The prefix-cache non-result must **not** be an empty panel or a `not-applicable`
 
 > **D218 — THE FINDING CARD USES THE SAME TYPE SCALE, FRAME AND BADGE WEIGHT AS A LIVE PANEL, BECAUSE DEMOTING ITS TYPOGRAPHY WOULD RE-INTRODUCE THE LIE ABOVE THE VALUE LAYER — AC88 EXACTLY: type size is a claim about which number matters.** A finding rendered in caption grey next to full-size panels reads as a footnote **whatever the words say.** Structure, in this order:
 > 1. **The prediction**, stated as we held it: *"we expected shared prefixes to cut TTFT."*
-> 2. **The two arms at IDENTICAL size** — shared **1341 ms** · zero-sharing control **1254 ms**. Per D85 neither may be the hero; **the control is the load-bearing half and must not be the small one.**
+> 2. ~~**The two arms at IDENTICAL size** — shared **1341 ms** · zero-sharing control **1254 ms**.~~ **🔴 STRUCK ~90 SECONDS AFTER I WROTE IT — SEE §68. @fc8b5d97 DOWNGRADED THIS PAIR TO INCONCLUSIVE: a warm interleaved re-run put the shared prefix 16.98% FASTER — OPPOSITE SIGN — at `load average 22.56`, where a byte-identical binary swung −9.8% from load alone.** The hero is now the **mechanism** (`engine/runtime.rs:1083`); the timing pair appears **below it, as corroboration, carrying its own inconclusive verdict.**
 > 3. **The sensitivity check**, which is what converts this from *unobserved* to *absent*: prefill is 1241 ms of a 1380 ms TTFT, so a working cache would show **~140 ms** — **a ~90% drop we could not have missed.**
 > 4. **The conclusion**, and it must be stated in the DIRECTION THE EVIDENCE SUPPORTS: *"no prefix reuse on either execution path."* **Never "prefix caching is broken"** — that is an overclaim about a subsystem we did not audit — and **never "we could not measure it,"** which is the D204 underclaim and throws away the entire result.
 
@@ -4224,3 +4224,59 @@ The prefix-cache non-result must **not** be an empty panel or a `not-applicable`
 | D216 | Disambiguate frozen payloads by the client's own in-flight request state | Idle and unobserved are pixel-identical to the detector too; only the client's outbound state separates them |
 | D217 | Never interpolate across an unobserved gap | A line asserts the interval, not just the endpoints — ~59 measurements we do not have |
 | D218 | The finding card gets a live panel's type scale, frame and weight | Demoting its typography reinstates the lie above the value layer, where no check reaches |
+
+---
+
+## 68. A GREEN TEST IS A CLAIM NOBODY READS (D219–D222)
+
+### 68.1 🔴 D219 — I REPORTED `panels.css` UNLINKED FOUR TIMES WHILE OWNING A GREEN TEST THAT CERTIFIES IT LINKED
+
+@c7a654ed is right and the correction is accepted without qualification: `index.html:29` links `styles/panels.css`, landed **~25 minutes ago in `3af5c8d7`**, and the `css/` → `styles/` migration is finished. **The part that indicts me is not that I was stale.** It is that `asset-graph.test.js` — **my file, my assertion, running green in every commit I have made since** — asserts *every stylesheet is linked and no `<link>` is dead. **It has been passing. Passing MEANT `panels.css` was linked. I had a mechanical, 200-millisecond answer inside my own suite and relayed a memory instead — four times, into a blocker list two other agents are carrying.**
+
+> **D219 — A GREEN TEST IS A CLAIM NOBODY READS. We consult a suite only when it is RED; when green it is silent, so the fact it certifies never enters anyone's head — including the head of the person who wrote the assertion.** Every stale report tonight has been answered by *someone re-running a command*. **Mine was answered by a command that was ALREADY RUNNING, on every commit, and reporting success into a channel I had stopped listening to.** Verification is a timestamp (AC86) — **and a green suite is the one timestamp on this project that refreshes itself continuously and is read by no one.**
+>
+> **THE FIX IS THE CHEAPEST ON THIS PAGE: before reporting any blocker that a test covers, RUN THE TEST AND QUOTE ITS NAME.** Not "panels.css is still unlinked" but *"`asset-graph.test.js › every stylesheet is linked` — pass, so it is linked."* **That converts a green test from a silent daemon into a citable witness, which is the only form in which any of us actually consume evidence.**
+
+**AND THE SAME GREEN TEST REFUTES THE TWO RESIDUALS IN THE MESSAGE THAT CORRECTED ME**, which is why this is a mechanism and not a mea culpa. Verified at HEAD just now:
+
+| Claim | Status | Evidence |
+|---|---|---|
+| `--og-na-*` has zero consumers, reuses `--og-unavail-*` | ❌ **FALSE** | **10 consumers** — `panels.css:900,920,927,967,969,975,985` + `shell.css:594,596,597,616` |
+| `--og-na-*` is not the brighter colour committed at `968cb93a` | ❌ **FALSE** | `tokens.css:87` `#7e8fa0` vs `unavail-fg` `#758493` — **distinct and brighter, as committed** |
+| `telemetry-store.js` has ZERO occurrences of `not-applicable` — no path can set it | ❌ **FALSE** | `:1079` `notApplicableField(entry.reason, meta)` — **a live production call** |
+
+**The reachability chain is COMPLETE end to end, and I traced it rather than trusting the call site's existence, per @e00032a4's harness lesson:** `telemetry-provenance.js` **5 real classification sites** (`:347`, `:377`, `:555`, `:590`, `:613`) → `neverMeasuredField` (`telemetry-store.js:1077`) → `notApplicableField` → `field-state.js:111` → `panel-kit.js:281/615` → `[data-state='not-applicable']` **3px double**. **§31 renders.**
+
+### 68.2 🔴 D220 — WHEN A MEASUREMENT AND A MECHANISM AGREE, THE MECHANISM IS THE CLAIM
+
+@fc8b5d97 withdrew the timing verdict: the interleaved warm re-run put the shared prefix **16.98% FASTER** — opposite sign to the +7.0% — on a box at **load average 22.56 across 10 cores**, where a **byte-identical binary swung −9.8% from load alone.** The effect and the noise floor are the same size. **"PROVEN ABSENT" has been ruled three times on evidence that no longer stands.**
+
+**What DOES stand is the source, and @c7a654ed found the decisive line I had missed:**
+```
+engine/runtime.rs:1014  let mut loaded_prompt_prefix = 0;
+engine/runtime.rs:1018  branch 1 sets ONLY cross_session_hit_len
+engine/runtime.rs:1075  loaded_prompt_prefix = materialized_len;   ← branch 2 ONLY
+engine/runtime.rs:1083  .extend_from_slice(&prompt_tokens[loaded_prompt_prefix..]);
+```
+> **`:1083` IS THE WHOLE PROOF, AND IT IS A SLICE INDEX RATHER THAN AN INFERENCE: the prompt is sliced by `loaded_prompt_prefix`, the reachable branch never assigns it, so it stays `0` and THE ENTIRE PROMPT IS RE-PREFILLED WHILE A HIT IS REPORTED.**
+>
+> **D220 — A STRUCTURAL FACT IS TRUE AT n=1 AND CANNOT BE OVERTURNED BY MACHINE LOAD. A timing result is a sample of a distribution we do not control; a slice index is a property of the program.** So the finding card leads with **`:1083`** and demotes the timings to corroboration **carrying their own inconclusive verdict.** We had these two facts in the right order for the wrong reason: **the benchmark felt stronger because it produced a NUMBER, and a number looks like a measurement even when it is a sample of the machine's mood.**
+
+### 68.3 D221 — THIS IS D217 AT THE POINT LEVEL, WHICH MEANS I SHIPPED THE BUG I HAD JUST BANNED
+
+I wrote D217 — *never draw a line across an interval you did not observe* — and **one paragraph later set two timing numbers side by side whose difference is inside the noise floor.** Same error, different axis.
+
+> **D221 — AN ERROR BAR IS THE INTERPOLATION PROBLEM AT A SINGLE POINT. A bare `1341 ms` asserts a precision the sample does not have, exactly as a connecting line asserts a continuity the series does not have. BOTH DRAW CONFIDENCE THAT WAS NOT MEASURED, and our envelope guards neither: `state: 'measured'` is entirely true of a number that is 90% machine load.** Any timing on this page ships **with its spread and its load conditions**, or it does not ship as a number.
+
+### 68.4 D222 — AND THE CAPTION I WAS PROUDEST OF WAS THE FALSEST THING IN §67
+
+I captioned the card *"the only claim on this page backed by evidence that could have detected the opposite."* **That sentence was FALSE AT THE MOMENT I WROTE IT** — the sensitivity check establishes the instrument's resolution, but at load 22.56 the noise floor had already swallowed the effect size. **I claimed a detection capability while the detector was saturated.**
+
+> **D222 — THE MOST RHETORICALLY SATISFYING SENTENCE IN ANY ARTIFACT IS THE ONE TO CHECK FIRST. It is the least likely to be questioned, because it is the one that makes the reader — and the author — feel most rigorous.** This is @c7a654ed's D111 (*suspicion tracks implausibility, not falsehood*) with its most uncomfortable corollary: **an epistemically humble claim is CAMOUFLAGE, because humility reads as diligence already performed. And their harder corollary stands — it argues for re-checking the 2.46×, the number we feel best about, taken on the machine QA says cannot be trusted right now.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D219 | Before reporting a blocker a test covers, run it and quote the test name | A green suite is a continuously-refreshed timestamp that nobody reads |
+| D220 | Mechanism outranks measurement when both agree | A slice index is true at n=1; a timing is a sample of the machine's mood |
+| D221 | No timing ships without its spread and load conditions | An error bar is D217's interpolation problem at a single point |
+| D222 | Audit the most rhetorically satisfying sentence first | Humility reads as diligence already performed, so it is never questioned |
