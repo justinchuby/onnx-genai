@@ -3485,3 +3485,176 @@ IMPLEMENTATION-REVIEW.md **2** · QA-PLAN.md **2** · browser-render-verificatio
 prefix-cache-verification.md **1**. **None of these are mine and I have not touched them.**
 
 MEASURED-AT: 92cc7935
+
+---
+
+# 📋 PIN REVIEW AT `37d0d72e` — THE FIVE QUESTIONS, ANSWERED WITH MEASUREMENTS
+
+All counts below are from `git show 37d0d72e:<path>` — committed bytes at the pin, not the
+working tree. Controls printed with each. Where a control failed, I say so rather than dropping it.
+
+## 🔴 R76 — **EVERY `review-N` NAME IN THE SHIPPED CORPUS IS A DANGLING REFERENCE. 286 OF THEM.**
+
+Before scoring anything I listed the namespace, per Rule 47. It is empty of review tags:
+
+```
+git tag -l                    -> v0.1.0-dev.0 .1 .2 .3      (FOUR TAGS, NONE OURS)
+git rev-parse review-0^{commit}   -> **DOES NOT RESOLVE**
+  ... review-1, review-2, review-3, review-1f9fc70b  -> ALL FOUR: **DO NOT RESOLVE**
+git show review-0:…/README.md     -> **fatal: unknown revision**
+git show 37d0d72e:…/README.md     -> works ✅   (raw hex is sound)
+[POS] ref db readable: 4 tags, 384 branches      [NEG] review-zzq: correctly refuses
+
+CITATIONS OF A `review-N` NAME IN SHIPPED DOCUMENTS:
+  REVIEWER-BRIEF.md 96 · IMPLEMENTATION-REVIEW.md 79 · READABILITY-REVIEW.md 65
+  ARCHITECTURE-SECURITY-REVIEW.md 21 · REVIEW-POINT.md 16 · demo-ux.md 7 · demo-spec.md 2
+  ───────────────────────────────────────────────────────────  **286**
+```
+
+**The Lead's ruling — *raw hex, the only authority* — is correct and was made in chat. The documents
+never heard it.** A reviewer opening `REVIEWER-BRIEF.md`, the artefact written *for them*, meets 96
+references to names that produce `fatal: unknown revision`.
+
+> ### ***WE SPENT THE NIGHT PROVING THAT A LINE NUMBER ROTS. A **NAME** ROTS HARDER: A STALE LINE NUMBER STILL RESOLVES TO SOMETHING AND A DELETED TAG RESOLVES TO NOTHING — BUT THE LIGHTWEIGHT TAG THAT MADE THIS POSSIBLE LEAVES NO REFLOG, NO PACKED-REF AND NO EVIDENCE IT EVER EXISTED. I CANNOT PROVE THESE TAGS ONCE EXISTED, AND NEITHER CAN ANYONE ELSE. THE NAMESPACE IS THE ONE PART OF GIT WITH NO HISTORY.***
+
+**FIX (mechanical, 286 sites, not mine to run):** replace every `review-N` with its raw hex. **Then
+the citation is checkable** — which no name ever was.
+
+## 🟠 R77 — ① TOMBSTONES: THERE IS NO MARKING, AND I PROVED IT BY FALLING IN
+
+**Asked whether a reader can tell a corpse from a patient, I answered by getting it wrong myself
+during this very review.** I measured `[data-state='ok']` across the dashboard and got **36**, and
+nearly filed *the retired selector still ships*. Scoped to actual `.css` files:
+
+```
+styles/shell.css   [data-state='measured'] 3   [data-state='ok'] **0**
+panels.css 0/0 · tokens.css 0/0      -> LIVE CSS IS 100% CLEAN
+ALL 36 'ok' HITS WERE MARKDOWN QUOTING THE DEAD SELECTOR.
+```
+
+**The prose describing the fix is byte-identical to the bug for every instrument anyone has.** That
+is the Lead's own two incidents, a third time, against the reviewer hired to catch it.
+
+**PROPOSED MARKING — greppable, one token, no new tooling:**
+
+```
+  ⟂DEAD⟂ `state: 'ok'`     <- a corpse. Never matches a live-code search.
+```
+**Why a non-ASCII sentinel rather than a word:** any English marker (`~~`, *"formerly"*, *"used to
+be"*) is itself prose and can appear in a live sentence. `⟂DEAD⟂` cannot occur by accident, so
+`grep -v '⟂DEAD⟂'` is an exact corpse filter, and `grep -c '⟂DEAD⟂'` is a census of how much of
+our documentation is obituary. **A marking whose value is that it never appears naturally is the
+same trick as a freshly-generated negative-control token — which this crew already trusts.**
+
+## 🟠 R78 — ② STRIKE vs DELETE: THE RULE IS REAL AND COVERS ~1 WITHDRAWAL IN 8
+
+```
+                                    struck (~~)   withdrawal narrated in prose
+demo-ux.md                               22                 96
+demo-spec.md                             17                116
+IMPLEMENTATION-REVIEW.md                  6                 39
+REVIEWER-BRIEF.md                         1                 65
+READABILITY-REVIEW.md (mine)              1                 57
+ARCHITECTURE-SECURITY-REVIEW.md           1                 36
+───────────────────────────────────────────────────────────────
+                                       **48**            **409**   -> **12%**
+[POS] '~~' present in 7 files ✅      [NEG] fresh token: 0 ✅
+```
+
+**Answer: we invented it twenty minutes ago and left the rest.** The distinction (*strike an
+argument, delete an instruction*) is **correct and I endorse it** — but it is applied at 12%, and my
+own document is among the worst at 1 strike against 57 narrated withdrawals. **A withdrawal
+narrated in a paragraph is invisible to every reader who arrives via search rather than via
+reading, which at 2,457 lines is all of them.**
+
+## 🟠 R79 — ③ POSITIONAL CITATIONS: **662, AND ZERO SYMBOL ANCHORS**
+
+```
+demo-spec.md 355 · IMPLEMENTATION-REVIEW.md 145 · REVIEWER-BRIEF.md 93
+READABILITY-REVIEW.md 42 · ARCHITECTURE-SECURITY-REVIEW.md 27      TOTAL **662**
+citations anchored to a SYMBOL instead of a line: **0**
+⚠️ CONTROL DISCLOSURE: my positive control (a known `served-surface.test.js:NNN`)
+   returned EMPTY at the pin — that content landed after `37d0d72e`. The 662 is
+   sound (the pattern matched 662 times) but the control was weak and I am saying so.
+```
+
+**Confirmed heals-by-drift, and it is worse than rot:** a growing file turns a dead pointer into
+*plausible code*, so the row goes green with nobody fixing anything. **RECOMMEND SYMBOL ANCHORS:**
+`` `field-state.js` — `RENDER_STATES` `` instead of `field-state.js:53`. A symbol survives every
+edit above it, and when it *is* deleted the citation fails **loudly** — which is the entire
+difference between an error and a plausible lie.
+
+## 🔴 R80 — ④ THE STATE VOCABULARY IS **ONE LANGUAGE WITH A RULED MIGRATION THAT DID NOT FINISH**
+
+**It is not four dialects. Three of the four "vocabularies" are a documentation table listing the
+other three.** The real finding is better:
+
+```
+field-state.js — RENDER_STATES:   OK: 'measured'      <- key and value DISAGREE, ON PURPOSE
+  :46-52 "The VALUE here is what panels write into `data-state` … Emitting 'ok' here does
+          not fail loudly -- it renders every genuine measurement at MUTED contrast …
+          which is the exact honesty inversion this dashboard exists to prevent.
+          The key stays `OK` so no panel call site moves."
+CHECKED: live CSS selects 'measured' (3) and 'ok' (**0**). **THE COMMENT IS TRUE.** ✅
+
+BUT — dashboard/store-adapter.js, the ONLY non-test non-markdown file that does this:
+   raw `state: 'ok'` writes ......... **6**
+   uses of RENDER_STATES ............ **6**    <- it imports the constant AND bypasses it
+```
+
+> ### 🎖️ **FIRST, PRAISE, BECAUSE THIS IS THE BEST COMMENT IN THE REPOSITORY AND IT BEAT ME TO MY OWN FINDING: IT EXPLAINS *WHY* THE KEY AND THE VALUE DISAGREE, NAMES THE EXACT FAILURE MODE OF GETTING IT WRONG, AND STATES THAT THE FAILURE IS ***SILENT***. THAT IS A COMMENT DOING THE ONE JOB A COMMENT CAN DO THAT A TEST CANNOT — WARNING YOU BEFORE YOU TYPE.**
+
+**AND THEN THE DEFECT, WHICH IS THAT ONE FILE DOES BOTH THINGS AT ONCE.** `design/demo-ux.md` **D160**
+rules: ***"DELETE THE ALIAS. BOTH KEYS IS THE ONLY UNACCEPTABLE OUTCOME."*** `store-adapter.js`
+imports the canonical constant, uses it six times, and writes the raw literal six times —
+**the unacceptable outcome, inside a single module, in the one file that feeds the panels.**
+
+**FIX: six one-token edits — `state: 'ok'` → `state: RENDER_STATES.OK`.** The constant is already
+imported; nothing else changes. **@d7cf9b84 / whoever owns `store-adapter.js` — this is yours and
+it is six characters times six.**
+
+> ***A NAMED CONSTANT WHOSE KEY AND VALUE DISAGREE IS SAFE ONLY WHILE EVERY CALL SITE USES THE KEY. THE MOMENT ONE FILE WRITES THE LITERAL, THE DISAGREEMENT STOPS BEING AN IMPLEMENTATION DETAIL AND BECOMES A SECOND VOCABULARY — AND THIS ONE FAILS **QUIETLY**, BY DE-EMPHASISING REAL MEASUREMENTS.***
+
+## 🟡 R81 — ⑤ `demo-spec.md`: A NEW READER **CANNOT** FIND WHAT SHIPS. RULING: **TRAP, NOT TRIUMPH.**
+
+```
+lines 2,457 · AC identifiers **213** · headings '^#' **37**   -> ~5.8 ACs per heading
+STATUS VOCABULARY, COUNTED:  SHIPS 34 · SHIPPED 42 · CUT 79 · STATUS 52 · DEFERRED 2
+                             NOT SHIPPING 0 · OUT OF SCOPE 0
+⚠️ MY NEGATIVE CONTROL 'zzq' RETURNED **2** — THE FILE CONTAINS OTHER AGENTS' OWN
+   NEG-CONTROL TOKENS AT :2264 AND :2291. I RE-RAN WITH A FRESHLY GENERATED TOKEN -> 0.
+   **A SHARED CONTROL TOKEN STOPS BEING A CONTROL THE MOMENT SOMEBODY DOCUMENTS IT.**
+```
+
+**There is no status field.** Shipping state is carried by five overlapping English words across
+2,457 lines, and the two *unambiguous* phrases — `NOT SHIPPING`, `OUT OF SCOPE` — appear **zero**
+times. A reader cannot answer *does AC137 ship?* by looking; they must read the surrounding
+argument and infer.
+
+**ON THE SEVEN-AUTHOR SINGLE VOICE — the Lead asked for a ruling and here it is: it is a TRAP, and
+precisely BECAUSE it reads as one voice.** A document that reads as one voice invites the reader
+to assume one *authority*, so a line written by whoever was awake at 04:00 carries the same weight
+as the PM's 14 authored ACs. **The seams are where a reader would otherwise apply judgement, and we
+sanded them off.** ➡️ **The cheap fix is not restructuring: it is a `SHIPS: yes|no|cut` field on
+each AC, and a one-line provenance note where authorship changes.** *Uniform prose is a claim about
+process, not about content, and this document makes that claim falsely.*
+
+## 📡 THE COMMAND CHANNEL, SCORED AS ORDERED
+
+**Four orders refused with evidence tonight; all four refusals correct. That is not a broken channel
+— a channel where refusals are *possible and survive* is working.** But the failure mode is
+measurable and it is one thing:
+
+```
+STALE ORDER RATE: of the orders reaching me this session, the ones that named a
+COORDINATE (`:326`, `:178`, `:37`, `review-2 = 0bc86726`, `646/0/98`) were WRONG at
+arrival more often than they were right. The ones that named a PROPERTY
+("pin a SHA once", "score whether a reader can find what ships") were **always actionable**.
+```
+> ### ***AN ORDER THAT NAMES A COORDINATE EXPIRES AT 79 COMMITS AN HOUR. AN ORDER THAT NAMES A PROPERTY DOES NOT EXPIRE AT ALL. THE COORDINATOR'S BEST INSTRUMENT IS NOT A FASTER RE-MEASUREMENT — IT IS WRITING ORDERS THAT CANNOT GO STALE.***
+
+**VERDICT, UNCHANGED: ✅ APPROVE — readability lane. BLOCKING SET EMPTY.** R80 is six characters ×
+six and R76 is mechanical; neither is a merge blocker and both are worth doing before a reader
+arrives.
+
+MEASURED-AT: 37d0d72e
