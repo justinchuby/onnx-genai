@@ -51,7 +51,6 @@ const CLIENT_STATES = Object.freeze({
 
 export const meta = Object.freeze({
   // Client-observed; every profile can produce it.
-  requires: null,
   id: 'requests',
   title: 'Requests',
   group: 'scheduling',

@@ -41,7 +41,6 @@ const TTFT_DIVERGENCE_WARN_RATIO = 0.2;
 
 export const meta = Object.freeze({
   // Token throughput is meaningful on every execution path.
-  requires: null,
   id: 'throughput',
   title: 'Throughput & latency',
   group: 'throughput',

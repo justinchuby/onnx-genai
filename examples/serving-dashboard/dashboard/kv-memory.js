@@ -38,7 +38,6 @@ export const meta = Object.freeze({
   // The title must follow the profile: rows are NOT pages, and calling them
   // pages would re-import the exact confusion the capability-profile design
   // exists to remove.
-  requires: null,
   id: 'kv-memory',
   title: 'KV memory',
   group: 'memory',

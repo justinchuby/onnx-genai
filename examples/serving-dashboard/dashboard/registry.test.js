@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { PANELS, panelById, panelsForMode } from './index.js';
+import { PANELS, panelById } from './index.js';
 
 describe('panel registry', () => {
   it('registers every panel module with a complete meta block', () => {
@@ -27,7 +27,7 @@ describe('panel registry', () => {
       assert.equal(typeof panel.module.mount, 'function', `${panel.id} has no mount()`);
       assert.equal(panel.id, panel.module.meta.id, `${panel.id} id disagrees with its meta`);
       assert.ok(panel.module.meta.title, `${panel.id} has no title`);
-      assert.ok(panel.modes.length > 0, `${panel.id} can never be shown`);
+      assert.equal('modes' in panel, false, `${panel.id} carries a mode gate again`);
     }
   });
 
@@ -58,118 +58,93 @@ describe('panel registry', () => {
     assert.equal(new Set(ids).size, ids.length, `duplicate panel id in ${ids.join(', ')}`);
   });
 
-  it('KEEPS the KV panel on the batching server', () => {
-    // This test previously asserted the opposite, on the reasoning that
-    // "showing them with em-dashes would promise data that is not coming".
-    // That reasoning is from a four-state world, and it is exactly the
-    // confusion the fifth state was introduced to remove: `unavailable`
-    // promises a value, `not-applicable` explicitly does not — it states an
-    // architectural fact and points at where the number IS real.
+  it('mounts every registered panel, on every server, with no mode gate', () => {
+    // This replaces four tests that asserted a filter: "KEEPS the KV panel on
+    // the batching server", "hides the scheduling panel on the paged server",
+    // "preserves DOM order when filtering", and a RATIFIED placement table.
     //
-    // This panel is how a visitor learns the demo's central claim, that
-    // continuous batching and the paged KV cache are mutually exclusive
-    // execution paths. Hiding it replaces that lesson with SILENCE, and
-    // silence reads as a smaller dashboard rather than as something withheld.
-    // kv-memory also ADAPTS rather than disappears (decode-row occupancy here,
-    // a paged block table on the other profile), so hiding it discards a panel
-    // that had a real number to show.
-    const ids = panelsForMode('batching').map((panel) => panel.id);
-    assert.deepEqual(ids, [
-      'throughput',
-      'scheduling',
-      'kv-memory',
-      'requests',
-      'system',
-    ]);
+    // The filter is gone on a ruling AND on measurement. The measurement is the
+    // half that was never taken: `/v1/status` on the paged origin returns the
+    // SAME served keys and the SAME server-declared absences as the batching
+    // origin. `scheduling` was therefore not hidden because it had nothing to
+    // show -- it was hidden while the server was measuring its numbers, and the
+    // provenance table classified those fields MEASURED on both origins the
+    // whole time.
+    //
+    // Asserted as an explicit list rather than derived from PANELS, so that
+    // adding a panel is a decision someone has to write down here rather than a
+    // silent membership change.
+    assert.deepEqual(
+      PANELS.map((panel) => panel.id),
+      ['throughput', 'scheduling', 'kv-memory', 'requests', 'system'],
+    );
   });
 
-  it('derives modes from each panel\'s own meta.requires, with no second table', () => {
-    // The bug this closes: `modes` was declared by hand in the registry,
-    // separately from `meta.requires`, and the two drifted. kv-memory
-    // declared `requires: null` ("I ship everywhere") while the registry gated
-    // it to ['paged'] — and the registry won, because it is what
-    // panelsForMode filters on.
-    //
-    // Both suites stayed green the whole time, because each mechanism was
-    // only ever tested against itself. A reconciling test would have caught
-    // this instance; deriving removes the second mechanism entirely.
-    // Pinned as an EXPLICIT table rather than recomputed from meta.requires.
-    // Deriving the expectation from the same field the implementation derives
-    // from would produce a test that cannot fail — false assurance, which is
-    // worse than no test, and precisely the shape that let the original drift
-    // survive. This table encodes the RULING, so changing a panel's
-    // meta.requires now has to argue with the ruling rather than silently
-    // redefine it.
-    const RATIFIED = {
-      throughput: ['batching', 'paged'],
-      // The only genuinely gated panel: queue depth and occupancy are
-      // properties of the continuous batch scheduler.
-      scheduling: ['batching'],
-      // Adapts rather than disappears — decode-row occupancy vs a paged block
-      // table. Same component, different noun.
-      'kv-memory': ['batching', 'paged'],
-      requests: ['batching', 'paged'],
-      system: ['batching', 'paged'],
-    };
-
-    assert.deepEqual(
-      PANELS.map((panel) => panel.id).sort(),
-      Object.keys(RATIFIED).sort(),
-      'a panel was added or removed without deciding where it belongs',
-    );
-    for (const panel of PANELS) {
-      assert.deepEqual(
-        [...panel.modes],
-        RATIFIED[panel.id],
-        `${panel.id}: placement disagrees with the ruling. If this is intentional, the ruling ` +
-          'is what needs changing — hiding a panel is silence, not honesty.',
+  it('exposes no mode-filtering API at all', async () => {
+    // The mechanism is REMOVED, not neutralised. A `panelsForMode` that returns
+    // everything is a dormant gate: the next reader restores the filter inside
+    // it and every caller silently starts hiding panels again. A missing export
+    // fails loudly at import time instead.
+    const registry = await import('./index.js');
+    for (const gone of ['panelsForMode', 'modesFor']) {
+      assert.equal(
+        gone in registry,
+        false,
+        `${gone} is exported again — the mode gate is back. Panels are not hidden by `
+          + 'server mode; both servers serve an identical field set.',
       );
     }
   });
 
-  it('refuses to guess where a panel belongs', async () => {
-    // modesFor throws on an unknown meta.requires rather than defaulting.
-    // Defaulting to universal would show a panel that cannot populate;
-    // defaulting to none would hide one that had something to say, with no
-    // error anywhere. Neither is guessable, so it stops the build.
-    const { PANELS: registered } = await import('./index.js');
-    assert.ok(registered.length > 0);
+  it('ignores a mode argument instead of quietly filtering on it', async () => {
+    // The shell still passes `mode:` while app.js catches up. That must be
+    // INERT, not partially honoured: a half-removed gate that filters for some
+    // values and not others is the divergence this change exists to end.
+    const { installFakeDom } = await import('./testing/fake-dom.js');
+    const { mountDashboard } = await import('./index.js');
+    const uninstall = installFakeDom();
+    try {
+      // A RAW store, not the panel-facing fake: mountDashboard adapts what it
+      // is given, so handing it an already-adapted store tests the wrong seam.
+      const rawStore = () => ({
+        field: (key) => ({
+          value: null,
+          state: 'unavailable',
+          source: 'unknown',
+          reason: `No field named "${key}".`,
+          unit: null,
+          observedAtMs: null,
+          derivedFrom: null,
+        }),
+        getSnapshot: () => ({
+          timestampMs: 1000,
+          fields: {},
+          connection: { state: 'connected', origin: 'http://example.invalid' },
+        }),
+        subscribe(listener) {
+          listener(this.getSnapshot());
+          return () => {};
+        },
+      });
 
-    // Exercised directly, because the previous version of this test only
-    // imported a panel and asserted its `requires` was null -- it never once
-    // reached the branch its name describes, so it would have passed with the
-    // throw deleted.
-    const { modesFor } = await import('./index.js');
-    assert.throws(
-      () => modesFor({ meta: { id: 'fake', requires: 'paged-kv-v2' } }),
-      /unknown meta\.requires/,
-      'an unrecognised requirement must stop the build, not be guessed at',
-    );
-    assert.deepEqual([...modesFor({ meta: { id: 'fake', requires: null } })], [
-      'batching',
-      'paged',
-    ]);
-  });
+      const mountedFor = (mode) =>
+        mountDashboard({
+          telemetryStore: rawStore(),
+          mode,
+          resolveRoot: () => document.createElement('div'),
+        }).mounted;
 
-  it('hides the scheduling panel on the paged server', () => {
-    const ids = panelsForMode('paged').map((panel) => panel.id);
-    assert.deepEqual(ids, ['throughput', 'kv-memory', 'requests', 'system']);
-  });
-
-  it('preserves DOM order when filtering', () => {
-    for (const mode of ['batching', 'paged']) {
-      const filtered = panelsForMode(mode).map((panel) => panel.id);
-      const canonical = PANELS.map((panel) => panel.id).filter((id) => filtered.includes(id));
-      assert.deepEqual(filtered, canonical);
+      const everything = PANELS.map((panel) => panel.id);
+      for (const mode of ['batching', 'paged', 'nonsense', undefined]) {
+        assert.deepEqual(
+          [...mountedFor(mode)],
+          everything,
+          `mode ${JSON.stringify(mode)} changed what mounted`,
+        );
+      }
+    } finally {
+      uninstall();
     }
-  });
-
-  it('shows everything rather than nothing when the mode is unrecognised', () => {
-    // A misspelled config string must not blank the dashboard: an empty page
-    // looks like a dead server, while a full one shows panels explaining
-    // themselves and is diagnosable in seconds.
-    assert.equal(panelsForMode('scatter-v2').length, PANELS.length);
-    assert.equal(panelsForMode(undefined).length, PANELS.length);
   });
 
   it('never hardcodes a port or an origin anywhere in the registry', async () => {
@@ -186,7 +161,7 @@ describe('panel registry', () => {
 });
 
 describe('mountDashboard', () => {
-  it('adapts the store once and mounts only the panels for the mode', async () => {
+  it('adapts the store exactly once and mounts every panel', async () => {
     const { installFakeDom, flushAnimationFrames } = await import('./testing/fake-dom.js');
     const { mountDashboard } = await import('./index.js');
     const uninstall = installFakeDom();

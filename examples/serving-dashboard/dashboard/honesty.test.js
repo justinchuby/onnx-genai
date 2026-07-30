@@ -242,50 +242,67 @@ describe('accessibility cannot be skipped one panel at a time', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §13(b): every panel declares the engine capability it needs.
+// §13(b) INVERTED BY RULING: no panel declares an engine capability, because
+// no panel is hidden by one any more.
 //
-// The shell uses this to decide what to mount. The reason it is asserted for
-// EVERY panel rather than only for the ones that need a capability is that the
-// dangerous value is the MISSING one: an undeclared panel is indistinguishable
-// from a panel declared as universal, so a KV panel that forgot to declare
-// would mount on a profile that cannot feed it and fill with em-dashes. Making
-// the declaration mandatory turns that from a silent default into a build
-// failure.
+// This block used to REQUIRE `meta.requires` on every panel, justified by
+// four-state reasoning: an undeclared panel "would mount on a profile that
+// cannot feed it and fill with em-dashes". That reasoning is what the fifth
+// state, `not-applicable`, was introduced to retire, and the gate it protected
+// was hiding MEASURED data -- the two servers serve an identical field set.
+//
+// The lint is inverted rather than deleted. A deleted lint protects nothing and
+// leaves no trace, and a re-scope that leaves no trace is indistinguishable
+// from a feature that never existed. Inverted, it is a ratchet: re-introducing
+// the vocabulary has to argue with the ruling instead of silently reappearing,
+// which is exactly how the old gate survived a vocabulary change in the first
+// place.
 // ---------------------------------------------------------------------------
 
-describe('panels declare their capability requirement', () => {
-  const VALID = new Set(['continuous-batch', 'paged-kv', null]);
+describe('no panel is gated by server mode', () => {
+  // The retired spellings. Named explicitly so their return is loud.
+  const RETIRED = new Set(['continuous-batch', 'paged-kv']);
 
-  it('every panel declares `requires` explicitly, including the universal ones', async () => {
+  it('declares no capability requirement in any panel meta', async () => {
+    const offenders = [];
     for (const file of panelSources()) {
-      const module = await import(`./${file}`);
-      const meta = module.meta;
-
+      const { meta } = await import(`./${file}`);
       assert.ok(meta, `${file} exports no meta`);
-      assert.ok(
-        'requires' in meta,
-        `${file} does not declare meta.requires. Declare it as null if the panel ` +
-          'works on every profile — an absent declaration reads as universal, which ' +
-          'is exactly how a panel ends up mounted on an engine that cannot feed it.',
-      );
-      assert.ok(
-        VALID.has(meta.requires),
-        `${file} declares meta.requires = ${JSON.stringify(meta.requires)}, which is ` +
-          `not a capability the shell knows. A typo here silently means "universal".`,
-      );
+      if ('requires' in meta) {
+        offenders.push(`${file}: meta.requires = ${JSON.stringify(meta.requires)}`);
+      }
     }
+    assert.deepEqual(
+      offenders,
+      [],
+      'a panel declares meta.requires again. Panels are no longer hidden by server mode: '
+        + 'the paged and batching servers serve an identical field set, so a gated panel '
+        + 'hides measured data. Re-adding the gate needs a new ruling, not a merge.\n'
+        + offenders.join('\n'),
+    );
   });
 
-  it('keeps the KV panel universal, because it adapts rather than disappearing', async () => {
-    // §13(d). Guards a specific and tempting mistake: declaring 'paged-kv'
-    // here would look obviously correct and would DELETE the KV story from the
-    // static-cache profile — which is the profile the demo actually runs on.
-    // The panel adapts instead: a paged block table on one, decode-row
-    // occupancy on the other.
-    const { meta } = await import('./kv-memory.js');
-    assert.equal(meta.requires, null);
+  it('leaves no retired capability spelling anywhere in the panel sources', async () => {
+    // The meta check above only sees the FIELD. This sees the WORDS, so the
+    // vocabulary cannot come back through a helper, a constant or a second
+    // table -- which is how it drifted from `modes` the first time.
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const offenders = [];
+    for (const file of panelSources()) {
+      const source = readFileSync(fileURLToPath(new URL(`./${file}`, import.meta.url)), 'utf8');
+      for (const spelling of RETIRED) {
+        // Skip the historical note in scheduling.js, which quotes the spelling
+        // in order to explain why it is gone. Prose that BURIES a vocabulary
+        // must not be counted as prose that USES it.
+        const uses = source
+          .split('\n')
+          .filter((line) => line.includes(spelling) && !line.trimStart().startsWith('//'));
+        if (uses.length > 0) offenders.push(`${file}: ${spelling} in ${uses.length} code line(s)`);
+      }
+    }
+    assert.deepEqual(offenders, [], offenders.join('\n'));
   });
-
 });
 
 describe('honesty lint — the measured state is never compared as a literal', () => {

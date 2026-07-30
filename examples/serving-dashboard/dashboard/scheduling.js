@@ -44,13 +44,23 @@ import {
 const WINDOW_MS = 60_000;
 
 export const meta = Object.freeze({
-  // §13(b). The ONE panel with a hard capability requirement: continuous
-  // batching is live on the static-cache profile and absent on the dynamic
-  // one, where every request runs its own path and there is no batch to show.
-  // The shell reads this and renders the group explanation in its place rather
-  // than a panel full of em-dashes -- em-dashes promise a number that is
-  // coming, and on that profile it never is.
-  requires: 'continuous-batch',
+  // This panel used to declare `requires: 'continuous-batch'`, and the registry
+  // removed it from the DOM entirely on the paged server. The declaration said
+  // continuous batching is "absent on the dynamic one, where every request runs
+  // its own path and there is no batch to show".
+  //
+  // The server disagrees, and the server is the authority. `/v1/status` on the
+  // paged origin returns the SAME field set as on the batching origin -- the
+  // served keys and the server-declared absences diff clean -- so this panel
+  // shows the same numbers on both. The gate was hiding measured data, and the
+  // provenance table had classified those fields MEASURED on both origins the
+  // whole time. Two mechanisms, opposite answers, both suites green, because
+  // each was only ever tested against itself.
+  //
+  // The comment also documented a mechanism that never existed: it claimed the
+  // shell "renders the group explanation in its place". Nothing did. The panel
+  // simply vanished, which is the one absence the honesty layer never gets to
+  // narrate.
   id: 'scheduling',
   title: 'Scheduling & batching',
   group: 'scheduling',
