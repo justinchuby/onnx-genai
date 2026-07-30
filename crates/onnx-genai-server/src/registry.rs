@@ -168,6 +168,8 @@ pub(crate) struct ModelStatus {
     pub(crate) is_default: bool,
     /// `last_request_at` (epoch millis) if the model is currently loaded.
     pub(crate) last_request_at: Option<u64>,
+    /// Configured directory for this model, loaded or not.
+    pub(crate) path: PathBuf,
 }
 
 /// Mutable interior of the registry, guarded by a single `RwLock`.
@@ -353,7 +355,13 @@ impl ModelRegistry {
         Ok(self.read()?.available.contains_key(id))
     }
 
-    /// Returns the ids of all currently loaded models in insertion order.
+    /// Ids of currently *loaded* models, in insertion order.
+    ///
+    /// Test-only. `/v1/models` used to be built on this, which silently omitted
+    /// configured-but-lazy models from the only ungated model endpoint; it is
+    /// scoped to tests so production code cannot reach for it again by mistake.
+    /// Callers describing what the server offers want `statuses()`.
+    #[cfg(test)]
     pub(crate) fn ids(&self) -> Result<Vec<String>, RegistryError> {
         Ok(self.read()?.order.clone())
     }
@@ -370,14 +378,15 @@ impl ModelRegistry {
         let default = inner.default_id.as_deref();
         let mut statuses: Vec<ModelStatus> = inner
             .available
-            .keys()
-            .map(|id| {
+            .iter()
+            .map(|(id, spec)| {
                 let loaded = inner.models.get(id);
                 ModelStatus {
                     id: id.clone(),
                     loaded: loaded.is_some(),
                     is_default: default == Some(id.as_str()),
                     last_request_at: loaded.map(|h| h.last_request_at.load(Ordering::Relaxed)),
+                    path: spec.path.clone(),
                 }
             })
             .collect();

@@ -2284,6 +2284,29 @@ fn lazy_state(config: ServerConfig) -> AppState {
     AppState::load_from_specs(specs, config).expect("load lazy two-model state")
 }
 
+/// Router over the lazy two-model state, bound to loopback.
+async fn lazy_two_model_router() -> axum::Router {
+    router_bound_to("127.0.0.1:8123").await
+}
+
+/// Router over the lazy two-model state, bound to `addr`. The bind address is
+/// what decides how much of a model path `/v1/models` may disclose.
+async fn router_bound_to(addr: &str) -> axum::Router {
+    crate::app(lazy_state(ServerConfig {
+        bind_addr: Some(addr.parse().expect("valid socket address")),
+        ..ServerConfig::default()
+    }))
+}
+
+async fn get_json(router: axum::Router, uri: &str) -> Value {
+    let response = router
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
 fn chat_request(model: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -3732,5 +3755,82 @@ fn the_paged_model_cannot_run_continuous_batching() {
     assert!(
         err.to_string().contains("continuous batching requires"),
         "unexpected error: {err}"
+    );
+}
+
+/// A configured-but-lazy model must appear on `/v1/models`, marked unloaded.
+///
+/// It previously did not appear at all, because the endpoint was built on the
+/// loaded-models list. Absence is read as "this model does not exist", which is
+/// a stronger and falser claim than "not loaded".
+#[tokio::test]
+async fn models_lists_configured_models_that_are_not_yet_loaded() {
+    let router = lazy_two_model_router().await;
+    let models = get_json(router, "/v1/models").await;
+    let data = models["data"].as_array().expect("data array");
+
+    assert_eq!(
+        data.len(),
+        2,
+        "both configured models must be listed: {models}"
+    );
+    assert!(
+        data.iter().any(|m| m["loaded"] == false),
+        "a configured-but-unloaded model must be listed and marked unloaded: {models}"
+    );
+    assert_eq!(
+        data.iter().filter(|m| m["is_default"] == true).count(),
+        1,
+        "exactly one model is the default: {models}"
+    );
+}
+
+/// `created` was `now_unix()`, so the same model reported a different creation
+/// time on every poll. Directory mtime is stable and genuinely measured.
+#[tokio::test]
+async fn model_created_is_stable_across_polls() {
+    let router = lazy_two_model_router().await;
+    let first = get_json(router.clone(), "/v1/models").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let second = get_json(router, "/v1/models").await;
+
+    assert_eq!(
+        first["data"][0]["created"], second["data"][0]["created"],
+        "a model's creation time must not advance between polls"
+    );
+    assert!(
+        first["data"][0]["created"].is_u64(),
+        "expected a real mtime: {first}"
+    );
+}
+
+/// An absolute path on an ungated endpoint discloses the operator's username and
+/// filesystem layout. Loopback callers are already on the host, so they get the
+/// full path; anything else gets the basename.
+#[tokio::test]
+async fn model_paths_are_disclosed_only_on_loopback() {
+    let loopback = get_json(router_bound_to("127.0.0.1:8123").await, "/v1/models").await;
+    let path = loopback["data"][0]["path"].as_str().unwrap();
+    assert!(
+        path.contains(std::path::MAIN_SEPARATOR),
+        "loopback should expose the full path, got {path:?}"
+    );
+
+    let public = get_json(router_bound_to("0.0.0.0:8123").await, "/v1/models").await;
+    let path = public["data"][0]["path"].as_str().unwrap();
+    assert!(
+        !path.contains(std::path::MAIN_SEPARATOR),
+        "a non-loopback bind must not disclose the directory layout, got {path:?}"
+    );
+    assert!(!path.is_empty(), "the basename still identifies the model");
+}
+
+/// The cautious behaviour must be what happens when nobody configured anything,
+/// so a new construction path cannot silently start disclosing paths.
+#[test]
+fn an_unknown_bind_address_does_not_disclose_paths() {
+    assert!(
+        !ServerConfig::default().may_disclose_model_paths(),
+        "an unknown bind address must be treated as non-loopback"
     );
 }

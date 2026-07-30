@@ -97,8 +97,24 @@ pub(crate) struct ModelsResponse {
 struct ModelObject {
     id: String,
     object: &'static str,
-    created: u64,
+    /// Directory mtime, in epoch seconds.
+    ///
+    /// Omitted when the directory cannot be stat'd. This previously returned
+    /// `now_unix()`, so polling twice reported two different creation times for
+    /// the same model -- a fabrication that survived because it is conventional
+    /// OpenAI-compat boilerplate that nobody reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<u64>,
     owned_by: &'static str,
+    /// Whether the model is currently resident, as opposed to configured and
+    /// loadable on demand.
+    loaded: bool,
+    /// Whether this is the model that an empty/omitted `model` field resolves to.
+    is_default: bool,
+    /// Configured directory. Absolute on loopback; the basename otherwise, so a
+    /// non-loopback deployment does not leak the operator's username and
+    /// filesystem layout on an endpoint with no authentication in front of it.
+    path: String,
 }
 
 #[derive(Debug, Serialize)]

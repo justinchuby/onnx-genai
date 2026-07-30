@@ -124,6 +124,7 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         max_output_tokens: args.max_output_tokens,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
+        bind_addr: Some(args.addr),
         max_batch: args.max_batch,
         enable_debug_endpoints: args.enable_debug_endpoints,
         enable_admin_endpoints: args.enable_admin_endpoints,

@@ -13,21 +13,53 @@ pub(crate) async fn health(
     }))
 }
 
+/// Directory mtime in epoch seconds, or `None` when it cannot be determined.
+///
+/// Returns `None` rather than a fallback timestamp: an unknown creation time is
+/// omitted, never guessed. Any guess here would be indistinguishable from a
+/// real one and would be wrong in a way no caller could detect.
+fn directory_mtime_secs(path: &std::path::Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since_epoch.as_secs())
+}
+
+/// How much of a model's path to disclose on the ungated `/v1/models`.
+///
+/// The basename still identifies the model usefully while withholding the
+/// operator's home directory and username.
+fn model_path_for_display(path: &std::path::Path, disclose_full_path: bool) -> String {
+    if disclose_full_path {
+        return path.display().to_string();
+    }
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 pub(crate) async fn models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsResponse>, ApiError> {
+    let disclose_paths = state.config.may_disclose_model_paths();
     Ok(Json(ModelsResponse {
         object: "list",
+        // Built from `statuses()`, not `ids()`. `ids()` lists only *loaded*
+        // models, so a configured-but-lazy model was absent from the only
+        // ungated model endpoint -- and absence reads as "this model does not
+        // exist", which is a stronger and falser claim than "not loaded".
         data: state
             .registry
-            .ids()
+            .statuses()
             .map_err(map_registry_error)?
             .into_iter()
-            .map(|id| ModelObject {
-                id,
+            .map(|status| ModelObject {
+                id: status.id,
                 object: "model",
-                created: now_unix(),
+                created: directory_mtime_secs(&status.path),
                 owned_by: "onnx-genai",
+                loaded: status.loaded,
+                is_default: status.is_default,
+                path: model_path_for_display(&status.path, disclose_paths),
             })
             .collect(),
     }))
