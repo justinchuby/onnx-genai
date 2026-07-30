@@ -13,3 +13,8 @@
 ## 2026-07-30T15:20:00Z — PR #477 merged (shape-inference container types + Sequence)
 
 - PR #477 merged (Lori APPROVED): shape-inference IR container-type model + Sequence foundation (#449). Additive `ValueType` layer, byte-identical tensor path, 4 Sequence ops, 300 tests. Unblocks the previously-deferred Sequence/Optional/Map/ZipMap propagation.
+
+## 2026-07-30T21:15:00Z — PR #486 merged (#449 inc2 sequence ops)
+
+- PR #486 merged: #449 inc2 — SequenceInsert/SequenceErase/SplitToSequence/ConcatFromSequence + seq↔tensor conversion; op catalog 213→217, shape-inference 258→262.
+- In flight: #449 inc3 (#527 in review) and inc4.
