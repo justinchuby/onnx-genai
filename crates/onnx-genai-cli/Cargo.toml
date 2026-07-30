@@ -63,6 +63,7 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 reedline = "0.49.0"
+nu-ansi-term = "0.50.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # getrusage for the peak-RSS probe; Linux reads /proc/self/status instead.
@@ -74,7 +75,7 @@ image = { workspace = true, features = ["png"] }
 onnx-genai = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 serde_json = { workspace = true }
-# Unit tests assert visible alignment widths with ratatui's width table.
+# Profile formatting unit tests assert visible alignment widths.
 unicode-width = "0.2.2"
 
 [target.'cfg(unix)'.dev-dependencies]

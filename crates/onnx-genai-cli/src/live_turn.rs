@@ -1,12 +1,12 @@
 //! Append-only rendering of a generating turn.
 //!
 //! The REPL uses reedline for input editing. A previous ratatui inline viewport
-//! also tried to own the cursor and scrollback during generation, which made the
-//! two terminal models fight: a new live viewport could reserve rows at the
-//! submitted input line and overwrite it. This renderer is deliberately simpler:
-//! generated text is appended exactly where ordinary stdout would write it, and
-//! per-turn stats are printed after the turn by `output.rs`. It never moves the
-//! cursor up, never rewrites scrollback, and never reserves rows.
+//! was removed because it also tried to own the cursor and scrollback, so it
+//! could reserve rows at reedline's submitted input line and overwrite it. This
+//! renderer is deliberately simpler: generated text is appended exactly where
+//! ordinary stdout would write it, and per-turn stats are printed after the turn
+//! by `output.rs`. It never moves the cursor up, never rewrites scrollback, and
+//! never reserves rows.
 
 use std::io::{self, IsTerminal, Write};
 

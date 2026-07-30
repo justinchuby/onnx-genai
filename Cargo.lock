@@ -2063,6 +2063,7 @@ dependencies = [
  "image",
  "libc",
  "nix",
+ "nu-ansi-term",
  "onnx-genai",
  "onnx-genai-engine",
  "onnx-genai-metadata",
