@@ -15,7 +15,7 @@ the text**; line numbers are a hint and may have rotted by the time you read thi
 <!-- Machine-checked by check-review-freshness.test.js. Raw hex, never a ref name:
      `review-0` named 6ecd9183 at 03:57 and 0aac6bb1 at 04:21 -- 60 commits apart,
      re-pointed silently, because a tag is a mutable pointer to an immutable object. -->
-MEASURED-AT: 484cda07
+MEASURED-AT: 8230060c
 
 > ⚠️ **A review is a measurement, not a document, and it decays at the rate the tree moves.**
 > This file spent roughly ninety minutes asserting five findings in the present tense after
@@ -598,9 +598,17 @@ its status, its predicate, and both controls.
 
 ### R16 🔴 `'…/**/*.js'` reaches 36 of 74 tracked files, and exits 0
 
-Measured at `f0da0c2a`. `git grep -l '' HEAD -- 'examples/serving-dashboard/**/*.js'` → **36**
-files; the same command with `'examples/serving-dashboard/*.js'` → **74**. Positive control:
-`fetch` reaches 15 files under the working form. Negative control: `zzz_never_written` → 0.
+Measured at `8230060c`, **from the repository toplevel**. `git grep -l '' HEAD -- 'examples/serving-dashboard/**/*.js'` → **36** files; the same command with
+`'examples/serving-dashboard/*.js'` → **75**. Positive control: `fetch` reaches 17 files under
+the working form. Negative control: `zzz_never_written` → 1, and that one hit is this document
+talking about the control, which is the honest answer rather than a suspicious zero.
+
+> ⚠️ **This finding is stated with a predicate that exhibits the finding.** Run either command
+> from inside `examples/serving-dashboard/` instead of the toplevel and **both return 0**, because
+> a `git grep` pathspec resolves relative to the current directory. So the sentence above is only
+> true from one place on disk — which is R18's defect, in R16's evidence. **Every measurement must
+> print its container**, and this one now does. It is the third time this session that a
+> repo-root pathspec issued from a subdirectory turned a real count into a confident zero.
 
 **The `**` form is NARROWER than the `*` form, which is the opposite of what every reader
 assumes.** In a git pathspec `*` already matches `/`, so `dir/*.js` reaches every depth, while
@@ -707,3 +715,43 @@ document has the **fewest** `file:NNN` citations of the three reviewer deliverab
 90 and 43 — and that was published as evidence of cleanliness. **Both are wrong.** The census
 that scored it well counts citations; it has never validated one, neither bounds nor content.
 *Low citation density is a different trade, not rigour.*
+
+### R22 🔴 `git cat-file -e` cannot verify that a tag names a commit, and was used to
+
+A verdict published tonight reads: **`review-0` = `6ecd9183` · verified by `git cat-file -e`.**
+That instrument cannot answer that question. `git cat-file -e 6ecd9183` exits 0 because the
+commit exists. `git cat-file -e review-0` exits 0 because *whatever review-0 points at* exists.
+**Both succeed no matter what the tag names, so the pair proves existence twice and identity
+never.** Measured at `8230060c`: `review-0` resolves to `0aac6bb1`, not `6ecd9183` — the two are
+60 commits apart, and four separate agents published the old mapping after it stopped being true.
+
+The correct predicate is a comparison, not an existence check:
+`[ "$(git rev-parse review-0)" = "$(git rev-parse 6ecd9183^{commit})" ]`.
+
+**The general form, which is this session's most repeated defect and now has five specimens:**
+*an instrument answered a question adjacent to the one asked, and the adjacent answer was
+true.* A histogram that is registered but never observed serves the same 19 lines as one with
+real data. A control proves the instrument reached the subject and says nothing about whether
+the subject is the quantity you meant. **A true answer to the wrong question is far more
+dangerous than a false one, because it survives every check aimed at falsehood.**
+
+### R23 🔴 A review tag freezes the artifact and leaves the verdicts floating
+
+Two reviewers formed blocking verdicts four minutes and two minutes before a tag was cut, on
+SHAs that are ancestors of it. Both were true when written; both were false of the tagged tree;
+neither reviewer could have noticed, because **nothing re-scores a finding when the branch moves
+past it, and a finding does not know a tag was cut after it.**
+
+This document had the same defect: it declared `484cda07`, sixteen commits behind the review
+point. It is now guarded — `check-review-freshness.test.js` fails when any review document's
+`MEASURED-AT` is an ancestor of the newest review tag, and the failure names the document, the
+SHA and the boundary.
+
+**Two details in that guard are the finding rather than the implementation.** It picks the
+boundary tag by **commit date, not by name**, because `review-1` is timestamped 04:02 while
+`review-0` is 04:16 — the numbering implies an order the timestamps deny, and readers sort by
+the name without looking. And it **resolves the tag once and prints the SHA it resolved to**,
+because the obvious spelling of this check — `merge-base --is-ancestor <mine> review-0` —
+re-introduces the exact defect the marker exists to block: **it anchors a freshness decision to
+a mutable name, so the set of documents it condemns changes silently, and the run that
+condemned you cannot be reproduced from its own output.**

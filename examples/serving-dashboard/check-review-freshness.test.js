@@ -142,3 +142,68 @@ test('every review document that declares a measurement SHA declares a real one'
     );
   }
 });
+
+// BACKWARD DRIFT -- the half the ancestor check above cannot see.
+//
+// Asserting that a document's SHA is an ancestor of HEAD proves it is on this
+// history. It does NOT prove the document was measured against the tree reviewers
+// are actually extracting. Those are different failures and only one of them has
+// been instrumented all session.
+//
+// A review tag freezes the artifact and leaves the VERDICTS floating. Two reviewers
+// tonight formed blocking verdicts four minutes and two minutes before a tag was cut,
+// on SHAs that are ancestors of it. Both verdicts were true when written, both were
+// false of the tagged tree, and neither reviewer had any way to notice: nothing
+// re-scores a finding when the branch moves past it, and the finding does not know a
+// tag was cut afterwards.
+//
+// THE REMEDY'S OWN TRAP, WHICH IS WHY THIS RESOLVES THE TAG ONCE AND PRINTS IT:
+// the obvious check is `git merge-base --is-ancestor <mine> review-0`, and that
+// re-introduces exactly the defect the hex requirement above exists to block --
+// it anchors a freshness decision to a MUTABLE NAME. `review-0` moved 60 commits
+// during this session. A check against a moving boundary silently changes which
+// documents it condemns, and the run that condemned you is not reproducible from
+// its own output. So the tag is resolved to a SHA once, that SHA is printed, and
+// the printed SHA is what the assertion talks about.
+test('no review document was measured before the tree reviewers extract', () => {
+  const tags = git('tag', '--list', 'review-*')
+    .split('\n')
+    .filter(Boolean)
+    .map((name) => ({ name, sha: git('rev-parse', `${name}^{commit}`) }));
+
+  if (tags.length === 0) {
+    console.log('  note: no review-* tag exists; backward drift is not defined yet');
+    return;
+  }
+
+  // The newest tag by commit date, not by NAME: review-1 is timestamped 04:02 and
+  // review-0 is 04:16 on this branch. The numbering implies an order the timestamps
+  // deny, and readers sort by the name without looking.
+  const boundary = tags
+    .map((t) => ({ ...t, when: Number(git('log', '-1', '--format=%ct', t.sha)) }))
+    .sort((a, b) => b.when - a.when)[0];
+
+  console.log(`  boundary: ${boundary.name} resolved to ${boundary.sha.slice(0, 8)}`);
+
+  for (const doc of REVIEW_DOCS) {
+    const match = MARKER.exec(readFileSync(join(HERE, doc), 'utf8'));
+    if (!match) continue;
+    const declared = match[1];
+
+    let predatesBoundary = false;
+    try {
+      git('merge-base', '--is-ancestor', declared, boundary.sha);
+      predatesBoundary = git('rev-parse', declared) !== boundary.sha;
+    } catch {
+      predatesBoundary = false;
+    }
+
+    assert.ok(
+      !predatesBoundary,
+      `${doc} was measured at ${declared}, which is an ancestor of ${boundary.name} ` +
+        `(${boundary.sha.slice(0, 8)}). Every row in it describes a tree that the ` +
+        `review point has already moved past. Re-measure and update MEASURED-AT. ` +
+        `Quote the resolved SHA, never the tag name -- the name moves.`,
+    );
+  }
+});
