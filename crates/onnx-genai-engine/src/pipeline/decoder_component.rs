@@ -155,6 +155,129 @@ impl PipelineDecoderComponent for OrtPipelineDecoder<'_> {
     }
 }
 
+/// Native (pure-Rust nxrt) [`PipelineDecoderComponent`]: wraps a
+/// [`NativeDecodeSession`](crate::native_decode::NativeDecodeSession) whose KV
+/// cache stays session-resident across `step()` calls, so the expensive KV state
+/// never round-trips through the host pipeline pool. Only the small per-step
+/// routed inputs (e.g. one token's `inputs_embeds` produced by an every_step
+/// component) cross the host seam each step; the decoder owns and grows its KV
+/// internally.
+///
+/// This is the Inc2b (GAP 3) counterpart to [`OrtPipelineDecoder`]: the same
+/// pipeline decode loop drives either backend through the trait with no forked
+/// code path. Paged present-KV mirroring is not yet supported here — native
+/// selection runs the non-paged, fresh-decode path (see
+/// `.squad/decisions/inbox/mary-pipeline-inc2b-design.md`); cross-attention /
+/// vision KV is Inc3.
+#[cfg(feature = "native-backend")]
+pub(crate) struct NativePipelineDecoder {
+    session: crate::native_decode::NativeDecodeSession,
+    /// Next-token logits (final position) from the most recent step, retained so
+    /// the loop reads them without the native tensor type crossing the seam.
+    last_logits: Option<Vec<f32>>,
+}
+
+#[cfg(feature = "native-backend")]
+impl NativePipelineDecoder {
+    /// Load the decoder ONNX model as a native decode session on the given
+    /// device, keeping its KV cache resident across the generation. The
+    /// pipeline-declared `io` spec is threaded so an `inputs_embeds` decoder
+    /// (no token input) binds its sequence source and KV pairs from metadata.
+    pub(crate) fn load(
+        path: &std::path::Path,
+        device: crate::native_decode::NativeDecodeDevice,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
+        let session = crate::native_decode::NativeDecodeSession::load_with_io(path, device, io)
+            .with_context(|| {
+                format!(
+                    "failed to load native pipeline decoder '{}'",
+                    path.display()
+                )
+            })?;
+        Ok(Self {
+            session,
+            last_logits: None,
+        })
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl PipelineDecoderComponent for NativePipelineDecoder {
+    fn step(
+        &mut self,
+        input_tokens: &[TokenId],
+        past_len: usize,
+        extras: &[(String, Value)],
+    ) -> anyhow::Result<()> {
+        // Route each host-pool extra (an ort::Value, e.g. the every_step
+        // embedding output) to the decoder's exact graph port as a native tensor.
+        // value -> ComponentTensor -> native Tensor reuses the Inc1 value-type
+        // seam; this is one token's embedding per decode step (small upload),
+        // while the KV cache stays resident inside the native session.
+        let mut step_inputs = Vec::with_capacity(extras.len());
+        for (port, value) in extras {
+            let component = value_to_component_tensor(value)?;
+            let tensor =
+                crate::native_component::component_tensor_to_native_tensor(port, &component)?;
+            step_inputs.push((port.clone(), tensor));
+        }
+        let rows = self
+            .session
+            .decode_with_step_inputs(input_tokens, past_len, &step_inputs)?;
+        // Native decode returns one logits row per input position; the final row
+        // is the next-token distribution (matching the ORT extractor).
+        self.last_logits = Some(
+            rows.into_iter()
+                .next_back()
+                .context("native decoder produced no logits rows")?,
+        );
+        Ok(())
+    }
+
+    fn next_token_logits(&self) -> anyhow::Result<Vec<f32>> {
+        self.last_logits
+            .clone()
+            .context("decoder logits requested before any decode step ran")
+    }
+
+    fn mirror_last_present_kv(
+        &self,
+        _kv_model: &KvModelInfo,
+        _cache: &mut PagedKvCache,
+        _seq: SequenceId,
+        _retained_past_len: usize,
+        _input_len: usize,
+    ) -> anyhow::Result<()> {
+        // The native decoder keeps KV session-resident and does not expose host
+        // present tensors for paged mirroring. Native selection runs the
+        // non-paged path, so this is never reached; exposing native present-KV
+        // for cross-request reuse is Inc3.
+        anyhow::bail!(
+            "native pipeline decoder does not support paged present-KV mirroring yet (Inc3); \
+             native selection runs the non-paged decode path"
+        )
+    }
+
+    fn use_kv(&self) -> bool {
+        true
+    }
+
+    fn retained_kv_len(&self, past_len: usize) -> usize {
+        // No sliding window in this increment: retained length is the absolute
+        // past length. Only feeds paged mirroring, which native selection skips.
+        past_len
+    }
+
+    fn sliding_window(&self) -> Option<usize> {
+        None
+    }
+
+    fn sink_tokens(&self) -> usize {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
