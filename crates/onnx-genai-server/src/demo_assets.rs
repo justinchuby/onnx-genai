@@ -436,6 +436,30 @@ mod tests {
         }
     }
 
+    /// The percent refusal at the top of the `/demo/` branch is the obvious
+    /// thing to hoist to the first statement, and hoisting it would 404 every
+    /// route whose path parameter is percent-encoded. Model ids contain `/`,
+    /// which arrives as `%2F`, so `Qwen/Qwen3-8B` is a real id on this server
+    /// and not a contrived one. Without these cases the loop above holds only
+    /// for paths that happen to have no escapes, and a `path.contains('%')`
+    /// regression ships green through the one test written to stop it.
+    #[test]
+    fn api_paths_carrying_percent_escapes_are_still_not_this_predicate_s_business() {
+        for path in [
+            "/v1/admin/models/Qwen%2FQwen3-8B/load",
+            "/v1/admin/models/Qwen%2FQwen3-8B/unload",
+            "/v1/sessions/9d1f%2Fscatter",
+        ] {
+            assert!(
+                demo_path_is_servable(path),
+                "{path} is outside /demo/ and must stay outside this predicate's opinion"
+            );
+        }
+        // Control: the refusal is still live one segment over, so a predicate
+        // that simply returns true for everything cannot satisfy this test.
+        assert!(!demo_path_is_servable("/demo/absolute-path%2Etest.js"));
+    }
+
     /// Case is not a bypass: `ServeDir` will happily open `NOTES.MD`.
     #[test]
     fn extension_matching_is_case_insensitive() {
