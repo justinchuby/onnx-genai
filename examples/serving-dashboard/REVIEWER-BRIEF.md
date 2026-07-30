@@ -630,3 +630,79 @@ which is why nobody would question it.
 The same applies to observations of a running system. A dashboard checked at rest
 is checked in the one state where several defects are invisible; peak-zero — zero
 at maximum load, not zero at idle — is the observation that finds them.
+
+### 8.7 Verify your artefact is inside a repository at all
+
+We ratified "verify your commits exist." There is a rung below it that cost us
+more.
+
+A failed commit leaves a dirty file, and `git status` will show it to you. A file
+written **outside** the repository produces a perfectly clean `git status` —
+byte-identical to the output of work that committed successfully. No index entry,
+no diff, nothing to notice. The proudest field in our provenance stamp,
+`--porcelain 0`, is also the exact signature of work that was never in the
+repository.
+
+A census near the end of this session found thirteen documents over 2 KB, roughly
+830 KB in total, written by eleven contributors over eight hours, that `git
+ls-files` could not find. Two of them had been announced as delivered minutes
+earlier. One was a complete review deliverable; one was the evidence for a
+release-gate item.
+
+So the family of claims a reviewer should keep separate is longer than it looks.
+**Exists · is inside a repository · is committed · is wired · is reachable from a
+branch · is in the right checkout.** Every one of those looks identical when it
+passes, and this session lost time to all six.
+
+The only instrument that distinguishes them is `git show HEAD:<path>` followed by
+counting something you already know the answer to. `git ls-files` proves a *path*
+is tracked; it cannot prove the bytes at that path are yours.
+
+### 8.8 A check satisfiable only by a defect is a false-red generator
+
+This one is ours, found in the release gate itself and not in the product.
+
+One gate criterion read: *a live 4-concurrent generation on the **dynamic**
+origin returning a non-zero batch size*. The dynamic origin is the per-request
+engine path — it returns a batch size of exactly 1, by construction, and that is
+the arm demonstrating batching does **not** occur. One is non-zero. So the
+criterion was satisfied precisely by the configuration that proves the feature
+absent, and would have been violated by a working build.
+
+It never fired, because the item closed on other evidence. That is the part worth
+carrying: **a defective check that gets routed around is indistinguishable from a
+correct one.** It has no failures to its name and no successes either. Nothing in
+a green run, or in a closed checklist, marks the difference.
+
+The mirror of this is the pattern documented throughout §8: a check that cannot
+fail, and a check that can only fail wrongly, are the same defect measured from
+opposite ends.
+
+### 8.9 Two instruments that share an input do not corroborate — they echo
+
+Several confirmations in this record are weaker than they appear, and it is worth
+knowing which kind you are reading.
+
+Our citation checker and its repair script both `readFileSync` the **working
+tree**. They agree with each other by construction, and can only disagree with
+the tree you will clone. Separately, one guard reports different results in a
+clean checkout and a dirty one — it audits whatever is on disk, including files
+that are not in the repository and will never ship. It reddened on an orphaned
+document and would have gone green if someone deleted that file without fixing
+anything.
+
+The same applies to people. Two reviewers using different methods at the same
+commit are independent in *method* and correlated in *time*; two reports at one
+sha are one report wearing two names. The check is
+`git merge-base --is-ancestor <their-sha> <my-sha>` — if one confirmation's
+commit is an ancestor of the other's, it is not a second data point.
+
+And the corollary that surprised us: recency is evidence about *staleness*, not
+evidence about *correctness*. Late in this session the freshest reading of a file
+was the only wrong one, and it nearly retired a live blocker.
+
+For a runtime result the equivalent of "retrieve it from HEAD" is: **identify the
+binary by its behaviour in the same invocation as the measurement.** `ps` cannot
+tell you which code is executing — two server pairs here shared a binary path
+while the older processes held the older inode, and only a payload field
+distinguished them.
