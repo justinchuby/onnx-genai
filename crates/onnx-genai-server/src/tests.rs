@@ -5097,3 +5097,67 @@ fn the_driver_never_derives_kv_applicability_from_the_batch_path() {
          guards is gone is worse than no guard"
     );
 }
+
+/// The parked queue must be drained BEFORE the first `step()`, not merely
+/// before the batch returns.
+///
+/// `commands_parked_before_a_batch_starts_are_drained_into_it` proves the
+/// command is drained EVENTUALLY, and that is not the property AC31 needs. It
+/// passes with the drain moved below the idle break, because a multi-step
+/// generation always has a non-final iteration for a late drain to run in --
+/// the command comes out one step late and the assertion, made after the batch
+/// returns, cannot see the difference. A step is a whole forward pass, and
+/// under a backfilled batch there is no last iteration to be late in: that is
+/// exactly the 7.9s `/v1/resources` stall.
+///
+/// `max_new_tokens = 1` removes the hiding place. The batch is idle after one
+/// step, so the loop breaks on its first pass and a drain positioned after the
+/// break never executes at all. Ordering becomes observable through a plain
+/// after-the-fact assertion, with no timing and no concurrency.
+///
+/// MUTATION-PROVEN: moving the `std::mem::take(deferred)` block below
+/// `if manager.is_idle() { break; }` leaves the test above green and turns
+/// this one red.
+#[tokio::test]
+async fn parked_commands_are_drained_before_the_batch_takes_its_first_step() {
+    use std::collections::VecDeque;
+
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+
+    let (_tx, mut rx) = tokio::sync::mpsc::channel::<crate::driver::DriverCommand>(8);
+    let (events, _events_rx) = tokio::sync::mpsc::channel(64);
+    let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        .acquire_owned()
+        .await
+        .expect("semaphore permit");
+
+    let mut deferred = VecDeque::new();
+    let (reply, _snapshot_rx) = tokio::sync::oneshot::channel();
+    deferred.push_back(crate::driver::DriverCommand::ResourceSnapshot(reply));
+
+    // One token: the batch is idle the moment the first step returns.
+    let mut request = onnx_genai::GenerateRequest::new("hello");
+    request.options.max_new_tokens = 1;
+
+    let batch_telemetry = crate::batch_telemetry::BatchTelemetry::default();
+    crate::driver::run_static_batch_until_idle(
+        &engine,
+        &mut rx,
+        &mut deferred,
+        4,
+        request,
+        events,
+        permit,
+        &batch_telemetry,
+    );
+
+    assert!(
+        deferred.is_empty(),
+        "a command parked before the batch started survived a single-step \
+         batch, so the drain runs after the idle break rather than before the \
+         first step; under a backfilled batch that command waits for the whole \
+         batch and /v1/resources stalls"
+    );
+}
