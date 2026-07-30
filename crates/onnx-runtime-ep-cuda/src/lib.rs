@@ -87,7 +87,10 @@ pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
-pub use weight_paging::{CudaWeightPage, CudaWeightPager};
+pub use weight_paging::{
+    CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,
+    WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV,
+};
 
 /// Number of additional u32 words required by the CUDA device argmax result buffer.
 pub fn device_argmax_scratch_words(elements: usize) -> usize {

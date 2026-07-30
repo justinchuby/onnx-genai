@@ -120,6 +120,12 @@ impl CudaExecutionProvider {
     ) -> crate::weight_paging::CudaWeightPager<'a, S> {
         crate::weight_paging::CudaWeightPager::new(Arc::clone(&self.runtime), source)
     }
+
+    /// Build a bounded-VRAM [`CudaWeightResidency`] (WEIGHT_OFFLOAD Phase 3b
+    /// page-in + eviction) sized by `budget_bytes`, sharing this EP's runtime.
+    pub fn weight_residency(&self, budget_bytes: u64) -> crate::weight_paging::CudaWeightResidency {
+        crate::weight_paging::CudaWeightResidency::new(Arc::clone(&self.runtime), budget_bytes)
+    }
 }
 
 impl ExecutionProvider for CudaExecutionProvider {

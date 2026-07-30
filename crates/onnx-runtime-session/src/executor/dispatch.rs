@@ -333,8 +333,7 @@ impl Executor {
         )?;
 
         let capabilities = self.ep.capabilities();
-        let accepts_lazy_weights =
-            LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
+        let accepts_lazy_weights = LazyWeightBoundary::matches_any(&node.domain, &node.op_type);
         let has_lazy_inputs = accepts_lazy_weights
             && inputs.iter().any(|input| {
                 input

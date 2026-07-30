@@ -95,13 +95,37 @@ fn checked_shape_product(shape: &[usize]) -> Result<usize, WeightHandleError> {
 pub enum LazyWeightBoundary {
     /// `pkg.nxrt::BlockQuantizedMoE`, the Phase-3 offload binding boundary.
     BlockQuantizedMoe,
+    /// `com.microsoft::QMoE`, the boundary real DeepSeek/GLM/Qwen exports use.
+    QMoe,
 }
 
 impl LazyWeightBoundary {
+    /// Every op boundary at which a lazy weight may be device-paged.
+    pub const ALL: [LazyWeightBoundary; 2] = [Self::BlockQuantizedMoe, Self::QMoe];
+
+    /// Canonical (domain, op_type) this boundary binds at.
+    fn identity(self) -> (&'static str, &'static str) {
+        match self {
+            Self::BlockQuantizedMoe => ("pkg.nxrt", "BlockQuantizedMoE"),
+            Self::QMoe => ("com.microsoft", "QMoE"),
+        }
+    }
+
     pub fn matches(self, domain: &str, op_type: &str) -> bool {
-        matches!(self, Self::BlockQuantizedMoe)
-            && domain == "pkg.nxrt"
-            && op_type == "BlockQuantizedMoE"
+        let (want_domain, want_op) = self.identity();
+        domain == want_domain && op_type == want_op
+    }
+
+    /// The offload boundary that binds `(domain, op_type)`, if any.
+    pub fn for_op(domain: &str, op_type: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|boundary| boundary.matches(domain, op_type))
+    }
+
+    /// Whether any offload boundary binds `(domain, op_type)`.
+    pub fn matches_any(domain: &str, op_type: &str) -> bool {
+        Self::for_op(domain, op_type).is_some()
     }
 }
 
@@ -145,7 +169,9 @@ impl std::fmt::Debug for LazyWeight {
 }
 
 impl LazyWeight {
-    pub fn block_quantized_moe<M>(
+    /// Build a lazy weight bound at an arbitrary offload boundary.
+    pub fn new<M>(
+        boundary: LazyWeightBoundary,
         dtype: DataType,
         shape: Vec<usize>,
         regions: Vec<ExternalMmapRegion>,
@@ -158,12 +184,30 @@ impl LazyWeight {
             return Err(WeightHandleError::MissingRegions);
         }
         Ok(Self {
-            boundary: LazyWeightBoundary::BlockQuantizedMoe,
+            boundary,
             dtype,
             shape,
             regions,
             resident_materializer: Arc::new(resident_materializer),
         })
+    }
+
+    pub fn block_quantized_moe<M>(
+        dtype: DataType,
+        shape: Vec<usize>,
+        regions: Vec<ExternalMmapRegion>,
+        resident_materializer: M,
+    ) -> Result<Self, WeightHandleError>
+    where
+        M: ResidentWeightMaterializer + 'static,
+    {
+        Self::new(
+            LazyWeightBoundary::BlockQuantizedMoe,
+            dtype,
+            shape,
+            regions,
+            resident_materializer,
+        )
     }
 
     /// Total canonical byte size of the backing tensor, summed across regions.
@@ -342,6 +386,30 @@ mod tests {
         assert_eq!(materializations.load(Ordering::Relaxed), 0);
         assert_eq!(weight.materialize().unwrap().bytes(), &[1, 2, 3, 4]);
         assert_eq!(materializations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn offload_boundary_recognizes_block_quantized_moe_and_qmoe() {
+        assert_eq!(
+            LazyWeightBoundary::for_op("pkg.nxrt", "BlockQuantizedMoE"),
+            Some(LazyWeightBoundary::BlockQuantizedMoe)
+        );
+        assert_eq!(
+            LazyWeightBoundary::for_op("com.microsoft", "QMoE"),
+            Some(LazyWeightBoundary::QMoe)
+        );
+        assert!(LazyWeightBoundary::matches_any("com.microsoft", "QMoE"));
+        assert!(LazyWeightBoundary::matches_any(
+            "pkg.nxrt",
+            "BlockQuantizedMoE"
+        ));
+        // Wrong domain/op pairings and unrelated ops are not offload boundaries.
+        assert_eq!(LazyWeightBoundary::for_op("pkg.nxrt", "QMoE"), None);
+        assert_eq!(
+            LazyWeightBoundary::for_op("com.microsoft", "BlockQuantizedMoE"),
+            None
+        );
+        assert!(!LazyWeightBoundary::matches_any("ai.onnx", "MatMul"));
     }
 
     #[test]
