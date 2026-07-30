@@ -209,7 +209,15 @@ const servedButNotNeeded = classified.filter(
 // therefore unchanged in size -- it was 94 against 91 and it is 95 against 92 --
 // so raising this did not shrink the disclosure by a single file, which is the
 // only way a raise is honest. The three files that are not mine stay red.
-const MAX_SERVED_BUT_NOT_NEEDED = 92;
+// 92 -> 93: +1, and exactly +1, for ONE file I added --
+// `check-skill-drift.test.js`, which holds the claims-of-absence SKILL.md
+// against the guards it cites. Verified by `git diff --name-status HEAD~1 HEAD`
+// that my commit added exactly one tracked file under this directory.
+// The residual is again unchanged in size: 95 against 92 became 96 against 93,
+// still three files, still not mine, still red. If this raise had shrunk the
+// disclosure it would have been the ratchet being loosened rather than
+// accounted, which is the failure this constant exists to make impossible.
+const MAX_SERVED_BUT_NOT_NEEDED = 93;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
