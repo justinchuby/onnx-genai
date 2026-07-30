@@ -4,11 +4,75 @@ Reviewers extract exactly one tree. This file records which one. **This file is 
 authority.** Broadcasts, chat messages, DAG task text and tag names do not outrank it, by
 explicit ruling of the project lead.
 
-REVIEW-POINT-SHA: 217ae17052f50b901ebd5bb057bfab5ffd418c49
-MEASURED-AT: 217ae17052f50b901ebd5bb057bfab5ffd418c49
+REVIEW-POINT-SHA: 1944a5e9a7d79c5f0936f488c0c60b6c7f9b7ff8
+MEASURED-AT: 1944a5e9a7d79c5f0936f488c0c60b6c7f9b7ff8
+
+**MOVED FORWARD FROM `217ae170`, AND THE REASON IS A SECURITY FIX, NOT A GREENER NUMBER.**
+`217ae170` and every earlier candidate — `37d0d72e`, `3b701494`, `d1c8fff0` — **do not contain
+the C19 fix.** Measured in their own bytes rather than by ancestry alone:
+
+    rest.contains('%')  in demo_assets.rs   at 1944a5e9 ... 1   [CONTROL] fn count 27
+                                            at 37d0d72e ... 0
+
+`f359363a` (07:57:47) is the commit that closes it and is an ancestor of this pin. **Pinning
+any earlier SHA ships a live percent-escape bypass of the demo asset guard.** The failure
+count at the earlier candidates is lower and that is exactly the trap: `d1c8fff0` scores
+787/786 because it is **69 test arms smaller** than the tree above it (61 test files against
+64; control — files present at the candidate and absent above: 0, a pure superset).
+
+### The score at this pin, taken in a clean detached worktree
+
+    git worktree add --detach <dir> 1944a5e9a7d79c5f0936f488c0c60b6c7f9b7ff8
+    requested SHA == actual SHA .... ASSERTED
+    porcelain 0 · untracked 0 · tracked-but-missing 0
+    [POS CONTROL] test files enumerated by git ls-files: 64
+
+    node --test $(git ls-files '*.test.js')      RAW UNPIPED EXIT: 1
+      tests 868 · suites 126 · pass 860 · fail 8 · cancelled 0 · skipped 0 · todo 0
+
+**Eight failures, and the split is five false to three true.** The five are one defect:
+`run-demo.sh:329` is English prose inside a quoted `fail "..."` string, and the line-based
+scanner in `check-launcher.test.js:48-66` counts it as a server launch. Named, so a reader
+greps the assertion and not the count:
+
+    every endpoint the dashboard polls is registered by the documented launch command   FALSE
+    every flag in a copy-pasteable command exists in the server CLI                     FALSE
+    every flag named in any demo document exists in the server CLI                      FALSE
+    every server launch passes --demo-assets-dir                                        FALSE
+    the --demo-assets-dir value is absolute, not relative                               FALSE
+    no review document was measured before the tree reviewers extract                   TRUE
+    no served measurement is left unrendered, beyond the pinned set                     TRUE
+    the exposure ratchet has not been loosened                                          TRUE
+
+The three true ones are disclosed, owned and deliberate. The ratchet reads 94 against a
+ceiling of 91 and its author left it red on purpose rather than absorb three files that were
+not theirs. **Do not raise it to go green.**
+
+### The Rust suite is inherited, and the inheritance is proved rather than assumed
+
+No `cargo` run was taken at this pin. The machine has 1.68 GiB free against 87 GiB of
+existing `target/` directories, so building would have been a disk incident. Instead the
+subject was shown to be unchanged:
+
+    crates/ tree object @ 34ea441d ... 560f0a7ebf453746d297e2a4ad06f090c29f2080
+    crates/ tree object @ 1944a5e9 ... 560f0a7ebf453746d297e2a4ad06f090c29f2080   IDENTICAL
+    [NEG CONTROL]      @ 37d0d72e ... e613bf7a…                                   DIFFERS
+
+Six commits separate the two SHAs and not one touches `crates/` (control: 5 paths changed,
+all of them `.md` or `shipping-tree.*`). The Rust result carried forward is **272 passed · 0
+failed · 4 ignored** at `34ea441d`, measured by its author, against byte-identical bytes.
+
+**Two caveats, both against this inheritance and both mine to state.** A green suite is a
+sample and not a property of a commit — the same package produced exit 101 once and exit 0
+twice at one SHA earlier tonight, on a genuinely flaky concurrency test over the shared
+batched driver. And an identical tree proves the *subject* did not move, not that the *result*
+is reproducible. **Anyone who needs a certified Rust number must run it here, once disk
+allows, and should expect to run it more than once.**
 
 **ALL TAGS ARE VOID.** `review-0`, `review-1` and `review-2` are retired and no `review-3`
-was ever created. The line above is a raw hex SHA and that is deliberate: a tag is a mutable
+was ever created — **and none will be.** The project lead has ruled that no fourth tag exists
+and that the review point is published as raw hex only. A task order asking for `review-3` to
+be *cut* is satisfied by the hex above, not by `git tag`. The line above is a raw hex SHA and that is deliberate: a tag is a mutable
 pointer to an immutable object, and the object's immutability is exactly what hides the move.
 `review-0` was silently re-pointed across sixty commits under four reviewers and every stale
 SHA still resolved, so nothing errored. Cite the hex. Never cite a name.
