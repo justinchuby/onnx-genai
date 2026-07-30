@@ -33,7 +33,37 @@
      projector; dark reduces emitted-light area and lets the Okabe-Ito hues
      sit at their intended saturation instead of fighting white.           */
   --og-bg: #0d1117;
+
+  /* ── THE REFERENCE SURFACE — READ BEFORE CHANGING THE NEXT LINE ────────
+     --og-bg-raised is not one colour among five. It is the DENOMINATOR of
+     every contrast claim in this file: 14 tokens carry an "N:1 on
+     --og-bg-raised" annotation, and asset-graph.test.js recomputes all 14
+     from the shipped hex values on every run.
+
+     Editing it does NOT break anything silently -- that was the fear, and
+     it is measurably wrong. Mutating #151b23 -> #171d26 (a change too small
+     to see) turns the suite RED in three places and names the casualty:
+         --og-na-rule #53687e = 2.94:1, needs 3:1
+     The guard is doing its job. This note exists because being STOPPED by a
+     red suite and knowing WHY you were stopped are different things, and
+     only one of them is written down.
+
+     MARGIN TO THE WCAG FLOOR, COMPUTED (not asserted), closest first:
+         --og-na-rule      3.009:1  vs 3.0 non-text   +0.009  <- knife edge
+         --og-fg-subtle    4.528:1  vs 4.5 body text  +0.028  <- knife edge
+         --og-unavail-rule 3.086:1  vs 3.0            +0.086
+         --og-cell-stroke  3.086:1  vs 3.0            +0.086
+     Everything else clears by >0.12.
+
+     So: ANY perceptible change to this value will fail on --og-na-rule
+     first, and --og-fg-subtle second. --og-fg-subtle is the more expensive
+     of the two -- it is body text, used 25 times, and D291 records that it
+     already shipped once at 4.10:1 underneath a comment certifying it
+     passed. Re-run the contrast suite BEFORE you commit a new surface, not
+     after, and fix the token rather than the annotation. Editing the
+     annotation to match a failing colour is the exact move D291 cost us. */
   --og-bg-raised: #151b23;
+
   --og-bg-sunken: #090c10;
   --og-bg-hover: #1c232b;
   --og-bg-active: #232b35;
