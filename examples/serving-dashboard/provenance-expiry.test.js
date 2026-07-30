@@ -27,6 +27,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
+import {
+  declaredKeys as scanKeys,
+  duplicatesAmong,
+  findLiteralOpener,
+} from './dashboard/testing/object-keys.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ADMIN_RS = resolve(HERE, '../../crates/onnx-genai-server/src/routes/admin.rs');
@@ -158,9 +163,42 @@ describe('the provenance register expires when the server catches up', () => {
 describe('the provenance catalogue defines each field exactly once', () => {
   const REGISTER_PATH = new URL('./telemetry-provenance.js', import.meta.url);
 
-  /** Keys at the register's own indent level; nested option keys are deeper. */
+  /**
+   * Keys declared directly in the PROVENANCE literal.
+   *
+   * This used to be `/^ {2}'([\w.]+)':\s*\{/gm`, and that regex was BLIND to
+   * the defect it guards. Proven by mutation: injecting a duplicate written
+   * `"server.model_id":` -- same key, double quotes -- left this file 5 pass /
+   * 0 fail over a live duplicate, while the parse-level scanner reddened.
+   *
+   * ⚠️ And the anti-vacuity check below PASSED during that mutation, which is
+   * the part worth remembering. A key the regex never matches never enters the
+   * list, so it changes neither `keys.length > 20` nor the duplicate count:
+   * both halves read through the same regex and were blind in the same
+   * direction at the same instant. A control is only as wide as the instrument
+   * it controls.
+   *
+   * Nobody types the second quote style on purpose -- a formatter, a paste
+   * from JSON, or one contributor's editor is all it takes. So this now shares
+   * ONE implementation with dashboard/field-keys.test.js. Two separate parsers
+   * for one defect is how guards drift apart; two call sites of one scanner
+   * cannot.
+   */
   function declaredKeys(source) {
-    return [...source.matchAll(/^ {2}'([\w.]+)':\s*\{/gm)].map((m) => m[1]);
+    return declaredKeyEntries(source).map((key) => key.name);
+  }
+
+  /**
+   * The same keys with their line numbers, for reporting WHERE a duplicate is.
+   * "'batch.capacity' is declared twice" without line numbers sends a reader
+   * scrolling a 900-line catalogue looking for a second occurrence that, by
+   * definition, looks exactly like the first.
+   */
+  function declaredKeyEntries(source) {
+    // findLiteralOpener THROWS when the marker is absent rather than returning
+    // an empty answer, so a rename of the export cannot be reported as "no
+    // duplicates found".
+    return scanKeys(source, findLiteralOpener(source, 'export const PROVENANCE'));
   }
 
   it('parses keys out of the register source at all', () => {
@@ -173,9 +211,10 @@ describe('the provenance catalogue defines each field exactly once', () => {
   });
 
   it('declares no field twice', () => {
-    const keys = declaredKeys(readFileSync(REGISTER_PATH, 'utf8'));
-    const seen = new Set();
-    const duplicates = [...new Set(keys.filter((k) => seen.has(k) || (seen.add(k), false)))];
+    const keys = declaredKeyEntries(readFileSync(REGISTER_PATH, 'utf8'));
+    const duplicates = duplicatesAmong(keys).map(
+      ({ name, lines }) => `${name} (lines ${lines.join(', ')})`,
+    );
 
     assert.deepEqual(
       duplicates,
