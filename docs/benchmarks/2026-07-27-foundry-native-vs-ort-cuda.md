@@ -113,3 +113,118 @@ for backend in native ort; do
       --prompt "Explain the theory of relativity in detail."
 done
 ```
+
+---
+
+# 7B bottleneck localization (follow-up, 2026-07-27)
+
+**Why:** the 7B native lead over ORT was the thinnest of the four models
+(1.13×). Justin wants us strong on larger models, so we localized where the 7B
+native CUDA decode spends its on-device time to aim a future *reviewed* kernel
+PR at the right place. **Scoping only — no kernels were modified.**
+
+## Method
+
+The `profile_native --steady --trace` path short-circuits before the tracer
+block, and the tool's standalone `NativeDecodeSession::load` can't resolve this
+Foundry model's token port (`input_ids` and `attention_mask` are both
+`int64 [-1,-1]`, so port auto-detection is ambiguous — the ambiguity the
+engine's `genai_config.json`-derived `model.io.token_input` resolves). So the
+trace was captured through the real engine via the supported CLI timeline
+(`--profile-trace`, which merges the engine's ORT-profiler spans with the native
+runtime's per-operator `onnx-runtime-tracer` spans — the same `write_merged_trace`
+the interactive CLI uses). No source was modified.
+
+```bash
+source /home/justinchu/onnx-genai/.cudaenv.sh
+export ONNX_GENAI_ORT_LIB="$ORT_ROOT/lib/libonnxruntime.so.1.27.0"
+cargo build --release -p onnx-genai-cli --features native-cuda --bin onnx-genai
+CUDA_VISIBLE_DEVICES=1 taskset -c 1 \
+  env ONNX_GENAI_EP=cuda ONNX_GENAI_TRACE_VERBOSITY=full \
+  target/release/onnx-genai --profile --profile-trace qwen7b-native.json \
+    generate --backend native --raw --greedy --max-new-tokens 64 \
+    --prompt "Explain the theory of relativity in detail." \
+    /home/justinchu/.foundry/cache/models/Microsoft/qwen2.5-7b-instruct-cuda-gpu-4/v4
+```
+
+Pinned to **GPU 1** (device 1, idle). The decode runs under **CUDA-graph
+capture** (every op reports `capture_status: captured`): the graph is exercised
+eagerly twice (a cold capture-warmup pass and one warm pass) and then replayed
+silently, so per-op spans exist only for those two passes. The table below uses
+the **warm** per-node occurrence (the cold first pass, e.g. a 68 ms cublas/JIT
+first-touch on `layers.0/qkv_proj`, is discarded), summed across all 28 layers —
+i.e. one steady decode step's on-device kernel spans.
+
+## Top kernels by device time (one steady decode step, 28 layers)
+
+Total attributed on-device kernel span ≈ **1.283 ms**. (Measured steady decode
+is ~3.4 ms/token; the remainder is graph-replay launch overhead, sampling and
+detokenize, none of which is kernel time.)
+
+| # | op | kernel_variant | calls | total_ms | %-of-kernel | capture_status |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| 1 | GroupQueryAttention | `attention_gqa_decode_fp16_splitk` | 28 | 0.425 | **33.1%** | captured |
+| 2 | MatMulNBits | `gemv_f16_general` (o_proj) | 29 | 0.250 | **19.5%** | captured |
+| 3 | MatMulNBits | `gemv_f16_down_projection` | 28 | 0.205 | 16.0% | captured |
+| 4 | MatMulNBits | `gate_up_swiglu_rmsnorm_fused` | 28 | 0.200 | 15.6% | captured |
+| 5 | MatMulNBits | `gemv_f16_scales_f16_rmsnorm` (qkv+RMSNorm) | 27 | 0.196 | 15.3% | captured |
+| 6 | MatMulNBits | `gemv_f16_scales_f16_rmsnorm` (lm_head) | 1 | 0.007 | 0.5% | captured |
+
+**Family rollup:** MatMulNBits int4 GEMV **66.9%**, GroupQueryAttention **33.1%**.
+
+All GEMVs are **symmetric int4** (`zero_points=false`), `block_size=32`,
+`scales=fp16`. At steady state the GQA decode prep is already fused
+(`gqa_prep_fused_with_metadata`: `Sq==1, k_seq==1`, aliased device-KV) — the
+unfused split/transpose/append/RoPE prep only appears on the first
+post-prefill step (`k_seq=10`), so it is **not** a steady-state cost.
+
+## #1 time sink — GroupQueryAttention decode (33.1%)
+
+- **Kernel:** `crates/onnx-runtime-ep-cuda/src/kernels/group_query_attention.rs`,
+  entry `attention_gqa_decode_fp16_splitk` (~L2233; module `gqa_decode_fp16`,
+  `MAX_SPLITS = 16`).
+- **Capture:** captured in the CUDA graph. Reason string:
+  *"capture-safe fp16 split-K flash-decode: q_seq=1, even head_dim=128; active
+  split count (up to 16) chosen on-device from the valid length and a host
+  occupancy target that fills the multiprocessors."*
+- **Assessment:** this path is **already the tuned split-K flash decode** — it
+  fills the SMs with an on-device split count and its prep is already fused. This
+  is genuine attention bandwidth/FLOP work, not a grid-starvation artifact, so it
+  is the *lower*-leverage target. The only structural lever left is the
+  **two-launch partial + softmax-merge reduction** (the partial and merge kernels
+  record/replay as separate launches, ~L2212): folding the merge into the partial
+  epilogue would remove one launch per layer (28/step). This is **not** a
+  register-prefetch case.
+
+## #2 time sink — MatMulNBits int4 GEMV family (66.9%; largest single variant o_proj `gemv_f16_general`, 19.5%)
+
+- **Kernel:** `crates/onnx-runtime-ep-cuda/src/kernels/matmul_nbits.rs`. The
+  o_proj lands on `gemv_f16_general` because it is **square** (K=N=3584) and so
+  fails the tall-skinny gate: reason
+  *"variant=general; class=not(tall_skinny K>N & block_size=32 & scales=fp16 &
+  K%32==0)"*. The `general` path is the single-warp / few-columns-per-CTA kernel
+  and is the prime **grid-starvation** suspect on H200 (132 SMs) — the same
+  failure mode the code already fixes elsewhere with grid widening:
+  `gemv_f16_down_projection` multiplies columns-per-CTA for tall-skinny down
+  projections, and `matmul_nbits_gemv_f16_scales_f16_splitk`
+  (`GEMV_F16_SCALES_F16_SPLITK_ENTRY`, ~L96) K-slices to fill idle SMs
+  (~0.36 waves/SM noted in-source).
+- **Hypothesis (to verify, then implement in a separate reviewed PR):** route the
+  **grid-starved `gemv_f16_general` (o_proj)** through the existing **split-K /
+  grid-widening** treatment (a `_general_splitk` sibling), gated on a measured
+  `<1 wave/SM` occupancy check — *not* register prefetch.
+- **Cross-reference — guardrails from prior perf memory (respect these):**
+  - *Register-prefetch on the symmetric gate/up GEMV **regresses**.* The 15.6%
+    `gate_up_swiglu_rmsnorm_fused` path is exactly that symmetric gate/up kernel —
+    **do not** add register prefetch there.
+  - *Grid-starved (<1 wave/SM) int GEMV wants **split-K, not prefetch**.* This is
+    why the recommended direction for the o_proj `general` variant is split-K /
+    grid widening, consistent with the down_projection and scales_f16 siblings.
+
+## Next step (out of scope here)
+
+Confirm the o_proj `gemv_f16_general` occupancy (`waves/SM`, achieved occupancy)
+with Nsight Compute on device 1, then, in a separate reviewed PR, add a
+grid-widened / split-K `general` variant gated on the grid-starvation check.
+Attention (#1) is already split-K-tuned; the higher-leverage, guardrail-safe
+target for the 7B is the o_proj GEMV.
