@@ -464,3 +464,98 @@ fn residency_materialized_pages_evicts_and_matches_resident() {
         "process-global counters must observe paging: {global:?}"
     );
 }
+
+/// #87 Increment 1 — async page-in on the transfer stream must be *transparent*:
+/// paging a weight through the asynchronous copy-stream + fence path produces
+/// output byte-identical to both the resident upload and the synchronous page-in
+/// path, while (a) actually issuing async H2D copies (proving overlap machinery
+/// ran, not a silent fallback) and (b) still evicting under a tiny budget.
+#[test]
+fn async_prefetch_page_in_matches_sync_and_issues_async_copies() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 + 0.125).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * -0.5 + 3.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    // Resident references (the trusted baseline output for each weight).
+    let rt = ep.runtime();
+    let resident_out = |b: &[f32]| {
+        let buf = ep.allocate(std::mem::size_of_val(b), 256).unwrap();
+        // SAFETY: buffer sized for b's bytes.
+        unsafe { rt.htod(f32_bytes(b), cuptr(buf.as_ptr())).unwrap() }
+        let out = run_matmul_with_b_ptr(&ep, &a, buf.as_ptr(), m, k, n);
+        ep.deallocate(buf).unwrap();
+        out
+    };
+    let resident_b0 = resident_out(&b0);
+    let resident_b1 = resident_out(&b1);
+
+    // Synchronous page-in outputs (the shipped path), for a direct A vs B parity.
+    let (_h_sync, lazies_sync) = combined_weights(&[b0.clone(), b1.clone()], k, n);
+    let sync = ep.weight_residency(page_bytes);
+    let sync0 = sync.resident_materialized(0, &lazies_sync[0]).unwrap();
+    let sync_out0 = run_matmul_with_b_ptr(&ep, &a, sync0.device_ptr(), m, k, n);
+    drop(sync0);
+    let sync1 = sync.resident_materialized(1, &lazies_sync[1]).unwrap();
+    let sync_out1 = run_matmul_with_b_ptr(&ep, &a, sync1.device_ptr(), m, k, n);
+    assert_eq!(sync_out0, resident_b0, "sync page-in must match resident");
+    assert_eq!(sync_out1, resident_b1, "sync page-in must match resident");
+
+    // Asynchronous page-in: same weights, same one-page budget, prefetch path.
+    let async_before = ep.runtime().transfer_counts().async_host_to_device;
+    let (_h_async, lazies_async) = combined_weights(&[b0.clone(), b1.clone()], k, n);
+    let prefetch = ep.weight_residency_prefetch(page_bytes);
+    assert!(
+        prefetch.prefetch_enabled(),
+        "residency must be in async prefetch mode"
+    );
+
+    let apage0 = prefetch.resident_materialized(0, &lazies_async[0]).unwrap();
+    let async_out0 = run_matmul_with_b_ptr(&ep, &a, apage0.device_ptr(), m, k, n);
+    assert_eq!(
+        async_out0, resident_b0,
+        "async page-in of weight 0 must be byte-identical to resident"
+    );
+    assert_eq!(
+        async_out0, sync_out0,
+        "async must match sync page-in exactly"
+    );
+    drop(apage0);
+
+    // Miss on weight 1 under the one-page budget: evicts weight 0 (its inbound
+    // async copy must be drained before its VRAM is freed — see admit_async).
+    let apage1 = prefetch.resident_materialized(1, &lazies_async[1]).unwrap();
+    let async_out1 = run_matmul_with_b_ptr(&ep, &a, apage1.device_ptr(), m, k, n);
+    assert_eq!(
+        async_out1, resident_b1,
+        "async page-in of weight 1 must be byte-identical to resident"
+    );
+    assert_eq!(
+        async_out1, sync_out1,
+        "async must match sync page-in exactly"
+    );
+
+    let stats = prefetch.stats();
+    assert_eq!(stats.page_ins, 2, "each miss must page in");
+    assert_eq!(
+        stats.evictions, 1,
+        "one-page budget must evict the LRU page"
+    );
+
+    // Prove the async machinery actually ran (not a silent synchronous fallback):
+    // at least one async H2D copy was issued on the transfer stream.
+    let async_after = ep.runtime().transfer_counts().async_host_to_device;
+    assert!(
+        async_after >= async_before + 2,
+        "async page-in must issue async H2D copies (before={async_before}, after={async_after})"
+    );
+}

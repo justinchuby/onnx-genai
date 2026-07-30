@@ -32,6 +32,15 @@ const MAX_NEW_TOKENS: usize = 32;
 /// int4 MatMulNBits weights cannot all stay resident, forcing real page-ins and
 /// LRU evictions each decode step.
 const TINY_DEVICE_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
+/// A *realistic* residency budget for the prefetch A/B: large enough that many
+/// weights stay resident (so decode isn't purely H2D-bound), yet small enough
+/// that a meaningful fraction still pages + evicts each step. This is the regime
+/// where async page-in overlap can actually hide latency. Overridable so the
+/// budget can be swept without recompiling.
+const REALISTIC_DEVICE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Timed runs per configuration for the perf A/B (median reported); one warmup
+/// run precedes these and is discarded.
+const AB_RUNS: usize = 3;
 
 fn model_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("QWEN3_0_6B_CUDA_E2E_DIR")
@@ -186,6 +195,173 @@ fn offloaded_native_cuda_decode_is_token_identical_and_pages() -> anyhow::Result
         offloaded_tok_s,
         offloaded_elapsed,
         baseline_elapsed.as_secs_f64() / offloaded_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+    );
+    Ok(())
+}
+
+/// Median of a small sample (sorted, middle element).
+fn median_secs(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples[samples.len() / 2]
+}
+
+/// The residency budget for the prefetch A/B, overridable via
+/// `WEIGHT_OFFLOAD_AB_BUDGET_BYTES` so the paging fraction can be swept.
+fn ab_budget_bytes() -> u64 {
+    std::env::var("WEIGHT_OFFLOAD_AB_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REALISTIC_DEVICE_BUDGET_BYTES)
+}
+
+/// Run one offloaded decode at `budget`, `prefetch` on/off. Returns the token
+/// stream, the wall-clock elapsed, and the global offload counters after the run
+/// (reset immediately before). Env is restored to a clean offload-off state.
+fn offloaded_run(
+    dir: &Path,
+    budget: u64,
+    prefetch: bool,
+) -> anyhow::Result<(
+    GenerateResult,
+    std::time::Duration,
+    onnx_runtime_ep_cuda::GlobalOffloadStats,
+)> {
+    unsafe {
+        std::env::set_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV, "1");
+        std::env::set_var(
+            onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV,
+            budget.to_string(),
+        );
+        if prefetch {
+            std::env::set_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV, "1");
+        } else {
+            std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV);
+        }
+    }
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+    let start = Instant::now();
+    let result = generate(dir)?;
+    let elapsed = start.elapsed();
+    let stats = onnx_runtime_ep_cuda::global_offload_stats();
+    unsafe {
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV);
+    }
+    Ok((result, elapsed, stats))
+}
+
+/// #87 Increment 1 proof: async copy-stream page-in (prefetch ON) is token-exact
+/// with the synchronous page-in (prefetch OFF), and the async path actually ran
+/// (`async_page_ins > 0`). Also reports a perf A/B (median tok/s both ways) at a
+/// realistic budget so the overlap benefit — or its absence — is recorded with
+/// real numbers, not asserted.
+#[test]
+#[ignore = "requires the real Qwen3-0.6B int4 postfix export and a CUDA device"]
+fn async_prefetch_native_cuda_decode_matches_sync_offload_and_pages() -> anyhow::Result<()> {
+    let Some(dir) = model_dir() else {
+        return Ok(());
+    };
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping async-prefetch native CUDA e2e: CUDA unavailable: {error}");
+        return Ok(());
+    }
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", "cuda");
+    }
+    let budget = ab_budget_bytes();
+
+    // --- Baseline: offload OFF (the trusted resident output) ------------------
+    unsafe {
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV);
+    }
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+    let baseline = match generate(&dir) {
+        Ok(result) => result,
+        Err(error) if is_load_chain_metadata_gap(&error) => {
+            eprintln!(
+                "skipping async-prefetch native CUDA e2e: export {} lacks declared \
+                 model.io ports (blocked on #384 load-chain): {error:#}",
+                dir.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    // --- Offload ON, prefetch OFF (synchronous page-in) -----------------------
+    let (sync_off, _sync_elapsed, sync_stats) = offloaded_run(&dir, budget, false)?;
+    assert!(
+        sync_stats.page_ins > 0 && sync_stats.evictions > 0,
+        "realistic budget {budget} did not force paging+eviction (prefetch OFF): {sync_stats:?} \
+         — lower WEIGHT_OFFLOAD_AB_BUDGET_BYTES"
+    );
+    assert_eq!(
+        sync_stats.async_page_ins, 0,
+        "prefetch was OFF yet async page-ins were recorded: {sync_stats:?}"
+    );
+
+    // --- Offload ON, prefetch ON (async copy-stream page-in) ------------------
+    let (async_on, _async_elapsed, async_stats) = offloaded_run(&dir, budget, true)?;
+    assert!(
+        async_stats.page_ins > 0 && async_stats.evictions > 0,
+        "realistic budget {budget} did not force paging+eviction (prefetch ON): {async_stats:?}"
+    );
+    assert!(
+        async_stats.async_page_ins > 0,
+        "prefetch ON but no async page-ins ran — the async path silently fell back: {async_stats:?}"
+    );
+
+    // --- Proof: async page-in is transparent (token-exact, both vs baseline) --
+    assert_eq!(
+        sync_off.token_ids, baseline.token_ids,
+        "synchronous offload changed the token stream vs baseline"
+    );
+    assert_eq!(
+        async_on.token_ids, sync_off.token_ids,
+        "async prefetch page-in changed the greedy token stream vs synchronous \
+         page-in — the copy fence is not ordering the H2D before the kernel.\n\
+         sync={:?}\nasync={:?}",
+        sync_off.token_ids, async_on.token_ids
+    );
+
+    // --- Perf A/B: median tok/s, prefetch OFF vs ON, at the realistic budget --
+    let tokens = MAX_NEW_TOKENS as f64;
+    // Warmup (discarded) then AB_RUNS timed runs per configuration.
+    let _ = offloaded_run(&dir, budget, false)?;
+    let mut off_secs = Vec::with_capacity(AB_RUNS);
+    for _ in 0..AB_RUNS {
+        off_secs.push(offloaded_run(&dir, budget, false)?.1.as_secs_f64());
+    }
+    let _ = offloaded_run(&dir, budget, true)?;
+    let mut on_secs = Vec::with_capacity(AB_RUNS);
+    for _ in 0..AB_RUNS {
+        on_secs.push(offloaded_run(&dir, budget, true)?.1.as_secs_f64());
+    }
+    let off_median = median_secs(off_secs);
+    let on_median = median_secs(on_secs);
+    let off_tok_s = tokens / off_median;
+    let on_tok_s = tokens / on_median;
+    eprintln!(
+        "async-prefetch native CUDA e2e OK (budget={} bytes): tokens={:?}\n  \
+         prefetch OFF: page_ins={}, evictions={}, async_page_ins={}\n  \
+         prefetch ON : page_ins={}, evictions={}, async_page_ins={}\n  \
+         median tok/s  OFF={:.2} ({:.3}s)  ON={:.2} ({:.3}s)  speedup={:.3}x",
+        budget,
+        async_on.token_ids,
+        sync_stats.page_ins,
+        sync_stats.evictions,
+        sync_stats.async_page_ins,
+        async_stats.page_ins,
+        async_stats.evictions,
+        async_stats.async_page_ins,
+        off_tok_s,
+        off_median,
+        on_tok_s,
+        on_median,
+        on_tok_s / off_tok_s,
     );
     Ok(())
 }

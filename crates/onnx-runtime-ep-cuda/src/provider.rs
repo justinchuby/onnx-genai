@@ -81,7 +81,11 @@ impl CudaExecutionProvider {
             let budget = offload_policy
                 .device_budget_bytes
                 .unwrap_or(DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
-            Arc::new(CudaWeightResidency::new(runtime.clone(), budget))
+            Arc::new(CudaWeightResidency::new_with_prefetch(
+                runtime.clone(),
+                budget,
+                offload_policy.prefetch,
+            ))
         });
         Ok(Self {
             device: DeviceId::cuda(ordinal),
@@ -146,6 +150,20 @@ impl CudaExecutionProvider {
     /// page-in + eviction) sized by `budget_bytes`, sharing this EP's runtime.
     pub fn weight_residency(&self, budget_bytes: u64) -> crate::weight_paging::CudaWeightResidency {
         crate::weight_paging::CudaWeightResidency::new(Arc::clone(&self.runtime), budget_bytes)
+    }
+
+    /// Build a residency cache like [`Self::weight_residency`] but routing page-ins
+    /// through the asynchronous copy-stream + fence path (#87 Increment 1). Tests
+    /// use this to exercise real async H2D overlap on a device.
+    pub fn weight_residency_prefetch(
+        &self,
+        budget_bytes: u64,
+    ) -> crate::weight_paging::CudaWeightResidency {
+        crate::weight_paging::CudaWeightResidency::new_with_prefetch(
+            Arc::clone(&self.runtime),
+            budget_bytes,
+            true,
+        )
     }
 
     /// Borrow the live device residency cache used to page lazy weights during

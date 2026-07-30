@@ -104,3 +104,24 @@ Drive the live dispatch loop with the shipped `plan_double_buffer`/`drive_double
 Defer the double-buffered look-ahead (Increment 2) to a follow-up once Increment 1's A/B numbers justify the extra VRAM and scheduling complexity.
 
 **Awaiting green-light before implementing.**
+
+---
+
+## 8. Increment 1 — IMPLEMENTED + A/B RESULT (2026-07-30)
+
+**Status:** GREEN-LIT and shipped (branch `squad/87-async-prefetch-inc1`, stacks on #446). Env flag `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH=1` (device async path is **opt-in**; unset = synchronous #444 path, byte-identical).
+
+### What shipped
+- `CudaWeightResidency::admit_async()` (weight_paging.rs): stages canonical bytes into a **single reusable pinned buffer**, issues `htod_async` on the copy stream, `record_copy_fence()`, then `compute_wait_fence(fence)` so the single compute stream (which runs every kernel) waits on the copy before the consuming kernel reads it. All under the residency lock (page-ins serialized — fine for single-session decode).
+- **Eviction/WAR/UAF safety:** before evict/alloc/pinned-refill, `synchronize()` (compute) + `sync_copy_stream()` (transfer) drain any prior in-flight copy. The drains happen BEFORE issuing the *current* copy, so a page-in never drains itself → stays overlappable. No async H2D can be in flight into a page that is freed/reused.
+- Global observability counter `async_page_ins` (⊆ `page_ins`) so an opaque e2e decode can prove the async path actually ran (vs silent sync fallback).
+
+### Validation (real numbers, Qwen3-0.6B int4, device 0, taskset-pinned)
+- **Token parity (the correctness proof):** baseline (offload OFF) == sync offload (prefetch OFF) == async offload (prefetch ON), **byte-identical** token IDs `[12095, 11, 323, 279, 6722, 315, 15344, 374, ...]`. The copy fence orders H2D before the kernel correctly.
+- **Paging exercised:** budget 64 MiB → `page_ins=12544`, `evictions=12441`; prefetch ON → `async_page_ins=12544` (prefetch OFF → `async_page_ins=0`, proving no silent fallback).
+- **Perf A/B (median of 3 + warmup, 64 MiB realistic budget):** prefetch OFF = **2.62 tok/s** (12.209 s); prefetch ON = **2.61 tok/s** (12.243 s); **speedup 0.997× — a WASH** (within run-to-run noise).
+
+### Honest verdict: WASH, not a win (as expected for single-buffer)
+Increment 1 is **correctness/safety infrastructure**, not a perf win by itself. At this budget every weight is re-paged each step (`hits=0`), and **single-buffer** async issues each weight's copy *immediately before its own kernel*, then the fence forces that same kernel to wait on that same copy — there is no *other* weight's compute to overlap it with. Latency hiding requires **look-ahead**: prefetch layer N+1's weights on the copy stream *while layer N computes*. That is **Increment 2 (double-buffered look-ahead)** — now clearly justified: the async machinery is proven live + safe + token-exact + non-regressing (0.997×), so Increment 2 only needs to add the look-ahead schedule + budget-aware second slot.
+
+**Recommendation:** merge Increment 1 as the safe, reversible, opt-in foundation (no regression); green-light Increment 2 for the actual overlap win. Keep prefetch opt-in until Increment 2 demonstrates tok/s ≥ sync at realistic budgets.

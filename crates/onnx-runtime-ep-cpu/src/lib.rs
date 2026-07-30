@@ -64,8 +64,8 @@ pub use weight_offload::weight_handle::{
 };
 pub use weight_offload::{
     LinuxProcessMemoryStats, WEIGHT_OFFLOAD_ENV, WEIGHT_OFFLOAD_HOST_BYTES_ENV,
-    WeightOffloadLayerStats, WeightOffloadStats, set_weight_offload_host_budget,
-    weight_offload_stats,
+    WEIGHT_OFFLOAD_PREFETCH_ENV, WeightOffloadLayerStats, WeightOffloadStats,
+    set_weight_offload_host_budget, weight_offload_stats,
 };
 
 pub use kernels::selection::non_max_suppression;
