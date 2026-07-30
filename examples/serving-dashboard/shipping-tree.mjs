@@ -531,6 +531,122 @@ export function divergentPaths(rels) {
 export const STASH_PHRASE = 'also has unlanded work in a stash, invisible to';
 
 /**
+ * Match repo-root-relative stash filenames against the paths a caller read.
+ *
+ * Pure — no git, no disk, no clock — for the same reason `parsePorcelain()` is:
+ * proving this logic correct must not require creating a stash in a tree
+ * fourteen agents are working in. Stashing to test a stash detector would hide
+ * somebody's uncommitted work to prove that hiding work is detectable.
+ *
+ * @param {(string[]|null)[]} entryFileLists one entry per stash, each an array
+ *   of REPO-ROOT-relative filenames as `git stash show --name-only` prints
+ *   them, or `null` for an entry that could not be read. NULL IS PART OF THE
+ *   CONTRACT, not a defensive check: representing an unreadable entry in the
+ *   pure layer is the only way to test the "could not compute" path without
+ *   writing stash state into a tree fourteen agents share. Left to the impure
+ *   caller, that branch is unreachable from any test and silently rots.
+ * @param {string[]} rels paths relative to THIS directory.
+ * @param {string} prefix repo-root-to-here path, e.g. `examples/serving-dashboard/`.
+ * @returns {{paths: string[], unreadable: number}} `paths` are the members of
+ *   `rels` that appear in some entry, in the caller's own coordinate system and
+ *   spelling; `unreadable` counts entries that could not be examined.
+ */
+export function matchStashedNames(entryFileLists, rels, prefix = '') {
+  if (!Array.isArray(entryFileLists) || !Array.isArray(rels)) {
+    return { paths: [], unreadable: 0 };
+  }
+
+  // Keyed by the ROOT-relative spelling and valued by the caller's spelling, so
+  // what comes back is what they passed in. Handing `examples/serving-dashboard/
+  // format.js` to a caller who asked about `format.js` is the coordinate-system
+  // mix that `shippedPaths()` calls "the whole hazard".
+  const wanted = new Map(rels.map((rel) => [`${prefix}${rel}`, rel]));
+  const found = new Set();
+  let unreadable = 0;
+
+  for (const names of entryFileLists) {
+    if (!Array.isArray(names)) {
+      unreadable += 1;
+      continue;
+    }
+    for (const name of names) {
+      const hit = wanted.get(String(name).trim());
+      if (hit !== undefined) found.add(hit);
+    }
+  }
+  // Sorted so a disclosure line's order is a property of the paths and not of
+  // how recently somebody happened to stash them.
+  return { paths: [...found].sort(), unreadable };
+}
+
+/**
+ * Count stash entries, distinguishing "none" from "could not look".
+ *
+ * @param {string|null} listing stdout of `git stash list`, or `null` if the
+ *   command failed. NULL IS THE CONTRACT: this is the one distinction the whole
+ *   module exists to preserve, and leaving it inside a `catch` block makes it
+ *   the one distinction no test can reach.
+ * @returns {{entries: number, unreadable: number}}
+ */
+export function countStashEntries(listing) {
+  if (typeof listing !== 'string') return { entries: 0, unreadable: 1 };
+  return {
+    entries: listing.split('\n').filter((line) => line.trim() !== '').length,
+    unreadable: 0,
+  };
+}
+
+/**
+ * The clause a summary line appends about parked work. `''` means nothing to say.
+ *
+ * Pure, and separate from `divergenceSummary()` for the reason the rest of this
+ * block is separate from its IO: a rendering branch that only fires when git
+ * fails is a branch no test in a healthy repository can enter. Deleting it
+ * would then be invisible — and it is precisely the branch whose job is to stop
+ * a failure rendering as an all-clear.
+ *
+ * @param {{paths: string[], unreadable: number}} s a `stashedPaths()` result.
+ * @returns {string}
+ */
+export function stashSuffix(s) {
+  if (!s || typeof s !== 'object') return '';
+  if (s.unreadable > 0) {
+    return `; ${s.unreadable} stash entr(y/ies) could not be read, so parked work is UNKNOWN`;
+  }
+  if (Array.isArray(s.paths) && s.paths.length > 0) {
+    return `; ${s.paths.length} of them ${STASH_PHRASE} both`;
+  }
+  return '';
+}
+
+/**
+ * The per-file disclosure lines about parked work. Pure, for the same reason.
+ *
+ * @param {{paths: string[], unreadable: number}} s a `stashedPaths()` result.
+ * @param {string} ref the commit being compared against, for the caption.
+ * @returns {string[]}
+ */
+export function stashLines(s, ref) {
+  if (!s || typeof s !== 'object') return [];
+  const lines = [];
+  if (s.unreadable > 0) {
+    lines.push(
+      'WORKTREE_DIVERGENCE the stash list could not be fully read, so this run '
+        + 'cannot say whether any of these files also have work parked out of '
+        + 'sight. That is not the same as "none do".',
+    );
+  }
+  for (const name of Array.isArray(s.paths) ? s.paths : []) {
+    lines.push(
+      `WORKTREE_DIVERGENCE ${name}: ${STASH_PHRASE} both git status and the `
+        + `comparison against ${ref}. Somebody's work on this file is parked `
+        + 'where no other check in this directory looks.',
+    );
+  }
+  return lines;
+}
+
+/**
  * Which of `rels` have content parked in a stash entry.
  *
  * WHY THIS EXISTS: A STASH IS INVISIBLE TO EVERY OTHER CHECK WE HAVE
@@ -558,13 +674,23 @@ export const STASH_PHRASE = 'also has unlanded work in a stash, invisible to';
  * always present is one nobody reads.
  *
  * @param {string[]} rels paths relative to THIS directory.
- * @returns {{paths: string[], entries: number, unreadable: number,
- *   computed: boolean}} `computed: false` means the stash list itself could not
- *   be read — never confuse that with "no stashes", which is the failure this
- *   module exists to prevent.
+ * @returns {{paths: string[], entries: number, unreadable: number}}
+ *   `unreadable > 0` means some part of the stash state could not be examined —
+ *   never confuse that with "no stashes", which is the failure this module
+ *   exists to prevent.
+ *
+ * ONE FACT, ONE SPELLING — AND THIS ONE WAS EARNED
+ * -----------------------------------------------
+ * An earlier version also carried a `computed` boolean derived as
+ * `unreadable === 0`. Mutating that derivation to a bare `true` could not be
+ * caught by any test, because `unreadable` is 0 in every healthy repository, so
+ * both spellings agreed in every reachable state. A REDUNDANT FIELD IS NOT
+ * MERELY UNTESTED; IT IS UNTESTABLE, and it is the same "two places that both
+ * get to decide" shape flagged three times elsewhere in this tree. The cure was
+ * to delete the second spelling rather than to write a cleverer assertion.
  */
 export function stashedPaths(rels) {
-  const result = { paths: [], entries: 0, unreadable: 0, computed: true };
+  const result = { paths: [], entries: 0, unreadable: 0 };
   if (!Array.isArray(rels) || rels.length === 0) return result;
 
   const run = (args) => execFileSync('git', args, {
@@ -573,43 +699,46 @@ export function stashedPaths(rels) {
     maxBuffer: 64 * 1024 * 1024,
   });
 
-  let listing;
+  // `null` on failure, so the "could not look" case is decided by a pure
+  // function instead of dying inside a catch block where no test can reach it.
+  // The listing IS a thing that could not be read, so it counts as one
+  // unreadable item -- literally what happened, and it keeps every consumer
+  // branching on a single quantity instead of two that can disagree.
+  let listing = null;
   try {
+    // The `%gd` spelling honours the caller's date config, so it can come back
+    // as `stash@{2026-07-30 ...}`; entries are addressed by INDEX below because
+    // `stash@{N}` is stable regardless of how the reflog chooses to print.
     listing = run(['stash', 'list', '--format=%gd']);
   } catch {
-    return { ...result, computed: false };
+    listing = null;
   }
 
-  // Counted, then addressed by index. The `%gd` spelling of a stash ref honours
-  // the caller's date config, so it can come back as `stash@{2026-07-30 ...}`;
-  // `stash@{N}` is stable regardless of how the reflog chooses to print.
-  const entries = listing.split('\n').filter((line) => line.trim() !== '').length;
+  const counted = countStashEntries(listing);
+  if (counted.unreadable > 0) return { ...result, unreadable: counted.unreadable };
+  const { entries } = counted;
   result.entries = entries;
   if (entries === 0) return result;
 
   // Stash listings, like porcelain, are REPO-ROOT-relative while `rels` are
   // relative to this directory. Comparing the two coordinate systems directly
-  // is the hazard `shippedPaths()` warns about; translate before matching.
-  const wanted = new Map(rels.map((rel) => [`${HERE_PREFIX}${rel}`, rel]));
-  const found = new Set();
+  // is the hazard `shippedPaths()` warns about; the pure matcher translates.
+  const entryFileLists = [];
 
   for (let i = 0; i < entries; i += 1) {
-    let names;
     try {
-      names = run(['stash', 'show', '--name-only', `stash@{${i}}`]);
+      entryFileLists.push(run(['stash', 'show', '--name-only', `stash@{${i}}`]).split('\n'));
     } catch {
-      // One unreadable entry must not be reported as "nothing stashed here".
-      result.unreadable += 1;
-      continue;
-    }
-    for (const name of names.split('\n')) {
-      const hit = wanted.get(name.trim());
-      if (hit !== undefined) found.add(hit);
+      // `null` means "this entry could not be read". The pure matcher counts
+      // it; an unreadable entry must never be silently equivalent to an empty
+      // one, because that renders as "nothing is parked here".
+      entryFileLists.push(null);
     }
   }
 
-  result.paths = [...found];
-  if (result.unreadable > 0) result.computed = false;
+  const matched = matchStashedNames(entryFileLists, rels, HERE_PREFIX);
+  result.paths = matched.paths;
+  result.unreadable = matched.unreadable;
   return result;
 }
 
@@ -666,6 +795,11 @@ export function divergenceReport(rels) {
         + `${SHIPPING_REF}. Any result about it describes a file that is going away.`,
     );
   }
+
+  // Stash disclosure last, and ADDITIVE: a path can be clean on the desk AND
+  // stashed at the same time. That combination is the dangerous one, because
+  // every other check in this module calls such a file agreement.
+  lines.push(...stashLines(stashedPaths(rels), SHIPPING_REF));
   return lines;
 }
 
@@ -697,10 +831,16 @@ export function divergenceSummary(rels) {
     return `WORKTREE_DIVERGENCE could not be computed for ${total} file(s) read by this run`;
   }
   const n = d.modified.length + d.untracked.length + d.deleted.length;
-  return (
+  const base = (
     `WORKTREE_DIVERGENCE tree and ${SHIPPING_REF} differ on ${n} of ${total} `
     + 'file(s) read by this run'
   );
+
+  // The aggregate is the line people actually absorb, so the stash count has to
+  // reach it. Reporting parked work only in the per-file lines would leave the
+  // one-line summary saying "differ on 0 of 2" about two files with unlanded
+  // changes -- which is the exact false all-clear this module refuses to emit.
+  return `${base}${stashSuffix(stashedPaths(rels))}`;
 }
 
 /**

@@ -35,12 +35,18 @@ import {
   DIVERGENCE_PHRASES,
   SHIPPING_BRANCH,
   SHIPPING_REF,
+  STASH_PHRASE,
+  countStashEntries,
   describeTree,
   divergenceReport,
   divergenceSummary,
   divergentPaths,
+  matchStashedNames,
   parsePorcelain,
+  stashLines,
+  stashSuffix,
   shipped,
+  stashedPaths,
 } from './shipping-tree.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -427,5 +433,238 @@ describe('a check discloses which tree it actually read', () => {
       !python.includes('zzz-phrase-that-was-never-written-1cb'),
       'the cross-language check cannot distinguish present from absent',
     );
+  });
+});
+
+describe('work parked in a stash is disclosed, not counted as agreement', () => {
+  /** What git itself reports, as an independent second opinion on `entries`. */
+  const gitStashCount = () => git('stash', 'list', '--format=%gd')
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .length;
+
+  // The gap this closes, found by reading `git stash list` in this repository
+  // rather than by imagining a case: a stash on this branch holds five files of
+  // unlanded work, `git status` does not mention stashes at all, and
+  // `divergenceSummary` therefore reported "differ on 0 of 2" about two of
+  // those very files. Every check in this directory called them clean.
+  //
+  // The incentive is the sharp end. Several guards here assert a clean
+  // porcelain, and the cheapest way to turn that green is to stash -- to hide
+  // the evidence rather than land the work. A cleanliness check that can be
+  // satisfied by concealment needs a companion that looks where things get
+  // concealed.
+
+  it('finds a path that is parked in a stash entry', () => {
+    const hits = matchStashedNames([['format.js', 'other.js']], ['format.js']);
+
+    assert.deepEqual(hits.paths, ['format.js']);
+    assert.equal(hits.unreadable, 0, 'a readable entry must not be counted as unreadable');
+  });
+
+  it('translates root-relative stash names into the coordinates the caller used', () => {
+    // `git stash show --name-only` prints REPO-ROOT-relative names while
+    // callers hold paths relative to THIS directory -- the same mismatch
+    // `parsePorcelain` handles, and the one `shippedPaths()` calls the whole
+    // hazard. What comes back must be the caller's own spelling, or they
+    // cannot match it against anything they hold.
+    const hits = matchStashedNames(
+      [['examples/serving-dashboard/ui/model-card.js']],
+      ['ui/model-card.js'],
+      'examples/serving-dashboard/',
+    );
+
+    assert.deepEqual(hits.paths, ['ui/model-card.js'], 'the prefix must be stripped back off');
+  });
+
+  it('does not match a path outside this directory that merely looks similar', () => {
+    // Negative control for the translation above: without it, a prefix-strip
+    // implemented as a substring test would match half the repository.
+    const hits = matchStashedNames(
+      [['crates/server/src/format.js']],
+      ['format.js'],
+      'examples/serving-dashboard/',
+    );
+
+    assert.deepEqual(hits.paths, [], 'a different file with the same basename is a different file');
+  });
+
+  it('reports a path once even when several stashes touch it', () => {
+    // 28 stash entries exist in this repository right now. A file parked in
+    // three of them is one disclosure, not three.
+    const hits = matchStashedNames(
+      [['format.js'], ['format.js'], ['format.js', 'other.js']],
+      ['format.js', 'other.js'],
+    );
+
+    assert.deepEqual(hits.paths, ['format.js', 'other.js']);
+  });
+
+  it('an empty stash list is a real "nothing parked", and reads as such', () => {
+    assert.deepEqual(matchStashedNames([], ['format.js']).paths, []);
+    assert.deepEqual(stashedPaths([]).paths, [], 'no inputs cannot produce a finding');
+  });
+
+  it('counts the stash entries it examined, so a zero can be told from a no-op', () => {
+    // A zero with no denominator is the failure mode this crew has hit three
+    // times tonight: an instrument that never reached its subject returns
+    // exactly what a clean subject returns. `entries` is that denominator.
+    const s = stashedPaths(['shipping-tree.mjs']);
+
+    assert.equal(s.unreadable, 0, 'a healthy repository must read every entry');
+    assert.equal(s.entries, gitStashCount(), 'the count must match what git itself reports');
+    assert.equal(typeof s.entries, 'number');
+    assert.ok(s.entries >= 0, 'the number of stashes examined must be stated');
+  });
+
+  it('an unreadable stash entry is NOT reported as "nothing is stashed"', () => {
+    // Same refusal `divergentPaths` makes for a failed `git status`: an
+    // instrument that could not run must say so rather than say "clean".
+    //
+    // This assertion had to be earned. The first version of it read
+    // `assert.equal(s.computed, s.unreadable === 0)` against a live call, which
+    // is VACUOUS -- `unreadable` is 0 in any healthy repository, so it compared
+    // true to true and a mutation deleting the whole branch stayed green. The
+    // fix was structural, not a stronger assertion: unreadability is now
+    // representable in the PURE matcher as a `null` entry, so the branch can be
+    // reached without stashing anything in a tree the crew shares.
+    const mixed = matchStashedNames([['format.js'], null, ['other.js']], ['format.js']);
+
+    assert.deepEqual(mixed.paths, ['format.js'], 'readable entries are still examined');
+    assert.equal(mixed.unreadable, 1, 'the entry that could not be read must be counted');
+  });
+
+  it('one unreadable entry poisons the verdict even when a hit was found', () => {
+    // The dangerous shape: a partial read that found something looks like a
+    // successful read. If four entries are unreadable and the fifth yields a
+    // hit, the answer is still "I do not know what is parked".
+    const partial = matchStashedNames([null, null, ['format.js']], ['format.js', 'other.js']);
+
+    assert.deepEqual(partial.paths, ['format.js']);
+    assert.equal(partial.unreadable, 2);
+    assert.ok(partial.unreadable > 0, 'a partial answer must be distinguishable from a whole one');
+  });
+
+  it('the summary carries the stash count, not just the per-file lines', () => {
+    // The regression that made this necessary: the disclosure existed only in
+    // divergenceReport, so the ONE LINE a reader absorbs still said
+    // "differ on 0 of N" about files with unlanded work. A disclosure nobody
+    // reads is the same as no disclosure.
+    //
+    // Asserted as an IF-AND-ONLY-IF rather than "contains the phrase", because
+    // whether any given file is stashed depends on what the crew is doing this
+    // minute. The biconditional is true whichever way that falls, and it is
+    // non-vacuous in BOTH directions: it fails if the summary forgets parked
+    // work, and equally if it announces parked work that does not exist.
+    const probe = ['shipping-tree.mjs', 'format.js', 'ui/model-card.js'];
+    const summary = divergenceSummary(probe);
+    const s = stashedPaths(probe);
+
+    assert.match(summary, /differ on \d+ of 3 file\(s\) read by this run/);
+    assert.equal(
+      summary.includes(STASH_PHRASE),
+      s.paths.length > 0,
+      'the summary must mention parked work exactly when there is parked work',
+    );
+  });
+
+  it('a per-file line exists for every parked path the summary counts', () => {
+    // Report and summary must not be able to disagree. Two renderings of one
+    // fact drifting apart is how a green banner ends up contradicting the
+    // detail directly beneath it.
+    const probe = ['shipping-tree.mjs', 'format.js', 'ui/model-card.js'];
+    const lines = divergenceReport(probe);
+    const s = stashedPaths(probe);
+
+    const stashLines = lines.filter((line) => line.includes(STASH_PHRASE));
+    assert.equal(stashLines.length, s.paths.length, 'one line per parked path, no more, no fewer');
+    for (const name of s.paths) {
+      assert.ok(
+        stashLines.some((line) => line.includes(name)),
+        `${name} is counted as parked but never named in the report`,
+      );
+    }
+  });
+
+  it('keeps the stash wording OUT of the cross-language contract', () => {
+    // DIVERGENCE_PHRASES is the shared vocabulary with scripts/tree_context.py
+    // and a test asserts every key of it appears in that Python source. Python
+    // has no stash concept, so putting STASH_PHRASE in there would redden a
+    // true statement about a real hazard -- and a guard that reddens on correct
+    // work gets deleted rather than fixed.
+    assert.ok(!Object.values(DIVERGENCE_PHRASES).includes(STASH_PHRASE));
+    assert.equal(typeof STASH_PHRASE, 'string');
+    assert.ok(STASH_PHRASE.length > 0, 'the wording must exist to be shared');
+  });
+});
+
+describe('a stash check that cannot look says so, instead of saying "clean"', () => {
+  // Every test in this block was IMPOSSIBLE to write an hour ago. The logic
+  // lived inside a `catch` in a function that shells out to git, so the only
+  // way to reach it was to break git -- and the branches went untested. Three
+  // mutations survived because of it, including one that made a failed stash
+  // read render as an all-clear. The cure was to move the DECISIONS out of the
+  // IO, not to write cleverer assertions against the IO.
+
+  it('tells "there are no stashes" apart from "I could not look"', () => {
+    // These two states are identical in every downstream rendering unless this
+    // distinction is preserved here, and confusing them is the single failure
+    // this module exists to prevent.
+    assert.deepEqual(countStashEntries(''), { entries: 0, unreadable: 0 });
+    assert.deepEqual(countStashEntries(null), { entries: 0, unreadable: 1 });
+  });
+
+  it('counts entries without being fooled by trailing blank lines', () => {
+    assert.equal(countStashEntries('stash@{0}\nstash@{1}\n').entries, 2);
+    assert.equal(countStashEntries('stash@{0}\n\n\n').entries, 1);
+  });
+
+  it('a failed stash read renders as UNKNOWN, never as an absence of parked work', () => {
+    const suffix = stashSuffix({ paths: [], unreadable: 1 });
+
+    assert.match(suffix, /UNKNOWN/);
+    assert.ok(!suffix.includes(STASH_PHRASE), 'it must not imply a finding it does not have');
+    assert.notEqual(suffix, '', 'silence is what a clean result looks like -- this is not one');
+  });
+
+  it('an unreadable stash outranks a hit: a partial answer is not an answer', () => {
+    // If four entries are unreadable and the fifth yields a hit, reporting
+    // "1 file is parked" states a floor as though it were a total.
+    const suffix = stashSuffix({ paths: ['format.js'], unreadable: 4 });
+
+    assert.match(suffix, /UNKNOWN/, 'the doubt must win over the partial finding');
+  });
+
+  it('says nothing at all when there is genuinely nothing parked', () => {
+    // The other half of the contract. A banner that fires unconditionally is a
+    // constant, and a constant carries no information.
+    assert.equal(stashSuffix({ paths: [], unreadable: 0 }), '');
+    assert.deepEqual(stashLines({ paths: [], unreadable: 0 }, 'abc123'), []);
+  });
+
+  it('names the ref it compared against in every per-file line', () => {
+    const lines = stashLines({ paths: ['format.js'], unreadable: 0 }, 'deadbeef');
+
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /deadbeef/, 'a disclosure that names no tree discloses nothing');
+    assert.match(lines[0], /format\.js/);
+    assert.ok(lines[0].includes(STASH_PHRASE));
+  });
+
+  it('emits a line for the unreadable case even with zero known paths', () => {
+    const lines = stashLines({ paths: [], unreadable: 2 }, 'deadbeef');
+
+    assert.equal(lines.length, 1, 'the doubt itself is the disclosure');
+    assert.match(lines[0], /not the same as "none do"/);
+  });
+
+  it('orders parked paths by name, not by which stash happened to be newest', () => {
+    // Pins the sort. Without it the order is Set-insertion order, which is
+    // stash recency -- so the same tree prints a different report depending on
+    // who stashed last, and a diff of two runs shows spurious churn.
+    const out = matchStashedNames([['zebra.js'], ['alpha.js'], ['middle.js']],
+      ['middle.js', 'zebra.js', 'alpha.js']);
+
+    assert.deepEqual(out.paths, ['alpha.js', 'middle.js', 'zebra.js']);
   });
 });
