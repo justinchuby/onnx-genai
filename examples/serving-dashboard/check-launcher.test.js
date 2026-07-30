@@ -129,3 +129,63 @@ test('the README still makes the claim this file is guarding', () => {
       `promise the documentation no longer makes.`,
   );
 });
+
+// Every `scenario=<id>` URL the launcher or the README hands a visitor must be
+// a scenario that actually exists.
+//
+// Why this is a separate hazard from a broken link, and why it is worse. An
+// unrecognised id does not 404 and does not warn: `currentScenarioId` falls
+// back to the local server's own scenario and renders it perfectly. That
+// fallback is CORRECT and is deliberately asserted in scenario-origins.test.js
+// -- the prefix-cache id was public for a while, so a bookmark that outlived
+// the cut has to land somewhere sane rather than stay reachable.
+//
+// But a fallback written for a STALE link is not a licence to print a FRESH
+// one. run-demo.sh advertised `?scenario=prefix-cache` in its success banner
+// -- the first thing an operator reads -- for a scenario deliberately moved to
+// CUT_SCENARIOS with no `id:`, precisely so it could not be addressed. The
+// visitor clicked "prefix caching" and got a flawless, fully honest page about
+// paged KV, with nothing anywhere saying they were shown something else. A 404
+// would have been kinder: it is the one failure our five-state vocabulary
+// cannot narrate, because every field on that page IS correctly labelled.
+//
+// The cut was enforced in JavaScript and undone in a printf. Nothing reconciled
+// the two, because every honesty mechanism we own inspects a FIELD -- none
+// inspects a ROUTE, a LINK, or a launch banner, and the visitor's CHOICE is
+// made before a single field is read.
+test('every scenario URL we hand a visitor names a scenario that exists', async () => {
+  const { SCENARIOS, CUT_SCENARIOS } = await import('./scenario-origins.js');
+
+  const cited = [];
+  for (const [label, source] of [
+    ['run-demo.sh', LAUNCHER],
+    ['README.md', README],
+  ]) {
+    for (const m of source.matchAll(/scenario=([a-z0-9-]+)/g)) {
+      cited.push({ label, id: m[1] });
+    }
+  }
+
+  // Anti-vacuity. If the extractor stops matching -- the URLs get templated,
+  // the query key is renamed -- this check would pass by finding nothing, which
+  // is the failure mode it is least able to report on itself.
+  assert.ok(
+    cited.length > 0,
+    'no scenario= URLs found in run-demo.sh or README.md. Either both stopped ' +
+      'advertising scenarios, or this extractor no longer matches how they are ' +
+      'written. Both mean this check is guarding nothing.',
+  );
+
+  const bad = cited
+    .filter(({ id }) => !Object.hasOwn(SCENARIOS, id))
+    .map(({ label, id }) => {
+      const why = Object.hasOwn(CUT_SCENARIOS, id)
+        ? `'${id}' is in CUT_SCENARIOS -- it was deliberately made unaddressable`
+        : `'${id}' is not a scenario at all -- likely a typo`;
+      return `${label} advertises ?scenario=${id}. ${why}. The page will NOT ` +
+        `error: it silently renders a different scenario, correctly labelled, ` +
+        `and the visitor has no way to tell. Remove the link, or register the id.`;
+    });
+
+  assert.deepEqual(bad, []);
+});

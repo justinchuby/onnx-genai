@@ -271,7 +271,11 @@ cat <<EOF
 
     continuous batching   ${SCATTER_ORIGIN}/demo/?${TOPOLOGY}&scenario=continuous-batching
     paged KV block table  ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=paged-kv
-    prefix caching        ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=prefix-cache
+  There is deliberately no prefix-caching link. Prefix reuse was measured and
+  found absent on both execution paths -- the engine's hit counter fires on
+  every request, including controls that share no prefix -- so the scenario was
+  cut rather than shipped as a tab. The null result ships as evidence inside the
+  KV panel, which is a stronger thing to show than a tab would have been.
 
   Opening /demo/ without those parameters still works. The scenarios backed by
   the other server then report that it is not configured, rather than quietly
