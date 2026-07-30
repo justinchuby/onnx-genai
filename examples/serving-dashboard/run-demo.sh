@@ -269,6 +269,11 @@ require_free_port "${DYNAMIC_PORT}" "dynamic"
 # argument -- cargo ALREADY tracks the thing the `-x` test was guessing at, so
 # the branch bought nothing and cost the demo its correctness. Let the tool
 # that tracks source freshness answer the question about source freshness.
+# Captured BEFORE the build, deliberately. Reading it afterwards would defeat
+# the check: HEAD can advance during a 20-40s build, and a post-build read would
+# then be a commit the build never saw, so a correct binary would fail against
+# it. This is the tree we are asking the build to produce.
+PRE_BUILD_SHA="$(cd "${REPO_ROOT}" && git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
 printf 'building onnx-genai-server (release)...\n'
 ( cd "${REPO_ROOT}" && cargo build --release -p onnx-genai-server )
 [[ -x "${SERVER_BIN}" ]] || fail "the server binary is missing after the build: ${SERVER_BIN}"
@@ -286,22 +291,45 @@ printf 'building onnx-genai-server (release)...\n'
 # The server stamps its own build commit into /v1/status (build.rs ->
 # ONNX_GENAI_BUILD_SHA). Comparing that against HEAD is the only check here
 # that reads the binary's PROVENANCE rather than its file metadata.
-EXPECTED_SHA="$(cd "${REPO_ROOT}" && git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
-# `--version` reports the build commit and short-circuits before clap validates
-# required args, so this needs no --model and starts no server.
+# The test is "did the build we just ran produce this binary", and the direction
+# is the opposite of the obvious one.
+#
+# First attempt was equality against HEAD. Wrong: this branch moves while you
+# work and a release build takes 20-40s, so a commit landing mid-build makes the
+# stamp differ through no fault of the build. A launcher that refuses at random
+# gets disabled by whoever is about to present, which costs us the check.
+#
+# Second attempt was "stamp must be an ancestor of HEAD". ALSO WRONG, and the
+# control is what caught it: the sibling checkout was branched FROM this
+# history, so its HEAD is an ancestor too. That check passes the exact binaries
+# that served the operator's home directory for five hours -- it scored
+# identically on the fixed tree and the leaking one, which is no test at all.
+#
+# The correct predicate runs the ancestry the OTHER WAY. We record HEAD before
+# building, then require that commit to be an ancestor of what the binary
+# reports. A binary the build above produced is stamped at that commit or newer,
+# so it passes. Anything OLDER -- a stale artefact, or one from a sibling
+# checkout sharing this CARGO_TARGET_DIR -- cannot contain it, and fails. This
+# tolerates the branch advancing and still rejects every binary that predates
+# the tree we are launching from.
 BUILT_SHA="$("${SERVER_BIN}" --version 2>/dev/null | awk '{print $NF}')"
 if [[ -z "${BUILT_SHA}" || "${BUILT_SHA}" == "unknown" ]]; then
   # Not fatal: the stamp is newer than some binaries, and refusing here would
   # make an older-but-fine checkout unlaunchable. Say so out loud instead --
   # silence is what let the stale binaries run.
   printf 'warning: this server cannot report its build commit; provenance is unverifiable\n' >&2
-elif [[ "${BUILT_SHA}" != "${EXPECTED_SHA}" ]]; then
-  fail "the server binary was built from ${BUILT_SHA} but this checkout is at ${EXPECTED_SHA};
-  ${SERVER_BIN} is shared between worktrees, so a rebuild here does not
-  guarantee it came from here. Build in this checkout, or point
-  CARGO_TARGET_DIR somewhere this checkout owns."
+elif [[ "${PRE_BUILD_SHA}" == "unknown" ]]; then
+  printf 'warning: could not read this checkout HEAD; binary reports %s, unverified\n' \
+    "${BUILT_SHA}" >&2
+elif ( cd "${REPO_ROOT}" && git merge-base --is-ancestor "${PRE_BUILD_SHA}" "${BUILT_SHA}" 2>/dev/null ); then
+  printf 'server binary provenance: %s (contains checkout %s)\n' "${BUILT_SHA}" "${PRE_BUILD_SHA}"
+else
+  fail "the server binary reports build ${BUILT_SHA}, which does NOT contain this
+  checkout (${PRE_BUILD_SHA}) -- it predates the tree you are launching from.
+  ${SERVER_BIN} is shared between worktrees, so the build above may have
+  written somewhere else, or another checkout may own this path. Build in
+  this checkout, or point CARGO_TARGET_DIR somewhere this checkout owns."
 fi
-printf 'server binary provenance: %s (checkout %s)\n' "${BUILT_SHA:-unreadable}" "${EXPECTED_SHA}"
 
 # --enable-debug-endpoints carries the KV and prefix-cache fields (/v1/debug/kv)
 # and the context length shown on the model card (/v1/debug/config). The
