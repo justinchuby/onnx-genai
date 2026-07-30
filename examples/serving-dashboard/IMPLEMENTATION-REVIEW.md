@@ -3117,3 +3117,75 @@ the lesson the other four census sites have not. It just never had its corpus wi
 
 **Verdict unchanged: APPROVE. Blocking set empty.** F32, like F24/F30/F31, is follow-up-branch work.
 
+
+---
+
+## F24 — **SUPERSEDED ON THE FIELD AXIS by `33c7a77c`. One axis remains, and it is not the one I named.**
+
+`@1cb42f0e` messaged that they were taking my `:780` test gap and would measure *"whether
+`model-path-disclosure.test.js` guards the field or the class."* **I measured it before replying, and
+the answer is that somebody already closed the class — after my pass 2, so my F24 was correct at
+`review-2` (`0bc86726`) and is stale at HEAD.**
+
+```
+33c7a77c  test(dashboard): close the disclosure CLASS, not the one field that reached a projector
+  NOT in review-2 (git show 0bc86726:… | grep -c 'whatever its name' -> 0)
+```
+
+**The new guard is the strongest test on this branch and I want to be specific about why**, because it
+does the four things I have been asking for all night, in one test:
+
+1. **Sweeps every field key**, not the one that got caught — `allFieldKeys()`, floor `> 20`.
+2. **Guards its own filter**: `swept.length > 5`, with the reason stated — *"it is over-excluding and
+   this sweep is hollow."* **An anti-vacuity floor on the exclusion, not just on the corpus.** I have
+   asked for denominators; this asserts the denominator *survived filtering*.
+3. **Carries the positive control on every iteration** — a real `server.model_id` in every fixture so
+   *"a panel that rendered NOTHING cannot be mistaken for a panel that refused the path"* — plus
+   `mountsObserved > 10` to prove the control actually rendered. **It credits the control to me and
+   then improves it: I applied mine once, this applies it 2×N times.**
+4. **The exemption expires by itself.** `DECLARED_STRING_DISCLOSURE` holds exactly one key, and the
+   anti-rot arm **fails when a declared offender stops offending**: *"an exemption outliving its defect
+   silently exempts whatever inherits that key."* That is the self-retiring limit I faulted myself for
+   not having, written by someone who did not need to be told.
+
+### The residue — **the surface axis, and it is my census class again**
+
+The guard sweeps **all fields** through a **hardcoded pair of surfaces**:
+
+```
+PANEL_MOUNTS = [ ['dashboard/system.js', mount], ['ui/model-card.js', mountModelCard] ]
+
+REGISTRY (dashboard/index.js:84):  throughput · scheduling · kvMemory · prefixCache · requests · system
+                                    + ui/model-card.js            =  7 mountable surfaces
+SWEPT: 2 of 7.
+
+UNSWEPT SURFACES THAT ACTUALLY BIND FIELDS:
+  kv-memory.js  13 field() bindings
+  scheduling.js  9
+  throughput.js  7          -> 29 live bindings never mounted by this sweep
+  prefix-cache.js 0 · requests.js 0   (prose/derived panels — nothing to paint)
+```
+
+The guard's own failure text says *"A panel painted a filesystem path from a field that is not
+`server.model_path`"* — **but it can only observe two panels.** The field axis is closed; the surface
+axis is the same frozen-numerator/growing-denominator shape as F24, F31 and F32.
+
+**And the fix is derivation, not enumeration** — `dashboard/index.js:77` already exports
+`PANELS`, frozen, each entry carrying `.module.mount`:
+
+```js
+import { PANELS } from './index.js';
+const PANEL_MOUNTS = [
+  ...PANELS.map((panel) => [`dashboard/${panel.id}.js`, panel.module.mount]),
+  ['ui/model-card.js', mountModelCard],
+];
+assert.ok(PANEL_MOUNTS.length > 6, 'the registry did not load; this sweep covers nothing');
+```
+
+This is the design question I ask of every function that trusts a caller-supplied value: **could it
+derive this itself instead of being told?** Here it can — the registry is the single source of truth,
+it is already exported, and a panel added tomorrow is swept without anyone remembering.
+
+**Corrected standing of F24:** field axis **CLOSED at `33c7a77c`**; surface axis **OPEN, 2 of 7**.
+Still non-blocking, still follow-up-branch work.
+
