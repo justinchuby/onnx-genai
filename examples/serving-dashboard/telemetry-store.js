@@ -27,10 +27,13 @@ import {
   ENDPOINTS,
   DEBUG_GATED_ENDPOINTS,
   DEBUG_ENDPOINTS_FLAG,
+  TEXT_ENDPOINTS,
+  FEATURE_GATED_ENDPOINTS,
   PROVENANCE,
   NEVER_MEASURED_CLASSIFICATIONS,
   allFieldKeys,
 } from './telemetry-provenance.js';
+import { parsePrometheusText, scalarOf, histogramMean } from './prometheus-parse.js';
 
 /**
  * Connection state. These drive the two BLOCKING full-stage failure states
@@ -141,6 +144,12 @@ export function createTelemetryStore({
    * noise. @type {Map<string, {retryAtMs: number, result: SourceResult}>}
    */
   const suppressedEndpoints = new Map();
+
+  /**
+   * Previous sample of the cumulative token counter, for deriving a rate.
+   * @type {{total: number, atMs: number}|null}
+   */
+  let lastTokenSample = null;
 
   /** @type {TelemetryStore} */
   const store = {
@@ -258,9 +267,16 @@ export function createTelemetryStore({
     const paths =
       snapshot.connection.state === CONNECTION_STATES.UNREACHABLE
         ? [ENDPOINTS.HEALTH, ENDPOINTS.STATUS]
-        : [ENDPOINTS.HEALTH, ENDPOINTS.STATUS, ENDPOINTS.DEBUG_KV, ENDPOINTS.DEBUG_CONFIG];
+        : [
+            ENDPOINTS.HEALTH,
+            ENDPOINTS.STATUS,
+            ENDPOINTS.DEBUG_KV,
+            ENDPOINTS.DEBUG_CONFIG,
+            ENDPOINTS.METRICS,
+            ENDPOINTS.RESOURCES,
+          ];
 
-    const settled = await Promise.all(paths.map((path) => fetchJson(path)));
+    const settled = await Promise.all(paths.map((path) => fetchSource(path)));
     /** @type {Record<string, SourceResult>} */
     const byPath = {};
     paths.forEach((path, index) => {
@@ -279,10 +295,16 @@ export function createTelemetryStore({
    */
 
   /**
+   * Fetch one endpoint. JSON endpoints yield a parsed object in `body`; text
+   * endpoints (currently only /metrics) yield a parsed Map of metric families,
+   * so downstream code reads them via `metric` rather than `path`.
+   *
    * @param {string} path
    * @returns {Promise<SourceResult>}
    */
-  async function fetchJson(path) {
+  async function fetchSource(path) {
+    const isText = TEXT_ENDPOINTS.includes(path);
+
     // Replay a recent HTTP failure rather than re-issuing a request we already
     // know will fail. The visitor still sees the same explanation; DevTools
     // does not fill with identical errors.
@@ -293,7 +315,7 @@ export function createTelemetryStore({
 
     try {
       const response = await fetchImpl(`${baseUrl}${path}`, {
-        headers: { accept: 'application/json' },
+        headers: { accept: isText ? 'text/plain' : 'application/json' },
         cache: 'no-store',
       });
       if (!response.ok) {
@@ -313,7 +335,7 @@ export function createTelemetryStore({
       suppressedEndpoints.delete(path);
       return {
         ok: true,
-        body: await response.json(),
+        body: isText ? parsePrometheusText(await response.text()) : await response.json(),
         status: response.status,
         serverMessage: null,
         transportError: null,
@@ -477,6 +499,9 @@ export function createTelemetryStore({
     for (const key of allFieldKeys()) {
       const entry = PROVENANCE[key];
 
+      // Client-derived fields are produced after this loop, from other fields.
+      if (entry.derived) continue;
+
       if (NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)) {
         fields[key] = unavailableField(entry.reason, { source: entry.source, unit: entry.unit });
         continue;
@@ -499,11 +524,11 @@ export function createTelemetryStore({
         continue;
       }
 
-      const rawValue = readPath(source.body, entry.path);
+      const rawValue = readEntryValue(source.body, entry);
       if (rawValue === undefined || rawValue === null) {
         fields[key] = unavailableField(
-          `${entry.source} responded, but carried no "${entry.path}" field. This server build ` +
-            'may predate that field.',
+          `${entry.source} responded, but carried no "${entry.metric ?? entry.path}" value. ` +
+            'This server build may predate it.',
           { source: entry.source, unit: entry.unit },
         );
         continue;
@@ -515,7 +540,66 @@ export function createTelemetryStore({
         observedAtMs: timestampMs,
       });
     }
+    addDerivedThroughput(fields, timestampMs);
     return Object.freeze(fields);
+  }
+
+  /**
+   * Throughput, derived client-side by differentiating the cumulative token
+   * counter between two polls.
+   *
+   * The server hardcodes `tokens_per_second: 0.0` because it records totals but
+   * no rate (see telemetry-provenance.js). The totals are real, though, so the
+   * rate is genuinely recoverable here — this is a real measurement of the
+   * server, computed by us, and is labelled as derived rather than reported.
+   *
+   * On the first poll there is no previous sample, so the field is `pending`,
+   * not `unavailable`: it resolves on the next tick, and an em-dash would
+   * wrongly promise a number that is never coming.
+   *
+   * @param {Record<string, import('./telemetry-field.js').TelemetryField>} fields
+   * @param {number} timestampMs
+   */
+  function addDerivedThroughput(fields, timestampMs) {
+    const total = fields['metrics.tokens_generated_total'];
+    const options = { source: ENDPOINTS.METRICS, unit: 'tokens/s' };
+
+    if (!total || total.state !== FIELD_STATES.MEASURED) {
+      lastTokenSample = null;
+      fields['throughput.observed'] = unavailableField(
+        'Derived from the cumulative token counter on /metrics, which is not available.',
+        options,
+      );
+      return;
+    }
+
+    const previous = lastTokenSample;
+    lastTokenSample = { total: total.value, atMs: timestampMs };
+
+    if (!previous) {
+      fields['throughput.observed'] = pendingField(
+        'Waiting for a second sample of the token counter to measure a rate.',
+        options,
+      );
+      return;
+    }
+
+    const elapsedS = (timestampMs - previous.atMs) / 1000;
+    const delta = total.value - previous.total;
+    // A restarted server resets the counter; a negative delta is not a rate.
+    if (elapsedS <= 0 || delta < 0) {
+      fields['throughput.observed'] = pendingField(
+        'The token counter reset, most likely a server restart. Re-measuring.',
+        options,
+      );
+      return;
+    }
+
+    fields['throughput.observed'] = measuredField(delta / elapsedS, {
+      ...options,
+      observedAtMs: timestampMs,
+      derivedFrom: ['metrics.tokens_generated_total'],
+    });
   }
 
   /**
@@ -534,6 +618,15 @@ export function createTelemetryStore({
       return (
         `${path} is disabled. Restart the server with ${DEBUG_ENDPOINTS_FLAG} to enable it ` +
         '(the rest of the dashboard keeps working without it).'
+      );
+    }
+    // A feature-gated endpoint is missing at BUILD time, so telling the visitor
+    // to pass a flag would send them down a dead end — the fix is a rebuild.
+    if (source.status === 404 && FEATURE_GATED_ENDPOINTS[path]) {
+      return (
+        `${path} is not compiled into this server. It is on by default; this build used ` +
+        `--no-default-features without re-enabling the "${FEATURE_GATED_ENDPOINTS[path]}" ` +
+        'feature. Rebuild with it to see these metrics.'
       );
     }
     if (source.serverMessage) {
@@ -683,6 +776,36 @@ function readPath(body, path) {
     if (node === null || node === undefined) return undefined;
     return node[segment];
   }, body);
+}
+
+/**
+ * Read one provenance entry's raw value out of its source body, dispatching on
+ * whether that source is JSON or parsed Prometheus text.
+ *
+ * Returns `undefined` when the value is absent so that `buildFields` can
+ * explain the gap. It must never fall back to 0 — that is the failure mode the
+ * whole provenance table exists to prevent.
+ *
+ * @param {any} body
+ * @param {object} entry A PROVENANCE entry.
+ * @returns {number|string|boolean|undefined}
+ */
+function readEntryValue(body, entry) {
+  if (!entry.metric) {
+    return entry.path ? readPath(body, entry.path) : undefined;
+  }
+  // Prometheus sources parse to a Map; anything else means the endpoint
+  // returned a shape we did not expect, and guessing would be worse than a gap.
+  if (!(body instanceof Map)) return undefined;
+
+  if (entry.kind === 'histogram_mean') {
+    const observed = histogramMean(body, entry.metric);
+    // `null` here means zero observations recorded — a real state, but not a
+    // measurement. Reporting 0s of latency for an idle server would be a lie.
+    return observed === null ? undefined : observed.mean;
+  }
+  const value = scalarOf(body, entry.metric);
+  return value === null ? undefined : value;
 }
 
 /**

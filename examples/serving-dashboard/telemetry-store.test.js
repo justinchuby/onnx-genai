@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 import { createTelemetryStore, CONNECTION_STATES } from './telemetry-store.js';
 import { FIELD_STATES } from './telemetry-field.js';
-import { ENDPOINTS } from './telemetry-provenance.js';
+import { ENDPOINTS, allFieldKeys } from './telemetry-provenance.js';
 
 const BASE_URL = 'http://127.0.0.1:8123';
 
@@ -66,8 +66,49 @@ function fakeFetch(routes) {
     if (route instanceof Error) {
       throw route;
     }
+    // `/metrics` is Prometheus text, not JSON. Routes carrying `text` are
+    // served verbatim so the store exercises its real parsing path.
+    if (typeof route.text === 'string') {
+      return textResponse(route.status ?? 200, route.text);
+    }
     return jsonResponse(route.status ?? 200, route.body);
   };
+}
+
+function textResponse(status, text) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async json() {
+      throw new SyntaxError('not JSON');
+    },
+    async text() {
+      return text;
+    },
+  };
+}
+
+/**
+ * A Prometheus body shaped exactly like the live server's, with the values the
+ * tests need. `batch_size_current` is deliberately larger than the hardcoded
+ * max_batch of 4, which is the case that exposes the naming trap.
+ */
+function metricsBody({ inFlight = 3, tokens = 5048, ttftSum = 20.7, ttftCount = 10 } = {}) {
+  return `# HELP onnx_genai_tokens_generated_total Total prompt and completion tokens processed.
+# TYPE onnx_genai_tokens_generated_total counter
+onnx_genai_tokens_generated_total ${tokens}
+# HELP onnx_genai_batch_size_current Current generation batch size.
+# TYPE onnx_genai_batch_size_current gauge
+onnx_genai_batch_size_current ${inFlight}
+# HELP onnx_genai_time_to_first_token_seconds Time to first generated token.
+# TYPE onnx_genai_time_to_first_token_seconds histogram
+onnx_genai_time_to_first_token_seconds_bucket{le="+Inf"} ${ttftCount}
+onnx_genai_time_to_first_token_seconds_sum ${ttftSum}
+onnx_genai_time_to_first_token_seconds_count ${ttftCount}
+# HELP onnx_genai_prefix_cache_hits_total Generation requests with a prefix-cache hit.
+# TYPE onnx_genai_prefix_cache_hits_total counter
+onnx_genai_prefix_cache_hits_total 0
+`;
 }
 
 function jsonResponse(status, body) {
@@ -97,6 +138,13 @@ function healthyRoutes(overrides = {}) {
         max_sessions: 256,
         max_queue_depth: 64,
         model_max_context: 32768,
+      },
+    },
+    [ENDPOINTS.METRICS]: { text: metricsBody() },
+    [ENDPOINTS.RESOURCES]: {
+      body: {
+        derived_kv_budget: { bytes: 5746050801 },
+        vram: { used: 0, limit: 5746050801, headroom: 5746050801 },
       },
     },
     ...overrides,
@@ -316,9 +364,15 @@ test('at most one poll cycle is in flight at a time', async () => {
   });
 
   await Promise.all([store.pollOnce(), store.pollOnce(), store.pollOnce()]);
-  // 4 endpoints fetched concurrently within ONE cycle is expected; 8+ would
-  // mean a second cycle started before the first finished.
-  assert.ok(maxInFlight <= 4, `expected <= 4 concurrent requests, saw ${maxInFlight}`);
+  // One cycle fetches every polled endpoint concurrently, so the bound is the
+  // endpoint count itself. Derived rather than hardcoded: adding an endpoint
+  // should not look like a concurrency regression. Anything above this means a
+  // second cycle started before the first finished.
+  const endpointsPerCycle = Object.keys(ENDPOINTS).length;
+  assert.ok(
+    maxInFlight <= endpointsPerCycle,
+    `expected <= ${endpointsPerCycle} concurrent requests (one cycle), saw ${maxInFlight}`,
+  );
 });
 
 test('a failing endpoint is not re-requested on every poll (no console flood)', async () => {
@@ -463,4 +517,210 @@ test('every field is present in the very first snapshot, before any poll', () =>
     assert.equal(field.value, null);
     assert.ok(field.reason);
   }
+});
+
+// ── /metrics: the honest counterpart to /v1/status's fabricated zeros ───────
+
+test('Prometheus metrics become measured fields', async () => {
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  assert.equal(fields['metrics.tokens_generated_total'].state, FIELD_STATES.MEASURED);
+  assert.equal(fields['metrics.tokens_generated_total'].value, 5048);
+  // TTFT arrives as a histogram and must be reduced to sum/count, not read raw.
+  assert.equal(fields['metrics.ttft'].state, FIELD_STATES.MEASURED);
+  assert.ok(Math.abs(fields['metrics.ttft'].value - 2.07) < 0.001);
+});
+
+test('the in-flight gauge is NEVER exposed as the engine batch size', async () => {
+  // The single most dangerous metric on the server: onnx_genai_batch_size_current
+  // is documented "Current generation batch size" but is incremented per HTTP
+  // generation and decremented on drop, so it counts requests in flight. With
+  // max_batch pinned at 4, this body reports 3 in flight -- and on a busier
+  // server it would report 8 while the engine batched only 4.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: { text: metricsBody({ inFlight: 8 }) } })),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  // It is a real measurement -- of in-flight generations.
+  assert.equal(fields['batch.in_flight'].state, FIELD_STATES.MEASURED);
+  assert.equal(fields['batch.in_flight'].value, 8);
+
+  // The number a viewer would assume "batch size" means is NOT available, and
+  // must not be silently backfilled from the gauge above.
+  assert.equal(fields['batch.effective_size'].state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(fields['batch.effective_size'].value, null);
+  assert.match(fields['batch.effective_size'].reason, /does not report/i);
+});
+
+test('a genuinely measured zero from /metrics survives as zero', async () => {
+  // prefix_cache_hits is 0 on a static-cache server because the batching path
+  // bypasses the prefix trie. That zero is a real observation about the
+  // architecture, and flattening it to "unavailable" would hide the finding.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  assert.equal(fields['metrics.prefix_cache_hits'].state, FIELD_STATES.MEASURED);
+  assert.equal(fields['metrics.prefix_cache_hits'].value, 0);
+});
+
+test('an idle server reports no latency rather than zero latency', async () => {
+  // Zero observations means sum/count is 0/0. Reporting "0s time to first
+  // token" for a server that has generated nothing is a fabricated number.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(
+      healthyRoutes({
+        [ENDPOINTS.METRICS]: { text: metricsBody({ ttftSum: 0, ttftCount: 0 }) },
+      }),
+    ),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  assert.equal(fields['metrics.ttft'].state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(fields['metrics.ttft'].value, null);
+});
+
+test('a server built without the metrics feature explains a rebuild, not a flag', async () => {
+  // /metrics is compiled in by default, so a 404 means --no-default-features.
+  // Telling the visitor to pass a runtime flag would send them down a dead end.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: undefined })),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  const field = fields['metrics.tokens_generated_total'];
+  assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
+  assert.match(field.reason, /rebuild/i);
+  assert.doesNotMatch(field.reason, /--enable-debug-endpoints/);
+});
+
+test('metrics degrade independently of the JSON endpoints', async () => {
+  // Losing /metrics must not blank fields that /v1/status still serves.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: undefined })),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  assert.equal(fields['queue.depth'].state, FIELD_STATES.MEASURED);
+  assert.equal(fields['metrics.ttft'].state, FIELD_STATES.UNAVAILABLE);
+});
+
+test('an HTML error page served at /metrics does not crash the store', async () => {
+  // A proxy or a wrong port realistically returns HTML with a 200.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(
+      healthyRoutes({ [ENDPOINTS.METRICS]: { text: '<html><body>hello</body></html>' } }),
+    ),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  assert.equal(fields['metrics.ttft'].state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(fields['queue.depth'].state, FIELD_STATES.MEASURED);
+});
+
+test('/v1/resources fields are measured', async () => {
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  assert.equal(fields['resources.kv_budget_bytes'].state, FIELD_STATES.MEASURED);
+  assert.equal(fields['resources.kv_budget_bytes'].value, 5746050801);
+});
+
+// ── derived throughput: recovering a rate the server refuses to compute ─────
+
+test('throughput is PENDING on the first poll, not unavailable', async () => {
+  // A rate needs two samples. `pending` promises a number that is genuinely
+  // coming; `unavailable` would wrongly say it never will.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  await store.pollOnce();
+
+  assert.equal(store.getSnapshot().fields['throughput.observed'].state, FIELD_STATES.PENDING);
+});
+
+test('throughput is derived from the delta of the cumulative token counter', async () => {
+  let tokens = 1000;
+  let clock = 10_000;
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => clock,
+    fetchImpl: async (url) =>
+      fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: { text: metricsBody({ tokens }) } }))(url),
+  });
+
+  await store.pollOnce();
+  tokens = 1200;
+  clock = 12_000;
+  await store.pollOnce();
+
+  // 200 tokens over 2 seconds.
+  const field = store.getSnapshot().fields['throughput.observed'];
+  assert.equal(field.state, FIELD_STATES.MEASURED);
+  assert.equal(field.value, 100);
+  // It must disclose that we computed it rather than read it.
+  assert.deepEqual(field.derivedFrom, ['metrics.tokens_generated_total']);
+});
+
+test('a counter reset re-measures instead of reporting a negative rate', async () => {
+  let tokens = 5000;
+  let clock = 10_000;
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => clock,
+    fetchImpl: async (url) =>
+      fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: { text: metricsBody({ tokens }) } }))(url),
+  });
+
+  await store.pollOnce();
+  clock = 12_000;
+  tokens = 12; // server restarted; counter went backwards
+  await store.pollOnce();
+
+  const field = store.getSnapshot().fields['throughput.observed'];
+  assert.equal(field.state, FIELD_STATES.PENDING);
+  assert.match(field.reason, /reset/i);
+});
+
+test('throughput is unavailable when /metrics is, and does not go stale silently', async () => {
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: undefined })),
+  });
+  await store.pollOnce();
+
+  assert.equal(store.getSnapshot().fields['throughput.observed'].state, FIELD_STATES.UNAVAILABLE);
+});
+
+test('every provenance entry appears in the snapshot, including derived ones', () => {
+  // Guards the footer table: a key documented in PROVENANCE but never emitted
+  // (or vice versa) would make the "what's real" table lie by omission.
+  const store = createTelemetryStore({ baseUrl: BASE_URL, fetchImpl: fakeFetch({}) });
+  const keys = Object.keys(store.getSnapshot().fields).sort();
+
+  assert.deepEqual(keys, allFieldKeys().sort());
 });

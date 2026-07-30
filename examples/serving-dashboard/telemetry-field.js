@@ -83,7 +83,7 @@ export const FIELD_STATES = Object.freeze({
  * @param {number} [options.observedAtMs] Defaults to now.
  * @returns {TelemetryField}
  */
-export function measuredField(value, { source, unit = null, observedAtMs = Date.now() }) {
+export function measuredField(value, { source, unit = null, observedAtMs = Date.now(), derivedFrom = null }) {
   if (value === null || value === undefined) {
     throw new TypeError(
       'measuredField() was given a null/undefined value. A missing value is not a ' +
@@ -100,7 +100,10 @@ export function measuredField(value, { source, unit = null, observedAtMs = Date.
     reason: null,
     unit,
     observedAtMs,
-    derivedFrom: null,
+    // Set when WE computed the value from other fields rather than reading it
+    // off a response. Still a real measurement, but a panel showing it owes the
+    // viewer the inputs — a number we derived needs more disclosure, not less.
+    derivedFrom,
   });
 }
 

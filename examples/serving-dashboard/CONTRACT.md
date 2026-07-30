@@ -128,10 +128,42 @@ Measured today: `queue.depth`, `sessions.active`, `server.model_id`,
 `batch.active_size`, `admission.slots_available`, `admission.rejections`,
 `prefix_cache.hits`, `prefix_cache.lookups`.
 
+From `GET /metrics` (Prometheus text, parsed by `prometheus-parse.js`):
+`metrics.ttft`, `metrics.e2e_latency`, `metrics.tokens_generated_total`,
+`metrics.completion_tokens_total`, `metrics.requests_waiting`,
+`metrics.prefix_cache_hits`, `metrics.prefix_cache_lookups`, `batch.in_flight`.
+From `GET /v1/resources`: `resources.kv_budget_bytes`,
+`resources.vram_limit_bytes`.
+
+Derived in the browser: `throughput.observed` — a real tokens/sec, obtained by
+differentiating `metrics.tokens_generated_total` between polls. The server
+hardcodes `tokens_per_second: 0.0` because it keeps totals but no rate; the
+totals are genuine, so the rate is recoverable. It carries
+`derivedFrom: ['metrics.tokens_generated_total']`, and it is `pending` on the
+first poll because a rate needs two samples.
+
 Unavailable today (documented zeros / not plumbed): `kv.usage`, `kv.pages_used`,
 `kv.pages_total`, `kv.pages_shared`, `kv.introspection`, `batch.utilization`,
 `throughput.tokens_per_second`, `sessions.paused`, `prefix_cache.hashes`,
-`server.model_path`, `server.execution_provider`.
+`server.model_path`, `server.execution_provider`, `batch.effective_size`.
+
+> ⚠️ **Do not build a "batch size" panel on `batch.in_flight`.**
+> `onnx_genai_batch_size_current` is documented "Current generation batch size"
+> but is `fetch_add(1)` in `GenerationMetrics::start()` and decremented in
+> `Drop` (`metrics.rs:112`, `:145`) — it counts **generation requests in
+> flight** at the HTTP layer and never consults the batch manager. With
+> `max_batch` pinned at 4, 8 concurrent requests make it read 8 while the engine
+> batches 4. The engine's real batch size is `batch.effective_size`, which is
+> **unavailable** because nothing exposes it.
+>
+> This is the queueing-vs-batching distinction the spec requires you to narrate:
+> `in_flight` is measured, everything above the batch limit is *queued*, and the
+> batch itself is not observable. Say that, rather than implying a batch of 8.
+
+> `metrics.prefix_cache_hits` is `measured` and is genuinely `0` on a
+> static-cache server: the batching path bypasses the prefix trie entirely. That
+> zero is a real finding about the architecture — caption it, don't debug it,
+> and don't convert it to `unavailable`.
 
 > Build your panel against the unavailable ones **now**. Unavailable is the
 > correct first state, not a placeholder — when @d7cf9b84's plumbing lands, one
