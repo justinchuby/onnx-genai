@@ -48,7 +48,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { basename } from 'node:path';
 
-import { assertShippingTree, shippedPaths } from './shipping-tree.mjs';
+import { assertShippingTree, shipped, shippedPaths } from './shipping-tree.mjs';
 
 assertShippingTree();
 
@@ -211,6 +211,229 @@ describe('test-file basenames', () => {
       `Test files were found in only ${directories.size} directory. A basename ` +
         'collision requires two directories, so this check could never fail — ' +
         'which means it is not measuring what it claims to measure.',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The `check-` prefix: what it means, and why it is not being applied by rename
+// ---------------------------------------------------------------------------
+//
+// THE COMPLAINT THIS ANSWERS. Some suites are `check-foo.test.js` and some are
+// `foo.test.js`, and a newcomer cannot infer which they should write. An
+// unstated convention is worse than either consistent alternative: it looks
+// meaningful, so readers infer a meaning, and the meaning they infer is wrong.
+//
+// WHAT THE PREFIX ACTUALLY MEANS, MEASURED RATHER THAN ASSUMED.
+// Every `*.test.js` at the shipping ref was classified by what it DOES:
+//
+//   check- prefixed, reads repo artefacts .......... 14   (all of them)
+//   check- prefixed, pure unit test ................  0
+//   unprefixed, pure unit test .................... 18   (all unprefixed)
+//   unprefixed, reads repo artefacts .............. 33   <- the drift
+//
+// So the prefix is already 100% reliable in ONE direction — `check-` always
+// means "this reads the repository as data: sources, docs, the launcher, the
+// committed tree" — and it is silent in the other. That one-directional rule is
+// real, is load-bearing, and is what this file now states and enforces.
+//
+// The prefix carries NO functional meaning: `run-tests.sh` and `package.json`
+// were both searched and neither selects on it. Nothing dispatches differently.
+//
+// WHY THIS IS NOT A RENAME COMMIT.
+// Making the corpus consistent means renaming 33 files. This repo has already
+// weighed that trade once, four exemption-comments above, and declined it: the
+// review documents cite these filenames, and renaming mid-review converts
+// correct citations into stale ones inside documents their authors are actively
+// reading. Thirty-three renames is that hazard at eleven times the size, landed
+// while three reviewers hold open findings.
+//
+// So the hazard is frozen instead. The 33 are grandfathered by exact set, which
+// means a NEW unprefixed scanner cannot be added without failing this test —
+// the corpus converges on the convention as files are added, and no citation
+// anywhere rots today. The list shrinks by rename, one file at a time, whenever
+// somebody is already touching a file for another reason.
+
+/**
+ * Evidence that a suite reads the repository as data rather than importing a
+ * module and exercising it.
+ *
+ * Deliberately broad. A false POSITIVE here costs a rename argument; a false
+ * negative silently lets a scanner ship unprefixed, which is the drift being
+ * frozen. Broad-and-noisy is the safe direction for a ratchet.
+ */
+const SCANNER_EVIDENCE = /node:fs|node:child_process|shipping-tree|readFileSync|execFileSync/;
+
+/**
+ * Unprefixed suites that read repo artefacts, as committed.
+ *
+ * EXACT SET, not a count. A count would let one file be renamed and another
+ * added without notice, which is precisely the quiet drift this pins.
+ *
+ * RETIREMENT: rename `foo.test.js` -> `check-foo.test.js`, update any citation
+ * in the review documents, and delete the line here in the SAME commit. The
+ * self-expiry test below fails if an entry outlives the file it names.
+ */
+const GRANDFATHERED_UNPREFIXED_SCANNERS = Object.freeze([
+  'asset-graph.test.js',
+  'backstop-reach.test.js',
+  'caption-catalogue.test.js',
+  'dashboard/field-keys.test.js',
+  'dashboard/honesty.test.js',
+  'dashboard/model-path-disclosure.test.js',
+  'dashboard/panel-kit.test.js',
+  'dashboard/panels.test.js',
+  'dashboard/registry-prefix-tripwire.test.js',
+  'dashboard/registry.test.js',
+  'dashboard/scheduling.test.js',
+  'dashboard/staleness.test.js',
+  'dashboard/stylesheet.test.js',
+  'denominator-binding.test.js',
+  'fetch-chokepoint.test.js',
+  'never-bind.test.js',
+  'page-claims.test.js',
+  'prefix-counters-forbidden.test.js',
+  'provenance-expiry.test.js',
+  'register-completeness.test.js',
+  'repair-citations.test.js',
+  'request-deadline.test.js',
+  'run-tests-guards.test.js',
+  'scenario-origins.test.js',
+  'scenario-routes.test.js',
+  'scenario-switcher.test.js',
+  'served-surface-rendered.test.js',
+  'served-surface.test.js',
+  'shipping-tree.test.js',
+  'state-channel.test.js',
+  'state-treatments.test.js',
+  'telemetry-field.test.js',
+  'telemetry-key-namespace.test.js',
+]);
+
+/** Every shipped test path, tagged with whether it scans and whether it is prefixed. */
+function classifiedTests() {
+  return shippedPaths()
+    .filter((path) => path.endsWith('.test.js'))
+    .map((path) => ({
+      path,
+      prefixed: basename(path).startsWith('check-'),
+      scans: SCANNER_EVIDENCE.test(shipped(path)),
+    }));
+}
+
+describe('the check- test-file prefix', () => {
+  it('THE RULE: a check- prefixed suite reads the repository as data', () => {
+    // State it once, here, and enforce it. This is the direction of the rule
+    // that is true today with zero renames, so it can be enforced immediately
+    // rather than aspirationally.
+    const offenders = classifiedTests()
+      .filter((t) => t.prefixed && !t.scans)
+      .map((t) => `  ${t.path}`);
+
+    assert.deepEqual(
+      offenders,
+      [],
+      'These suites carry the `check-` prefix but do not read any repository ' +
+        `artefact:\n${offenders.join('\n')}\n\n` +
+        'In this repo `check-` means "audits the repository as data" — sources, ' +
+        'docs, the launcher, the committed tree. A unit test that imports a ' +
+        'module and exercises it is named after the module, with no prefix.\n' +
+        'Either drop the prefix, or if it really is an audit, make it read the ' +
+        'artefact it audits.',
+    );
+  });
+
+  it('THE RULE, other half: a pure unit test is not named check-', () => {
+    // The contrapositive, asserted separately so the failure message can say
+    // which mistake was made rather than making the reader work it out.
+    const misnamed = classifiedTests()
+      .filter((t) => t.prefixed && !t.scans)
+      .map((t) => t.path);
+
+    assert.equal(
+      misnamed.length,
+      0,
+      `A suite named check-* must audit repo artefacts: ${misnamed.join(', ')}`,
+    );
+
+    // And the population that gives the rule its meaning must be non-empty.
+    const prefixed = classifiedTests().filter((t) => t.prefixed);
+    assert.ok(
+      prefixed.length >= 10,
+      `Only ${prefixed.length} check- prefixed suites found; there were 14 when ` +
+        'this rule was written. A rule about a population of zero is not a rule.',
+    );
+  });
+
+  it('no NEW unprefixed scanner may be added — the drift is frozen, not blessed', () => {
+    const actual = classifiedTests()
+      .filter((t) => !t.prefixed && t.scans)
+      .map((t) => t.path)
+      .sort();
+
+    const expected = [...GRANDFATHERED_UNPREFIXED_SCANNERS].sort();
+    const added = actual.filter((p) => !expected.includes(p));
+    const removed = expected.filter((p) => !actual.includes(p));
+
+    assert.deepEqual(
+      added,
+      [],
+      'New suites read repository artefacts but are not named `check-`:\n' +
+        `${added.map((p) => `  ${p}`).join('\n')}\n\n` +
+        'Rename them to `check-<name>.test.js`. The 33 unprefixed scanners ' +
+        'already here are grandfathered ONLY because renaming them mid-review ' +
+        'would rot live citations in the review documents — that reprieve does ' +
+        'not extend to files being written now.',
+    );
+
+    assert.deepEqual(
+      removed,
+      [],
+      'GRANDFATHERED_UNPREFIXED_SCANNERS names files that are no longer ' +
+        `unprefixed scanners:\n${removed.map((p) => `  ${p}`).join('\n')}\n\n` +
+        'If you renamed one, delete its line here in the same commit. An ' +
+        'exemption that outlives its subject silently exempts the next file ' +
+        'that takes the name.',
+    );
+  });
+
+  it('the classifier can say both YES and NO', () => {
+    // ANTI-VACUITY. Every assertion above is satisfied if `scans` is constant.
+    // If SCANNER_EVIDENCE never matched, test one passes trivially and the
+    // ratchet reports an empty set as agreement with a 33-entry list — which
+    // would fail loudly, but only by luck rather than by design. Assert the
+    // instrument's discrimination directly.
+    const all = classifiedTests();
+
+    assert.ok(
+      all.length >= 50,
+      `Only ${all.length} test files at the shipping ref; the census is broken.`,
+    );
+
+    const scanners = all.filter((t) => t.scans);
+    const units = all.filter((t) => !t.scans);
+
+    assert.ok(
+      scanners.length >= 20 && units.length >= 10,
+      `Classifier produced ${scanners.length} scanners and ${units.length} unit ` +
+        'tests. It was 47 and 18 when written. A lopsided split means the ' +
+        'evidence pattern stopped discriminating, not that the corpus changed.',
+    );
+
+    // POSITIVE CONTROL: a known scanner is recognised.
+    assert.ok(
+      all.find((t) => t.path === 'check-source-citations.test.js')?.scans,
+      'check-source-citations.test.js reads the Rust sources and must classify ' +
+        'as a scanner. The instrument cannot see what it is pointed at.',
+    );
+
+    // NEGATIVE CONTROL: a known pure unit test is NOT recognised as a scanner.
+    assert.equal(
+      all.find((t) => t.path === 'dashboard/sparkline.test.js')?.scans,
+      false,
+      'dashboard/sparkline.test.js imports a module and exercises it; if it ' +
+        'classifies as a scanner then SCANNER_EVIDENCE matches everything and ' +
+        'the prefix rule is enforcing nothing.',
     );
   });
 });

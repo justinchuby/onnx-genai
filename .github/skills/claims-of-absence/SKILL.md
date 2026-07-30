@@ -89,9 +89,13 @@ assert.match(rawAdminRs, /uptime/);
 assert.equal(sourcesMentioning('uptime').length, 0);
 ```
 
-Also pick wire names that cannot collide. `ttft` appears in `metrics.rs` as a
-registry field; `ttft_client` does not. A short token is a false positive
-waiting to happen.
+Also pick wire names that cannot collide. `ttft` appears in
+`crates/onnx-genai-server/src/metrics.rs` as a registry field; `ttft_client` does
+not. A short token is a false positive waiting to happen.
+
+Cite the **repo-relative path**, never the bare basename. Two crates ship a file
+named metrics.rs, and a citation that resolves to either sends the reader to the
+wrong one with full confidence.
 
 ## 5. Anti-vacuity controls are mandatory
 
@@ -103,16 +107,39 @@ A scan that reaches nothing passes. Every scanner here asserts:
 
 Green must mean "checked and clean", never "found nothing to check".
 
-## 6. Some guards read `git show HEAD:`, not the working tree — on purpose
+Corollary, learned the expensive way: **measure the hazard before building the
+detector.** A text-similarity check for this very document was written, measured,
+and thrown away — verbatim overlap with the guards was already near zero because
+the duplication was semantic. It would have shipped permanently green.
 
-`served-surface.test.js`, `caption-catalogue.test.js`, `check-perf-claims.test.js`
-and others read committed bytes, because a reviewer clones HEAD and so does CI.
+## 6. Some guards read committed bytes, not the working tree — on purpose
+
+They read the shipping ref because a reviewer clones a commit and so does CI.
 Consequences when working on this repo:
 
 - **They cannot go green before you commit.** Do not "fix" them in a loop
   pre-commit; commit, then re-run.
 - **Re-run the suite with a clean `git status --porcelain`**, or you are reading
   one tree and reasoning about another.
+
+Do not guess which guards these are from the filename — check for a
+`shipped()` / `SHIPPING_REF` read. The two lists below are **verified in both
+directions** by `examples/serving-dashboard/check-skill-drift.test.js`: every
+file on the first line must read the shipping ref, and every file on the second
+must not.
+
+- Reads committed bytes: `examples/serving-dashboard/served-surface-rendered.test.js`,
+  `examples/serving-dashboard/caption-catalogue.test.js`,
+  `examples/serving-dashboard/check-perf-claims.test.js`
+- Reads the working tree: `examples/serving-dashboard/served-surface.test.js`
+
+Those first two are near-namesakes and they differ. An earlier revision of this
+document confused them and told readers to commit in order to fix a red that
+committing could not fix — which is why the working-tree line is asserted rather
+than simply omitted. A counter-example nobody checks decays into an exception.
+
+The house form resolves a **SHA** into `SHIPPING_REF` rather than spelling
+`HEAD` at each call site, so that one run cannot read several different trees.
 
 ## 7. Ratchets move in both directions
 
@@ -134,3 +161,37 @@ fixtures mean guards reason about a response shape the server stopped sending.
 The capture recorder derives its endpoint list from `Object.values(ENDPOINTS)`,
 so adding an endpoint needs no recorder change — but the fixtures still have to
 be re-recorded and the diff actually read.
+
+## 9. Where each rule is enforced — and which text wins
+
+This document is **not** the authority on how these rules are enforced here. The
+guards are: they sit beside the code, they run, and they fail. Prose cannot.
+
+So the division is deliberate, and it is the whole reason this section exists:
+
+| Concern | Authority | This document's job |
+| --- | --- | --- |
+| How a rule is enforced in *this* repo | the guard | cite it |
+| The shape of the mistake, in code not yet written | this document | state it |
+
+When the two overlap, **the skill cites and the guard states.** Restating a
+guard's rationale here creates two independent wordings of one rule, and only
+one of them can ever go red — so the copy that cannot fail is the copy that
+rots, in front of the audience least able to check it.
+
+The enforced statements:
+
+| Rule | Enforced by | Mechanism |
+| --- | --- | --- |
+| §1 call sites resolve | `examples/serving-dashboard/dashboard/field-keys.test.js` | `KEY_LITERAL` |
+| §3 deferrals name a falsifier | `examples/serving-dashboard/check-unplumbed-claims.test.js` | `absentWireNames` |
+| §4 scanners strip comments | `examples/serving-dashboard/check-unplumbed-claims.test.js` | `COMMENT_ONLY_CONTROL` |
+| §7 ratchets shrink on repair | `examples/serving-dashboard/telemetry-key-namespace.test.js` | `KNOWN_UNSERVABLE_KEYS` |
+| §7 counted ratchet | `examples/serving-dashboard/served-surface.test.js` | `MAX_SERVED_BUT_NOT_NEEDED` |
+| this section's own citations | `examples/serving-dashboard/check-skill-drift.test.js` | resolves every path and symbol above |
+
+That last row is the point. Every path and symbol in this document is checked
+against the shipping ref, so a mechanism that is renamed or deleted turns this
+document **red** instead of leaving it quietly wrong. A skill is loaded *instead
+of* reading the code; an uncheckable citation is not a broken link, it is advice
+about a mechanism the reader will assume is still there.
