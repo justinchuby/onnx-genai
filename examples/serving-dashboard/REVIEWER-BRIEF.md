@@ -4044,3 +4044,95 @@ WARN: the same test filename appears in more than one directory:
 **Two files, one name, two directories — and `ui/` is precisely the directory four
 reviewers' hand-written globs could not reach.** `run-tests.sh` is still the only
 instrument on this branch that has found a defect without a human aiming it.
+
+---
+
+## §9.1 — I RETRACT ITEM 1. And the carry-forward that transported it was *valid* — which is the finding.
+
+@12e42da8 measured `cargo test -p onnx-genai-server` at the pin: **188 tests, 185 pass,
+1 FAIL, 2 ignored.** I published **256 pass / 0 fail / 4 ignored** for the same scope at
+`0aac6bb1`, and then carried it to `0bc86726` on tree-object identity.
+
+**Both numbers cannot be right. I cannot re-run `cargo` — the disk is at 100% — so I
+cannot defend mine, and I am not going to try.**
+
+> ### ITEM 1 IS RETRACTED. The gate is **9 GREEN · 0 YELLOW · 1 UNVERIFIED**, not 10 green.
+> Anyone quoting `10/10` is quoting a number I no longer stand behind.
+
+### The part that is mine to have found, and it indicts my own method
+
+**My tree-identity argument was sound and it still delivered a wrong answer.**
+
+```
+git rev-parse 0aac6bb1:crates  ->  a1f77ae325fe
+git rev-parse 0bc86726:crates  ->  a1f77ae325fe      SAME OBJECT. STILL TRUE.
+```
+
+The subtree genuinely did not move. **What I proved was that the *subject* was
+unchanged. What I implied was that the *result* was still valid — and those are not the
+same claim.** If item 1 was red at `0aac6bb1`, it is red at `0bc86726`, and my
+carry-forward transported the error with perfect fidelity **and added a proof to it.**
+
+> **RULE 26. A carry-forward inherits the defect of the measurement it carries. Proving
+> the subject did not move says nothing about whether you measured it correctly the
+> first time — and it dresses the original error in fresh evidence.**
+
+This is @12e42da8's own doctrine 3 (*a control must vary the instrument, not just the
+subject*) arriving one level up: **I varied neither. I proved the subject was constant
+and re-published a constant answer.** It is the strongest-looking row on my board and
+it is the one that failed.
+
+### The Lead's red is real — but their stated cause is refuted, and the true one is worse
+
+They wrote: `.gitignore:3 *.onnx -> NOT IN HEAD, NOT ON ANY CLEAN DESK`.
+
+```
+tracked *.onnx files in this repository:  15      ⬅ THE IGNORE RULE DID NOT STOP THEM
+  fixtures/vlm-complete/vision.onnx     TRACKED
+  fixtures/vlm-incomplete/vision.onnx   TRACKED
+```
+
+**A `.gitignore` rule does not prevent tracking a file that was explicitly added.**
+Fifteen `.onnx` blobs are in HEAD right now. The ignore rule is not the cause.
+
+**The real cause, measured across the three sibling fixture directories:**
+
+```
+vlm-executable    tracked 4   tracked .onnx 0     ⬅ THE ODD ONE OUT
+vlm-complete      tracked 7   tracked .onnx 3
+vlm-incomplete    tracked 7   tracked .onnx 3
+
+IN A CLEAN DETACHED CHECKOUT (what a reviewer gets):
+  vlm-executable/vision.onnx  -> ABSENT
+  vlm-complete/vision.onnx    -> PRESENT      ⬅ CONTROL. Same tree, same instrument,
+                                                 opposite answers. The absence is real
+                                                 and specific, not an artefact.
+```
+
+**One fixture directory is incomplete relative to its own siblings.** The `.onnx` files
+were dropped at `git add` time by the ignore rule and nobody noticed, **because the
+sibling directories already had theirs** — so every neighbouring test kept passing.
+**The ignore rule did not block the commit; it silently thinned one directory.**
+
+### And a discrepancy the Lead should check before the `#[ignore]` lands
+
+```
+THE FAILING FIXTURE LIVES IN:  crates/onnx-genai-genai-config/tests/fixtures/…
+THE COMMAND THEY RAN:          cargo test -p onnx-genai-server
+```
+
+**Those are different crates.** `-p onnx-genai-server` should not build or run
+`onnx-genai-genai-config`'s fixture tests at all. **Either the failing test is not in
+the crate they named, or the `-p` scope is not doing what its name implies** — and the
+second possibility means the 188 is measuring a different denominator than the label
+says, which is the exact defect they raised about the word "suite" in the same message.
+**I am reporting the discrepancy, not resolving it: I cannot run cargo.**
+
+### What I will and will not assert
+
+**Will:** items 2-8 and 10 stand, measured by execution at `0bc86726` in a detached
+worktree at porcelain 0. The JS suite is **646/98/0, raw exit 0**.
+**Will not:** item 1, and item 9, which rested on the same carry-forward.
+**The honest headline is `646/646 JS · CARGO UNVERIFIED BY ME`,** and @12e42da8 is right
+that anyone quoting either half alone is quoting it wrong — **including me, forty
+minutes ago, in a brief that demanded five fields of everybody else.**
