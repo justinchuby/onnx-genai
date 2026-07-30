@@ -209,6 +209,25 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                 )
             )
 
+    # Positional citations were previously COUNTED and ratcheted but never
+    # resolved -- not even for path existence. That made the ratchet a tally of
+    # unchecked text, not a shrinking pile of checked-but-legacy citations. All
+    # five in ARCHITECTURE.md turned out to name crate-relative fragments
+    # (`cli/src/lib.rs`) that match no tracked path at all, and one basename
+    # (`governor.rs`) that matches two different crates. Resolve them too: a
+    # citation the tool cannot follow must never be counted as one it checked.
+    for c in positional:
+        if resolve_path(repo, tracked, c.path) is None:
+            failures.append(
+                Failure(
+                    "UNANCHORED_UNRESOLVABLE",
+                    c,
+                    f"positional citation '{c.raw}' names a path that is not "
+                    f"tracked on this branch. A line number cannot rescue a "
+                    f"path that does not exist; re-anchor as `path::symbol`.",
+                )
+            )
+
     stats = {
         "anchored": len(anchored),
         "unanchored": len(positional),
@@ -352,7 +371,46 @@ def self_test() -> int:
         (repo / "src" / "sample.rs").write_text("// cited_symbol is described here\n")
     run_case("symbol appears only in a comment", mention_only, "SYMBOL_NOT_IN_FILE")
 
-    # 8. Anti-shrink: deleting the citation must NOT be a way to go green.
+    # 8. A positional citation naming an UNTRACKED path must be caught. This
+    #    category was previously counted and ratcheted but never resolved, so a
+    #    citation the tool could not follow was tallied as one it had checked.
+    def positional_unresolvable(repo: Path):
+        (repo / "docs" / "d.md").write_text(
+            SAMPLE_DOC + "Also see `engine/src/sample.rs:44` for detail.\n"
+        )
+    run_case(
+        "positional citation to an untracked path",
+        positional_unresolvable,
+        "UNANCHORED_UNRESOLVABLE",
+    )
+
+    # 9. ...but a positional citation whose path IS tracked must NOT raise
+    #    UNANCHORED_UNRESOLVABLE. Without this the check above would pass by
+    #    flagging every positional citation indiscriminately, which proves
+    #    nothing about whether it can actually resolve a path.
+    def positional_resolvable(repo: Path):
+        (repo / "docs" / "d.md").write_text(
+            SAMPLE_DOC + "Also see `src/sample.rs:2` for detail.\n"
+        )
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td)
+        (repo / "src").mkdir()
+        (repo / "docs").mkdir()
+        (repo / "src" / "sample.rs").write_text(SAMPLE_SRC)
+        (repo / "docs" / "d.md").write_text(SAMPLE_DOC)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "src/sample.rs", "docs/d.md"], cwd=repo, check=True)
+        positional_resolvable(repo)
+        failures, _ = check(repo, repo / "docs" / "d.md", {})
+        kinds = {f.kind for f in failures}
+        ok = "UNANCHORED_UNRESOLVABLE" not in kinds
+        results.append((
+            "positional citation to a TRACKED path (must not raise)",
+            ok,
+            "did not raise" if ok else f"falsely raised: {kinds}",
+        ))
+
+    # 10. Anti-shrink: deleting the citation must NOT be a way to go green.
     def shrink(repo: Path):
         (repo / "docs" / "d.md").write_text("No citations at all here.\n")
     with tempfile.TemporaryDirectory() as td:

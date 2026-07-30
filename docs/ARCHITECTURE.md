@@ -226,8 +226,8 @@ The spine of the system. Following one `POST /v1/chat/completions` from socket t
 ### 3.1 Startup — before any request
 
 1. `main()` (`crates/onnx-genai-cli/src/main.rs::main`) → `run(argv)` in `crates/onnx-genai-cli/src/lib.rs`.
-2. `Commands::Serve` (`cli/src/lib.rs:93-95`) → `run_serve` (`crates/onnx-genai-server/src/cli.rs::ServeArgs`). The standalone `onnx-genai-server` binary calls the same function — **one serving path, not two**.
-3. Model source resolution (`crates/onnx-genai-server/src/cli.rs::run_serve`). A clap `ArgGroup` (`cli.rs:20-25`) requires exactly one of `--model` / `--models-dir` / `--models-config`, producing `Vec<ModelSpec>`.
+2. `Commands::Serve` (`crates/onnx-genai-cli/src/lib.rs::Commands`) → `run_serve` (`crates/onnx-genai-server/src/cli.rs::ServeArgs`). The standalone `onnx-genai-server` binary calls the same function — **one serving path, not two**.
+3. Model source resolution (`crates/onnx-genai-server/src/cli.rs::run_serve`). A clap `ArgGroup` (`crates/onnx-genai-server/src/cli.rs::ServeArgs`) requires exactly one of `--model` / `--models-dir` / `--models-config`, producing `Vec<ModelSpec>`.
 4. `AppState::load_from_specs` (`crates/onnx-genai-server/src/cli.rs::run_serve`) → `build_handle` per spec (`crates/onnx-genai-server/src/state.rs::with_default_fim_config`) — **the single shared construction path** for both eager startup and lazy load.
 5. `build_handle` resolves the directory (`ModelDirectory::load`, `crates/onnx-genai-ort/src/loader.rs::load`), loads the tokenizer, then `Engine::from_dir` (`crates/onnx-genai-engine/src/engine/load.rs::from_dir`).
 6. `EngineDriver::start(engine, DEFAULT_MAX_BATCH, max_queue_depth)` (`crates/onnx-genai-server/src/state.rs::load_chat_template`) spawns the engine thread.
@@ -563,7 +563,7 @@ Verified instances in this repo, all genuinely measured and all easy to misread:
 Four independent instances:
 
 - **`PageUsage` collapses page identity into a count.** `SequenceUsage.pages` is `pages.len()` (`crates/onnx-genai-kv/src/page_table.rs::build`) — the `Vec<PageId>` is consumed to produce a length. The table knows *which* pages each sequence holds (`self.sequences`, `crates/onnx-genai-kv/src/page_table.rs::TelemetryHandle`), but that mapping never crosses the API boundary. **Consequence:** per-block sequence ownership — colouring a block grid by owning sequence — cannot be built from `page_usage()` as it stands.
-- **`GovernorReconfigureOutcome` drops the eviction plan**, so a caller learns that reconfiguration happened but not what it decided. `overage_bytes` and `eviction_order` (`scheduler/src/governor.rs:158-167`) have **no consumers anywhere outside `governor.rs`'s own tests** (`:786`, `:852`).
+- **`GovernorReconfigureOutcome` drops the eviction plan**, so a caller learns that reconfiguration happened but not what it decided. `overage_bytes` and `eviction_order` (`crates/onnx-genai-scheduler/src/governor.rs::GovernorReconfigureOutcome`) have **no consumers anywhere outside `governor.rs`'s own tests** (`crates/onnx-genai-scheduler/src/governor.rs::lower_below_usage_reports_overage_and_engine_eviction_order`). *(Verified repo-wide: no reference to either field exists in any other file.)*
 - **`crates/onnx-genai-server/src/driver.rs::submit_to_continuous_manager` discards the reconfigure result** entirely.
 - **`execution_provider` is resolved and dropped.** Determined at `crates/onnx-genai-engine/src/engine/load.rs::package_selection_from_session_options`, then not carried out to any handler. *(Reported by @d7cf9b84; the first three verified here.)*
 
@@ -691,13 +691,13 @@ There is a paged **allocator** (`PageTable`, `PrefixCache`) that genuinely alloc
 > **⚠️ "Evicts" is true, but only of one of the two eviction mechanisms in this repo, and they must not be conflated in public copy.**
 >
 > * **The page allocator's LRU eviction is REAL and RUNS.** `PagedDecode::evict_until_free()`
->   (`engine/src/pipeline/paged_decode.rs:44`) calls `evict_lru(..)` (`:53`), reached from
+>   (`crates/onnx-genai-engine/src/pipeline/paged_decode.rs::evict_until_free`) calls `evict_lru(..)`, reached from
 >   `crates/onnx-genai-engine/src/pipeline/flat_autoregressive.rs::admit_paged_sequence` — i.e. on the **dynamic / per-request path**, which is the only
 >   path with a page table at all (§5.6.1). §5.4's liveness guarantee applies to *this* mechanism.
 > * **The resource governor's eviction plan is COMPUTED AND NEVER EXECUTED.**
 >   `GovernorReconfigureOutcome` produces `overage_bytes` and an ordered `eviction_order`
->   (`scheduler/src/governor.rs:158-167`), and **the only references anywhere are its own tests**
->   (`:786`, `:852`). `ByteBudget::reconfigure` moves `state.limit` and never touches `state.used`;
+>   (`crates/onnx-genai-scheduler/src/governor.rs::GovernorReconfigureOutcome`), and **the only references anywhere are its own tests**
+>   (`crates/onnx-genai-scheduler/src/governor.rs::lower_below_usage_reports_overage_and_engine_eviction_order`). `ByteBudget::reconfigure` moves `state.limit` and never touches `state.used`;
 >   the repo names the behaviour itself in `reconfigure_lower_reports_overage_without_evicting`.
 >   See §8.7 — lowering the VRAM limit affects new allocations only and never releases resident KV.
 >
