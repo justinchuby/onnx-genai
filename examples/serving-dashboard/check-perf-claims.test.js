@@ -409,7 +409,7 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
       `There is NO measured prefix timing result in either direction. The ` +
       `counter finding is the one that stands, and it needs no stopwatch: ` +
       `twelve requests with six deliberately unique prompts produced twelve ` +
-      `hits and a 0.9375 rate, so the counter cannot tell reuse from no-reuse.`,
+      `hits -- one per completed generation -- so the counter cannot tell reuse from no-reuse.`,
   );
 });
 
@@ -570,7 +570,7 @@ test('no source file states the withdrawn prefix timing result as a live finding
       `Replacement (needs no stopwatch, so no re-run can withdraw it): "We could not measure a ` +
       `prefix effect above this machine's noise floor, so we ship no prefix number. The counter is ` +
       `disqualified on its own arithmetic instead: twelve requests with six deliberately unique ` +
-      `prompts produced twelve hits and a 0.9375 rate."\n\n` +
+      `prompts produced twelve hits, one per completed generation."\n\n` +
       offenders.join('\n'),
   );
 });
@@ -730,4 +730,118 @@ test('the QA plan matches whether the prefix scenario is actually cut', () => {
         + 'measurement that would confirm the reinstatement.',
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// THE TWELVE-REQUEST BLOCK MAY NOT CARRY A RATE.
+//
+// The counter finding is a DELTA: twelve requests, six sharing no prefix, +12
+// hits -- one per completed generation. That form needs no denominator and no
+// baseline, which is exactly why it survives.
+//
+// A rate attached to that same block is not merely weak evidence, it is
+// ARITHMETICALLY FALSE, and @376a0297 reconstructed it from the primary record
+// (prefix-cache-verification.md:78 and :112):
+//
+//     before the block   7 hits /  8 lookups = 0.875
+//     after  the block  19 hits / 20 lookups = 0.95
+//     19-7 = 12 hits, 20-8 = 12 lookups -> the block is fully accounted for
+//
+// So 15/16 = 0.9375 is REQUEST EIGHT OF TWELVE -- a mid-block snapshot -- and
+// the rate did not sit at ~0.94, it CLIMBED across the very block the sentence
+// describes. Our README stated "twelve requests ... produced +12 hits, a 0.9375
+// hit rate", fusing the delta with a reading taken two-thirds of the way in.
+//
+// AND THE SENTENCE WAS SELF-DEFEATING: a reader who checked it found the rate
+// MOVING, which reads as "the counter responds to what you send" -- the exact
+// opposite of the point the paragraph exists to make. The false detail
+// undermined the true conclusion it was added to support.
+//
+// DO NOT "FIX" A SITE BY SWAPPING 0.9375 FOR 0.95. `prefix_cache_hits` and
+// `prefix_cache_lookups` are CUMULATIVE SINCE BOOT, so their ratio is a
+// property of the process, not of the experiment: diluted by warm-up and
+// tunable to any value by sending more traffic. Four rates for this one run
+// appear across our documents (0.875, 0.9375, 0.95, 0.96875), every one
+// honestly transcribed and not one of them evidence.
+//
+// WHY THIS IS SEMANTIC AND NOT A DIGIT BAN: "95 %" appears legitimately all
+// over this tree as a CONFIDENCE INTERVAL -- a different quantity that happens
+// to share a number. A checker that reddened on `95 % CI` would be reworded
+// away within a day. The property is CO-OCCURRENCE: a rate inside a paragraph
+// that is describing the twelve-request block.
+test('no document attributes a hit RATE to the twelve-request block', () => {
+  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter((f) => f.endsWith('.md'))
+    // The raw measurement records legitimately carry every reading, including
+    // the mid-block ones. They are where the arithmetic above was RECOVERED
+    // from; banning the figures there would delete the evidence.
+    .filter((f) => !/^(perf-baseline|demo-spec|prefix-cache-verification)\.md$/.test(f))
+    .filter((f) => !/^design\//.test(f));
+
+  assert.ok(docs.length > 0, 'no tracked .md files found — this check would pass vacuously');
+
+  // The block, however it is worded across our documents.
+  const BLOCK = /twelve requests|12 requests|\+12 hits|twelve hits/i;
+  // A hit-rate-shaped figure. `\d+ ?% CI` is deliberately excluded.
+  const RATE = /0\.9\d{2,}|\b9[0-9](?:\.\d+)? ?%(?! ?CI)|\b1[56]\s*\/\s*16\b|\b19\s*\/\s*20\b/;
+  // A paragraph that WITHDRAWS a rate must be allowed to quote it, or
+  // documenting the defect would trip the guard against the defect. This is
+  // the same exemption shape the launcher guard needed.
+  const WITHDRAWN = /wrong|withdrew|withdrawn|earlier version|not evidence|cumulative since boot|~~|NOT a baseline|mid-block/i;
+
+  const offenders = [];
+  let inspected = 0;
+  // ONE KNOWN SITE, EXEMPTED BY ITS EXACT WORDING RATHER THAN BY FILENAME, so
+  // that any OTHER rate appearing in that file still reddens and so that this
+  // exemption stops matching the moment the line is fixed. A file-level
+  // exemption would have hidden the next one too.
+  //
+  // browser-render-verification.md:256 is @fc8b5d97's QA evidence document and
+  // is not mine to edit under the freeze. I have reported it with its
+  // provenance, which is the uncomfortable part and the reason it is only
+  // exempt rather than forgiven:
+  //
+  //   THAT SENTENCE IS VERBATIM THE REMEDIATION STRING THIS VERY FILE USED TO
+  //   PRINT. A reader who tripped my check was handed "twelve hits and a
+  //   0.9375 rate" as the CORRECT replacement text and pasted it faithfully.
+  //   The guard did not merely fail to catch the defect -- IT AUTHORED IT, and
+  //   in the one register nobody proofreads, because remediation text is read
+  //   only by someone who has already been told they are wrong.
+  //
+  // Both of this file's remediation strings now quote the delta. DELETE THIS
+  // EXEMPTION once :256 does too.
+  const KNOWN = 'produced twelve hits and a 0.9375 rate';
+  for (const doc of docs) {
+    for (const para of shipped(doc).split(/\n\s*\n/)) {
+      if (!BLOCK.test(para)) continue;
+      inspected += 1;
+      if (WITHDRAWN.test(para)) continue;
+      if (doc === 'browser-render-verification.md' && para.includes(KNOWN)) continue;
+      const hit = para.match(RATE);
+      if (hit) {
+        offenders.push(`${doc}: "${hit[0]}" in — ${para.trim().slice(0, 160).replace(/\s+/g, ' ')}`);
+      }
+    }
+  }
+
+  // ANTI-VACUITY, stated over what we REQUIRE to be present rather than over
+  // the file list: a floor on `docs.length` stays green if the matcher stops
+  // recognising the paragraph, which is the failure that actually happens.
+  assert.ok(
+    inspected >= 3,
+    `only ${inspected} paragraph(s) describing the twelve-request block were found; ` +
+      `the matcher has drifted and this check is inspecting nothing`,
+  );
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} site(s) attach a hit RATE to the twelve-request block.\n` +
+      `That block ran 0.875 -> 0.95; any single rate quoted for it is a mid-block\n` +
+      `snapshot, and the counters are cumulative since boot so NO rate is evidence.\n` +
+      `Quote the delta and stop: "+12 hits, one per completed generation."\n\n  ` +
+      offenders.join('\n  '),
+  );
 });

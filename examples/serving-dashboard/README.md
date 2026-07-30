@@ -676,8 +676,8 @@ a hit each:
 | after a second unique prompt | 17 / 18 |
 
 Twelve requests — six repeated, six deliberately unique — produced **+12 hits,
-a 0.9375 "hit rate"**. Every completed generation scores a hit, including
-prompts differing from token 0. **So `hits 0 → 1` is exactly what an unrelated
+one per completed generation**, including prompts differing from token 0.
+**So `hits 0 → 1` is exactly what an unrelated
 prompt produces, and the counter cannot distinguish reuse from no-reuse.** That
 is a counting fact: no sample size, no load, no noise.
 
