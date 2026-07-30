@@ -501,7 +501,12 @@ than one we made prettier.
 ./examples/serving-dashboard/run-tests.sh
 ```
 
-Runnable from anywhere; it resolves its own directory. **This is the only
+The script resolves its own directory, so its *results* never depend on where
+you stand. **This path does.** Run it from the repository root; from anywhere
+else it fails loudly with `No such file or directory` -- which is the whole
+point of the wrapper. The form it replaced answered a wrong `cwd` with
+`0 tests, exit 0`: a normative document certifying an empty run as a pass.
+A loud miss is recoverable; a green nothing is not. **This is the only
 documented form.** The command it replaced was correct prose about a command
 that had already drifted, and this section is kept as the reason the script
 exists rather than as a second copy of it.
