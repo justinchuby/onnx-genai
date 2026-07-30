@@ -305,6 +305,58 @@ has been re-derived at the stamped revision, and one of them changed when it was
 a count taken on a working desk read 112 where the shipping tree holds 98. Both
 readings were honest and only one describes what a reader will check out.
 
+### A third species of control: shape, not just liveness
+
+Two kinds of control were used all session. One asks *is my instrument alive* —
+run the matcher against something it must hit. One asks *am I pointed at the
+right corpus* — assert the corpus is non-empty before counting in it. **A defect
+in this document needed a third, and it cost a ruling.**
+
+I searched for latency fields with the pattern `latency\.` and got zero. **The
+zero was real.** I controlled it with the key `queue.`, and the control fired, so
+the matcher was demonstrably alive. I then ruled on the result.
+
+The field exists. It is `metrics.e2e_latency`, classified `MEASURED`, backed by
+`onnx_genai_e2e_request_latency_seconds` in the server's metrics module.
+
+```
+metrics.e2e_latency   my pattern: MISS      shape-matched pattern: HIT
+metrics.latency_ms    my pattern: MISS      shape-matched pattern: HIT
+latency.p50           my pattern: HIT       shape-matched pattern: HIT
+queue.depth  (my control)  ..... token in PREFIX position — a namespace
+metrics.e2e_latency  (target)  .. token in LEAF position   — a suffix
+```
+
+**My pattern required `latency` to be a namespace. The field has `latency` as a
+leaf.** And my control had the same shape as my pattern rather than the same
+shape as my target — so **it could not fail in the way the target fails.** It
+proved the matcher runs. It could not prove the matcher asks the right question.
+
+> **A positive control must share the shape of the subject, not merely the
+> liveness of the instrument.** A control drawn from the same assumption as the
+> query confirms the assumption instead of testing it. Mine was live, correct,
+> and pointed at a differently-shaped key — and every field of the report around
+> it passed inspection.
+
+**Two consequences were avoided by the author who overturned it, and both were
+one step away.** Retitling the panel to *latency (not yet measured)* would have
+printed a caption on the projector denying a value the system measures and
+certifies — the honesty layer apologising for a number it has, which is the
+inverse of the defect the honesty layer exists to prevent. And filing the field
+with the batch's shared *not plumbed* reason would have been correct for fourteen
+entries and a fabrication for the fifteenth. **A reason that is true of a group is
+not thereby true of each member.**
+
+**The coordinate they sent was 27 lines stale; the symbol name found it
+immediately.** That is the fourth time a bare `path:NNN` rotted while the property
+it named survived, and it is why the standard here is a quoted expected string
+rather than a line number.
+
+**Worth recording how it surfaced.** The author wrote that file, edited it that
+session, and read it end-to-end four times without seeing the field. What found it
+was a checklist entry marked UNRUN. **Familiarity with a file is not coverage of
+it — an unrun check that is written down outranks a file you are sure you know.**
+
 ### The corruption that produced grammatical English
 
 The single most alarming thing found this session was not in the server. It was
