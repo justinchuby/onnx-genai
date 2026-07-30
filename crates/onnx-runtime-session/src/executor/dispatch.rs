@@ -393,6 +393,35 @@ impl Executor {
             );
         }
 
+        // Executor-owned metadata-only ops: short-circuit common layout/alias
+        // nodes before kernel-cache lookup and compute dispatch. ORT erases
+        // these at graph-optimization time; the native executor can safely
+        // represent them as views directly because SSA values are immutable and
+        // `install_view_outputs` pins the aliased source for the rest of the run.
+        if !has_lazy_inputs
+            && let Some(specs) = direct_view_outputs(
+                node,
+                inputs,
+                ctx.graph,
+                &views,
+                &output_shapes,
+                outputs.len(),
+            )
+        {
+            if outputs
+                .iter()
+                .any(|output| external.outputs.contains_key(output))
+            {
+                return Err(SessionError::Internal(format!(
+                    "op '{}' cannot bind a zero-copy view output to external storage",
+                    node.op_type
+                )));
+            }
+            drop(views);
+            ctx.install_view_outputs(node, inputs, outputs, output_dtypes, resolved, specs)?;
+            return Ok(());
+        }
+
         let opset = effective_opset(ctx.graph, node);
         let kernel = {
             let _s = phase_span!("exec_kernel.get_kernel");
@@ -979,6 +1008,61 @@ impl Executor {
         }
         let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
         bytes_as_f64(&bytes, dtype)
+    }
+}
+
+fn direct_view_outputs(
+    node: &Node,
+    plan_inputs: &[Option<ValueId>],
+    graph: &Graph,
+    inputs: &[TensorView<'_>],
+    output_shapes: &[Vec<usize>],
+    num_outputs: usize,
+) -> Option<Vec<ViewOutput>> {
+    if !node.is_default_domain() || num_outputs != 1 {
+        return None;
+    }
+    match node.op_type.as_str() {
+        "Identity" if inputs.len() == 1 => {
+            let input_vid = plan_inputs.first().copied().flatten()?;
+            if graph.initializers.contains_key(&input_vid) {
+                return None;
+            }
+            let input = &inputs[0];
+            (input.dtype.byte_size() > 0).then(|| {
+                vec![ViewOutput {
+                    input_index: 0,
+                    shape: input.shape.to_vec(),
+                    strides: input.strides.to_vec(),
+                    byte_offset: input.byte_offset,
+                }]
+            })
+        }
+        "Reshape" if inputs.len() == 2 => {
+            let data = &inputs[0];
+            let shape = output_shapes.first()?;
+            if data.dtype.byte_size() == 0
+                || !onnx_runtime_ir::is_contiguous(data.shape, data.strides)
+            {
+                return None;
+            }
+            let input_numel = data
+                .shape
+                .iter()
+                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+            let output_numel = shape
+                .iter()
+                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+            (input_numel == output_numel).then(|| {
+                vec![ViewOutput {
+                    input_index: 0,
+                    shape: shape.clone(),
+                    strides: compute_contiguous_strides(shape),
+                    byte_offset: data.byte_offset,
+                }]
+            })
+        }
+        _ => None,
     }
 }
 
