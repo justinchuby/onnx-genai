@@ -730,7 +730,22 @@ Note `tokens_per_second` is honest about the reason — *"only cumulative token 
 
 Observed: identical prompts yield `prefix_cache_hits: 0` with non-zero lookups when continuous batching is active.
 
-Per §5.6 this is **expected**: prefix caching lives in the paged KV manager, which is inactive for static-cache models. Recorded here because it looks exactly like a bug. Whether the counters should instead report *unavailable* rather than zero is an open question — reporting `0` for a structurally unavailable feature is precisely the trap described in §8.3.
+Per §5.6 this is **expected**: prefix caching lives in the paged KV manager, which is inactive for static-cache models. Recorded here because it looks exactly like a bug.
+
+**RESOLVED — the zero is `not-applicable`, not `unavailable`, and the distinction is enforced by tests that already exist.**
+
+The earlier open question ("should these counters report *unavailable* rather than zero?") rested on not knowing whether anyone intended to instrument this path. They do not, and the repository says so in the strongest form available:
+
+| Evidence | Citation |
+|---|---|
+| `ContinuousBatchManager` holds eight fields — `decode`, `tokenizer`, `metadata_max_context`, `static_max_len`, `queue`, `rows`, `events`, `next_handle`. **No `kv_cache`, no page table.** | `crates/onnx-genai-engine/src/batched.rs:101-110` |
+| `batched.rs` only ever **reads** `row.state.prefix_cache_hit_len` when building a result; it never assigns it | `batched.rs:347`, `:579` |
+| The only literal assignment anywhere is `prefix_cache_hit_len: 0` | `crates/onnx-genai-engine/src/pipeline/nested_autoregressive.rs:533` |
+| **Three engine tests assert the zero as a postcondition** — `.all(\|result\| result.prefix_cache_hit_len == 0)` | `tests/batched_static_decode.rs:53`, `:88`, `tests/engine_continuous_batch_scheduled.rs:82` |
+
+That last row is what closes it. **A stub is a value nobody has gotten to yet; this is a value the test suite would fail if someone changed.** Instrumenting the batching path is not deferred work — it is work that would break three green tests, because there is no cache to instrument.
+
+**Consequence for consumers:** the batching path must report this field as `not-applicable`, never `unavailable`. `unavailable` is a *promise* that someone will supply the number later; here nobody can, ever. Labelling it `unavailable` would also err in the flattering direction — it implies the project is behind on measurement rather than that static-cache and paged-KV are mutually exclusive by design (§5.6). The zero must never render at full contrast either way; see §8.12 for why the counters' *names* are separately wrong.
 
 ### 8.5 `scripts/build_qwen.sh` produces a model that cannot be loaded
 
