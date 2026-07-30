@@ -1361,3 +1361,168 @@ describe('an unknown state cannot render as a measured one', () => {
     );
   });
 });
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE -rule FAMILY: EXTENDING THE COVERAGE LIST, AND REFUSING THE FLOOR
+ *
+ * Two coverage lists in this file enumerate `--og-{unavail,pending,stale,na}-fg`
+ * and check all six pairs against a 1.05 separation floor. Neither has ever
+ * named a `-rule` token. The order was to extend both lists to `-rule`.
+ *
+ * I MEASURED THE `-rule` FAMILY BEFORE EXTENDING ANYTHING, AND THE FLOOR IS THE
+ * WRONG ASSERTION FOR IT:
+ *
+ *     -fg   family: 6 pairs, 0 below 1.05
+ *     -rule family: 6 pairs, 3 BELOW 1.05
+ *       unavail/stale 1.0149 · unavail/na 1.0258 · stale/na 1.0411
+ *
+ * Extending the lists verbatim would have shipped a RED guard, and a guard that
+ * reds on correct work gets deleted by lunch. But the three pairs are NOT a
+ * defect, and the reason is written in `shell.css` in the author's own words:
+ * "the border grammar remains the entire signal." The rule COLOUR was never the
+ * channel for these states -- the border STYLE is:
+ *
+ *     pending 1px solid · stale 1px dashed · unavailable 1px dotted
+ *     not-applicable 3px double
+ *
+ * ☠️ SO THE REAL DEFECT IS NEITHER THE VALUES NOR THE MISSING FLOOR. IT IS THAT
+ * NOTHING ANYWHERE RECORDED **WHICH CHANNEL CARRIES WHICH PAIR.** Three pairs
+ * have been resting on border-style alone all night, in a list nobody wrote
+ * down, and the composite tests cannot report it: a pair carried by exactly ONE
+ * channel is one CSS edit from identical WITH NOTHING GOING RED.
+ *
+ * That is what these arms pin. Not a floor the palette was never designed to
+ * meet -- the ACTUAL load-bearing channel, named per pair, so that removing it
+ * fails.
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+describe('every absence pair is separated on a channel that is written down', () => {
+  const SEP = 1.05;
+  const FAMILY = { unavailable: 'unavail', pending: 'pending', stale: 'stale', 'not-applicable': 'na' };
+  const STATES = Object.keys(FAMILY);
+
+  const relativeLuminance = (hex) =>
+    [1, 3, 5]
+      .map((i) => parseInt(hex.substr(i, 2), 16) / 255)
+      .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4))
+      .reduce((sum, v, i) => sum + [0.2126, 0.7152, 0.0722][i] * v, 0);
+
+  const ratio = (a, b) => {
+    const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+
+  const hexOf = (token) => {
+    const m = css['tokens.css'].match(new RegExp(`${token}:\\s*(#[0-9a-fA-F]{6})`));
+    return m && m[1];
+  };
+
+  // The border declaration for a state, read from its OWN block. A windowed
+  // grep bleeds into the next rule -- it has produced two false attributions in
+  // this file's history -- so the block is bounded by its closing brace.
+  const borderOf = (state) => {
+    const src = css['shell.css'];
+    const start = src.indexOf(`[data-state='${state}']`);
+    if (start === -1) return null;
+    const open = src.indexOf('{', start);
+    const close = src.indexOf('}', open);
+    if (open === -1 || close === -1) return null;
+    const body = src.slice(open, close).replace(/\/\*[\s\S]*?\*\//g, '');
+    const m = body.match(/border-bottom:\s*([0-9]+px)\s+([a-z]+)/);
+    return m ? { width: m[1], style: m[2], decl: `${m[1]} ${m[2]}` } : null;
+  };
+
+  const pairs = [];
+  for (let i = 0; i < STATES.length; i += 1) {
+    for (let j = i + 1; j < STATES.length; j += 1) pairs.push([STATES[i], STATES[j]]);
+  }
+
+  it('computes a known ratio correctly (anti-vacuity)', () => {
+    // An implementation returning a large number for everything would pass every
+    // separation assertion below while measuring nothing.
+    assert.ok(Math.abs(ratio('#ffffff', '#000000') - 21) < 0.01, 'ratio() is wrong');
+    assert.ok(Math.abs(ratio('#151b23', '#151b23') - 1) < 0.01, 'ratio() is wrong');
+  });
+
+  it('resolves every token and every border declaration (non-zero floor)', () => {
+    // Without this, DELETING a state's rule makes the comparisons below skip it
+    // and the suite reports separation caused by absence.
+    const missing = [];
+    for (const [state, fam] of Object.entries(FAMILY)) {
+      for (const kind of ['fg', 'rule']) {
+        if (!hexOf(`--og-${fam}-${kind}`)) missing.push(`--og-${fam}-${kind}`);
+      }
+      if (!borderOf(state)) missing.push(`[data-state='${state}'] border-bottom`);
+    }
+    assert.deepEqual(missing, [], `Unresolvable, so unmeasurable:\n  ${missing.join('\n  ')}`);
+    assert.equal(pairs.length, 6, 'expected all six pairs of a four-state family');
+  });
+
+  it('gives every absence state a distinct border style', () => {
+    // THIS IS THE CHANNEL THAT ACTUALLY CARRIES ALL SIX PAIRS, and until now
+    // nothing asserted it. Set-based, so it cannot be satisfied by three states
+    // agreeing and one differing.
+    const decls = STATES.map((s) => [s, borderOf(s).decl]);
+    const seen = new Map();
+    const collisions = [];
+    for (const [state, decl] of decls) {
+      if (seen.has(decl)) collisions.push(`${seen.get(decl)} and ${state} both render '${decl}'`);
+      else seen.set(decl, state);
+    }
+    assert.deepEqual(
+      collisions,
+      [],
+      `Two absence states share a border treatment:\n  ${collisions.join('\n  ')}\n` +
+        `Border style is the ONLY channel separating three of these six pairs ` +
+        `(their rule colours sit within 1.05), so a collision here renders them ` +
+        `identical with nothing else to fall back on.`,
+    );
+  });
+
+  it('requires a distinct border style wherever the rule COLOUR collapses', () => {
+    // The load-bearing arm. For every pair whose rule colours are closer than
+    // the floor, the border style MUST differ -- otherwise the pair is carried
+    // by nothing at all on the rule channel.
+    const unguarded = [];
+    let collapsed = 0;
+    for (const [a, b] of pairs) {
+      const sep = ratio(hexOf(`--og-${FAMILY[a]}-rule`), hexOf(`--og-${FAMILY[b]}-rule`));
+      if (sep >= SEP) continue;
+      collapsed += 1;
+      if (borderOf(a).decl === borderOf(b).decl) {
+        unguarded.push(`${a} vs ${b}: rule colour ${sep.toFixed(4)}:1 AND identical border`);
+      }
+    }
+    assert.ok(
+      collapsed >= 1,
+      `No rule-colour pair measured below ${SEP}. Either the palette changed or ` +
+        `the token matcher has drifted -- three pairs were below it when this ` +
+        `arm was written, so a zero here means the instrument stopped reading.`,
+    );
+    assert.deepEqual(
+      unguarded,
+      [],
+      `Pair(s) separated by NOTHING on the rule channel:\n  ${unguarded.join('\n  ')}`,
+    );
+  });
+
+  it('separates every pair on at least one named channel', () => {
+    const orphans = [];
+    for (const [a, b] of pairs) {
+      const carriers = [];
+      if (ratio(hexOf(`--og-${FAMILY[a]}-fg`), hexOf(`--og-${FAMILY[b]}-fg`)) >= SEP) carriers.push('fg');
+      if (ratio(hexOf(`--og-${FAMILY[a]}-rule`), hexOf(`--og-${FAMILY[b]}-rule`)) >= SEP) carriers.push('rule');
+      if (borderOf(a).decl !== borderOf(b).decl) carriers.push('border');
+      if (carriers.length === 0) orphans.push(`${a} vs ${b}`);
+    }
+    assert.deepEqual(
+      orphans,
+      [],
+      `Pair(s) indistinguishable on EVERY channel: ${orphans.join(', ')}. These ` +
+        `states mean different things -- we have no number / we are waiting / we ` +
+        `had one and it aged out / this cannot apply here -- and a visitor who ` +
+        `cannot separate them reads four different admissions as one.`,
+    );
+  });
+});

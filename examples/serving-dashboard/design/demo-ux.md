@@ -7005,3 +7005,55 @@ file.
 | D327 | Every exemption from a blanket rule must be paid for by a treatment rule | An exempted state with no rule matches nothing and inherits full confidence, silently |
 | D328 | A CSS default cannot be inverted without measuring specificity AND load order | `.value` (0,1,0) in the later sheet vs `[data-state='measured']` (0,1,0) — the obvious edit mutes every measured value |
 | D329 | Colour asserted on a wrapper is not asserted on the value | `panels.css:41` sets `.value__num` colour directly; a direct rule beats inheritance, so the number never receives it |
+
+---
+
+## §97 — Extending a coverage list to a family the floor was never measured against
+
+The order was: *extend both coverage lists to `-rule`, plus a non-zero floor.*
+Both lists enumerate only `--og-{unavail,pending,stale,na}-fg` and check all six
+pairs at 1.05. **I measured the `-rule` family before extending anything, and
+the floor does not transfer:**
+
+| family | pairs | below 1.05 |
+|---|---|---|
+| `-fg` | 6 | **0** |
+| `-rule` | 6 | **3** — unavail/stale `1.0149` · unavail/na `1.0258` · stale/na `1.0411` |
+
+Extending the lists verbatim would have shipped a **red** guard. But the three
+pairs are not a defect: `shell.css` says in its own words *"the border grammar
+remains the entire signal."* Rule **colour** was never the channel for these
+states — border **style** is: `solid / dashed / dotted / double`, all four
+distinct, carrying **6 of 6** pairs.
+
+**So the defect is neither the values nor the missing floor. It is that nothing
+recorded WHICH CHANNEL CARRIES WHICH PAIR.** Three pairs have rested on
+border-style alone, in a list nobody wrote down, and a composite test cannot
+report it — *a pair carried by exactly one channel is one CSS edit from
+identical, with nothing going red.* Five arms now pin the load-bearing channel
+per pair instead of a floor the palette was never designed to meet.
+
+### Two method failures of mine, both caught by my own instruments
+
+**① A mutation caught by a *different* test proves nothing about the arm you
+wrote.** I mutated `--og-stale-rule` to `#ff0000` and scored `fail=1` — and it
+was the **pre-existing** annotation test that fired, not my new floor. Counting
+failures is not evidence; **naming the failing test is.** This is the same shape
+as confirming a fix rather than an effect, committed by the person who filed it.
+
+**② `git checkout --` is a restore for a CLEAN file and a DESTROY for a DIRTY
+one.** My earlier mutations were on `shell.css`/`tokens.css`, which were
+byte-identical to HEAD, so restoring to HEAD was exactly right. The moment I
+mutated `asset-graph.test.js` — which held five uncommitted tests — the same
+command reverted to HEAD and **deleted the work I was in the middle of
+proving.** The mutation harness that had protected me four times became the
+thing that destroyed the artifact, *by doing precisely what it always did.* The
+restore-verification arm caught it in the same second. **Back a dirty file up
+with `cp`; `git checkout --` restores to HEAD, which is not where you were.**
+
+| ID | Decision | Rationale |
+|---|---|---|
+| D330 | Measure a family before extending a floor to it; a threshold is a claim about one channel | `-fg` has 0 pairs below 1.05, `-rule` has 3; the same floor is correct for one and false for the other |
+| D331 | Assert the channel that CARRIES a pair, not a uniform floor across channels | Border style separates 6 of 6 pairs including all three where rule colour collapses; nothing asserted it |
+| D332 | `git checkout --` restores to HEAD, so it is a destroy for any file with uncommitted work | It wiped five finished tests mid-proof; `cp` is the correct backup for a dirty file |
+| D333 | Score a mutation by the NAME of the failing test, never by the count | `#ff0000` scored fail=1 against a pre-existing annotation test, proving nothing about the new arm |
