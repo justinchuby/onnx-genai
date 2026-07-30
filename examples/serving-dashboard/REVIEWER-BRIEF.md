@@ -1980,3 +1980,47 @@ grep -n 'server\.model_path' — shipped JS at fca13038, tests excluded:
 
 > **Nine of ten is not a ship signal, and it never was.** The gate exists to be
 > read after it disagrees with the people who built it.
+
+### 8.20 Three blockers, adjudicated against the frozen commit
+
+**All three Rust/JS blockers held at REQUEST CHANGES are closed at `fca13038`.**
+Measured by content, at the frozen coordinate, with a control -- not relayed:
+
+```
+F1  'set_applicable(!'        driver.rs @ fca13038  -> 0 hits   ⛔ DEFECT STRING GONE
+    'set_not_applicable'                            -> 1 hit    ✅ reason enum present
+    fix 459c40c2 is an ANCESTOR of fca13038
+C2  app.js:189  await fetchWithDeadline(new URL('/health', …))  ✅ import at :18
+C14 every batch_telemetry.publish in driver.rs, with its enclosing fn:
+      :178  publish(0, 0, published_capacity)   <- a DECIDED value, not the ceiling
+      :770  fn run_fallback_engine_driver
+        :779 :783 :787  publish(…, 1)           <- serial loop IS width 1  ✅
+      :792  fn run_static_engine_driver
+        :803 :937       publish(…, max_batch)   <- the batching arm's TRUE width  ✅
+CONTROL: same instrument finds `fn` 6× in a sibling driver file.
+```
+
+**The reviewer's open question -- *does the continuous arm publish its width, or is
+`batch_capacity` now `pending` forever on the arm that actually batches?* -- is
+answered by `:803` and `:937`.** It does. And the caller's-thread ceiling publish
+that was C14's target is gone: `:178` publishes a capacity that was **decided**
+before the engine moved.
+
+> **Two reviewers reached opposite verdicts on C14 within four minutes, and both
+> were right about the bytes they read.** One read a working tree that held the fix
+> and lost it; the other read a `HEAD` that predated it. **Neither was wrong. They
+> were reading different objects and calling both of them "the code."**
+
+**This is the whole argument for a frozen coordinate, and it is why the gate names
+one sha and scores everything against it exactly once.** A blocker is not a
+property of a repository. It is a property of a commit.
+
+> **A stale red costs more than a stale green in the last hour of a freeze**, and
+> for an unobvious reason: a green invites someone to look again, because shipping
+> on it feels risky. **A red invites nobody to look at all -- it has already
+> supplied the reason not to.** Three of tonight's blockers were fixed while the
+> board still showed them red, and the fixes sat unnoticed because the red had
+> stopped the traffic that would have found them.
+
+**Item 10 is unaffected and remains the only red on the gate.** The two render rows
+are still present at `fca13038` -- 3 hits where 1 is required.
