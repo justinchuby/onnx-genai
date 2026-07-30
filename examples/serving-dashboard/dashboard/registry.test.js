@@ -29,12 +29,90 @@ describe('panel registry', () => {
     assert.equal(new Set(ids).size, ids.length, `duplicate panel id in ${ids.join(', ')}`);
   });
 
-  it('hides the KV and prefix panels on the batching server', () => {
-    // Not a styling choice. ContinuousBatchManager never touches engine.kv_cache,
-    // so these panels cannot populate there — showing them with em-dashes would
-    // promise data that is not coming.
+  it('KEEPS the KV and prefix panels on the batching server', () => {
+    // This test previously asserted the opposite, on the reasoning that
+    // "showing them with em-dashes would promise data that is not coming".
+    // That reasoning is from a four-state world, and it is exactly the
+    // confusion the fifth state was introduced to remove: `unavailable`
+    // promises a value, `not-applicable` explicitly does not — it states an
+    // architectural fact and points at where the number IS real.
+    //
+    // These panels are how a visitor learns the demo's central claim, that
+    // continuous batching and the paged KV cache are mutually exclusive
+    // execution paths. Hiding them replaces that lesson with SILENCE, and
+    // silence reads as a smaller dashboard rather than as something withheld.
+    // kv-memory also ADAPTS rather than disappears (decode-row occupancy here,
+    // a paged block table on the other profile), so hiding it discards a panel
+    // that had a real number to show.
     const ids = panelsForMode('batching').map((panel) => panel.id);
-    assert.deepEqual(ids, ['throughput', 'scheduling', 'requests', 'system']);
+    assert.deepEqual(ids, [
+      'throughput',
+      'scheduling',
+      'kv-memory',
+      'prefix-cache',
+      'requests',
+      'system',
+    ]);
+  });
+
+  it('derives modes from each panel\'s own meta.requires, with no second table', () => {
+    // The bug this closes: `modes` was declared by hand in the registry,
+    // separately from `meta.requires`, and the two drifted. kv-memory and
+    // prefix-cache both declared `requires: null` ("I ship everywhere") while
+    // the registry gated them to ['paged'] — and the registry won, because it
+    // is what panelsForMode filters on.
+    //
+    // Both suites stayed green the whole time, because each mechanism was
+    // only ever tested against itself. A reconciling test would have caught
+    // this instance; deriving removes the second mechanism entirely.
+    // Pinned as an EXPLICIT table rather than recomputed from meta.requires.
+    // Deriving the expectation from the same field the implementation derives
+    // from would produce a test that cannot fail — false assurance, which is
+    // worse than no test, and precisely the shape that let the original drift
+    // survive. This table encodes the RULING, so changing a panel's
+    // meta.requires now has to argue with the ruling rather than silently
+    // redefine it.
+    const RATIFIED = {
+      throughput: ['batching', 'paged'],
+      // The only genuinely gated panel: queue depth and occupancy are
+      // properties of the continuous batch scheduler.
+      scheduling: ['batching'],
+      // Adapts rather than disappears — decode-row occupancy vs a paged block
+      // table. Same component, different noun.
+      'kv-memory': ['batching', 'paged'],
+      // Ships unconditionally. Hiding it where the story is weak is the one
+      // genuinely dishonest move available here.
+      'prefix-cache': ['batching', 'paged'],
+      requests: ['batching', 'paged'],
+      system: ['batching', 'paged'],
+    };
+
+    assert.deepEqual(
+      PANELS.map((panel) => panel.id).sort(),
+      Object.keys(RATIFIED).sort(),
+      'a panel was added or removed without deciding where it belongs',
+    );
+    for (const panel of PANELS) {
+      assert.deepEqual(
+        [...panel.modes],
+        RATIFIED[panel.id],
+        `${panel.id}: placement disagrees with the ruling. If this is intentional, the ruling ` +
+          'is what needs changing — hiding a panel is silence, not honesty.',
+      );
+    }
+  });
+
+  it('refuses to guess where a panel belongs', async () => {
+    // modesFor throws on an unknown meta.requires rather than defaulting.
+    // Defaulting to universal would show a panel that cannot populate;
+    // defaulting to none would hide one that had something to say, with no
+    // error anywhere. Neither is guessable, so it stops the build.
+    const { PANELS: registered } = await import('./index.js');
+    assert.ok(registered.length > 0);
+
+    const { default: mountFn, meta } = await import('./prefix-cache.js');
+    assert.equal(typeof mountFn, 'function');
+    assert.equal(meta.requires, null, 'prefix-cache must remain universal');
   });
 
   it('hides the scheduling panel on the paged server', () => {
@@ -114,7 +192,14 @@ describe('mountDashboard', () => {
       });
       flushAnimationFrames();
 
-      assert.deepEqual(dashboard.mounted, ['throughput', 'scheduling', 'requests', 'system']);
+      assert.deepEqual(dashboard.mounted, [
+        'throughput',
+        'scheduling',
+        'kv-memory',
+        'prefix-cache',
+        'requests',
+        'system',
+      ]);
       // One upstream subscription for the whole dashboard, not one per panel.
       assert.equal(subscriptions, 1);
 

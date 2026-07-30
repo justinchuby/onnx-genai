@@ -56,6 +56,55 @@ import * as throughput from './throughput.js';
 const BOTH = Object.freeze(['batching', 'paged']);
 
 /**
+ * Which server modes a panel can mount on, DERIVED from its own `meta.requires`.
+ *
+ * This used to be declared here by hand, separately from each panel's
+ * `meta.requires`, and the two drifted -- silently, and in the worst possible
+ * direction. `kv-memory` and `prefix-cache` both declare `requires: null`
+ * ("I ship everywhere"), and this table gated both to `['paged']`. The table
+ * won, because it is what `panelsForMode` filters on.
+ *
+ * The consequence was that on the batching server -- the profile the default
+ * model runs -- neither panel mounted AT ALL. A visitor never saw the prefix
+ * cache, never saw the KV panel, and therefore never encountered the demo's
+ * central technical claim: that continuous batching and the paged KV cache are
+ * mutually exclusive execution paths. That claim is taught by those panels
+ * rendering `not-applicable` WITH THEIR REASON. Hiding them replaces the
+ * lesson with silence, and silence looks like a smaller dashboard rather than
+ * like something withheld.
+ *
+ * Both suites stayed green throughout, because each mechanism was tested
+ * against itself. Deriving removes the second mechanism rather than adding a
+ * test to reconcile them: a panel now answers "where do I belong" exactly once,
+ * in the file that also implements its behaviour.
+ *
+ * @param {PanelModule} module
+ * @returns {ReadonlyArray<ServerMode>}
+ */
+function modesFor(module) {
+  switch (module.meta.requires) {
+    case 'continuous-batch':
+      return Object.freeze(['batching']);
+    case 'paged-kv':
+      return Object.freeze(['paged']);
+    case null:
+    case undefined:
+      // Universal. Note this is the answer for every panel that ADAPTS rather
+      // than disappears -- kv-memory draws a paged block table on one profile
+      // and decode-row occupancy on the other, and prefix-cache ships
+      // unconditionally because hiding it where the story is weak is the one
+      // genuinely dishonest move available here.
+      return BOTH;
+    default:
+      throw new Error(
+        `${module.meta.id}: unknown meta.requires ${JSON.stringify(module.meta.requires)}. ` +
+          'Refusing to guess where this panel belongs — guessing wrong hides it on a server ' +
+          'where it had something to say, with no error anywhere.',
+      );
+  }
+}
+
+/**
  * Panels in DOM order. The order is editorial, not alphabetical: a visitor
  * reads down the column, so it runs from the outcome (throughput) to the
  * mechanism that produced it (scheduling, memory, cache) and ends with the
@@ -63,21 +112,11 @@ const BOTH = Object.freeze(['batching', 'paged']);
  *
  * @type {ReadonlyArray<RegisteredPanel>}
  */
-export const PANELS = Object.freeze([
-  Object.freeze({ id: throughput.meta.id, module: throughput, modes: BOTH }),
-
-  // Batching only: queue depth and occupancy are properties of the continuous
-  // batch scheduler. On the paged server there is no batch to be occupied.
-  Object.freeze({ id: scheduling.meta.id, module: scheduling, modes: Object.freeze(['batching']) }),
-
-  // Paged only: ContinuousBatchManager never allocates KV pages, so on the
-  // batching server every page counter is structurally zero rather than idle.
-  Object.freeze({ id: kvMemory.meta.id, module: kvMemory, modes: Object.freeze(['paged']) }),
-  Object.freeze({ id: prefixCache.meta.id, module: prefixCache, modes: Object.freeze(['paged']) }),
-
-  Object.freeze({ id: requests.meta.id, module: requests, modes: BOTH }),
-  Object.freeze({ id: system.meta.id, module: system, modes: BOTH }),
-]);
+export const PANELS = Object.freeze(
+  [throughput, scheduling, kvMemory, prefixCache, requests, system].map((module) =>
+    Object.freeze({ id: module.meta.id, module, modes: modesFor(module) }),
+  ),
+);
 
 /**
  * The panels that can genuinely populate on a given server mode, in DOM order.
