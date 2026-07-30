@@ -21,6 +21,39 @@ that was measured, and the two are the same tree.
     all 64 *.test.js blobs ...... identical at both (corpus hash 601f45bf…)
     [NEG CONTROL] same corpus hash at 37d0d72e ... 97e4b301…  DIFFERS
 
+### ⛔ BLOCKING FOR THE PR BODY, NOT FOR THIS PIN — the disclosure has expired
+
+`PR-DESCRIPTION.md` at this pin ships a section headed **"KNOWN GAP — C19, percent-encoded
+dot segments, unfixed and shipping"**, whose first line reads *"This is a named, unfixed
+defect in the code this PR ships."* **It is fixed in the code this PR ships.** Measured in the
+guard's own bytes, with the body's own probe:
+
+    percent/decode/urlencode tokens in demo_assets.rs
+      @ 3b701494 ... 0    @ 37d0d72e ... 0    @ THIS PIN ... 9
+    rest.contains('%')              @ THIS PIN ... 1     [CONTROL] fn count 27
+    named regression tests present  @ THIS PIN ... :467 and :493
+
+The body states that number as **0** and prints controls beside it. Those controls fired and
+that measurement was honest **when it was taken, at `3b701494`**. It has expired. Nothing in
+1,927 lines retracts it: `f359363a` appears **0** times, and the section is unamended.
+
+**The sharpest part is that the body proposes the remedy that already landed** — *"refuse any
+`/demo/` path containing `%` at all"* — which is exactly what `f359363a` implemented, before
+the body was written. **The document argues for a fix the tree already contains, in the
+present tense, under a heading that calls it unfixed.**
+
+This does not move the pin. It is a documentation defect, and it fails in the direction that
+understates us, which is why nobody would catch it by reading for overclaims. **But it is a
+false security disclosure in the most public artefact we produce, and it would be published
+under a section that exists specifically to prove we do not ship silent defects.**
+
+Two clauses of the reviewer's approve predicate, measured at this pin rather than relayed:
+
+    ① PR body must name C19 .......................... NAMED, but AS UNFIXED — false
+    ④ PR body must name the shared-buffer downgrade ... ABSENT
+         'shared buffer' 0 · 'shared-buffer' 0 · 'downgrade' 0
+         [CONTROL] 'continuous batching' 5 · 'dashboard' 21 · [NEG] zzq_void 0
+
 **MOVED FORWARD FROM `217ae170`, AND THE REASON IS A SECURITY FIX, NOT A GREENER NUMBER.**
 `217ae170` and every earlier candidate — `37d0d72e`, `3b701494`, `d1c8fff0` — **do not contain
 the C19 fix.** Measured in their own bytes rather than by ancestry alone:
