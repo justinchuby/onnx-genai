@@ -1387,6 +1387,54 @@ test('the absolute model directory is not addressable through the store at all',
   );
 });
 
+// @73e77d95's finding. The staleness branch promotes any value the table did
+// not expect, and its `present` test was `!== undefined && !== null` -- which
+// an empty string passes. The result would be a field rendering its label
+// followed by nothing, marked `measured`, i.e. an ABSENCE WEARING A TRUSTED
+// STATE. It is reachable from real server code: model_path_for_display ends in
+// `unwrap_or_default()`, so a path whose file_name() is None emits exactly "".
+test('an empty string is treated as an absence, not as a stale-table contradiction', async () => {
+  const store = storeWith(
+    healthyRoutes({
+      [ENDPOINTS.STATUS]: { body: statusBody({ server: { execution_provider: '' } }) },
+    }),
+  );
+
+  await store.pollOnce();
+  const field = store.field('server.execution_provider');
+
+  assert.notEqual(
+    field.state,
+    FIELD_STATES.MEASURED,
+    'an empty string must never render as a trusted reading',
+  );
+  assert.ok(
+    !Object.hasOwn(store.provenanceWarnings(), 'server.execution_provider'),
+    'an empty string is not evidence the table went stale, so it must not accuse it',
+  );
+});
+
+// THE CONTROL THAT MUST NOT FIRE. Suppressing `''` must not become suppressing
+// falsy values: `0` and `false` are real readings, and hiding them would
+// recreate the absent-versus-zero defect one layer down. Driven through the
+// same branch, on the same endpoint, so a change that over-suppresses goes red
+// here rather than shipping as caution.
+test('a zero from a not-plumbed field is still promoted, unlike an empty string', async () => {
+  const store = storeWith(
+    healthyRoutes({
+      [ENDPOINTS.STATUS]: { body: statusBody({ server: { execution_provider: 0 } }) },
+    }),
+  );
+
+  await store.pollOnce();
+
+  assert.equal(store.field('server.execution_provider').value, 0);
+  assert.ok(
+    Object.hasOwn(store.provenanceWarnings(), 'server.execution_provider'),
+    'a real zero DOES contradict a not-plumbed row and must still be reported',
+  );
+});
+
 test('a provenance row that has gone stale is detected rather than em-dashed forever', async () => {
   // Vehicle swapped to another NOT_PLUMBED row. The property under test is the
   // STALENESS MACHINERY, never the model directory: a row that asserts its

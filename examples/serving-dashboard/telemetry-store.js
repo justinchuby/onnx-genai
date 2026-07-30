@@ -813,7 +813,27 @@ export function createTelemetryStore({
         // undefined. Only a value that is actually present can contradict the
         // table -- and treating absence as a contradiction crashes the poll
         // cycle, because there is nothing to render.
-        const present = observed !== undefined && observed !== null;
+        //
+        // AND AN EMPTY STRING IS AN ABSENCE, NOT A CONTRADICTION. This is the
+        // one absence a `!== undefined && !== null` test cannot see, and the
+        // consequence is the worst shape we have: `''` would satisfy `present`,
+        // reach `measuredField`, and render the field's label followed by
+        // NOTHING -- carrying `data-state="measured"`, which tells a visitor
+        // that the blank IS the reading. An absence rendered as a trusted
+        // value is the exact defect this whole layer exists to prevent, and it
+        // would have arrived through the branch built to catch it.
+        //
+        // It is also not hypothetical upstream: `model_path_for_display`
+        // (crates/onnx-genai-server/src/routes/admin.rs:31) ends in
+        // `unwrap_or_default()`, so a path whose `file_name()` is `None` -- one
+        // ending in `..` or a root -- emits exactly `""`. That fallback is
+        // CORRECT; it fails closed rather than disclosing the full path. This
+        // is the client honouring it instead of promoting its output.
+        //
+        // Note `0` and `false` are deliberately still present: they are real
+        // readings for a numeric or boolean field, and suppressing them would
+        // recreate the absent-versus-zero defect one layer down.
+        const present = observed !== undefined && observed !== null && observed !== '';
         if (source?.ok && present && !matchesStub(entry, observed)) {
           const warning = describeStaleProvenance(key, entry, observed);
           recordProvenanceWarning(key, warning);
