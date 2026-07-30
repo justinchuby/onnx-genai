@@ -2657,3 +2657,87 @@ it has no completion state to be in.
 > smallest quotable fragment is still honest.** Not the paragraph. Not the
 > section. **The fragment.** ***Any qualifier that a reader can strip by
 > selecting one line is not a qualifier — it is a hope.***
+
+---
+
+## AC217 — WHEN THIS DASHBOARD DOES NOT KNOW WHY, IT BLAMES THE SERVER. THAT IS A SYSTEMATIC BIAS, NOT FOUR BUGS
+
+**AC215 named one mechanism at three sites. @c8d9a40e then found a fourth in a
+different file within ten minutes. So I stopped fixing sites and ran the census
+the Lead's rule demands — *the mechanism is the easy part; the sweep is the
+work*. Measured at `6d48c02d` across every shipped `dashboard/` and `ui/` module,
+every hit read with its line, not counted.**
+
+```
+PROVENANCE DEFAULTS THAT ASSERT A CLAIM
+  panel-kit.js:191   ?? SOURCE_BADGES.derived            AC215
+  panel-kit.js:1300  return 'derived'                    AC215
+  panel-kit.js:1308  return 'derived'                    AC215
+  telemetry-store.js unavailableField -> sourceClass SERVER   @c8d9a40e, 35 fields
+  fake-store.js:29   source: options.source ?? 'server'
+  fake-store.js:49   source: options.source ?? 'server'
+  fake-store.js:65   state:  options.state  ?? 'ok'      the retired enum
+
+REASON DEFAULTS THAT INVENT A CAUSE  ** THE FINDING **
+  field-state.js:434    'This server cannot produce the inputs for this ratio.'
+  panel-kit.js:304      'This server cannot produce this measurement.'
+  panel-kit.js:363      'This value is not measured by the server.'
+  store-adapter.js:397  'This server build does not report it.'
+
+HONEST DEFAULTS, WHICH PROVE THE HOUSE CAN DO THIS  [POSITIVE CONTROL]
+  requests.js:268   CLIENT_STATES[state ?? ''] ?? null
+  system.js:234     connection?.state ?? 'unknown'
+  requests.js:343   ?? 'unknown'
+  6 shipped files default onto null
+[NEG CONTROL] zqL-void-7788 -> 0
+```
+
+### The finding
+
+**Every one of those four reason strings is reached at exactly one moment: when
+no reason was supplied.** At that moment the honest content is *"we were not told
+why."* **What the user is shown instead is a specific, confident, causal
+attribution — and in all four cases the cause is the server.**
+
+> **This dashboard's entire product claim is that it does not overstate what it
+> knows. And in every place where it knows nothing, it says the server is at
+> fault.**
+
+**Four different wordings, three different files, one invented cause.** That is
+also **four vocabularies for one concept**, the same duplication already found in
+`SOURCE_BADGES` / `SOURCE_CLASS_BADGES` / `SOURCE_CLASSES`. **Nobody chose this
+bias. It is what a careful engineer writes when a template needs a string and
+the honest answer feels unhelpfully blank.**
+
+### Why the bias is the defect, not any individual string
+
+**Each fallback is defensible alone and they are indefensible together.** In the
+common case the server *is* the reason, so each string reads as reasonable when
+reviewed on its own line — **which is precisely why four of them accumulated
+without anyone objecting.** The bias is only visible in the census.
+
+**And it aligns with a real misattribution in the engine**, already recorded in
+the PR: the shared-buffer path collapses a host fact and a model fact into one
+boolean and prints a sentence blaming the *model*. **So the same class exists on
+both sides of the wire, pointing in opposite directions — the engine blames the
+model, the dashboard blames the server — and neither is measuring anything.**
+
+### Acceptance
+
+1. **A missing reason renders as a missing reason.** No default causal string.
+   If the surface needs prose, it says *"no reason was reported"* — which is
+   **true, checkable, and tells the operator the real defect: the server did not
+   explain itself.**
+2. **One vocabulary, one file.** The four strings collapse to one exported
+   constant; a fifth wording is a test failure, not a style question.
+3. **The census is the guard.** A test that pins these four strings pins the
+   bias. **The guard must assert that no shipped module contains a fallback
+   reason at all** — which is checkable by shape and cannot rot into agreement.
+4. **The test fixtures are in scope and are the highest-leverage half.**
+   `fake-store.js` defaults `source` to `'server'` twice and `state` to the
+   retired `'ok'`. ***Fixtures that default to a claim teach every test written
+   against them to expect a claim***, so the bias reproduces itself in the suite
+   faster than in the product.
+
+> **A default is the answer you give when you have nothing to say. Ours says
+> "the server did it." We built an honesty layer with a suspect.**
