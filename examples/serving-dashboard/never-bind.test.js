@@ -101,7 +101,7 @@ test('no shell module reads a never-bind field off a response body', () => {
 // unwritten, or the code the exemption was granted for is deleted and the hole
 // outlives it -- still subtracting a token, now from files it was never
 // examined against. So every exemption must justify itself AND still be load
-// bearing. When the last `entry.path` disappears, this goes red and the
+// bearing. When the last exempted expression disappears, this goes red and the
 // exemption gets deleted rather than inherited.
 test('every never-bind exemption is justified and still earning its keep', () => {
   const sources = shellSources();
@@ -128,6 +128,65 @@ test('every never-bind exemption is justified and still earning its keep', () =>
         'Delete it: an exemption for code that no longer exists is a permanent hole in ' +
         'the ban, granted for a reason nobody can check.',
     );
+  }
+});
+
+// AN EXEMPTION'S PREMISE MUST BE EXECUTABLE, NOT MERELY WRITTEN DOWN.
+//
+// Every exemption above carries a `why` in prose, and prose is not checked by
+// anything. The premise under all of them is the same sentence: "this spelling
+// can only mean the catalogue addressing itself, never a panel reading the
+// field off a response body." If that sentence is false, the exemption is not
+// a narrow hole -- it is an open door positioned exactly where the defect walks
+// in, and the guard reports green while holding it.
+//
+// IT WAS FALSE HERE. The `path` ban once exempted the bare identifier
+// `entry.path`, justified as "this table addressing itself, not a panel reading
+// `path` off a /v1/models body". But telemetry-store.js binds `entry` to a
+// /v1/models WIRE OBJECT when it picks the primary model -- `entries.map((entry)
+// => entry?.id)` over `models.body.data`. A future `entry.path` at that site
+// reads the operator's home directory straight off the wire, and the exemption
+// subtracted it before the scan ever saw it.
+//
+// So this test does not trust the prose. It builds the wire-read spelling of
+// every banned field, subtracts the real granted exemptions from it exactly as
+// the scan does, and asserts the ban still fires. It is the ONE assertion here
+// that fails if an exemption is ever widened back into an identifier.
+test('no exemption subtracts a spelling the defect could use', () => {
+  const granted = NEVER_BIND.flatMap((entry) => entry.exemptions ?? []);
+  assert.ok(
+    granted.length > 0,
+    'this test is vacuous with no exemptions granted -- it would pass by having nothing ' +
+      'to subtract. If the last exemption was deleted, delete this test with it.',
+  );
+
+  for (const { field, exemptions = [] } of NEVER_BIND) {
+    // How a panel would actually read the field off a parsed body. `entry` is
+    // used deliberately: it is the identifier telemetry-store.js already binds
+    // to a /v1/models element, so it is the likeliest spelling of the defect.
+    const wireReads = [
+      `const leaked = entry.${field};`,
+      `const leaked = body.data[0].${field};`,
+      `const leaked = entry['${field}'];`,
+    ];
+
+    for (const wireRead of wireReads) {
+      let scanned = wireRead;
+      for (const { token } of exemptions) scanned = scanned.split(token).join('');
+
+      const patterns = [
+        new RegExp(`\\.${field}\\b`),
+        new RegExp(`\\[['"]${field}['"]\\]`),
+        new RegExp(`['"]${field}['"]\\s*:`),
+      ];
+      assert.ok(
+        patterns.some((pattern) => pattern.test(scanned)),
+        `the exemptions on "${field}" swallow ${JSON.stringify(wireRead)}, which is a read ` +
+          'of the banned field off a response body. An exemption must subtract the smallest ' +
+          'unique EXPRESSION that covers the legitimate use, never a bare identifier the ' +
+          'defect could spell the same way.',
+      );
+    }
   }
 });
 

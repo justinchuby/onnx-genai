@@ -953,17 +953,38 @@ export const NEVER_BIND = Object.freeze([
     // WHY THIS ONE NEEDS EXEMPTIONS AND `created` DOES NOT. The broad scan below
     // looks for the field NAME being read off a parsed body. `created` is a
     // distinctive word; `path` is not -- it is also the name of the property on
-    // a PROVENANCE row that holds the dotted lookup path. So `entry.path` is a
-    // read of THIS TABLE, not of a response body, and the scan cannot tell the
-    // difference. Listing the exact safe tokens keeps the ban narrow and honest
-    // rather than silently excusing whole files.
+    // a PROVENANCE row that holds the dotted lookup path, so the scan cannot
+    // tell this table addressing itself from a panel reading the wire.
+    //
+    // AN EXEMPTION MUST SUBTRACT THE SMALLEST UNIQUE STRING THAT COVERS THE
+    // LEGITIMATE USE -- NEVER A TOKEN THE DEFECT COULD ALSO SPELL. This list
+    // used to exempt the bare identifier `entry.path`, justified as "this table
+    // addressing itself, not a panel reading `path` off a /v1/models body".
+    // THAT JUSTIFICATION WAS FALSE IN THE VERY FILE IT EXEMPTED: telemetry-store.js
+    // binds `entry` to a /v1/models WIRE OBJECT when it picks the primary model
+    // (`entries.map((entry) => entry?.id)`, `entries.find((entry) => entry?.is_default)`).
+    // `entry` there is one element of `models.body.data` -- so `entry.path` at
+    // that site would read the operator's model directory straight off the wire,
+    // and the old exemption would have subtracted it and left the guard green.
+    // The exempted spelling was the MOST LIKELY spelling of the defect: the ban
+    // was widest open at exactly the point it was meant to be shut.
+    //
+    // So the tokens below are the two whole expressions that legitimately use
+    // it. A bare `entry.path` anywhere now survives the subtraction and fires.
     exemptions: Object.freeze([
       Object.freeze({
-        token: 'entry.path',
+        token: 'entry.metric ?? entry.path',
         why:
-          'Reads the dotted-path DESCRIPTOR on a PROVENANCE row (telemetry-store.js resolves ' +
-          'and reports fields through it). It is this table addressing itself, not a panel ' +
-          'reading `path` off a /v1/models body.',
+          'Names the producer in a "responded but carried no value" message. Reads the ' +
+          'DESCRIPTOR on a PROVENANCE row, never a response body. Exempted as a whole ' +
+          'expression so a bare `entry.path` elsewhere is still caught.',
+      }),
+      Object.freeze({
+        token: 'entry.path ? readPath(body, entry.path) : undefined',
+        why:
+          'The single site that resolves a row against a parsed body. `body` is the ' +
+          'HAYSTACK here and `entry.path` the dotted lookup INTO it -- the inverse of ' +
+          'reading a `path` field off that body. Exempted whole for the same reason.',
       }),
     ]),
   }),
