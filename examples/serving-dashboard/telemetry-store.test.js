@@ -1108,7 +1108,7 @@ test('static endpoints are not re-fetched every poll (AC33 overhead budget)', as
     baseUrl: BASE_URL,
     now: () => clock,
     fetchImpl: async (url) => {
-      const path = url.slice(BASE_URL.length);
+      const path = new URL(url).pathname;
       counts[path] = (counts[path] ?? 0) + 1;
       return fakeFetch(routes)(url);
     },

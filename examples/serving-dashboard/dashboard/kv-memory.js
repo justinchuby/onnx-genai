@@ -102,7 +102,7 @@ export default function mount(rootElement, telemetryStore) {
       unavailableReason: 'Sharing is a proportion of blocks in use, and one of those is not measured.',
     });
     const slotFill = ratioField(slotsFilled, slotCapacity, {
-      label: 'Slot fill in returned window',
+      label: 'Slot fill efficiency',
       unavailableReason: 'Slot fill needs both filled slots and slot capacity from the engine.',
     });
 
@@ -262,8 +262,7 @@ function renderSlotFillNote(slotsFilled, slotCapacity) {
   return element('p', {
     className: 'panel-kv-memory__note',
     text:
-      `In the returned block-table window, ${formatNumber(filled)} of ${formatNumber(capacity)} ` +
-      'allocated token slots hold data. ' +
+      `${formatNumber(filled)} of ${formatNumber(capacity)} token slots hold data. ` +
       'The gap is the cost of paging: blocks are allocated whole, so the last block of ' +
       'each sequence is usually partly empty. This is real and we show it.',
   });

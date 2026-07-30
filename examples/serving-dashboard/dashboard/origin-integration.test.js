@@ -129,8 +129,9 @@ function syntheticBlockTable({
   };
 }
 
-function blockTableServer(baseServer, blockTable) {
+function blockTableServer(baseServer, blockTable, requestedUrls = []) {
   return async (url) => {
+    requestedUrls.push(url);
     if (new URL(url).pathname === '/v1/debug/kv/blocks') {
       return {
         ok: true,
@@ -144,26 +145,25 @@ function blockTableServer(baseServer, blockTable) {
 }
 
 async function pollBlockTable(blockTable) {
+  const requestedUrls = [];
   const store = createTelemetryStore({
     origin: 'dynamic',
-    fetchImpl: blockTableServer(respondingServer(), blockTable),
+    fetchImpl: blockTableServer(respondingServer(), blockTable, requestedUrls),
   });
   await store.pollOnce();
-  return store;
+  return { store, requestedUrls };
 }
 
 describe('KV block-window aggregation', () => {
-  it('renders a fully filled 300-page pool as 100%, not 85.33% from mixed scopes', async () => {
-    // SYNTHETIC: imitates BlockTableResponse's documented default-window wire
-    // shape: a 300-page pool, the first 256 dense page entries returned, and
-    // every returned page allocated and filled to page_size.
-    const returnedPages = 256;
+  it('requests the maximum window and renders a complete 300-page pool as 100%', async () => {
+    // SYNTHETIC: a complete global view of a fully allocated 300-page pool.
+    const poolPages = 300;
     const blockTable = syntheticBlockTable({
-      pagesInUse: 300,
-      refCounts: Array(returnedPages).fill(1),
-      filledSlots: Array(returnedPages).fill(16),
+      pagesInUse: poolPages,
+      refCounts: Array(poolPages).fill(1),
+      filledSlots: Array(poolPages).fill(16),
     });
-    const store = await pollBlockTable(blockTable);
+    const { store, requestedUrls } = await pollBlockTable(blockTable);
 
     const slotsFilled = store.field('kv.slots_filled');
     const slotCapacity = store.field('kv.slot_capacity');
@@ -177,6 +177,14 @@ describe('KV block-window aggregation', () => {
       'measured',
       `synthetic block table did not publish kv.slot_capacity: ${JSON.stringify(slotCapacity)}`,
     );
+    assert.equal(slotsFilled.value, 4800);
+    assert.equal(slotCapacity.value, 4800);
+    assert.equal(slotsFilled.sourceClass, 'derived');
+    assert.equal(slotCapacity.sourceClass, 'derived');
+    assert.ok(
+      requestedUrls.some((url) => new URL(url).searchParams.get('count') === '1024'),
+      `block-table request did not ask for the 1024-page maximum: ${requestedUrls.join(', ')}`,
+    );
     const computedPercent = (slotsFilled.value / slotCapacity.value) * 100;
     const adapter = adaptStore(store);
     const panel = await import('./kv-memory.js');
@@ -184,34 +192,92 @@ describe('KV block-window aggregation', () => {
     const handle = panel.mount(root, adapter);
     flushAnimationFrames();
 
-    assert.doesNotMatch(
-      root.textContent,
-      /85\.3%/,
-      `fully filled returned pages computed ${computedPercent.toFixed(2)}% and rendered "${root.textContent}"`,
-    );
-    assert.equal(computedPercent, 100, 'a fully filled returned window must compute to exactly 100%');
-    assert.match(root.textContent, /returned block-table window/i);
+    assert.match(root.textContent, /100%/);
+    assert.equal(computedPercent, 100, 'a complete fully filled pool must compute to exactly 100%');
 
     handle.unmount();
     adapter.destroy();
     store.stop();
   });
 
-  it('keeps null pages distinct from observed released and allocated pages', async () => {
+  it('withholds both slot fields when only 256 of 300 pool pages were scanned', async () => {
+    // SYNTHETIC: the reviewer's exact original failure shape. The first 256
+    // pages are full, but the response does not cover the whole 300-page pool.
+    const scannedPages = 256;
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 300,
+      refCounts: Array(scannedPages).fill(1),
+      filledSlots: Array(scannedPages).fill(16),
+      total: 300,
+      poolTotal: 300,
+    });
+    const { store } = await pollBlockTable(blockTable);
+
+    for (const key of ['kv.slots_filled', 'kv.slot_capacity']) {
+      const field = store.field(key);
+      assert.equal(field.state, 'unavailable', `${key} published a partial global view`);
+      assert.match(field.reason, /256 of 300 pool pages/);
+    }
+    store.stop();
+  });
+
+  it('withholds both slot fields when the pool exceeds the server maximum window', async () => {
+    // SYNTHETIC: the server clamps count=1024 while the pool holds 1200 pages.
+    const scannedPages = 1024;
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 1200,
+      refCounts: Array(scannedPages).fill(1),
+      filledSlots: Array(scannedPages).fill(16),
+      total: 1024,
+      poolTotal: 1200,
+      truncated: true,
+    });
+    const { store } = await pollBlockTable(blockTable);
+
+    for (const key of ['kv.slots_filled', 'kv.slot_capacity']) {
+      const field = store.field(key);
+      assert.equal(field.state, 'unavailable', `${key} published a pool larger than MAX_WINDOW`);
+      assert.match(field.reason, /1024 of 1200 pool pages/);
+    }
+    store.stop();
+  });
+
+  it('withholds both slot fields when any dense block array is misaligned', async () => {
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 4,
+      refCounts: [1, 1, 1, 1],
+      filledSlots: [16, 16, 16, 16],
+      total: 4,
+      poolTotal: 4,
+    });
+    blockTable.blocks.tiers = [0, 0, 0];
+    const { store } = await pollBlockTable(blockTable);
+
+    for (const key of ['kv.slots_filled', 'kv.slot_capacity']) {
+      const field = store.field(key);
+      assert.equal(field.state, 'unavailable', `${key} published misaligned dense arrays`);
+      assert.match(field.reason, /block arrays do not all contain window\.scanned/);
+    }
+    store.stop();
+  });
+
+  it('keeps null, released-zero, and non-zero pages distinct in a complete view', async () => {
     // SYNTHETIC: imitates the dense parallel-array contract in routes/mod.rs:
     // null = never written, 0 = observed and released, positive = allocated.
     const blockTable = syntheticBlockTable({
       pagesInUse: 2,
       refCounts: [null, 0, 1, 2],
-      filledSlots: [null, 0, 7, 16],
-      tiers: [null, 0, 1, 0],
+      filledSlots: [null, 0, 5, 16],
+      tiers: [null, 0, 0, 1],
       total: 4,
       poolTotal: 4,
     });
-    const store = await pollBlockTable(blockTable);
+    const { store } = await pollBlockTable(blockTable);
 
-    assert.equal(store.field('kv.slots_filled').value, 23);
+    assert.equal(store.field('kv.slots_filled').value, 21);
     assert.equal(store.field('kv.slot_capacity').value, 32);
+    assert.equal(store.field('kv.slots_filled').sourceClass, 'derived');
+    assert.equal(store.field('kv.slot_capacity').sourceClass, 'derived');
     assert.deepEqual(store.field('kv.refcount_histogram').value, [
       { refcount: 0, blocks: 1 },
       { refcount: 1, blocks: 1 },
@@ -221,45 +287,6 @@ describe('KV block-window aggregation', () => {
       { name: 'hot', pages: 2 },
       { name: 'cold', pages: 1 },
     ]);
-    store.stop();
-  });
-
-  it('does not materialise never-written null pages as refcount or tier zeroes', async () => {
-    // SYNTHETIC: an untouched two-page mirror window. The all-null shape is
-    // explicitly documented by BlockTable's wire contract and occurs at startup.
-    const blockTable = syntheticBlockTable({
-      pagesInUse: 0,
-      refCounts: [null, null],
-      filledSlots: [null, null],
-      tiers: [null, null],
-      total: 2,
-      poolTotal: 2,
-    });
-    const store = await pollBlockTable(blockTable);
-
-    assert.equal(store.field('kv.slots_filled').value, 0);
-    assert.equal(store.field('kv.slot_capacity').value, 0);
-    assert.deepEqual(store.field('kv.refcount_histogram').value, []);
-    assert.deepEqual(store.field('kv.tiers').value, []);
-    store.stop();
-  });
-
-  it('keeps slot fill window-scoped when the server mirror is truncated', async () => {
-    // SYNTHETIC: mirrors the real response shape when MAX_WINDOW caps the
-    // telemetry mirror below pool_total. The returned 256 pages are all full.
-    const returnedPages = 256;
-    const blockTable = syntheticBlockTable({
-      pagesInUse: 1200,
-      refCounts: Array(returnedPages).fill(1),
-      filledSlots: Array(returnedPages).fill(16),
-      total: 1024,
-      poolTotal: 1200,
-      truncated: true,
-    });
-    const store = await pollBlockTable(blockTable);
-
-    assert.equal(store.field('kv.slots_filled').value, 4096);
-    assert.equal(store.field('kv.slot_capacity').value, 4096);
     store.stop();
   });
 });

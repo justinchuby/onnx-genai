@@ -476,28 +476,26 @@ export const PROVENANCE = Object.freeze({
   'kv.slots_filled': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     derived: true,
-    derivedFrom: ['blocks.filled_slots', 'blocks.ref_counts'],
+    derivedFrom: ['window.start', 'window.scanned', 'window.pool_total', 'blocks.filled_slots'],
     classification: 'MEASURED',
     unit: 'tokens',
     evidence:
-      'Summed client-side over aligned BlockTable.filled_slots and ref_counts entries in the ' +
-      'returned window (routes/mod.rs). Null pairs are unobserved and skipped; ref_count 0 is ' +
-      'an observed released page and contributes no occupancy. Pairing the arrays prevents a ' +
-      'partial-window numerator from being compared with a whole-pool denominator.',
-    label: 'Token slots holding data in returned window',
+      'Summed client-side over BlockTable.filled_slots only after the response proves a complete ' +
+      'global view: start 0, scanned >= pool_total, and all four dense block arrays aligned to ' +
+      'window.scanned. Nulls are skipped as unobserved; released ref_count 0 remains distinct.',
+    label: 'Token slots holding data',
   },
   'kv.slot_capacity': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     derived: true,
-    derivedFrom: ['page_size', 'blocks.ref_counts', 'blocks.filled_slots'],
+    derivedFrom: ['window.start', 'window.scanned', 'window.pool_total', 'page_size', 'pages_in_use'],
     classification: 'MEASURED',
     unit: 'tokens',
     evidence:
-      'Derived as page_size × pages with ref_count > 0 in the same returned block window used ' +
-      'for kv.slots_filled. It deliberately does not use whole-pool pages_in_use: the endpoint ' +
-      'defaults to a 256-page window, so mixing those scopes rendered a fully filled 300-page ' +
-      'pool as 85.33%.',
-    label: 'Token slots allocated in returned window',
+      'Derived as page_size × whole-pool pages_in_use only after the block response proves the ' +
+      'same complete global view required by kv.slots_filled. Partial or MAX_WINDOW-clamped ' +
+      'responses make both fields unavailable instead of publishing a mixed-scope ratio.',
+    label: 'Token slots allocated',
   },
   'kv.refcount_histogram': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,

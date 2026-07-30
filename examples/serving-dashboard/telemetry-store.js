@@ -91,6 +91,11 @@ const ENDPOINT_CADENCE_MS = Object.freeze({
   [ENDPOINTS.MODELS]: 30000,       // the loaded model set, for attribution
 });
 
+const BLOCK_TABLE_MAX_WINDOW = 1024;
+const REQUEST_QUERY = Object.freeze({
+  [ENDPOINTS.DEBUG_KV_BLOCKS]: `?start=0&count=${BLOCK_TABLE_MAX_WINDOW}`,
+});
+
 /** Poll cadence bounds. The spec fixes the dashboard at 250-500 ms. */
 export const MIN_POLL_INTERVAL_MS = 100;
 export const DEFAULT_POLL_INTERVAL_MS = 250;
@@ -453,7 +458,7 @@ export function createTelemetryStore({
     // request-deadline.js because it previously lived here ONLY, and the boot
     // probe in app.js never received it.
     try {
-      const response = await fetchWithDeadline(`${baseUrl}${path}`, {
+      const response = await fetchWithDeadline(`${baseUrl}${path}${REQUEST_QUERY[path] ?? ''}`, {
         fetchImpl,
         timeoutMs: requestTimeoutMs,
         headers: { accept: isText ? 'text/plain' : 'application/json' },
@@ -965,6 +970,8 @@ export function createTelemetryStore({
     const blocks = body.blocks ?? {};
     const pagesInUse = numberOrNull(body.pages_in_use);
     const pageSize = numberOrNull(body.page_size);
+    const windowStart = numberOrNull(body.window?.start);
+    const windowScanned = numberOrNull(body.window?.scanned);
     const poolTotal = numberOrNull(body.window?.pool_total);
 
     // A null in these arrays means the page has NEVER BEEN WRITTEN. The server
@@ -975,7 +982,29 @@ export function createTelemetryStore({
     const filledSlots = Array.isArray(blocks.filled_slots) ? blocks.filled_slots : null;
     const refCounts = Array.isArray(blocks.ref_counts) ? blocks.ref_counts : null;
     const tierValues = Array.isArray(blocks.tiers) ? blocks.tiers : null;
-    const windowOccupancy = summarizeWindowOccupancy(filledSlots, refCounts);
+    const pageIds = Array.isArray(blocks.page_ids) ? blocks.page_ids : null;
+    const blockArrays = [pageIds, refCounts, filledSlots, tierValues];
+    const arraysMatchWindow =
+      windowScanned !== null &&
+      blockArrays.every((values) => values !== null && values.length === windowScanned);
+    const completeGlobalView =
+      windowStart === 0 &&
+      windowScanned !== null &&
+      poolTotal !== null &&
+      windowScanned >= poolTotal &&
+      arraysMatchWindow;
+    let incompleteWindowReason =
+      'Global slot fill requires window.start, window.scanned, window.pool_total, and four ' +
+      'aligned block arrays.';
+    if (!arraysMatchWindow && windowScanned !== null) {
+      incompleteWindowReason =
+        `The block arrays do not all contain window.scanned (${windowScanned}) entries; ` +
+        'global slot fill requires one complete aligned view.';
+    } else if (windowScanned !== null && poolTotal !== null) {
+      incompleteWindowReason =
+        `The block window covers ${windowScanned} of ${poolTotal} pool pages; global slot fill ` +
+        'requires a start-0 window covering the whole pool with every block array aligned.';
+    }
 
     fields['kv.usage'] =
       pagesInUse !== null && poolTotal !== null && poolTotal > 0
@@ -986,26 +1015,20 @@ export function createTelemetryStore({
             metaFor('kv.usage'),
           );
 
-    fields['kv.slots_filled'] = windowOccupancy
-      ? measuredField(windowOccupancy.filledSlots, {
+    fields['kv.slots_filled'] = completeGlobalView && filledSlots
+      ? measuredField(sumDefined(filledSlots), {
           ...metaFor('kv.slots_filled'),
           observedAtMs,
         })
-      : unavailableField(
-          'Slot occupancy needs aligned filled_slots and ref_counts arrays from the same block window.',
-          metaFor('kv.slots_filled'),
-        );
+      : unavailableField(incompleteWindowReason, metaFor('kv.slots_filled'));
 
     fields['kv.slot_capacity'] =
-      pageSize !== null && windowOccupancy
-        ? measuredField(pageSize * windowOccupancy.allocatedPages, {
+      completeGlobalView && pageSize !== null && pagesInUse !== null
+        ? measuredField(pageSize * pagesInUse, {
             ...metaFor('kv.slot_capacity'),
             observedAtMs,
           })
-        : unavailableField(
-            'Slot capacity needs page_size plus aligned ref_counts and filled_slots from one block window.',
-            metaFor('kv.slot_capacity'),
-          );
+        : unavailableField(incompleteWindowReason, metaFor('kv.slot_capacity'));
 
     fields['kv.refcount_histogram'] = refCounts
       ? measuredField(groupRefCounts(refCounts), {
@@ -1419,48 +1442,22 @@ function numberOrNull(value) {
 }
 
 /**
- * Aggregate slot occupancy over one dense block-table window.
+ * Sum the entries that are actually numbers, skipping nulls.
  *
- * Null entries are unobserved pages and are excluded. A numeric refcount of
- * zero is different: it is an observed, released page, so it remains visible
- * to the refcount histogram but contributes neither filled slots nor allocated
- * capacity. Pairing the arrays here keeps the ratio's numerator and denominator
- * on the identical page population.
+ * Nulls are pages the pool has NEVER WRITTEN. They are an absence of
+ * observation, not a zero, and the difference is served on the wire as
+ * `window.scanned - window.observed`.
  *
- * @param {readonly unknown[]|null} filledSlots
- * @param {readonly unknown[]|null} refCounts
- * @returns {{filledSlots: number, allocatedPages: number}|null}
+ * @param {readonly unknown[]} values
+ * @returns {number}
  */
-function summarizeWindowOccupancy(filledSlots, refCounts) {
-  if (!filledSlots || !refCounts || filledSlots.length !== refCounts.length) return null;
-
-  let totalFilledSlots = 0;
-  let allocatedPages = 0;
-  for (let index = 0; index < refCounts.length; index += 1) {
-    const refCountIsNull = refCounts[index] === null;
-    const filledSlotsIsNull = filledSlots[index] === null;
-    if (refCountIsNull || filledSlotsIsNull) {
-      if (refCountIsNull !== filledSlotsIsNull) return null;
-      continue;
-    }
-
-    const refCount = numberOrNull(refCounts[index]);
-    const pageFilledSlots = numberOrNull(filledSlots[index]);
-    if (
-      refCount === null ||
-      pageFilledSlots === null ||
-      refCount < 0 ||
-      pageFilledSlots < 0
-    ) {
-      return null;
-    }
-    if (refCount === 0) continue;
-
-    allocatedPages += 1;
-    totalFilledSlots += pageFilledSlots;
+function sumDefined(values) {
+  let total = 0;
+  for (const value of values) {
+    const numeric = numberOrNull(value);
+    if (numeric !== null) total += numeric;
   }
-
-  return { filledSlots: totalFilledSlots, allocatedPages };
+  return total;
 }
 
 /**
