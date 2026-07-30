@@ -417,9 +417,12 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
       why:
         'the counter is disqualified on its own arithmetic, which needs no stopwatch: ' +
         'twelve requests -- six repeated, six DELIBERATELY UNIQUE -- produced +12 hits, ' +
-        'one per completed generation, and the rate never left ~0.94. A counter that reads ' +
+        'one per completed generation. A counter that reads ' +
         'the same whether prefixes are reused or not ' +
-        'cannot distinguish the two, so it measures nothing. (We could not measure a timing ' +
+        'cannot distinguish the two, so it measures nothing. (The DELTA is the evidence; ' +
+        'do not quote a hit RATE. These counters are cumulative since boot, so the ratio ' +
+        'describes the process, not the experiment -- it is diluted by warm-up and can be ' +
+        'moved to any value with unrelated traffic.) (We could not measure a timing ' +
         'effect above this machine noise floor — a byte-identical binary swung 9.8% from ' +
         'ambient load alone — so we ship no prefix timing number at all.)',
       instead:

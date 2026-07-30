@@ -5,10 +5,23 @@
 // no stopwatch, so no re-run can withdraw it:
 //   - twelve requests: six repeated, SIX DELIBERATELY UNIQUE
 //   - +12 hits -- one per completed generation, unique prompts included
-//   - the rate never left ~0.94 (it read 15/16 before the experiment began)
 // A counter that reads the same whether prefixes are reused or not cannot
 // distinguish the two cases, so it is not measuring reuse.
 //
+// QUOTE THE DELTA, NEVER A RATE. `prefix_cache_hits` and `prefix_cache_lookups`
+// are CUMULATIVE SINCE BOOT, so their ratio is a property of the process rather
+// than of the experiment: diluted by warm-up and tunable to any value by sending
+// more traffic. Four different rates for this one finding appear across our
+// documents (0.875, 0.9375, 0.95, 0.96875), every one honestly transcribed and
+// not one of them evidence. The delta is immune -- no denominator, no baseline,
+// and no amount of unrelated traffic can move it.
+//
+// (An earlier version of this comment said the rate "never left ~0.94 (it read
+// 15/16 before the experiment began)". BOTH HALVES WERE WRONG: 0.9375 is 15/16,
+// which is request EIGHT OF TWELVE -- a mid-block snapshot, not a baseline. The
+// before-rate was 7/8 = 0.875 and the block ended at 19/20 = 0.95, so the rate
+// did move. @376a0297 caught it by checking the arithmetic in
+// prefix-cache-verification.md:91 and :127 -- 7/8 + 12/12 = 19/20 exactly.)
 // (An earlier timing arm reported shared prefixes slower. ITS OWN AUTHOR
 // WITHDREW IT: the interleaved warm re-run came back with the opposite sign,
 // on a box where a byte-identical binary swung 9.8% from ambient load alone.
