@@ -996,7 +996,11 @@ export function createTelemetryStore({
     let incompleteWindowReason =
       'Global slot fill requires window.start, window.scanned, window.pool_total, and four ' +
       'aligned block arrays.';
-    if (!arraysMatchWindow && windowScanned !== null) {
+    if (windowStart !== null && windowStart !== 0) {
+      incompleteWindowReason =
+        `The block window starts at page ${windowStart}; global slot fill requires a start-0 ` +
+        'window covering the whole pool.';
+    } else if (!arraysMatchWindow && windowScanned !== null) {
       incompleteWindowReason =
         `The block arrays do not all contain window.scanned (${windowScanned}) entries; ` +
         'global slot fill requires one complete aligned view.';

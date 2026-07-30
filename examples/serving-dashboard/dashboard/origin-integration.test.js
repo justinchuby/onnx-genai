@@ -97,6 +97,7 @@ function syntheticBlockTable({
   refCounts,
   filledSlots,
   tiers = refCounts.map((value) => (value === null ? null : 0)),
+  start = 0,
   total = pagesInUse,
   poolTotal = pagesInUse,
   truncated = poolTotal > total,
@@ -113,7 +114,7 @@ function syntheticBlockTable({
     allocation_failures: 0,
     tiers: { 0: 'hot', 1: 'cold' },
     window: {
-      start: 0,
+      start,
       scanned,
       observed: refCounts.filter((value) => value !== null).length,
       total,
@@ -121,7 +122,7 @@ function syntheticBlockTable({
       truncated,
     },
     blocks: {
-      page_ids: Array.from({ length: scanned }, (_, index) => index),
+      page_ids: Array.from({ length: scanned }, (_, index) => start + index),
       ref_counts: refCounts,
       filled_slots: filledSlots,
       tiers,
@@ -217,6 +218,49 @@ describe('KV block-window aggregation', () => {
       const field = store.field(key);
       assert.equal(field.state, 'unavailable', `${key} published a partial global view`);
       assert.match(field.reason, /256 of 300 pool pages/);
+    }
+    store.stop();
+  });
+
+  it('does not trust truncated=false when only 256 of 1024 pool pages were scanned', async () => {
+    // SYNTHETIC: reproduces the live server's misleading flag exactly.
+    // `truncated` compares pool_total with mirror total, not with scanned.
+    const scannedPages = 256;
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 400,
+      refCounts: Array(scannedPages).fill(1),
+      filledSlots: Array(scannedPages).fill(16),
+      total: 1024,
+      poolTotal: 1024,
+      truncated: false,
+    });
+    assert.equal(blockTable.window.truncated, false, 'fixture must preserve the wire lie');
+    const { store } = await pollBlockTable(blockTable);
+
+    for (const key of ['kv.slots_filled', 'kv.slot_capacity']) {
+      const field = store.field(key);
+      assert.equal(field.state, 'unavailable', `${key} trusted truncated=false`);
+      assert.match(field.reason, /256 of 1024 pool pages/);
+    }
+    store.stop();
+  });
+
+  it('withholds both slot fields when a full-length window starts after page zero', async () => {
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 4,
+      refCounts: [1, 1, 1, 1],
+      filledSlots: [16, 16, 16, 16],
+      start: 1,
+      total: 5,
+      poolTotal: 4,
+      truncated: false,
+    });
+    const { store } = await pollBlockTable(blockTable);
+
+    for (const key of ['kv.slots_filled', 'kv.slot_capacity']) {
+      const field = store.field(key);
+      assert.equal(field.state, 'unavailable', `${key} published a nonzero-start window`);
+      assert.match(field.reason, /starts at page 1/);
     }
     store.stop();
   });
