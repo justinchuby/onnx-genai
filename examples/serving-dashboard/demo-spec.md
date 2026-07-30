@@ -2378,3 +2378,37 @@ The execution provider is **true, harmless, and the single most interpretively l
   3. **An unactioned cross-owner finding must appear on the gate as its own row.** Today it appears nowhere: the suite is green, every lane approves, and three live defects sit in three different agents' inboxes. **An absent item and a not-done item render identically on every ledger we own — and this is that law applied to work rather than to documents.**
 
   **⚠️ AND THE SELF-CATCH THAT PROVES THE HANDOFF STANDARD IS NOT FREE, RECORDED AGAINST MY OWN RULING ONE SCREEN ABOVE:** my `AC208` remedy said **"it is not a deletion"** and **"strike the ratio"** — **the PROSE remedy, prescribed for an artifact I had myself classified as an INSTRUCTION in the same AC.** @0837fdf9's **D308** caught it: *prose is struck for a reader; a byte-sequence is not struck for a `grep`.* **They found the identical error inside their own repair, mid-commit, and published it.** ➡️ **So the handoff I sent was correct in its diagnosis and wrong in its patch — and under the standard above, a wrong patch handed to an owner is worse than no patch, because it arrives carrying my authority.** *If we are going to hand each other fixes, the fix is a claim and it needs a control like any other.*
+
+- [ ] **AC211 — ⚖️ PRODUCT SEVERITY RULING ON THE WIRE HALF OF P1, NOW THE GATE'S LAST OPEN CODE DEFECT. **🟡 FOR THE LIVE PRESENTED DEMO. 🔴 FOR ANYTHING RECORDED, SCREENSHOTTED, HOSTED OR SHARED.** THE TWO ARE NOT THE SAME EVENT AND WE HAVE BEEN SCORING THEM AS ONE.**
+
+  **Measured on the wire at 05:10:29, not relayed. Negative control: `:8199` has no listener, so the probe can fail.**
+
+  ```
+  :8123  "path":"/Users/justinc/Documents/GitHub/onnx-genai-demo/../onnx-genai/models/qwen2.5-0.5b-scatter-v2"
+  :8124  "path":"/Users/justinc/Documents/GitHub/onnx-genai-demo/../onnx-genai/models/qwen2.5-0.5b"
+  ```
+
+  **Four disclosures in one string, and only the first is ever named:** ① the operator's **username** · ② **both repository names** · ③ an unnormalised `..` that **reveals the two-repo sibling layout** · ④ the **model directory**, including the private `-scatter-v2` suffix that is not a public artifact name.
+
+  **WHY 🟡 AND NOT 🔴 ON THE DAY — AND THIS IS A PRODUCT JUDGEMENT, NOT A SECURITY ONE:** the **render half is genuinely closed**. `server.model_path` binds **0** times in `ui/model-card.js` and **0** in `dashboard/system.js` at HEAD. **Nothing on the projected screen shows this.** A visitor watching the demo sees a clean dashboard. **The dashboard is better than its specification here and I will not manufacture a blocker to make a board look thorough.**
+
+  **WHY 🔴 THE MOMENT THE DEMO LEAVES THE ROOM, WHICH IS THE CASE NOBODY HAS SCORED:** the string is **one unauthenticated GET away**, on an origin we tell people to open. **A devtools Network tab, a screen recording that pans, a screenshot of a JSON response, a hosted deployment, or a curl pasted into a follow-up email all publish it — and every one of those is a normal thing to do with a demo.** ➡️ **We have been scoring "can the audience see it" when the operative question is "can the artifact carry it." *A demo is not an event, it is a thing that gets forwarded.***
+
+  **AND THE ROOT CAUSE IS NOT A BUG. IT IS A CORRECT THREAT MODEL FOR A DIFFERENT DEPLOYMENT, AND @c0de4c2e NAMED IT EXACTLY:**
+
+  ```
+  routes/mod.rs:117-119  /// Absolute on loopback; the basename otherwise, so a
+                         /// non-loopback deployment does not leak the operator's
+                         /// username and filesystem layout ...
+  ```
+
+  **The author reasoned: loopback is private, so be verbose; the network is public, so redact. That is right for a server and exactly inverted for us. WE ARE SERVING LOOPBACK ONTO A PROJECTOR. Loopback is not the private case here — it is the case with an audience pointed at it.** ➡️ **This is the first defect all session whose cause is a *correct decision made under a different assumption about who is watching*, and it is why six agents converged on the JavaScript and nobody saw it until the endpoint was curled.**
+
+  **BINDING — AND NOTE WHAT I AM *NOT* ASKING FOR:**
+  1. **DO NOT change the server's loopback default.** It is correct for the product `onnx-genai` actually is, it is documented, and the reasoning is sound. **Changing a right decision because our demo is unusual is how a demo becomes a maintenance burden on a real server.**
+  2. **The demo launcher must opt out of verbosity explicitly.** The disclosure is a property of **how we launch**, not of what the server is. **The fix belongs in `run-demo.sh`, in one flag, owned by @d7cf9b84** — and it must be a *positive* assertion of redaction, not a reliance on a default, because **a default that happens to be safe is the thing this whole session has been about.**
+  3. **Two disclosure mechanisms currently disagree and that is the durable defect.** `admin.rs` uses `model_path_for_display` (unconditional basename); `routes/mod.rs` has **zero** references to that helper and rolls its own loopback conditional. **They do not even agree today.** *Two sites that both get to decide, with nothing stating which wins — @f6527cc9's third sighting of the same shape, now in Rust.*
+
+  **ACCEPTANCE, AND IT IS A `curl`, NOT A PAGE:** `curl -s :PORT/v1/models` on every launched origin contains **no `/Users/`, no `..`, and no repository name**, with a positive control proving the probe can see a path when one is present. **The browser is not the instrument for this AC — the browser is exactly what proved it invisible.**
+
+  **⚠️ AND THE SCORING ERROR I AM CORRECTING IN MYSELF, SINCE I FILED THIS AND THEN UNDERSOLD IT:** I ruled it live and explicitly declined to inflate it to a blocker, on the ground that it is loopback-bound. **That was the right call about *reach* and the wrong frame entirely — I reasoned about who can connect, when the question is what gets copied.** *Loopback bounds the listener. It does not bound the screenshot.*
