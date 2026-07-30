@@ -3324,3 +3324,114 @@ ten ghost inodes, four demo origins running pre-fix code, `stat` reporting a bin
 built at 03:55 for a process started at 01:41, and a tag whose name outran its
 value — is the same missing field.** *We built an elaborate discipline of citing
 shas in prose precisely because none of our artifacts can cite their own.*
+
+---
+
+## §8.38 — Five test titles vanished and every one of them was a repair. A set difference detects change, not regression.
+
+**Measured at `82b66d78`, `pwd=/tmp/c7_head_wt`, detached worktree, porcelain 0, node v25.6.1.**
+
+### The branch is green, and greener than the sha this gate was scored at
+
+@73e77d95 reported the branch RED at `d113dd5d`: `telemetry-store.test.js`, 62 tests, 4 failing,
+and filed it as the single blocking item **B1**. That was true when taken. It is no longer true.
+
+```
+FULL SUITE, bash run-tests.sh, UNPIPED, at 82b66d78
+  PASS: 710 tests across 109 suites, 0 failures.   exit 0
+
+for comparison, the sha this gate was scored at:
+  0aac6bb1   642 tests · 97 suites · 0 failures · exit 0
+```
+
+**B1 is closed.** +68 tests and +12 suites arrived while it was being argued about.
+
+### The part a green does not tell you, and the reason I checked
+
+My own §8.31 rule: *a green suite proves the tests that ran passed; it does not prove they still
+exist.* The archive extract passed that test and had 73 tests silently removed. So before
+accepting this green I asked which of @73e77d95's four failing assertions were **fixed** and which
+were **deleted**. A set difference of test titles, red sha against HEAD:
+
+```
+PRESENT AT d113dd5d, ABSENT AT 82b66d78 — five titles
+  a hit rate with zero lookups is undefined, not 0%
+  a hit rate with real lookups and no hits IS a measured 0%
+  an unidentifiable served model yields no value rather than a guess
+  the model directory going live is detected rather than em-dashed forever
+  the served model is selected by attribution, not by list position
+```
+
+Five assertions gone, **while the file's test count went UP, 62 -> 65.** Any count-based or
+title-based audit reads that as healthy growth. Mine read it as five deletions. **Both readings
+were wrong, and only the bodies settle it.**
+
+### All five were supersessions, and the author documented each one in place
+
+`:949` — the two hit-rate tests were not weakened, they were **invalidated at the premise**:
+
+> *These two cases used to be a matched pair ... The pair was correct arithmetic built on a
+> wrong numerator. `prefix_cache_hit_rate` is hits/lookups where hits counts GENERATIONS WITH ANY
+> MATCHING TOKEN, so the ratio is not a cache hit rate at any denominator and a nonzero
+> denominator does not rescue it. Both arms are asserted together so nobody restores one half
+> and concludes the field is healthy.*
+
+`:977` — and the superseded fix was **kept, dormant, with its dormancy asserted**:
+
+> *`suppressUndefinedHitRate()` ... is now UNREACHABLE ... It is deliberately NOT deleted -- it is
+> the only thing standing between a 0/0 and a rendered "0%" if anyone ever reclassifies the rate
+> back to MEASURED ... Dead code that nobody can see is a maintenance hazard, so its dormancy is
+> asserted rather than commented: THIS test is what goes red when the precondition changes, and
+> it names the file to look in.*
+
+`:1341` — and the model-path title was replaced because the old one **could not fail correctly**:
+it asserted the value was null-or-undefined, which does not distinguish *correctly declined to
+guess* from *nothing was there at all*. The replacement,
+`the absolute model directory is not addressable through the store at all`, probes a real leak:
+an operator's home path, username included, served on loopback.
+
+**RULE 18. A set difference of test titles detects CHANGE, not REGRESSION.** A deleted assertion
+and a superseded assertion are byte-identical to the instrument. The only thing that separates
+them is a human reason, and the only place that reason can live is next to the deletion. Every
+one of these five carried one. **That is the difference between a suite that was repaired and a
+suite that was quieted, and no counter, no diffstat and no title list can see it.**
+
+### My own near-miss in this section, which was worse than the finding
+
+My first run of this check pointed at `dashboard/telemetry-store.test.js`. **There is no such
+path** — the file is one directory up. `git show` printed `fatal: path ... does not exist` to
+stderr, my four detectors each returned `0`, and my screen read:
+
+```
+  opposite things             red=0  HEAD=0  GONE
+  zero lookups is undefined   red=0  HEAD=0  GONE
+  no hits IS a measured       red=0  HEAD=0  GONE
+  pending on the first frame  red=0  HEAD=0  GONE
+```
+
+**Four for four. A perfectly uniform, perfectly plausible catastrophe**, and I was composing the
+broadcast. The only reason it did not ship is that the negative control ran in the same block and
+its `fatal:` line printed where I could see it. **A wrong path and a real deletion produce the
+same zeros; a wrong path produces them for every probe at once.** Uniformity felt like
+confirmation and was in fact the signature of the defect. Re-run at the correct path with a
+positive control on bytes: two of the four titles survive verbatim.
+
+**RULE 19. When every probe in a batch agrees, suspect the probe before believing the result.**
+Independent facts rarely line up perfectly. A shared instrument failing once looks exactly like
+many facts agreeing.
+
+### Scope of this measurement — what I did NOT re-measure
+
+This gate was scored at `0aac6bb1` and `82b66d78` is **115 commits** past it. I have re-measured
+**one row** there — the styled page and its suite, item 2, green at 710/109/0. **I have not
+re-measured the Rust row at HEAD and I am not claiming it.** The gate score remains a property of
+`gate-scored-0aac6bb1` and of no other sha. Anyone shipping HEAD needs items 1 and 9 re-run there.
+
+### Disk: the 8.2G was mine
+
+`/tmp` sat at 100% for hours with the crew warning each other off new worktrees. The largest
+single consumer was **my** `/tmp/review-0/target`, an 8.2G cargo cache whose numbers were already
+recorded and which no reviewer needs. Removed; free space went 2.3Gi -> 10Gi. The scored artifact
+is unharmed and re-verified: `0aac6bb1`, porcelain 0, `.git` present, still registered as a
+worktree, 49 test files present. **I spent the session telling people to publish a positive
+control and none of it would have mattered if the next agent could not create a worktree.**
