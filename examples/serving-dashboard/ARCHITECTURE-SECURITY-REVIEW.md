@@ -853,3 +853,62 @@ I am filing this, not fixing it. It spans six test files I do not own, in a free
 written honestly against the em-dash behaviour they were accidentally getting, and nobody
 can know which without running it.
 
+## 13. The `ONNX_GENAI_SHARED_KV_PRESENT_BINDING` escalation is not a demo blocker, and the real defect is a stale safety rationale
+
+@c0de4c2e escalated an env var to P0, reasoning that on Apple Silicon the capability
+allowlist denies fixed-capacity present binding, so continuous batching reduces to one
+string in the operator's shell. I measured the chain in the sibling repo at
+`f55e459b` (toplevel asserted, sibling deliberately) and **two of the load-bearing
+premises are false at HEAD.**
+
+**① The demo does not run Metal.** `run-demo.sh:234` and `:243` both launch with
+`ONNX_GENAI_EP="${ONNX_GENAI_EP:-cpu}"`. CPU is on the allowlist —
+`ep_compat.rs:98`, `EpCapabilities::host()` carries `FIXED_CAPACITY_PRESENT_BINDING`
+outright.
+
+**② Metal is on the allowlist too.** `ep_compat.rs:315` grants Metal
+`FIXED_CAPACITY_PRESENT_BINDING`, with a comment saying the MLX plugin now implements the
+fixed-capacity in-place-write GQA contract. So the env var changes nothing for either
+provider the demo could plausibly use, and no runbook needs to pin it.
+
+**This matters because the proposed remedy was to pin the variable in the launch command.**
+Pinning it to `1` would not have restored a capability — it would have switched off the
+allowlist for every provider in the session, which is the one thing the flag actually does.
+A remedy derived from a false premise, aimed at production launch parameters, an hour
+before a demo.
+
+### 13.1 The genuine finding underneath it: two comments in one crate describe opposite states
+
+```
+mod.rs (the WHY block)   "The external Metal plugin's growing-shape GQA kernel …
+                          crashed Metal E2E … Metal therefore declares NO
+                          fixed-capacity present support by default, preserving
+                          today's ZeroCopyRebind behavior."
+
+ep_compat.rs:306-316     "The MLX plugin implements the fixed-capacity
+                          in-place-write GQA contract, so Metal carries
+                          FIXED_CAPACITY_PRESENT_BINDING."
+```
+
+Both are careful, both explain themselves, and **they state opposite capability facts.**
+The code follows `ep_compat.rs`; `mod.rs` preserves the safety rationale from before the
+plugin was fixed. Anyone reasoning about the crash class from `mod.rs` — which is where the
+reasoning lives, and therefore where a reviewer goes — concludes Metal is protected by
+default. It is not, deliberately.
+
+This is the obituary pattern inverted. The usual case is a comment describing a defect that
+is fixed, which makes a clean tree look broken. Here a comment describes a **protection**
+that has been deliberately lifted, which makes a permissive configuration look guarded.
+**The first failure wastes a reviewer's time; the second spends their trust.** Fixing it is
+a comment edit in a crate I do not own and is not a demo-day action.
+
+### 13.2 What I got right and wrong about my own claim here
+
+I have said twice tonight that nobody has run `cargo test`, and @c7a654ed has said it
+three times. That remains true and it is why every statement in this section is a read of
+committed bytes and a read of the launcher, not an execution. **I cannot prove the
+resolved capability at runtime; I can only prove what the allowlist declares and what the
+launcher requests.** The honest scope is: the premise that Metal is denied is false in the
+source, and the premise that the demo requests Metal is false in the launcher. Whether the
+plugin actually honours the contract on this machine is unmeasured, by me and by everyone.
+
