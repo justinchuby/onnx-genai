@@ -448,7 +448,7 @@ Enforced at `crates/onnx-genai-kv/src/page_table.rs::allocate_page`, which filte
 
 Enforced in `run_continuous_batch_scheduled` (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled` — the executable assignments `preemption_policy = PreemptionPolicy::Disabled` and `priority_policy = PriorityPolicy::Fcfs`): the scheduler governs *eligibility* (ordering plus the shared token/byte budget) while the manager's `max_batch` bounds *row count*. Up-front worst-case reservation is what makes byte-budget admission sound (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`).
 
-`DEFAULT_MAX_BATCH` is currently **hardcoded to 4** (`crates/onnx-genai-server/src/state.rs::DEFAULT_MAX_OUTPUT_TOKENS`) with no CLI flag.
+`DEFAULT_MAX_BATCH` is **4** (`crates/onnx-genai-server/src/state.rs::DEFAULT_MAX_BATCH`), and it is a default rather than a fixed value: `--max-batch` overrides it (`crates/onnx-genai-server/src/cli.rs::max_batch`, env `ONNX_GENAI_MAX_BATCH`).
 
 ### 5.6 The static-cache requirement — ENFORCED (and load-bearing)
 
@@ -767,11 +767,11 @@ That last row is what closes it. **A stub is a value nobody has gotten to yet; t
 ---
 
 
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1009 = "fn prepare_session_prefix" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1029 = "started_empty && state.decode_state.uses_token_prefix_cache()" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1087 = "loaded_prompt_prefix = materialized_len" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1099 = "let in_process_hit" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1110 = "never claiming a hit we can" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1020 = "fn prepare_session_prefix" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1040 = "started_empty && state.decode_state.uses_token_prefix_cache()" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1098 = "loaded_prompt_prefix = materialized_len" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1110 = "let in_process_hit" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1121 = "never claiming a hit we can" -->
 <!-- cite: crates/onnx-genai-engine/src/decode/state.rs:206 = "fn uses_token_prefix_cache" -->
 #### 8.4b The dynamic path reports hits it never serves — `MISLEADING`, not `measured` 🔴
 
@@ -899,9 +899,15 @@ Also asymmetric: the CLI applies `resolve_model_dir` (`crates/onnx-genai-cli/src
 
 `/v1/status` reports this explicitly rather than pretending it works (`crates/onnx-genai-server/src/routes/mod.rs::PERFETTO_EXPORT_PATH`). Perfetto export is available at `/v1/debug/trace/perfetto`.
 
-### 8.9 `max_batch` is not configurable
+### 8.9 `max_batch` is configurable — RESOLVED
 
-`DEFAULT_MAX_BATCH = 4` (`crates/onnx-genai-server/src/state.rs::DEFAULT_MAX_OUTPUT_TOKENS`) with no CLI flag, which also makes any batch-utilization percentage computed against it uninformative.
+`DEFAULT_MAX_BATCH = 4` (`crates/onnx-genai-server/src/state.rs::DEFAULT_MAX_BATCH`) is a **default**, not a ceiling: `--max-batch` sets it (`crates/onnx-genai-server/src/cli.rs::max_batch`, env `ONNX_GENAI_MAX_BATCH`).
+
+⚠️ **The second half of this section was wrong in a way worth keeping visible: batch utilization is NOT computed against `max_batch`.** It divides by `effective_batch_capacity()` = `max_batch.min(max_queue_depth)` (`crates/onnx-genai-server/src/state.rs::effective_batch_capacity`), because `max_batch` alone overstates capacity whenever admission is the tighter constraint — with `max_batch = 4` and `max_queue_depth = 1` the batch can never hold more than one generation, so `1/4 = 25%` would show a fully saturated server as three-quarters idle.
+
+**Do not surface `max_batch` as the denominator to clients.** A client-side `3 of 4` beside a server-side `100%` is two honest fields disagreeing because they divide by different things.
+
+**And the numerator is process-global** (`crates/onnx-genai-server/src/metrics.rs::current_batch_size`) while the denominator belongs to one configuration, so the numerator can legitimately exceed it. The reported value is clamped, which hides a **scope mismatch** rather than a bug.
 
 ### 8.10 `/v1/resources` can block for the duration of a busy batch ⚠️
 
