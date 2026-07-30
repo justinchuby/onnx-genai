@@ -8,6 +8,16 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 
 **Verification.** All 87 distinct `file:line` citations in this document were checked mechanically against the tree — every one resolves to an existing file with that line present. The load-bearing claims were additionally verified by reading the code at each cited location, not by trusting the recon notes they came from.
 
+**How each claim was established — verified vs inferred.** This document deliberately distinguishes the two rather than blending them:
+
+| Evidence class | What it means | Examples |
+|---|---|---|
+| **Observed** | Confirmed against a *running server* — curled, streamed, or profiled | §5.6's mode matrix (both model types run and profiled); the endpoint behaviours in §8.3; debug endpoints returning **404**, not 403 |
+| **Read** | Established by reading the cited source | The dependency edges in §2; the command-deferral dispatch in §5.11; the `NodeStatus` scope comment in §4.7 |
+| **Inferred** | A conclusion drawn from the above, not directly witnessed | §5.3's claim that a shared-page write *would* corrupt silently — no test provokes it, and nothing in the code prevents it |
+
+Where a claim is inferred, the text says so. The distinction matters most in §5: an **ASSUMED** invariant is precisely one where the code offers no evidence either way, so the reader is the last line of defence.
+
 **How to read §5.** Each invariant is tagged **ENFORCED** (the code prevents violation) or **ASSUMED** (nothing stops you; violation compiles, runs, and corrupts or degrades silently). The ASSUMED ones — §5.3, §5.8, §5.10 — are the highest-risk sections in this document. §5.12 is tagged **CURRENTLY VIOLATED**, because documenting it as true would be exactly the kind of intent-as-behaviour this document forbids.
 
 ---
