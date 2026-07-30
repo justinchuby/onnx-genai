@@ -18,6 +18,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Mirrors tree_context.CANNOT_RUN. Deliberately duplicated rather than
+# imported: this file predates the shared helper and still carries its own
+# repo_root() at :39. Adopting tree_context here is the correct change and it
+# is NOT this change -- rewiring an untested writer's tree resolution while
+# disabling its write path would mix two edits with opposite risk profiles.
+CANNOT_RUN = 2
+
 POSITIONAL = re.compile(r"`([\w./\-]+\.(?:rs|py|js|css|html|toml|md|sh)):(\d+)(?:-(\d+))?`")
 
 ENCLOSING = [
@@ -124,16 +131,69 @@ def main() -> int:
         return f"`{converted_path}::{sym}`"
 
     original = doc.read_text()
-    updated = POSITIONAL.sub(rewrite, original)
+    # Computed for the side effect of populating `converted` and `skipped`,
+    # which is what the dry-run report prints. The result is intentionally
+    # never written -- see the refusal below.
+    POSITIONAL.sub(rewrite, original)
 
     print(f"converted {len(converted)} | left positional {len(skipped)}")
     for s in skipped:
         print(f"  SKIP {s}")
     if apply:
-        doc.write_text(updated)
-        print(f"wrote {doc}")
-    else:
-        print("(dry run; pass --apply to write)")
+        # --apply IS DISABLED. This is a refusal, not a bug.
+        #
+        # This script rewrites `path:NNN` into `path::symbol` INSIDE NORMATIVE
+        # DOCUMENTS. It has no quote-awareness of any kind -- no fence
+        # handling, no blockquote handling, nothing. Measured, not assumed:
+        # grep -ciE 'fence|```|backtick|blockquote' over this file returns 0.
+        #
+        # That is fatal for a WRITER, and the distinction matters. A
+        # frame-blind READER produces a false alarm and costs someone an
+        # hour. A frame-blind WRITER produces a fabricated fact and ships it.
+        # The live specimen (found by c0de4c2e, generalised by 086345a5):
+        #
+        #   IMPLEMENTATION-REVIEW.md:142 contains the prose
+        #     "README.md cites driver.rs:956, but that file has only 912 lines."
+        #
+        # That sentence is an OBITUARY for a defect that is already dead.
+        # Point this script at it and `driver.rs:956` matches POSITIONAL,
+        # resolves against today's driver.rs, and gets rewritten into a
+        # confident, present-tense, symbol-anchored citation THAT NOBODY
+        # WROTE -- destroying the historical record and manufacturing a claim
+        # in its place. The document would then assert, in our own citation
+        # format, the opposite of what its author meant.
+        #
+        # Two further defects, both mine, both measured, either one enough:
+        #   - it ENUMERATES from the index (git ls-files, :46) and READS from
+        #     the working tree (:116, :126). Those are two different trees.
+        #     It can rewrite a citation using bytes that exist in no commit.
+        #   - 141 lines, ZERO tests. It has already written one
+        #     past-end-of-file citation into README.md.
+        #
+        # It is referenced by NOTHING at HEAD -- no CI, no doc, no script
+        # (control: check_citations.py is referenced by 3). So this refusal
+        # cannot break a caller, because there is no caller. An unreferenced
+        # writer with no tests and no quote-awareness is not a tool, it is a
+        # loaded gun on a shelf, and the safety belongs ON THE GUN rather
+        # than in a sentence in a document asking people not to touch it.
+        #
+        # TO RE-ENABLE, the bar is a test, not a judgement call: a case
+        # proving a citation inside a fence and a citation inside a
+        # blockquote are both LEFT ALONE, plus the obituary above as a
+        # regression fixture.
+        print(
+            "REFUSING TO WRITE. --apply is disabled by construction.\n"
+            "  reason: this rewriter has no fence- or blockquote-awareness, so it\n"
+            "          cannot distinguish a CITATION from PROSE QUOTING a citation,\n"
+            "          and it would rewrite a quoted dead defect into a live claim.\n"
+            "  reason: it enumerates from the index but reads the working tree.\n"
+            "  reason: 141 lines, zero tests, and it writes to normative documents.\n"
+            "  The dry run above is still trustworthy -- it only READS.\n"
+            "  Apply its suggestions by hand, or fix the quote-awareness first.",
+            file=sys.stderr,
+        )
+        return CANNOT_RUN
+    print("(dry run only; --apply is disabled -- see the refusal notice in main())")
     return 0
 
 
