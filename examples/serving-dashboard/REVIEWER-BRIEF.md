@@ -4136,3 +4136,89 @@ worktree at porcelain 0. The JS suite is **646/98/0, raw exit 0**.
 **The honest headline is `646/646 JS · CARGO UNVERIFIED BY ME`,** and @12e42da8 is right
 that anyone quoting either half alone is quoting it wrong — **including me, forty
 minutes ago, in a brief that demanded five fields of everybody else.**
+
+---
+
+## §9.2 — The citation guard covers **23 of 769** citations. @0837fdf9 filed it; it is 30x worse than filed.
+
+They reported: `check-source-citations.test.js` reads exactly one file, `README.md`,
+while `demo-ux.md` is rank-1 with ~30 inbound citers and no outbound validation.
+**Confirmed, and then I counted the whole corpus.**
+
+```
+DOC                             file:NNN CITATIONS     GUARDED?
+demo-spec.md                            258            ⛔ NO   ⬅ THE BIGGEST, AND
+design/demo-ux.md                       168            ⛔ NO      NOBODY NAMED IT
+IMPLEMENTATION-REVIEW.md                121            ⛔ NO
+REVIEWER-BRIEF.md  (MINE)                73            ⛔ NO
+READABILITY-REVIEW.md                    35            ⛔ NO
+QA-PLAN.md                               33            ⛔ NO
+ARCHITECTURE-SECURITY-REVIEW.md          24            ⛔ NO
+README.md                                23            ✅ YES  ⬅ THE ONLY ONE
+  + 6 smaller docs                       34            ⛔ NO
+                                        ----
+TOTAL                                    769
+GUARDED                                   23   =  3 %
+UNGUARDED                                746   = 97 %
+```
+
+**And the inbound-citation control inverts the priority completely:**
+
+```
+tracked files citing demo-ux.md   35     ⬅ UNGUARDED
+tracked files citing README.md    24     ⬅ GUARDED
+NEG CONTROL 'zzqq-nonexistent.md'  0     ✅ the instrument can return zero
+```
+
+> **The single guarded document is neither the most-cited nor the most-citing. We
+> anchored the one doc that needed it least, and every reviewer's own review document
+> — all four of them, 253 citations between them — grades source it never verifies.**
+
+**This is the exact asymmetry @0837fdf9 named, quantified: the narrow-blast-radius
+document has the anchor checker; the rank-1 documents do not.** Their citation rotted
+for hours in a file 35 other files quote, and nothing in the repository could have
+noticed.
+
+### It is one line of corpus, and @0837fdf9 was right not to fork it
+
+The extractor is **test-local and unexported**, so a second copy would be their own D303
+(three declarations of one concept, drifting). **The fix is to widen the corpus in a
+file neither of us owns.** Whoever owns that guard inherits the anchor checker, the
+`checked >= 30` floor and the mutation proof for the other 746 citations for free.
+
+**I am naming my own document in that list deliberately: `REVIEWER-BRIEF.md` carries 73
+unverified `file:NNN` citations, and I have already had two rot this session** (`:1724`
+→ `:1780`, and `telemetry-field.js:63-65` in @0837fdf9's file). **I am the loudest voice
+for citing by content in this repo and I have 73 coordinates nothing checks.**
+
+### One instrument failure of my own, disclosed because it printed a false zero
+
+My census accumulated its totals inside a `| sort -rn` pipeline. **Bash runs the left
+side of a pipe in a subshell, so every `TOT=$((TOT+N))` was discarded and the summary
+printed `TOTAL 0` while the itemisation above it showed 258, 168, 121…**
+
+> **RULE 27. A total that disagrees with its own itemisation is the cheapest instrument
+> check there is, and it is free — print both, every time. A summary line computed in a
+> subshell is not a measurement of the rows above it; it is a different measurement that
+> happens to sit underneath them.**
+
+Caught in one glance **only because I printed the rows, not just the total.** Had I
+printed the summary alone — which is what a tidy report does — I would have published
+"0 citations in the corpus" with a straight face. **@12e42da8's set-difference reform on
+`run-tests.sh` is the same lesson: one untracked and one deleted file cancel in a count.
+Counts hide their own failures; itemisations cannot.**
+
+### Commit-stat audit, per @12e42da8's shared-index order
+
+All six of my commits, `git show --name-only` untruncated:
+
+```
+b897b33e  1 file  +91        015cbe43  1 file  +50 -5
+28c809e1  1 file  +73        24d9ad96  1 file  +110
+66352434  1 file  +27        9bc77034  1 file  +92
+FOREIGN PATHS ACROSS ALL SIX:  **ZERO**
+```
+
+**Nothing of mine is wider than I intended.** Method that made it true: `-F` never `-m`,
+explicit pathspec every time, and **never once running `git add`** — my index has been
+empty all session, so the shared-index hazard never had a way to arm against me.
