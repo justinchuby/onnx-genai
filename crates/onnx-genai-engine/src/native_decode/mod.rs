@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 mod backend;
+mod batched;
 mod cpu;
 mod cuda;
 mod io;
@@ -32,6 +33,7 @@ mod tensor;
 mod tests;
 
 use backend::*;
+pub use batched::NativeBatchedDecodeSession;
 use cpu::DecodeCpuKvState;
 use cpu::*;
 use cuda::DecodeCudaState;
@@ -325,6 +327,31 @@ impl NativeDecodeSession {
             .as_ref()
             .map(|state| state.adapter_ids.iter().map(|(name, _)| name.as_str()).collect())
             .unwrap_or_default()
+    }
+
+    /// The grouped-LoRA adapter routes (`name` → `lora.segments` id) this session
+    /// admits, in admission order (design §J.4 P2e). Empty for a base-only /
+    /// non-grouped session. Used to build a
+    /// [`NativeBatchedDecodeSession`](batched::NativeBatchedDecodeSession) whose
+    /// continuous-batch manager resolves per-request adapters to these ids.
+    pub(crate) fn lora_adapter_routes(&self) -> Vec<(String, i32)> {
+        self.lora_segments
+            .as_ref()
+            .map(|state| {
+                state
+                    .adapter_ids
+                    .iter()
+                    .map(|(name, id)| (name.clone(), id.0 as i32))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Borrow the underlying native [`InferenceSession`] mutably so a native
+    /// continuous-batch decode session can drive per-row grouped-LoRA routing on
+    /// the same graph (which owns the `GroupedLoraDelta` op).
+    pub(crate) fn inference_session_mut(&mut self) -> &mut InferenceSession {
+        &mut self.session
     }
 
     /// Select the grouped-LoRA adapter that subsequent decode steps route every

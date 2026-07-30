@@ -1077,19 +1077,55 @@ than the previous misleading "session was not loaded with a grouped pool" error.
   and fails (verified by temporarily forcing all routes to base).
   `continuous_batch_unknown_adapter_fails_loud` covers the admission-time
   fail-loud path.
+* **Native continuous-batch decode backend — mixed-adapter rows in one batch,
+  production-reachable** (§J.4/§J.5 P2e): `NativeBatchedDecodeSession`
+  (`crates/onnx-genai-engine/src/native_decode/batched.rs`) is a real
+  `BatchedDecodeSession` that borrows the engine's native grouped
+  `InferenceSession` — the one that actually owns the `GroupedLoraDelta` op — and
+  implements a genuine `set_lora_routes` that binds `lora.segments` (Int32, one
+  route per activation row, `-1` == base) into that session, reusing a
+  little-endian scratch buffer so the routing payload is not reallocated per
+  step. It builds step inputs (`input_ids` `[rows,1]`, optional
+  `attention_mask` / `position_ids`, optional batched past KV) and runs the
+  native `InferenceSession::run` path directly, reshaping logits to
+  `[rows,1,vocab]`. The engine entry point
+  `Engine::run_native_continuous_batch` (`crates/onnx-genai-engine/src/batched.rs`,
+  `native-backend`) constructs a `ContinuousBatchManager` over this session via
+  `with_lora_adapter_routes`, resolving the loaded adapter→route map from the
+  native session, so a native continuous batch carries mixed adapters end to end
+  from a production caller — not just a test double. The base / single-adapter
+  fast path is preserved: routing is dormant unless the graph declares a
+  `lora.segments` input and a caller feeds routes.
+* Test: engine `native_continuous_batch_routes_mixed_adapters_per_row`
+  (`native-backend`) is THE gap-closing acceptance proof. It drives the **real**
+  `NativeBatchedDecodeSession` (not `GroupedProbeSession`) through the production
+  `ContinuousBatchManager` over a token-driven zero-base grouped model
+  (`input_ids → Gather(embedding) → Reshape → q_proj MatMulNBits`, with
+  `GroupedLoraDelta` auto-injected by `SessionBuilder::lora_adapters`). Three
+  submitted requests bound to adapter A, adapter B, and base each emit their own
+  adapter's argmax token (A ≠ B ≠ base=0) — non-tautological, since a
+  whole-batch-to-base session collapses A and B to token 0 and fails.
+  `native_continuous_batch_unknown_adapter_fails_loud` covers admission-time
+  fail-loud on the production native path.
 
 **Deferred (honestly not done in this pass).**
 
-* **Native engine-level continuous-batch decode backend**: the per-row routing
-  wiring above lives in `ContinuousBatchManager` + `BatchedDecodeSession` and is
-  proven against a decode-session double running the real grouped kernel. It is
-  NOT yet reachable from a production native continuous-batch backend, because
-  today's `ContinuousBatchManager` runs only on the ORT backend
-  (`BatchedStaticCacheDecodeSession`), whose `libonnxruntime.so` session has no
-  `GroupedLoraDelta` op, and the native backend does not yet expose a
-  continuous-batch decode session. `generate_batched_static` remains base-only.
-  Wiring a native KV-cache continuous-batch decode session that implements
-  `set_lora_routes` against the grouped `InferenceSession` is the remaining step
-  to ship mixed-adapter batching as a product surface.
+* **Native ragged / KV-cursor continuous batching**: `NativeBatchedDecodeSession`
+  fully supports the **KV-free** grouped routing surface (the acceptance proof
+  above) and **batched decode-with-past in strict lockstep** (all participating
+  rows at one sequence length). It does **not** support independent per-row KV
+  cursors, because the native CPU execution provider has no `TensorScatter`
+  kernel to mirror the ORT static-cache contract (independent write cursors into
+  one `[batch, max_len, kv_dim]` buffer). A ragged advance — a mid-flight prefill
+  that grows one row while others hold, at differing lengths — **fails loud**
+  rather than silently corrupting the cache. Because the `ContinuousBatchManager`
+  prefills rows one at a time (ragged), a *KV-cache* native continuous batch is
+  not yet driveable through the manager; the reachable, tested production surface
+  is the KV-free grouped routing path. Wiring a native static-cache scatter
+  (per-row write cursors) is the remaining step for KV-backed native continuous
+  batching.
+* **CUDA continuous-batch grouped path**: out of scope; the native CUDA batched
+  decode session is not built here (single-request CUDA grouped decode remains
+  covered by §J.7).
 * **Speculative decoding + grouped adapter** combined: rejected fail-loud (the
   draft/verify paths do not yet thread the route).
