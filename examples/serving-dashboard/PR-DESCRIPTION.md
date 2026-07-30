@@ -305,6 +305,72 @@ has been re-derived at the stamped revision, and one of them changed when it was
 a count taken on a working desk read 112 where the shipping tree holds 98. Both
 readings were honest and only one describes what a reader will check out.
 
+### The corruption that produced grammatical English
+
+The single most alarming thing found this session was not in the server. It was
+in the process of writing about the server.
+
+An author wrote a commit message with `git commit -m "…"`. The message contained
+a backtick — unavoidable, since the subject was code. In a double-quoted shell
+string a backtick is command substitution. **Two things happened, and only one of
+them is the scary one.**
+
+First, the shell **executed the enclosed text as a command**, in a tree the crew
+had agreed not to build in. That is bad and it is loud.
+
+Second — and this is the one that belongs in a document about honesty — **the
+substitution deleted the phrase from the sentence and left the sentence
+standing.** The text was confessing a defect involving a pipe to `tail`. The name
+of the defect was consumed, and what got committed was fluent English with the
+subject silently removed. I reproduced the mechanism with a harmless command:
+
+```
+intended : the sentence confessing the | tail defect
+survived : the sentence confessing the  defect
+           -> no syntax error, no warning, no diagnostic. Just prose.
+```
+
+> **A corruption that throws a syntax error is a gift. That one produced a
+> sentence.** Every other failure mode in this document announces itself as a
+> wrong value, a red test, or a missing file. This one announces itself as
+> *readable text*, and the only reader positioned to catch it is the author, who
+> already knows what the sentence was supposed to say and will read it there.
+
+**And it lands on me, which is why it is here rather than in a style guide.**
+Every commit in this file used `git commit -F <msgfile>`, which is immune. **My
+last six commit messages contain five backticks.** Five silent mutations did not
+happen to a document whose entire purpose is being accurate about what was
+measured.
+
+**I did not adopt `-F` for safety. I adopted it because my messages are long and
+multi-line.** So this document's integrity was protected by a formatting
+preference — which is precisely the *safe by luck* pattern it complains about in
+the MIME allowlist, the ratchet, and the loopback bind, now found in my own
+tooling by someone else paying the bill for it.
+
+### An append-only document is safest to write and most dangerous to freeze
+
+This file, the spec, and every review document here are append-only: nobody
+rewrites anyone's paragraph, so fourteen authors committed at high frequency all
+session and **not one person's text was ever swept by another's**. It is the
+reason the concurrency worked.
+
+**It is also the reason a retraction can sit hundreds of lines and many minutes
+away from the claim it kills.** Corrections land as new text, so a reader
+encountering the original first gets the withdrawn version with no local signal
+that it is dead — and if a snapshot is taken between the claim and its
+retraction, the snapshot contains a confident falsehood and no trace of doubt.
+
+> **The discipline that makes a document safe to write concurrently is the same
+> discipline that makes it unsafe to freeze at an arbitrary moment.** These are
+> not two policies in tension by accident; they are one property seen from the
+> write side and the read side.
+
+**The mitigation used here is to strike in place rather than append elsewhere**:
+withdrawn claims stay where they were, struck through, with the correction beside
+them. It costs more lines and it is the only form where finding the claim
+guarantees finding its retraction.
+
 ### The two anchors this document is written against
 
 **The code and the suites are pinned at `37d0d72e`. The review documents are
