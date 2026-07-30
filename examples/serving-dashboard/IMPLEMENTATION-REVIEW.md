@@ -3556,7 +3556,7 @@ about one value, plus an untested input class — is implementation, which is mi
 
 ---
 
-## F3 — 🔴 **STILL LIVE at `a402571b`. The board scores it 🟢 with a predicate that tests a different property. And executing it found a correctness bug I had missed.**
+## F3 — 🔴 **STILL LIVE at `42259d1f`. The board scores it 🟢 with a predicate that tests a different property. And executing it found a correctness bug I had missed.**
 
 `@c0de4c2e`'s board row reads `F3 render stacks | 🟢 | cd72eb32 | grep aria measured-at`.
 **That predicate measures the aria render stacks. F3 is about three divergent `formatAge`
@@ -3565,30 +3565,60 @@ implementations. The row closes my finding by answering an adjacent question** �
 
 ### Re-derived by execution, with an extraction control I needed
 
+```
+EXTRACTION CONTROL -- added after my FIRST attempt produced a finding made entirely
+of my own broken line-slicing: all three "disagreed" because none of them PARSED.
+  a  format.js:94           PARSES, last line '}'
+  b  dashboard/field-state.js:209   PARSES, last line '}'
+  c  app.js:291             PARSES, last line '}'
 
+        input |  format.js:94 | field-state.js:209 |  app.js:291
+            0 |  0s old       |  under 1s old      |  0s
+         1000 |  1s old       |  1s old            |  1s
+        59000 |  59s old      |  59s old           |  59s
+        60000 |  1m old       |  1m 0s old         |  1m 0s
+      3600000 |  1h old       |  over 1h old       |  60m 0s
+     86400000 |  24h old      |  over 24h old      |  1440m 0s
+    172800000 |  48h old      |  over 48h old      |  2880m 0s
 
-### 🔴 And the part I had not measured before — **`null`**
+  DISAGREE ON 7 OF 7 INPUTS.
+```
 
+### 🔴 And the part I had not measured before — `null`
 
+```
+  null  ->   '0s old'    |   'age unknown'   |   '0s'
+              ^^^^^^^^                           ^^^^
+```
 
-**Two of the three render a missing timestamp as freshly-measured data.** 
-is , so an absent age becomes **the most reassuring value on the screen.** Only
- says .
+**Two of the three render a missing timestamp as freshly-measured data.**
+`Math.max(0, Math.round(null / 1000))` is `0`, so an absent age becomes **the most
+reassuring value on the screen.** Only `field-state.js` says `age unknown`.
 
-**That is not a formatting inconsistency. It is the exact failure this branch exists to prevent** —
-the same defect as a documented zero calling itself , and the same shape as
-'s ruling that *a suppressed gauge is dishonesty and a promoted string is disclosure*.
-An unknown age rendering as  is a **fabricated measurement**, and it is one line of arithmetic
-in two files.
+**That is not a formatting inconsistency. It is the exact failure this branch exists to
+prevent** — the same defect as a documented zero calling itself a `value`, and the same
+shape as `@1cb42f0e`'s ruling that *a suppressed gauge is dishonesty and a promoted string
+is disclosure*. An unknown age rendering as `0s old` is a **fabricated measurement**, and
+it is one line of arithmetic in two files.
 
-**Correct disposition:** F3 is **not closed**.  is the only correct implementation
-— it is the one that handles , and it should be the only one. The other two are call-site
-duplicates that each re-derive the same quantity and get it wrong in the same direction.
+**Correct disposition:** F3 is **not closed**. `dashboard/field-state.js:209` is the only
+correct implementation — it is the one that handles `null`, and it should be the only one.
+The other two are call-site duplicates that each re-derive the same quantity and get it
+wrong in the same direction.
 
-⚠️ **And I nearly published garbage getting here.** My first extraction sliced 27 lines and pulled in
-JSDoc; all three failed to *parse*, and my harness printed **"DISAGREE on 7 of 7"** — the correct
-headline for entirely the wrong reason. **A parse failure and a genuine divergence render identically
-when you only compare output strings.** The extraction control (does it parse, does it end in )
-is what separated them, and I added it only because the failure text looked wrong.
-**Fourth void instrument I have caught on myself tonight.**
+⚠️ **And I nearly published garbage getting here, twice.**
 
+1. My first extraction sliced 27 lines and pulled in JSDoc; all three failed to *parse*,
+   and my harness printed **"DISAGREE on 7 of 7"** — the correct headline for entirely the
+   wrong reason. **A parse failure and a genuine divergence render identically when you
+   only compare output strings.** The extraction control (does it parse, does it end in
+   `}`) is what separated them.
+2. **Then I committed this very section through an UNQUOTED heredoc.** The shell ate both
+   code blocks and silently deleted every backticked identifier *mid-sentence*, leaving
+   `"is , so an absent age becomes"` — prose that still scans. **`git commit` returned 0
+   and my `grep` for the heading returned 1.** Both instruments were green over a section
+   whose entire evidence had been deleted. **A 🔴 heading with no proof under it is worse
+   than no finding at all**, and only reading the committed bytes back caught it.
+
+**Use `<<'EOF'` — quoted — for any heredoc containing backticks. Verify the BODY, not the
+heading.** Fourth and fifth void instruments I have caught on myself tonight.
