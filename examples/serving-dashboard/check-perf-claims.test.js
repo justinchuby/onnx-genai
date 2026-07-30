@@ -1100,64 +1100,6 @@ test('the README populated-fields ratio still matches the tree it describes', ()
   );
 });
 
-// ---------------------------------------------------------------------------
-// The KV panel's static-profile redefinition is DESIGNED but not LIVE: both
-// fields it needs are recorded unpublished in field-keys.test.js. The README
-// once described that redefinition in the present tense -- "real, measurable,
-// and moves under load" -- which was true of the design and false of the page.
-//
-// This guard is bidirectional on purpose, because the caveat has two ways to
-// become a lie and they pull in opposite directions:
-//
-//   still unpublished + no caveat  -> the original defect, prose outruns the tree
-//   published        + caveat kept -> a stale apology for a gap that closed,
-//                                     which trains readers to discount caveats
-//
-// The second is the one that never gets reported, so it is asserted first-class
-// here rather than left to whoever happens to land the endpoint.
-test('the KV redefinition caveat matches whether its fields are published', () => {
-  assertShippingTree();
-
-  const guard = shipped('dashboard/field-keys.test.js');
-  const KEYS = ['kv.slots_filled', 'kv.slot_capacity'];
-
-  // Membership is read from the allowlist LITERAL, not inferred from the key
-  // appearing anywhere in the file -- the key also appears in error strings.
-  const allowlist = guard.slice(
-    guard.indexOf('NOT_YET_PUBLISHED = Object.freeze({'),
-    guard.indexOf('});', guard.indexOf('NOT_YET_PUBLISHED = Object.freeze({')),
-  );
-  assert.ok(
-    allowlist.length > 100,
-    'could not locate the NOT_YET_PUBLISHED literal in field-keys.test.js — '
-      + 'the guard was restructured and this check is now reading nothing. '
-      + 'Fix the extractor rather than deleting the assertion.',
-  );
-
-  const unpublished = KEYS.filter((k) => allowlist.includes(`'${k}':`));
-  const caveat = /That redefinition is designed and not yet live/.test(README);
-
-  if (unpublished.length > 0) {
-    assert.ok(
-      caveat,
-      `${unpublished.join(' and ')} ${unpublished.length === 1 ? 'is' : 'are'} `
-        + 'still listed unpublished in dashboard/field-keys.test.js, so the KV '
-        + 'panel em-dashes on the static-cache profile. The README must keep the '
-        + 'caveat beginning "That redefinition is designed and not yet live". '
-        + 'Do not describe a designed behaviour in the present tense.',
-    );
-  } else {
-    assert.ok(
-      !caveat,
-      'Both kv.slots_filled and kv.slot_capacity are now PUBLISHED — the '
-        + 'block-table endpoint landed. Delete the README caveat beginning '
-        + '"That redefinition is designed and not yet live" and restore the '
-        + 'plain description; the panel really does move under load now. '
-        + 'A caveat that outlives its defect teaches readers to skip caveats.',
-    );
-  }
-});
-
 // A cut that ships in code, and a QA plan that still asks a tester to decide it.
 //
 // §5.5 of QA-PLAN.md specifies a 30-request protocol (n >= 15/arm, interleaved,

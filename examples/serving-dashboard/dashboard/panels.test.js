@@ -8,7 +8,9 @@
 // together makes it obvious when one panel is missing a case the others have.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { after, before, describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
 import { createFakeStore, measured, series, unavailable } from './testing/fake-store.js';
@@ -23,6 +25,7 @@ const throughput = await import('./throughput.js');
 const kvMemory = await import('./kv-memory.js');
 const requests = await import('./requests.js');
 const system = await import('./system.js');
+const README_SOURCE = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
 
 /**
  * @param {{mount: Function}} panel
@@ -183,6 +186,48 @@ describe('kv-memory panel', () => {
     assert.ok(root.findByClass('capability-notice'), 'a hatched grid for an absent feature is noise');
     assert.match(root.textContent, /--enable-debug-endpoints/);
     assert.match(root.textContent, /Everything else on this page still works/);
+    handle.unmount();
+  });
+
+  it('keeps the documented static-cache redefinition backed by a rendered code path', () => {
+    const readmeClaimsLiveRedefinition = /THAT REDEFINITION IS NOW LIVE/.test(README_SOURCE);
+
+    const notApplicable = (label) => ({
+      value: null,
+      state: 'not-applicable',
+      source: '/v1/debug/kv/blocks',
+      unit: '',
+      label,
+      reason: "This model's KV cache holds no paged tensor storage.",
+    });
+    const store = kvStore({
+      fields: {
+        'kv.pages_used': notApplicable('KV pages in use'),
+        'kv.pages_total': notApplicable('KV pages total'),
+        'kv.block_size': notApplicable('KV page size'),
+        'kv.pages_shared': notApplicable('Shared KV pages'),
+        'kv.slots_filled': notApplicable('Filled KV slots'),
+        'kv.slot_capacity': notApplicable('KV slot capacity'),
+        'kv.refcount_histogram': notApplicable('KV page refcounts'),
+        'kv.tiers': notApplicable('KV page tiers'),
+        'batch.active_size': measured(3, { unit: 'rows', label: 'Active decode rows' }),
+        'batch.capacity': measured(8, { unit: 'rows', label: 'Effective batch capacity' }),
+      },
+    });
+
+    const { root, handle } = mountPanel(kvMemory, store);
+
+    const rendersLiveRedefinition =
+      /decode row occupancy/i.test(root.textContent) &&
+      /3/.test(root.textContent) &&
+      /8/.test(root.textContent) &&
+      !/\bpages?\b/i.test(root.textContent);
+
+    assert.equal(
+      readmeClaimsLiveRedefinition,
+      rendersLiveRedefinition,
+      'the README and the static-cache renderer disagree about whether decode-row occupancy is live',
+    );
     handle.unmount();
   });
 

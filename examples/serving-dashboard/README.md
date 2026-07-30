@@ -1371,52 +1371,18 @@ profile, or its panel is **not mounted at all** and the profile banner explains
 why. A scenario that cannot run is absent rather than disabled, because an
 unclickable tab is an invitation to feel excluded.
 
-The one place this could have gone wrong is the KV panel, which has no pages to
-count on the static-cache profile. The *design* answer was to redefine the panel
-there rather than em-dash it: show **decode row occupancy** — active rows against
-the effective batch capacity — same component, different noun, no fabricated
-numbers.
+The KV panel has no pages to count on the static-cache profile. An earlier
+design proposed redefining it there as **decode row occupancy**, but that
+redefinition is **not implemented and is not supported by the current wire**.
+`/v1/debug/kv/blocks` explicitly answers `applicable: false`, so the live panel
+shows that written not-applicable reason instead of page measurements.
 
-> **✅ THAT REDEFINITION IS NOW LIVE — AND THE RECORD OF WHEN IT WAS NOT IS KEPT
-> ON PURPOSE.** Both fields it needs, `kv.slots_filled` and `kv.slot_capacity`,
-> are published: they are derived from `/v1/debug/kv/blocks`
-> (`BlockTableResponse`, `routes/mod.rs`), and on the static-cache profile the
-> endpoint answers `applicable: false` with its own written reason, so that
-> profile now shows **not-applicable with a sentence** rather than an em-dash.
->
-> **What this paragraph said before it was true is worth keeping.** It read
-> *"which is real, measurable, and moves under load … nothing on screen that
-> looks broken"* at a time when both fields were recorded as unpublished, so on
-> the static-cache profile **the KV panel em-dashed: exactly the outcome the
-> paragraph claimed to have avoided.**
->
-> It is worth being blunt about how that happened, because it is the most
-> instructive error in this document. **Nothing here was ever untrue of the
-> design; it was written from the design and then read as a report about the
-> page.** No reviewer catches that, because the sentence is well-formed,
-> internally consistent, and cites a real mechanism — and the code it describes
-> really did contain the redefinition. Only the *data* was missing. **A page
-> whose entire thesis is "never present a fabricated number as real" had, in its
-> own documentation, a fabricated success story about refusing to fabricate.**
->
-> The general form, and the reason it survived so long: **prose has no tense
-> discipline.** Code cannot half-exist, but a sentence about code can silently
-> mean *is*, *will be*, or *was designed to be*, and all three render
-> identically. Every "which is real and moves under load" in a design document is
-> a claim about a runtime nobody re-checked.
->
-> **AND NOTE HOW THIS CORRECTION ARRIVED.** Not from a reader, and not from
-> anybody re-reading the paragraph: `check-perf-claims.test.js` failed on the
-> commit that landed the fields and named the exact sentence to delete. The
-> lesson generalises past this one caveat — **a caveat that outlives its defect
-> teaches readers to skip caveats** — so the claim had to be executable, or it
-> would have rotted in the flattering direction and nobody would have noticed.
-
-**Note on the denominator:** the ceiling is `effective_batch_capacity()` —
-`min(max_batch, max_queue_depth)` — not the raw `--max-batch` flag, which this
-paragraph also used to name. Dividing by `--max-batch` **overstates the ceiling**
-whenever the queue is the binding constraint, which understates occupancy and
-flatters the page.
+The nearby scheduler fields cannot honestly fill the gap. `active_batch_size`
+counts admitted HTTP generations, not engine decode rows, and
+`batch_capacity` is not a bound on that gauge. Presenting their ratio as decode
+row occupancy would fabricate both the numerator's noun and the relationship
+between the terms. The dynamic profile still renders the real paged-KV fields
+from `/v1/debug/kv/blocks`; the static profile makes no substitute measurement.
 
 So provenance is keyed by **(field, profile)**, not by field name alone. The same
 field legitimately has different states on the two profiles — prefix cache hit
