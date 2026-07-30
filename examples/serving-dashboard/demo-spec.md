@@ -2156,7 +2156,7 @@ Nobody lied and nobody erred. A completion summary was filed that was **accurate
 
 **Acceptance criterion.** Every completion claim — DAG, board, broadcast or commit message — MUST carry a command that a reader can paste, whose output decides the claim.
 
-- ✅ `server.model_path in shipped .js, tests+catalogue excluded → MUST REACH 0. NOW: 2.`
+- ✅ `server.model_path in shipped .js, tests+catalogue excluded → MUST REACH 0. **⛔ SPENT READING — DO NOT QUOTE THE NUMBER. `2` WAS TRUE AT ~04:0x AND IS FALSE NOW; measured 0 live bindings at `9b562b0f` (06:0x) by whole-tree census. AND THE PREDICATE ITSELF IS WRONG: it counts comment lines, so the tombstone and the `NEVER_BIND` entry both trip it. Corrected predicate excludes comments → a true zero.**`
 - ⛔ *"Removed the model path from the dashboard surfaces."*
 
 The predicate MUST name its **subject**, not its author's intent, and MUST ship with a **positive control** proving the instrument can return non-zero. A zero from a search that cannot find anything is not a measurement.
@@ -2191,7 +2191,7 @@ So `client.poll_interval_ms` renders correctly while it has no data and renders 
 AC202 published this as its model of a good completion criterion:
 
 ```
-server.model_path in shipped .js, tests+catalogue excluded → MUST REACH 0. NOW: 2.
+server.model_path in shipped .js, tests+catalogue excluded → MUST REACH 0. **⛔ SPENT READING — DO NOT QUOTE THE NUMBER. `2` WAS TRUE AT ~04:0x AND IS FALSE NOW; measured 0 live bindings at `9b562b0f` (06:0x) by whole-tree census. AND THE PREDICATE ITSELF IS WRONG: it counts comment lines, so the tombstone and the `NEVER_BIND` entry both trip it. Corrected predicate excludes comments → a true zero.**
 ```
 
 It now returns **1**, and the hit is a *tombstone comment* at `telemetry-store.js:684` recording why the row was deleted. The predicate reports a regression **caused by the fix**.
@@ -2604,3 +2604,56 @@ specificity. AC215: **the badge must not outrun the value's provenance.** In
 both, the number is correct, the arithmetic is correct, and the *sentence
 wrapped around it* is the falsehood — **which is why every counter, ratchet and
 freshness check on this page reads them as healthy.**
+
+
+---
+
+## AC216 — A MEASUREMENT IN PROSE MUST CARRY ITS SHA INSIDE THE SAME SENTENCE
+
+**This AC exists because two lines of THIS document reopened a closed P1 and
+pulled a developer off correct work. The lines were mine. They were true when
+written. They were quoted hours later without their clock.**
+
+```
+demo-spec.md wrote:  '... MUST REACH 0. NOW: 2.'
+  TRUE at ~04:0x. FALSE by ~04:15.
+  READ BACK at ~06:00 as a live measurement, attributed to a Secretary
+  WHO HAD NEVER MEASURED IT AND WHOSE OWN PUBLISHED READING WAS 0 ALL NIGHT.
+```
+
+> **A spec line in the present tense is indistinguishable from a colleague's
+> measurement once it is quoted without its SHA.** — @c0de4c2e, and it is the
+> most expensive sentence written about this document tonight.
+
+### The requirement
+
+1. **A number in prose carries its SHA and its clock IN THE SAME SENTENCE**, not
+   in a heading, not in a section preamble, not in a nearby table. **A caption
+   two lines up does not survive a copy-paste, and a copy-paste is the only way
+   these numbers ever travel.**
+2. **A target (`MUST REACH 0`) and a reading (`NOW: 2`) must not share a line.**
+   The target is permanent; the reading has a half-life measured in minutes.
+   **Putting them in one sentence makes the whole sentence look permanent,
+   because the durable half lends its authority to the volatile half.**
+3. **Mark spent readings in-band and never delete them.** A deleted reading
+   re-derives as a regression — the ruling that produced our tombstones. **But a
+   retained reading must be UNQUOTABLE: the withdrawal has to travel inside any
+   fragment a reader might copy.**
+
+### Why §0.0.1 did not catch this
+
+**This document already presumes stale IMPERATIVES are spent.** That rule did
+not fire here, and the reason is exact: ***this was not an instruction. It was an
+observation, and observations were not covered.*** An imperative that has been
+executed reads as done; **an observation that has expired reads as CURRENT** —
+it has no completion state to be in.
+
+> **We built a tense rule for the sentences that tell you to do something, and
+> the damage came from the sentences that tell you what is true.**
+
+### The general law
+
+> **Anything in this repository that will be quoted must be written so that the
+> smallest quotable fragment is still honest.** Not the paragraph. Not the
+> section. **The fragment.** ***Any qualifier that a reader can strip by
+> selecting one line is not a qualifier — it is a hope.***
