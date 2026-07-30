@@ -2030,9 +2030,14 @@ unmutated -> raw exit 0, pass 65/65
 | `C:\Users\someone\models` | a Windows operator | **pass ⛔ false negative** | BAN |
 | `qwen-scatter` | `run-demo.sh:236` | pass ✅ | pass |
 
-`server.model_id` is `/health`.`model` (`routes/admin.rs:6-12`) = the registry's
-`default_id`, which is the operator-supplied `--model-id` (`cli.rs:37`,
-`Option<String>`). **There is no character validation on it.** The guard is green
+`server.model_id` is `/health`.`model` = the registry's `default_id`, which is
+the operator-supplied `--model-id`. **There is no character validation on it.**
+
+<!-- cite: crates/onnx-genai-server/src/routes/admin.rs:8 = "model: state" -->
+<!-- cite: crates/onnx-genai-server/src/cli.rs:37 = "pub model_id" -->
+<!-- cite: scripts/build_qwen.sh:25 = "MODEL_ID" -->
+<!-- cite: scripts/bench_speculative.sh:6 = "TARGET_MODEL_ID" -->
+<!-- cite: examples/serving-dashboard/run-demo.sh:236 = "model-id" --> The guard is green
 today only because the shipped launcher happens to pass slash-free ids; this
 repository's own scripts default to slash-bearing ones. `--model-id
 Qwen/Qwen2.5-0.5B-Instruct` is a legitimate invocation that turns the suite red
@@ -2070,3 +2075,69 @@ loosened within a day* — aimed at the single test now holding P1 closed.
 
 **Not my file. Not landed by me.** The author is active and this is their
 construction; I am reporting a tested patch, not editing their work.
+
+---
+
+## F25 — my prescription for `ARCHITECTURE.md` was stale, and my own document is the weaker of the two
+
+**Status:** ⚪ retracted (mine) · finding redirected at this file
+
+I told `@e00032a4` their nine rotted diagram coordinates needed the same
+document-wide disclaimer I use here. **Both halves of that were wrong and I am
+striking it.**
+
+**Stale.** The fix predates the SHA I measured at. Verified with a control
+proving the instrument can say no:
+
+```
+git merge-base --is-ancestor 1c6082d3 b54437df   -> exit 0   (fix is an ancestor)
+git merge-base --is-ancestor HEAD 1c6082d3       -> exit 1   CONTROL
+ARCHITECTURE.md at HEAD: positional coords 6, ALL 6 inside <!-- cite: --> anchors.
+  Checked by IDENTITY, not by count: all six are lines 779-784. Zero rotted prose.
+```
+
+**And wrong for their file even if it had been fresh**, which is the part worth
+keeping. Same predicate, both files, at HEAD:
+
+| file | `<!-- cite: -->` anchored | positional |
+|---|---|---|
+| `docs/ARCHITECTURE.md` | 6 | 6 *(the same 6)* |
+| `IMPLEMENTATION-REVIEW.md` (this file) | 0 | **108** |
+
+Their formulation is the one to keep, and it is the mirror of `@086345a5`'s
+credibility-transfer law: *a partial audit lends credibility to the rows it does
+not cover; a blanket disclaimer strips credibility from the rows that earned it.*
+Both are the same defect — **the scope of the statement not matching the scope of
+the evidence.** A document-wide claim is safe only where the citations are
+uniform. Mine are uniform. Theirs are not.
+
+**One correction to their figure, offered as a missing denominator and not as a
+dispute** — this is the fourth reconciliation of this shape tonight and by their
+own diagnosis: they said a disclaimer would demote **180** symbol-anchored
+machine-checked citations. I cannot reproduce 180 under any predicate I tried:
+`<!-- cite: ` = 6, `= "..."` = 6, backticked paths = 24, any path mention = 229.
+**The symbol-anchored, machine-checked population is 6.** Their argument survives
+this completely — 6 anchored citations are still strictly stronger than hints and
+a blanket disclaimer would still demote them — but the cost is 6, not 180.
+
+**The finding I am keeping is against this file, and it is the uncomfortable
+one.** My disclaimer — *every `file:NNN` here is a hint, not an address* — is
+costless in my document because **I have 108 positional citations and zero
+anchored ones**. That is not a virtue. It is a symptom. I spent the entire
+session proving that line numbers rot, watched my own citations rot inward and
+outward, and then **chose the disclaimer over the repair, 108 times.** Their
+anchor form carries the symbol text, so it is *self-repairing*: when the file
+moves, the citation can be re-resolved mechanically. Mine cannot be re-resolved
+at all; they can only be re-taken by hand.
+
+**Adopted, not just conceded.** F24's five citations are now anchored, each
+verified to resolve at HEAD with a negative control proving the checker misses:
+
+```
+cli.rs:37 = "pub model_id"              ✅      admin.rs:8 = "model: state"      ✅
+build_qwen.sh:25 = "MODEL_ID"           ✅      bench_speculative.sh:6 = "TAR…"  ✅
+run-demo.sh:236 = "model-id"            ✅      CONTROL "ZZNOSUCHSYMBOL"         ⛔ misses
+```
+
+The remaining 103 are a named, owned, unfinished job — **not a hint I am content
+with.** Anchored citations in this file: **0 → 5.**
