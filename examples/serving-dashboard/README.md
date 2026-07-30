@@ -259,8 +259,8 @@ places:
 
 | path | handler | borrow | behaviour |
 |---|---|---|---|
-| batching (`:8123`) | `driver.rs:773` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
-| dynamic (`:8124`) | `driver.rs:977` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
+| batching (`:8123`) | `crates/onnx-genai-server/src/driver.rs`, `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
+| dynamic (`:8124`) | `crates/onnx-genai-server/src/driver.rs`, `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
 
 The shared-vs-exclusive borrow *is* the fix — nothing else differs.
 
@@ -1058,7 +1058,7 @@ to stage, and every stall you see actually happened.
 
 > **Concurrency is not the lever here, and that is a fact about this runtime
 > rather than a staging preference.** The dynamic server runs generation
-> *inline* on the driver thread (`run_fallback_generation`, `driver.rs:1083`), so concurrent requests
+> *inline* on the driver thread (`crates/onnx-genai-server/src/driver.rs`, `run_fallback_generation`), so concurrent requests
 > **queue rather than overlap** — raising concurrency against the paged-KV
 > server adds waiting, not pressure. Concurrency drives Scenario A, on the
 > scatter server, which has no block table at all. Pressure on the pool comes
