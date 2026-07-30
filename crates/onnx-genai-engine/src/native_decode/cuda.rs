@@ -28,7 +28,11 @@ impl GraphCaptureStructuralSafety {
 /// auto-decision.
 ///
 /// Precedence:
-/// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) always wins.
+/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) always wins and forces
+///    capture OFF. The pager's alloc/copy/free ops are capture-illegal, so the
+///    two features are mutually exclusive; offload wins and capture is skipped
+///    with a one-time notice.
+/// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) wins next.
 /// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
 ///    forces ON) is honored next.
 /// 3. When neither is set, auto-decide from `structural` safety: attempt capture
@@ -38,7 +42,12 @@ pub(crate) fn resolve_graph_capture_enabled(
     env_explicit: bool,
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
+    weight_offload_enabled: bool,
 ) -> bool {
+    if weight_offload_enabled {
+        log_weight_offload_capture_exclusion();
+        return false;
+    }
     if let Some(explicit) = programmatic {
         return explicit;
     }
@@ -46,6 +55,15 @@ pub(crate) fn resolve_graph_capture_enabled(
         return env_value;
     }
     structural.is_capture_safe()
+}
+
+/// Emit the offload/capture mutual-exclusion notice at most once per process, so
+/// operators who enable both learn capture was declined without log spam.
+fn log_weight_offload_capture_exclusion() {
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| {
+        tracing::warn!("weight offload is incompatible with CUDA graph capture; capture disabled");
+    });
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

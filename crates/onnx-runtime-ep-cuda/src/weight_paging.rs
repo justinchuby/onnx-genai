@@ -383,19 +383,23 @@ impl CudaWeightResidency {
     }
 
     /// Insert a freshly paged-in `page` under `key`, evicting LRU pages to fit the
-    /// budget. Synchronizes the compute stream first (unless capturing) so no
-    /// in-flight kernel still references an about-to-be-freed page's VRAM.
+    /// budget. Synchronizes the compute stream first so no in-flight kernel still
+    /// references an about-to-be-freed page's VRAM. (Offload is mutually exclusive
+    /// with CUDA graph capture, so this sync is never capture-illegal.)
     fn admit(
         &self,
         key: u64,
         page: Arc<CudaWeightPage>,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
         let bytes = page.len() as u64;
-        if !self.runtime.is_capturing().unwrap_or(false) {
-            self.runtime.synchronize().map_err(|error| {
-                WeightHandleError::DeviceBinding(format!("stream sync: {error}"))
-            })?;
-        }
+        // Weight offload and CUDA graph capture are mutually exclusive: the decode
+        // session declines capture whenever offload is enabled (see
+        // `resolve_graph_capture_enabled`), so paging never runs during capture.
+        // The synchronize below — and the alloc/copy/free it guards against — are
+        // themselves capture-illegal, so we can unconditionally sync here.
+        self.runtime
+            .synchronize()
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
         let mut inner = self.lock();
         // A concurrent caller may have populated `key` while we paged in; prefer
         // the already-resident page and drop ours (its Drop frees the VRAM).
