@@ -217,7 +217,12 @@ describe('the design document does not instruct a build it has ruled against', (
     const exempt = new Map([
       ['8d37e2cc3656', 'file tree: names scenarios/prefix.js as a path, binds no field'],
       ['970cf30e5349', "honesty footer sample: the generated WHAT'S REAL / DERIVED table"],
-      ['eb830f5dee14', 'PLACEHOLDER treatment: defines the confession copy, renders no value'],
+      // RE-ATTESTED S76: hash moved eb830f5dee14 -> e1155fbb83bc when the Lead's
+      // ruling renamed BYPASSED to STRUCTURALLY_BYPASSED to match the code. The
+      // revocation fired exactly as designed on a one-word edit, and I re-read
+      // the block rather than porting the hash: still hover COPY, no value, no
+      // 's' badge, and it explains an absence instead of promising a feature.
+      ['e1155fbb83bc', 'PLACEHOLDER treatment: defines the confession copy, renders no value'],
       ['652f178b3ebf', 'KV memory panel: ships; names eviction only in a not-plumbed row'],
       ['b9cc9dfbf776', 'paged KV block table: ships, verified (allocated 3, freed 3, 14612 pages)'],
       ['23e9cd2205fb', 'the not-applicable card itself -- the honest treatment, D30'],

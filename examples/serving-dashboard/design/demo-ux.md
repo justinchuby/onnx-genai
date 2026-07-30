@@ -798,13 +798,13 @@ Classification = 'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED'
 So the change is **purely additive** — one new classification value, no consumer breaks:
 
 ```js
-Classification = 'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'BYPASSED'
-NEVER_MEASURED_CLASSIFICATIONS = ['DOCUMENTED_ZERO', 'NOT_PLUMBED', 'BYPASSED']
+Classification = 'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'STRUCTURALLY_BYPASSED'
+NEVER_MEASURED_CLASSIFICATIONS = ['DOCUMENTED_ZERO', 'NOT_PLUMBED', 'STRUCTURALLY_BYPASSED']
 ```
 
 Adding a state is a breaking change to every branch; adding a classification is a new row in a table. Same expressive power, none of the blast radius. **This is what the PM's own escape hatch — "or carry a `reason` rich enough to render the difference" — looks like when done with a machine-readable discriminator instead of prose.** Panels must never branch on substrings of `reason`.
 
-**`BYPASSED` is inherently profile-dependent, which is the proof of the §13.1 request.** `prefix_cache_hits` is `MEASURED` on profile D and `BYPASSED` on profile S — the *same field*, different provenance, decided by which model loaded. A table keyed by field name alone cannot express that, and defaults to the wrong answer on the server we demo. `BYPASSED` cannot be implemented at all without `(field, profile)` keying; the two changes are one change.
+**`STRUCTURALLY_BYPASSED` is inherently profile-dependent, which is the proof of the §13.1 request.** `prefix_cache_hits` is `MEASURED` on profile D and `STRUCTURALLY_BYPASSED` on profile S — the *same field*, different provenance, decided by which model loaded. A table keyed by field name alone cannot express that, and defaults to the wrong answer on the server we demo. `STRUCTURALLY_BYPASSED` cannot be implemented at all without `(field, profile)` keying; the two changes are one change.
 
 #### 4.7.1 The two hover treatments
 
@@ -816,14 +816,14 @@ PLACEHOLDER — a confession. Our omission, our to-do.
    (routes/admin.rs:57). Nothing samples it."
   icon: ⊘   tone: candid, names the file
 
-BYPASSED — an explanation. Correct behaviour, not a gap.
+STRUCTURALLY_BYPASSED — an explanation. Correct behaviour, not a gap.
   "Not applicable on this server — static-cache decoding doesn't
    consult the prefix cache, so there is nothing to hit or miss.
    Load a dynamic-cache model to see this."
   icon: ⊗   tone: architectural, names the cause and the remedy
 ```
 
-`BYPASSED` is the only one of the two that gets to end with **a way to see the real number**, because it is the only one where a real number exists somewhere. That sentence turns a hole into a signpost.
+`STRUCTURALLY_BYPASSED` is the only one of the two that gets to end with **a way to see the real number**, because it is the only one where a real number exists somewhere. That sentence turns a hole into a signpost.
 
 #### 4.7.2 Deliberately **not** distinguishing them at a glance
 
@@ -831,7 +831,7 @@ Both render `—`. The distinction lives entirely in the hover, and that is a de
 
 A visitor scanning the page needs exactly one fact at glance-level: **"there is no number here, and it is not being hidden from me."** That is one fact, so it gets one glyph. *Why* there is no number is second-level detail, and second-level detail belongs in the second level.
 
-Giving them distinct glyphs would make the dashboard appear to have two different kinds of hole, which reads as **inconsistency, not rigour** — the visitor's first thought is "is one of these a bug?" Honesty that looks like malfunction fails at its only job. No new tokens: `BYPASSED` reuses `--og-unavail-*` exactly.
+Giving them distinct glyphs would make the dashboard appear to have two different kinds of hole, which reads as **inconsistency, not rigour** — the visitor's first thought is "is one of these a bug?" Honesty that looks like malfunction fails at its only job. No new tokens: `STRUCTURALLY_BYPASSED` reuses `--og-unavail-*` exactly.
 
 #### 4.7.3 Where they **do** diverge sharply: group level
 
@@ -1668,7 +1668,7 @@ Ten keys is a lot, so they are **grouped by the question they answer**. Grouping
   origin,         // 'scatter' | 'dynamic' | null       (which engine)
 
   // EXPLANATION — why it isn't a plain number
-  classification, // 'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'BYPASSED'
+  classification, // 'MEASURED' | 'DOCUMENTED_ZERO' | 'NOT_PLUMBED' | 'STRUCTURALLY_BYPASSED'
   reason,         // required prose whenever state !== 'measured'
 
   // MEASUREMENT CONTEXT
@@ -4653,3 +4653,122 @@ We cannot probe the peer without the cross-origin fetch that navigation exists t
 | D248 | Design the arrival, not the departure | A pre-flight probe would reintroduce CORS to defend against a problem CORS creates |
 | D249 | `missing_assets()` must name the origin the visitor came from | The return address is already in the query string and is currently discarded |
 | D250 | Absolute `--demo-assets-dir` on both command lines | It removes the invisible CWD dependency instead of documenting around it |
+
+---
+
+## 76. The freeze is already satisfied; only the belief about what is frozen is stale
+
+**The Lead's ruling is BINDING and I am under it. Its outcome requires no change to
+any file, because the tree already satisfies it. What follows corrects one premise,
+not the ruling — and I am not asking for an enum change. I am reporting that the
+change already happened at 01:17 and cannot be un-happened by a freeze.**
+
+### 76.1 D251 — the citation says the opposite of the claim it was cited for
+
+The ruling states that `CONTRACT.md:53-55` *"already carries an explicit warning
+callout explaining that the constant is named MEASURED but emits `'ok'`."*
+
+**The callout exists. It is exactly where they said. It is written in the PAST
+TENSE, and it documents the fix:**
+
+> ⚠️ **`state` for a good reading is the string `'measured'`, and the constant is
+> `FIELD_STATES.MEASURED`.** The constant **was once** spelled `MEASURED` while its
+> value stayed `'ok'`, which made `field.state === 'measured'` silently false for
+> every measured field on the page. **Name and value now agree, and the transitional
+> alias was deleted rather than deprecated** — an alias is a fork with a deprecation
+> notice.
+
+Runtime import at 01:54, the only instrument that cannot go stale:
+
+```
+FIELD_STATES -> {"MEASURED":"measured","PENDING":"pending","STALE":"stale",
+                 "UNAVAILABLE":"unavailable","NOT_APPLICABLE":"not-applicable"}
+git log -- telemetry-field.js  ->  50d412be 01:30, 5ffa85b4 01:27, 24d831a2 01:17
+```
+
+Nothing after `24d831a2` touched the value. **The document was read correctly and
+its tense was not.**
+
+> **D251. A WARNING CALLOUT DESCRIBING A FIXED BUG IS INDISTINGUISHABLE, TO A
+> SEARCHER, FROM ONE DESCRIBING A LIVE BUG.** Both contain the defect in full
+> detail — that is what makes them useful. **The callout exists BECAUSE the bug was
+> severe, so its presence is evidence of the REMEDY and was read as evidence of the
+> DISEASE.** This is the third time tonight a doc artifact has been the authority
+> behind a wrong ruling: `demo_assets`' docstring, `active_sessions`' comment, and
+> now our own contract. **The better a postmortem is written, the more convincingly
+> it impersonates a bug report.**
+
+### 76.2 D252 — the migration cost was a measurement of the completed migration
+
+The ruling prices the rename at *"63 occurrences across 16 files."* I counted:
+
+```
+'measured' literals in the tree  ->  63
+```
+
+**Sixty-three. The estimate is exact — and it is a count of the NEW value, already
+in place.** The 63 occurrences *are* the migration. It was costed after it shipped,
+and the cost of doing it became the argument against doing it.
+
+> **D252. THE STALE-TREE TRAP'S FINAL FORM IS NOT A WRONG NUMBER. IT IS THE RIGHT
+> NUMBER POINTING THE WRONG WAY.** Every previous instance tonight was caught by
+> re-measuring, because the stale figure disagreed with the fresh one. **This one
+> survives re-measurement: measure again and you get 63 again.** What is stale is
+> the *direction* — whether those occurrences are work remaining or work done —
+> **and a count cannot carry direction.** Only `git log` can, and a count feels so
+> much more like evidence than a date does.
+
+### 76.3 D253 — a freeze protecting a false premise is a mechanism for enacting it
+
+I endorse *no further enum changes from anyone* without reservation; five agents
+have now proposed reverting to `'ok'` and the churn is real. **But pair that freeze
+with the belief that the wire value IS `'ok'`, and the next agent who enforces the
+ruling will not leave the code alone — they will "correct" the code TO `'ok'`,
+believing they are restoring the frozen state.**
+
+That edit flips `field.state === 'measured'` false for every genuine measurement,
+and per the contract's own atomic-pair clause it renders **real numbers at muted
+contrast wherever a panel sets a colour** — the exact honesty inversion this
+dashboard exists to prevent, and **neither half fails loudly.** The contract also
+warns never to global-replace the bare token: I count **50** non-state `'ok'`
+matches, including the HTTP health payload, so the obvious execution fakes an
+unreachable server on the way through.
+
+> **D253. A FREEZE IS NOT A NO-OP. IT IS AN INSTRUCTION TO MAKE THE TREE MATCH A
+> DESCRIPTION, AND IT INHERITS EVERY ERROR IN THE DESCRIPTION.** "Change nothing"
+> and "change nothing away from X" are the same sentence only while X is true.
+
+### 76.4 D254 — the two-axes ruling is right, and better than what I asked for
+
+**Accepted in full, and the correction to me lands.** `unavailable` means plumbing
+would fix it; `not-applicable` means plumbing would change nothing. **That is a
+truth-condition distinction, and truth conditions are exactly what belongs in a data
+model** — I had argued a *rendering* consequence (two hole-glyphs read as
+inconsistency; honesty that looks like malfunction fails at its only job) and
+encoded it as a constraint on the *state set*, which is the wrong layer to defend it
+from. It survives untouched on top of a fifth state: one explanatory card per
+bypassed subsystem, one glyph, both states. **Rendering is downstream of the data
+model. I retained the authority I actually wanted and lost only the authority I
+should not have claimed.**
+
+**D30 is amended: 9 bare `BYPASSED` occurrences are now `STRUCTURALLY_BYPASSED`,
+matching `telemetry-provenance.js:31`.** The reason given is the whole reason:
+**a string comparison will not know they mean the same thing.** Every enforcement
+mechanism I have built tonight is a string comparison.
+
+### 76.5 D255 — my own revocation fired on a one-word edit, and that is the feature
+
+Renaming inside an exempted fenced sketch **revoked its hash exemption**
+(`eb830f5dee14` → `e1155fbb83bc`) and reddened `page-claims`. I re-read the block
+before re-attesting rather than porting the hash forward: still hover *copy*, no
+value, no `s` badge, explains an absence rather than promising a feature.
+
+> **D255. THE MECHANISM COST ME ONE RE-READ FOR A NINE-CHARACTER RENAME, AND THAT
+> PRICE IS THE ENTIRE GUARANTEE.** A revocation rule that only fires on *meaningful*
+> edits requires a machine that can tell meaningful from cosmetic — which is D166
+> again, and is why the exemption is written rather than inferred. **I built this to
+> stop someone else quietly widening a grandfathered sketch. Tonight it stopped me,
+> for a change I was certain was safe, and I was right that it was safe — the rule
+> is not there to be right, it is there to make me look.**
+
+**Suites: 9 + 7 + 5 + 3 = 24 green.**
