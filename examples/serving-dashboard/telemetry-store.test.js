@@ -1651,6 +1651,38 @@ test('a provenance row that has gone stale is detected rather than em-dashed for
   assert.equal(store.field('server.execution_provider').value, 'CUDAExecutionProvider');
 });
 
+test('stale-provenance diagnostics describe a string without echoing its bytes', async () => {
+  const sensitivePath = '/Users/operator/secret/provider';
+  const consoleWarnings = [];
+  const originalWarn = console.warn;
+  let store;
+  console.warn = (...args) => consoleWarnings.push(args.join(' '));
+  try {
+    store = storeWith(
+      healthyRoutes({
+        [ENDPOINTS.STATUS]: {
+          body: statusBody({ server: { execution_provider: sensitivePath } }),
+        },
+      }),
+    );
+    await store.pollOnce();
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const warning = store.provenanceWarnings()['server.execution_provider'];
+  assert.match(warning, /server sent a string/i);
+  assert.ok(!warning.includes(sensitivePath), 'stored warning retained the absolute path');
+  assert.ok(
+    !store.field('server.execution_provider').provenanceWarning.includes(sensitivePath),
+    'field metadata retained the absolute path',
+  );
+  assert.ok(
+    consoleWarnings.every((message) => !message.includes(sensitivePath)),
+    'console warning disclosed the absolute path',
+  );
+});
+
 // --- Bypassed fields are never PENDING -------------------------------------
 //
 // These three tests exist because the rule "a bypassed subsystem can never

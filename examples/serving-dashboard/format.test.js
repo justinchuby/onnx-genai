@@ -339,6 +339,23 @@ describe('display-safe fields', () => {
     }
   });
 
+  it('removes sensitive warning metadata with the rejected path', () => {
+    const value = '/Users/operator/secret/provider';
+    const field = measuredField(value, {
+      source: '/v1/status',
+      provenanceWarning: `The server sent ${value}.`,
+    });
+
+    const safe = displaySafeField(field);
+    assert.equal(safe.value, null);
+    assert.equal(safe.provenanceWarning, null);
+    assert.ok(!JSON.stringify(safe).includes(value), 'display-safe field retained path residue');
+    assert.ok(
+      !JSON.stringify(formatField(field)).includes(value),
+      'formatted output retained path residue',
+    );
+  });
+
   it('preserves legitimate model identifiers exactly', () => {
     for (const value of [
       'Qwen/Qwen2.5-0.5B-Instruct',

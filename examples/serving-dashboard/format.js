@@ -39,6 +39,7 @@ export function displaySafeField(field) {
     value: null,
     state: FIELD_STATES.UNAVAILABLE,
     reason: ABSOLUTE_PATH_REASON,
+    provenanceWarning: null,
   };
 }
 

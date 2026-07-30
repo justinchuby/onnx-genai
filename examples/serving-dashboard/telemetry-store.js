@@ -772,7 +772,7 @@ export function createTelemetryStore({
     const expected = 'stubValue' in entry ? JSON.stringify(entry.stubValue) : 'no value at all';
     return (
       `"${key}" is classified ${entry.classification} in telemetry-provenance.js, which expects ` +
-      `${expected} from ${entry.source}. The server sent ${JSON.stringify(observed)}. ` +
+      `${expected} from ${entry.source}. The server sent ${describeWireValue(observed)}. ` +
       'That means this field is now genuinely measured and the provenance table is out of date. ' +
       `Update its classification and re-read the evidence citation (${entry.evidence}). ` +
       'The value is being displayed rather than hidden, because suppressing a real measurement ' +
