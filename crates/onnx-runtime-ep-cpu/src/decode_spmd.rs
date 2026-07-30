@@ -104,6 +104,12 @@ use crate::kernels::matmul_nbits::output_chunk_len;
 /// default prioritises predictability over adaptation.
 /// See `.squad/decisions.md` (Voight 2026-07-24; Chu 2026-07-27 opt-in adaptive).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
+/// Selects how the persistent decode pool assigns output-column work inside an
+/// op. Unset / `fixed` keeps the existing deterministic one-shard-per-worker
+/// SPMD split; `steal` decomposes the op into coarser tiles and lets resident
+/// workers claim tiles dynamically, so a delayed worker does not strand a whole
+/// static shard behind the per-op barrier.
+pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
 
 /// Bounded active-spin window before a worker parks, mirroring the
 /// **LLVM/Intel OpenMP runtime `KMP_BLOCKTIME`** design: after a fork/join the
@@ -163,6 +169,15 @@ fn decode_blocktime() -> Duration {
 /// parks; the yield after the budget only lets a descheduled straggler worker get
 /// a core under oversubscription.
 const DISPATCHER_SPIN_BEFORE_YIELD: u32 = 1 << 12;
+
+/// Default number of dynamic tiles per resident worker in work-stealing mode.
+/// Two tiles per worker gives an idle worker something meaningful to steal when
+/// a peer is delayed, without multiplying MLAS SQNBit shard calls enough to
+/// recreate the per-node dispatch overhead the SPMD pool removed.
+const DEFAULT_STEAL_TILES_PER_WORKER: usize = 2;
+/// Minimum output columns in one dynamic tile. Keeps MLAS/KAI/hand GEMV calls
+/// coarse enough that the extra atomic `fetch_add` scheduling is amortized.
+const MIN_STEAL_OUTPUTS_PER_TASK: usize = 32;
 
 /// Cache-line pad so per-node completion counters and per-worker park flags do
 /// not false-share (which would reintroduce cross-socket coherency traffic).
@@ -342,6 +357,36 @@ pub struct SpmdDecodePools {
     /// order (workers `0..counts[0]` are node 0, and so on).
     node_worker_counts: Vec<usize>,
     total_workers: usize,
+    schedule: DecodeSchedule,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeSchedule {
+    Fixed,
+    Steal,
+}
+
+fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
+    match raw.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
+        Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
+        _ => DecodeSchedule::Fixed,
+    }
+}
+
+fn decode_schedule() -> DecodeSchedule {
+    decode_schedule_from_raw(std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref())
+}
+
+fn steal_tiles_per_worker() -> usize {
+    static TILES: OnceLock<usize> = OnceLock::new();
+    *TILES.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_STEAL_TILES_PER_WORKER)
+    })
 }
 
 impl SpmdDecodePools {
@@ -349,6 +394,10 @@ impl SpmdDecodePools {
     /// laid out node-major (node 0's workers first) so row segments and weight
     /// placement line up with the node assignment.
     fn build(shards: &[NodeShard]) -> Self {
+        Self::build_with_schedule(shards, decode_schedule())
+    }
+
+    fn build_with_schedule(shards: &[NodeShard], schedule: DecodeSchedule) -> Self {
         let node_count = shards.len();
         let mut worker_node = Vec::new();
         let mut node_worker_counts = Vec::with_capacity(node_count);
@@ -411,6 +460,7 @@ impl SpmdDecodePools {
             join_handles: Mutex::new(handles),
             node_worker_counts,
             total_workers,
+            schedule,
         }
     }
 
@@ -422,6 +472,10 @@ impl SpmdDecodePools {
     /// Number of node groups in the layout.
     pub fn node_count(&self) -> usize {
         self.node_worker_counts.len()
+    }
+
+    fn uses_work_stealing(&self) -> bool {
+        self.schedule == DecodeSchedule::Steal
     }
 
     /// Signal every worker to stop and **join** them. Idempotent: the join
@@ -568,6 +622,46 @@ impl SpmdDecodePools {
         segments
     }
 
+    fn work_stealing_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        if n == 0 {
+            return vec![(0, 0)];
+        }
+        let align = align.max(1);
+        let min_tile = MIN_STEAL_OUTPUTS_PER_TASK.div_ceil(align) * align;
+        let max_by_size = n.div_ceil(min_tile).max(1);
+        let target = self
+            .total_workers
+            .saturating_mul(steal_tiles_per_worker())
+            .max(1)
+            .min(max_by_size)
+            .min(n);
+        if target <= self.total_workers {
+            return self.worker_row_segments_aligned(n, align);
+        }
+        let mut segments = Vec::with_capacity(target);
+        let mut prev = 0usize;
+        for index in 0..target {
+            let boundary = if index + 1 == target {
+                n
+            } else {
+                let ideal = n.saturating_mul(index + 1).div_ceil(target);
+                let rounded = ((ideal + align / 2) / align) * align;
+                rounded.clamp(prev, n)
+            };
+            segments.push((prev, boundary - prev));
+            prev = boundary;
+        }
+        segments
+    }
+
+    fn output_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        if self.uses_work_stealing() {
+            self.work_stealing_segments_aligned(n, align)
+        } else {
+            self.worker_row_segments_aligned(n, align)
+        }
+    }
+
     /// Shard `result`'s output rows across the workers and run `compute` on each
     /// worker's contiguous slice under one lightweight barrier.
     ///
@@ -583,6 +677,10 @@ impl SpmdDecodePools {
         let n = result.len();
         if self.total_workers <= 1 || output_chunk_len(n, k) >= n {
             compute(0, result);
+            return;
+        }
+        if self.uses_work_stealing() {
+            self.dispatch_rows_work_stealing(result, 1, compute);
             return;
         }
         self.dispatch_rows_across_workers(result, &compute);
@@ -607,7 +705,7 @@ impl SpmdDecodePools {
     /// `align = 1` for kernels whose per-column result is already
     /// partition-independent (e.g. the hand int4/int8 GEMV).
     pub fn output_column_segments(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
-        self.worker_row_segments_aligned(n, align)
+        self.output_segments_aligned(n, align)
     }
 
     /// Like [`Self::dispatch_output_rows`], but hands each worker its global
@@ -624,12 +722,31 @@ impl SpmdDecodePools {
         F: Fn(usize, usize, &mut [f32]) + Sync,
     {
         let n = result.len();
-        let segments = self.worker_row_segments_aligned(n, align);
+        let segments = self.output_segments_aligned(n, align);
         let table = RowTable {
             base: result.as_mut_ptr(),
             segments: &segments,
         };
         let table = &table;
+        if self.uses_work_stealing() {
+            let next = AtomicUsize::new(0);
+            let next = &next;
+            let job = move |_global_index: usize| loop {
+                let task_index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(start, len)) = table.segments.get(task_index) else {
+                    break;
+                };
+                if len == 0 {
+                    continue;
+                }
+                // SAFETY: dynamic segments are disjoint, in-bounds column ranges;
+                // each task index is claimed once by exactly one worker.
+                let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+                compute(task_index, start, outputs);
+            };
+            self.dispatch(&job);
+            return;
+        }
         let job = move |global_index: usize| {
             let (start, len) = table.segments[global_index];
             if len == 0 {
@@ -755,6 +872,34 @@ impl SpmdDecodePools {
             // SAFETY: `worker_row_segments` produces disjoint, in-bounds row
             // ranges covering `0..n` exactly once, and each worker touches only
             // its own segment, so these mutable slices never alias.
+            let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+            compute(start, outputs);
+        };
+        self.dispatch(&job);
+    }
+
+    fn dispatch_rows_work_stealing<F>(&self, result: &mut [f32], align: usize, compute: &F)
+    where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        let segments = self.work_stealing_segments_aligned(result.len(), align);
+        let table = RowTable {
+            base: result.as_mut_ptr(),
+            segments: &segments,
+        };
+        let table = &table;
+        let next = AtomicUsize::new(0);
+        let next = &next;
+        let job = move |_global_index: usize| loop {
+            let task_index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(start, len)) = table.segments.get(task_index) else {
+                break;
+            };
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: each dynamic tile is a disjoint, in-bounds row range, and
+            // the atomic cursor hands every tile to exactly one worker.
             let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
             compute(start, outputs);
         };
@@ -1221,6 +1366,7 @@ fn report_spmd_fallback(message: &str) {
 /// otherwise. See `docs/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
+        PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "spmd-pool-steal",
         PersistenceMode::On => "spmd-pool",
         PersistenceMode::Adaptive => "adaptive",
         PersistenceMode::Off => "flat",
@@ -1598,16 +1744,45 @@ mod tests {
                 workers: 2,
             },
         ];
-        SpmdDecodePools::build(&shards)
+        SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed)
     }
 
     fn single_group_pool(workers: usize) -> SpmdDecodePools {
+        single_group_pool_with_schedule(workers, DecodeSchedule::Fixed)
+    }
+
+    fn single_group_pool_with_schedule(
+        workers: usize,
+        schedule: DecodeSchedule,
+    ) -> SpmdDecodePools {
         let shards = vec![NodeShard {
             index: 0,
             cpus: vec![],
             workers,
         }];
-        SpmdDecodePools::build(&shards)
+        SpmdDecodePools::build_with_schedule(&shards, schedule)
+    }
+
+    #[test]
+    fn decode_schedule_parses_env_values() {
+        assert_eq!(decode_schedule_from_raw(None), DecodeSchedule::Fixed);
+        assert_eq!(decode_schedule_from_raw(Some("")), DecodeSchedule::Fixed);
+        assert_eq!(
+            decode_schedule_from_raw(Some("fixed")),
+            DecodeSchedule::Fixed
+        );
+        assert_eq!(
+            decode_schedule_from_raw(Some("steal")),
+            DecodeSchedule::Steal
+        );
+        assert_eq!(
+            decode_schedule_from_raw(Some(" work-stealing ")),
+            DecodeSchedule::Steal
+        );
+        assert_eq!(
+            decode_schedule_from_raw(Some("bogus")),
+            DecodeSchedule::Fixed
+        );
     }
 
     #[test]
@@ -1737,6 +1912,24 @@ mod tests {
     }
 
     #[test]
+    fn work_stealing_segments_create_coarse_extra_tiles() {
+        let pool = single_group_pool_with_schedule(4, DecodeSchedule::Steal);
+        let segments = pool.output_column_segments(2048, 16);
+        assert!(
+            segments.len() > pool.total_workers(),
+            "work-stealing mode should expose more tiles than workers"
+        );
+        let mut expected_start = 0;
+        for (start, len) in segments {
+            assert_eq!(start, expected_start);
+            assert_eq!(start % 16, 0);
+            assert!(len >= MIN_STEAL_OUTPUTS_PER_TASK || start + len == 2048);
+            expected_start += len;
+        }
+        assert_eq!(expected_start, 2048);
+    }
+
+    #[test]
     fn dispatch_output_rows_matches_flat_computation() {
         let pool = two_group_pool();
         let n = 101usize;
@@ -1747,6 +1940,23 @@ mod tests {
         };
         let mut sharded = vec![0.0f32; n];
         pool.dispatch_rows_across_workers(&mut sharded, &compute);
+        let mut flat = vec![0.0f32; n];
+        compute(0, &mut flat);
+        assert_eq!(sharded, flat);
+    }
+
+    #[test]
+    fn work_stealing_dispatch_output_rows_matches_flat_computation() {
+        let pool = single_group_pool_with_schedule(4, DecodeSchedule::Steal);
+        let n = 2048usize;
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            for (offset, out) in outputs.iter_mut().enumerate() {
+                let row = output_start + offset;
+                *out = row as f32 * 1.25 - 7.0;
+            }
+        };
+        let mut sharded = vec![0.0f32; n];
+        pool.dispatch_output_rows(&mut sharded, 1024, &compute);
         let mut flat = vec![0.0f32; n];
         compute(0, &mut flat);
         assert_eq!(sharded, flat);

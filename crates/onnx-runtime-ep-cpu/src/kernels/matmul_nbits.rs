@@ -11125,7 +11125,7 @@ mod tests {
     const MLAS_SHARD_PARITY_MARKER: &str = "NXRT_MLAS_SHARD_PARITY_BYTES=";
 
     #[cfg(feature = "mlas")]
-    fn mlas_shard_parity_child_output(no_shard: bool) -> Vec<f32> {
+    fn mlas_shard_parity_child_output(no_shard: bool, work_stealing: bool) -> Vec<f32> {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
@@ -11137,6 +11137,11 @@ mod tests {
             .env("RAYON_NUM_THREADS", "3")
             .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if work_stealing {
+            command.env(crate::decode_spmd::DECODE_SCHEDULE_ENV, "steal");
+        } else {
+            command.env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV);
+        }
         if no_shard {
             command.env("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD", "1");
         } else {
@@ -11209,16 +11214,25 @@ mod tests {
         let n = MLAS_SHARD_PARITY_N;
         let pool = crate::decode_spmd::pools().expect("forced persistent SPMD pool");
         let segments = pool.output_column_segments(n, MLAS_SQNBIT_DECODE_SHARD_ALIGN);
-        assert_eq!(
-            segments.len(),
-            3,
-            "child requested three persistent workers"
-        );
+        let work_stealing = std::env::var(crate::decode_spmd::DECODE_SCHEDULE_ENV)
+            .is_ok_and(|value| value.trim() == "steal");
+        if work_stealing {
+            assert!(
+                segments.len() > 3,
+                "work-stealing child should create extra dynamic MLAS tiles"
+            );
+        } else {
+            assert_eq!(
+                segments.len(),
+                3,
+                "child requested three persistent workers"
+            );
+            assert!(
+                segments.windows(2).any(|pair| pair[0].1 != pair[1].1),
+                "N={n} must create uneven worker output-column segments: {segments:?}"
+            );
+        }
         assert_eq!(segments.iter().map(|&(_, len)| len).sum::<usize>(), n);
-        assert!(
-            segments.windows(2).any(|pair| pair[0].1 != pair[1].1),
-            "N={n} must create uneven worker output-column segments: {segments:?}"
-        );
 
         let activation = pseudo(
             MLAS_SHARD_PARITY_CONFIGS
@@ -11307,8 +11321,8 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_matches_no_shard_full_width() {
-        let sharded = mlas_shard_parity_child_output(false);
-        let full_width = mlas_shard_parity_child_output(true);
+        let sharded = mlas_shard_parity_child_output(false, false);
+        let full_width = mlas_shard_parity_child_output(true, false);
         assert_eq!(
             sharded.len(),
             full_width.len(),
@@ -11332,6 +11346,26 @@ mod tests {
             "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width \
              (max_ulp={max_ulp}); if this fails, MLAS_SQNBIT_DECODE_SHARD_ALIGN is not \
              keeping N-tiles whole. mismatching (index, sharded_bits, full_bits): {mismatches:?}"
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_work_stealing_decode_matches_no_shard_full_width() {
+        let sharded = mlas_shard_parity_child_output(false, true);
+        let full_width = mlas_shard_parity_child_output(true, true);
+        assert_eq!(sharded.len(), full_width.len());
+        let mismatches: Vec<_> = sharded
+            .iter()
+            .zip(&full_width)
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, (a, b))| (i, a.to_bits(), b.to_bits()))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "work-stealing MLAS decode shards must stay bit-identical to full-width; \
+             mismatching (index, sharded_bits, full_bits): {mismatches:?}"
         );
     }
 
