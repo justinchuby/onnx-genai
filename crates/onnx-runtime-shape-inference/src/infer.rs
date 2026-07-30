@@ -87,7 +87,13 @@ impl InferenceRegistry {
         let mut containers: HashMap<ValueId, ValueType> = seed_containers.clone();
 
         seed_sources(graph, &mut types, &mut shape_data);
-        bind_captures(graph, &imported_scope, &mut types, &mut shape_data);
+        bind_captures(
+            graph,
+            &imported_scope,
+            &mut types,
+            &mut shape_data,
+            &mut containers,
+        );
 
         // Snapshot graph outputs' declared shapes for the final merge.
         let declared_outputs: HashMap<ValueId, Vec<Dim>> = graph
@@ -224,13 +230,22 @@ impl InferenceRegistry {
                 })
                 .map(|(vid, _)| vid)
                 .collect();
-            extend_visible_scope(graph, types, shape_data, scope, source_values, interner);
+            extend_visible_scope(
+                graph,
+                types,
+                shape_data,
+                containers,
+                scope,
+                source_values,
+                interner,
+            );
             *scope_sources_added = true;
         }
         extend_visible_scope(
             graph,
             types,
             shape_data,
+            containers,
             scope,
             pending_scope_values.drain(..),
             interner,
@@ -250,6 +265,7 @@ impl InferenceRegistry {
                 &key.1,
                 subgraph,
                 types,
+                containers,
                 effective_version(node, opset_imports),
                 interner,
             );
@@ -351,6 +367,7 @@ fn infer_control_flow(
         "Scan" if version >= 9 => {
             infer_scan_outputs(graph, node, subgraph_results, types, interner)?
         }
+        "SequenceMap" => infer_sequence_map_outputs(graph, node, subgraph_results, interner)?,
         _ => return Ok(false),
     };
 
@@ -601,6 +618,7 @@ fn seed_control_flow_body(
     attr_name: &str,
     body: &mut Graph,
     types: &HashMap<ValueId, TypeInfo>,
+    containers: &HashMap<ValueId, ValueType>,
     version: u64,
     interner: &mut SymbolInterner,
 ) {
@@ -610,16 +628,49 @@ fn seed_control_flow_body(
     match node.op_type.as_str() {
         "Loop" => seed_loop_body(node, body, types, interner),
         "Scan" if version >= 9 => seed_scan_body(node, body, types, interner),
+        "SequenceMap" => seed_sequence_map_body(node, body, types, containers, interner),
         _ => {}
     }
 }
 
+/// Seed a `SequenceMap` body: body formal input `i` takes the *per-element* type
+/// of `SequenceMap` operand `i`. A sequence operand contributes its element
+/// tensor type; a plain tensor operand is passed whole to every iteration. The
+/// container-element case (a sequence of sequences) is seeded separately via
+/// [`body_container_seeds`], so this only writes tensor leaves onto body inputs.
+fn seed_sequence_map_body(
+    node: &Node,
+    body: &mut Graph,
+    types: &HashMap<ValueId, TypeInfo>,
+    containers: &HashMap<ValueId, ValueType>,
+    interner: &mut SymbolInterner,
+) {
+    for (i, &dst) in body.inputs.clone().iter().enumerate() {
+        let Some(src) = node_input(node, i) else {
+            continue;
+        };
+        // A sequence operand's element tensor; otherwise the operand's own tensor
+        // type (a broadcast whole-tensor additional input).
+        let element = containers
+            .get(&src)
+            .and_then(ValueType::as_sequence_element)
+            .and_then(ValueType::as_tensor)
+            .and_then(TensorType::to_type_info)
+            .or_else(|| types.get(&src).cloned());
+        if let Some(type_info) = element {
+            let dims = lower_shape(&type_info.shape, interner);
+            set_body_input(body, dst, type_info.dtype, dims);
+        }
+    }
+}
+
 /// Build container-typed seeds for a control-flow body's formal inputs from the
-/// owning node's *container* operands, keyed by body-input [`ValueId`]. Only
-/// `Loop` carried dependencies are threaded today: an `If` branch takes no
-/// formal inputs (it reads the outer scope by name), and `Scan` container state
-/// variables are a deferred #449 follow-up (inc3b). Empty when the node has no
-/// container operands, which keeps the tensor path byte-identical.
+/// owning node's *container* operands, keyed by body-input [`ValueId`]. Covers
+/// `Loop` carried dependencies, `Scan` container **state** variables, and
+/// `SequenceMap` operands whose per-element type is itself a container (a
+/// sequence of sequences). An `If` branch takes no formal inputs (it reads the
+/// outer scope by name). Empty when the node has no container operands, which
+/// keeps the tensor path byte-identical.
 fn body_container_seeds(
     node: &Node,
     attr_name: &str,
@@ -627,26 +678,73 @@ fn body_container_seeds(
     containers: &HashMap<ValueId, ValueType>,
     version: u64,
 ) -> HashMap<ValueId, ValueType> {
-    let _ = version;
     let mut seeds = HashMap::new();
-    if !node.is_default_domain() || attr_name != "body" || node.op_type != "Loop" {
+    if !node.is_default_domain() || attr_name != "body" {
         return seeds;
     }
-    // Body inputs are (iter_num, cond_in, v_1..v_N); carried operand `2 + i`
-    // seeds carried body input `2 + i`.
-    let carried = body.inputs.len().saturating_sub(2);
-    for i in 0..carried {
-        let Some(src) = node_input(node, 2 + i) else {
-            continue;
-        };
-        let Some(value_type) = containers.get(&src) else {
-            continue;
-        };
-        if let Some(&dst) = body.inputs.get(2 + i) {
-            seeds.insert(dst, value_type.clone());
+    match node.op_type.as_str() {
+        // Body inputs are (iter_num, cond_in, v_1..v_N); carried operand `2 + i`
+        // seeds carried body input `2 + i`.
+        "Loop" => {
+            let carried = body.inputs.len().saturating_sub(2);
+            for i in 0..carried {
+                seed_container_input(node, body, containers, 2 + i, 2 + i, &mut seeds);
+            }
         }
+        // The first `num_state` body inputs are loop-state variables, bound to
+        // node operands `0..num_state`; a container state var seeds its input.
+        "Scan" if version >= 9 => {
+            if let Some(num_scan) = scan_num_scan_inputs(node, body.inputs.len()) {
+                let num_state = body.inputs.len() - num_scan;
+                for i in 0..num_state {
+                    seed_container_input(node, body, containers, i, i, &mut seeds);
+                }
+            }
+        }
+        // Body input `i` takes the per-element type of operand `i`; a container
+        // element (a sequence of sequences) seeds the body input as a container.
+        "SequenceMap" => {
+            for i in 0..body.inputs.len() {
+                let Some(src) = node_input(node, i) else {
+                    continue;
+                };
+                let Some(element) = containers
+                    .get(&src)
+                    .and_then(ValueType::as_sequence_element)
+                else {
+                    continue;
+                };
+                if !matches!(element, ValueType::Tensor(_))
+                    && let Some(&dst) = body.inputs.get(i)
+                {
+                    seeds.insert(dst, element.clone());
+                }
+            }
+        }
+        _ => {}
     }
     seeds
+}
+
+/// Seed body input `body_idx` from node operand `operand_idx` when that operand
+/// carries a container type (shared by `Loop` carried deps and `Scan` state).
+fn seed_container_input(
+    node: &Node,
+    body: &Graph,
+    containers: &HashMap<ValueId, ValueType>,
+    operand_idx: usize,
+    body_idx: usize,
+    seeds: &mut HashMap<ValueId, ValueType>,
+) {
+    let Some(src) = node_input(node, operand_idx) else {
+        return;
+    };
+    let Some(value_type) = containers.get(&src) else {
+        return;
+    };
+    if let Some(&dst) = body.inputs.get(body_idx) {
+        seeds.insert(dst, value_type.clone());
+    }
 }
 
 /// The first symbol id strictly above every symbol appearing in a seeded
@@ -1035,6 +1133,15 @@ fn infer_scan_outputs(
             outputs.push(CfOutput::Unresolved);
             continue;
         };
+        // A loop-state slot (slot < num_state) can be a container; scan-output
+        // slots stack tensors and are never containers.
+        if slot < num_state
+            && let Some(value_type) = result.report.containers.get(&body_output)
+        {
+            let mapped = map_container_to_parent(value_type, &result.parent_symbols, interner);
+            outputs.push(CfOutput::Container(mapped));
+            continue;
+        }
         match read_body_output(body, body_output, &resolved, &parent_symbols, interner) {
             Ok((dtype, mut shape)) => {
                 if slot >= num_state {
@@ -1076,6 +1183,58 @@ fn scan_sequence_length(
     length.unwrap_or_else(|| interner.fresh_dim())
 }
 
+/// Map a `SequenceMap` body's outputs onto the node's outputs: each body output
+/// `j` (a per-element tensor, or a container for a seq-of-seq body) is wrapped as
+/// `Sequence<body_output_j>` — the sequence the body produces one element of per
+/// iteration. Body inputs were already seeded with each operand's per-element
+/// type by [`seed_sequence_map_body`]/[`body_container_seeds`], so this only
+/// wraps the inferred body outputs, reusing the same read-back + parent-remap
+/// helpers as `Loop`/`Scan`.
+fn infer_sequence_map_outputs(
+    graph: &Graph,
+    node: &Node,
+    subgraph_results: &HashMap<String, ScopedInference>,
+    interner: &mut SymbolInterner,
+) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
+    let key = (node.id, "body".to_string());
+    let Some(body) = graph.subgraphs.get(&key) else {
+        return Ok(None);
+    };
+    let Some(result) = subgraph_results.get("body") else {
+        return Ok(None);
+    };
+    let resolved: HashSet<_> = result.report.resolved.iter().copied().collect();
+    let parent_symbols = body_parent_symbols(body);
+
+    let mut outputs = Vec::with_capacity(node.outputs.len());
+    for slot in 0..node.outputs.len() {
+        let Some(&body_output) = body.outputs.get(slot) else {
+            outputs.push(CfOutput::Unresolved);
+            continue;
+        };
+        // A seq-of-seq body output is itself a container element; otherwise the
+        // element is the body output's tensor type. Either way the SequenceMap
+        // output is that element wrapped one level in a `Sequence`.
+        if let Some(value_type) = result.report.containers.get(&body_output) {
+            let element = map_container_to_parent(value_type, &result.parent_symbols, interner);
+            outputs.push(CfOutput::Container(ValueType::sequence(element)));
+            continue;
+        }
+        match read_body_output(body, body_output, &resolved, &parent_symbols, interner) {
+            Ok((dtype, shape)) => {
+                let element = ValueType::Tensor(TensorType::new(dtype, shape));
+                outputs.push(CfOutput::Container(ValueType::sequence(element)));
+            }
+            Err(CfOutput::UnknownRank(dtype)) => {
+                let element = ValueType::Tensor(TensorType::dtype_only(dtype));
+                outputs.push(CfOutput::Container(ValueType::sequence(element)));
+            }
+            Err(other) => outputs.push(other),
+        }
+    }
+    Ok(Some(outputs))
+}
+
 /// Seed every explicitly known value type, including intermediate `value_info`.
 ///
 /// A producer rule can overwrite this seed with a freshly inferred type. If the
@@ -1108,6 +1267,7 @@ fn bind_captures(
     scope: &ScopeBindings,
     types: &mut HashMap<ValueId, TypeInfo>,
     shape_data: &mut HashMap<ValueId, ShapeData>,
+    containers: &mut HashMap<ValueId, ValueType>,
 ) {
     let formal_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
     for (vid, value) in graph.values.iter() {
@@ -1128,6 +1288,11 @@ fn bind_captures(
         }
         if let Some(data) = &binding.shape_data {
             shape_data.insert(vid, data.clone());
+        }
+        // A captured container (e.g. a sequence referenced from an outer scope)
+        // resolves to its element type inside this body.
+        if let Some(value_type) = &binding.value_type {
+            containers.insert(vid, value_type.clone());
         }
     }
 }
@@ -1197,10 +1362,58 @@ fn remap_node_io(
                 .collect();
             data
         }),
-        // Container edges are not yet propagated across subgraph scope
-        // boundaries (a documented #449 follow-up); tensor scope capture is
-        // unchanged.
-        value_type: None,
+        // A captured container edge (a sequence referenced by name from an outer
+        // scope) threads its `ValueType` through the same parent->child symbol
+        // remap as the tensor path, so a body sees the element type.
+        value_type: io
+            .value_type
+            .as_ref()
+            .map(|vt| remap_container_type(vt, interner, parent_to_child, child_to_parent)),
+    }
+}
+
+/// Parent->child remap of a captured container [`ValueType`], recursing into the
+/// element type and remapping every tensor-leaf element-shape symbol through the
+/// same [`remap_dim_expr`] the tensor capture path uses. The mirror image of
+/// [`map_container_to_parent`] (child->parent), used when a subgraph captures an
+/// outer-scope container by name.
+fn remap_container_type(
+    value_type: &ValueType,
+    interner: &mut SymbolInterner,
+    parent_to_child: &mut HashMap<SymbolId, SymbolId>,
+    child_to_parent: &mut HashMap<SymbolId, SymbolId>,
+) -> ValueType {
+    match value_type {
+        ValueType::Tensor(tensor) => ValueType::Tensor(TensorType {
+            dtype: tensor.dtype,
+            shape: tensor.shape.as_ref().map(|shape| {
+                shape
+                    .iter()
+                    .map(|dim| remap_dim_expr(dim, interner, parent_to_child, child_to_parent))
+                    .collect()
+            }),
+        }),
+        ValueType::Sequence(inner) => ValueType::sequence(remap_container_type(
+            inner,
+            interner,
+            parent_to_child,
+            child_to_parent,
+        )),
+        ValueType::Optional(inner) => ValueType::Optional(Box::new(remap_container_type(
+            inner,
+            interner,
+            parent_to_child,
+            child_to_parent,
+        ))),
+        ValueType::Map(key, inner) => ValueType::Map(
+            *key,
+            Box::new(remap_container_type(
+                inner,
+                interner,
+                parent_to_child,
+                child_to_parent,
+            )),
+        ),
     }
 }
 
@@ -1228,6 +1441,7 @@ fn extend_visible_scope(
     graph: &Graph,
     types: &HashMap<ValueId, TypeInfo>,
     shape_data: &HashMap<ValueId, ShapeData>,
+    containers: &HashMap<ValueId, ValueType>,
     scope: &mut ScopeBindings,
     values: impl IntoIterator<Item = ValueId>,
     interner: &mut SymbolInterner,
@@ -1239,26 +1453,37 @@ fn extend_visible_scope(
         let Some(name) = value.name.as_ref() else {
             continue;
         };
-        let binding = types.get(&vid).map(|type_info| NodeIo {
-            type_info: Some(TypeInfo::new(
+        let type_info = types.get(&vid).map(|type_info| {
+            TypeInfo::new(
                 type_info.dtype,
                 type_info
                     .shape
                     .iter()
                     .map(|dim| DimExpr::from(interner.lower(dim)))
                     .collect(),
-            )),
-            shape_data: shape_data.get(&vid).map(|data| {
-                let mut data = data.clone();
-                data.elems = data
-                    .elems
-                    .iter()
-                    .map(|dim| DimExpr::from(interner.lower(dim)))
-                    .collect();
-                data
-            }),
-            value_type: None,
+            )
         });
+        let shape_data = shape_data.get(&vid).map(|data| {
+            let mut data = data.clone();
+            data.elems = data
+                .elems
+                .iter()
+                .map(|dim| DimExpr::from(interner.lower(dim)))
+                .collect();
+            data
+        });
+        // Publish an outer-produced container (e.g. a `SequenceConstruct` result
+        // later referenced inside a sibling subgraph) so capture threads it.
+        let value_type = containers.get(&vid).cloned();
+        let binding = if type_info.is_some() || shape_data.is_some() || value_type.is_some() {
+            Some(NodeIo {
+                type_info,
+                shape_data,
+                value_type,
+            })
+        } else {
+            None
+        };
         scope.insert(name.clone(), binding);
     }
 }
