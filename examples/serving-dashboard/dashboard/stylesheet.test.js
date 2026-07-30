@@ -42,7 +42,70 @@ const PANEL_FILES = [
   'kv-memory.js',
   'requests.js',
   'system.js',
+  // Renders into a panel body and requests `server.model_id`, but sits in `ui/`
+  // rather than `dashboard/`. Its CLASSES were always styled; its FIELD PATH was
+  // reconciled by nothing until the corpus check below derived this list from the
+  // code instead of trusting it.
+  '../ui/model-card.js',
 ];
+
+/**
+ * Comments are stripped before any path is scraped. A comment explaining why a
+ * panel deliberately does NOT read a field would otherwise be scraped as a real
+ * binding — the audit would flag the documentation of a decision as a defect.
+ *
+ * Shares its shape with the same helper in `field-keys.test.js`; the two audits
+ * scrape the same corpus and must not disagree about what counts as code.
+ *
+ * @param {string} source
+ * @returns {string}
+ */
+function stripJsComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
+/**
+ * Panels may BUILD a field path instead of writing it, but only if this audit
+ * knows the rule that reconstructs it.
+ *
+ * A template literal is opaque to a literal-scanner, and a scanner that shrugs
+ * at what it cannot read reports "nothing wrong here" and "I could not look
+ * here" in the identical green. `throughput.js` has built its latency paths
+ * this way the whole time; the expansion below existed but was keyed to a
+ * COINCIDENCE — it happened to also scrape `prefix:`. Nothing failed if the
+ * template changed shape.
+ */
+const DYNAMIC_PATH_SITES = new Map([
+  [
+    'throughput.js',
+    {
+      rule:
+        'latency rows build `${definition.prefix}_${percentile}`; expanded from each ' +
+        '`prefix:` crossed with the percentile suffixes',
+      expand: (source) => {
+        const paths = [];
+        for (const match of source.matchAll(/prefix: '([A-Za-z0-9_.-]+)'/g)) {
+          for (const percentile of ['p50', 'p95', 'max']) paths.push(`${match[1]}_${percentile}`);
+        }
+        return paths;
+      },
+    },
+  ],
+  [
+    'model-card.js',
+    {
+      rule:
+        'CARD_FIELDS rows are relayed to `field(key)` by the render loop; expanded ' +
+        'from each `key:` entry in that table',
+      expand: (source) => [...source.matchAll(/key: '([A-Za-z0-9_.-]+)'/g)].map((m) => m[1]),
+    },
+  ],
+]);
+
+/** A forwarder takes a path from its caller and relays it; it originates none. */
+const PATH_FORWARDERS = new Map([
+  ['store-adapter.js', 'generic adapter; every `key` is a parameter supplied by a panel'],
+]);
 
 /**
  * Look a panel up by its own `meta.id` rather than by position.
@@ -237,19 +300,26 @@ describe('stylesheet contract', () => {
     // is checked against the paths extracted from the panel sources.
     const requested = new Set();
     for (const file of PANEL_FILES) {
-      const source = readFileSync(fileURLToPath(new URL(`./${file}`, import.meta.url)), 'utf8');
+      const source = stripJsComments(
+        readFileSync(fileURLToPath(new URL(`./${file}`, import.meta.url)), 'utf8'),
+      );
       // Character class DELIBERATELY WIDER than the keys we ship: a narrow
       // `[a-z0-9_.]` SKIPS a malformed key rather than flagging it, and a
       // skipped key is scored as a clean panel.
-      for (const match of source.matchAll(/\bfield\('([A-Za-z0-9_.-]+)'\)/g)) {
+      //
+      // The trailing `\)` is gone for the same reason it was wrong to be there:
+      // it made `field('x', opts)` invisible, and an invisible path is scored
+      // as a clean panel exactly like a malformed one.
+      for (const match of source.matchAll(/\bfield\(\s*'([A-Za-z0-9_.-]+)'/g)) {
         requested.add(match[1]);
       }
-      // Latency rows are assembled as `${prefix}_${percentile}`; expand them.
-      for (const match of source.matchAll(/prefix: '([A-Za-z0-9_.-]+)'/g)) {
-        for (const percentile of ['p50', 'p95', 'max']) {
-          requested.add(`${match[1]}_${percentile}`);
-        }
-      }
+      // Paths this file BUILDS rather than writes, expanded by its DECLARED rule.
+      // Keyed to the rule, not to whichever scrape happened to work: the guard
+      // below goes red the day a panel builds a path no rule here explains.
+      const site = DYNAMIC_PATH_SITES.get(file.replace('../ui/', ''));
+      for (const path of site ? site.expand(source) : []) requested.add(path);
+      // Latency rows are assembled as `${prefix}_${percentile}`; that expansion now
+      // lives in DYNAMIC_PATH_SITES above, keyed to throughput.js by a stated rule.
     }
 
     const missing = [...requested].filter((path) => !(path in MEASURED_FIELDS)).sort();
@@ -258,6 +328,95 @@ describe('stylesheet contract', () => {
       missing,
       [],
       `the fixture never supplies these paths, so they render unavailable: ${missing.join(', ')}`,
+    );
+  });
+
+  it('every declared build rule actually reconstructs paths', () => {
+    // A NON-ZERO FLOOR PER RULE, not just over the total. Measured: breaking
+    // throughput.js's expansion so it returned NOTHING left all thirteen tests
+    // green -- the aggregate floor of 30 had enough slack to absorb fifteen
+    // vanished latency paths. An expansion that silently yields nothing is the
+    // same defect as a scanner that silently skips: the panel is scored clean
+    // because it was never read.
+    const empty = [];
+    for (const file of PANEL_FILES) {
+      const name = file.replace('../ui/', '');
+      const site = DYNAMIC_PATH_SITES.get(name);
+      if (!site) continue;
+      const source = stripJsComments(
+        readFileSync(fileURLToPath(new URL(`./${file}`, import.meta.url)), 'utf8'),
+      );
+      if (site.expand(source).length === 0) empty.push(`${name} (${site.rule})`);
+    }
+    assert.deepEqual(
+      empty,
+      [],
+      `${empty.join('; ')} — the declared rule reconstructed NO path. Either the panel ` +
+        'stopped building paths, or the rule no longer matches how it builds them. ' +
+        'Until this is fixed those paths are reconciled against nothing.',
+    );
+  });
+
+  it('fails loudly on a panel that builds a field path by a rule this audit does not know', () => {
+    // The defect this reconciliation exists to prevent, aimed at the reconciliation
+    // itself. The check above scrapes LITERALS. A path built at runtime is invisible
+    // to it, and an invisible path is indistinguishable from an absent one -- so the
+    // fixture check scores a panel it never read as a panel with nothing to fix.
+    //
+    // Tests for ANY non-literal first argument, not just a backtick. A bare
+    // `field(key)` is exactly as opaque to a literal-scanner as `field(`${x}`)`,
+    // and for the same reason; matching only the one opaque shape somebody
+    // happened to think of is how the previous version stayed green.
+    const unexplained = [];
+    for (const file of PANEL_FILES) {
+      const name = file.replace('../ui/', '');
+      if (DYNAMIC_PATH_SITES.has(name) || PATH_FORWARDERS.has(name)) continue;
+      const source = stripJsComments(
+        readFileSync(fileURLToPath(new URL(`./${file}`, import.meta.url)), 'utf8'),
+      );
+      const opaque = [...source.matchAll(/\.(?:field|series)\(\s*([^'"\s)][^,)]*)/g)];
+      if (opaque.length > 0) unexplained.push(`${file} (${opaque[0][1].trim()})`);
+    }
+    assert.deepEqual(
+      unexplained,
+      [],
+      `${unexplained.join(', ')} build a field path this audit cannot read. Declare the ` +
+        'rule in DYNAMIC_PATH_SITES so the expansion above is keyed to a STATED rule ' +
+        'rather than to a coincidence, or add it to PATH_FORWARDERS if it only relays ' +
+        'a caller-supplied path. Otherwise those paths are reconciled by nothing.',
+    );
+  });
+
+  it('reads every file that requests a field path', () => {
+    // ANTI-VACUITY, ONE LEVEL UP. Everything above is only as wide as PANEL_FILES,
+    // which is hand-maintained. This requirement is derived from the CODE and never
+    // from PANEL_FILES: a list checked against itself is a mirror, not an inventory,
+    // and deleting an entry would delete the assertion that notices.
+    //
+    // This found `ui/model-card.js` -- styled, rendered, requesting a real path, and
+    // outside this audit for as long as the audit has existed.
+    const inCorpus = new Set(PANEL_FILES.map((file) => file.replace('../ui/', '')));
+    const unread = [];
+    for (const [dir, prefix] of [
+      [fileURLToPath(new URL('./', import.meta.url)), ''],
+      [fileURLToPath(new URL('../ui/', import.meta.url)), 'ui/'],
+    ]) {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith('.js') || entry.name.endsWith('.test.js')) {
+          continue;
+        }
+        const source = stripJsComments(readFileSync(`${dir}${entry.name}`, 'utf8'));
+        if (!/\.(?:field|series)\(/.test(source)) continue;
+        if (inCorpus.has(entry.name) || PATH_FORWARDERS.has(entry.name)) continue;
+        unread.push(`${prefix}${entry.name}`);
+      }
+    }
+    assert.deepEqual(
+      unread,
+      [],
+      `${unread.join(', ')} request field paths but are outside this audit's corpus, so ` +
+        'the fixture is never checked against them. Add them to PANEL_FILES, or to ' +
+        'PATH_FORWARDERS with the reason they originate no path.',
     );
   });
 
