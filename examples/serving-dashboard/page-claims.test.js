@@ -102,6 +102,13 @@ describe("the page's claims about itself", () => {
       '<meta name="description">',
       /<meta\s+name="description"\s+content="([\s\S]*?)"/,
     ],
+    // The subtitle is the claim position the other two are PROXIES for. Title
+    // and description are read in link previews; this one is read by everyone
+    // who actually arrives, in the largest prose on the page, above every
+    // panel. It was missed for ~50 minutes precisely because it renders --
+    // the two positions nobody can see got audited first, and the visible one
+    // did not, because fixing `<meta>` FEELS like fixing the page's claims.
+    ['.app__subtitle', /<p class="app__subtitle">([\s\S]*?)<\/p>/],
   ];
 
   for (const [label, regex] of positions) {
