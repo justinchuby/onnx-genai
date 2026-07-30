@@ -48,6 +48,7 @@ import * as throughput from './throughput.js';
 /**
  * @typedef {object} RegisteredPanel
  * @property {string} id
+ * @property {string} title Human-readable, for the roving group's accessible name.
  * @property {PanelModule} module
  * @property {ReadonlyArray<ServerMode>} modes Server modes this panel can populate on.
  */
@@ -111,7 +112,18 @@ export function modesFor(module) {
  */
 export const PANELS = Object.freeze(
   [throughput, scheduling, kvMemory, requests, system].map((module) =>
-    Object.freeze({ id: module.meta.id, module, modes: modesFor(module) }),
+    // `title` is lifted out of `meta` deliberately. The shell naturally
+    // reaches for `panel.title`, and it silently read `undefined` for a while:
+    // every roving group was built with no accessible name, which is invisible
+    // on screen and only audible to a screen-reader user. Carrying the field
+    // the callers actually reach for is cheaper than expecting each of them to
+    // remember the extra hop through `.module.meta`.
+    Object.freeze({
+      id: module.meta.id,
+      title: module.meta.title,
+      module,
+      modes: modesFor(module),
+    }),
   ),
 );
 

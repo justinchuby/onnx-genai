@@ -77,7 +77,7 @@ export const RENDER_STATES = Object.freeze({
  * bundler, which this project does not have, and a hand-set flag is one someone
  * eventually ships in the wrong position.
  */
-const IS_DEVELOPMENT = typeof globalThis.process?.versions?.node === 'string';
+export const IS_DEVELOPMENT = typeof globalThis.process?.versions?.node === 'string';
 
 const STATE_ALIASES = Object.freeze({
   // BOTH SPELLINGS OF THE MEASURED STATE ARE ACCEPTED, DELIBERATELY.

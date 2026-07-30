@@ -242,6 +242,22 @@ describe('mountDashboard', () => {
         assert.ok(root.children.length > 0, 'a panel rendered nothing on the unavailable path');
       }
 
+      // AC29. Every panel is a roving group, and a group without an accessible
+      // name announces "group" and nothing else. This read `panel.title` while
+      // the registry only carried `{id, module, modes}`, so the label was
+      // `undefined` for every panel -- invisible on screen, and audible only to
+      // the people the group exists for.
+      for (const [id, root] of roots) {
+        assert.equal(root.getAttribute('role'), 'group', `${id} is not a group`);
+        const label = root.getAttribute('aria-label');
+        assert.ok(label, `${id}: roving group has no accessible name`);
+        assert.equal(
+          label,
+          panelById(id).title,
+          `${id}: the group is named something other than the panel's own title`,
+        );
+      }
+
       dashboard.unmount();
       assert.equal(subscriptions, 0, 'unmount left the store subscription behind');
     } finally {

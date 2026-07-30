@@ -22,6 +22,7 @@
 
 import {
   DEFAULT_STALE_CEILING_MS,
+  IS_DEVELOPMENT,
   RENDER_STATES,
   ageMsOf,
   formatAge,
@@ -1031,8 +1032,26 @@ function setRovingCursor(items, current) {
  */
 export function createRovingGroup(container, options = {}) {
   container.setAttribute('role', 'group');
-  if (options.label) {
-    container.setAttribute('aria-label', options.label);
+
+  // A `role="group"` with no accessible name is worse than no group at all: a
+  // screen reader announces "group" and the listener learns nothing, while the
+  // page looks perfect to everyone else. This shipped for a while because the
+  // shell passed `panel.title` and the registry had no `title` -- so `label`
+  // was `undefined`, the `if` quietly skipped, and every panel on the dashboard
+  // was an anonymous group.
+  //
+  // Refusing to build one is the only version of this that cannot recur. In a
+  // browser we still set the group up and complain loudly, because dropping a
+  // panel in front of a room is worse than an unnamed one.
+  const label = typeof options.label === 'string' ? options.label.trim() : '';
+  if (!label) {
+    const message =
+      'createRovingGroup requires a non-empty `label`: a role="group" with no ' +
+      'accessible name announces "group" and nothing else. Pass the panel title.';
+    if (IS_DEVELOPMENT) throw new Error(message);
+    console.error(`[dashboard] ${message}`);
+  } else {
+    container.setAttribute('aria-label', label);
   }
 
   const move = (delta, absolute) => {
