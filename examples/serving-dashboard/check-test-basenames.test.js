@@ -46,7 +46,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { basename } from 'node:path';
+import { basename, posix } from 'node:path';
 
 import { assertShippingTree, shipped, shippedPaths } from './shipping-tree.mjs';
 
@@ -349,6 +349,73 @@ function classifiedTests() {
     }));
 }
 
+function byNameTestReads(source) {
+  const found = [];
+  const uncommented = source.replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, '');
+  const readCalls = /\b(?:readFileSync|readFile|createReadStream)\s*\(([\s\S]*?)\)\s*;/g;
+
+  for (const [, argumentsSource] of uncommented.matchAll(readCalls)) {
+    let depth = 0;
+    let quote = null;
+    let escaped = false;
+    let firstArgumentEnd = argumentsSource.length;
+
+    for (let index = 0; index < argumentsSource.length; index += 1) {
+      const character = argumentsSource[index];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (character === '\\') {
+          escaped = true;
+        } else if (character === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (character === "'" || character === '"' || character === '`') {
+        quote = character;
+      } else if (character === '(' || character === '[' || character === '{') {
+        depth += 1;
+      } else if (character === ')' || character === ']' || character === '}') {
+        depth -= 1;
+      } else if (character === ',' && depth === 0) {
+        firstArgumentEnd = index;
+        break;
+      }
+    }
+
+    const firstArgument = argumentsSource.slice(0, firstArgumentEnd);
+    const pieces = [...firstArgument.matchAll(/(["'])(.*?)\1/gs)].map((match) => match[2]);
+    const testFileIndex = pieces.findIndex((piece) => piece.endsWith('.test.js'));
+    if (testFileIndex >= 0) found.push(posix.join(...pieces.slice(0, testFileIndex + 1)));
+  }
+  return found;
+}
+
+function byNameTestReadExists(readerPath, name, paths) {
+  const target = posix.normalize(posix.join(posix.dirname(readerPath), name));
+  return paths.includes(target);
+}
+
+function auditByNameTestReads(sources, paths) {
+  assert.ok(
+    sources.length > 0,
+    'The by-name test-read guard scanned an empty source corpus. An empty result proves nothing.',
+  );
+
+  const dangling = [];
+  const seen = [];
+  for (const { path, source } of sources) {
+    for (const name of byNameTestReads(source)) {
+      seen.push(`${path} -> ${name}`);
+      if (!byNameTestReadExists(path, name, paths)) {
+        dangling.push(`${path} reads '${name}', which is not shipped`);
+      }
+    }
+  }
+  return { dangling, seen };
+}
+
 describe('the check- test-file prefix', () => {
   it('THE RULE: a check- prefixed suite reads the repository as data', () => {
     // State it once, here, and enforce it. This is the direction of the rule
@@ -425,6 +492,51 @@ describe('the check- test-file prefix', () => {
     );
   });
 
+  it('rejects a by-name read whose directory is wrong even when its basename exists', () => {
+    assert.equal(
+      byNameTestReadExists(
+        'consumer.js',
+        'definitely-wrong-directory/absolute-path.test.js',
+        ['dashboard/absolute-path.test.js'],
+      ),
+      false,
+      'a matching basename in a different directory must not satisfy a path dependency',
+    );
+  });
+
+  it('recognizes a by-name test read split across multiple lines', () => {
+    const T = '.test' + '.js';
+    const found = byNameTestReads(
+      [
+        'const source = readFileSync(',
+        `  join(HERE, "dashboard/absolute-path${T}"),`,
+        '  "utf8",',
+        ');',
+      ].join('\n'),
+    );
+    assert.deepEqual(found, [`dashboard/absolute-path${T}`]);
+  });
+
+  it('recognizes both single-quoted and double-quoted by-name test reads', () => {
+    const T = '.test' + '.js';
+    assert.deepEqual(
+      byNameTestReads(
+        [
+          `const single = readFileSync('dashboard/field-keys${T}', 'utf8');`,
+          `const double = readFileSync("dashboard/absolute-path${T}", "utf8");`,
+        ].join('\n'),
+      ),
+      [`dashboard/field-keys${T}`, `dashboard/absolute-path${T}`],
+    );
+  });
+
+  it('fails closed when the by-name source corpus is empty', () => {
+    assert.throws(
+      () => auditByNameTestReads([], ['dashboard/field-keys.test.js']),
+      /scanned an empty source corpus/,
+    );
+  });
+
   it('every by-name reference to a test file resolves to a real file', () => {
     // THE LEAD'S PRECONDITION, ENFORCED RATHER THAN DOCUMENTED.
     //
@@ -443,37 +555,11 @@ describe('the check- test-file prefix', () => {
     // have to be re-tuned for every consumer. It asserts the target EXISTS.
     // That holds however the consumer behaves when the file is missing, which
     // makes it the stronger invariant of the two.
-    const dangling = [];
-    const seen = [];
-
-    // The extractor, factored out so the anti-vacuity control below can drive
-    // it with a synthetic fixture instead of depending on the corpus happening
-    // to contain a real by-name read.
-    const byNameTestReads = (source) => {
-      const found = [];
-      for (const line of source.split('\n')) {
-        // Only lines that actually READ a file by name. A prose cross-reference
-        // in a comment is not a functional dependency and must not be policed
-        // here — comments are how this codebase explains itself.
-        if (!/readFileSync|readFile\(|createReadStream/.test(line)) continue;
-        if (/^\s*(?:\/\/|\*)/.test(line)) continue;
-        for (const [, name] of line.matchAll(/'([^']*\.test\.js)'/g)) found.push(name);
-      }
-      return found;
-    };
-
-    for (const path of shippedPaths()) {
-      if (!/\.(?:js|mjs)$/.test(path)) continue;
-
-      for (const name of byNameTestReads(shipped(path))) {
-        seen.push(`${path} -> ${name}`);
-        const base = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
-        const exists = shippedPaths().some(
-          (p) => p === name || p.endsWith(`/${base}`) || p === base,
-        );
-        if (!exists) dangling.push(`${path} reads '${name}', which is not shipped`);
-      }
-    }
+    const paths = shippedPaths();
+    const sources = paths
+      .filter((path) => /\.(?:js|mjs)$/.test(path))
+      .map((path) => ({ path, source: shipped(path) }));
+    const { dangling, seen } = auditByNameTestReads(sources, paths);
 
     assert.deepEqual(
       dangling,
