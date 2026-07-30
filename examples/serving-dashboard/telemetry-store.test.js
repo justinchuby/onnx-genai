@@ -908,6 +908,85 @@ test('a stalled slow endpoint cannot block the fast lane or retain stale values'
   assert.equal(afterSlowTimeout.fields['server.context_length'].state, FIELD_STATES.UNAVAILABLE);
 });
 
+test('slow completion cannot roll a newer fast value or observation time backward', async () => {
+  let clock = 0;
+  let statusRequests = 0;
+  let releaseSlow;
+  const slowResponse = new Promise((resolve) => {
+    releaseSlow = resolve;
+  });
+  const routes = healthyRoutes();
+  const observedQueue = [];
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    pollIntervalMs: 100,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname;
+      if (path === ENDPOINTS.STATUS) {
+        statusRequests += 1;
+        clock = statusRequests * 1_000;
+        return jsonResponse(200, statusBody({ queue_depth: statusRequests }));
+      }
+      if (path === ENDPOINTS.DEBUG_CONFIG) {
+        return slowResponse;
+      }
+      return fakeFetch(routes)(url);
+    },
+  });
+  const unsubscribeObserved = store.subscribe((candidate) => {
+    const field = candidate.fields['queue.depth'];
+    if (field.state === FIELD_STATES.MEASURED) {
+      observedQueue.push({ value: field.value, observedAtMs: field.observedAtMs });
+    }
+  });
+  const waitForQueue = (value) =>
+    new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`queue.depth never reached ${value}`));
+      }, 2_000);
+      const unsubscribe = store.subscribe((candidate) => {
+        const field = candidate.fields['queue.depth'];
+        if (field.value !== value) return;
+        clearTimeout(timeout);
+        unsubscribe();
+        resolve(field);
+      });
+    });
+
+  try {
+    store.start();
+    const first = await waitForQueue(1);
+    const second = await waitForQueue(2);
+    releaseSlow(fakeFetch(routes)(`${BASE_URL}${ENDPOINTS.DEBUG_CONFIG}`));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const finalField = store.field('queue.depth');
+    assert.equal(first.value, 1);
+    assert.equal(second.value, 2);
+    assert.equal(
+      finalField.value,
+      2,
+      `slow completion rewrote queue.depth 1 -> 2 -> 1: ${JSON.stringify(observedQueue)}`,
+    );
+    assert.ok(
+      finalField.observedAtMs >= second.observedAtMs,
+      `slow completion moved observedAtMs backward from ${second.observedAtMs} to ` +
+        `${finalField.observedAtMs}`,
+    );
+    for (let index = 1; index < observedQueue.length; index += 1) {
+      assert.ok(
+        observedQueue[index].observedAtMs >= observedQueue[index - 1].observedAtMs,
+        `queue.depth freshness regressed: ${JSON.stringify(observedQueue)}`,
+      );
+    }
+  } finally {
+    unsubscribeObserved();
+    store.stop();
+  }
+});
+
 test('an HTML error page served at /metrics does not crash the store', async () => {
   // A proxy or a wrong port realistically returns HTML with a 200.
   const store = createTelemetryStore({

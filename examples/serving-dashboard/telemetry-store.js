@@ -439,10 +439,8 @@ export function createTelemetryStore({
     if (slowPollInFlight || snapshot.connection.state === CONNECTION_STATES.UNREACHABLE) return;
     slowPollInFlight = true;
     try {
-      latestSourceResults = {
-        ...latestSourceResults,
-        ...(await fetchSources(BACKGROUND_SLOW_ENDPOINTS)),
-      };
+      const slowResults = await fetchSources(BACKGROUND_SLOW_ENDPOINTS);
+      Object.assign(latestSourceResults, slowResults);
       publish(buildSnapshot(latestSourceResults));
     } finally {
       slowPollInFlight = false;
