@@ -149,10 +149,30 @@ const servedButNotNeeded = classified.filter(
 // author exempts their own contribution is not a ratchet, and the first
 // exemption is the one that teaches everyone else the number is negotiable.
 //
+// `absolute-path.mjs` (the OS-independent path detector shared by the
+// disclosure guards) and `absolute-path.test.js` (its two-directional table)
+// make it 87. A visitor may have both: the module is a pair of regexes over
+// filesystem-root NAMES, and the table is a list of INVENTED example paths --
+// `/home/presenter/...`, `C:\Users\presenter\...` -- that exist on no machine.
+// Neither discloses anything about this host. They replace a detector that
+// asked `text.includes('/Users/')`, which was blind to every non-macOS
+// disclosure.
+//
+// ⚠️ THE COUNT AT THE TIME OF THIS RAISE WAS 92, NOT 87, AND THAT IS
+// DELIBERATE. This assertion was ALREADY RED before either of my files
+// existed -- measured by removing them and re-running: 3 pass / 2 fail. Five
+// files I do not own entered the served directory ahead of me, three of them
+// claimed by no class at all (`clean-binary.sha256`,
+// `raw/qa-baseline-long512.json`, `raw/qa-baseline-nullab.json`). I am paying
+// for my two and no more. Raising this to 92 would have bought my commit a
+// green by publishing five other people's artefacts on their behalf, which is
+// precisely the decision this file exists to force somebody to make out loud.
+// The residual red is theirs, it is correct, and it must keep pointing at them.
+//
 // Raising it is therefore a NORMAL and expected part of adding a guard, and it
 // is not the same act as raising it to accommodate a new document or fixture.
 // The diff shows which one you did.
-const MAX_SERVED_BUT_NOT_NEEDED = 85;
+const MAX_SERVED_BUT_NOT_NEEDED = 87;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
