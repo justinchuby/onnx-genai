@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
-    Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
-    OpRegistry, Result, deny,
+    Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
+    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, deny,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -32,6 +32,12 @@ use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
+use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
+
+/// Default VRAM budget for the device weight-offload residency cache when
+/// `ONNX_GENAI_WEIGHT_OFFLOAD` is enabled without an explicit
+/// `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` override (4 GiB).
+pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
@@ -45,6 +51,12 @@ pub struct CudaExecutionProvider {
     initialized: bool,
     registry: OpRegistry,
     csa_metrics: Arc<CsaMetrics>,
+    /// Device weight-offload policy resolved from the environment. When enabled,
+    /// the EP advertises the `nxrt` weight-paging capability and pages lazy
+    /// weights host↔device on demand during dispatch.
+    offload_policy: DeviceOffloadPolicy,
+    /// LRU device residency cache. `Some` iff `offload_policy.enabled`.
+    residency: Option<Arc<CudaWeightResidency>>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -64,12 +76,21 @@ impl CudaExecutionProvider {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
+        let offload_policy = DeviceOffloadPolicy::from_env();
+        let residency = offload_policy.enabled.then(|| {
+            let budget = offload_policy
+                .device_budget_bytes
+                .unwrap_or(DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
+            Arc::new(CudaWeightResidency::new(runtime.clone(), budget))
+        });
         Ok(Self {
             device: DeviceId::cuda(ordinal),
             runtime,
             initialized: false,
             registry,
             csa_metrics,
+            offload_policy,
+            residency,
         })
     }
 
@@ -120,6 +141,24 @@ impl CudaExecutionProvider {
     ) -> crate::weight_paging::CudaWeightPager<'a, S> {
         crate::weight_paging::CudaWeightPager::new(Arc::clone(&self.runtime), source)
     }
+
+    /// Build a bounded-VRAM [`CudaWeightResidency`] (WEIGHT_OFFLOAD Phase 3b
+    /// page-in + eviction) sized by `budget_bytes`, sharing this EP's runtime.
+    pub fn weight_residency(&self, budget_bytes: u64) -> crate::weight_paging::CudaWeightResidency {
+        crate::weight_paging::CudaWeightResidency::new(Arc::clone(&self.runtime), budget_bytes)
+    }
+
+    /// Borrow the live device residency cache used to page lazy weights during
+    /// dispatch, or `None` when weight offload is disabled. Tests use this to
+    /// assert page-in / eviction counters after a decode.
+    pub fn residency(&self) -> Option<&Arc<CudaWeightResidency>> {
+        self.residency.as_ref()
+    }
+
+    /// The resolved device weight-offload policy for this EP.
+    pub fn offload_policy(&self) -> &DeviceOffloadPolicy {
+        &self.offload_policy
+    }
 }
 
 impl ExecutionProvider for CudaExecutionProvider {
@@ -133,6 +172,39 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn device_id(&self) -> DeviceId {
         self.device
+    }
+
+    /// Advertise the `nxrt` weight-paging capability only when device weight
+    /// offload is enabled. This is what makes the session build real lazy weight
+    /// handles for boundary-matched quantized weights; the default (offload off)
+    /// path keeps stock capabilities so the fast resident path is unchanged.
+    fn capabilities(&self) -> ExecutionProviderCapabilities {
+        if self.residency.is_some() {
+            ExecutionProviderCapabilities::nxrt_weight_paging()
+        } else {
+            ExecutionProviderCapabilities::stock()
+        }
+    }
+
+    /// Page a lazy weight into VRAM (or reuse a resident page) through the LRU
+    /// residency cache, returning a [`PagedWeight`] whose keep-alive pins the
+    /// device allocation for the kernel's lifetime. Returns `Ok(None)` when
+    /// offload is disabled so dispatch falls back to the resident path.
+    fn page_lazy_weight(&self, key: u64, weight: &LazyWeight) -> Result<Option<PagedWeight>> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(None);
+        };
+        let page = residency
+            .resident_materialized(key, weight)
+            .map_err(|error| EpError::KernelFailed(format!("weight offload page-in: {error}")))?;
+        let device_ptr = page.device_ptr();
+        let len = page.len();
+        Ok(Some(PagedWeight::new(
+            device_ptr,
+            self.device,
+            len,
+            page as Arc<dyn std::any::Any + Send + Sync>,
+        )))
     }
 
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {

@@ -253,3 +253,214 @@ fn offloaded_weight_wrong_region_diverges() {
         "corrupted paged weight must not match the resident output — test would be blind"
     );
 }
+
+/// Build one host mmap holding every weight in `bs` back-to-back after a padding
+/// prefix, plus a lazy weight per entry pointing at its region. All share one
+/// mapping so a single `CudaWeightResidency` can page every one of them.
+fn combined_weights(bs: &[Vec<f32>], k: usize, n: usize) -> (HostMmap, Vec<LazyWeight>) {
+    let mapping_id = 42;
+    let prefix = 256usize; // padding proves offset handling
+    let mut backing = vec![0xABu8; prefix];
+    let mut lazies = Vec::with_capacity(bs.len());
+    for b in bs {
+        let offset = backing.len();
+        let b_bytes = f32_bytes(b).to_vec();
+        let len = b_bytes.len();
+        backing.extend_from_slice(&b_bytes);
+        let region = ExternalMmapRegion {
+            mapping_id,
+            offset,
+            len,
+        };
+        let shape = vec![k, n];
+        let resident_bytes = b_bytes.clone();
+        let lazy =
+            LazyWeight::block_quantized_moe(DataType::Float32, shape.clone(), vec![region], {
+                let shape = shape.clone();
+                move || {
+                    ResidentWeight::new(DataType::Float32, shape.clone(), resident_bytes.clone())
+                }
+            })
+            .unwrap();
+        lazies.push(lazy);
+    }
+    (
+        HostMmap {
+            mapping_id,
+            bytes: backing,
+        },
+        lazies,
+    )
+}
+
+/// Live residency: paging under a one-page VRAM budget must page-in on a miss,
+/// reuse on a hit, evict LRU on pressure, and stay byte-identical to resident.
+#[test]
+fn residency_pages_in_reuses_and_evicts() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 + 0.125).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * -0.5 + 3.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    // Resident references for both weights.
+    let rt = ep.runtime();
+    let resident_out = |b: &[f32]| {
+        let buf = ep.allocate(std::mem::size_of_val(b), 256).unwrap();
+        // SAFETY: buffer sized for b's bytes.
+        unsafe { rt.htod(f32_bytes(b), cuptr(buf.as_ptr())).unwrap() }
+        let out = run_matmul_with_b_ptr(&ep, &a, buf.as_ptr(), m, k, n);
+        ep.deallocate(buf).unwrap();
+        out
+    };
+    let resident_b0 = resident_out(&b0);
+    let resident_b1 = resident_out(&b1);
+
+    // One-page budget: holding one weight fills the cache; a second evicts it.
+    let (host, lazies) = combined_weights(&[b0.clone(), b1.clone()], k, n);
+    let residency = ep.weight_residency(page_bytes);
+
+    // Miss on weight 0: one page-in, exactly one page resident.
+    let page0 = residency.resident(0, &lazies[0], &host).unwrap();
+    let out0 = run_matmul_with_b_ptr(&ep, &a, page0.device_ptr(), m, k, n);
+    assert_eq!(out0, resident_b0, "paged weight 0 must match resident");
+    let s = residency.stats();
+    assert_eq!(s.page_ins, 1);
+    assert_eq!(s.hits, 0);
+    assert_eq!(s.pages_resident, 1);
+    assert_eq!(s.resident_bytes, page_bytes);
+
+    // Hit on weight 0 while still held: reuse the *same* device pointer, no copy.
+    let page0_again = residency.resident(0, &lazies[0], &host).unwrap();
+    assert_eq!(page0_again.device_ptr(), page0.device_ptr());
+    let s = residency.stats();
+    assert_eq!(s.page_ins, 1, "cache hit must not page in");
+    assert_eq!(s.hits, 1);
+
+    // Release both handles so the cache is the page's sole owner and can evict.
+    drop(page0);
+    drop(page0_again);
+
+    // Miss on weight 1 under the one-page budget: weight 0 is evicted.
+    let page1 = residency.resident(1, &lazies[1], &host).unwrap();
+    let out1 = run_matmul_with_b_ptr(&ep, &a, page1.device_ptr(), m, k, n);
+    assert_eq!(out1, resident_b1, "paged weight 1 must match resident");
+    let s = residency.stats();
+    assert_eq!(s.page_ins, 2);
+    assert_eq!(s.evictions, 1, "one-page budget must evict the LRU page");
+    assert_eq!(s.pages_resident, 1);
+    assert_eq!(s.resident_bytes, page_bytes);
+    assert_eq!(s.peak_resident_bytes, page_bytes);
+}
+
+/// Use-safety: a page still referenced by a live handle is never evicted, even
+/// under budget pressure — the cache runs transiently over budget instead.
+#[test]
+fn residency_never_evicts_a_referenced_page() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    let (k, n) = (4usize, 2usize);
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) + 1.0).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * 2.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let (host, lazies) = combined_weights(&[b0, b1], k, n);
+    let residency = ep.weight_residency(page_bytes);
+
+    // Hold weight 0's handle across the admission of weight 1.
+    let _held = residency.resident(0, &lazies[0], &host).unwrap();
+    let _page1 = residency.resident(1, &lazies[1], &host).unwrap();
+
+    let s = residency.stats();
+    assert_eq!(s.evictions, 0, "a referenced page must not be evicted");
+    assert_eq!(s.pages_resident, 2);
+    assert_eq!(
+        s.resident_bytes,
+        2 * page_bytes,
+        "both pages stay resident, transiently over budget"
+    );
+}
+
+/// Live-dispatch path: `resident_materialized` (the entry point the CUDA EP's
+/// `page_lazy_weight` calls) must materialize a lazy weight's canonical bytes,
+/// stream them host→device, evict under a tiny budget, and stay byte-identical
+/// to the resident upload. Also proves the process-global counters advance so an
+/// opaque end-to-end run can observe that paging really happened.
+#[test]
+fn residency_materialized_pages_evicts_and_matches_resident() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 + 0.125).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * -0.5 + 3.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let rt = ep.runtime();
+    let resident_out = |b: &[f32]| {
+        let buf = ep.allocate(std::mem::size_of_val(b), 256).unwrap();
+        // SAFETY: buffer sized for b's bytes.
+        unsafe { rt.htod(f32_bytes(b), cuptr(buf.as_ptr())).unwrap() }
+        let out = run_matmul_with_b_ptr(&ep, &a, buf.as_ptr(), m, k, n);
+        ep.deallocate(buf).unwrap();
+        out
+    };
+    let resident_b0 = resident_out(&b0);
+    let resident_b1 = resident_out(&b1);
+
+    let (_host, lazies) = combined_weights(&[b0.clone(), b1.clone()], k, n);
+    let residency = ep.weight_residency(page_bytes);
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+
+    // Miss on weight 0 via the materialized (no MmapRegionSource) path.
+    let page0 = residency.resident_materialized(0, &lazies[0]).unwrap();
+    let out0 = run_matmul_with_b_ptr(&ep, &a, page0.device_ptr(), m, k, n);
+    assert_eq!(
+        out0, resident_b0,
+        "materialized weight 0 must match resident"
+    );
+    assert_eq!(page0.len() as u64, page_bytes);
+    drop(page0);
+
+    // Miss on weight 1 under the one-page budget evicts weight 0.
+    let page1 = residency.resident_materialized(1, &lazies[1]).unwrap();
+    let out1 = run_matmul_with_b_ptr(&ep, &a, page1.device_ptr(), m, k, n);
+    assert_eq!(
+        out1, resident_b1,
+        "materialized weight 1 must match resident"
+    );
+
+    let stats = residency.stats();
+    assert_eq!(stats.page_ins, 2, "each miss must page in");
+    assert_eq!(
+        stats.evictions, 1,
+        "one-page budget must evict the LRU page"
+    );
+    assert_eq!(stats.pages_resident, 1);
+
+    let global = onnx_runtime_ep_cuda::global_offload_stats();
+    assert!(
+        global.page_ins >= 2 && global.evictions >= 1,
+        "process-global counters must observe paging: {global:?}"
+    );
+}

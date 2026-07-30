@@ -363,6 +363,24 @@ pub trait ExecutionProvider: Send + Sync {
         ExecutionProviderCapabilities::stock()
     }
 
+    /// Page a lazy weight into device memory for live dispatch (WEIGHT_OFFLOAD
+    /// Phase 3b). Returns a [`crate::PagedWeight`] whose device pointer the
+    /// executor substitutes into the weight's input view; the binding must be
+    /// held for the kernel's lifetime so the residency is not reclaimed early.
+    ///
+    /// `key` is a stable per-weight identity (the executor passes the
+    /// initializer's value id) an EP may use to cache/evict residency across
+    /// decode steps. The default returns `None`: stock EPs never receive lazy
+    /// handles and the executor falls back to the host-materialization route.
+    fn page_lazy_weight(
+        &self,
+        key: u64,
+        weight: &crate::LazyWeight,
+    ) -> Result<Option<crate::PagedWeight>> {
+        let _ = (key, weight);
+        Ok(None)
+    }
+
     /// Initialize device resources / load libraries.
     fn initialize(&mut self, config: &EpConfig) -> Result<()>;
     /// Release device resources.

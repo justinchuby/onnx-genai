@@ -333,17 +333,12 @@ impl Executor {
         )?;
 
         let capabilities = self.ep.capabilities();
-        let accepts_lazy_weights =
-            LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
-        let has_lazy_inputs = accepts_lazy_weights
-            && inputs.iter().any(|input| {
-                input
-                    .and_then(|value| self.weight_handles.get(&value))
-                    .is_some_and(|handle| handle.is_lazy_for(&capabilities))
-            });
+        let accepts_lazy_weights = LazyWeightBoundary::matches_any(&node.domain, &node.op_type);
 
         // Resolve each input's real geometry (root buffer + strides/offset) and
-        // bounds-check it while only shared borrows of `self` are live.
+        // bounds-check it while only shared borrows of `self` are live. Lazy
+        // weights the EP can page are uploaded here and bound as normal device
+        // views; ones it declines stay absent and are flagged `lazy_unresolved`.
         let in_infos = self.build_input_bindings(
             inputs,
             input_dtypes,
@@ -352,6 +347,10 @@ impl Executor {
             accepts_lazy_weights,
             &capabilities,
         )?;
+
+        // Only inputs the EP could NOT page remain "lazy" for kernel dispatch;
+        // paged weights now have concrete views and take the normal compute path.
+        let has_lazy_inputs = in_infos.iter().any(|info| info.lazy_unresolved);
 
         let ep = self.ep.clone();
 
@@ -773,6 +772,8 @@ impl Executor {
                     device: self.ep.device_id(),
                     backing: TensorBacking::Opaque,
                     root_len: 0,
+                    lazy_unresolved: false,
+                    paged: None,
                 });
                 continue;
             };
@@ -793,6 +794,8 @@ impl Executor {
                     device: value.device,
                     backing: TensorBacking::Opaque,
                     root_len: value.len,
+                    lazy_unresolved: false,
+                    paged: None,
                 });
                 continue;
             }
@@ -821,26 +824,58 @@ impl Executor {
                     device: elem.device(),
                     backing: TensorBacking::Opaque,
                     root_len,
+                    lazy_unresolved: false,
+                    paged: None,
                 });
                 continue;
             }
             if accepts_lazy_weights
-                && self
+                && let Some(lazy) = self
                     .weight_handles
                     .get(&vid)
-                    .is_some_and(|handle| handle.is_lazy_for(capabilities))
+                    .filter(|handle| handle.is_lazy_for(capabilities))
+                    .and_then(|handle| handle.as_lazy())
             {
-                in_infos.push(InInfo {
-                    present: false,
-                    dtype: input_dtypes[i],
-                    shape: input_shapes[i].clone(),
-                    strides: compute_contiguous_strides(&input_shapes[i]),
-                    byte_offset: 0,
-                    base_ptr: std::ptr::null(),
-                    device: self.ep.device_id(),
-                    backing: TensorBacking::Opaque,
-                    root_len: 0,
-                });
+                // Ask the EP to page this lazy weight into device memory (or reuse
+                // a resident page). On success we bind a normal device view over
+                // the paged bytes and keep the page pinned for the kernel's
+                // lifetime via `paged`. On `None` (EP can't page) the input stays
+                // absent and is routed to the kernel as a lazy `KernelInput::Weight`.
+                let paged = self.ep.page_lazy_weight(vid.0 as u64, lazy)?;
+                match paged {
+                    Some(paged) => {
+                        let shape = input_shapes[i].clone();
+                        let strides = compute_contiguous_strides(&shape);
+                        in_infos.push(InInfo {
+                            present: true,
+                            dtype: input_dtypes[i],
+                            shape,
+                            strides,
+                            byte_offset: 0,
+                            base_ptr: paged.device_ptr(),
+                            device: paged.device(),
+                            backing: TensorBacking::Opaque,
+                            root_len: paged.len(),
+                            lazy_unresolved: false,
+                            paged: Some(paged),
+                        });
+                    }
+                    None => {
+                        in_infos.push(InInfo {
+                            present: false,
+                            dtype: input_dtypes[i],
+                            shape: input_shapes[i].clone(),
+                            strides: compute_contiguous_strides(&input_shapes[i]),
+                            byte_offset: 0,
+                            base_ptr: std::ptr::null(),
+                            device: self.ep.device_id(),
+                            backing: TensorBacking::Opaque,
+                            root_len: 0,
+                            lazy_unresolved: true,
+                            paged: None,
+                        });
+                    }
+                }
                 continue;
             }
             let root = self.root_of(vid);
@@ -882,6 +917,8 @@ impl Executor {
                 device: buf.device(),
                 backing,
                 root_len,
+                lazy_unresolved: false,
+                paged: None,
             });
         }
         drop(_build_inputs_span);
@@ -1298,11 +1335,17 @@ impl KernelDispatchContext<'_> {
                 .iter()
                 .zip(views.iter().copied())
                 .map(|(value, view)| {
-                    value
+                    // A lazy weight the EP paged into device memory already has a
+                    // concrete device view, so route it as a normal tensor. Only
+                    // an unresolved lazy weight (absent view) is handed to the
+                    // kernel as `KernelInput::Weight` for host-side materialization.
+                    let lazy_handle = value
                         .and_then(|value| self.weight_handles.get(&value))
-                        .filter(|handle| handle.is_lazy_for(capabilities))
-                        .map(KernelInput::Weight)
-                        .unwrap_or(KernelInput::Tensor(view))
+                        .filter(|handle| handle.is_lazy_for(capabilities));
+                    match lazy_handle {
+                        Some(handle) if view.is_absent() => KernelInput::Weight(handle),
+                        _ => KernelInput::Tensor(view),
+                    }
                 })
                 .collect::<Vec<_>>()
         });
