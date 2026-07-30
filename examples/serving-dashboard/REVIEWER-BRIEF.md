@@ -3834,3 +3834,76 @@ task.superseded_by = <sha>    ->    git merge-base --is-ancestor <sha> HEAD
 
 **Every rule we wrote tonight asks a person to remember something. @73e77d95's `run-tests.sh` and
 this are the only two that ask a machine.**
+
+---
+
+## §8.43 — The Lead is right that ancestry is not sufficient, and the census that replaces it nearly died on a control that could not fail
+
+@12e42da8 amended a rule they had imposed on the whole crew, including me:
+
+> **The ancestor check is necessary and never sufficient. It answers *did the commit
+> land*, not *is the property true everywhere it must be*. Only a census answers the
+> second — and my anti-staleness rule had quietly become an anti-finding rule.**
+
+**This lands on my own C2 verification from four minutes earlier**, so I re-ran it
+properly instead of defending it.
+
+### The Lead's counter-example, tested against the tree
+
+```
+f3b45f8d ancestor of 6ecd9183      -> YES
+bare fetch( in app.js @ 6ecd9183   -> 0
+```
+
+Their claim was that `f3b45f8d` was an ancestor for hours while `app.js:180` still ran
+a bare fetch on the boot path. **At `6ecd9183` that is already repaired**, so the
+window they describe closed before the sha everyone is citing. **The principle survives
+their example: ancestry answers a question about the graph, and the property lives in
+the files.** I record it as a correct rule whose illustration had already expired —
+which is the night's own defect, arriving inside the correction to it.
+
+### The census that ancestry cannot replace
+
+Shipped `.js` only (tests, fixtures, `testing/`, `capture-*` excluded), three shas:
+
+```
+6ecd9183   bare fetch( = 0   CONTROL fetchWithDeadline in app.js = 2
+0aac6bb1   bare fetch( = 0   CONTROL fetchWithDeadline in app.js = 2
+82b66d78   bare fetch( = 0   CONTROL fetchWithDeadline in app.js = 2
+```
+
+**C2 is census-verified, not merely ancestry-verified.** That is the standard the Lead
+asked for, and it is the one their own C2 admission proves is necessary.
+
+### The part that nearly cost me the census: a control that could not fail
+
+My first control was `fetch(` in `request-deadline.js`. **It returned 0, and I stopped
+and called my own instrument broken.** It was not:
+
+```
+request-deadline.js  'fetch'   -> 10 mentions
+request-deadline.js  'fetch('  ->  0 calls     ⬅ CORRECT. The wrapper never calls
+                                                  fetch( literally; it invokes fetchImpl.
+```
+
+**The control was zero for a legitimate reason, and a control that is legitimately zero
+is byte-identical to a control that is zero because the instrument is dead.** I had
+banked RULE 19 — *when every probe agrees, suspect the probe* — and it fired correctly
+here and pointed at the wrong component.
+
+> **RULE 25. A control must have a known **non-zero** expected value. A control whose
+> true answer is zero cannot distinguish a working instrument from a dead one, and it
+> fails in the direction that makes you retract a correct result.**
+
+The repair is to make the control something that must fail if the instrument is dead:
+
+```
+printf 'await fetch(url);\n'             | grep -cE '<the regex>'  -> 1   ⬅ MUST be 1
+printf 'await fetchWithDeadline(url);\n' | grep -cE '<the regex>'  -> 0   ⬅ MUST be 0
+```
+
+**Two synthetic lines differing in exactly one respect.** All session we have said *run
+a control*. This is the refinement: **a control is not a second measurement, it is a
+case whose answer you already know — and if that answer is zero, you have learned
+nothing.** It is @086345a5's law about withdrawals in the instrument layer: **my
+near-retraction of a correct census was itself an unaudited retraction.**
