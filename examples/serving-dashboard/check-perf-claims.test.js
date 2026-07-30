@@ -178,8 +178,41 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // beside them, and widening the pattern produced ZERO new offenders. The
   // blindness was real and was being masked by the fact that every existing
   // ASCII occurrence happened to be already withdrawn.
-  const RATIO = /\b2\.4[5-9]\s*[×xX]|\b2\.5\s*[×xX]|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
+  // The `-fold` arm was added after a probe showed `2.5-fold` evading a digit
+  // this matcher already claimed to cover. "fold" is how a figure gets written
+  // when someone is deliberately avoiding the × they know is contested.
+  const RATIO = /\b2\.4[5-9]\s*(?:[×xX])|\b2\.5\s*(?:[×xX]|-?fold)|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
   const ARMS = /\b0\.62\s*×|\b82\.\d{3}\s*tok|\b33\.\d{3}\s*tok|\+147\s*%/;
+
+  // THE ENVELOPE BOUNDS -- a laundering route that OPENED WHEN THE FIX LANDED.
+  //
+  // perf-baseline.md §12 (a81a6d54, @fc8b5d97) nulled this box at a worst-case
+  // pair spread of +58.41 %, and drew the correct narrower conclusion: the
+  // envelope does not forbid a 2.46× effect from EXISTING, it forbids the
+  // DIGITS. It then prescribes the honest rendering: "roughly 1.6× to 3.9×".
+  //
+  // That prescription is right, and it handed this gate a hole. RATIO is pinned
+  // to 2.45-2.5. It cannot see EITHER bound. So "throughput gains of up to
+  // 3.9×" passes clean -- a BIGGER number than the withdrawn one, wearing §12's
+  // authority, and unlike a bare 2.46× it looks like it came from an error
+  // analysis. That is the form most likely to survive a retelling intact.
+  //
+  // THE DISTINCTION THIS ENCODES: the envelope is honest ONLY AS AN ENVELOPE.
+  // Both bounds together are §12's prescribed rendering and are excused. ONE
+  // BOUND ALONE IS NOT A RANGE, IT IS A HEADLINE -- "up to 3.9×" and "at least
+  // 1.6× faster" are the two ways to quote an uncertainty interval as a result.
+  // A guard that banned the range outright would forbid the very rendering §12
+  // prescribes, so this cannot be a matcher alone; it needs the pairing rule.
+  const ENVELOPE = /\b1\.6\s*[×xX]|\b3\.9\s*[×xX]/;
+  // The separator forbids a PARAGRAPH break but permits a single newline:
+  // markdown reflows, and PR-DESCRIPTION.md:340 states the range with the two
+  // bounds on adjacent lines. A pairing rule that only recognises a range on
+  // one physical line would call that honest rendering a bare bound.
+  const SEP = '(?:[^.\\n]|\\n(?!\\n)){0,60}';
+  const ENVELOPE_BOTH = new RegExp(
+    `1\\.6\\s*[×xX]${SEP}3\\.9\\s*[×xX]|3\\.9\\s*[×xX]${SEP}1\\.6\\s*[×xX]`,
+  );
+  const PAIR_WINDOW = 120;
 
   // PERMANENT exclusions, SCOPED TO A PATTERN CLASS RATHER THAN TO A FILE.
   //
@@ -341,10 +374,59 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // the question the deferral already answered; it cannot see a deferred
   // document acquiring ten new claims, because the set membership never changes.
   const deferredLiveClaims = new Map();
+  // Which arms actually ran. The form controls below prove the MATCHERS see a
+  // bare bound; they cannot prove the loop still ASKS. Today's corpus contains
+  // no bare bound, so deleting 'ENVELOPE' from the label list would remove the
+  // scan and change no result -- a guard that stops looking and stays green.
+  const scannedLabels = new Set();
   const sampleExemptionUsed = new Set();
 
   let inspected = 0;
   const offenders = [];
+  // One shared scan, called by the corpus loop AND by synthetic-text
+  // assertions below. That sharing is the point, not tidiness: today's corpus
+  // contains no BARE envelope bound, so mutating the pairing rule to `if (true)`
+  // or widening its window to the whole document changed no result and no test
+  // noticed. A branch only reachable when a document misbehaves cannot be
+  // proven by a corpus of well-behaved documents -- so the hazard is passed in
+  // as DATA instead of waited for.
+  const RETRACTION = /withdraw|withdrew|withdrawn|retract|no longer claim|deleted rather than hedged|used to (?:print|state|lead)/i;
+  const WINDOW = 600;
+
+  const scanHits = (text, { sampleExempt }) => {
+    const sites = [];
+    const labels = new Set();
+    let armsExcused = 0;
+    // The raw-sample exemption applies HERE and only here: to the ARMS figures,
+    // in the documents that must retain them. RATIO and ENVELOPE fall through
+    // to the ordinary vicinity rule in every document without exception.
+    for (const [label, re] of [['RATIO', RATIO], ['ARMS', ARMS], ['ENVELOPE', ENVELOPE]]) {
+      labels.add(label);
+      const excuseArms = label === 'ARMS' && sampleExempt;
+      const m = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+      for (const hit of text.matchAll(m)) {
+        if (excuseArms) { armsExcused += 1; continue; }
+        // An envelope bound is excused when its PARTNER sits alongside it --
+        // that is §12's prescribed range, stated whole. A bound with no partner
+        // nearby is a bound being used as a figure.
+        if (label === 'ENVELOPE') {
+          const tight = text.slice(
+            Math.max(0, hit.index - PAIR_WINDOW),
+            hit.index + hit[0].length + PAIR_WINDOW,
+          );
+          if (ENVELOPE_BOTH.test(tight)) continue;
+        }
+        const near = text.slice(
+          Math.max(0, hit.index - WINDOW),
+          hit.index + hit[0].length + WINDOW,
+        );
+        if (RETRACTION.test(near)) continue;
+        sites.push({ label, index: hit.index });
+      }
+    }
+    return { sites, armsExcused, labels };
+  };
+
   for (const doc of docs) {
     // Strip fenced and inline code: a document may legitimately show the old
     // figure inside a quoted diff or an example of what not to write.
@@ -363,34 +445,22 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
     // a guard whose own source satisfies its exemption -- an exemption is a
     // claim about a PASSAGE, and testing it against a FILE answers a broader
     // question than the one being asked.
-    const RETRACTION = /withdraw|withdrew|withdrawn|retract|no longer claim|deleted rather than hedged|used to (?:print|state|lead)/i;
-    const WINDOW = 600;
-
-    for (const [label, re] of [['RATIO', RATIO], ['ARMS', ARMS]]) {
-      // The raw-sample exemption applies HERE and only here: to the ARMS
-      // figures, in the documents that must retain them. RATIO falls through
-      // to the ordinary vicinity rule in every document without exception.
-      //
-      // The matches are still COUNTED before being excused. Skipping the scan
-      // outright would mark the exemption "used" on a file that no longer
-      // contains a single raw sample, which is precisely the stale-entry
-      // failure the DEFERRED bucket already guards against.
-      const excuseArms = label === 'ARMS' && SAMPLE_ONLY_EXEMPT.has(doc);
-      const m = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
-      for (const hit of text.matchAll(m)) {
-        if (excuseArms) { sampleExemptionUsed.add(doc); continue; }
-        const near = text.slice(
-          Math.max(0, hit.index - WINDOW),
-          hit.index + hit[0].length + WINDOW,
-        );
-        if (RETRACTION.test(near)) continue;
-        if (doc in DEFERRED) {
-          stillDirty.add(doc);
-          deferredLiveClaims.set(doc, (deferredLiveClaims.get(doc) ?? 0) + 1);
-          continue;
-        }
-        if (!offenders.includes(doc)) offenders.push(doc);
+    const { sites, armsExcused, labels } = scanHits(text, {
+      sampleExempt: SAMPLE_ONLY_EXEMPT.has(doc),
+    });
+    for (const l of labels) scannedLabels.add(l);
+    // The matches are still COUNTED before being excused. Skipping the scan
+    // outright would mark the exemption "used" on a file that no longer
+    // contains a single raw sample, which is precisely the stale-entry failure
+    // the DEFERRED bucket already guards against.
+    if (armsExcused > 0) sampleExemptionUsed.add(doc);
+    for (const _site of sites) {
+      if (doc in DEFERRED) {
+        stillDirty.add(doc);
+        deferredLiveClaims.set(doc, (deferredLiveClaims.get(doc) ?? 0) + 1);
+        continue;
       }
+      if (!offenders.includes(doc)) offenders.push(doc);
     }
   }
 
@@ -416,6 +486,91 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
     'the withdrawn-ratio matcher no longer fires on the plain ASCII form. That '
       + 'is the form a person TYPES rather than copies, so this is the arm most '
       + 'likely to carry a fresh claim, and it is the arm that was missing.',
+  );
+
+  // THE HAZARD AS DATA. Each of these was a surviving mutation before it was
+  // written -- the pairing rule could be replaced with `if (true)` and its
+  // window widened to 100000 with every test still green, because no real
+  // document contains a bare bound to notice.
+  const envLabels = (text) => scanHits(text, { sampleExempt: false })
+    .sites.filter((x) => x.label === 'ENVELOPE').length;
+
+  assert.equal(
+    envLabels('throughput gains of up to 3.9× with continuous batching'),
+    1,
+    'a BARE upper bound is no longer reported. This is the laundered form of '
+      + 'the withdrawn claim: a bigger number than 2.46×, wearing §12\'s error '
+      + 'analysis, which it earned only as one END of an interval.',
+  );
+  assert.equal(
+    envLabels('at least 1.6× faster than single-request decoding'),
+    1,
+    'a BARE lower bound is no longer reported. "At least" reads as a floor and '
+      + 'is the more persuasive half of the interval, not the more modest one.',
+  );
+  assert.equal(
+    envLabels('the honest envelope is roughly 1.6× to 3.9× on this hardware'),
+    0,
+    'the pairing rule stopped excusing §12\'s prescribed rendering. This guard '
+      + 'must not forbid the sentence the baseline tells authors to write, or '
+      + 'the next person to hit it deletes the guard instead of the claim.',
+  );
+  assert.equal(
+    envLabels(`up to 3.9× in the headline.${' filler.'.repeat(400)} elsewhere 1.6× appears`),
+    2,
+    'two bounds thousands of characters apart are now excusing each other as a '
+      + '"range". That is the pairing window widened from a PASSAGE to a FILE — '
+      + 'the same widening this file was split to fix for the sample exemption, '
+      + 'rebuilt in the newest arm.',
+  );
+  assert.equal(
+    envLabels('the 3.9× figure was withdrawn once the box was nulled'),
+    0,
+    'the ordinary retraction rule stopped applying to envelope bounds. A bound '
+      + 'quoted in order to strike it must stay legal, or documenting the '
+      + 'withdrawal becomes an offence and authors stop writing strike records.',
+  );
+
+  assert.deepEqual(
+    [...scannedLabels].sort(),
+    ['ARMS', 'ENVELOPE', 'RATIO'],
+    'an arm stopped being scanned. This is asserted separately from the matcher '
+      + 'controls because they answer different questions: a control proves the '
+      + 'regex can still SEE a bare bound, this proves the loop still ASKS it. '
+      + 'No document currently holds a bare bound, so dropping an arm would '
+      + 'change no offender list and this file would stay green while blind.',
+  );
+
+  // One control per FORM, the rule this file already learned the hard way when
+  // a single `2.46×` probe kept the guard green while `2.46x` was invisible.
+  // These four are the four ways to quote an uncertainty interval as a result.
+  assert.ok(
+    ENVELOPE.test('gains of up to 3.9× with batching')
+      && ENVELOPE.test('at least 1.6× faster than single-request'),
+    'the envelope matcher no longer fires on a BARE bound. §12 prescribes '
+      + '"roughly 1.6× to 3.9×" as the honest rendering, which means both bounds '
+      + 'are now quotable digits — and a lone bound is the laundered form of the '
+      + 'withdrawn claim, wearing an error analysis it did not earn.',
+  );
+  assert.ok(
+    ENVELOPE_BOTH.test('roughly 1.6× to 3.9× on this hardware')
+      && ENVELOPE_BOTH.test('somewhere between roughly 1.6x and\n3.9x survives'),
+    'the pairing rule no longer recognises §12\'s prescribed range, including '
+      + 'the form that wraps across a line break. Without this the guard forbids '
+      + 'the exact rendering the baseline tells authors to use, and the next '
+      + 'person to hit it will delete the guard rather than the claim.',
+  );
+  assert.ok(
+    !ENVELOPE_BOTH.test('up to 3.9× today.  Unrelated: 1.6× fewer allocations'),
+    'the pairing rule now spans a sentence boundary, so two unrelated figures '
+      + 'in adjacent sentences excuse each other as a "range". That turns the '
+      + 'pairing rule into a blanket exemption for both bounds.',
+  );
+  assert.ok(
+    RATIO.test('a 2.5-fold improvement') && RATIO.test('a 2.46 fold gain'),
+    'the fold-form arm has gone blind. "fold" is how a contested figure gets '
+      + 'rewritten when the author knows the × is contested — it was found '
+      + 'evading a digit this matcher already claimed to cover.',
   );
 
   // Anti-rot, the SAME rule the deferrals get, now applied to the bucket that
