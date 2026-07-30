@@ -620,6 +620,10 @@ Note `tokens_per_second` is honest about the reason — *"only cumulative token 
 
 > **Planned change.** These fields are being wired to real measurements at their source rather than routed around. When that lands, the correct pattern for an unmeasurable field is `null` plus a machine-readable reason — **not** `0`. Any change that populates one of these fields must delete the corresponding `// not yet tracked` comment in the same commit; a stale marker next to a live value misleads worse than the stub did.
 
+> **On how this list was established, and how much to trust it.** Two independent audits produced it: one reading forward from the engine toward the response, one reading backward from the response struct toward its sources. They agree on the same set, which is stronger evidence than either pass alone.
+>
+> **That convergence still failed once, and the failure is instructive.** Both audits initially placed `prefix_cache_lookups` on the honest side of the line. Both were wrong for the same reason: each read the field's *name* and neither read `metrics.rs:130-135` (see §5.13). Agreement is only independent evidence when the two paths do not share a premise — and a plausible name is a premise both readers inherit from the same place. The rule this list is built on is therefore **verify the field, not the rule**: confirm each entry at its cited line rather than trusting the table, including this one.
+
 ### 8.4 Prefix cache reports zero hits on the static-cache path
 
 Observed: identical prompts yield `prefix_cache_hits: 0` with non-zero lookups when continuous batching is active.
