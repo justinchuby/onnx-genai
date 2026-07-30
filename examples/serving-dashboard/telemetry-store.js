@@ -37,6 +37,7 @@ import {
   allFieldKeys,
 } from './telemetry-provenance.js';
 import { parsePrometheusText, scalarOf, histogramMean } from './prometheus-parse.js';
+import { selfClassesFromModelId } from './scenario-origins.js';
 
 /**
  * Connection state. These drive the two BLOCKING full-stage failure states
@@ -74,6 +75,7 @@ const ENDPOINT_CADENCE_MS = Object.freeze({
   [ENDPOINTS.METRICS]: 500,   // by far the largest payload; still within spec
   [ENDPOINTS.RESOURCES]: 1000,
   [ENDPOINTS.DEBUG_CONFIG]: 30000, // model_max_context/pipeline cannot change
+  [ENDPOINTS.MODELS]: 30000,       // the loaded model set, for attribution
 });
 
 /** Poll cadence bounds. The spec fixes the dashboard at 250-500 ms. */
@@ -182,6 +184,28 @@ export function createTelemetryStore({
   // window and its own explanation for the visitor.
   /** @type {Map<string, SourceResult>} */
   const lastSuccessfulFetch = new Map();
+
+  /**
+   * WHICH ENGINE PRODUCED THIS NUMBER, as asserted by the server itself.
+   *
+   * `origin` is the client's belief about which server it is talking to. This
+   * is the server's own answer. The distinction is not pedantic: if someone
+   * starts the two servers with the ports swapped, or the single --models-dir
+   * server lands, a client-side label becomes a confident lie while the
+   * server-reported model id stays true. Under our own rules a client-inferred
+   * attribution would be sourceClass 'client', and attribution is the one field
+   * that must not be a guess.
+   *
+   * @type {{modelIds: string[], primary: string|null}}
+   */
+  let attribution = { modelIds: [], primary: null };
+
+  // NOTE: mutable closure state lives HERE, above every function that reads it.
+  // Declaring `let` further down puts it in the temporal dead zone for the
+  // pending-field build that runs during construction -- which throws at
+  // runtime while every unit test that stubs the build still passes.
+  /** Warn once if the server is not the kind of server we think it is. */
+  let mismatchWarned = false;
 
   /**
    * Previous sample of the cumulative token counter, for deriving a rate.
@@ -312,6 +336,7 @@ export function createTelemetryStore({
             ENDPOINTS.DEBUG_CONFIG,
             ENDPOINTS.METRICS,
             ENDPOINTS.RESOURCES,
+            ENDPOINTS.MODELS,
           ];
 
     const settled = await Promise.all(paths.map((path) => fetchSource(path)));
@@ -552,17 +577,73 @@ export function createTelemetryStore({
    *
    * @param {object} entry A PROVENANCE entry.
    */
+  /**
+   * Read the loaded model set from whichever source answered.
+   *
+   * /v1/models is ungated (lib.rs:65 sits outside the admin gate) and lists
+   * every loaded model, which is also how a single multi-model server announces
+   * itself. /health.model is the fallback and carries the same id for the
+   * single-model case (routes/mod.rs:105-108).
+   *
+   * @param {Record<string, SourceResult>} sources
+   */
+  function readAttribution(sources) {
+    const models = sources[ENDPOINTS.MODELS];
+    if (models?.ok && Array.isArray(models.body?.data)) {
+      const ids = models.body.data.map((entry) => entry?.id).filter((id) => typeof id === 'string');
+      if (ids.length > 0) return { modelIds: ids, primary: ids[0] };
+    }
+    const health = sources[ENDPOINTS.HEALTH];
+    const fromHealth = health?.ok ? health.body?.model : null;
+    if (typeof fromHealth === 'string' && fromHealth !== '') {
+      return { modelIds: [fromHealth], primary: fromHealth };
+    }
+    return { modelIds: [], primary: null };
+  }
+
+  /**
+   * The one case where per-origin classification can go silently wrong.
+   *
+   * `origin` decides whether a prefix-cache zero is a real measurement or
+   * structurally impossible. If the two servers are started with their ports
+   * swapped, or a URL is shared with the wrong origin parameter, that decision
+   * inverts and the page renders confident nonsense with no error anywhere.
+   * The server's own model id is the check.
+   */
+  function warnOnAttributionMismatch() {
+    if (mismatchWarned || !attribution.primary || !origin) return;
+    const inferred = selfClassesFromModelId(attribution.primary).classes;
+    if (inferred.length === 0 || inferred.includes(origin)) return;
+    mismatchWarned = true;
+    console.warn(
+      `[telemetry-store] This store is configured as the "${origin}" server, but ` +
+        `${baseUrl} reports model "${attribution.primary}", which looks like a ` +
+        `"${inferred[0]}" server. Per-server classification is now probably inverted: ` +
+        'prefix-cache and paged-KV fields will be labelled with the wrong kind of zero. ' +
+        'Check the origin parameters in the URL against the servers that are actually running.',
+    );
+  }
+
   function fieldMeta(entry) {
     return {
       source: entry.source,
       sourceClass: entry.derived ? SOURCE_CLASSES.DERIVED : SOURCE_CLASSES.SERVER,
       origin,
+      // Server-asserted, never inferred. Null when the server has not answered
+      // yet, which is honest -- an unattributed number is better than a wrong
+      // attribution.
+      originModelId: attribution.primary,
       label: entry.label,
       unit: entry.unit,
     };
   }
 
   function buildFields(sources, timestampMs) {
+    // Resolved BEFORE the loop so every field in this snapshot carries the same
+    // attribution, rather than some fields having it and others not.
+    attribution = readAttribution(sources);
+    warnOnAttributionMismatch();
+
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const fields = {};
     for (const key of allFieldKeys()) {

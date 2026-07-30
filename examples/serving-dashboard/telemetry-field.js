@@ -138,6 +138,7 @@ export function measuredField(
     source,
     sourceClass = SOURCE_CLASSES.SERVER,
     origin = null,
+    originModelId = null,
     label = null,
     unit = null,
     observedAtMs = Date.now(),
@@ -159,6 +160,7 @@ export function measuredField(
     source,
     sourceClass,
     origin,
+    originModelId,
     label,
     reason: null,
     unit,
@@ -185,7 +187,14 @@ export function measuredField(
  */
 export function notApplicableField(
   reason,
-  { source = 'unavailable', sourceClass = SOURCE_CLASSES.SERVER, origin = null, label = null, unit = null } = {},
+  {
+    source = 'unavailable',
+    sourceClass = SOURCE_CLASSES.SERVER,
+    origin = null,
+    originModelId = null,
+    label = null,
+    unit = null,
+  } = {},
 ) {
   if (!reason) {
     throw new TypeError(
@@ -199,6 +208,7 @@ export function notApplicableField(
     source,
     sourceClass,
     origin,
+    originModelId,
     label,
     reason,
     unit,
@@ -220,7 +230,14 @@ export function notApplicableField(
  */
 export function unavailableField(
   reason,
-  { source = 'unavailable', sourceClass = SOURCE_CLASSES.SERVER, origin = null, label = null, unit = null } = {},
+  {
+    source = 'unavailable',
+    sourceClass = SOURCE_CLASSES.SERVER,
+    origin = null,
+    originModelId = null,
+    label = null,
+    unit = null,
+  } = {},
 ) {
   if (!reason) {
     throw new TypeError(
@@ -234,6 +251,7 @@ export function unavailableField(
     source,
     sourceClass,
     origin,
+    originModelId,
     label,
     reason,
     unit,
@@ -258,7 +276,14 @@ export function unavailableField(
  */
 export function pendingField(
   reason,
-  { source = 'unknown', sourceClass = SOURCE_CLASSES.SERVER, origin = null, label = null, unit = null } = {},
+  {
+    source = 'unknown',
+    sourceClass = SOURCE_CLASSES.SERVER,
+    origin = null,
+    originModelId = null,
+    label = null,
+    unit = null,
+  } = {},
 ) {
   if (!reason) {
     throw new TypeError('pendingField() requires a reason explaining what is being waited on.');
@@ -269,6 +294,7 @@ export function pendingField(
     source,
     sourceClass,
     origin,
+    originModelId,
     label,
     reason,
     unit,

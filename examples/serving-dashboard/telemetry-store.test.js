@@ -979,9 +979,11 @@ test('static endpoints are not re-fetched every poll (AC33 overhead budget)', as
   assert.equal(counts[ENDPOINTS.METRICS], 2, '/metrics is the largest payload; 500 ms');
   assert.equal(counts[ENDPOINTS.DEBUG_CONFIG], 1, 'model config cannot change');
   assert.equal(counts[ENDPOINTS.RESOURCES], 1, 'resource limits are configuration');
+  assert.equal(counts[ENDPOINTS.MODELS], 1, 'the loaded model set changes rarely');
 
+  // Uniform polling of seven endpoints at 250 ms would be 28 requests/second.
   const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
-  assert.ok(total <= 16, `expected <= 16 requests in one second, got ${total}`);
+  assert.ok(total <= 17, `expected <= 17 requests in one second, got ${total}`);
 });
 
 test('a reused response never claims to be fresher than it is', async () => {
@@ -1009,4 +1011,67 @@ test('a reused response never claims to be fresher than it is', async () => {
     firstObservedAt,
     'a reused /v1/debug/config body must keep the timestamp of the request that produced it',
   );
+});
+
+test('every field is attributed to the model the SERVER named, not the one we assumed', async () => {
+  // The lead requires per-panel server attribution. The honest version is one
+  // the server asserts: `origin` is the client's belief about which server it
+  // is talking to, and if two servers are started with their ports swapped that
+  // belief becomes a confident lie while the reported model id stays true.
+  const store = storeWith(healthyRoutes(), DYNAMIC);
+  await store.pollOnce();
+
+  const field = store.field('queue.depth');
+  assert.equal(field.state, FIELD_STATES.MEASURED);
+  assert.equal(field.originModelId, 'qwen-scatter', 'attribution comes from the server');
+  assert.equal(field.sourceClass, 'server');
+});
+
+test('an unattributed number is preferred over a wrongly attributed one', async () => {
+  // If the server has not told us what it is running, the correct answer is
+  // "unknown", not the client's guess.
+  const routes = healthyRoutes({
+    [ENDPOINTS.MODELS]: { status: 404, body: { error: { message: 'nope', type: 'server_error' } } },
+    [ENDPOINTS.HEALTH]: { status: 200, body: { status: 'ok' } },
+  });
+  const store = storeWith(routes, DYNAMIC);
+  await store.pollOnce();
+
+  assert.equal(store.field('queue.depth').originModelId, null);
+});
+
+test('a store pointed at the wrong kind of server says so', async () => {
+  // The failure this catches: two servers started with their ports swapped, or
+  // a shared URL whose origin parameters no longer match reality. Per-server
+  // classification then INVERTS -- a structurally impossible prefix-cache zero
+  // renders as a real measurement -- and nothing else in the system notices,
+  // because every individual response is perfectly well formed.
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    // healthyRoutes reports model "qwen-scatter"; we claim to be the dynamic one.
+    const store = storeWith(healthyRoutes(), DYNAMIC);
+    await store.pollOnce();
+    await store.pollOnce();
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(warnings.length, 1, 'warned exactly once, not once per poll');
+  assert.match(warnings[0], /qwen-scatter/);
+  assert.match(warnings[0], /dynamic/);
+});
+
+test('a correctly configured store is silent', async () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    const store = storeWith(healthyRoutes()); // defaults to the scatter origin
+    await store.pollOnce();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(warnings, []);
 });
