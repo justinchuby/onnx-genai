@@ -613,7 +613,10 @@ export const PROVENANCE = Object.freeze({
         classification: 'STRUCTURALLY_BYPASSED',
         reason:
           'This server batches with a static cache, and that path never consults the prefix ' +
-          'cache, so there is no rate to report. A 0% here would imply a cache that tried.',
+          'cache, so there is no rate to report. A 0% here would imply a cache that tried. ' +
+          'The engine asserts the bypass: ' +
+          'crates/onnx-genai-engine/tests/batched_static_decode.rs:53 requires ' +
+          'prefix_cache_hit_len == 0 for every batched result.',
       },
       dynamic: { classification: 'MEASURED' },
     },

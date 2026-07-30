@@ -420,3 +420,78 @@ describe('renderField — a wire-spelling flip must not blank the dashboard', ()
     }
   });
 });
+
+describe('not-applicable copy — demo-ux.md §20.2', () => {
+  // This state is the ONLY one whose explanation renders on screen unprompted,
+  // and under two servers it is the NORMAL case rather than the exception. So
+  // this copy is read more than any other text the dashboard produces, and it
+  // is the sentence carrying the demo's central technical claim.
+
+  // Each of these turns an architectural FACT back into a missing FEATURE.
+  // "Not yet" and "coming soon" promise a value that can never arrive on this
+  // execution path; "unfortunately" apologises for a design decision; and
+  // "currently unavailable" is the exact phrasing of the OTHER state, which
+  // collapses the distinction the whole five-state vocabulary exists to draw.
+  const BANNED = [/\bnot yet\b/i, /\bcoming soon\b/i, /\bunfortunately\b/i, /\bcurrently unavailable\b/i];
+
+  /** Every reason the provenance table can hand to a not-applicable field. */
+  async function bypassedReasons() {
+    const { PROVENANCE } = await import('../telemetry-provenance.js');
+    /** @type {{key: string, reason: string}[]} */
+    const found = [];
+    for (const [key, entry] of Object.entries(PROVENANCE)) {
+      for (const perOrigin of Object.values(entry?.byOrigin ?? {})) {
+        if (perOrigin?.classification === 'STRUCTURALLY_BYPASSED' && perOrigin.reason) {
+          found.push({ key, reason: perOrigin.reason });
+        }
+      }
+    }
+    return found;
+  }
+
+  it('never apologises for a value that was never possible', async () => {
+    const reasons = await bypassedReasons();
+    assert.ok(reasons.length > 0, 'expected the provenance table to declare bypassed fields');
+
+    for (const { key, reason } of reasons) {
+      for (const banned of BANNED) {
+        assert.doesNotMatch(
+          reason,
+          banned,
+          `${key}: this wording reframes an architectural fact as a missing feature`,
+        );
+      }
+    }
+  });
+
+  it('cites the source that proves the bypass, so a reader can check us', async () => {
+    // An unfalsifiable claim about our own architecture is just marketing. The
+    // citation is what makes this a teaching surface rather than an assertion.
+    for (const { key, reason } of await bypassedReasons()) {
+      assert.match(reason, /\.rs:\d+/, `${key}: no file:line citation to check the claim against`);
+    }
+  });
+
+  it('has a headline sentence that stands alone on screen', async () => {
+    // The caption shows the first sentence; the rest is one hover away. If a
+    // reason's opening sentence does not itself say the path never asks the
+    // question, the on-screen text becomes a fragment and the meaning moves
+    // entirely into the tooltip nobody opens.
+    for (const { key, reason } of await bypassedReasons()) {
+      const node = renderField({ state: 'not-applicable', reason, label: key });
+      const caption = node.textContent.replace(/^n\/a/, '');
+
+      assert.ok(caption.length > 20, `${key}: on-screen caption is too short to mean anything`);
+      assert.doesNotMatch(
+        caption,
+        /\.rs:\d+$/,
+        `${key}: caption was cut mid-citation — a file:line must not be read as a sentence end`,
+      );
+      assert.match(
+        caption,
+        /never|no |bypass/i,
+        `${key}: the visible sentence must say the path cannot ask, not merely that a value is absent`,
+      );
+    }
+  });
+});

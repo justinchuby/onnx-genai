@@ -232,6 +232,35 @@ function ageSeparator() {
  * @param {SourceClass} [options.sourceClass] Overrides `field.source`.
  * @returns {HTMLElement}
  */
+/**
+ * First sentence of a reason, for the one caption that renders on screen.
+ *
+ * The full `reason` stays in `title` and `aria-label`, so nothing is lost for
+ * an auditor or a screen reader — this only decides what is shown unprompted.
+ *
+ * It has to be trimmed because these reasons carry their evidence inline (two
+ * file:line citations each, ~350 characters), and a single panel can hold four
+ * not-applicable fields. Rendered whole, that is well over a thousand
+ * characters of near-identical prose stacked inside one card, which buries the
+ * very sentence it exists to communicate. The first sentence is written to
+ * stand alone in every case we author: it names the execution path and says
+ * the question is never asked.
+ *
+ * Trimming is not the same as softening. The sentence still says IMPOSSIBLE
+ * rather than ABSENT, which is the property demo-ux.md §20.2 actually
+ * protects, and the citation is one hover away rather than deleted.
+ *
+ * @param {string} reason
+ * @returns {string}
+ */
+function headlineSentence(reason) {
+  const text = String(reason).trim();
+  // Require a following space so a version number or a file:line citation
+  // ("batched_static_decode.rs:53") is never mistaken for a sentence end.
+  const match = /^(.+?[.!?])\s/s.exec(text);
+  return match ? match[1] : text;
+}
+
 export function renderField(field, options = {}) {
   const state = renderStateOf(field, { strict: options.strict });
   const label = options.label ?? field?.label ?? 'value';
@@ -278,7 +307,7 @@ export function renderField(field, options = {}) {
       // visitor's first run would otherwise show a dashboard half-covered in
       // apparent breakage — rendering our single most interesting finding as
       // a bug.
-      element('span', { className: 'value__na-caption', text: reason }),
+      element('span', { className: 'value__na-caption', text: headlineSentence(reason) }),
     );
     return wrapper;
   }
