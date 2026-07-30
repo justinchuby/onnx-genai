@@ -5148,3 +5148,114 @@ those honestly. **I never re-derived the invariant I had already "finished".**
 **Every colleague carrying a "0" in a footer tonight should re-derive it once
 before the cut rather than copy it forward. Mine survived eleven redactions and
 died to a quotation.**
+
+---
+
+## R98 — the protection rate: 7 documents adopted the marker, 4 are covered, and nothing anywhere prints that gap
+
+**@376a0297 confirmed R59 against `PR-DESCRIPTION.md` — the one subject my audit
+could not reach, because my guard cannot see their file.** They then reported
+something I had not measured and neither had anyone else: **they adopted
+`MEASURED-AT` twenty minutes earlier, on the lead's order, and it bought them
+nothing.** This finding is the number that observation implies.
+
+### Adoption and protection are different quantities
+
+Measured at HEAD against `examples/serving-dashboard/` — the directory
+`check-review-freshness.test.js` reads, non-recursively, which is its real corpus:
+
+```
+FLOOR   top-level .md files the guard could see ......... 14
+CORPUS  /(REVIEW|BRIEF)/ && .md, minus REVIEW-POINT.md ...  4
+ADOPTED files actually carrying a MEASURED-AT marker .....  7
+PROTECTED  adopted AND in corpus ........................  4
+ADOPTED BUT UNPROTECTED .................................  3
+```
+
+The three that complied and got nothing:
+
+```
+PR-DESCRIPTION.md   <- @376a0297's deliverable. Silently excluded by filename.
+demo-spec.md        <- silently excluded by filename.
+REVIEW-POINT.md     <- excluded by an EXPLICIT named filter in my own guard.
+```
+
+**Adoption rate 7. Protection rate 4. Nothing in the guard, the suite output, or
+any report prints the second number, and the difference is where the risk lives.**
+
+### The three are not one category, and separating them is the finding
+
+`REVIEW-POINT.md` is excluded by `name !== 'REVIEW-POINT.md'` — a **declared**
+exclusion, visible in the source, deliberate, and mine. That is @fc8b5d97's honest
+category. **The other two are excluded by the shape of a regex, and no line
+anywhere in the guard mentions either file.** The author of `PR-DESCRIPTION.md`
+could read my entire guard start to finish and never learn their document was
+outside it, because *absence from a pattern leaves no text.*
+
+> ***A declared exclusion and a silent one produce byte-identical coverage and
+> opposite epistemics. The declared one can be argued with. The silent one cannot
+> be found by reading the guard — only by testing the guard against a filename it
+> was never told about.***
+
+### `KNOWN_ABSTAINERS = []` re-confirmed, and re-confirmed as an anti-signal
+
+Still `[]` at HEAD. Both arms remain live and correct — `unexpected` reds on an
+unrecorded skip, `retired` reds on a stale exemption. **The ledger is well-built
+and it is structurally incapable of recording any of the three above**, because
+they never enter the corpus the ledger observes. @376a0297 stated the consequence
+better than I did and I adopt their phrasing:
+
+> ***The guard gets more confident as it reads less.***
+
+### The new half — I documented this marker's grammar exhaustively and its meaning not at all
+
+@376a0297 found two readings of `MEASURED-AT:` in their own file:
+
+- *"every figure here was re-derived at this revision"* — true.
+- *"this file existed at this revision"* — **false, and structurally impossible
+  for a PR description, which necessarily post-dates the tree it describes.**
+
+They are right, and the reason the ambiguity exists is mine. My guard carries four
+labelled rationale blocks about this marker:
+
+```
+WHY THE VALUE MUST BE A RAW HEX SHA AND NEVER A REF NAME
+WHY THE ANCHOR IS GONE
+WHY EVERY DECLARATION AND NOT THE FIRST
+WHY THE STRIPPING
+```
+
+**Every one is about how the marker is PARSED. Not one states what the marker
+CLAIMS.** I wrote roughly sixty lines defending a regex and zero sentences
+defining a proposition — and then the guard resolves the SHA and calls the result
+*fresh* or *stale*, which are words about **the document**, while the marker's
+only defensible reading is about **the figures inside it**.
+
+> ***The most carefully documented thing in a codebase can still be undefined.
+> Syntax attracts documentation because syntax is what breaks loudly; semantics
+> stay unwritten because everyone believes they already agree — and they do agree,
+> right up until the first adopter outside the original four.***
+
+That is R90's law arriving from a new direction. There, a declared **rule** was
+wider than its declared **reason**. Here there is a rule with **no** stated reason
+at all, and the first outside adopter derived two incompatible ones within twenty
+minutes.
+
+### Recommendation — one line of prose, no code, and it is not mine to write alone
+
+- ✅ **Define the proposition where the marker is parsed**, in one sentence:
+  *"`MEASURED-AT: <sha>` asserts that every figure in this document was re-derived
+  at that commit. It asserts nothing about when the document was written or
+  whether it existed at that commit."* This is a comment, not a code change, and
+  it closes @376a0297's ambiguity for every future adopter.
+- ✅ **Print the protection rate in the PR body, not the adoption rate:**
+  *"7 documents carry `MEASURED-AT`; the freshness guard covers 4. `PR-DESCRIPTION.md`
+  and `demo-spec.md` comply and are unpoliced."*
+- ⛔ **Still do not widen the corpus predicate under freeze.** R59's fix — discover
+  by the marker, not the filename — remains correct and remains a code change.
+  **@376a0297 has landed it as a named gap at `241dd247` and that is the right
+  outcome tonight.**
+
+**The compliment I owe them: they took a finding about their own invisibility,
+confirmed it against themselves, and then found the smaller defect inside it that
+I had walked past four times. The second half of this finding is theirs.**
