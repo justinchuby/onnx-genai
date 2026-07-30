@@ -597,9 +597,27 @@ is worse than no reason, because the visitor believes it.
         itself. Within-run CV (1.98%) is the wrong variance component; the criterion depends on
         **dispersion of run means**, which n-per-run does not touch.
       - ✅ **Required: alternate binaries RUN BY RUN — A B A B A … ≥5 runs per arm.** Unit of
-        analysis is the **run mean** (5 numbers per arm), compared by permutation/Welch on run
-        labels. Report **n_runs**, the CI of the run-mean difference, and require non-overlap to
-        claim a regression *or* to claim `<2%`. ~80 min, unattended.
+        analysis is the **run MEDIAN** (not mean — see below), compared by exact permutation on
+        run labels. **VALIDATED:** a null test of the clean binary against itself (10 runs, 55 min,
+        `raw/qa-runlevel-null.json`) produced a naive **+6.23%** delta from pure noise, and the
+        permutation test correctly returned **p = 0.643, indistinguishable.** The decision rule
+        caught what a point estimate would have shipped as a 3×-over-budget regression.
+      - 🔴 **NEVER report a bare delta of run means.** One pathological run (CV 37.95%, samples
+        down to 9.6 tok/s) moved the estimate from **+1.27% (medians)** to **+6.23% (means)** on
+        identical data.
+      - 🔴 **"CI straddles 0" IS NOT "passes `<2%`". This is the most likely way this criterion
+        gets falsely certified.** `<2%` is an **equivalence** claim; a non-significant difference
+        test only says *we could not detect a difference*. The null test's CI was
+        **[−5.55%, +28.08%]** — a +20% regression fits inside it. **Correct rule: the ENTIRE 95%
+        CI of the difference must lie inside ±2%.** Outcome is three-state —
+        **REGRESSION / EQUIVALENT / UNRESOLVED** — and **`UNRESOLVED` is not a pass.**
+      - ✅ **This is how the "can't certify a quiet machine" problem is solved:** don't gate on
+        quiet in advance (unverifiable). **Let the CI width certify the window retrospectively** —
+        contention inflates variance, inflates the CI, and forces `UNRESOLVED`. A noisy window
+        can no longer produce a confident answer. Re-running on `UNRESOLVED` is legitimate;
+        dropping individual runs for "looking bad" is not.
+      - **Runs needed per arm ≈ (between-run CV / 1.02)²:** ~4 on a quiet machine (~25 min),
+        **~20** at the 4.58% CV measured here (~7 h). Run it when the crew is idle.
       - ❌ **Do NOT gate on a "quiet machine" and do NOT interleave per-request.** Measured:
         `loadavg` has **no** correlation with our throughput (ρ = +0.079, p = 0.785), so no
         instrument certifies a window as quiet — gating on it converts an acknowledged threat
