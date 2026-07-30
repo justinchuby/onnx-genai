@@ -450,5 +450,141 @@ else
   printf 'skip  tokenizer asset checks (no python3)\n'
 fi
 
+# ---------------------------------------------------------------------------
+# Static-cache detection, driven by SYNTHETIC graphs.
+#
+# "If the graph has no static-cache scatter ABI it is not a static-cache model,
+# and continuous batching will not engage" is the highest-frequency confusion on
+# this project, so it must be checked mechanically rather than remembered.
+#
+# The real-model rejection case above needs models/qwen2.5-0.5b, which exists
+# only in the main checkout - so it SKIPS on the branch the PR is cut from,
+# leaving the assertion unverified exactly where it gets reviewed. These cases
+# build throwaway ONNX graphs instead: no weights, no network, a few kilobytes,
+# and they run in every checkout.
+#
+# The predicate is deliberately IDENTICAL to the runtime's fail-closed guard
+# (crates/onnx-genai-ort/src/decode/io.rs:198): the presence of a write_indices
+# or nonpad_kv_seqlen INPUT. Neither side ever inspects TensorScatter *nodes* -
+# checking for the op would be testing a different property than the one the
+# loader actually enforces.
+#
+# The last case is a POSITIVE control. Without it, all three rejection cases
+# would still pass if the generator rejected every graph unconditionally.
+# ---------------------------------------------------------------------------
+if [ -n "${GENERATOR_PYTHON:-}" ] &&
+  "$GENERATOR_PYTHON" -c 'import onnx, yaml' >/dev/null 2>&1; then
+
+  synth_tmp="$(mktemp -d)"
+  trap 'rm -rf "$synth_tmp"' EXIT
+
+  # make_synthetic_graph <kind> <dir>
+  make_synthetic_graph() {
+    "$GENERATOR_PYTHON" - "$1" "$2" <<'PY'
+import sys
+import onnx
+from onnx import TensorProto, helper
+
+kind, out_dir = sys.argv[1], sys.argv[2]
+
+def f32(name):
+    return helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 1, 1, 1])
+
+def i64(name):
+    return helper.make_tensor_value_info(name, TensorProto.INT64, [1])
+
+inputs = [helper.make_tensor_value_info("input_ids", TensorProto.INT64, [1, 1])]
+outputs = [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 1])]
+nodes = [helper.make_node("Cast", ["input_ids"], ["logits"], to=TensorProto.FLOAT)]
+
+# Everything except "plain" carries the integer scatter control ports that the
+# runtime keys on.
+if kind != "plain":
+    inputs += [i64("write_indices"), i64("nonpad_kv_seqlen")]
+
+if kind in ("mispaired", "complete"):
+    for layer in (0, 1):
+        inputs += [f32("key_cache.%d" % layer), f32("value_cache.%d" % layer)]
+        for role in ("key", "value"):
+            # "mispaired" omits updated_key_cache.1, so the four lists no longer
+            # line up positionally - the silent KV mis-binding this guards.
+            if kind == "mispaired" and role == "key" and layer == 1:
+                continue
+            src = "%s_cache.%d" % (role, layer)
+            dst = "updated_%s_cache.%d" % (role, layer)
+            outputs.append(f32(dst))
+            nodes.append(helper.make_node("Identity", [src], [dst]))
+
+graph = helper.make_graph(nodes, "synthetic-%s" % kind, inputs, outputs)
+onnx.save(helper.make_model(graph), "%s/model.onnx" % out_dir)
+PY
+  }
+
+  # assert_generator_rejects <name> <kind> <expected substring>
+  assert_generator_rejects() {
+    TESTS_RUN=$((TESTS_RUN + 1))
+    local name="$1" kind="$2" needle="$3"
+    local dir="$synth_tmp/$kind" output
+    mkdir -p "$dir"
+    if ! make_synthetic_graph "$kind" "$dir" >/dev/null 2>&1; then
+      fail "$name" "could not build the synthetic '$kind' graph"
+      return
+    fi
+    if output="$("$GENERATOR_PYTHON" "$GENERATOR" "$dir" --check 2>&1)"; then
+      fail "$name" "generator ACCEPTED a '$kind' graph and emitted: $output"
+      return
+    fi
+    case "$output" in
+      *"$needle"*) pass "$name" ;;
+      *) fail "$name" "rejected, but the message would not tell you why: $output" ;;
+    esac
+  }
+
+  assert_generator_rejects \
+    "a graph with no scatter ABI is rejected, not silently declared static" \
+    plain "does not expose a static-cache scatter ABI"
+
+  assert_generator_rejects \
+    "scatter control ports without cache ports are rejected as incomplete" \
+    control_only "no key_cache.N inputs"
+
+  assert_generator_rejects \
+    "a graph missing one layer's cache output is rejected before it mis-pairs" \
+    mispaired "mis-pair"
+
+  # Positive control: the same machinery must ACCEPT a well-formed graph, or the
+  # three rejections above would prove nothing.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  complete_dir="$synth_tmp/complete"
+  mkdir -p "$complete_dir"
+  if make_synthetic_graph complete "$complete_dir" >/dev/null 2>&1 &&
+    complete_out="$("$GENERATOR_PYTHON" "$GENERATOR" "$complete_dir" --check 2>&1)"; then
+    if printf '%s' "$complete_out" | "$GENERATOR_PYTHON" -c '
+import sys, yaml
+spec = yaml.safe_load(sys.stdin)["io"]["static_cache"]
+ok = (
+    spec["write_indices_input"] == "write_indices"
+    and spec["kv_sequence_length_input"] == "nonpad_kv_seqlen"
+    and spec["key_cache_inputs"] == ["key_cache.0", "key_cache.1"]
+    and spec["key_cache_outputs"] == ["updated_key_cache.0", "updated_key_cache.1"]
+)
+sys.exit(0 if ok else 1)
+'; then
+      pass "a well-formed scatter graph is accepted and paired in layer order"
+    else
+      fail "a well-formed scatter graph is accepted and paired in layer order" \
+        "derived an unexpected block: $complete_out"
+    fi
+  else
+    fail "a well-formed scatter graph is accepted and paired in layer order" \
+      "generator rejected a valid graph: ${complete_out:-<build failed>}"
+  fi
+
+  rm -rf "$synth_tmp"
+  trap - EXIT
+else
+  printf 'skip  synthetic static-cache detection checks (onnx/pyyaml unavailable)\n'
+fi
+
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 [ "$TESTS_FAILED" -eq 0 ]
