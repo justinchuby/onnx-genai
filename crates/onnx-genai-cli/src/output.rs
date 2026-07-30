@@ -157,6 +157,35 @@ fn needs_trailing_newline(output: &str) -> bool {
     !output.is_empty() && !output.ends_with('\n')
 }
 
+fn emit_reasoning_segment(
+    segment: &ReasoningChunk,
+    dim_reasoning: bool,
+    dimmed: &mut bool,
+    live: Option<&mut live_turn::LiveTurn>,
+) -> anyhow::Result<()> {
+    if segment.text.is_empty() {
+        return Ok(());
+    }
+    if let Some(live) = live {
+        live.push(&segment.text, segment.is_reasoning)?;
+    } else {
+        if dim_reasoning && segment.is_reasoning != *dimmed {
+            print!(
+                "{}",
+                if segment.is_reasoning {
+                    "\x1b[2m"
+                } else {
+                    "\x1b[0m"
+                }
+            );
+            *dimmed = segment.is_reasoning;
+        }
+        print!("{}", segment.text);
+        io::stdout().flush()?;
+    }
+    Ok(())
+}
+
 fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
     show_stats && !show_profile
 }
@@ -248,17 +277,15 @@ pub(super) fn run_generation_turn(
                 tracker.push_segments(&token.text)
             } else {
                 vec![ReasoningChunk {
-                    text: token.text.as_str(),
+                    text: token.text.clone(),
                     is_reasoning: false,
                 }]
             };
             for segment in segments {
-                if segment.text.is_empty() {
-                    continue;
-                }
-                if let Some(live) = live.as_deref_mut() {
+                let using_live = live.is_some() && !segment.text.is_empty();
+                emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
+                if using_live {
                     let first = live_frames == 0;
-                    live.push(segment.text, segment.is_reasoning)?;
                     live_frames += 1;
                     // The first token draws immediately so the line is never empty
                     // while a reply is on screen; after that the numbers are
@@ -279,23 +306,11 @@ pub(super) fn run_generation_turn(
                                 status.push_str(&format!(" · ctx {context}"));
                             }
                         }
-                        live.set_status(status)?;
+                        if let Some(live) = live.as_deref_mut() {
+                            live.set_status(status)?;
+                        }
                         last_status = Instant::now();
                     }
-                } else {
-                    if dim_reasoning && segment.is_reasoning != dimmed {
-                        print!(
-                            "{}",
-                            if segment.is_reasoning {
-                                "\x1b[2m"
-                            } else {
-                                "\x1b[0m"
-                            }
-                        );
-                        dimmed = segment.is_reasoning;
-                    }
-                    print!("{}", segment.text);
-                    io::stdout().flush()?;
                 }
             }
         }
@@ -303,6 +318,11 @@ pub(super) fn run_generation_turn(
     };
 
     let result = backend.generate(turn, &mut callback);
+    if stream && let Some(tracker) = reasoning_stream.as_mut() {
+        for segment in tracker.finish() {
+            emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
+        }
+    }
     if dimmed {
         print!("\x1b[0m");
         let _ = io::stdout().flush();

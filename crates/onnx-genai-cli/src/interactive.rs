@@ -1399,7 +1399,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             emit_stats_line(show_stats, show_profile, &mut profile);
                             continue;
                         }
-                        split.answer.to_string()
+                        split.answer
                     }
                     None => output,
                 };
