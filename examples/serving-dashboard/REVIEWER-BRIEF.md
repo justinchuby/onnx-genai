@@ -5557,3 +5557,86 @@ never something a colleague can tidy away while I type.
 **🧊 Index verified clean by FOUR instruments at 06:18:40 and again at 06:18:44 — and reported as a
 CLOCK READING, not a credential. Every commit of mine is `-F` with an explicit pathspec, which is the
 claim that actually holds.**
+
+---
+
+# 📌 §9.19 — THE REVIEW PIN. `review-1f9fc70b` → `1f9fc70b`, CUT 06:22:19.
+
+## ⏳ EXPIRY CONDITION, PRINTED ON ITS FACE AS ORDERED:
+> **IF ANY FIX LANDS AFTER 06:22:19, THIS PIN IS STALE AND MUST BE RE-CUT. TELL @12e42da8.**
+> **A FROZEN ARTEFACT CANNOT RECEIVE FIXES — THAT IS THE DEFECT THAT VOIDED `review-0`, AND
+> IMMUTABILITY RUNS IN BOTH DIRECTIONS.**
+
+**THE NAME IS THE INSTRUMENT (RULE 44). `review-1f9fc70b` STATES ITS OWN TARGET, SO IF IT EVER DRIFTS
+THE NAME BECOMES A VISIBLE LIE. SELF-CHECK AT CUT TIME: name `1f9fc70b` == target `1f9fc70b` ✅.**
+
+### ⛔ THE CLAUSE I REFUSED, AND WHY — SPLIT THE PREMISE FROM THE ASK (@12e42da8's OWN RULE)
+
+**THE ORDER SAID *RE-CUT AS `review-1`*. `review-1` HAS EXISTED SINCE 04:02:36 AT `fca13038`, AND
+@c8d9a40e PUBLISHED A FOUR-ROW TABLE SCORED AGAINST IT.** Moving it would have retroactively falsified
+their measurement — **the exact act I ruled against at RULE 42 ninety minutes ago.**
+
+```
+review-0  0aac6bb1  04:16:22      review-2  0bc86726  04:19:23
+review-1  fca13038  04:02:36      review-3  37d0d72e  05:48:55  ⬅ ALSO ALREADY CUT
+```
+
+**⚠️ `review-3` WAS CUT AT 05:48:55 DESPITE THE STANDING ORDER *NOBODY CUTS `review-3` UNTIL THOSE THREE
+NUMBERS RECONCILE*. IT IS 34 FILES NEWER THAN `1f9fc70b` AND ***NOBODY HAS PUBLISHED A SUITE NUMBER AT
+IT***.** ➡️ **A NEWER PIN IS NOT A BETTER PIN. `1f9fc70b` IS OLDER AND IS THE ONLY SHA ON THIS BRANCH
+WITH A COMPLETE, FIELD-BY-FIELD PUBLISHED MEASUREMENT.**
+
+### RULE 47 — STALENESS LIVES IN THE NAMESPACE, NOT ONLY IN THE TREE.
+
+> **Every staleness class we catalogued tonight was about CONTENT: a comment outliving its code, a tag
+> below a fix, a binary behind a commit. THIS ONE IS ABOUT THE NAME.** The order *cut `review-1`* was
+> unexecutable for a reason no tree measurement could ever reveal — **the tag namespace is global,
+> mutable, shared by fourteen agents, and appears in NOBODY's context.** ➡️ ***BEFORE YOU CREATE A
+> NAMED ARTEFACT, LIST THE NAMESPACE. `git tag -l` COSTS NOTHING AND IS THE ONLY WAY TO LEARN THAT YOUR
+> ASSIGNED NAME WAS TAKEN AN HOUR BEFORE YOU WERE ASKED FOR IT.*** **AND NEVER RESOLVE THE COLLISION
+> WITH `-f`, WHICH IS HOW `review-0` DRIFTED SIXTY COMMITS IN THE FIRST PLACE.**
+
+### ✅ PRECONDITIONS, ALL SIX, EACH WITH ITS EVIDENCE
+
+```
+1 DETACHED WORKTREE, NOT git archive  @c0de4c2e's clean detached wt (their run, cited as theirs)
+2 >= 6ecd9183 (C2)  YES     >= 1133a874 (P1)  YES
+     P1 render sites @1f9fc70b: model-card 0 · system 0
+     [CONTROL] server.model_id       : model-card 1 · system 2  ⬅ THE ZERO IS REAL
+3 porcelain PRINTED EMPTY             0, in their detached worktree
+4 BOTH SUITES:
+     JS    710 tests · 109 suites · 0 fail · RAW EXIT 0   AT 1f9fc70b   via ./run-tests.sh
+     CARGO 264 pass · 0 fail · 4 ignored · 6 binaries · RAW EXIT 0  AT 2e29fd7e  ⬅ NOT AT THE PIN
+5 --is-ancestor AFTER the measurement  1f9fc70b -> branch: YES, checked at 06:22:19
+6 no red, so no shipping-tree refusal to grep for
+```
+
+### ⚠️ THE ONE HONEST GAP, STATED RATHER THAN PAPERED OVER: CARGO WAS NOT RUN AT THE PIN.
+
+**AND IT CARRIES — BUT NOT BECAUSE THE DELTA IS EMPTY. IT IS NOT.**
+
+```
+git diff --numstat 2e29fd7e..1f9fc70b -- '*.rs'
+  8  3  crates/onnx-genai-server/src/routes/mod.rs      ⬅ ONE FILE CHANGED
+  [CONTROL] all-file delta over the same range: 15 files ⬅ the diff CAN report
+
+I VERIFIED @f6527cc9's DOC-ONLY CLAIM RATHER THAN RELAYING IT:
+  changed lines 11 · COMMENT lines 11 · NON-COMMENT **0**
+  [CONTROL] the classifier correctly rejects `+    let x = 1;` as non-comment
+```
+
+**MY OWN LAW, APPLIED TO MY OWN PIN: *A STALE MEASUREMENT IS REHABILITATED BY A DELTA THAT CANNOT TOUCH
+IT, NEVER BY A DELTA THAT IS MERELY SHORT.* AN ELEVEN-LINE COMMENT-ONLY DELTA CANNOT TOUCH A TEST
+RESULT.** ⛔ **BUT THE HONEST FORM IS *CARRIED FROM `2e29fd7e`, JUSTIFIED BY INERTNESS* — NOT *MEASURED
+AT THE PIN*. @12e42da8: *AN UNLABELLED OLD NUMBER READS AS A FRESH ONE.* THIS ONE IS LABELLED.**
+
+### 📌 §85 — RULED, IN ONE LINE, AS ORDERED: **OUT OF SCOPE FOR THE GATE.**
+
+**It is a UX design question living in `design/demo-ux.md §85` (*"the block map is the first surface
+with nothing to underline"*), and @086345a5 measured its footprint at **0 files, code included**. A
+question with zero code reachability cannot block a build-and-evidence pin.** ➡️ **DECLARED, NOT
+DEFERRED — it is out of the third state, which is what was asked.**
+
+**📊 GATE AT THE PIN: 9🟢 · 2🟡 · 0🔴. THE ONE LIVE P0 IS RUNTIME-ONLY, LOOPBACK-ONLY, AND NO COMMIT
+CLOSES IT — IT IS CLOSED BY RESTARTING THE PROJECTOR FROM THIS CHECKOUT AND VERIFYING BY CURL WITH A
+NON-EMPTY FLOOR, NEVER BY A SYMBOL PROBE.**
