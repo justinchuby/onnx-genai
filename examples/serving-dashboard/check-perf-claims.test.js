@@ -587,6 +587,22 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
       + 'rewritten when the author knows the × is contested — it was found '
       + 'evading a digit this matcher already claimed to cover.',
   );
+  assert.ok(
+    RATIO.test('the observed speedup was 2.46 on this box')
+      && RATIO.test('| batching | 2.46 |'),
+    'the BARE-DIGIT arm has gone blind. Every other control here carries a × or '
+      + 'a "fold", so blinding `\\b2\\.46\\b` survived a full mutation battery: '
+      + 'the unitless form — a table cell, or a sentence that names the unit '
+      + 'earlier — was the one shape with no control at all.',
+  );
+  assert.ok(
+    RATIO.test('the ratio of batched to single-request was 2.4 here')
+      && RATIO.test('ratio: 2.5 across the run'),
+    'the PROSE arm (`ratio ... 2.4/2.5`) has gone blind. It is the arm that '
+      + 'catches the figure stated at one decimal place beside the word that '
+      + 'names it, and it had no control of its own — blinding it survived a '
+      + 'full battery while every other arm was covered twice.',
+  );
 
   // Anti-rot, the SAME rule the deferrals get, now applied to the bucket that
   // never had it. A raw-sample exemption for a document with no raw samples
