@@ -1095,3 +1095,69 @@ They wrote that my "~1-line admin.rs fix has NOT landed". It landed at
 the basename off the wire. Their 4-of-4 leak measurement is correct and is a
 measurement of processes started 01:41 and 02:07 from the OTHER checkout.
 The fix is real, shipped, and not running. That distinction is the whole P0.
+
+## 17. The Rust suite, executed — my longest-standing open debt, closed
+
+I have said "cargo test has not run tonight" in every message since 02:00 and
+carried it as an open limit. It has now run, by me.
+
+    cd /Users/justinc/Documents/GitHub/onnx-genai-demo   HEAD 964cad4a
+    porcelain WHOLE TREE 1  ·  porcelain crates/ 0
+      ^ the corpus I executed is committed bytes even though the desk is dirty
+    cargo test -p onnx-genai-server      RAW UNPIPED EXIT 0
+
+    lib.rs                211 passed  0 failed  3 ignored
+    main.rs                 0          0         0
+    tests/demo_dashboard.rs 15          0         0
+    tests/http.rs           28          0         1
+    tests/vlm_image_bundle.rs 10        0         0
+    TOTAL                 264 passed  0 failed  4 ignored
+
+**THE LEAD'S RED IS GONE.** They reported 185 pass / 1 FAIL / 2 ignored and
+said they were converting the unsatisfiable `vlm-executable` fixture to a
+visible `#[ignore]` naming its gitignored prerequisite. That landed:
+`tests.rs:1109` now reads *"requires a real vision encoder ... which
+.gitignore (*.onnx) excludes from every clone."*
+
+### 17.1 A denominator disagreement I am reporting rather than resolving
+
+The Lead measured 188 total. I measure 268 (264 + 4). I am not claiming
+their number was wrong and I am not picking mine because it is mine — that
+is the exact move @e00032a4 refused when their instrument said 15 and the
+Lead said 546. My total is auditable: six test binaries, each printed
+above, summing to 264. **Whoever re-runs this should publish the per-binary
+split, because a single total cannot show which binary went missing.**
+
+### 17.2 Layer 1 is now proven BY EXECUTION, not by reading
+
+In §15 I verified the server-side path fix by reading committed bytes and
+probing the wire. The branch's own Rust test asserts it, and it ran:
+
+    test tests::no_configuration_can_re_enable_full_path_disclosure ... ok
+
+`tests.rs:4252`. That test forbids the *token* rather than sampling the
+configuration space, which is the strongest form available: a sampled
+config space only proves the settings you remembered to list.
+
+### 17.3 The 4 ignored, by name, because a skip is invisible to a pass rate
+
+    audio_endpoints_route_through_tiny_whisper_pipeline
+      "synthetic Whisper-contract smoke test; run explicitly"
+    sidecar_free_compatibility_package_builds_server_pipeline...
+      "requires a real vision encoder ... .gitignore (*.onnx) excludes it"
+    vision_request_routes_through_tiny_vlm_pipeline
+      "requires gitignored models/tiny-vlm; run scripts/build_tiny_vlm.py first"
+    qwen_real_model_tool_use_chain_end_to_end
+      "requires gitignored models/qwen2.5-0.5b real model fixture"
+
+All four name their missing prerequisite. That is the right convention and
+it is followed consistently. **But four tests that never run are four claims
+nobody checks, and three of them are the multimodal pipelines** -- the least
+exercised surface on the branch. Not blocking; worth stating beside the
+264 rather than after it.
+
+### 17.4 Scope
+
+`-p onnx-genai-server` only. I did NOT run the workspace: item 1 on the gate
+is a known `cargo check` exit 101 from vendored x86 AVX2 on arm64 in other
+crates, and I did not re-measure it. **264/0 is a claim about one package.**
