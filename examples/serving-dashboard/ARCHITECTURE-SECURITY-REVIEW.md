@@ -1412,3 +1412,62 @@ removes the differential rather than trying to keep two parsers in agreement.
 Severity: MAJOR, non-blocking for the demo — loopback-only, bounded by the
 extension allowlist, and no secret in this tree currently sits in a dot-directory
 under an allowed extension. It blocks nothing tonight. It should not ship.
+
+---
+
+## §21 — gate item 1 adjudicated: not this branch's defect, and structurally so
+
+Measured at `cb03105f`. This is the last 🟡 on the board and it has been carried
+by everyone, re-measured by nobody, all night. I carried it too. It is now
+settled by execution.
+
+    cargo check --workspace --all-targets      RAW UNPIPED EXIT 101
+    error in cc-rs: c++ --target=arm64-apple-macosx … qgemm_kernel_avx2.cpp
+
+### Three questions, three measurements
+
+**Is it ours?** Files this branch changed under `crates/mlas-sys`: **0**.
+Control, files changed under `crates/onnx-genai-server`: **17** — so the diff
+instrument reaches the tree and the zero is real. Pre-existing, merge-base
+`f55e459b`.
+
+**Does it reach the demo?** `mlas-sys` is depended on by exactly one crate,
+`onnx-runtime-ep-cpu`, and is not in `onnx-genai-server`'s graph at all —
+`cargo tree -p onnx-genai-server -i mlas-sys` cannot even resolve the spec.
+And the decisive positive: `cargo check -p onnx-genai-server --all-targets`
+**raw exit 0**.
+
+**Why does it fail?** `crates/mlas-sys/build.rs` has **no concept of the target
+architecture**:
+
+    target_arch 0 · CARGO_CFG_TARGET_ARCH 0 · aarch64 0 · arm64 0 · TARGET 0
+    CONTROL avx2 -> 14   ⬅ the grep reaches this file; the zeros are real
+
+`:36` unconditionally does `lib.join("x86_64")` and `:112` passes
+`-mavx2 -mfma -mf16c -mavxvnni`. cc-rs correctly supplies
+`--target=arm64-apple-macosx`; the build script never asks. **It is not a broken
+build, it is a build script that was written when there was one architecture and
+has never been told otherwise.** A vendored kernel directory named `x86_64`
+joined without a conditional is a hardcoded assumption wearing a path separator.
+
+### Disposition
+
+**Gate item 1 is NOT a defect of this branch and cannot affect the demo.** It
+should move from 🟡 *carried, not re-measured* to **🟡 adjudicated: pre-existing,
+out of scope, unreachable from the served artefact** — a different status, and
+the difference is that nobody needs to look at it again tonight.
+
+### A correction to the record, offered as a denominator and not a dispute
+
+@c0de4c2e generously closed what they understood to be my standing limit by
+running `cargo test -p onnx-genai-server --no-fail-fast` → 264/0/4. **That is the
+same single package I ran, and it closes a different limit than the one I
+carried.** The limit I published was *workspace-wide cargo has never been run by
+anyone*. It had not been. It has now, by me, and the answer is exit 101.
+
+This is tonight's dominant class one more time — **a correct measurement of an
+adjacent subject** — and it is worth naming precisely because @c0de4c2e's
+measurement was rigorous, their intent was to relieve me of a debt, and the
+result was that a real open item was very nearly retired by agreement. Two
+parties agreeing that a limit is paid is not the same as the limit being paid.
+The Lead's rule applies verbatim: **name the path, never say "the suite".**
