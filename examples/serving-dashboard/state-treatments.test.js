@@ -4,7 +4,7 @@
 // visual treatment in the CSS that receives it.
 //
 // WHY THIS FILE EXISTS. `styles/shell.css` styled `[data-state='measured']`
-// while `FIELD_STATES.OK` is the string `'ok'`, so the rule for the most
+// while `FIELD_STATES.MEASURED` is the string `'ok'`, so the rule for the most
 // common state on the page matched nothing at all. Every measured value fell
 // back to inherited styling — which looks close enough to correct that it
 // survived a browser check. Nothing in JS could catch it: the JS was right.
@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import { FIELD_STATES, SOURCE_CLASSES } from './telemetry-field.js';
+import { ABSENT_TEXT, NOT_APPLICABLE_TEXT } from './format.js';
 
 const shellCss = readFileSync(new URL('./styles/shell.css', import.meta.url), 'utf8');
 
@@ -84,4 +85,49 @@ test('every source class has a CSS hook for its badge', () => {
   if (styled.size === 0) return; // no badge styling in this stylesheet yet
   const missing = Object.values(SOURCE_CLASSES).filter((cls) => !styled.has(cls));
   assert.deepEqual(missing, [], `source classes with no styling: ${missing.join(', ')}`);
+});
+
+// --- CONTRACT.md must not contradict the renderer ---------------------------
+//
+// Same gap as the one at the top of this file, one level up: CONTRACT.md is
+// authoritative for the panel author, and it stated that `not-applicable`
+// renders as an em-dash while format.js has always rendered `n/a`. Nothing
+// could catch it -- the doc was internally consistent, the code was correct,
+// and the panel author reading the doc would have hardcoded the wrong glyph in
+// a file this test does not even look at.
+//
+// Docs drift silently because nothing executes them. This executes them.
+
+test('CONTRACT.md renders each absence state the way format.js actually does', () => {
+  const contract = readFileSync(new URL('./CONTRACT.md', import.meta.url), 'utf8');
+  const row = (state) =>
+    contract.split('\n').find((line) => line.startsWith(`| \`${state}\``)) ?? '';
+
+  const notApplicable = row('not-applicable');
+  assert.ok(notApplicable, 'CONTRACT.md must document the not-applicable state');
+  assert.ok(
+    notApplicable.includes(NOT_APPLICABLE_TEXT),
+    `CONTRACT.md must say not-applicable renders as "${NOT_APPLICABLE_TEXT}", the string ` +
+      `format.js emits. Row: ${notApplicable}`,
+  );
+  assert.ok(
+    !notApplicable.includes(ABSENT_TEXT),
+    'CONTRACT.md must NOT claim not-applicable renders as the em-dash: spec:714 requires it be ' +
+      'distinguishable from unavailable on the surface, and a panel author following the doc ' +
+      'would render half a working dashboard as broken',
+  );
+
+  const unavailable = row('unavailable');
+  assert.ok(unavailable.includes(ABSENT_TEXT), 'unavailable IS the em-dash');
+  assert.ok(
+    !unavailable.includes(NOT_APPLICABLE_TEXT),
+    'unavailable must not be documented as n/a',
+  );
+});
+
+test('the two absence texts are actually different strings', () => {
+  // Guards the whole distinction at its root: if these ever collapse to the
+  // same string, every test above still passes and the surface difference the
+  // spec requires quietly disappears.
+  assert.notEqual(ABSENT_TEXT, NOT_APPLICABLE_TEXT);
 });

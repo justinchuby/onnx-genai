@@ -35,14 +35,14 @@ parseable number for them.** You cannot accidentally bind a panel to a lie.
 
 ```js
 {
-  value:        3,              // null unless state is 'ok' or 'stale'
-  state:        'ok',           // see the five states below
+  value:        3,              // null unless state is 'measured' or 'stale'
+  state:        'measured',     // see the five states below
   source:       '/v1/status',   // the ENDPOINT -- precise enough to curl
   sourceClass:  'server',       // the CLASS -- 'server'|'client'|'derived'|'estimated'
   origin:       'scatter',      // which server we asked: 'scatter' | 'dynamic'
   originModelId:'qwen2.5-0.5b-scatter-v2',  // what that server CALLED ITSELF
   label:        'Queue depth',
-  reason:       null,           // required sentence whenever state !== 'ok'
+  reason:       null,           // required sentence whenever state !== 'measured'
   unit:         'requests',     // or null
   observedAtMs: 1785390093123,  // null when absent; ORIGINAL time when stale
   derivedFrom:  null,           // field keys, when sourceClass === 'derived'
@@ -50,28 +50,51 @@ parseable number for them.** You cannot accidentally bind a panel to a lie.
 }
 ```
 
-> ⚠️ **`state` for a good reading is the string `'ok'`, and the constant is
-> `FIELD_STATES.OK`.** The constant was briefly spelled `MEASURED` while its
-> value was `'ok'`, which made `field.state === 'measured'` silently false for
-> every measured field on the page. Name and value now agree (ruling D160), and
-> the alias was deleted rather than deprecated — a transitional alias is a fork
+> ⚠️ **`state` for a good reading is the string `'measured'`, and the constant
+> is `FIELD_STATES.MEASURED`.** The constant was once spelled `MEASURED` while
+> its value stayed `'ok'`, which made `field.state === 'measured'` silently
+> false for every measured field on the page. Name and value now agree, and the
+> transitional alias was deleted rather than deprecated — an alias is a fork
 > with a deprecation notice.
+>
+> The enum value and the `[data-state='measured']` selector in
+> `styles/shell.css` are an **atomic pair**: changing either alone reintroduces
+> the bug in one direction or the other, and neither half fails loudly. A
+> mismatch renders every genuine measurement at *muted* contrast wherever a
+> panel sets a colour, so real numbers look de-emphasised — the exact honesty
+> inversion this dashboard exists to prevent. `state-treatments.test.js`
+> compares the two on every run.
+>
+> Never global-replace the bare string `'ok'` to make this change: `status:
+> 'ok'` is the HTTP health payload, and renaming that fakes an unreachable
+> server. Three unrelated vocabularies share that token.
 > **Always compare against `FIELD_STATES.*`, never a string literal.**
 
 | `state` | Meaning | Render as |
 |---|---|---|
-| `ok` | The server computed this, just now. **Includes a genuine zero.** | The number, full contrast, no apology. |
+| `measured` | The server computed this, just now. **Includes a genuine zero.** | The number, full contrast, no apology. |
 | `pending` | Measurable, but no sample has arrived yet. **Resolves on its own.** | `···` |
 | `stale` | Was measured; the latest poll did not refresh it. `value` is the last good reading. | The number, de-emphasised, **with its age in words** (`41 · 12s old`). |
 | `unavailable` | The server hardcodes a placeholder and never computes it. **Plumbing would fix it.** | **Em-dash `—`** + `reason` on hover. Never `0`, never blank. |
-| `not-applicable` | The subsystem exists but **this code path never consults it**, so the question is never asked. Plumbing would *not* fix it. | **Em-dash `—`** + `reason` explaining *why*. |
+| `not-applicable` | The subsystem exists but **this code path never consults it**, so the question is never asked. Plumbing would *not* fix it. | **`n/a`** + `reason` explaining *why*. Deliberately distinct from `unavailable`, see the note below. |
+
+> ⚠️ **`not-applicable` renders `n/a`, NOT an em-dash.** This table said em-dash
+> for both until it was caught; the code (`format.js`, `NOT_APPLICABLE_TEXT`)
+> has always rendered `n/a`, and `state-treatments.test.js` asserts the two are
+> distinguishable **on the surface, not only in the hover**.
+> The reason is demo-spec.md:714 — *structurally not applicable must not look
+> like broken*. Under the two-server design, structurally-empty panels are the
+> NORMAL case, so if they render identically to a stubbed field, a visitor reads
+> half a correctly-working dashboard as defective. A hover cannot fix that: it
+> is not reachable by touch or keyboard scanning, and nobody hovers a field they
+> have already concluded is broken.
 
 ### The three kinds of zero (demo-spec.md §3, binding)
 
 A `0` on the wire is byte-identical in all three cases, so neither the wire nor
 a panel can tell them apart. Only the provenance table can:
 
-1. **`ok` with value `0`** — the question was asked, the answer really is zero.
+1. **`measured` with value `0`** — the question was asked, the answer really is zero.
    This is DATA. Hiding it is as dishonest as fabricating it.
 2. **`unavailable`** — a hardcoded stub (`tokens_per_second: 0.0`,
    `admin.rs:63`). A gap in the server.

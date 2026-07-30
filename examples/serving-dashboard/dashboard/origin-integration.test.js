@@ -87,29 +87,29 @@ async function mountAgainstRealStore(origin, moduleName) {
 }
 
 describe('a structurally bypassed counter never renders as a measurement', () => {
-  it('shows n/a, not 0%, for prefix cache on the batching server', async () => {
-    // prefix_cache_hit_len is a hardcoded 0 on this decode path
-    // (batched.rs:262/:486), and the engine tests assert it. A "0%" here would
-    // describe a cache that tried and missed. It never tried.
+  it('renders the finding, never a rate, on the batching server', async () => {
+    // The panel binds nothing now, so this asserts the property that matters:
+    // whatever the server says, no percentage reaches the screen.
     const panel = await mountAgainstRealStore('scatter', 'prefix-cache');
 
     assert.doesNotMatch(panel.text, /\b0(\.0)?\s*%/, 'rendered a hit rate the server never measured');
-    assert.match(panel.text, /n\/a/i, 'expected the not-applicable treatment');
+    assert.match(panel.text, /not happening on either execution path/i);
     panel.release();
   });
 
-  it('never says "not measurable yet" about something structurally impossible', async () => {
-    // That wording promises a value that will arrive later. On this origin it
-    // cannot arrive at all, so the promise is false — including for the
-    // DERIVED hit rate, whose inputs are both bypassed.
-    const panel = await mountAgainstRealStore('scatter', 'prefix-cache');
-    const hero = panel.root.findByClass('panel-prefix-cache__hero');
-    assert.doesNotMatch(
-      hero.textContent,
-      /not measurable yet/i,
-      'the derived hit rate softened its inputs into a promise',
-    );
-    panel.release();
+  it('renders identically whichever server answered, because the gap is real on both', async () => {
+    // This is the inversion worth pinning. The OLD panel said not-applicable on
+    // scatter and measured on dynamic. Both readings are now wrong: the
+    // batching path never consults the trie, AND the paged path reports hits it
+    // does not serve. Two different architectural reasons, one identical
+    // finding — so an origin-dependent rendering here would be a regression
+    // back to a distinction that no longer exists.
+    const scatter = await mountAgainstRealStore('scatter', 'prefix-cache');
+    const dynamic = await mountAgainstRealStore('dynamic', 'prefix-cache');
+
+    assert.equal(scatter.text, dynamic.text);
+    scatter.release();
+    dynamic.release();
   });
 
   it('does not call the counter "lookups", because it counts generations', async () => {
@@ -126,7 +126,7 @@ describe('a structurally bypassed counter never renders as a measurement', () =>
     // must render as a stark zero rather than being hidden.
     const store = createTelemetryStore({ origin: 'dynamic', fetchImpl: respondingServer() });
     await store.pollOnce();
-    assert.equal(store.field('prefix_cache.hits').state, 'ok');
+    assert.equal(store.field('prefix_cache.hits').state, 'measured');
     assert.equal(store.field('prefix_cache.hits').value, 0);
     store.stop();
   });
@@ -144,7 +144,7 @@ describe('the fabricated zeros never reach the screen', () => {
 
       // The server really did send 0.0 on the wire for this key...
       const field = store.field(key);
-      assert.notEqual(field.state, 'ok', `${key} is being presented as a live measurement`);
+      assert.notEqual(field.state, 'measured', `${key} is being presented as a live measurement`);
       assert.notEqual(field.state, 'measured', `${key} is being presented as a live measurement`);
       store.stop();
     });
@@ -174,7 +174,7 @@ describe('genuinely measured fields still render as numbers', () => {
     await store.pollOnce();
 
     assert.equal(store.field('queue.depth').value, 3);
-    assert.equal(store.field('queue.depth').state, 'ok');
+    assert.equal(store.field('queue.depth').state, 'measured');
     assert.equal(store.field('sessions.active').value, 2);
 
     const adapter = adaptStore(store);

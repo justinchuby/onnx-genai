@@ -36,7 +36,7 @@ describe('renderField — a measured zero and an unmeasurable value must look di
     // real and good news; hiding or dimming it would misrepresent the server.
     const node = renderField({ value: 0, state: 'ok', source: 'server', unit: 'count', label: 'Rejections' });
 
-    assert.equal(node.getAttribute('data-state'), 'ok');
+    assert.equal(node.getAttribute('data-state'), 'measured');
     assert.equal(node.findByClass('value__num').textContent, '0');
     assert.equal(node.findByClass('value__num--unavailable'), null);
   });

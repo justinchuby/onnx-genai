@@ -189,7 +189,7 @@ test('a genuinely measured field is reported as measured with its source', async
   await store.pollOnce();
 
   const queueDepth = store.field('queue.depth');
-  assert.equal(queueDepth.state, FIELD_STATES.OK);
+  assert.equal(queueDepth.state, FIELD_STATES.MEASURED);
   assert.equal(queueDepth.value, 3);
   assert.equal(queueDepth.source, ENDPOINTS.STATUS);
   assert.equal(queueDepth.unit, 'requests');
@@ -227,7 +227,7 @@ test('a real zero from a measured field is still reported as a measurement', asy
   await store.pollOnce();
 
   const field = store.field('queue.depth');
-  assert.equal(field.state, FIELD_STATES.OK);
+  assert.equal(field.state, FIELD_STATES.MEASURED);
   assert.equal(field.value, 0);
 });
 
@@ -286,7 +286,7 @@ test('measured fields go stale (not unavailable) when the server disappears', as
 
   await store.pollOnce();
   const before = store.field('queue.depth');
-  assert.equal(before.state, FIELD_STATES.OK);
+  assert.equal(before.state, FIELD_STATES.MEASURED);
 
   reachable = false;
   await store.pollOnce();
@@ -327,7 +327,7 @@ test('a disabled debug endpoint degrades only its own fields, with the exact fix
   const snapshot = await store.pollOnce();
 
   assert.equal(snapshot.connection.state, CONNECTION_STATES.CONNECTED);
-  assert.equal(store.field('queue.depth').state, FIELD_STATES.OK, '/v1/status still works');
+  assert.equal(store.field('queue.depth').state, FIELD_STATES.MEASURED, '/v1/status still works');
 
   const gated = store.field('prefix_cache.hits');
   assert.equal(gated.state, FIELD_STATES.UNAVAILABLE);
@@ -431,7 +431,7 @@ test('a failing endpoint is not re-requested on every poll (no console flood)', 
   assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
   assert.match(field.reason, /--enable-debug-endpoints/);
   // Healthy endpoints keep polling normally.
-  assert.equal(store.field('queue.depth').state, FIELD_STATES.OK);
+  assert.equal(store.field('queue.depth').state, FIELD_STATES.MEASURED);
 });
 
 test('a suppressed endpoint recovers once its retry window elapses', async () => {
@@ -465,7 +465,7 @@ test('a suppressed endpoint recovers once its retry window elapses', async () =>
   clock += 11_000;
   await store.pollOnce();
   assert.equal(requests, 2, 'retried after the window elapsed');
-  assert.equal(store.field('prefix_cache.hits').state, FIELD_STATES.OK);
+  assert.equal(store.field('prefix_cache.hits').state, FIELD_STATES.MEASURED);
 });
 
 test('an unavailable field never inherits an explanation from an unrelated earlier state', async () => {
@@ -545,7 +545,7 @@ test('every field is present in the very first snapshot, before any poll', () =>
     // edited every time a non-measuring state is added -- which quietly turns a
     // real invariant into a list someone maintains.
     assert.ok(
-      field.state !== FIELD_STATES.OK && field.state !== FIELD_STATES.STALE,
+      field.state !== FIELD_STATES.MEASURED && field.state !== FIELD_STATES.STALE,
       `no field may claim to be measured before the first poll (saw ${field.state})`,
     );
     assert.equal(field.value, null);
@@ -563,10 +563,10 @@ test('Prometheus metrics become measured fields', async () => {
   await store.pollOnce();
   const { fields } = store.getSnapshot();
 
-  assert.equal(fields['metrics.tokens_generated_total'].state, FIELD_STATES.OK);
+  assert.equal(fields['metrics.tokens_generated_total'].state, FIELD_STATES.MEASURED);
   assert.equal(fields['metrics.tokens_generated_total'].value, 5048);
   // TTFT arrives as a histogram and must be reduced to sum/count, not read raw.
-  assert.equal(fields['metrics.ttft'].state, FIELD_STATES.OK);
+  assert.equal(fields['metrics.ttft'].state, FIELD_STATES.MEASURED);
   assert.ok(Math.abs(fields['metrics.ttft'].value - 2.07) < 0.001);
 });
 
@@ -584,7 +584,7 @@ test('the in-flight gauge is NEVER exposed as the engine batch size', async () =
   const { fields } = store.getSnapshot();
 
   // It is a real measurement -- of in-flight generations.
-  assert.equal(fields['batch.in_flight'].state, FIELD_STATES.OK);
+  assert.equal(fields['batch.in_flight'].state, FIELD_STATES.MEASURED);
   assert.equal(fields['batch.in_flight'].value, 8);
 
   // The number a viewer would assume "batch size" means is NOT available, and
@@ -614,7 +614,7 @@ test('the same zero means opposite things on the two servers', async () => {
   await Promise.all([dynamic.pollOnce(), scatter.pollOnce()]);
 
   const onDynamic = dynamic.getSnapshot().fields['metrics.prefix_cache_hits'];
-  assert.equal(onDynamic.state, FIELD_STATES.OK);
+  assert.equal(onDynamic.state, FIELD_STATES.MEASURED);
   assert.equal(onDynamic.value, 0, 'a real zero must survive as zero, not be hidden');
 
   const onScatter = scatter.getSnapshot().fields['metrics.prefix_cache_hits'];
@@ -688,7 +688,7 @@ test('metrics degrade independently of the JSON endpoints', async () => {
   await store.pollOnce();
   const { fields } = store.getSnapshot();
 
-  assert.equal(fields['queue.depth'].state, FIELD_STATES.OK);
+  assert.equal(fields['queue.depth'].state, FIELD_STATES.MEASURED);
   assert.equal(fields['metrics.ttft'].state, FIELD_STATES.UNAVAILABLE);
 });
 
@@ -704,7 +704,7 @@ test('an HTML error page served at /metrics does not crash the store', async () 
   const { fields } = store.getSnapshot();
 
   assert.equal(fields['metrics.ttft'].state, FIELD_STATES.UNAVAILABLE);
-  assert.equal(fields['queue.depth'].state, FIELD_STATES.OK);
+  assert.equal(fields['queue.depth'].state, FIELD_STATES.MEASURED);
 });
 
 test('/v1/resources fields are measured', async () => {
@@ -715,7 +715,7 @@ test('/v1/resources fields are measured', async () => {
   await store.pollOnce();
   const { fields } = store.getSnapshot();
 
-  assert.equal(fields['resources.kv_budget_bytes'].state, FIELD_STATES.OK);
+  assert.equal(fields['resources.kv_budget_bytes'].state, FIELD_STATES.MEASURED);
   assert.equal(fields['resources.kv_budget_bytes'].value, 5746050801);
 });
 
@@ -750,7 +750,7 @@ test('throughput is derived from the delta of the cumulative token counter', asy
 
   // 200 tokens over 2 seconds.
   const field = store.getSnapshot().fields['throughput.observed'];
-  assert.equal(field.state, FIELD_STATES.OK);
+  assert.equal(field.state, FIELD_STATES.MEASURED);
   assert.equal(field.value, 100);
   // It must disclose that we computed it rather than read it.
   assert.deepEqual(field.derivedFrom, ['metrics.tokens_generated_total']);
@@ -878,7 +878,7 @@ test('the two stores poll independently and do not share a snapshot', async () =
   // One server going down must not blank the other's panels.
   assert.equal(scatter.getSnapshot().connection.state, CONNECTION_STATES.CONNECTED);
   assert.equal(dynamic.getSnapshot().connection.state, CONNECTION_STATES.UNREACHABLE);
-  assert.equal(scatter.getSnapshot().fields['queue.depth'].state, FIELD_STATES.OK);
+  assert.equal(scatter.getSnapshot().fields['queue.depth'].state, FIELD_STATES.MEASURED);
 });
 
 test('a hit rate with zero lookups is undefined, not 0%', async () => {
@@ -920,7 +920,7 @@ test('a hit rate with real lookups and no hits IS a measured 0%', async () => {
   await store.pollOnce();
 
   const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
-  assert.equal(rate.state, FIELD_STATES.OK);
+  assert.equal(rate.state, FIELD_STATES.MEASURED);
   assert.equal(rate.value, 0);
 });
 
@@ -1025,7 +1025,7 @@ test('a reused response never claims to be fresher than it is', async () => {
   await store.pollOnce();
 
   const field = store.field('server.context_length');
-  assert.equal(field.state, FIELD_STATES.OK);
+  assert.equal(field.state, FIELD_STATES.MEASURED);
   assert.equal(
     field.observedAtMs,
     firstObservedAt,
@@ -1042,7 +1042,7 @@ test('every field is attributed to the model the SERVER named, not the one we as
   await store.pollOnce();
 
   const field = store.field('queue.depth');
-  assert.equal(field.state, FIELD_STATES.OK);
+  assert.equal(field.state, FIELD_STATES.MEASURED);
   assert.equal(field.originModelId, 'qwen-scatter', 'attribution comes from the server');
   assert.equal(field.sourceClass, 'server');
 });
@@ -1124,7 +1124,7 @@ test('a stub that starts returning real data is shown, not hidden', async () => 
   }
 
   const field = store.field('kv.usage');
-  assert.equal(field.state, FIELD_STATES.OK, 'a real measurement must not be suppressed');
+  assert.equal(field.state, FIELD_STATES.MEASURED, 'a real measurement must not be suppressed');
   assert.equal(field.value, 0.42);
 
   // ...but it must never pass as an ordinary measurement while the table
@@ -1258,7 +1258,7 @@ test('the served model is selected by attribution, not by list position', async 
   const field = store.field('server.model_path');
 
   assert.equal(field.value, '/models/scatter');
-  assert.equal(field.state, FIELD_STATES.OK);
+  assert.equal(field.state, FIELD_STATES.MEASURED);
 });
 
 test('an unidentifiable served model yields no value rather than a guess', async () => {
@@ -1283,7 +1283,7 @@ test('an unidentifiable served model yields no value rather than a guess', async
   const field = store.field('server.model_path');
 
   assert.equal(field.value === null || field.value === undefined, true);
-  assert.notEqual(field.state, FIELD_STATES.OK);
+  assert.notEqual(field.state, FIELD_STATES.MEASURED);
 });
 
 test('the model directory going live is detected rather than em-dashed forever', async () => {

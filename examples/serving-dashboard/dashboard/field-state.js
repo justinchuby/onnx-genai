@@ -25,9 +25,9 @@
  * The dashboard's internal render states. Panels branch on these, never on the
  * raw string off the wire.
  *
- * @typedef {'ok' | 'pending' | 'stale' | 'unavailable'} RenderState
+ * @typedef {'measured' | 'pending' | 'stale' | 'unavailable' | 'not-applicable'} RenderState
  *
- * - `ok`          — a genuine measurement, including a genuine zero. Render it
+ * - `measured`    — a genuine measurement, including a genuine zero. Render it
  *                   at full contrast with no apology (demo-ux.md §4.1).
  * - `pending`     — measurable, but no sample has arrived yet. Renders `···`.
  *                   Distinct from `unavailable` because pending resolves on its
@@ -43,7 +43,14 @@
 
 /** @type {Readonly<Record<string, RenderState>>} */
 export const RENDER_STATES = Object.freeze({
-  OK: 'ok',
+  // The VALUE here is what panels write into `data-state`, so it must be the
+  // ruled wire spelling: styles/shell.css selects [data-state='measured'] and
+  // nothing else. Emitting 'ok' here does not fail loudly -- it renders every
+  // genuine measurement at MUTED contrast wherever a panel container sets a
+  // colour, so real numbers look de-emphasised, which is the exact honesty
+  // inversion this dashboard exists to prevent. The key stays `OK` so no panel
+  // call site moves; only the emitted string is the ruled one.
+  OK: 'measured',
   PENDING: 'pending',
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',

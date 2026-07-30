@@ -143,7 +143,7 @@ describe('scheduling panel — a real zero next to an honest absence', () => {
     const rejectionsRow = rows.find((row) => row.textContent.includes('rejections'));
     const preemptionsRow = rows.find((row) => row.textContent.includes('preemptions'));
 
-    assert.equal(rejectionsRow.findByClass('value').getAttribute('data-state'), 'ok');
+    assert.equal(rejectionsRow.findByClass('value').getAttribute('data-state'), 'measured');
     assert.match(rejectionsRow.findByClass('value__num').textContent, /^0$/);
     assert.equal(preemptionsRow.findByClass('value').getAttribute('data-state'), 'unavailable');
     assert.equal(preemptionsRow.findByClass('value__num--unavailable').textContent, '—');

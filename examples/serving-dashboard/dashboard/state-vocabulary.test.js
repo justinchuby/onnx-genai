@@ -25,7 +25,7 @@ import { createTelemetryStore } from '../telemetry-store.js';
 import { RENDER_STATES, renderStateOf } from './field-state.js';
 
 /** The five ruled states. Changing this list is a project-level decision. */
-const RULED_STATES = Object.freeze(['ok', 'pending', 'stale', 'unavailable', 'not-applicable']);
+const RULED_STATES = Object.freeze(['measured', 'pending', 'stale', 'unavailable', 'not-applicable']);
 
 function statesIn(snapshot) {
   return Object.entries(snapshot.fields).map(([key, field]) => [key, field?.state]);

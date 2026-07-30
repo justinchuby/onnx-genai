@@ -153,8 +153,25 @@ describe('AC45(c) — the ceiling is per-panel, not global', () => {
   it('gives every panel an explicit ceiling rather than inheriting the default', async () => {
     const { PANELS } = await import('./index.js');
     for (const panel of PANELS) {
+      const { staleCeilingMs, cadence } = panel.module.meta;
+
+      // A panel that polls nothing has no ceiling to declare — staleness is a
+      // property of a value that stopped arriving, and this panel has no
+      // values. `null` is the explicit, honest declaration for that case;
+      // inventing a number would imply a freshness contract it does not have.
+      // The escape hatch is gated on `cadence === 0` so it cannot be used to
+      // silently drop the ceiling from a panel that DOES poll.
+      if (cadence === 0) {
+        assert.equal(
+          staleCeilingMs,
+          null,
+          `${panel.id} polls nothing, so its ceiling must be explicitly null`,
+        );
+        continue;
+      }
+
       assert.equal(
-        typeof panel.module.meta.staleCeilingMs,
+        typeof staleCeilingMs,
         'number',
         `${panel.id} has no declared stale ceiling`,
       );
@@ -198,7 +215,7 @@ describe('AC45(d) — a whole-origin stall marks every panel', () => {
     return {
       field: () => ({
         value: 41,
-        state: 'ok',
+        state: 'measured',
         source: 'server',
         label: 'Queue depth',
         observedAtMs: Date.now() - 500,
@@ -210,7 +227,7 @@ describe('AC45(d) — a whole-origin stall marks every panel', () => {
 
   it('downgrades a live-looking field when the origin stopped answering', () => {
     // The store only marks the field whose poll failed. A field whose endpoint
-    // was not polled this cycle keeps state 'ok' and goes on looking live.
+    // was not polled this cycle keeps state 'measured' and goes on looking live.
     const adapter = adaptStore(storeWithConnection('unreachable'));
     const field = adapter.field('queue.depth');
     assert.equal(renderStateOf(field), 'stale');
@@ -226,7 +243,7 @@ describe('AC45(d) — a whole-origin stall marks every panel', () => {
 
   it('leaves fields alone while the origin is healthy', () => {
     const adapter = adaptStore(storeWithConnection('connected'));
-    assert.equal(renderStateOf(adapter.field('queue.depth')), 'ok');
+    assert.equal(renderStateOf(adapter.field('queue.depth')), 'measured');
     adapter.destroy();
   });
 

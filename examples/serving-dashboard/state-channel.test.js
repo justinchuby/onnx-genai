@@ -35,7 +35,7 @@ const css = readFileSync(SHELL_CSS, 'utf8');
 // `measured` is styled as the inherited default. Reading the enum from its
 // source of truth means a rename lands here as a red test instead of as a
 // silent loss of every absence treatment on the page.
-const DEFAULT_STATE = FIELD_STATES.OK;
+const DEFAULT_STATE = FIELD_STATES.MEASURED;
 const ABSENCE_STATES = Object.freeze(
   Object.values(FIELD_STATES).filter((state) => state !== DEFAULT_STATE),
 );

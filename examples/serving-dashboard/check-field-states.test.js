@@ -1,12 +1,16 @@
 // Binds the README's description of the telemetry envelope to the envelope the
 // code actually produces.
 //
-// This exists because of a specific, live landmine: the constant is named
-// `MEASURED` but its value is the string `'ok'`. A rename to `'measured'` has
-// been ratified and has not landed. Both the README and any panel author can
-// therefore write `field.state === 'measured'`, get `false` for every measured
-// field on the page, and see an interface that renders without error and
-// without data.
+// This exists because of a specific landmine that has now been defused: the
+// constant was named `MEASURED` while its value was the string `'ok'`. Both the
+// README and any panel author could therefore write `field.state === 'measured'`,
+// get `false` for every measured field on the page, and see an interface that
+// renders without error and without data.
+//
+// The rename has landed — name and value now both read `measured`. This file
+// stays because it does not hardcode a spelling: it reads the wire value off
+// the constant and requires the README to name that exact value, so the next
+// rename cannot land without the docs moving in the same commit.
 //
 // Every assertion below was verified by breaking the thing it protects and
 // watching it go red. The mutation is stated on each test.

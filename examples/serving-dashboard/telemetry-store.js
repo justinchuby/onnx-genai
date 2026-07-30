@@ -843,10 +843,10 @@ export function createTelemetryStore({
    */
   function suppressUndefinedHitRate(fields) {
     const rate = fields['prefix_cache.hit_rate'];
-    if (!rate || rate.state !== FIELD_STATES.OK) return;
+    if (!rate || rate.state !== FIELD_STATES.MEASURED) return;
 
     const denominator = fields['metrics.prefix_cache_lookups'] ?? fields['prefix_cache.lookups'];
-    if (!denominator || denominator.state !== FIELD_STATES.OK) return;
+    if (!denominator || denominator.state !== FIELD_STATES.MEASURED) return;
     if (Number(denominator.value) !== 0) return;
 
     fields['prefix_cache.hit_rate'] = unavailableField(
@@ -889,7 +889,7 @@ export function createTelemetryStore({
       unit: 'tokens/s',
     };
 
-    if (!total || total.state !== FIELD_STATES.OK) {
+    if (!total || total.state !== FIELD_STATES.MEASURED) {
       lastTokenSample = null;
       fields['throughput.observed'] = unavailableField(
         'Derived from the cumulative token counter on /metrics, which is not available.',
@@ -1015,7 +1015,7 @@ export function createTelemetryStore({
       const entry = resolveForOrigin(PROVENANCE[key], origin);
       const field = fields[key];
 
-      if (field && (field.state === FIELD_STATES.OK || field.state === FIELD_STATES.STALE)) {
+      if (field && (field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE)) {
         aged[key] = staleField(field, reason);
         continue;
       }

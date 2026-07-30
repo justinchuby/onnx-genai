@@ -17,17 +17,17 @@
 // branch on `field.state` before rendering.
 
 /**
- * @typedef {'ok' | 'pending' | 'stale' | 'unavailable' | 'not-applicable'} FieldState
+ * @typedef {'measured' | 'pending' | 'stale' | 'unavailable' | 'not-applicable'} FieldState
  *
  * These are the WIRE VALUES, which is what `field.state` is actually compared
- * against. Note that the measured state's value is `'ok'`, not `'measured'` --
- * the constant is named `FIELD_STATES.OK` but emits `'ok'` (see :90).
- * This typedef previously read `'measured'`, which meant a reader following the
- * documentation would write `field.state === 'measured'` and get a comparison
- * that is NEVER true, with no error to explain why. Always compare against
- * `FIELD_STATES.*` rather than a literal; the names and the values differ here.
+ * against. Constant names and wire values now AGREE: `FIELD_STATES.MEASURED`
+ * emits `'measured'`. They disagreed once, and it cost two separate bugs in
+ * opposite directions — a CSS selector that matched nothing, and a documented
+ * comparison that was never true — because a mismatch between a name and its
+ * value has no symptom at the point of use. Always compare against
+ * `FIELD_STATES.*` rather than a literal.
  *
- * - `ok`              — the server genuinely computed this value, just now.
+ * - `measured`    — the server genuinely computed this value, just now.
  *                   Includes a genuine zero, which renders at full contrast.
  * - `pending`     — measurable, but no sample has arrived yet (the first poll
  *                   has not completed). `value` is `null`. Renders `···`.
@@ -101,22 +101,25 @@ export const SOURCE_CLASSES = Object.freeze({
 
 export const FIELD_STATES = Object.freeze({
   /**
-   * The canonical name. `OK` and `'ok'` agree, which is the whole point.
+   * The state of a field the server computed, just now. Includes a genuine
+   * zero.
    *
-   * Two rulings collided here and this is the shape that satisfies both. The
-   * wire value must stay `'ok'`: a field carrying `state: 'measured'` beside
-   * `sourceClass: 'estimated'` contradicts itself, because STATE answers "can
-   * I trust this" and SOURCE answers "where did it come from" — a derived
-   * value is not measured and an estimate certainly is not. But a constant
-   * named `MEASURED` whose value is `'ok'` is a landmine with no symptom:
-   * `field.state === 'measured'` is false for every measured field on the
-   * page, and the comparison fails SILENTLY while the output still looks
-   * right.
+   * `MEASURED` and `'measured'` agree, which is the whole point. The constant
+   * and its value disagreed once — `MEASURED: 'ok'` — and that is a landmine
+   * with no symptom: `field.state === 'measured'` was false for every measured
+   * field on the page, and because the formatter fell through to rendering a
+   * plain number anyway, the comparison failed SILENTLY while the output still
+   * looked correct.
    *
-   * Renaming the constant fixes the landmine without touching the wire, so no
-   * `[data-state='ok']` selector, stored snapshot or panel binding moves.
+   * The name and the wire value must move together or not at all. Changing one
+   * alone reproduces the original bug in the opposite direction, which is why
+   * state-channel.test.js asserts BOTH halves — the enum value AND the
+   * `[data-state='measured']` selector in shell.css — as a single atomic pair.
+   *
+   * Never global-replace the string `'ok'` to make this change: `status: 'ok'`
+   * is the HTTP health payload, and renaming that fakes an unreachable server.
    */
-  OK: 'ok',
+  MEASURED: 'measured',
   PENDING: 'pending',
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',
@@ -186,7 +189,7 @@ export function measuredField(
   }
   return Object.freeze({
     value,
-    state: FIELD_STATES.OK,
+    state: FIELD_STATES.MEASURED,
     source,
     sourceClass,
     origin,
@@ -449,7 +452,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
   const observedAtMs = Math.min(...keys.map((key) => inputs[key].observedAtMs ?? Date.now()));
   return Object.freeze({
     value: result,
-    state: anyStale ? FIELD_STATES.STALE : FIELD_STATES.OK,
+    state: anyStale ? FIELD_STATES.STALE : FIELD_STATES.MEASURED,
     source: 'derived',
     sourceClass: SOURCE_CLASSES.DERIVED,
     // All inputs must share an origin for the result to be attributable to one
@@ -479,7 +482,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
  * @returns {boolean}
  */
 export function hasValue(field) {
-  return field.state === FIELD_STATES.OK || field.state === FIELD_STATES.STALE;
+  return field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE;
 }
 
 /**
