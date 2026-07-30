@@ -112,14 +112,22 @@ impl ModelsConfig {
 
 /// Build a `Vec<ModelSpec>` from a `--models-dir` path.
 ///
-/// Every immediate subdirectory of `dir` that looks like a model directory
-/// (contains at least one of `tokenizer.json`, `model.onnx`, or
-/// `genai_config.json`) yields one spec.  The spec `id` is the directory name,
-/// and `eager = true`.  Results are sorted by id for determinism.
+/// Every immediate subdirectory of `dir` that `ModelDirectory::load` accepts
+/// yields one spec.  The spec `id` is the directory name, and `eager = true`.
+/// Results are sorted by id for determinism.
+///
+/// Admission is delegated to the loader ON PURPOSE, and this is the whole point
+/// of the function.  A scanner that decides "this is a model directory" by its
+/// own criterion will eventually disagree with the component that actually
+/// opens the directory, and when it does, the user is told their model is fine
+/// and then told it cannot be loaded -- two contradictory messages about one
+/// directory, neither naming the real cause.  The only validator that cannot
+/// drift from the loader is the loader.
 ///
 /// Returns an error if `dir` is not readable or no model directories are found.
 pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
     let mut specs = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|e| {
         anyhow::anyhow!("failed to read models directory '{}': {}", dir.display(), e)
     })?;
@@ -130,7 +138,14 @@ pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
         if !path.is_dir() {
             continue;
         }
-        if !looks_like_model_dir(&path) {
+        // Ask the loader. Not a cheap lookalike of it.
+        if let Err(why) = onnx_genai_ort::ModelDirectory::load(&path) {
+            // A skipped directory used to vanish without a word, so a model
+            // that was ALMOST right -- one missing file, one misnamed weight --
+            // was indistinguishable from a directory nobody intended to serve.
+            // Keep the loader's reason and show it if the scan finds nothing:
+            // the near-misses are the only entries a user can act on.
+            rejected.push(format!("  {}: {}", path.display(), why));
             continue;
         }
         let id = path
@@ -150,19 +165,19 @@ pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
     }
     specs.sort_by(|a, b| a.id.cmp(&b.id));
     if specs.is_empty() {
+        rejected.sort();
+        let detail = if rejected.is_empty() {
+            "  (no subdirectories were present)".to_string()
+        } else {
+            rejected.join("\n")
+        };
         anyhow::bail!(
-            "no model directories found in '{}' (a model directory must contain tokenizer.json, model.onnx, or genai_config.json)",
-            dir.display()
+            "no model directories found in '{}'. Each candidate was rejected by the model loader:\n{}",
+            dir.display(),
+            detail
         );
     }
     Ok(specs)
-}
-
-/// Returns `true` if `path` looks like a model directory.
-fn looks_like_model_dir(path: &Path) -> bool {
-    path.join("tokenizer.json").is_file()
-        || path.join("model.onnx").is_file()
-        || path.join("genai_config.json").is_file()
 }
 
 #[cfg(test)]
@@ -179,7 +194,12 @@ mod tests {
     fn make_model_subdir(parent: &Path, name: &str) {
         let d = parent.join(name);
         std::fs::create_dir_all(&d).unwrap();
+        // Both files, because the LOADER requires both. The fixture previously
+        // wrote only tokenizer.json and passed, which is precisely the drift
+        // this module now forbids: a test fixture is itself a claim about what
+        // counts as a model directory, and it was the fourth such claim.
         write_file(&d, "tokenizer.json", r#"{"version":"1.0"}"#);
+        write_file(&d, "model.onnx", "not a real graph, but a real file");
     }
 
     #[test]
@@ -371,5 +391,33 @@ path = "/x"
         std::fs::create_dir(dir.path().join("empty-subdir")).unwrap();
         let err = from_models_dir(dir.path()).unwrap_err();
         assert!(err.to_string().contains("no model directories found"));
+    }
+
+    /// Weights alone are not a model directory.
+    ///
+    /// This is not hypothetical: a `mobilenetv2/` directory containing exactly
+    /// one `model.onnx` and no tokenizer sits in the shared models directory
+    /// this project is developed against. The previous OR-of-markers heuristic
+    /// ADMITTED it, so a vision model was registered as a text-generation model
+    /// and failed later, at load, with an error naming the wrong cause.
+    #[test]
+    fn models_dir_scan_rejects_weights_without_a_tokenizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("mobilenetv2");
+        std::fs::create_dir_all(&d).unwrap();
+        write_file(&d, "model.onnx", "weights, but nothing to tokenise with");
+
+        let err = from_models_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no model directories found"));
+        // and the rejection must say WHY, naming the directory it rejected --
+        // a silent skip is what made this class of mistake unreportable.
+        assert!(
+            err.to_string().contains("mobilenetv2"),
+            "rejection must name the directory it skipped, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("tokenizer.json"),
+            "rejection must carry the loader's reason, got: {err}"
+        );
     }
 }

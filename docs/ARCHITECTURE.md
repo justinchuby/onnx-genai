@@ -45,7 +45,7 @@ The practical consequence for this document is that **a chain of individually-tr
 
 Where a claim is inferred, the text says so. The distinction matters most in §5: an **ASSUMED** invariant is precisely one where the code offers no evidence either way, so the reader is the last line of defence.
 
-**How to read §5.** Each invariant is tagged **ENFORCED** (the code prevents violation) or **ASSUMED** (nothing stops you; violation compiles, runs, and corrupts or degrades silently). The ASSUMED ones — §5.3, §5.8, §5.10 — are the highest-risk sections in this document. §5.12 is tagged **CURRENTLY VIOLATED**, because documenting it as true would be exactly the kind of intent-as-behaviour this document forbids.
+**How to read §5.** Each invariant is tagged **ENFORCED** (the code prevents violation) or **ASSUMED** (nothing stops you; violation compiles, runs, and corrupts or degrades silently). The ASSUMED ones — §5.3, §5.8, §5.10 — are the highest-risk sections in this document. §5.12 is **half enforced**: unified in Rust, still ASSUMED across the shell scripts, where a third validator lives that no Rust change can reach.
 
 ---
 
@@ -347,7 +347,7 @@ For each boundary: what the **caller** must guarantee, what the **callee** guara
 
 - **`ModelDirectory::load`** (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
 - **Canonical errors:** `model directory does not exist: {}` (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`), `tokenizer.json not found in {}` (`crates/onnx-runtime-loader/tests/loader.rs::i64_initializer`).
-- ⚠️ **Known duplication:** the server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs::looks_like_model_dir`) is a *second, laxer* filter used only for `--models-dir` fan-out. It accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory can pass admission and then fail at load. See §8.6.
+- ✅ **Duplication removed:** the server's `--models-dir` fan-out previously ran a *second, laxer* filter that accepted `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory could pass admission and then fail at load. It now delegates to the loader (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`). See §5.12 and §8.6.
 
 ### 4.6 Tokenizer boundary
 
@@ -525,17 +525,17 @@ Enforced by the dispatch inside `run_static_batch_until_idle` (`crates/onnx-gena
 
 > ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`), and published through an atomic. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted. **✅ This is now shipped, not proposed: `KvTelemetry` (`onnx-genai-kv/src/telemetry.rs`) is a block of atomics stored with `Ordering::Relaxed`, attached via `Engine::attach_kv_telemetry` (`crates/onnx-genai-engine/src/engine/runtime.rs::page_stats`) on both driver paths (`crates/onnx-genai-server/src/driver.rs::run_engine_driver`, `:463`) and read lock-free by the HTTP handlers.** The measured consequence is the argument: routing the same data through a driver round-trip turns two 1.8 ms endpoints into **14.8-second stalls during a generation**, because the round-trip queues behind the exclusive `&mut Engine` borrow. **A relaxed atomic store is cheaper than servicing a channel, so the correct design is also the lower-overhead one.**
 
-### 5.12 Exactly one model-directory validator — **ASPIRATIONAL, CURRENTLY VIOLATED** ⚠️
+### 5.12 Exactly one model-directory validator in the server — **ENFORCED (Rust), ASSUMED (scripts)** ⚠️
 
 > A directory is a valid model directory if and only if `ModelDirectory::load` (`crates/onnx-genai-ort/src/loader.rs::load`) accepts it. No other component may define its own criterion.
 
-**This invariant is currently false**, and stating it as intent rather than behaviour would violate this document's own honesty rule. `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs::looks_like_model_dir`) is a second, weaker validator that accepts on an **OR** of conditions where the loader requires an **AND**. A directory can therefore pass admission and then fail at load, producing contradictory error text (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`).
+**Enforced inside the server as of this commit.** `looks_like_model_dir` is deleted; `from_models_dir` (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`) now delegates admission to `ModelDirectory::load` directly, so the scanner and the loader cannot disagree — there is no second criterion left to drift.
 
-**Why the invariant is worth holding:** validation that disagrees with loading is unfalsifiable from the user's side — the error message names the wrong cause.
+**This was not a hypothetical defect.** The deleted heuristic accepted on an **OR** of markers where the loader requires an **AND**. The shared models directory this project is developed against contains `mobilenetv2/`, holding exactly one `model.onnx` and no tokenizer. The old scanner admitted it, so a vision model was registered as a text-generation model and failed later, at load, with an error naming the wrong cause. The regression test (`crates/onnx-genai-server/src/models_config.rs::models_dir_scan_rejects_weights_without_a_tokenizer`) was mutation-verified: restoring the OR heuristic makes the scan return `ModelSpec { id: "mobilenetv2" }`.
 
-**What breaks while it is violated:** a user is told their model directory is fine, then told it does not exist. Two duplicated error strings (`crates/onnx-genai-server/src/state.rs::infer_model_id` and `crates/onnx-genai-engine/src/engine/load.rs::from_dir_impl`) make the origin ambiguous when debugging.
+**A silent skip was the other half of the bug, and deleting the validator alone would not have fixed it.** A rejected directory previously vanished without a word, so a model that was *almost* right — one missing file, one misnamed weight — was indistinguishable from a directory nobody intended to serve. `from_models_dir` now collects each rejection with the loader's own reason and prints them when the scan finds nothing, because the near-misses are the only entries a user can act on.
 
-**Status:** the fix is funded — delete `looks_like_model_dir` and unify on `ModelDirectory::load(...).is_ok()`. Update this section to ENFORCED when it lands.
+**⚠️ The invariant is still ASSUMED outside Rust, and this is now the weaker half.** A **third** validator exists in shell: `models_dir_contains_model` (`scripts/lib/models_dir.sh`) admits a directory only if it contains a file named literally `model.onnx`. The loader *prefers* `decoder.onnx` and accepts any single `.onnx` file. **A model directory built around `decoder.onnx` therefore loads correctly in the server and is invisible to every script that locates models** — the script reports no model found, and the skip is a banner rather than a failure. Nothing in the Rust type system can reach this, and no refactor of the server will ever surface it.
 
 ### 5.13 A metric's name is part of its contract — **ASSUMED, NOT ENFORCED** ⚠️
 
@@ -882,7 +882,7 @@ The failure is confusing: the script succeeds, artifacts appear correct, and the
 
 ### 8.6 Two model-directory admission filters
 
-`ModelDirectory::load` (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`) is the real validator. The server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs::looks_like_model_dir`) is a second, laxer filter for `--models-dir` fan-out that accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`.
+`ModelDirectory::load` (`crates/onnx-genai-ort/src/loader.rs::load`) is the only validator. The server's `--models-dir` fan-out (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`) calls it directly rather than approximating it; the laxer OR-of-markers filter that used to sit here is deleted (§5.12).
 
 Because the real loader requires `tokenizer.json` **AND** an onnx file, a directory can pass admission and then fail at load, with an error message (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`) that describes a contract the loader does not implement. Consolidating on `ModelDirectory::load(...).is_ok()` would remove the divergence.
 
