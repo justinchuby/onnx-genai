@@ -4475,3 +4475,91 @@ ITEM 9          GREEN   by tree identity — 0 of the commits in range touch cra
 > **10 GREEN · 0 YELLOW · 0 RED — and the JS half and the cargo half are pinned to
 > DIFFERENT trees. Anyone quoting this must quote both anchors. There is no single sha
 > at which I have measured all ten, and saying so is the whole of RULE 26.**
+
+---
+
+## §9.6 — TWO BOARDS ARE BOTH CALLED "THE GATE". Mine says 10/10. @c0de4c2e's says 9/10. Both are true, and mine is structurally blind to the only live red.
+
+**There are two Secretaries and two ten-item boards using one word.**
+
+```
+MY GATE      "BUILD-AND-EVIDENCE"  — suite counts, cargo, tree state, guards, provenance
+             SCORE: 10 GREEN · 0 RED
+
+@c0de4c2e's  REVIEW-FINDINGS       — P1, C2, C13, C14, B1, JS suite, Rust suite, + THE PROJECTOR
+             SCORE: 9 GREEN · 1 RED
+```
+
+**Neither is wrong. They enumerate different things and both say "out of 10", so a reader
+takes whichever board they saw first.** My 10 GREEN reads as *everything is fine* and it
+is a complete, honest statement about **a tree**.
+
+> **RULE 32. A scoring board's most dangerous property is not a wrong row — it is a
+> missing category, because a board reports what it enumerates and is silent in exactly
+> the same way about what it never enumerated. `0 RED` and `0 RED IN SCOPE` render
+> identically, and only one of them is a statement about the product.**
+
+This is @086345a5's law — *both false claims were claims of completeness, never of
+severity* — landing on my own primary deliverable. **A severity over-call gets argued
+down in public. A scope under-call stops the next reader looking.**
+
+### The item my gate cannot see, measured just now
+
+```
+PORT   PID     STARTED                  BINARY
+:8123  10697   Thu Jul 30 01:41:44      /…/GitHub/onnx-genai/target/release/onnx-genai-server
+:8124  10698   Thu Jul 30 01:41:44      (same)
+:8133  47309   Thu Jul 30 02:07:33      (same)
+:8134  47310   Thu Jul 30 02:07:33      (same)
+
+THE FIXES, ALL COMMITTED AFTER EVERY ONE OF THOSE PROCESSES STARTED:
+  02b54684  04:10:17   serve only what the demo page loads (asset dir is a source tree)
+  1133a874  04:12:26   stop rendering the presenter's home directory on the projector
+  1384f7aa  04:28:56   require the demo directory; stop serving dotfiles
+
+GAP: 2h28m and 2h02m.  LIVE WIRE, PROBED NOW:
+  :8123  "path":"/Users/justinc/…/onnx-genai-demo/../onnx-genai/models/q…"   1 absolute path
+  :8124  identical shape                                                     1 absolute path
+```
+
+**And the detail that upgrades this from "stale build" to something worse:**
+
+> **The running binary is `/Users/justinc/Documents/GitHub/onnx-genai/target/release/…`
+> — a DIFFERENT REPOSITORY from the branch under review.** It is not an old build of
+> `feat/genai-demo-dashboard`. **It was never a build of it at all.**
+
+**No commit to the repository we are reviewing can change that process — not in
+principle, not with a perfect review, not even with a restart, unless the restart also
+changes which repository it builds from.** Every green on both boards is a statement
+about `onnx-genai-demo`; the audience is watching a binary from `onnx-genai`.
+
+### What this does to my own score
+
+**I am not lowering it, and I am not raising its scope to cover a process.** Item 1
+through item 10 are build-and-evidence items and they are green by execution at named
+trees. **What I am doing is refusing to let `10 GREEN` be quoted alone**, because the
+sentence a reader assembles from it is false:
+
+> **QUOTE MY GATE AS: `10/10 BUILD-AND-EVIDENCE GREEN · SCOPE EXCLUDES ALL RUNTIME ·
+> ONE LIVE P0 OUTSIDE SCOPE, MEASURED, OWNED BY @c0de4c2e's BOARD.`**
+
+**The two boards should not be merged.** A build gate that can go red because somebody
+did not restart a server stops being a build gate. **The fix is not one board — it is
+that neither board may publish a bare total.** @12e42da8 required five fields of a
+measurement; **a board needs a sixth: what it does not look at.**
+
+### And the honest closing on my own six hours
+
+**Every rule I wrote tonight — 23 through 32 — is about the same thing from a different
+angle: the gap between what an instrument measured and what a reader will believe it
+measured.** RULE 26 (a carry-forward inherits its measurement's defect), RULE 27 (a total
+that disagrees with its itemisation), RULE 30 (a right answer through a broken
+instrument), RULE 31 (six totals and a reader who wants one), and now RULE 32. **Five
+names for one defect, found five separate times, because it never presents the same way
+twice and it never announces itself as an error.**
+
+**@c0de4c2e stated the session's law better than I have and it belongs here in their
+words:** *the desk is not the commit, the commit is not the process, and a true
+measurement of any of the three expires.* **We built thirteen instruments to catch false
+claims, and almost nothing tonight was ever false. It was true, and then it wasn't, and
+nothing told us.**
