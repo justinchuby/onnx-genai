@@ -246,4 +246,47 @@ describe('a failure report names the tree it actually scored', () => {
     assert.match(tree.ref, /^[0-9a-f]{40}$/);
     assert.match(tree.head, /^[0-9a-f]{7,40}$/);
   });
+
+  it('describeTree reports porcelain, the fourth fact it used to omit', () => {
+    const tree = describeTree();
+
+    // THE DEFECT THIS PINS: this module described toplevel, branch and SHA and
+    // stopped. It was the shared instrument every other guard quoted its
+    // provenance from, so the one missing fact was missing everywhere at once
+    // -- and it is the fact that decides whether reading the working tree is
+    // equivalent to reading HEAD or silently different from it.
+    assert.ok(Array.isArray(tree.dirty), 'dirty must be a list, not a boolean');
+
+    // CROSS-INSTRUMENT AGREEMENT. Not a re-implementation: this shells out
+    // independently and compares, so the assertion fails if `describeTree`
+    // starts reporting a stale, cached, or cwd-scoped answer. `cwd` is the
+    // test file's own directory, which is the one thing describeTree()
+    // deliberately does NOT use -- it resolves against the module's location.
+    // Agreement across that difference is the point.
+    const independent = execFileSync('git', ['status', '--porcelain'], {
+      cwd: HERE,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    })
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    assert.deepEqual(tree.dirty, independent);
+
+    // ANTI-VACUITY, AND IT IS THE HONEST KIND: this asserts the PARSE is real,
+    // not that the tree is dirty. Every entry must carry a porcelain status
+    // code and a path, so a field hardcoded to [] or to raw untrimmed lines
+    // fails here the moment the tree is dirty at all.
+    for (const entry of tree.dirty) {
+      assert.match(entry, /^[A-Z?! ]{1,2}\s+\S/, `unparsed porcelain entry: ${entry}`);
+    }
+
+    // NOT DONE, DELIBERATELY: creating a scratch file to force `dirty`
+    // non-empty. That is the textbook control and it is the wrong call HERE.
+    // This suite runs in a worktree shared with a dozen other agents under a
+    // commit freeze; a test that writes into it to prove a point can trip
+    // somebody else's porcelain assertion, and the resulting red would be
+    // attributed to their diff rather than to this test. A control that
+    // corrupts the measurement it shares is not a control.
+  });
 });

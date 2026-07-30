@@ -642,16 +642,31 @@ always."
 > **Why the dynamic model does not batch is now established — and it is not a
 > property of the model file alone.** `continuous_batch_manager`
 > (`crates/onnx-genai-engine/src/batched.rs`) accepts exactly two decode paths
-> and refuses the rest with a message that names both:
+> and refuses the other two — **with a different message for each, because the
+> two refusals have different fixes**:
 >
 > ```
 > continuous batching requires a STATIC-CACHE or shared-buffer past/present model
 > ```
 >
+> ```
+> continuous batching requires a shared KV buffer, and this past/present model is not using one: the execution provider did not report fixed-capacity present binding, or it was not opted into at launch
+> ```
+>
 > - `ModelDecodePath::StaticCache { .. }` — batches.
 > - `ModelDecodePath::PastPresent { shared_buffer: true, max_len: Some(_) }` —
 >   batches.
-> - `ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy` — `bail!`.
+> - `ModelDecodePath::PastPresent { .. }` — `bail!` with the **second** message.
+>   The model may be fine; the buffer was not negotiated. See the note below.
+> - `ModelDecodePath::Legacy` — `bail!` with the **first** message. This one
+>   really does need a different model.
+>
+> **Match the message you actually got, not the first one on this page.** The
+> two are one `match` arm apart in the source and a world apart in what they
+> ask of you: the `Legacy` refusal means replace the model, the past/present
+> refusal often means change how the server was launched. They were a single
+> combined arm emitting a single sentence until that sentence started sending
+> operators to swap a model when the real fix was an environment variable.
 >
 > **So a static cache is sufficient, not necessary.** "Does this directory
 > declare `static_cache`?" is the wrong question to ask of a model whose

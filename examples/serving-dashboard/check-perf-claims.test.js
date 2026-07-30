@@ -1141,17 +1141,63 @@ test('continuous batching still accepts exactly the two decode paths the README 
 
 test('the refused arms are still exactly the two the README says are refused', () => {
   const body = continuousBatchManagerBody();
-  // The README narrows the open question to a TWO-WAY ambiguity -- Legacy, or
-  // PastPresent without a shared buffer. That width is a claim. If a third arm
-  // starts bailing, the README understates what is unknown.
-  const refusal = /ModelDecodePath::PastPresent\s*\{\s*\.\.\s*\}\s*\|\s*ModelDecodePath::Legacy\s*=>\s*\{\s*\n\s*anyhow::bail!/;
+
+  // WHY THIS NO LONGER MATCHES A SINGLE COMBINED ARM.
+  //
+  // This assertion used to be one regex requiring the literal source shape
+  // `PastPresent { .. } | Legacy => { bail!`. That went RED on a refactor that
+  // split the combined arm in two -- and the claim it exists to protect was
+  // never touched. Still exactly two refusing paths, still the same two.
+  //
+  // A guard that pins the SYNTAX of a claim rather than the CLAIM fails in the
+  // most corrosive way available: it reds on a correct change. A red nobody
+  // can act on is not caution, it is an invitation to delete the guard, and
+  // whoever deletes it also deletes the check on the thing that mattered.
+  //
+  // So: assert the SET of refusing arms. A third arm starting to bail still
+  // fires this. Merging or splitting the two that already do, does not.
+  const REFUSING_ARMS = ['ModelDecodePath::PastPresent { .. }', 'ModelDecodePath::Legacy'];
+  const bailingArms = [...body.matchAll(/(ModelDecodePath::[A-Za-z]+(?:\s*\{[^}]*\})?)[^=]*=>\s*\{([\s\S]*?)\n(\s{12}\})/g)]
+    .filter(([, , arm]) => /anyhow::bail!/.test(arm))
+    .map(([, head]) => head.replace(/\s+/g, ' ').trim());
+
+  assert.deepEqual(
+    bailingArms,
+    REFUSING_ARMS,
+    'the set of match arms that REFUSE continuous batching has changed.\n' +
+      `  now refusing: ${JSON.stringify(bailingArms)}\n` +
+      `  README says : ${JSON.stringify(REFUSING_ARMS)}\n` +
+      'The README narrows the unresolved question to exactly two ways ("which ' +
+      'of those two it lands on has not been observed"). If a third arm bails, ' +
+      'that stated width claims MORE certainty than we have. If one stops ' +
+      'bailing, it claims less.',
+  );
+
+  // AND THE PART THE SPLIT ACTUALLY CHANGED, WHICH THE ARM-SET CANNOT SEE.
+  //
+  // The two arms now carry DIFFERENT messages, and that was the entire point
+  // of splitting them -- batched.rs says so in a comment: collapsing them
+  // "tells an operator to change the model when the real fix may be an
+  // environment variable". The README quotes ONE of the two verbatim in a
+  // block a reader matches against their own terminal. An operator on the
+  // other path searches for that string and does not find it.
+  //
+  // So both messages must be quoted, or the README's fenced refusal is a
+  // 50% chance of sending someone to replace a model they did not need to.
+  const SHARED_BUFFER_BAIL = 'continuous batching requires a shared KV buffer';
   assert.ok(
-    refusal.test(body),
-    'the refusing match arm is no longer `PastPresent { .. } | Legacy => bail!`. ' +
-      'The README tells the reader the unresolved question is exactly two ways ' +
-      'wide ("which of those two it lands on has not been observed"). If the ' +
-      'set of refused paths has changed, that stated width is wrong -- and it ' +
-      'is wrong in the direction of claiming MORE certainty than we have.',
+    body.includes(SHARED_BUFFER_BAIL),
+    `the PastPresent arm no longer emits its own distinct refusal (${SHARED_BUFFER_BAIL}). ` +
+      'If the two arms were re-merged into one message, the README section that ' +
+      'documents them separately is now overspecified -- fix them together.',
+  );
+  assert.ok(
+    shipped('README.md').includes(SHARED_BUFFER_BAIL),
+    'batched.rs emits TWO distinct refusal messages and the README quotes only ' +
+      'one. The unquoted one is the shared-KV-buffer case, whose fix may be a ' +
+      'launch flag rather than a different model -- so a reader who hits it and ' +
+      'searches for the quoted string finds nothing, and the string they DO find ' +
+      'tells them to change the model. Quote both.',
   );
 });
 

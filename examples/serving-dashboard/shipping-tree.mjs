@@ -173,6 +173,30 @@ export function announceShippingRef() {
   else if (treeRef) via = `SHIPPING_TREE_REF=${treeRef}`;
   else if (reviewSha) via = `REVIEW_SHA=${reviewSha}`;
   process.stderr.write(`# shipping ref: ${SHIPPING_REF} [${via}]\n`);
+
+  // STATE THE CORPUS BESIDE THE RESULT, ON PASS AS WELL AS ON FAIL.
+  //
+  // `assertShippingTree` folds porcelain into its `where` banner, but that
+  // banner is only ever rendered into a THROWN error -- so the disclosure
+  // reaches exactly the readers who already know something is wrong, and
+  // never the ones quoting a green run. That is the same defect this suite
+  // has now found in three separate guards: a limitation documented where
+  // the passing verdict cannot print it.
+  //
+  // It does NOT throw. Eleven checks read the desk after asserting, and a
+  // dirty tree makes their result describe the desk rather than the branch --
+  // but a hard failure here would red the whole suite for an untracked file
+  // in a directory nobody's check reads, and a guard that cries wolf on
+  // unrelated dirt is one people learn to run with a bypass flag set.
+  const dirty = describeTree().dirty;
+  if (dirty.length > 0) {
+    process.stderr.write(
+      `⚠️  working tree is NOT clean: ${dirty.length} path(s).\n` +
+        dirty.map((d) => `#     ${d}\n`).join('') +
+        `#   Checks that read HEAD via shipped()/shippedPaths() are unaffected.\n` +
+        `#   Checks that readFileSync the desk are scoring THESE bytes, not the branch.\n`,
+    );
+  }
   return SHIPPING_REF;
 }
 
@@ -194,6 +218,29 @@ export function describeTree() {
     // HEAD would send the reader to the wrong tree whenever they differ.
     ref: SHIPPING_REF,
     refIsOverridden: Boolean(process.env.SHIPPING_TREE_REF?.trim()),
+    // THE FOURTH FACT, AND THIS MODULE SHIPPED WITHOUT IT.
+    //
+    // This crew requires four facts beside every result: toplevel, branch,
+    // SHA, porcelain. `describeTree` implemented the first three and was the
+    // shared instrument everyone else quoted, so the missing one was missing
+    // everywhere at once.
+    //
+    // It is the fact that decides whether the paragraph 100 lines above this
+    // is describing a hazard or a non-event. That paragraph says reading the
+    // working tree "is correct and means the wrong thing, and the two are
+    // indistinguishable whenever the tree is clean". Eleven checks in this
+    // directory call `assertShippingTree()` and then `readFileSync` the desk.
+    // Their safety rests ENTIRELY on cleanliness, and nothing measured it.
+    //
+    // Deliberately a LIST, not a boolean. "Dirty" is not the question; the
+    // question is whether the dirt intersects what a given check reads, and
+    // only the caller knows that. A boolean would force every caller to
+    // re-shell out to recover the paths, which is the API gap that already
+    // manufactured two duplicate readers in this repo.
+    dirty: git('status', '--porcelain')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean),
   };
 }
 
@@ -318,6 +365,7 @@ export function assertShippingTree() {
   const tree = describeTree();
   const where =
     `worktree ${tree.toplevel}\n  branch   ${tree.branch}\n  HEAD     ${tree.head}` +
+    `\n  porcelain ${tree.dirty.length}` +
     (tree.refIsOverridden ? `\n  reading  ${tree.ref} (SHIPPING_TREE_REF)` : '');
 
   // MUTATION-TESTING ESCAPE HATCH, OPT-IN AND LOUD.
