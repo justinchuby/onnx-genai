@@ -133,6 +133,8 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
 |---|---|
 | `--model` | The server takes a model **directory**, not a config file. Unlike the CLI it does not normalise the path for you, so passing `.../genai_config.json` is a real footgun. |
 | `--demo-assets-dir` | Where the dashboard's static files live. Without it the server looks for `./examples/serving-dashboard` **relative to its working directory**, so a server started from anywhere else serves an explanatory error at `/demo` instead of the page. `run-demo.sh` always passes it, so it works from any directory. |
+| `--models-dir` | **Never used, and worth knowing why.** It loads *every* valid model directory it finds, eagerly. `models/` holds twenty-odd of them, so this means many gigabytes and a very long startup before the demo can serve anything. Each server is pointed at one model with `--model`. |
+| `--max-loaded-models` | **Never set.** The default is unlimited; setting it risks evicting a model mid-demo, which presents as a scenario mysteriously going dead. |
 | `--enable-debug-endpoints` | The dashboard polls `/v1/debug/kv` (KV and prefix-cache fields) and `/v1/debug/config` (context length on the model card). Without it those fields correctly degrade to unavailable — nothing breaks, there is just much less to see. |
 
 The dashboard polls **`/v1/status`, `/v1/debug/kv` and `/health`**, and
