@@ -68,6 +68,47 @@ function git(...args) {
   return execFileSync('git', args, { cwd: HERE, encoding: 'utf8' }).trim();
 }
 
+// THE THIRD EXIT STATE: 0 = clean, 1 = a defect was found, 2 = THIS GUARD COULD NOT RUN.
+//
+// Measured before this existed: run this file from a directory that is not a work
+// tree -- a tarball extract, which is exactly how reviewers receive the branch -- and
+// it exited 1 with THREE RED TESTS, the first reading "expected to discover at least
+// 3 review documents, found 1". That sentence accuses the DOCUMENTS. The actual cause
+// was that `git` had nothing to answer with. A reader would go looking for missing
+// review files that were never missing.
+//
+// Exit 1 is byte-identical to "a checker ran and found a genuine defect", so a crash
+// in our tooling reads as a finding against the branch. The python instruments in
+// scripts/ already separate these; the JS guards did not, and that asymmetry was
+// aimed at whoever reads the extract. This closes it for this file only -- the other
+// JS guards that call `git` still report a missing work tree as a test failure.
+//
+// The refusal happens at import time, BEFORE any test is registered, because a
+// refusal printed after the results is read as a footnote to numbers the reader has
+// already believed.
+function refuseToRun(reason) {
+  process.stdout.write(
+    `\nCANNOT_RUN (exit 2): ${reason}.\n` +
+      `THIS IS NOT A FINDING ABOUT ANY REVIEW DOCUMENT.\n` +
+      `This guard compares each document's MEASURED-AT commit against the branch's\n` +
+      `history, so with no work tree it can measure nothing -- and every number it\n` +
+      `would print below would describe the extraction, not the branch.\n` +
+      `Re-run from a checkout of the repository.\n\n`,
+  );
+  process.exit(2);
+}
+
+try {
+  const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+    cwd: HERE,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim();
+  if (inside !== 'true') refuseToRun(`git reports "${inside}" for --is-inside-work-tree`);
+} catch {
+  refuseToRun(`no git work tree contains ${HERE}`);
+}
+
 test('the review corpus is discoverable at all', () => {
   // Positive control. Without this the whole file passes when the glob is wrong,
   // which is the exact shape of every false green measured this session.
