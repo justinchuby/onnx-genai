@@ -8,3 +8,8 @@
 
 - Reviewed Kuato's PR #419 CUDA `LpPool`, `CenterCropPad`, and `Col2Im` wave.
 - Approved after 217 GPU parity cases covered the new kernels; PR #419 merged as `9eeca36c`.
+
+## 2026-07-30T04:10:00Z — CUDA parity 161 review gate
+
+- Approved Kuato's PR #423 after QLinearMatMul and Resize GPU parity evidence.
+- Requested changes on PR #424, locking Kuato out of the revision; then approved Mary's shape-aware claim-gate fix after independent on-device re-run covering 308 GPU parity cases plus claim-gate probe evidence.
