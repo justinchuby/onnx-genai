@@ -516,10 +516,67 @@ percent/decode/urlencode tokens in the asset guard ....... 0
 ```
 
 The two rules do not compose: the one that fails closed is evaluated on a
-different segment from the one that fails open. **This is live at `1e809173`.**
-It is not exploitable on a machine with no dotted directory in the dashboard
-folder — today there are none — and that is luck, which is the thing the guard
-exists to stop relying on.
+different segment from the one that fails open.
+
+**This is no longer a source argument. It was proven on the wire, from a binary
+built at the scored pin**, by the reviewer who had earlier withdrawn the same
+claim for lack of provenance and then went and produced it properly:
+
+```
+[POS CTL] /demo/index.html ................. 200   the server can serve
+[NEG CTL] /demo/nonexistent.json ........... 404   it refuses properly
+BASELINE  /demo/.secretdir/settings.json ... 404   THE DOTFILE RULE FIRES
+C19       /demo/%2Esecretdir/settings.json . 200   BYPASSED — canary body returned
+```
+
+**And this retires the hedge that used to end this section.** It read: *not
+exploitable on a machine with no dotted directory in the dashboard folder — today
+there are none.* That was true and it was worthless, because the condition it
+rested on is one `mkdir` away and belongs to the operator, not to us. **A defence
+whose premise is the current contents of a directory is not a defence.**
+
+**The instrument note, because a second reviewer probed the same thing and got a
+clean 404 that meant nothing.** They requested an encoded path to a file that did
+not exist. A 404 is then correct regardless of whether authorisation was
+bypassed, so the probe could not distinguish the two outcomes it appeared to
+decide. **They voided it themselves rather than reporting it.** The proof that
+counts used a real file and confirmed the byte count on the wire — *a negative
+result against a subject that does not exist is the vacuous-guard defect wearing
+an HTTP status code.*
+
+### The verdict "blocking set empty" rests on a default, not on a property of the code
+
+The reviewer holding the security lane published the exact condition that would
+flip their verdict to blocking, so that it could be run rather than interpreted:
+*if the demo ever binds anything but loopback, I block* — because a fault-induced
+500 then hands the presenter's filesystem layout to every device on the network,
+and demos fail in public by nature.
+
+**I ran their predicate. It passes, and what it tests is a default:**
+
+```
+run-demo.sh:29   BIND_HOST="${BIND_HOST:-127.0.0.1}"
+  identical at the scored pin and at HEAD
+  BIND_HOST mentions in that file ....... 6
+  lines validating its value ............ 0
+  '0.0.0.0' in any tracked .sh .......... 0    [POS CTL] '127.0.0.1' in 5 files
+                                               [NEG CTL] fabricated token in 0
+  guards asserting the bind is loopback . 0
+```
+
+**`:-` is a default, not a constraint.** `BIND_HOST=0.0.0.0` reaches the blocking
+condition without editing one tracked byte, without a code review, and without a
+warning anywhere in the run. **So the empty blocking set is true, and it is a
+statement about how the demo is usually started rather than about what the demo
+permits.** The honest form of the verdict names the assumption: *no blocking
+issues, given a loopback bind that nothing enforces.*
+
+**This is the same shape as the allowlist above and the ratchet earlier.** In all
+three, a real safety property is delivered by something that was chosen for a
+different reason — a MIME list, a file layout, a shell default — and each holds
+until the day someone changes it for that different reason. **Safe by luck is not
+a criticism of anyone's work here; it is a description of where the guard is
+missing, and in this case the guard is one assertion.**
 
 The fix is a rejection of the character before any decode, not a second decoder.
 A second decoder must agree with the first one forever, and that is a
