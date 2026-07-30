@@ -56,49 +56,55 @@ instead of copying anything:
 MODELS_DIR=/path/to/onnx-genai/models ./examples/serving-dashboard/run-demo.sh
 ```
 
-To build the static-cache model from scratch you need **Mobius**, and the way
-you install it matters more than it should:
+To build the models from scratch you need **Mobius**, the ONNX exporter, which
+lives in a separate repository:
 
 ```bash
-pip install git+https://github.com/onnxruntime/mobius.git
+pip install "git+https://github.com/onnxruntime/mobius"
 ```
 
 > ⚠️ **Do not `pip install mobius`.** The distribution is named **`mobius-ai`**
 > (the *import* name is `mobius`), it is **not published on PyPI**, and an
-> unrelated squatter package called `mobius` *is*. So the obvious command
-> installs a completely different library and then fails with
-> `No module named mobius.__main__` — an error that tells you nothing about the
-> real cause. Install from source, from **`onnxruntime/mobius`**; other repo
-> paths for it are stale and 404.
+> unrelated squatter package called `mobius` *is*. So the obvious command does
+> not fail — it **succeeds at installing a completely different library**, which
+> then fails much later with `No module named mobius.__main__`, an error that
+> says nothing about the real cause. Install from source, from
+> **`onnxruntime/mobius`**; other repository paths for it are stale and 404.
+
+Then build the two models. `scripts/build_qwen.sh` does the whole job — export,
+static-cache metadata, and tokenizer companions:
 
 ```bash
-HF_HOME=models/.hf_cache TMPDIR=models/.scratch \
-python -m mobius build --model Qwen/Qwen2.5-0.5B-Instruct \
-  models/qwen2.5-0.5b-scatter-v2 \
-  --dtype f32 --ep default --static-cache --max-seq-len 4096 \
-  --runtime onnx-genai
+# dynamic profile (:8124)
+scripts/build_qwen.sh
+
+# static-cache / scatter profile (:8123)
+STATIC_CACHE=1 MAX_SEQ_LEN=4096 OUT_DIR=models/qwen2.5-0.5b-scatter-v2 \
+  scripts/build_qwen.sh
 ```
 
-> **Three known traps, each of which costs an hour if you hit it blind.**
->
-> 1. `scripts/build_qwen.sh` passes `--runtime ort-genai`, which emits only
->    `genai_config.json`. The runtime needs `inference_metadata.yaml` with a
->    `model.io.static_cache` declaration, and rejects the model at load time
->    with a message about *"a TensorScatter static-cache scatter ABI but
->    declares no `model.io.static_cache`"*. Use `--runtime onnx-genai`, as
->    above. The pre-existing `models/qwen2.5-0.5b-scatter` directory has this
->    defect and does not load.
-> 2. Even under `--runtime onnx-genai`, the builder omits the `io:` block for
->    static-cache builds, so it has to be appended by hand. The graph follows
->    the same naming convention as the test fixture, so
->    `tests/fixtures/tiny-llm-scatter/inference_metadata.yaml` is a working
->    24-layer template.
-> 3. **On macOS, `scripts/build_qwen.sh` aborts before it does anything.** Stock
->    `/bin/bash` is 3.2.57, and under `set -u` bash 3.2 treats an empty array
->    expansion as an unbound variable. The documented no-argument invocation has
->    therefore never worked on a Mac without Homebrew bash 5 on `PATH`. If you
->    write `set -u` bash with arrays, the safe idiom is
->    `${arr[@]+"${arr[@]}"}`.
+`DRY_RUN=1` prints the exact commands without building, which is the fastest way
+to check your environment is wired up before committing to a 2 GB export.
+
+> **`OUT_DIR` is not optional for the scatter build.** Its default is
+> `models/qwen2.5-0.5b-scatter`, and a directory of that name **already exists
+> and does not load** — it was produced by an older version of this script that
+> emitted no `model.io.static_cache` declaration. `run-demo.sh` deliberately
+> looks for `-scatter-v2` so a stale artifact can never be mistaken for a fresh
+> one.
+
+**Three traps that used to live here are now fixed in the script**, and they are
+worth a sentence because you may still meet them in older notes:
+
+| Was | Now |
+| --- | --- |
+| The script passed `--runtime ort-genai`, producing a model the runtime rejects at load time. | It passes `--runtime onnx-genai` and **verifies the export afterwards**, failing loudly with the repair command rather than emitting a model that dies later. |
+| The `io:` block had to be appended by hand from a test fixture. | `scripts/lib/write_static_cache_metadata.py` writes it automatically. |
+| On stock macOS `/bin/bash` 3.2.57, the documented no-argument invocation **aborted at line 31** under `set -u` — so it had never worked on any Mac without Homebrew bash 5. | Runs clean on bash 3.2, and is regression-tested under both 3.2 and 5.3. Missing dependencies now produce an actionable message naming the interpreter and the install command. |
+
+That third one is the one worth remembering. It was invisible to everyone
+capable of finding it, because anyone who develops this project has bash 5 on
+`PATH` — **the failure was reserved exclusively for first-time readers.**
 
 The demo does no model loading, downloading, conversion, or management of its
 own. It is a pure client of a server you start yourself.
@@ -363,23 +369,57 @@ Reuse across a shared prompt prefix. The cache is a token radix trie, so reuse
 happens over the common *prefix*, not merely by appending to a previous
 conversation.
 
-This one is measured, not asserted. On a dynamic server, firing an identical
-long prefix twice moved `prefix_cache_hits_total` from 0 to 1 and cut end-to-end
-latency from 1.53 s to 1.22 s — roughly 20 % faster on the repeat.
+🔴 **This scenario is currently unconfirmed, and the honest reading is that
+prefix reuse does not measurably happen.** It is documented here rather than
+quietly removed, because how it failed is more instructive than the feature
+would have been.
 
-The hit rate you see is **derived client-side** from the TTFT delta on a
-repeated prefix, not read from the server's `prefix_cache_hit_rate` field. That
-field cannot be trusted: its denominator, `prefix_cache_lookups`, increments on
-every completed generation whether or not any cache was consulted, so it counts
-generations rather than lookups. The demo drives its own load and knows exactly
-what it sent, which makes client-side attribution exact rather than merely
-adequate.
+An early check fired one identical long prefix twice, saw
+`prefix_cache_hits_total` move 0 → 1 and latency fall 1.53 s → 1.22 s, and
+concluded the cache worked. A later controlled run **contradicted it**:
+
+| Arm | What was sent | Warm TTFT (median, n=6) |
+| --- | --- | --- |
+| A | One identical ~900-token prefix, repeated | 1341 ms |
+| B *(control)* | Six prefixes **differing from token 0** — no real sharing possible | 1254 ms |
+
+**Shared-prefix requests were 7 % *slower* than requests that shared nothing.**
+
+The reason the second result wins is not that it is newer — it is that it has a
+**control arm**. A single repeated request getting faster is fully explained by
+ordinary warm-up: allocators, page cache, thread pools. Without an arm that
+repeats *without* sharing, a warm-up effect and a cache hit are the same
+observation. The first run had no such arm, and n=2 cannot separate them.
+
+It also carried a **sensitivity control**, which is what turns this from *not
+observed* into **proven absent**: a ~10-token prompt takes 140 ms to first
+token, a ~900-token prompt takes 1380 ms, so prefill is ~90 % of TTFT. A cache
+genuinely reusing that prefill would collapse TTFT toward ~140 ms — a ~90 %
+drop, impossible to miss. The measured effect was **+7 %**.
+
+**And both hit-rate counters are unusable, in opposite directions.** On the
+scatter profile the counter records nothing — `prefix_cache_hit_len` is a
+hardcoded literal `0` (`batched.rs:262`, `:486`). On the dynamic profile it
+records *everything*: it counts any nonzero match, so the few shared tokens of
+the chat template make it read ~95 % from the very first request, including for
+prefixes that differ from token 0. One counter is pinned low, the other pinned
+high, and **neither is measuring prefix reuse.**
+
+> **So the demo displays no prefix cache hit rate, in any form, on either
+> profile.** A precisely-computed 95 % would have been the most convincing
+> number on the page and the least true. This is the failure this project exists
+> to catch, caught — and caught *before* the panel was built rather than at
+> sign-off.
+
+What remains real and reportable here is the **cold-versus-warm TTFT pair
+itself**. It is a genuine measurement; it simply shows no improvement. Reporting
+that is the whole point.
 
 > **This scenario cannot be driven by concurrency.** The dynamic server
 > serialises generations — one engine, one driver thread — so concurrent
-> requests queue rather than overlap. Prefix reuse and block sharing are driven
-> by *sequential* requests that repeat a prefix. Raising concurrency here shows
-> you a queue, not sharing.
+> requests queue rather than overlap. Any prefix reuse would have to come from
+> *sequential* requests repeating a prefix. Raising concurrency here shows you a
+> queue, not sharing.
 
 ### Scenario C — paged KV block table *(dynamic profile, `:8124`)*
 
