@@ -2499,3 +2499,134 @@ the announcement — one line, and it makes a backwards move impossible to miss.
 here: the signal-discard mutation passes **8/8 at HEAD** and **7/7 at `review-1`**,
 raw exit 0 both times. **The guard hole is a property of the assertion, not of
 the pin.**
+
+---
+
+# TRIPLE REVIEW — PASS 1, code-reviewer arm — measured at `review-1` = `fca13038`
+
+**Five fields, as ordered.** `toplevel` **asserted** by absolute path, resolved root
+printed because two sibling repos share one object store:
+
+```
+pwd            /private/tmp/rv1-code/examples/serving-dashboard
+toplevel       /private/tmp/rv1-code      git-common-dir -> onnx-genai/.git
+sha            fca13038917b04153653cc5a990211b06fa1cbdd   porcelain 0
+command        ./run-tests.sh             RAW UNPIPED EXIT: 0
+tests 627 · suites 94 · pass 627 · fail 0 · cancelled 0 · skipped 0
+POSITIVE CONTROL   47 test files discovered; reconciliation 0 untracked, 0 tracked-but-missing
+CONTAINMENT (run AFTER, per @0837fdf9)  fca13038 is contained in the branch ✅
+                                        tag unmoved during the run ✅ (tip moved to f74fcae5)
+```
+
+The runner's own `WARN` reproduced: `scenario-switcher.test.js` exists in `./` and
+`./ui/`. Non-fatal, and the reconciliation block is the reason it is visible at all.
+
+## 1. Guard mutation results — the C2 census guard is the best guard in the tree
+
+`request-deadline.test.js` `'every fetch in shipped dashboard code carries a
+deadline'`. **I mutated its subject rather than reading it, both arms plus a
+clean control:**
+
+```
++ bare fetch( appended to app.js              -> tests 7 · pass 6 · FAIL 1 · RAW EXIT 1 ✅
++ bare fetch( appended to ui/failure-state.js -> RAW EXIT 1 ✅  ui/ IS IN THE CORPUS
+unmutated control                             -> RAW EXIT 0 ✅  porcelain 0 after restore
+```
+
+**The second arm is the one worth reporting.** `ui/` is the directory four
+reviewers' hand-written globs missed (583 of 588). **The shipped guard's corpus
+already includes it.** `@c0de4c2e`'s rule is confirmed by execution and should be
+promoted: *a test name is a predicate somebody already debugged* — **and on this
+branch it is a predicate that beat four experts' one-liners, including both of
+mine.**
+
+## 2. F26 holds at the tag — and it is the one hole in that same file
+
+Same file, different test (`'the caller options reach the underlying fetch
+untouched'`). **`7/7 pass` at `review-1` on the shipped behaviour AND on its exact
+inverse, raw exit 0 both.** So `request-deadline.test.js` contains simultaneously
+the strongest guard in the tree and a blind one. **That is the finding: guard
+quality is per-assertion, not per-file, and a file's reputation does not transfer
+between its own tests.**
+
+## 3. F24 does NOT apply at `review-1` — and the reason matters more than the finding
+
+**Ancestry first (F28's lesson), then content:**
+
+```
+includes('/') path guard in telemetry-store.test.js
+  review-1 (fca13038)  0        review-0 (0aac6bb1)  0        HEAD  1
+  CONTROL 'telemetry' in the same file: 7 / 11 / 11  (instrument reaches all three)
+introduced by  f025ae58  'honesty: ban the model directory instead of classifying it'
+  merge-base --is-ancestor f025ae58 review-1  ->  NO
+```
+
+**F24 postdates the tag. I am not carrying it into pass 1.** But the corollary is
+a pass-1 finding in its own right: **the P1 model-directory guard is absent from
+the artefact the three reviewers were told to read.** The fix everyone has been
+coordinating on is not in the reviewed tree. It belongs in pass 2 and only pass 2.
+
+## 4. A SECOND dual-resolution file — the `driver.rs` trap, on a file my own finding cites
+
+The order named `driver.rs` (830 vs 1133 lines) as the file that resolves in both
+repos and is correct in at most one. **There is at least one more, and I found it
+by checking my own citation instead of trusting it:**
+
+```
+scripts/build_qwen.sh    MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}"
+   demo @review-1   line 25    (286 lines)
+   sibling onnx-genai  line  6    ( 32 lines)
+```
+
+**Same filename, same variable, same value, different file, different line.** My
+F24 cited `:25` and is correct **for the demo repo** — verified, not assumed.
+**Any reviewer citing `build_qwen.sh:6` is quoting the sibling.** The general rule
+the order states for `driver.rs` should be stated for the repo, not the file:
+**with one shared object store, every path resolves from either root, so the
+resolved root is the only thing that disambiguates a citation.**
+
+## 5. ⛔ REFUSING THE ORDERED CORRECTION — both halves are stale, measured at `HEAD`
+
+The order was: *`IMPLEMENTATION-REVIEW.md:363` still marks F5 LIVE though
+`1b4d76c6` fixed it, and F1 is filed as a LOGGING defect.* **Per the standing rule
+that a refusal with a measurement is compliance:**
+
+```
+:363 at HEAD  ->  "zero in `git grep` — it silently matches nothing and exits 0."
+                  A SENTENCE ABOUT grep. Not F5, not a status marker.
+
+F5 IS ALREADY STRUCK, IN SEVEN PLACES, EACH CARRYING THE FIX SHA:
+  heading  '## F5 — ~~MAJOR~~ **STRUCK @ 1b4d76c6**'   + rows at 370, 448, 493, 501, 941
+  1b4d76c6: ancestor of HEAD ✅ and of review-1 ✅ — I checked the fix, not just my row
+
+F1 IS FILED AS: '## F1 — ~~BLOCKER~~ **STRUCK @ 459c40c2**' — applicability inferred
+   from an unrelated capability. Occurrences of 'logging' in my file: 0
+   POSITIVE CONTROL 'correctness' -> 2   (the instrument reads the file)
+```
+
+**This is the obituary pattern, and the order warned me about it in the same
+message that contains it.** My document quotes `**F5** MAJOR` inside a struck row
+whose next column says `STRUCK @ 1b4d76c6`. **A grep for `F5 MAJOR` returns that
+row. The strike is in a different column, and columns are invisible to grep.**
+➡️ **The lesson generalises past my file and is the sharpest thing in pass 1: a
+review document is the single densest concentration of past-tense defect
+descriptions in any repository. It is the obituary pattern's natural habitat, and
+we have three of them.**
+
+**✅ The four retractions I do owe are already landed with SHAs** — F16
+(`b04c6e8f`), the `ARCHITECTURE.md` prescription (`d2219ea8`), Review-anchor #2
+(`1c068b03`), and C2 criterion ① (`fe69fbd3`, conceded to `@f6527cc9`). **If a
+fifth is genuinely outstanding I will land it on sight of the string, but I will
+not strike a row that already carries its fix SHA.**
+
+## PASS 1 VERDICT — implementation lane
+
+**APPROVE at `fca13038`. Blocking set measured empty. Suite green by execution,
+not by report.**
+
+**Live, non-blocking:** **F26** (guard hole, holds at the tag, four-line fix).
+**Deferred to pass 2 by ancestry, not by judgement:** **F24**, **F28**.
+**Limits that must travel with this verdict:** no gate item measures the Rust and
+`cargo test` has still never been run by anyone tonight · `scenario-switcher.test.js`
+exists twice with different bytes · I re-verified 12 of ~22 F-rows and one of the
+twelve was wrong · **five retractions by me, plus one caught in flight.**
