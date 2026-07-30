@@ -193,6 +193,59 @@ JS doc comments — code comments sit beside their referent and never need to po
 unowned prose surface is *cleaner* on this axis than every owned document, including this one,
 which shipped with one.
 
+### R12 — the provenance catalogue defines one field twice, and the weaker entry is the live one
+
+`PROVENANCE` in `telemetry-provenance.js` contains **two** `'batch.capacity'` entries, out of 37
+keys. A duplicate key in a JavaScript object literal is not an error: no syntax error, no
+warning, no lint. The last definition silently wins.
+
+Confirmed by executing the module rather than reading it:
+
+```
+import('./telemetry-provenance.js') -> PROVENANCE['batch.capacity']
+  LIVE evidence: 'admin.rs:178 (batch_capacity, from state.config.effective_batch_capacity()).'
+  LIVE label   : 'Batch limit'
+```
+
+**The entry that loses is the better one, on the axis this branch has spent all night
+ratifying.** It is anchored to a *symbol* and it carries the semantics:
+
+```
+DEAD  '...admin.rs — `batch_capacity` is serialised from AppConfig::effective_batch_capacity(),
+       which state.rs defines as max_batch.min(max_queue_depth). Genuinely computed from
+       configuration; no stub.'
+LIVE  '...admin.rs:178 (batch_capacity, from state.config.effective_batch_capacity()).'
+```
+
+The `min(max_batch, max_queue_depth)` explanation is the one the crew explicitly decided must not
+be un-learned — raw `max_batch` overstates the ceiling, so a saturated server can draw as 25%
+busy. That explanation is in the dead half. The surviving half is anchored to a line number, the
+least durable thing this file could cite.
+
+**So the fix is a merge, not a deletion, and getting that backwards loses something either way:**
+the dead entry uniquely holds the evidence prose and the denominator comment; the live entry
+uniquely holds `label: 'Batch limit'`. Keep the symbol-anchored evidence, keep the label, delete
+one key.
+
+> Two definitions of one fact do not disagree loudly — they resolve, silently, and the file
+> still reads as if both are in force. A reader who scrolls to the first entry, finds an
+> exemplary symbol-anchored explanation, and stops reading has read dead code that is
+> indistinguishable from live code.
+
+This is the defect the product exists to refuse — an absence that renders identically to a value
+— sitting inside the provenance table itself. **A cheap guard closes the class:** extract the key
+literals from the source and assert the list equals its own `Set`. Today that check goes red:
+
+```
+git show HEAD:telemetry-provenance.js | grep -oE "^  '[a-z_]+\.[a-z_]+':" | sort | uniq -d
+  ->  'batch.capacity':
+```
+
+*Do not write that guard by comparing a source count against `Object.keys(PROVENANCE).length`.*
+I tried it, and the two numbers are drawn from different populations — the pattern above matches
+a subset of the object's keys, so the counts agree while a duplicate is present and the check
+proves nothing. Compare a list against its own deduplication, in one population.
+
 ---
 
 ## Withdrawn by me
