@@ -17,9 +17,17 @@
 // branch on `field.state` before rendering.
 
 /**
- * @typedef {'measured' | 'pending' | 'stale' | 'unavailable'} FieldState
+ * @typedef {'ok' | 'pending' | 'stale' | 'unavailable' | 'not-applicable'} FieldState
  *
- * - `measured`    — the server genuinely computed this value, just now.
+ * These are the WIRE VALUES, which is what `field.state` is actually compared
+ * against. Note that the measured state's value is `'ok'`, not `'measured'` --
+ * the constant is named `FIELD_STATES.MEASURED` but emits `'ok'` (see :90).
+ * This typedef previously read `'measured'`, which meant a reader following the
+ * documentation would write `field.state === 'measured'` and get a comparison
+ * that is NEVER true, with no error to explain why. Always compare against
+ * `FIELD_STATES.*` rather than a literal; the names and the values differ here.
+ *
+ * - `ok`              — the server genuinely computed this value, just now.
  *                   Includes a genuine zero, which renders at full contrast.
  * - `pending`     — measurable, but no sample has arrived yet (the first poll
  *                   has not completed). `value` is `null`. Renders `···`.
@@ -31,10 +39,15 @@
  *                   `value` is the last known good value; `observedAtMs` says
  *                   how old it is. Render it visibly de-emphasised with its age.
  * - `unavailable` — no value exists and none is coming without a server or
- *                   configuration change. Either the server cannot measure it
- *                   yet, the endpoint that carries it is disabled, or the field
- *                   is structurally inapplicable to the current decode path.
+ *                   configuration change: the server cannot measure it yet, or
+ *                   the endpoint that carries it is disabled. This is OUR GAP,
+ *                   and it is a PROMISE that someone could do the work.
  *                   `value` is ALWAYS `null`. Render an em-dash, never a zero.
+ * - `not-applicable` — the field is structurally inapplicable to this decode
+ *                   path: that subsystem is never consulted here, so there is
+ *                   nothing to measure and never will be. An ARCHITECTURAL
+ *                   FACT, not a gap — do not render it as an apology.
+ *                   `value` is ALWAYS `null`. Render `n/a`, never a zero.
  */
 
 /**
