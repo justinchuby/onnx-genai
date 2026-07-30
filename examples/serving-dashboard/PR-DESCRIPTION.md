@@ -162,17 +162,29 @@ before it can route on this field honestly. Same applies to `kv_pages_used`,
 
 ## Tests
 
-**136 Rust tests** in the server crate; **67 documentation-drift checks**
-(`node --test check-*.test.js`) plus the dashboard's own suites in
-`examples/serving-dashboard/`.
+The JavaScript suite — documentation-drift checks plus the dashboard's own
+tests — has exactly one way to run it:
 
-> **Counts in this section are anchored, because a test count is a claim with a
-> shelf life.** The canonical suite is a *command*, not a number:
-> `cd examples/serving-dashboard && node --test`. Any total quoted here without
-> a commit and a Node version beside it should be re-run rather than believed —
-> including these. Measured at `e6dd848e`, Node v25.6.1. **Note that `node --test`
-> only recurses into `dashboard/` on Node ≥ 22; on older Node the same command
-> silently runs a fraction of the suite and reports success.**
+```bash
+./examples/serving-dashboard/run-tests.sh
+```
+
+> **This section no longer states the command, only cites it.** It previously
+> gave `node --test check-*.test.js` — a *single glob*, which does not recurse
+> and silently omitted every suite under `dashboard/` and `ui/` while exiting 0.
+> The runner discovers files instead of listing them, reconciles the discovered
+> count against the suites Node actually executed, and refuses to report a total
+> that includes untracked files. `CONTRACT.md` §7 records the five incompatible
+> forms this replaced and why each one was green and wrong.
+>
+> **Counts below are anchored, because a test count is a claim with a shelf
+> life.** Re-run rather than believe them.
+>
+> - **632 tests across 95 suites, 0 failures** — measured at `02b54684` on a
+>   clean detached worktree (`porcelain 0`), Node v25.6.1, 47 discovered files,
+>   0 untracked, 0 tracked-but-missing.
+> - **136 Rust tests** in the server crate — carried from `e6dd848e` and **not
+>   re-measured for this revision**; treat it as the older claim it is.
 
 The drift checks exist because **documentation rots faster than code and nothing
 tells you.** They bind the README to the repository: every cited file and line

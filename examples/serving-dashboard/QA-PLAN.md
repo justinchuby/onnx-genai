@@ -672,7 +672,11 @@ is worse than no reason, because the visitor believes it.
 - [ ] **10.1a** Any tok/s displayed by the dashboard is **client-derived** from SSE token
       timestamps. `/v1/status.tokens_per_second` is a hardcoded `0.0` (§7.1) and must never be
       the source. Verify the number on screen moves when generation speed moves.
-- [ ] **10.2** `node --test` passes with zero dependencies; no Vite/TS/npm build step introduced.
+- [ ] **10.2** `./examples/serving-dashboard/run-tests.sh` exits 0 with zero dependencies; no
+      Vite/TS/npm build step introduced. **Use the runner, not a bare `node --test`** — a bare
+      invocation can pass while running a subset, and a glob form can pass while running nothing.
+      The acceptance signal is the runner's `PASS:` line, which is emitted only after the
+      discovered-file / executed-suite reconciliation and the untracked-file check also pass.
 - [ ] **10.3** Full run from a clean clone by someone who has not read this thread — the real
       acceptance test.
 
