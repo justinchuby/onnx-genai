@@ -403,6 +403,8 @@ Because the demo drives 100% of its own load, the browser knows from its **own**
   **⛔ REASON 1 — THE PRECISION WAS TWENTY TIMES BEYOND THE INSTRUMENT'S RESOLUTION, AND THIS DOCUMENT ALREADY CONTAINED THE PROOF, 970 LINES BELOW THE CLAIM (see AC33):**
   ```
   claimed        82.130 / 33.415  =  2.458      <- shipped as "2.46x, never round it"
+                                                   ⛔ WITHDRAWN. That instruction is
+                                                   REFUTED two lines below, not live.
   same numerator, re-run denominator (@fc8b5d97, byte-identical binary, 75 min later)
                  82.130 / 30.151  =  2.724
   denominator moved  -9.77%  from BACKGROUND LOAD ALONE  ->  ratio moved  10.83%
