@@ -3915,3 +3915,76 @@ path-anchored zeros are unprovable.**
 
 **Verdict is UNCHANGED and now consistent with its own work order: APPROVE. Blocking set
 empty. F3 and F37 are the two things I would fix before a demo, and neither blocks a merge.**
+
+---
+
+## F41 — ✅ **`@0837fdf9`'s unreported RED is GREEN at HEAD, it went green the RIGHT way, and the guard that fixed it contains the best instrument-integrity pattern in this tree.**
+
+**Executed, `pwd` and `toplevel` both asserted, HEAD `eed75b8e`:**
+
+```
+node --test check-source-citations.test.js
+  ℹ tests 7 · pass 7 · fail 0 · exit 0        ⬅ NOT 4/2. THE RED IS CLOSED.
+```
+
+### ✅ And it closed by fixing the UNIT, not by moving the floor
+
+`@0837fdf9` warned the fix could be faked — *"removing a false citation always lowers a
+count-based floor; the floor scores honesty as regression."* **I checked the diffs rather
+than the colour, because a lowered floor and a real fix are both green:**
+
+```
+b0afa2be  "count symbol anchors as coverage, so the guard stops opposing the fix"
+35aaa6e2  "stop the guard opposing its own migration"
+          + // That made the floor below shrink every time the document got BETTER.
+          + // A guard whose floor drops when you follow its own advice leaves you to
+          + // lower the floor or revert the improvement. Both are wrong.
+ffe9ca85  "the citation checker graded the README against my desk"
+```
+
+**Nobody lowered anything. They changed what is counted so that following the guard's own
+advice can no longer reduce the score.** ➡️ **That is `@12e42da8`'s re-derive-at-read-time
+cure applied to a test's units, and it is the correct general answer to the stale-figure
+pump: a threshold that punishes improvement is not a weak guard, it is an inverted one.**
+
+### ✅ The green is not vacuous — **four independent anti-vacuity floors**
+
+```
+:163  citations().length >= 10     corpus is non-empty
+:624  checked >= 30                the checks actually ran
+        // "It was first written as `>= 8`, which was worse than useless"
+:691  seen.size >= 20              distinct symbols, not one symbol 30 times
+:773  shippedReads >= 4            ⬅ THE RATCHET
+```
+
+### 🎖️ **The RATCHET (`:718`–`:774`) is the strongest pattern I have seen in this repository, and it is the structural answer to tonight's entire disease**
+
+```js
+// RATCHET. This is not a claim about the README; it is a claim about THIS FILE.
+const shippedReads = (self.match(/\bshippedFile\(/g) ?? []).length;
+assert.ok(shippedReads >= 4,
+  `only ${shippedReads} shippedFile() call(s); this file has stopped reading …`);
+```
+
+**The test reads its own source and asserts it still reads committed bytes rather than the
+working tree.** ➡️ **We have spent this entire session on instruments that silently stopped
+measuring the thing they claimed to measure — `git grep` from the wrong cwd, `| tail`
+laundering exit codes, `git archive` disarming ten guards, a control returning the same value
+as its subject, my own twelve rows of perfect zeros. **Every one of those failed because
+nothing was watching the instrument.** **This guard watches itself, and it fails loudly the
+moment its own methodology degrades.**
+
+**That is the pattern to copy, and it generalises past citations: an instrument should assert
+its own preconditions, not merely its findings.** A guard that cannot detect its own
+disarmament is one refactor away from being a green that means nothing — **which is the
+single most expensive thing this crew has produced tonight, in nine separate costumes.**
+
+### ⚠️ One design question I would raise, not a defect
+
+The 7 drifted citations print as a **`note:`** and the test still passes — *"the symbols still
+exist, so no claim is false; repair at leisure."* **The reasoning is sound and I agree with
+the grading** (a moved line beside a live symbol is not a false claim). **But a `note:` on a
+passing test is read by nobody**, and this run is the only reason those 7 are now visible.
+**If they are worth printing, they are worth a count that can be ratcheted down; if they are
+not, they are noise.** Suggest: assert the drift count is `<= N` and lower `N` opportunistically
+— **the same ratchet already applied four times in this file, pointed at its own warnings.**
