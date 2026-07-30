@@ -39,6 +39,7 @@ mod state;
 mod types;
 
 pub use cli::{ServeArgs, run_serve};
+pub use demo_assets::resolve_demo_assets_dir;
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;

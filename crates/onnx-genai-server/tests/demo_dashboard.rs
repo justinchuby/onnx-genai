@@ -17,7 +17,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use onnx_genai_server::{AppState, ServerConfig, app};
+use onnx_genai_server::{AppState, ServerConfig, app, resolve_demo_assets_dir};
 use std::path::{Path, PathBuf};
 use tower::ServiceExt;
 
@@ -359,5 +359,79 @@ async fn a_crafted_host_header_does_not_widen_the_demo_policy() {
     assert!(
         !policy.contains("script-src *"),
         "the policy must never gain a directive from a header: got {policy}"
+    );
+}
+
+/// Reproduces a measurement: before the dotfile rule, `.secret.json` and
+/// `.vscode/settings.json` answered `200` on the demo origin WITH THEIR
+/// CONTENTS, because the extension allowlist judges the extension and a dotfile
+/// can carry an allowed one. `.env` and `.git/config` were refused only because
+/// `env` and `config` happen not to be on the list.
+///
+/// Bodies are inspected rather than statuses, because the point of the defect
+/// was the content that came back.
+#[tokio::test]
+async fn the_demo_origin_does_not_publish_dotfiles() {
+    let dir = demo_fixture();
+    let secret = "SUPER-SECRET-VALUE";
+    std::fs::write(dir.path().join(".env"), format!("KEY={secret}")).unwrap();
+    std::fs::write(
+        dir.path().join(".secret.json"),
+        format!("{{\"k\":\"{secret}\"}}"),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join(".vscode")).unwrap();
+    std::fs::write(
+        dir.path().join(".vscode/settings.json"),
+        format!("{{\"token\":\"{secret}\"}}"),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join(".git/config"), format!("url={secret}")).unwrap();
+
+    for path in [
+        "/demo/.env",
+        "/demo/.secret.json",
+        "/demo/.vscode/settings.json",
+        "/demo/.git/config",
+    ] {
+        let response = app_with_demo_dir(Some(dir.path()))
+            .oneshot(get(path))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} was served"
+        );
+        let body = body_string(response).await;
+        assert!(
+            !body.contains(secret),
+            "{path} returned its contents on an unauthenticated origin"
+        );
+    }
+}
+
+/// A directory that exists but cannot serve the dashboard must not be mounted:
+/// `--demo-assets-dir ~` would otherwise publish a home directory.
+#[tokio::test]
+async fn a_directory_without_the_entry_page_is_not_published() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("private.json"), "{\"pin\":\"1234\"}").unwrap();
+
+    let resolved = resolve_demo_assets_dir(Some(dir.path().to_path_buf()));
+    assert!(resolved.is_none(), "an arbitrary directory was accepted");
+
+    // What a server started with that flag actually answers.
+    let response = app_with_demo_dir(resolved.as_deref())
+        .oneshot(get("/demo/private.json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_string(response).await;
+    assert!(!body.contains("1234"), "the directory was published anyway");
+    assert!(
+        body.contains("index.html"),
+        "the refusal must say what was required, not just 404: got {body:?}"
     );
 }

@@ -40,22 +40,61 @@ const MISSING_ASSETS_MESSAGE: &str = concat!(
     "  1. --demo-assets-dir <DIR>\n",
     "  2. ONNX_GENAI_DEMO_ASSETS_DIR=<DIR>\n",
     "  3. ./examples/serving-dashboard (relative to the working directory)\n\n",
+    "A directory is used only if it contains a readable, non-empty index.html. \
+     A directory that exists but has no entry page is REFUSED rather than \
+     served, because /demo publishes what it is pointed at and this server \
+     needs no credentials.\n\n",
     "Either start the server from the repository root, or pass the directory \
      explicitly:\n",
     "  onnx-genai-server --model <MODEL_DIR> --demo-assets-dir examples/serving-dashboard\n",
 );
 
+/// The file a directory must be able to serve before it is treated as the demo.
+///
+/// This is the page `/demo/` resolves to, so a directory without it cannot
+/// serve the dashboard no matter what else it contains.
+const DEMO_ENTRY_PAGE: &str = "index.html";
+
+/// Whether this directory can actually serve the dashboard.
+///
+/// Deliberately asks what the directory CAN DO rather than whether it exists.
+/// `is_dir()` alone is satisfied by `/`, `$HOME` or `/etc`, and the `/demo`
+/// mount publishes whatever it is pointed at on an unauthenticated server — so
+/// the check that keeps a typo from turning into disclosure has to be evidence
+/// that this is the dashboard, not evidence that the path is real.
+///
+/// The entry page must be a non-empty regular file we can read: a directory
+/// named `index.html`, a dangling symlink, an unreadable file and a zero-byte
+/// placeholder all satisfy "exists" and none of them can serve the demo. Using
+/// the metadata we already had to fetch avoids claiming more than we checked —
+/// this does not parse the HTML, and does not pretend to.
+fn directory_can_serve_the_dashboard(candidate: &std::path::Path) -> bool {
+    if !candidate.is_dir() {
+        return false;
+    }
+    // `metadata` follows symlinks, so a link to a real page is accepted and a
+    // dangling one is not — which matches what `ServeDir` will do later.
+    std::fs::metadata(candidate.join(DEMO_ENTRY_PAGE))
+        .is_ok_and(|entry| entry.is_file() && entry.len() > 0)
+}
+
 /// Resolves the demo asset directory from an explicit override, the environment,
 /// then a working-directory-relative default.
 ///
-/// Returns `None` when nothing exists, so a server started outside the repo
-/// still boots — `/demo` then reports the problem instead of the process
-/// refusing to start over an optional feature.
+/// Returns `None` when no candidate can serve the dashboard, so a server
+/// started outside the repo still boots — `/demo` then reports the problem
+/// instead of the process refusing to start over an optional feature.
+///
+/// A candidate that exists but cannot serve the dashboard is rejected rather
+/// than mounted, because mounting it publishes its contents. The three sources
+/// are NOT tried in turn on failure: an explicit `--demo-assets-dir` that is
+/// wrong is a mistake to report, not a reason to silently serve a different
+/// directory than the operator named.
 pub fn resolve_demo_assets_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
     let candidate = explicit
         .or_else(|| std::env::var_os("ONNX_GENAI_DEMO_ASSETS_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DEMO_ASSETS_DIR));
-    candidate.is_dir().then_some(candidate)
+    directory_can_serve_the_dashboard(&candidate).then_some(candidate)
 }
 
 /// Fallback for every `/demo` route when no asset directory was configured.
@@ -87,6 +126,18 @@ fn demo_path_is_servable(path: &str) -> bool {
         return true;
     }
     let name = rest.rsplit('/').next().unwrap_or(rest);
+    // Dotfiles are refused by segment, not by name. `ServeDir` has NO dotfile
+    // rule of its own -- measured, not assumed: with the extension allowlist in
+    // place `.secret.json` and `.vscode/settings.json` both answered 200 with
+    // their contents, and `.env`, `.npmrc` and `.git/config` were refused only
+    // incidentally, because their extensions are not on the list. That is a
+    // refusal by coincidence, and it inverts the moment someone adds `json` to
+    // a dotted config directory. Checking every segment rather than the final
+    // name is what stops `.git/config` and `.vscode/settings.json`, where the
+    // secret is the DIRECTORY.
+    if rest.split('/').any(|segment| segment.starts_with('.')) {
+        return false;
+    }
     // Test files are `.js` and would pass the extension check. They are not
     // secret, but they are the largest source of confusing 200s for anyone
     // poking at the demo, and nothing in the page loads them.
@@ -374,18 +425,124 @@ mod tests {
         assert!(DEMO_CSP_PREFIX.contains("object-src 'none'"));
     }
 
+    /// Measured, not assumed: with only the extension allowlist, `.secret.json`
+    /// and `.vscode/settings.json` answered 200 WITH THEIR CONTENTS.
+    #[test]
+    fn dotfiles_are_refused_even_when_their_extension_is_allowed() {
+        for path in [
+            "/demo/.secret.json",
+            "/demo/.env.json",
+            "/demo/.well-known/keys.json",
+            "/demo/.vscode/settings.json",
+            "/demo/.config/app.js",
+        ] {
+            assert!(
+                !demo_path_is_servable(path),
+                "{path} carries an allowlisted extension, so the extension \
+                 check alone lets it through"
+            );
+        }
+    }
+
+    /// These were already refused, but only because of their extension. Pinning
+    /// them stops a later addition to the allowlist from re-exposing them.
+    #[test]
+    fn dotfiles_without_an_allowed_extension_stay_refused() {
+        for path in ["/demo/.env", "/demo/.npmrc", "/demo/.git/config"] {
+            assert!(!demo_path_is_servable(path));
+        }
+    }
+
+    /// The rule is "segment starts with a dot", not "contains a dot" -- every
+    /// real asset has a dot in it.
+    #[test]
+    fn the_dotfile_rule_does_not_refuse_ordinary_assets() {
+        for path in [
+            "/demo/index.html",
+            "/demo/app.js",
+            "/demo/styles/tokens.css",
+            "/demo/vendor/chart.min.js",
+            "/demo/",
+        ] {
+            assert!(
+                demo_path_is_servable(path),
+                "{path} is loaded by the page and must keep working"
+            );
+        }
+    }
+
     #[test]
     fn missing_directory_resolves_to_none_rather_than_failing() {
         assert!(resolve_demo_assets_dir(Some(PathBuf::from("/nonexistent/demo/dir"))).is_none());
     }
 
+    /// This test used to point at an EMPTY tempdir and assert it was accepted,
+    /// which certified the defect: any directory at all could be published on
+    /// an unauthenticated origin. It now requires the directory to be able to
+    /// serve the dashboard, which is the property that was always meant.
     #[test]
-    fn explicit_directory_is_used_when_it_exists() {
+    fn a_directory_holding_the_dashboard_is_used() {
         let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>").unwrap();
         assert_eq!(
             resolve_demo_assets_dir(Some(dir.path().to_path_buf())).as_deref(),
             Some(dir.path())
         );
+    }
+
+    /// The case the old test certified as acceptable. `$HOME` and `/etc` are
+    /// directories too, and `/demo` needs no credentials.
+    #[test]
+    fn an_arbitrary_directory_is_not_an_asset_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("taxes.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "private").unwrap();
+        assert!(
+            resolve_demo_assets_dir(Some(dir.path().to_path_buf())).is_none(),
+            "a directory with no entry page cannot serve the dashboard, so \
+             mounting it can only publish its contents"
+        );
+    }
+
+    /// "Exists" is not "can serve": each of these satisfies a bare existence
+    /// check and none of them can answer `GET /demo/`.
+    #[test]
+    fn an_entry_page_that_cannot_be_served_does_not_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("index.html")).unwrap();
+        assert!(
+            resolve_demo_assets_dir(Some(dir.path().to_path_buf())).is_none(),
+            "a DIRECTORY named index.html exists but cannot be served"
+        );
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        std::fs::write(empty.path().join("index.html"), "").unwrap();
+        assert!(
+            resolve_demo_assets_dir(Some(empty.path().to_path_buf())).is_none(),
+            "a zero-byte entry page exists but renders nothing"
+        );
+
+        let dangling = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(
+            dangling.path().join("gone.html"),
+            dangling.path().join("index.html"),
+        )
+        .unwrap();
+        assert!(
+            resolve_demo_assets_dir(Some(dangling.path().to_path_buf())).is_none(),
+            "a dangling symlink exists as a link and resolves to nothing"
+        );
+    }
+
+    /// A symlink to a real page is the normal packaging case and must work.
+    #[test]
+    fn an_entry_page_reached_through_a_symlink_is_served() {
+        let real = tempfile::tempdir().expect("tempdir");
+        let page = real.path().join("dashboard.html");
+        std::fs::write(&page, "<!doctype html>").unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&page, dir.path().join("index.html")).unwrap();
+        assert!(resolve_demo_assets_dir(Some(dir.path().to_path_buf())).is_some());
     }
 
     /// A file is not a directory: pointing `--demo-assets-dir` at `index.html`
