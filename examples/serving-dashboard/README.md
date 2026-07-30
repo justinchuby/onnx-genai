@@ -694,31 +694,47 @@ always."
 > on and quietly wrong elsewhere** — which is why the only sound way to know is
 > to ask the running server.
 
-> **This is now resolved, and not by watching the server.** The measurement puts
-> `qwen2.5-0.5b` on a *refused* arm, and the source says the refused arms are
-> `PastPresent { shared_buffer: false, .. }` and `Legacy`. **It is the first
-> one**, and you can establish that from the artifact without running anything.
-> In `crates/onnx-genai-engine/src/decode/metadata.rs`, `detect_model_decode_path`
+> **This is now diagnosed, and the cause is one level below where this document
+> first looked.** The measurement puts `qwen2.5-0.5b` on a *refused* arm, and the
+> source says the refused arms are `PastPresent { shared_buffer: false, .. }` and
+> `Legacy`. **It is the first one.** In
+> `crates/onnx-genai-engine/src/decode/metadata.rs`, `detect_model_decode_path`
 > selects `Legacy` only when the graph has *neither* KV inputs *nor* present
 > outputs; `model.onnx` in that directory names `past_key_values.0.key` and its
 > 47 siblings — 24 layers, key and value — so that branch is not reachable for
-> this model. What the directory
-> is actually missing is `inference_metadata.yaml` — absent here, present in
-> `qwen2.5-0.5b-scatter-v2` — which leaves `shared_kv_max_len` as `None` and
-> pins the shared-buffer flag to `false`.
+> this model.
 >
-> **So the refusal is a property of the declaration, not of the architecture.**
-> Of the 33 model directories on the disk this demo reads, 10 carry an
-> `inference_metadata.yaml` and **exactly one declares `static_cache`** — the
-> scatter build. **Nine models ship the file and still cannot batch**, which is
-> why "it is missing a file" is the wrong lesson to draw: the file has to
-> *declare a batching-capable decode path*, and nine of them do not.
+> **The root cause is that these are two different ONNX exports, and no
+> configuration change can close the gap.** The batching-capable path is
+> `StaticCache`, which is bound through a scatter ABI — a pair of integer control
+> ports the runtime writes new keys and values through.
+> `qwen2.5-0.5b-scatter-v2`'s graph carries a `write_indices` input;
+> `qwen2.5-0.5b`'s does not. In
+> `crates/onnx-genai-ort/src/decode/io.rs`, `reject_undeclared_static_cache`
+> returns `Ok(None)` for a graph that exposes no scatter ABI, and the ordinary KV
+> path takes it from there — so `StaticCache` is not merely undeclared for this
+> model, it is **unreachable**. There is no port to name.
 >
-> ⚠️ **That census is a fact about one laptop and you cannot check it from this
-> repository** — models are gitignored (`.gitignore:2`). The two predicates
-> behind it are checkable anywhere, and they are the ones to carry: does the
-> directory have `inference_metadata.yaml`, and does that file declare
-> `static_cache`?
+> ⛔ **Retracted, from an earlier revision of this very paragraph: "the refusal is
+> a property of the declaration, not of the architecture."** That was wrong, and
+> it was wrong in the flattering direction — it implied a missing file you could
+> go write. **You cannot add a graph input with a YAML key.** The export has to
+> be rebuilt, which is exactly what `scripts/build_qwen.sh` does.
+>
+> **And the "it is missing a file" story fails a second test: a genuinely missing
+> declaration does not look like this.** The same function raises a *loud*
+> `InvalidArgument` when a graph exposes the scatter ports and declares no
+> `model.io.static_cache`, and the error names the exact key to add. So the two
+> cases are distinguishable from the outside — **a missing declaration errors; a
+> missing capability degrades quietly.** `qwen2.5-0.5b` degrades quietly.
+>
+> ⚠️ **One census figure below is a fact about one laptop and you cannot check it
+> from this repository** — models are gitignored (`.gitignore:2`). Of the 33 model
+> directories on the disk this demo reads, 10 carry an `inference_metadata.yaml`
+> and **exactly one declares `static_cache`**. Carry the predicates, not the
+> count: does `model.onnx` expose a `write_indices` input, and does
+> `inference_metadata.yaml` declare `static_cache`? **The first predicate is the
+> one that decides**; the second cannot be satisfied without it.
 
 **You do not have to trust the log for this, because the number is on the
 page.** The fallback path is one row wide however large the configured ceiling
@@ -743,14 +759,27 @@ expected to be running.
 > `match` that keeps the error, and the fallback is logged at **WARN with a
 > `reason=` field**. **The log now tells you which path ran AND why.**
 >
-> **What it still cannot tell you is which refused decode path you are on —
-> and that is not an oversight, it is arithmetic.** Both refused arms
+> **What the log line still cannot tell you is which refused decode path you are
+> on — and that is not an oversight, it is arithmetic.** Both refused arms
 > (`PastPresent { .. }` and `Legacy`) are a **single match arm with a single
 > `bail!`**, so they emit the **same** `reason=` string. **Adding the reason
 > narrowed the question from "why is batching off?" to "which of two shapes is
-> this model?", and no amount of log-level detail closes the remaining gap,
-> because the two cases are indistinguishable at the point the message is
-> written.** That is the whole of the two-way ambiguity noted above.
+> this model?", and no amount of log-level detail closes that gap, because the
+> two cases are indistinguishable at the point the message is written.**
+>
+> **Two things have since closed it from the outside.** The artifact answers it
+> without the server's help — `write_indices` and the KV port names are readable
+> straight out of `model.onnx`, which is how the diagnosis above was reached. And
+> `1e1b2a82` added `batch_driver` and `batch_driver_detail` to `/v1/status`
+> (`crates/onnx-genai-server/src/routes/mod.rs`), populated on **both** paths, so
+> the running server now names its own driver instead of leaving you to infer it
+> from a capacity of 1.
+>
+> ⚠️ **That field has a birth date too, and it is younger than the servers you
+> may be pointing at.** It does not exist before `1e1b2a82`, and a process
+> started before that commit will not grow the field by being asked. **A missing
+> `batch_driver` means "old server", not "no driver"** — do not read its absence
+> as a measurement.
 >
 > ⚠️ **And note how this section decayed: a server-side fix landed one commit
 > before the documentation that described the old behaviour, so the prose was
