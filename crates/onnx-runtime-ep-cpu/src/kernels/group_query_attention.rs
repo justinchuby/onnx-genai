@@ -1862,6 +1862,148 @@ mod tests {
     }
 
     #[test]
+    fn decode_r1_grouping_head_dim_64_matches_reference_across_steps() {
+        const QUERY_HEAD_COUNT: usize = 12;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 64;
+        const ROTARY_DIMENSION: usize = 64;
+        const INITIAL_PAST_LENGTH: usize = 2;
+        const DECODE_STEPS: usize = 4;
+        const MAX_SEQUENCE_LENGTH: usize = INITIAL_PAST_LENGTH + DECODE_STEPS;
+
+        let rotary_half = ROTARY_DIMENSION / 2;
+        let cosine: Vec<f32> = (0..MAX_SEQUENCE_LENGTH * rotary_half)
+            .map(|index| (index as f32 * 0.013).cos())
+            .collect();
+        let sine: Vec<f32> = (0..MAX_SEQUENCE_LENGTH * rotary_half)
+            .map(|index| (index as f32 * 0.013).sin())
+            .collect();
+        let mut past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * INITIAL_PAST_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x6411))
+            .collect();
+        let mut past_value: Vec<f32> = (0..past_key.len())
+            .map(|index| mixed_scale_value(index, 0x6422))
+            .collect();
+
+        for step in 0..DECODE_STEPS {
+            let past_length = INITIAL_PAST_LENGTH + step;
+            let total_length = past_length + 1;
+            let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+                .map(|index| mixed_scale_value(index, 0x6433 + step as u64))
+                .collect();
+            let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+                .map(|index| mixed_scale_value(index, 0x6444 + step as u64))
+                .collect();
+            let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+                .map(|index| mixed_scale_value(index, 0x6455 + step as u64))
+                .collect();
+            let query_rotated = reference_rope_bsh_geometry(
+                &query,
+                1,
+                QUERY_HEAD_COUNT,
+                HEAD_WIDTH,
+                ROTARY_DIMENSION,
+                &[past_length],
+                &cosine,
+                &sine,
+            );
+            let current_key_rotated = bsh_to_bnsh_geometry(
+                &reference_rope_bsh_geometry(
+                    &current_key,
+                    1,
+                    KEY_VALUE_HEAD_COUNT,
+                    HEAD_WIDTH,
+                    ROTARY_DIMENSION,
+                    &[past_length],
+                    &cosine,
+                    &sine,
+                ),
+                1,
+                KEY_VALUE_HEAD_COUNT,
+                HEAD_WIDTH,
+            );
+            let current_value_bnsh =
+                bsh_to_bnsh_geometry(&current_value, 1, KEY_VALUE_HEAD_COUNT, HEAD_WIDTH);
+            let mut expected_key = vec![0.0; KEY_VALUE_HEAD_COUNT * total_length * HEAD_WIDTH];
+            let mut expected_value = expected_key.clone();
+            for head in 0..KEY_VALUE_HEAD_COUNT {
+                let past_source = head * past_length * HEAD_WIDTH;
+                let present_destination = head * total_length * HEAD_WIDTH;
+                let past_elements = past_length * HEAD_WIDTH;
+                expected_key[present_destination..present_destination + past_elements]
+                    .copy_from_slice(&past_key[past_source..past_source + past_elements]);
+                expected_value[present_destination..present_destination + past_elements]
+                    .copy_from_slice(&past_value[past_source..past_source + past_elements]);
+                expected_key[present_destination + past_elements
+                    ..present_destination + past_elements + HEAD_WIDTH]
+                    .copy_from_slice(
+                        &current_key_rotated[head * HEAD_WIDTH..(head + 1) * HEAD_WIDTH],
+                    );
+                expected_value[present_destination + past_elements
+                    ..present_destination + past_elements + HEAD_WIDTH]
+                    .copy_from_slice(
+                        &current_value_bnsh[head * HEAD_WIDTH..(head + 1) * HEAD_WIDTH],
+                    );
+            }
+            let expected_output = reference_with_geometry(
+                &query_rotated,
+                &expected_key,
+                &expected_value,
+                1,
+                total_length,
+                past_length,
+                QUERY_HEAD_COUNT,
+                KEY_VALUE_HEAD_COUNT,
+                HEAD_WIDTH,
+            );
+
+            let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut present_key =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, total_length, HEAD_WIDTH]);
+            let mut present_value =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, total_length, HEAD_WIDTH]);
+            gqa_kernel_with_heads(
+                QUERY_HEAD_COUNT as i64,
+                KEY_VALUE_HEAD_COUNT as i64,
+                &[("do_rotary", Attribute::Int(1))],
+            )
+            .execute(
+                &[
+                    Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                    Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key).view(),
+                    Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_value).view(),
+                    Owned::f32(
+                        &[1, KEY_VALUE_HEAD_COUNT, past_length, HEAD_WIDTH],
+                        &past_key,
+                    )
+                    .view(),
+                    Owned::f32(
+                        &[1, KEY_VALUE_HEAD_COUNT, past_length, HEAD_WIDTH],
+                        &past_value,
+                    )
+                    .view(),
+                    Owned::i32(&[1], &[past_length as i32]).view(),
+                    Owned::i32(&[], &[total_length as i32]).view(),
+                    Owned::f32(&[MAX_SEQUENCE_LENGTH, rotary_half], &cosine).view(),
+                    Owned::f32(&[MAX_SEQUENCE_LENGTH, rotary_half], &sine).view(),
+                ],
+                &mut [
+                    output.view_mut(),
+                    present_key.view_mut(),
+                    present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+            close(&present_key.to_f32(), &expected_key);
+            close(&present_value.to_f32(), &expected_value);
+            close(&output.to_f32(), &expected_output);
+            past_key = expected_key;
+            past_value = expected_value;
+        }
+    }
+
+    #[test]
     fn decode_widens_f16_past_cache_before_materializing_present_cache() {
         let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
         let past_k = vec![1., 0., 0., 1., 10., 0., 0., 10.];
