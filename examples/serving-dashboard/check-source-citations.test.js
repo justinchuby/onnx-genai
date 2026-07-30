@@ -275,6 +275,18 @@ const NOT_AN_ANCHOR = new Set([
 // rather than the unit of grammar.
 const ANY_CITATION = new RegExp(CITATION.source, 'g');
 
+// A symbol-anchored citation: a full path, then the symbol, e.g.
+//   `crates/onnx-genai-engine/src/batched.rs`, `struct ContinuousBatchManager`
+// This is the form we are migrating TO, so it has to be verifiable -- an
+// unverified anchor that merely LOOKS durable is the worst of both.
+const SYMBOL_ANCHORED =
+  // The symbol must START WITH AN IDENTIFIER CHARACTER. Without that the
+  // pattern also matched `path.rs`, `:156` -- a line-anchored CONTINUATION,
+  // where the second backtick group is another line number, not a symbol. It
+  // reported `:156` as a missing symbol: a real-looking failure produced
+  // entirely by the matcher, on a citation that was never malformed.
+  /`([A-Za-z0-9_./-]+\.(?:rs|js|css|html|sh))`,\s*`([A-Za-z_][^`\n]*)`/g;
+
 function clipBefore(text) {
   const last = [...text.matchAll(ANY_CITATION)].pop();
   const fromCitation = last ? last.index + last[0].length : 0;
@@ -530,6 +542,47 @@ test('a cited line still sits beside the symbol the prose names', () => {
       `cited line:\n\n${failures.join('\n\n')}`,
   );
 
+  // SYMBOL-ANCHORED citations count toward coverage too, and this is not
+  // bookkeeping -- without it THIS GUARD ACTIVELY OPPOSES THE FIX IT EXISTS TO
+  // ENCOURAGE. Converting `batched.rs:101-110` to (`.../batched.rs`,
+  // `struct ContinuousBatchManager`) removes a line number that rots and
+  // replaces it with an anchor that survives every rebase -- strictly better,
+  // and it dropped `checked` from 36 to 24 and turned the floor RED. The
+  // prescribed remedy was "lower the floor and say why", which would have
+  // ratcheted the guard weaker every time the docs got stronger.
+  //
+  // A symbol anchor is the EASIER thing to verify, not the harder one: the
+  // symbol either occurs in the shipped file or it does not, with no window
+  // and no proximity heuristic. So verify it and count it.
+  // NOT `failures`: that array was already asserted above, so pushing to it
+  // here would be silently dead -- a check that runs, finds a defect, and
+  // reports nothing. Caught by asking where the array is read, not whether it
+  // is written.
+  const symbolFailures = [];
+  for (const m of readme.matchAll(SYMBOL_ANCHORED)) {
+    const [, citedPath, symbol] = m;
+    const candidates = trackedSourceFiles.filter(
+      (f) => f === citedPath || f.endsWith(`/${citedPath}`),
+    );
+    if (candidates.length !== 1) continue; // uniqueness is the other test's job
+    if (!shippedFile(candidates[0]).includes(symbol)) {
+      symbolFailures.push(
+        `${citedPath} is cited for \`${symbol}\`, but that symbol does not ` +
+          `occur in the file at HEAD. A symbol anchor that does not resolve is ` +
+          `worse than a stale line number: it reads as durable.`,
+      );
+    }
+    checked += 1;
+  }
+
+  assert.deepEqual(
+    symbolFailures,
+    [],
+    `${symbolFailures.length} symbol-anchored citation(s) name a symbol that ` +
+      `is not in the file at HEAD:\n  ` +
+      symbolFailures.join('\n  '),
+  );
+
   // A coverage floor, because this check degrades silently in the one way that
   // matters: tighten the anchor rules or reword the prose and it starts
   // skipping everything while still reporting green.
@@ -553,7 +606,10 @@ test('a cited line still sits beside the symbol the prose names', () => {
     checked >= 30,
     `Only ${checked} citations were anchor-checked, down from 36. This test ` +
       `verifies nothing it cannot anchor, so a drop here means coverage ` +
-      `evaporated rather than that the README improved.`,
+      `evaporated rather than that the README improved. NOTE: converting a ` +
+      `line-anchored citation to a symbol anchor does NOT reduce this count -- ` +
+      `symbol anchors are counted above. A real drop here means citations were ` +
+      `DELETED or the matchers stopped matching.`,
   );
 });
 
