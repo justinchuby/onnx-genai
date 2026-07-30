@@ -868,9 +868,17 @@ attach or handle resize explicitly rather than discarding the `Result`.
 
 ---
 
-## Required before merge — FINAL, at committed `9e31a7c7`
+## ~~Required before merge — FINAL, at committed `9e31a7c7`~~ ⛔ **SUPERSEDED — DO NOT EXECUTE THIS LIST**
 
-1. **F1 (blocker)** — derive paged applicability from the engine, not from
+> 🔴 **STOP. This list is stale and item 1 orders work on a finding I STRUCK.** It was
+> stamped `FINAL` at `9e31a7c7` and never re-derived. **See `## Required before merge —
+> RE-DERIVED` at the end of this document for the list that is safe to execute.** The section
+> below is retained unedited because deleting it would destroy the record of what I got wrong,
+> but **every numbered item in it must be checked against the re-derived list before anyone
+> acts on it.** Known-dead as of `18609a0a`: **item 1 (F1) is STRUCK**, **item 4 (F11) is
+> RETRACTED**, and **item 2 (F3) is NOT a blocker.**
+
+1. **F1 (blocker)** ⛔ **STRUCK — DO NOT DO THIS** — derive paged applicability from the engine, not from
    `!continuous_batch_supported`. Make `runtime.rs:263 attach_kv_telemetry` return `bool` the
    way its pipeline sibling already does, then `set_applicable(paged && !continuous_batch_supported)`.
 2. **F3 (blocker)** — collapse the two render stacks, or document and test which one wins per
@@ -3848,3 +3856,62 @@ in the shared index RIGHT NOW"* is, at 05:53, false — and it was broadcast wit
 time and SHA that `@12e42da8`'s own amendment ① had just made mandatory.** **A hazard warning
 that outlives its hazard is tonight's disease arriving in the safety channel, which is the
 one place we cannot afford people to learn that alarms expire.**
+
+---
+
+## F40 — 🔴 **My own `Required before merge — FINAL` list ordered work on a STRUCK finding. Found in my deliverable, by me, one hour after I praised `@c0de4c2e` for finding the identical thing in `demo-ux.md §24.2`.**
+
+`@e00032a4` told me to check whether my repairs are absent from `review-1`. **31 of my 38
+commits are** (control: the file's first commit `60d89cce` **is** present, so the test is not
+vacuous). Chasing that, I read my own most actionable section and found it rotten:
+
+```
+## Required before merge — FINAL, at committed 9e31a7c7
+
+  1. **F1 (blocker)**  -- STRUCK at 459c40c2. A BUILD INSTRUCTION FOR A DEAD FINDING.
+  2. **F3 (blocker)**  -- live, but my VERDICT says the blocking set is EMPTY.
+  4. **F11 (major)**   -- RETRACTED by me after @086345a5's correction.
+  4. **F12 (major)**   -- SECOND ITEM NUMBERED 4.
+     "`driver.rs` is still dirty" -- an UNDATED dirty-tree claim, the exact
+     perishable reading @12e42da8 ruled on at 05:49.
+```
+
+**I have been broadcasting `APPROVE — blocking set empty` for hours while the FINAL
+required-before-merge list in my own deliverable named two blockers.** ➡️ **The verdict and
+the work order disagreed, and the work order is the half an implementer executes.**
+
+**This is exactly `@c0de4c2e`'s §24.2 class — *a retraction propagates to the line where a
+claim is ASSERTED, never to the lines where it is USED AS A BUILD INSTRUCTION* — and I
+committed it in the highest-consequence location available to me.** My F1 strike propagated
+to the F1 *row* and the F1 *section*, and never to the *order*.
+
+### ⛔ And I nearly published a twelve-row board of perfect zeros getting here
+
+```
+FIRST RUN, from `cd examples/serving-dashboard`, pathspecs already containing it:
+  F1 0 · F3 0 · F11 0 · F14 0 · F15 0 · **EVERY CONTROL 0** · neg control 0
+```
+
+**git resolved `examples/serving-dashboard/examples/serving-dashboard/…`. Every row and every
+control returned 0 — which would have read as *every item on my required list is closed*.**
+⚠️ **`@c0de4c2e` broadcast this exact trap, against themselves, roughly an hour ago. I walked
+into it anyway.** ➡️ **And the reason my standing safeguard missed it is worth more than the
+error: I assert `toplevel` on every measurement, and `git rev-parse --show-toplevel` returns
+the SAME value from any subdirectory. It cannot see this defect. `pwd` is the field that
+catches it, and I had never printed it.** **Assert `pwd` AND `toplevel`, or your
+path-anchored zeros are unprovable.**
+
+## Required before merge — RE-DERIVED at `18609a0a`, `pwd` and `toplevel` both asserted
+
+**Nothing here is carried. Each line says what I measured and what I did not.**
+
+| # | item | grade | measured at `18609a0a` |
+|---|---|---|---|
+| — | **F1** | ⚫ **STRUCK — REMOVED FROM THE LIST** | `set_applicable()` **now takes no argument at all** (`telemetry.rs:199`). The three call sites are `telemetry.rs:1164`, `driver.rs:605` (`Self::Applicable => telemetry.set_applicable()` — an exhaustive match, the cure), and `tests.rs:5087`, **a past-tense doc comment**. **The bug is not fixed, it is structurally impossible.** Stronger than my original clearance. |
+| 1 | **F3** | 🟠 **MAJOR, NOT A BLOCKER** | **3 implementations live**, printed verbatim: `app.js:291`, `dashboard/field-state.js:209`, `format.js:94`. **7 of 7 inputs disagree**, and `null` → `'0s old'` / `'age unknown'` / `'0s'` — **two of three render a MISSING timestamp as freshly-measured data.** That `null` behaviour is the real defect; the formatting drift is cosmetic beside it. **Fix: delete the other two, keep `field-state.js:209`, which is the only one that handles `null`.** |
+| 2 | **F37** | 🟠 **LATENT** | `demo_assets.rs:167` gates on raw `request.uri().path()`; tower-http decodes at `serve_dir/mod.rs:462`. **Acceptance test is one string added to the loop already at `demo_dashboard.rs:148`.** |
+| — | **F11** | ⚫ **RETRACTED — REMOVED** | `@086345a5` showed `options.label ?? field?.label` means the **caller wins**, so the catalogue is a default. My finding was wrong. |
+| ? | **F12 · F14 · F15** | 🟡 **CARRIED, NOT RE-VERIFIED** | The keys still resolve (`scheduler.max_batch` 10 files, `batch_capacity` 20, `kv.allocation_failures` 8, `dataset.state` 8) **but presence is not the claim** — F15 asserts *no client module publishes* these, which I have NOT re-measured at `18609a0a`. **Do not action these without re-deriving them. Their F12 dirty-tree clause is stale by construction: it was true of a working tree that no longer exists.** |
+
+**Verdict is UNCHANGED and now consistent with its own work order: APPROVE. Blocking set
+empty. F3 and F37 are the two things I would fix before a demo, and neither blocks a merge.**
