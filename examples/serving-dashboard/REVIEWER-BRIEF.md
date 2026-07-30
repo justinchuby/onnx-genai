@@ -423,32 +423,37 @@ itself, and it is why the scenario ships the half we can demonstrate.
 
 ## 7. Current state of the JavaScript suite
 
+The suite is a command, not a number. Run it, and state the command **and your
+working directory** alongside any result you report:
+
 ```
 cd examples/serving-dashboard && node --test
-pass 479   fail 1        (2582f5fb)
 ```
 
-**The single failure is a new check catching real defects, not a regression.**
-Do not make it pass by weakening it:
+That invocation is the only total the release gate accepts. Anything narrower —
+a single file, a subdirectory — is a subset and must say so when reported. The
+pass count has moved repeatedly in a single evening while the tree changed
+underneath it, which is why no number appears here.
 
-```
-check-source-citations.test.js:357
-  "a cited line still sits beside the symbol the prose names"
-  3 citation(s) name a symbol that is no longer at the cited line:
-    README cites driver.rs:717 for handle_or_defer_during_batch -> now :734, :752
-    README cites driver.rs:794 for handle_driver_command        -> now :581, :626, :829
-    README cites driver.rs:816 for run_fallback_generation      -> now :851, :935
-```
+Two cautions about running it. Node's `--test` recurses, so the count of files
+it collects is larger than the top-level directory suggests; and consecutive
+runs at one fixed sha can disagree if uncommitted work is moving in the shared
+tree. Quote `git status --porcelain` with the sha.
 
-An older version of this check verified only that the cited line number fit
-inside the file, so it caught a citation going *short* and never one going
-*stale*. This one resolves the symbol. It went red on its first run and found
-three. Fix the three citations in `README.md`; the assertion is correct.
+**If a check named below is red, do not make it pass by weakening it.**
+`check-source-citations.test.js` was written to catch citations that go *stale*
+rather than merely out of range: it resolves the symbol the prose names and
+confirms the cited line still sits beside it. It went red on its first run and
+found three real defects in `README.md` — citations for
+`handle_or_defer_during_batch`, `handle_driver_command` and
+`run_fallback_generation` whose symbols had moved. An older version of that
+check verified only that the cited line fit inside the file, so it caught a
+citation going short and never one going stale. Fix the citations; the
+assertion is correct.
 
-For context, the field-state suite was `pass 471 / fail 0` at `43eff6fd`
-(run twice, same tree state). The `ok` → `measured` migration is fully landed:
+The `ok` → `measured` migration is fully landed:
 `FIELD_STATES.MEASURED` evaluates to `'measured'`, `FIELD_STATES.OK` is
-`undefined`, and `styles/shell.css:163` is `[data-state='measured']`. Any
+`undefined`, and `styles/shell.css` selects `[data-state='measured']`. Any
 message or document telling you otherwise predates the migration — including
 `demo-spec.md`, see below.
 
