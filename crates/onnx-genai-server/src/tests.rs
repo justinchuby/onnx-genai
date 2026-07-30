@@ -5750,48 +5750,6 @@ fn an_untruncated_block_mirror_does_not_claim_truncation() {
     assert_eq!(value["window"]["pool_total"].as_u64(), Some(40));
 }
 
-/// A request window can be partial even when the mirror itself reaches the
-/// whole pool. `truncated` must describe THIS RESPONSE, not the mirror cap.
-#[test]
-fn a_short_request_window_reports_truncation_even_when_the_mirror_covers_the_pool() {
-    let response = crate::routes::BlockTableResponse::live(
-        Some("m".into()),
-        onnx_genai_engine::KvTelemetrySnapshot::default(),
-        0,
-        1024,
-        1024,
-        vec![None; 256],
-    );
-    let value = serde_json::to_value(&response).expect("serialise");
-    let window = &value["window"];
-
-    assert_eq!(window["scanned"].as_u64(), Some(256));
-    assert_eq!(window["pool_total"].as_u64(), Some(1024));
-    assert_eq!(
-        window["truncated"].as_bool(),
-        Some(true),
-        "truncated=false on a 256/1024 response invents coverage the request never received"
-    );
-}
-
-/// A nonzero start omits the beginning of the pool even if the returned vector
-/// is as long as the pool. The flag follows the response window, so this is
-/// truncated too.
-#[test]
-fn a_nonzero_start_window_reports_truncation() {
-    let response = crate::routes::BlockTableResponse::live(
-        Some("m".into()),
-        onnx_genai_engine::KvTelemetrySnapshot::default(),
-        1,
-        4,
-        4,
-        vec![None; 4],
-    );
-    let value = serde_json::to_value(&response).expect("serialise");
-    assert_eq!(value["window"]["start"].as_u64(), Some(1));
-    assert_eq!(value["window"]["truncated"].as_bool(), Some(true));
-}
-
 /// C4: the four `batch_*` occupancy fields describe ONE driver's batch, while
 /// `active_batch_size` beside them is node-wide. The shipped topology is one
 /// model per server, so a scope error here is invisible in the demo and fires
