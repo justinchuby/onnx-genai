@@ -296,3 +296,74 @@ describe('the design document does not instruct a build it has ruled against', (
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// A NAVIGABLE SCENARIO IS THE STRONGEST CLAIM THE PAGE MAKES.
+//
+// Per D139: panels display VALUES and may be grouped or collapsed; TABS
+// ADVERTISE CAPABILITIES. A scenario in the switcher is a labelled, clickable
+// promise that the product does this thing -- made before the visitor has seen
+// a single number, in the one control whose entire purpose is to enumerate what
+// is on offer.
+//
+// So a cut feature surviving in the scenario registry is worse than a cut field
+// surviving in a panel. The panel says "here is a number about X"; the tab says
+// "X IS ONE OF THE THINGS THIS RUNTIME DOES." The first is a wrong reading, the
+// second is a wrong product.
+//
+// AND THE TRIPWIRE NEXT DOOR CANNOT SEE THIS, BY CONSTRUCTION.
+// prefix-counters-forbidden.test.js bans the IDENTIFIERS -- prefix_cache_hits,
+// prefix_cache_lookups, hit_rate, prefix_hashes. A scenario registers the
+// string 'prefix-cache' with the human label 'Prefix caching'. Neither spelling
+// is an identifier, so the ban misses both, and the allowlist that tracks the
+// panel's removal debt never mentions the file. This is the same blind spot
+// that left "prefix caching" in the <meta> description and in the Profile D
+// hero strip: OUR ENFORCEMENT COVERS CODE AND FIELDS, NOT USER-FACING PROSE.
+//
+// MUTATIONS THIS TEST IS KNOWN TO FAIL ON:
+//   1. re-add a 'prefix-cache' entry to SCENARIOS   -> cut scenario navigable
+//   2. relabel a scenario 'KV eviction'             -> cut feature in a label
+import { readFileSync as readScenarios } from 'node:fs';
+
+describe('the scenario switcher advertises no cut capability', () => {
+  const source = readScenarios(
+    fileURLToPath(new URL('./scenario-origins.js', import.meta.url)),
+    'utf8',
+  );
+
+  it('registers scenarios at all', () => {
+    const ids = [...source.matchAll(/^\s{2}'([\w-]+)':\s*Object\.freeze/gm)].map((m) => m[1]);
+    assert.ok(
+      ids.length >= 2,
+      `Expected the scenario registry to define several scenarios; found ${ids.length}. ` +
+        'If the shape changed, the assertion below is vacuously true.',
+    );
+  });
+
+  it('registers no scenario id or label naming a cut feature', () => {
+    const ids = [...source.matchAll(/id:\s*'([\w-]+)'/g)].map((m) => m[1]);
+    const labels = [...source.matchAll(/label:\s*'([^']+)'/g)].map((m) => m[1]);
+    const offenders = [];
+    for (const feature of CUT_FEATURES) {
+      for (const id of ids) {
+        if (feature.pattern.test(id.replace(/-/g, ' '))) offenders.push(`id '${id}'`);
+      }
+      for (const label of labels) {
+        if (feature.pattern.test(label)) offenders.push(`label '${label}'`);
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      'The scenario registry still advertises a CUT capability. A tab is not a ' +
+        'panel: per D139 panels display values and may be grouped, but TABS ' +
+        'ADVERTISE CAPABILITIES -- a labelled, clickable promise that the ' +
+        'product does this, made before the visitor sees a single number. ' +
+        'Scenario B was cut in every form on every origin, so a reachable ' +
+        '?scenario= URL for it is a navigable route to a feature we proved ' +
+        'absent. The identifier tripwire cannot catch this: it bans ' +
+        "prefix_cache_hits and friends, not the string 'prefix-cache' or the " +
+        `label 'Prefix caching'.\nFOUND: ${offenders.join(', ')}`,
+    );
+  });
+});

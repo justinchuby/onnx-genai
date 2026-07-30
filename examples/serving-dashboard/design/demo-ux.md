@@ -3792,3 +3792,47 @@ Justified as: *"the numerator is node-wide and each loaded model has its own bat
 | D176 | An undefined denominator emits `null`, never `0.0` | `unavailable` is the TRUE statement when capacity is unknown; `0.0` renders as a confident "completely idle" |
 | D177 | Don't clamp the value — change the widget | Clamping makes 240% and 100% identical, and hides oversubscription, which is Scenario C's entire payoff |
 | D178 | Batch occupancy stays an absolute count | The ruled payload field is absent; the forbidden CLI flag shipped. No denominator the client may trust |
+
+---
+
+## 58. A CUT SCENARIO IS STILL NAVIGABLE — AND AC68's GAUGE RULE (D179–D183)
+
+### 58.1 🔴 D179 — `prefix-cache` IS STILL A LABELLED, CLICKABLE SCENARIO
+
+`scenario-origins.js:56-61` still registers:
+
+```js
+'prefix-cache': Object.freeze({
+  id: 'prefix-cache',
+  label: 'Prefix caching',
+  serverClass: SERVER_CLASSES.DYNAMIC,
+  ...
+}),
+```
+
+Per **§47/D134** the switcher renders one real `<a>` per registered scenario. **So the cut feature is a navigable tab labelled *"Prefix caching."*** And the detail that should decide this quickly: **@12e42da8's own end-to-end green cites `:8124/demo/?scenario=prefix-cache` returning 200 as PROOF THE DEMO WORKS. The URL certifying the build is the URL of the feature we proved absent.**
+
+> **D179 — A TAB IS NOT A PANEL, AND THIS IS WHY THE DISTINCTION IN D139 EARNS ITS KEEP: PANELS DISPLAY VALUES AND MAY BE GROUPED; TABS ADVERTISE CAPABILITIES.** A scenario in the switcher is a **labelled, clickable promise that the product does this thing — made before the visitor has seen a single number**, in the one control whose entire job is to enumerate what's on offer. **A cut field in a panel is a wrong reading. A cut scenario in the switcher is a wrong PRODUCT.**
+
+**AND OUR EXISTING TRIPWIRE CANNOT SEE IT, BY CONSTRUCTION.** `prefix-counters-forbidden.test.js` bans the **identifiers** — `prefix_cache_hits`, `prefix_cache_lookups`, `hit_rate`, `prefix_hashes`. The registry spells it **`'prefix-cache'`** with the human label **`'Prefix caching'`**. **Neither is an identifier, so the ban misses both, and the allowlist tracking the panel's removal debt never names the file.**
+
+- **This is D158 for the FOURTH time in two hours** — after the `<meta>` description, the Profile D hero slot, and the two fabricated sketches. **Same blind spot every time: OUR ENFORCEMENT COVERS CODE AND FIELDS, NOT USER-FACING PROSE.** Now closed: `page-claims.test.js` asserts no scenario **id or label** names a cut feature, and it is **RED right now** on exactly these two strings.
+
+### 58.2 D180–D182 — AC68: A GAUGE IS A RATIO WEARING A PICTURE
+
+@376a0297 assigned me this and their formulation is the rule; I'm only making it operable.
+
+> **D180 — ANY GAUGE, BAR, DIAL OR PERCENTAGE MUST NAME BOTH OF ITS TERMS ON SCREEN.** Not in a hover, not in the panel's help text — **adjacent to the mark**, in the form `3 of 4`, `1.2 GB of 8 GB`. **A percentage is a claim about TWO quantities, and a display that shows only the result CONCEALS WHICH HALF IT INVENTED.** `/v1/resources` carries `configured_limits`, `resolved_limits`, `derived_kv_budget` and per-tier records — **every field a LIMIT, a BUDGET or a TIER, with no consumption term anywhere** — so a used-of-limit bar drawn from it renders **three numbers, two of which do not exist.**
+
+- **D181 — a bar whose track is a real ceiling and whose fill is invented is MORE dangerous than a bare fabricated number, because the picture supplies a false precision the data never had.** The eye reads a filled proportion as *measured*; **the ratio inherits the credibility of the one term that is true.** On the **scatter** origin it is worse still: `derived_kv_budget` is degenerate (`total_pages: 359128175`), so **both halves are invented and rendered to nine significant figures.** Per §57: **precision is not accuracy, and a wrong number to nine digits is far more persuasive than one to two.**
+- **D182 — if a ratio can legitimately exceed 1, IT IS NOT A DIAL.** Clamping to 100% (as `batch_utilization` does) makes **240% and 100% render identically**, hiding oversubscription — **the exact condition Scenario C exists to show.** Render a count pair, or a bar whose track is capacity and whose fill may **visibly overflow** it. **When a number will not fit the widget, the widget is wrong.**
+
+> **D183 — AND THE REPAIR STANDARD, adopted from @376a0297/@c8d9a40e and now binding on my own work: WHEN YOU REMOVE A TRAP, LEAVE A TRIPWIRE.** A removed trap with no test **returns the first time somebody refactors in good faith — and it returns silently, because the person reintroducing it will have read a clean file.** Every cut I have ruled this session now has one: the prefix identifiers, the cut-feature prose, the fenced sketches, the scenario registry, the asset graph, the five-state census, and the two-file `measured` rename.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D179 | No registered scenario id or label may name a cut feature | Panels display values; tabs advertise capabilities. A cut scenario is a wrong product, not a wrong reading |
+| D180 | Every gauge/percentage names both terms adjacent to the mark | A ratio is a claim about two quantities; showing only the result conceals which half was invented |
+| D181 | No utilization bar may be drawn from `/v1/resources` | It carries only limits and budgets — no consumption term exists to be the numerator |
+| D182 | A ratio that can exceed 1 is not a dial | Clamping hides oversubscription, which is Scenario C's entire payoff |
+| D183 | Every removal ships with a tripwire | A removed trap with no test returns silently, read as a clean file by whoever reintroduces it |
