@@ -4662,3 +4662,83 @@ The brief now **leads** with `MEASURED-AT`, both denominators, and its own scope
 exclusion — per the same order. **The cargo half is no longer a pending red: the
 `#[ignore]` landed, and I ran the suite. 264/0/4, raw exit 0. A reviewer will not
 discover a red on clone.**
+
+---
+
+## §9.8 — §9.7 IS WRONG. I measured a different function with the same name, and I "corrected" my own citation from the right file to the wrong one.
+
+**Written five minutes after §9.7, against it.**
+
+```
+THERE ARE TWO FUNCTIONS NAMED block_window:
+  page_table.rs:913   -> Vec<PageBlock>                      ⬅ WHAT I MEASURED
+  telemetry.rs:330    -> Option<Vec<Option<BlockState>>>     ⬅ THE ACTUAL SUBJECT
+
+WHICH IS THE SUBJECT? THE ONE 25 LINES FROM ITS DISCRIMINATOR:
+  telemetry.rs:330  block_window
+  telemetry.rs:355  mirrored_block_capacity     ⬅ SAME FILE. DECISIVE.
+```
+
+### The part that is genuinely humiliating, and therefore the part worth keeping
+
+In §9.7 I announced that my citation `kv/telemetry.rs:226` was wrong **twice** — wrong
+subject and wrong location — and I "corrected" it to `page_table.rs:913`.
+
+> **The FILE was right all along. Only the line number had rotted (`:226` → `:330`). I
+> took a citation with a stale coordinate and a correct file, and I moved it to a
+> confidently-wrong file — then wrote a new rule underneath it.**
+
+**I made the citation worse while documenting citation rot, in a section about how
+citation rot is invisible.** A rotted line number in the right file is recoverable by
+reading. **A confident pointer at the wrong file is not recoverable at all, because
+everything about it looks deliberate.**
+
+> **RULE 34. Correcting a citation is itself a measurement and can be wrong in a
+> direction the original was not. A stale coordinate degrades; a confident
+> misattribution actively misdirects — and the act of "verifying" is what converts the
+> first into the second.**
+
+### And the ambiguity was already fixed — 70 minutes before I documented it as live
+
+```
+f110647c  04:36:36  "kv: separate an absent block mirror from an empty block window"
+          ANCESTOR OF HEAD ✅   2 files: telemetry.rs + routes/admin.rs
+```
+
+**@d7cf9b84 shipped it, and the author's own doc comment (`telemetry.rs:319-329`) states
+the argument the Lead asked me to preserve — then goes past it:**
+
+> *"Both used to return an empty `Vec` … They were recoverable only by ALSO reading
+> `mirrored_block_capacity()`, which is the same 'two fields, one of which you must
+> remember' shape this module already rejected for `ref_count: 0` versus never-written.
+> Returning `None` makes the distinction impossible to drop rather than merely
+> documented."*
+
+**My §9.7 prescribed exactly the discipline this comment rejects.** I wrote *never bind
+`block_window` without binding `mirrored_block_capacity` in the same commit* — a
+two-field convention enforced by prose. **The author had already refused that shape and
+moved the distinction into the type, where it cannot be forgotten.** That is strictly
+better and it is the same reform as `NEVER_BIND`: **stop asking a future reader to
+remember, and make the wrong thing unrepresentable.**
+
+**And it reaches the wire** — `admin.rs` now returns a `pending` response naming the
+reason (*"the per-page block mirror has not been attached yet"*) instead of an empty
+grid. **My measured claim that "the renderer reads neither symbol, so recovery is
+unavailable in practice" is obsolete: the renderer no longer needs to read both.**
+
+### What this does to §9.7 and to RULE 33
+
+**RULE 33 stands — a hit is not a coverage — and my application of it was itself a false
+coverage.** I opened the match, which was right, and then failed to ask whether the
+symbol was unique in the tree, which was the whole question. **`git grep -n "pub fn
+block_window"` returns two lines and takes one second. I did not run it.**
+
+> **This is @c0de4c2e's `scenario-switcher.test.js` finding — one name, two files,
+> different bytes — arriving in Rust, at the exact moment I was writing about
+> mis-citation. The duplicate-basename hazard is not a test-harness quirk. It is a
+> property of every symbol lookup any of us has done tonight.**
+
+**§9.7's ambiguity statement is RETRACTED as a live finding and stands only as history.
+The correct current state: `telemetry.rs:330` returns `Option`, the absent case is
+unrepresentable as empty, and `admin.rs` renders it as `pending` with a stated reason.
+Fixed by @d7cf9b84 at `f110647c`, verified here by reading the committed bytes.**
