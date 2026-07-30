@@ -114,12 +114,44 @@ test('switching scenarios carries the topology forward', () => {
 test('a javascript: origin is rejected rather than turned into an href', () => {
   // The page is meant to be handed around as a URL, so a link carrying a
   // hostile parameter is the realistic threat.
-  assert.equal(parseOrigin('javascript:alert(1)'), null);
-  assert.equal(parseOrigin('data:text/html,<script>'), null);
-  assert.equal(parseOrigin('not a url'), null);
-  assert.equal(parseOrigin(''), null);
-  assert.equal(parseOrigin(null), null);
-  assert.equal(parseOrigin('http://127.0.0.1:8124/some/path'), 'http://127.0.0.1:8124');
+  const HOST = '127.0.0.1';
+  assert.equal(parseOrigin('javascript:alert(1)', HOST), null);
+  assert.equal(parseOrigin('data:text/html,<script>', HOST), null);
+  assert.equal(parseOrigin('not a url', HOST), null);
+  assert.equal(parseOrigin('', HOST), null);
+  assert.equal(parseOrigin(null, HOST), null);
+  assert.equal(parseOrigin('http://127.0.0.1:8124/some/path', HOST), 'http://127.0.0.1:8124');
+});
+
+test('a well-formed origin on ANOTHER host is rejected', () => {
+  // The scheme check passes here. This is the gap it left: a third-party
+  // origin would be polled and its numbers rendered under our chrome, each
+  // one carrying the provenance badge that says a named server measured it.
+  // The values would be real, correctly labelled, and somebody else's --
+  // which is why no value-level honesty check can detect this.
+  const HOST = '127.0.0.1';
+  assert.equal(parseOrigin('http://evil.example', HOST), null);
+  assert.equal(parseOrigin('https://evil.example:8124', HOST), null);
+  // A hostname that merely CONTAINS ours must not pass either.
+  assert.equal(parseOrigin('http://127.0.0.1.evil.example', HOST), null);
+  assert.equal(parseOrigin('http://evil.example/?x=127.0.0.1', HOST), null);
+  // localhost and 127.0.0.1 name the same machine but are different hostnames.
+  // Rejecting is correct and costs nothing: run-demo.sh derives BOTH origins
+  // from one BIND_HOST, so a launcher-produced link can never disagree here.
+  assert.equal(parseOrigin('http://localhost:8124', HOST), null);
+});
+
+test('a differing PORT on our own host is allowed -- that is the real topology', () => {
+  const HOST = '127.0.0.1';
+  assert.equal(parseOrigin('http://127.0.0.1:9999', HOST), 'http://127.0.0.1:9999');
+});
+
+test('parseOrigin THROWS when given no hostname to compare against', () => {
+  // Fail closed. A caller that omits it would otherwise silently get the old
+  // scheme-only behaviour -- a security check that fails OPEN is
+  // indistinguishable from one that passed.
+  assert.throws(() => parseOrigin('http://evil.example'), TypeError);
+  assert.throws(() => parseOrigin('http://evil.example', ''), TypeError);
 });
 
 test('a hostile origin parameter cannot survive into a resolved origin', () => {
@@ -127,6 +159,19 @@ test('a hostile origin parameter cannot survive into a resolved origin', () => {
     href: `${SCATTER}/demo?dynamic-origin=javascript:alert(1)`,
     selfClasses: [SERVER_CLASSES.SCATTER],
   });
+  assert.equal(origins.dynamic, null);
+});
+
+test('a third-party origin parameter cannot survive into a resolved origin', () => {
+  // The end-to-end version of the check above: this is the URL an attacker
+  // would actually hand a visitor.
+  const origins = resolveOrigins({
+    href: `${SCATTER}/demo?dynamic-origin=${encodeURIComponent('http://evil.example:8124')}`,
+    selfClasses: [SERVER_CLASSES.SCATTER],
+  });
+  // null, not the hostile origin, and NOT silently swapped for our own origin
+  // either -- guessing the peer is here is the other silent failure this
+  // module exists to prevent.
   assert.equal(origins.dynamic, null);
 });
 

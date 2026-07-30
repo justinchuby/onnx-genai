@@ -237,17 +237,45 @@ function paramNameFor(serverClass) {
 }
 
 /**
- * Reject anything that is not a plain http(s) origin.
+ * Reject anything that is not a plain http(s) origin ON THIS HOST.
  *
  * The value arrives from the query string, so it is attacker-controllable in
  * the sense that a link can carry anything. It is used to build fetch URLs and
  * to populate an href, so a `javascript:` value would be an XSS vector on a
  * page whose whole purpose is to be handed around as a URL.
  *
+ * The scheme check alone is NOT enough, and the gap is worse here than the XSS
+ * it was written to stop. `?dynamic-origin=http://evil.example` is a perfectly
+ * well-formed http origin, so it passed — and the page would then POLL that
+ * host and RENDER ITS NUMBERS INSIDE OUR OWN CHROME, each one wearing the
+ * provenance badge that certifies it was measured by a named server. Every
+ * honesty mechanism in this codebase authenticates the VALUE and then trusts
+ * the SOURCE, so not one of them can see this: the values really were measured,
+ * really were served, and really are labelled correctly. They are simply
+ * somebody else's. That is fabrication carrying our own certification, which is
+ * the exact claim this product exists to make un-fakeable.
+ *
+ * So the hostname must equal the page's. PORTS MAY DIFFER, because that is our
+ * real topology: run-demo.sh derives both origins from ONE `BIND_HOST` and
+ * varies only the port, so a legitimate peer can never disagree on hostname and
+ * a rejection here can never be a false positive on a launcher-produced link.
+ *
+ * `pageHostname` is REQUIRED rather than defaulted. A caller that forgot it
+ * would otherwise silently get the old scheme-only behaviour back — a security
+ * check that fails OPEN and looks identical to one that passed.
+ *
  * @param {string} raw
+ * @param {string} pageHostname  `location.hostname` of the page being rendered.
  * @returns {string|null} A normalised origin, or null if unusable.
  */
-export function parseOrigin(raw) {
+export function parseOrigin(raw, pageHostname) {
+  if (typeof pageHostname !== 'string' || pageHostname === '') {
+    throw new TypeError(
+      'parseOrigin requires the page hostname to compare against. Without it ' +
+        'this function cannot reject a third-party origin, and an origin from ' +
+        'the query string would be polled and rendered under our own chrome.',
+    );
+  }
   if (typeof raw !== 'string' || raw === '') return null;
   let url;
   try {
@@ -256,6 +284,7 @@ export function parseOrigin(raw) {
     return null;
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (url.hostname !== pageHostname) return null;
   return url.origin;
 }
 
@@ -276,7 +305,10 @@ export function resolveOrigins({ href, selfClasses = [] }) {
   for (const serverClass of Object.values(SERVER_CLASSES)) {
     // An explicit parameter wins: it is how the launcher tells the page where
     // its peer landed, and how a developer points at a hand-started server.
-    const fromQuery = parseOrigin(url.searchParams.get(paramNameFor(serverClass)));
+    const fromQuery = parseOrigin(
+      url.searchParams.get(paramNameFor(serverClass)),
+      url.hostname,
+    );
     if (fromQuery) {
       resolved[serverClass] = fromQuery;
       continue;
