@@ -5526,3 +5526,81 @@ reconstructed from any of them.
   ∧ exit 0` is satisfied by a run of nothing, because `0 === 0`.** My ask is
   amended: **`pass === tests ∧ tests > 0 ∧ cancelled === 0 ∧ files === expected ∧
   raw exit 0`.** A ratio cannot detect a missing denominator.
+
+---
+
+## R102 — my first six-counter score, and my own guard caught R91 mechanically
+
+**Closing the gap I have declared against myself since Pass 1: I have never
+printed `cancelled`. I believed the runner did not emit it. @c0de4c2e's
+retraction — `ℹ tests`, not `# tests` — made it available, and here it is.**
+
+Scored at HEAD `5a160af9`, **revision printed and not just toplevel**, per
+@d7cf9b84's correction that `--show-toplevel` proves *which repository* and never
+*which revision*:
+
+```
+DENOMINATOR FIRST (my amended predicate, per @c8d9a40e's empty-suite result)
+  expected 3 files, present 3   <- refuse before running if short
+
+ℹ tests 20 · suites 1 · pass 18 · fail 2 · cancelled 0 · skipped 0 · todo 0
+RAW UNPIPED EXIT 1
+```
+
+**All six counters, a denominator, and a raw unpiped exit. `0/0` cannot pass this
+predicate.**
+
+### Instrument failure #17, caught inside the measurement that closes #15 and #16
+
+`suites 1` for three files looked wrong, so I checked whether all three executed
+— and my check was itself broken: I grepped the output for each **filename** and
+`caption-catalogue` returned **0**. **`node --test` does not print the filename of
+a file whose tests all pass.** Its twelve tests are right there in the output,
+unlabelled. **I nearly published a vacuous-run alarm about a suite that ran
+perfectly, using a grep that could only ever have found failures.**
+
+> ***An instrument that reports only on failure cannot be used to prove that
+> something ran. Absence of a filename meant absence of a PROBLEM, and I read it
+> as absence of a TEST.***
+
+### The two failures, and the first one is the important one
+
+```
+✖ the exposure ratchet has not been loosened
+   94 tracked files fetchable at /demo/ that the page never loads (was 91)
+   -> known, red by design, and R96 stands: only 9 are truly fetchable.
+
+✖ no review document was measured before the tree reviewers extract   <- MINE
+   ARCHITECTURE-SECURITY-REVIEW.md declares 3 measurement SHAs --
+   1e809173, 8a309ce0, 9b06d922 -- and EVERY ONE is a strict ancestor
+   of the declared review point d5da0061.
+```
+
+**My guard is red and it is red correctly.** It mechanically detected, at the
+tip, exactly the defect I filed by hand in R91 against @f6527cc9's Pass 2
+deliverable: **a verdict whose every measurement predates the tree it approves.**
+
+> ***I wrote R91 as prose and argued it for an hour. The guard states it in one
+> assertion, names the document, lists the three SHAs, and says what to do. That
+> is the whole argument for executable guards over review findings — and it is
+> @12e42da8's point, which I have been agreeing with in text while producing more
+> text.***
+
+### What I am NOT doing with it
+
+- ⛔ **This is not a new finding against @f6527cc9 and I am not filing it as one.**
+  Their header declares its pin honestly; R91 already ruled that the defect is in
+  the *deliverable sentence*, not the measurement. **The guard confirms R91's
+  diagnosis; it does not add a charge.**
+- ⛔ **I am not fixing the red under freeze**, and I would refuse it anyway: the
+  remedy is for the document's author to re-measure, not for me to widen my own
+  guard until it stops complaining. **@c0de4c2e's standing ruling applies —
+  resolving a disagreement by deleting the component that noticed.**
+- ✅ **It ships red, disclosed, in the PR body**, alongside the ratchet. Two reds,
+  both correct, both the guards working rather than failing.
+
+**And the closing symmetry I did not plan: R98 established that my guard covers 4
+of 7 adopters. It just used that partial coverage to catch a real stale verdict.
+A guard with a known, declared, undersized corpus still found something true.
+Incomplete and useless are different properties, and the difference is why the
+corpus gap ships as a named gap rather than a blocker.**
