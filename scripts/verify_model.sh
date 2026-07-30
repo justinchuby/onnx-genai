@@ -159,6 +159,20 @@ fi
 
 MODEL_ID="verify-$$"
 LOG_FILE="$(mktemp -t verify_model_log)"
+# tracing's fmt layer writes ANSI styling even when stdout is redirected to a
+# file, and it wraps structured FIELD names, so the literal bytes are:
+#   ...enabled <ESC>[3mmax_batch<ESC>[0m<ESC>[2m=<ESC>[0m4
+# "max_batch=4" is therefore never contiguous and grep never matches it, even
+# though a human reading the log sees exactly that. Assertions read this
+# stripped copy; the human-facing `cat` calls keep the colour.
+PLAIN_LOG="$(mktemp -t verify_model_plain)"
+ANSI_ESC="$(printf '\033')"
+# Written to a file rather than piped: `producer | grep -q` exits the producer
+# with SIGPIPE, and under `set -o pipefail` that turns a MATCH into a non-zero
+# pipeline status, silently inverting every check below.
+refresh_plain_log() {
+  sed "s/${ANSI_ESC}\[[0-9;]*m//g" "$LOG_FILE" >"$PLAIN_LOG"
+}
 SERVER_PID=""
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below
@@ -167,7 +181,7 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  rm -f "$LOG_FILE"
+  rm -f "$LOG_FILE" "$PLAIN_LOG"
 }
 trap cleanup EXIT
 
@@ -181,6 +195,7 @@ RUST_LOG="${RUST_LOG:-info}" \
   --model "$MODEL_DIR" \
   --model-id "$MODEL_ID" \
   --addr "127.0.0.1:$PORT" \
+  --max-batch "$MAX_BATCH" \
   >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
@@ -219,7 +234,8 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   cat "$LOG_FILE" >&2
   exit 1
 fi
-if grep -qi 'address already in use' "$LOG_FILE"; then
+refresh_plain_log
+if grep -qi 'address already in use' "$PLAIN_LOG"; then
   printf '\nerror: our server failed to bind port %s; /health was answered by\n' "$PORT" >&2
   printf '       another process. Re-run with --port on a free port. Log:\n\n' >&2
   cat "$LOG_FILE" >&2
@@ -229,11 +245,26 @@ printf 'server ready after ~%ss\n\n' "$elapsed"
 
 FAILURES=0
 
+# The driver line is written during load, but re-strip here so the checks below
+# read everything the server emitted, not just what existed at readiness.
+refresh_plain_log
+
 # --- Check 1: continuous batching actually engaged -------------------------
 # Both outcomes log at INFO, so absence of an error means nothing here.
-if grep -q "continuous batch driver enabled" "$LOG_FILE"; then
-  printf 'ok   continuous batch driver enabled\n'
-elif grep -q "continuous batch driver disabled" "$LOG_FILE"; then
+if grep -q "continuous batch driver enabled" "$PLAIN_LOG"; then
+  # The driver logs the width it actually built with. Assert it matches what we
+  # asked for, so --max-batch proves something instead of just being printed.
+  if grep -q "continuous batch driver enabled max_batch=$MAX_BATCH" "$PLAIN_LOG"; then
+    printf 'ok   continuous batch driver enabled (max_batch=%s)\n' "$MAX_BATCH"
+  else
+    actual="$(sed -n 's/.*continuous batch driver enabled max_batch=\([0-9]*\).*/\1/p' "$PLAIN_LOG" | head -1)"
+    printf 'FAIL batching engaged at the wrong width\n' >&2
+    printf '     asked for max_batch=%s, the driver built max_batch=%s\n' "$MAX_BATCH" "${actual:-<unparsed>}" >&2
+    printf '     ONNX_GENAI_MAX_BATCH in the environment overrides the flag default;\n' >&2
+    printf '     unset it, or pass the same value to --max-batch.\n' >&2
+    FAILURES=$((FAILURES + 1))
+  fi
+elif grep -q "continuous batch driver disabled" "$PLAIN_LOG"; then
   printf 'FAIL continuous batching did NOT engage\n' >&2
   printf '     The server logged: continuous batch driver disabled; using per-request engine path\n' >&2
   printf '     This model loads and answers correctly but is NOT batching. Usually it\n' >&2

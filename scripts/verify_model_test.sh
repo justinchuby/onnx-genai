@@ -215,5 +215,75 @@ else
   fail "re-asserts our own process owns the port after readiness"
 fi
 
+# --- ANSI-styled log output -------------------------------------------------
+# tracing's fmt layer emits ANSI styling even when stdout is redirected to a
+# FILE, and it wraps structured field NAMES. The bytes are:
+#   ...enabled <ESC>[3mmax_batch<ESC>[0m<ESC>[2m=<ESC>[0m4
+# so "max_batch=4" is never contiguous. A human reading the log sees exactly
+# that string; grep finds nothing. This cost a real false FAIL, and the
+# symptom was "batching engaged at the wrong width" on a correct server.
+esc="$(printf '\033')"
+styled_line="${esc}[2m2026-07-30T07:57:28Z${esc}[0m ${esc}[32m INFO${esc}[0m ${esc}[2monnx_genai_server::driver${esc}[0m${esc}[2m:${esc}[0m continuous batch driver enabled ${esc}[3mmax_batch${esc}[0m${esc}[2m=${esc}[0m4"
+printf '%s\n' "$styled_line" >"$tmp/styled.log"
+
+# The bug must be real, or the fix guards nothing.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "continuous batch driver enabled max_batch=4" "$tmp/styled.log"; then
+  fail "raw tracing output does NOT contain a contiguous max_batch=4 (fixture is wrong)"
+else
+  pass "raw tracing output does NOT contain a contiguous max_batch=4"
+fi
+
+# And the strip must recover it.
+sed "s/${esc}\[[0-9;]*m//g" "$tmp/styled.log" >"$tmp/styled.plain"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "continuous batch driver enabled max_batch=4" "$tmp/styled.plain"; then
+  pass "stripping ANSI makes max_batch=4 greppable"
+else
+  fail "stripping ANSI makes max_batch=4 greppable"
+fi
+
+# The message-only assertions survive styling because tracing appends fields
+# AFTER the message. Recording that here so nobody "simplifies" the strip away
+# on the grounds that the batching check still passes without it.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "continuous batch driver enabled" "$tmp/styled.log"; then
+  pass "message-only patterns match even unstripped (why this hid so long)"
+else
+  fail "message-only patterns match even unstripped (why this hid so long)"
+fi
+
+# Structural guard: no assertion may read the RAW log, or it silently starts
+# matching against escape sequences again. The stripper itself is exempt --
+# it is the one line allowed to read LOG_FILE, because it writes PLAIN_LOG.
+TESTS_RUN=$((TESTS_RUN + 1))
+# shellcheck disable=SC2016  # matching the literal text "$LOG_FILE" in the source
+raw_asserts="$(grep -nE '(grep|sed)[^|]*"\$LOG_FILE"' "$VERIFY" | grep -v 'PLAIN_LOG' || true)"
+if [ -z "$raw_asserts" ]; then
+  pass "no assertion greps the raw, ANSI-styled log"
+else
+  fail "no assertion greps the raw, ANSI-styled log"
+  printf '     offending line(s): %s\n' "$raw_asserts" >&2
+fi
+
+# The stripped copy must be refreshed before the checks read it, or PLAIN_LOG
+# is an empty file and every grep below it silently reports "not found".
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^refresh_plain_log$' "$VERIFY"; then
+  pass "refresh_plain_log is actually invoked, not just defined"
+else
+  fail "refresh_plain_log is actually invoked, not just defined"
+fi
+
+# --max-batch must reach the server. Until it did, the value was printed in the
+# header and passed nowhere -- a decorative number that read as a claim.
+TESTS_RUN=$((TESTS_RUN + 1))
+# shellcheck disable=SC2016  # matching the literal text "$MAX_BATCH" in the source
+if grep -q -- '--max-batch "\$MAX_BATCH"' "$VERIFY"; then
+  pass "--max-batch is forwarded to the server, not just printed"
+else
+  fail "--max-batch is forwarded to the server, not just printed"
+fi
+
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 [ "$TESTS_FAILED" -eq 0 ]
