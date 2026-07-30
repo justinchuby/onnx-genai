@@ -845,3 +845,67 @@ test('no document attributes a hit RATE to the twelve-request block', () => {
       offenders.join('\n  '),
   );
 });
+
+// ---------------------------------------------------------------------------
+// THE README QUOTES THE SERVER'S OWN LOG TO IDENTIFY THE EXECUTION PATH.
+//
+// A performance figure without its execution path is not a measurement: this
+// runtime has two decode paths, chooses one at startup, and the same binary on
+// the same machine produces non-comparable numbers depending on which it took.
+// So the README tells the reader how to check which one ran -- and it does that
+// by quoting two `tracing::info!` strings verbatim.
+//
+// A QUOTED LOG LINE IS A CITATION INTO A DIFFERENT LANGUAGE'S STRING LITERAL,
+// which is the least likely thing in this repo to be updated in step with the
+// docs: a Rust refactor that reworded the message would leave this README
+// telling readers to grep for text the server has stopped emitting, and every
+// markdown checker we own would stay green because the sentence around it is
+// still perfectly well-formed English.
+//
+// This is also the claim the LEAD had inverted when ordering the section
+// written -- the instruction was that the benchmark ran on the PER-REQUEST
+// FALLBACK "confirmed from the server's own log". The lab record says the
+// opposite in four places, and its harness protocol (perf-baseline.md) refuses
+// to measure at all unless the ENABLED line is present. Hence a test: the
+// distinction is load-bearing enough that an order was issued backwards on it.
+test('every driver log line the README quotes still exists in the server source', () => {
+  const readme = shipped('README.md');
+  const driver = execFileSync(
+    'git',
+    ['show', 'HEAD:crates/onnx-genai-server/src/driver.rs'],
+    { cwd: HERE, maxBuffer: 64 * 1024 * 1024 },
+  ).toString();
+
+  // The messages as Rust emits them. `max_batch` is a structured field rather
+  // than part of the literal, so the quoted log line carries a `max_batch=4`
+  // suffix that will NOT be found in source -- match the literal only.
+  const quoted = [...readme.matchAll(/continuous batch driver [a-z-]+(?:; using per-request engine path)?/g)]
+    .map((m) => m[0]);
+
+  assert.ok(
+    quoted.length >= 2,
+    `found ${quoted.length} quoted driver log line(s) in the README; the section ` +
+      `that names the execution path has been reworded or removed, and this ` +
+      `check is inspecting nothing`,
+  );
+
+  const missing = [...new Set(quoted)].filter((line) => !driver.includes(line));
+  assert.deepEqual(
+    missing,
+    [],
+    `the README tells readers to look for ${missing.length} log line(s) that ` +
+      `driver.rs no longer emits:\n  ${missing.join('\n  ')}\n` +
+      `Either the message was reworded in Rust and the README was not updated, ` +
+      `or the branch was removed. A reader following this instruction would ` +
+      `grep for text that never appears and conclude the demo is broken.`,
+  );
+
+  // The capacity-1 claim is the part a reader can check WITHOUT the log, so it
+  // has to stay true independently of the message strings.
+  assert.ok(
+    /published_capacity\s*=\s*if continuous_batch_supported/.test(driver),
+    'the README states that the per-request path publishes a batch capacity of ' +
+      '1 rather than max_batch, and offers that field as the execution-path ' +
+      'witness. The branch that makes it true is gone from driver.rs.',
+  );
+});

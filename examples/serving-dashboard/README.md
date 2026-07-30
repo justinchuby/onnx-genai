@@ -601,6 +601,45 @@ reading the code and a ratio is not.** If you try to reproduce a number and
 fail, every other claim in this document becomes suspect — including the ones
 that are true and were hard to earn.
 
+**Which driver produced which number, and how to check it yourself.** A
+performance figure without its execution path is not a measurement — *the
+conditions of a measurement are part of the measurement*. This runtime has
+**two** decode paths and picks one at startup, so the same binary on the same
+machine can produce numbers that are not comparable with each other.
+
+The choice is made once, in `run_engine_driver`
+(`crates/onnx-genai-server/src/driver.rs`), and it announces itself on both
+branches:
+
+```
+INFO onnx_genai_server::driver: continuous batch driver enabled max_batch=4
+INFO onnx_genai_server::driver: continuous batch driver disabled; using per-request engine path
+```
+
+- The **scatter server (`:8123`)** takes the first branch. That is the path the
+  lab record in [`perf-baseline.md`](perf-baseline.md) was captured on, and its
+  harness protocol requires that line to appear **before** measuring: *if it is
+  absent the run is invalid*, because the per-request path is a different code
+  path entirely rather than a slower version of the same one.
+- The **dynamic server (`:8124`)** takes the second branch **by design**, not by
+  failure. Batching and paged KV are mutually exclusive here, which is why there
+  are two servers at all.
+
+**You do not have to trust the log for this, because the number is on the
+page.** The fallback path is one row wide however large the configured ceiling
+is, so the server publishes a batch capacity of **1** rather than `max_batch`
+when it takes that branch (`published_capacity`, same file). **The capacity
+field is therefore its own execution-path witness** — a capacity of 1 next to a
+`max_batch` of 4 means you are reading the per-request path, whatever you
+expected to be running.
+
+> **The limit of that evidence, stated because it bounds every claim above.**
+> The decision is `engine.continuous_batch_manager(max_batch).is_ok()` — the
+> reason is discarded one line before it could be logged. So the log and the
+> capacity field tell you **which** path ran; **neither can tell you why**. A
+> run that unexpectedly reports capacity 1 is a fact you can act on and not yet
+> a diagnosis, and no log we currently ship will close that gap for you.
+
 **Continuous batching** (`crates/onnx-genai-engine/src/batched.rs`) keeps one
 decode batch running and edits its membership *between steps* rather than
 between batches. `submit` places a request in a FIFO queue; each `step` calls
