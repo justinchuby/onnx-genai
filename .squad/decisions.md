@@ -466,3 +466,134 @@ not: the inbox stopped drop-loss, not the hand-merge rewrite. For round 3:
   entry — never against today). deckard/roy re-accumulate fastest.
 - **Do not archive agent directories.** Fail-closed; with three teams active elsewhere,
   absence of local commits/drops/history proves nothing.
+
+
+### 2026-07-30: DeepSeek and GLM native-CUDA correctness bring-up
+**By:** Mary
+
+**What:** Tested the current `main` (`1574e87a`) native CUDA decode path on GPU 0
+against ORT-CUDA with greedy decoding. The original export directories do not
+contain explicit `model.io` declarations, so direct loading fails before
+placement with the ambiguous `input_ids`/`attention_mask` token-input error. I
+created external diagnostic package overlays under
+`/home/justinchu/mary-model-overlays/` that symlink the unchanged model data and
+add only explicit token, mask, position, logits, and KV port names.
+
+| Model | Native CUDA | Native tokens match ORT | Correctness verdict / blocker |
+|---|---|---|---|
+| DeepSeek-Coder-1.3B INT4 | Yes | Yes, exact 64/64 | Coherent: `Paris... Germany is Berlin... Italy is Rome...`; supported path is clean. |
+| DeepSeek-R1-Distill-Qwen-1.5B INT4 | Yes | No; first divergence at generated token 8 (zero-based index 7), native `374` vs ORT `315` | Both start `" **C iter**. The capital..."`, then native and ORT repeat differently. Native CPU exactly matches native CUDA for the first 16 tokens, so this is not isolated to CUDA arithmetic. The strongest discriminator is the native `GroupQueryAttention` grouped-head/non-interleaved-rotary decode path (`num_heads=12`, `kv_num_heads=2`, `do_rotary=1`, `rotary_interleaved=0`) or shared native KV plumbing. The MHA-shaped Coder graph (`16/16`) is exact. Needs a focused GQA/KV parity issue. |
+| GLM-4-9B INT4 | Yes | Unavailable | Native output is coherent and answers Paris, then explains the answer in Chinese. ORT 1.27 and 1.28 both reject the authored Microsoft `GroupQueryAttention` attribute `rotary_embedding_dim`; therefore ORT cannot provide a token oracle for this export. Native uses grouped/interleaved rotary (`32/2`, `rotary_interleaved=1`, `rotary_embedding_dim=64`). |
+| DeepSeek-V2-Lite INT4 | Yes | Yes, exact 64/64 | Coherent answer begins `Paris. The currency of France is the Euro...`. All 26 `QMoE` nodes run on native CUDA; QMoE/expert execution is not a correctness blocker. |
+| DeepSeek-V2-Lite block-32 INT4 | Yes | Yes, exact 16/16 | Coherent short run; confirms the alternate block-32 package too. |
+
+The native V2-Lite graph contains 26 each of `QMoE`, `TopK`,
+`GatherElements`, and `ScatterElements`; it completed without a CUDA claim
+decline or whole-graph CPU fallback. This does not prove live expert paging, but
+it clears `QMoE` itself as the E2E correctness blocker for this artifact.
+
+**Why:** This establishes broad native-CUDA viability before performance work.
+Three independently useful model/package variants match ORT exactly, GLM is
+coherent but lacks an ORT-compatible oracle, and R1 isolates one remaining
+native decode parity gap to grouped non-interleaved GQA/KV behavior rather than
+CUDA-specific numerical execution.
+
+Representative command (replace model and backend):
+
+```bash
+cd /home/justinchu/onnx-genai
+source /home/justinchu/onnx-genai/.cudaenv.sh
+export ONNX_GENAI_ORT_LIB="$ORT_ROOT/lib/libonnxruntime.so.1.27.0"
+cargo build --release -p onnx-genai-bench --features bench-native,bench-ort,cuda
+CUDA_VISIBLE_DEVICES=0 taskset -c 0 ./target/release/profile_native \
+  --model /home/justinchu/mary-model-overlays/coder \
+  --ep cuda --backend native --steady --tokens 64 --decode-skip 8 \
+  --warmups 0 --runs 1 --prompt 'The capital of France is'
+```
+
+Use `--backend ort` for the oracle. GLM was also retried with
+`/home/justinchu/onnx-genai/.ort-cuda-1.28/root/lib/libonnxruntime.so.1.28.0`
+and failed on the same unrecognized GQA attribute.
+
+
+### 2026-07-30: DeepSeek-V2-Lite MoE offload correctness and wiring status
+**By:** Mary
+
+**What:** Ran greedy native-CUDA A/B decoding on the 26-QMoE
+DeepSeek-V2-Lite INT4 package using GPU 0 and the same 64-token prompt as the
+resident bring-up. All tested environment variants returned exactly the same
+64 token IDs:
+
+| Variant | Settings | Baseline token equality | Did paging fire? |
+|---|---|---:|---:|
+| Resident baseline | `ONNX_GENAI_WEIGHT_OFFLOAD=0` | Reference | No |
+| Offload enabled, no owned warm cache | `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=0` | Yes, exact 64/64 | No |
+| Aggressive small/serial variant | `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=1048576`, `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH=0` | Yes, exact 64/64 | No |
+
+The matching variants are a configuration no-op on native CUDA, not evidence
+that expert eviction/reload is correct. Current controls and defaults are:
+
+- `ONNX_GENAI_WEIGHT_OFFLOAD`: exact value `1` enables the route-first
+  mmap-backed expert path; absent/other values mean disabled. This is consumed
+  by the **CPU QMoE kernel**.
+- `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES`: unsigned decimal byte override for
+  the CPU warm-host expert cache. Without it, the engine governor's resolved
+  host-RAM budget is used; its default resource limit is 25% of detected host
+  RAM.
+- `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH`: expert prefetch defaults ON; exact `0`
+  forces the serial CPU route-first loop.
+- CLI `--vram-limit` defaults to 90% of detected VRAM and `--host-ram-limit`
+  defaults to 25% of detected host RAM. These feed the resource governor/KV and
+  CPU host cache, but do not activate CUDA expert paging. `profile_native` does
+  not expose either flag.
+- `LocalTieredConnector` is KV paging, not immutable expert-weight paging.
+  Defaults: 1024 hot GPU pages, 16384 total cached pages, 64-KiB accounting per
+  page, and no compression or disk tier.
+
+Static wiring confirms why no paging fired:
+
+1. Native CUDA constructs the stock `CudaExecutionProvider`; only the CPU
+   device path receives the engine's `WeightOffloadHostCache`.
+2. The CUDA EP does not advertise `NXRT_WEIGHT_PAGING_CAPABILITY`, so
+   `build_lazy_weight_handles` returns no handles.
+3. The executor's only lazy boundary is
+   `pkg.nxrt::BlockQuantizedMoE`; this model uses 26
+   `com.microsoft::QMoE` nodes.
+4. `CudaWeightPager` exists and has isolated GPU byte-identity tests, but its
+   own module documents live executor/BlockQuantizedMoE dispatch, multi-page
+   LRU eviction, and prefetch overlap as deferred.
+
+Therefore all QMoE expert initializers are still eagerly uploaded and remain
+resident. There is no forced-eviction/small-device-budget knob capable of
+making this DeepSeek-V2-Lite CUDA run page experts today, and no live paging
+counter can advance on this path.
+
+**Why:** The token-equality checks show that merely setting the advertised
+offload variables does not perturb resident CUDA correctness, but #82/#63
+cannot yet be validated end-to-end on this QMoE model. The actionable gap is
+CUDA capability + executor dispatch integration, including either a lazy
+`com.microsoft::QMoE` boundary or conversion to the intended
+`pkg.nxrt::BlockQuantizedMoE` representation, followed by a bounded VRAM
+residency manager with observable page-in/eviction counters.
+
+Reproduction:
+
+```bash
+source /home/justinchu/onnx-genai/.cudaenv.sh
+export ONNX_GENAI_ORT_LIB="$ORT_ROOT/lib/libonnxruntime.so.1.27.0"
+ONNX_GENAI_WEIGHT_OFFLOAD=1 \
+ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=0 \
+CUDA_VISIBLE_DEVICES=0 taskset -c 0 \
+/home/justinchu/onnx-genai/target/release/profile_native \
+  --model /home/justinchu/mary-model-overlays/v2 \
+  --ep cuda --backend native --steady --tokens 64 --decode-skip 8 \
+  --warmups 0 --runs 1 --prompt 'The capital of France is'
+```
+
+
+### 2026-07-27: DeepSeek R1-Distill GQA parity resolution
+**By:** Mary; reviewed by Lori-2
+
+**What:** The earlier DeepSeek-R1-Distill native-CUDA divergence is resolved: the native grouped-query, non-interleaved-rotary decode path is correct. The observed native token `374` versus ORT-CUDA token `315` was an ORT-CUDA fp16 near-tie outlier; native matched the more accurate path. PR #430 landed test-only GQA 6:1 non-interleaved-rotary decode regressions at head dimensions 64 and 128 (`5c49c891`) to preserve the finding.
+
+**Why:** Future DeepSeek/GLM native-CUDA bring-up should not chase this as a native GQA/KV correctness defect. Treat ORT-CUDA fp16 near-ties as potentially non-authoritative and keep independent higher-precision/native checks in the loop.

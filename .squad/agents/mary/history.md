@@ -4,3 +4,9 @@
 
 - Authored PR #420 to widen extended reductions to f16/bf16 with f32 accumulation; merged as `6610f86f`, clearing the native 27B FP16 `ReduceSumSquare` CUDA fallback.
 - Revised PR #424 at `93d9e7b8` with `require_input_rank`, making CUDA claim gates shape-aware so deferred ranks retain CPU fallback instead of being treated as unsupported static shapes.
+
+## 2026-07-27T09:00:00Z — DeepSeek/GLM native-CUDA bring-up and R1 GQA resolution
+
+- Established native-CUDA viability for DeepSeek-Coder and DeepSeek-V2-Lite with ORT token-exact greedy decode; GLM native CUDA is coherent but lacks an ORT-CUDA oracle because ORT rejects its authored GQA rotary attribute.
+- Confirmed DeepSeek-V2-Lite QMoE resident CUDA correctness, while documenting that advertised weight-offload knobs do not yet activate CUDA expert paging for this path.
+- Resolved the R1-Distill divergence as an ORT-CUDA fp16 near-tie outlier: native token 374 is correct/more accurate than ORT-CUDA token 315. Landed PR #430 (`5c49c891`) with GQA 6:1 non-interleaved-rotary decode regressions at head_dim 64 and 128.
