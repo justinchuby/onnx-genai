@@ -22,7 +22,7 @@ everything you read above it, so this one goes first.
 ./examples/serving-dashboard/run-demo.sh
 ```
 
-Then open **<http://127.0.0.1:8123/demo>**.
+Then open **<http://127.0.0.1:8123/demo/>**.
 
 If that worked, skip to [What you are looking at](#what-you-are-looking-at). If
 it did not, it is almost certainly the models — read on.

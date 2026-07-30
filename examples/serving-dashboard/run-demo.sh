@@ -174,13 +174,13 @@ wait_until_ready "${DYNAMIC_PORT}" "dynamic" "${dynamic_pid}"
 
 cat <<EOF
 
-  Open the demo:  http://${BIND_HOST}:${SCATTER_PORT}/demo
+  Open the demo:  http://${BIND_HOST}:${SCATTER_PORT}/demo/
 
   Both servers serve the page. Each scenario reads telemetry from the server
   that can actually measure it, and switching scenarios moves you between them:
 
-    continuous batching          http://${BIND_HOST}:${SCATTER_PORT}/demo
-    paged KV / prefix caching    http://${BIND_HOST}:${DYNAMIC_PORT}/demo
+    continuous batching          http://${BIND_HOST}:${SCATTER_PORT}/demo/
+    paged KV / prefix caching    http://${BIND_HOST}:${DYNAMIC_PORT}/demo/
 
   Ctrl-C stops both servers.
 

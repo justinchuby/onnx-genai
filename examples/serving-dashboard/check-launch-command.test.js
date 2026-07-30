@@ -302,3 +302,31 @@ test('every flag in a copy-pasteable command exists in the server CLI', () => {
   }
   assert.ok(checked > 0, 'no server flags were checked; the extraction is wrong');
 });
+
+// ---------------------------------------------------------------------------
+// The demo URL is `/demo/`, with the trailing slash.
+//
+// `/demo` is a *temporary redirect* to `/demo/` (lib.rs:82-84), so the short
+// form works — which is exactly why it drifts back. It costs an extra
+// round-trip on every scenario switch, and any test asserting a URL
+// byte-for-byte will disagree with a document that omits it.
+// ---------------------------------------------------------------------------
+
+test('every documented demo URL carries the trailing slash', () => {
+  const sources = {
+    'README.md': readme,
+    'run-demo.sh': runDemoScript,
+    'ui/launch-command.js': DEMO_URL,
+  };
+  for (const [name, text] of Object.entries(sources)) {
+    const short = [...text.matchAll(/https?:\/\/[^\s`'")>]*\/demo(?![/\w-])/g)];
+    assert.equal(
+      short.length,
+      0,
+      `${name} points at /demo without the trailing slash ` +
+        `(${short.map((m) => m[0]).join(', ')}). Use /demo/ — the short form ` +
+        'is a temporary redirect, so it works while costing a round-trip and ' +
+        'breaking any byte-exact comparison.',
+    );
+  }
+});
