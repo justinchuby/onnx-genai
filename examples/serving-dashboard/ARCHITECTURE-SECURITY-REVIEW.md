@@ -15,7 +15,21 @@ finding, this document says so and does not restate it.
 > only form that cannot rot: a line number rots when code moves, and a per-citation
 > repository prefix rots the same way.
 
-**Verdict: APPROVE WITH COMMENTS.** Blocking set is **zero**. This document opened at
+**Verdict — and it differs by tree, so both are stated rather than one being implied:**
+
+- **At `review-0` (`6ecd9183`), the pinned review artifact: APPROVE WITH ONE BLOCKER — C5.**
+  `may_disclose_model_paths()` is present there and keys on the server's bind address, and
+  `run-demo.sh` binds loopback by default, so the disclosure branch is the one every demo
+  run takes. See §7.7.
+- **At `HEAD`: APPROVE WITH COMMENTS. Blocking set zero.** C5 was closed by `2da3e851`,
+  which is **not** an ancestor of the tag.
+
+**I reported C5 struck against the tag and it is live there — a false green, corrected in
+§7.7.** My recommendation to the Lead is to re-cut the tag above `2da3e851`: the fix is
+real and better than anything three reviewers proposed, and a tag that excludes it makes
+this review describe a tree nobody will run.
+
+This document opened at
 REQUEST CHANGES with three blocking findings; two were fixed while it sat unedited, and
 the third was downgraded on evidence. **The stale verdict was live in this file for
 roughly ninety minutes, and a stale red is not a safe error** — it either holds a ship
@@ -27,9 +41,9 @@ SHA in each row rather than recalled:
 | **C2** stalled-server hang | BLOCKING | ✅ **CLOSED** | `6ecd9183` | ancestor-of-HEAD; re-executed at `c1323e7f`: blackhole socket → typed `RequestTimeoutError` @ 2004 ms, normal-server control → HTTP 200 @ 14 ms — see §1 |
 | **C1** `parseOrigin` host validation | BLOCKING | ✅ **CLOSED** | `023db167` + `be3ab37c` | ancestors-of-HEAD; predicate re-run — see §2 |
 | **C11** router re-fabricates zeros | BLOCKING | 🟡 **real, not blocking** | — | shipping, but zero router processes ran tonight — see §3 |
-| **P1** model-path disclosure | *(not filed)* | 🟡 **caption defect only** | *(server half deleted)* | disclosure is now unconstructible in Rust — see §5 |
+| **P1** model-path disclosure | *(not filed)* | 🔴 **LIVE at `review-0`** · 🟡 caption-only at HEAD | `2da3e851` *(post-tag)* | at the tag the Rust still discloses on a loopback bind — see §7.7. The deletion is real but is **not** in the artifact — see §5 |
 
-**Blocking set is zero and I am not manufacturing a fourth.** The strongest single change
+**Blocking set at `review-0` is one: C5.** At HEAD it is zero. The strongest single change
 on this branch landed while this document sat stale: the server's path-disclosure
 *conditional* was not fixed, it was **deleted**, and a source-level test now forbids its
 return. That is the design principle this whole review argued for — **make the wrong
