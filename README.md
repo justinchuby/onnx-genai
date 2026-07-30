@@ -57,6 +57,14 @@ OpenAI HTTP server / CLI / Rust facade
 The paged KV manager currently supplies allocation, sharing, tiering, and
 materialization; true paged-attention kernels are not yet implemented.
 
+**Continuous batching and paged KV do not compose today.** Continuous batching
+engages only on static-cache models, and the batch manager never touches the
+paged KV cache — so on a batching server the page table, the prefix cache, and
+preemption are all bypassed. On a dynamic-cache server the paging and prefix
+subsystems are fully active but requests are served one at a time. Both paths
+are supported and correct; they are simply not yet available at once. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.6.
+
 ## Quick Start
 
 ### Build a model with Mobius
@@ -721,6 +729,10 @@ Remaining advanced work includes:
 - True paged-attention execution kernels; current paging manages KV storage.
 - Automatic hardware-profile probing/matching beyond explicit EP selection and
   metadata capability validation.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the system is put
+together — component hierarchy, the request lifecycle, the contracts and
+invariants between layers, and an honest inventory of what is stubbed.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the design and roadmap.
 
