@@ -354,7 +354,17 @@ def check_cite_markers(repo: Path, doc: Path) -> list[Failure]:
     return out
 
 
-def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
+def check(
+    repo: Path, doc: Path, manifest: dict, ref: str = "HEAD"
+) -> tuple[list[Failure], dict]:
+    # `ref` is resolved ONCE by the caller and threaded through every tree
+    # comparison below. Naming "HEAD" at each call site instead would ask a
+    # moving branch four separate questions: on a shared tree at ~1.4 commits
+    # a minute, presence could be checked against one commit, divergence
+    # computed against a second, and the banner could name a third. The run
+    # would report a coherent-looking verdict that was never true of any single
+    # tree. The default keeps the self-test callers addressing HEAD, which is
+    # correct there -- they build throwaway repos that nobody else can move.
     # Cleared per run. The self-test invokes check() repeatedly against
     # different throwaway repositories, and a set that survived between them
     # would carry one repo's paths into another's divergence report -- a
@@ -385,7 +395,7 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
         for real in (resolve_path(repo, tracked, c.path, getattr(c, "symbol", None)),)
         if real is not None
     }
-    tree_context.require_present_on_disk(repo, sorted(cited_paths))
+    tree_context.require_present_on_disk(repo, sorted(cited_paths), ref=ref)
 
     failures: list[Failure] = []
     # Non-fatal observations. A deictic citation is a real defect but a slow
@@ -635,14 +645,14 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     except ValueError:
         pass
     stats["divergence"] = tree_context.divergence_report(
-        repo, sorted(CITED_SOURCES_READ | {str(doc_rel)})
+        repo, sorted(CITED_SOURCES_READ | {str(doc_rel)}), ref=ref
     )
     # The aggregate goes out on EVERY run, green included. The per-file lines
     # above are correct and nobody counts them; "0 of 7" is the form a reader
     # absorbs, and printing it only beside failures would teach exactly the
     # reflex this file exists to break -- that agreement is the silent case.
     stats["divergence_summary"] = tree_context.divergence_summary(
-        repo, sorted(CITED_SOURCES_READ | {str(doc_rel)})
+        repo, sorted(CITED_SOURCES_READ | {str(doc_rel)}), ref=ref
     )
 
     # Anti-shrink anchors. A harness that enumerates citations from the artefact
@@ -755,7 +765,7 @@ def container_census(doc: Path) -> dict[str, int]:
     return census
 
 
-def tree_qualifier() -> str:
+def tree_qualifier(ref: str | None = None) -> str:
     """The tree this verdict is about, formatted to sit ON the verdict line.
 
     The banner already prints the toplevel -- at the TOP, dozens of lines
@@ -770,6 +780,16 @@ def tree_qualifier() -> str:
     """
     try:
         root = tree_context.repo_root()
+        if ref is not None:
+            # A SHA, resolved once by the caller. Preferred over the branch
+            # name: this branch has resolved to hundreds of different trees
+            # tonight, so "onnx-genai-demo @ feat/genai-demo-dashboard" names
+            # a moving target and cannot be checked by a later reader. Only
+            # root.name is published, never the absolute path -- the two repos
+            # this qualifier exists to separate are siblings sharing an entire
+            # prefix, so the basename carries all of the discriminating power
+            # and the home directory carries none of it.
+            return f"{root.name} @ {ref}"
         branch = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, check=True).stdout.strip()
@@ -780,7 +800,8 @@ def tree_qualifier() -> str:
         return "UNKNOWN TREE"
 
 
-def report(failures: list[Failure], stats: dict, doc: Path) -> int:
+def report(failures: list[Failure], stats: dict, doc: Path,
+           ref: str | None = None) -> int:
     print(f"citations in {doc}: anchored {stats['anchored']} | "
           f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']} "
           f"| line-anchored continuations {stats['continuations']}")
@@ -926,7 +947,7 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
         if len(diverged) > 8:
             print(f"  ... and {len(diverged) - 8} more")
     if not failures:
-        print(f"OK [{tree_qualifier()}] - every anchored citation resolves to a "
+        print(f"OK [{tree_qualifier(ref)}] - every anchored citation resolves to a "
               f"definition that exists IN THAT TREE. The sibling checkout has "
               f"files at identical paths; most citations resolve there too, so "
               f"this OK does NOT identify which repository the document means.")
@@ -944,7 +965,7 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     by_kind: dict[str, list[Failure]] = {}
     for f in failures:
         by_kind.setdefault(f.kind, []).append(f)
-    print(f"\nFAILURES BELOW ARE RELATIVE TO [{tree_qualifier()}]. A citation that "
+    print(f"\nFAILURES BELOW ARE RELATIVE TO [{tree_qualifier(ref)}]. A citation that "
           f"is wrong here may be correct in the sibling checkout, and vice versa.")
     for kind, group in by_kind.items():
         print(f"\n### {kind}: {len(group)}")
@@ -1499,7 +1520,7 @@ def main() -> int:
             rel = str(doc.resolve().relative_to(repo.resolve()))
         except ValueError:
             rel = None
-        if rel and tree_context.missing_from_disk(repo, [rel]):
+        if rel and tree_context.missing_from_disk(repo, [rel], ref=ctx["sha"]):
             print(
                 f"CANNOT RUN: {doc} is present in HEAD but missing from the "
                 f"working tree. The checkout is incomplete; this is not a "
@@ -1521,11 +1542,11 @@ def main() -> int:
     mpath = repo / args.manifest
     manifest = json.loads(mpath.read_text()) if mpath.exists() else {}
     try:
-        failures, stats = check(repo, doc, manifest)
+        failures, stats = check(repo, doc, manifest, ref=ctx["sha"])
     except tree_context.PartialWorktree as exc:
         print(f"CANNOT RUN: {exc}", file=sys.stderr)
         return tree_context.CANNOT_RUN
-    return report(failures, stats, doc)
+    return report(failures, stats, doc, ref=ctx["sha"])
 
 
 if __name__ == "__main__":
