@@ -2559,3 +2559,48 @@ A narrowed label is **true on every profile**, needs no asterisk, and states the
 | D93 | Precedence `not-applicable > unavailable > pending > stale > measured`; derived takes the highest | Only `not-applicable` asserts the value never arrives; the rest are timing |
 | D94 | A `not-applicable` input is **never** substituted with `0`; narrow the LABEL instead (§16) | "Structurally absent means it contributes zero" is the fabricated zero returning with a correctness argument |
 | D95 | `reason_code` on the wire, prose `reason` in the client — both, neither optional | Server owns classification, client owns voice; a stale client table can't contradict the server |
+
+---
+
+## 34. 🔴 `prefix_cache_hits` ON THE BATCHING SERVER IS `not-applicable`, NOT `measured` — THE ZERO IS A TAUTOLOGY, NOT AN OBSERVATION
+
+@bb2ee824 marked `metrics.prefix_cache_hits` as **`measured`** so its genuine zero can be shown and captioned. **The intent is exactly right and I'm adopting it. The STATE is wrong, and it's wrong in the one direction our whole envelope exists to prevent.**
+
+### 34.1 The disassembly — verified at four sites
+
+```rust
+// batched.rs:262 and :486  — BOTH batched call sites
+let loop_state = DecodeLoopState::with_rng(0, rng, options.top_logprobs);
+//                                         ↑
+// decode_loop.rs:40 — the FIRST PARAMETER IS prefix_cache_hit_len: usize
+//
+// batched.rs:347 / :579 — read back out and handed to the metric
+row.state.prefix_cache_hit_len
+//
+// metrics.rs:136 — the branch that increments hits
+if prefix_cache_hit_len > 0 { REGISTRY.prefix_cache_hits.fetch_add(1, ...); }
+```
+
+**The value tested at `metrics.rs:136` is a COMPILE-TIME LITERAL `0`, written 300 lines earlier and round-tripped through a struct field.** No cache lookup ever writes it on this path. **The branch is statically dead.** `prefix_cache_hits` on a batching server cannot increment — not *did not*, **cannot**.
+
+> **A number that could not have come out any other way is not a measurement. It is a restatement of the source code.**
+
+### 34.2 Why `measured` here is the exact failure we built the envelope to stop
+
+`state: 'measured'` promises **"we have a real value from its stated source."** With `source: 'server'`, the badge tells a visitor *the server counted this*. **The server counted nothing. It evaluated `0 > 0`.** Ship that and our provenance badge — the one component whose entire job is to be trustworthy — makes its **first false claim on our headline panel.** @c8d9a40e's grader would pass it; every test would be green.
+
+**And this is the strongest instance yet of the session's pattern, because of HOW it hides:** the literal is at `batched.rs:262`; the metric is at `metrics.rs:136`. **Read either site alone and nothing is wrong** — the metric site sees a variable, the call site sees an innocuous `0` among four positional args. **The fabrication is LAUNDERED THROUGH A STRUCT FIELD**, which is precisely why @bb2ee824's three-evidence analysis (all of it correct) still landed on the wrong state. Their EVIDENCE 1 proves the *mechanism* is wired; it does not prove the *input* is observed.
+
+### 34.3 The denominator is independently broken — do NOT render a hit RATE
+
+`metrics.rs:130-132` increments `prefix_cache_lookups` **unconditionally on every completed generation**, outside any predicate. **It counts generations, not lookups** — it would read 135 with the prefix cache deleted from the codebase. So `0 hits / 135 lookups` is **a statically-dead numerator over a mislabelled denominator**. D96: **no hit-rate percentage is rendered on any profile.** A ratio of two fabrications is the most authoritative-looking number we could possibly put on screen.
+
+### 34.4 What ships — @bb2ee824 gets the panel they argued for
+
+Their recommendation is right and better than an omission: **show the exclusivity as a finding.** §31's `not-applicable` treatment is *built* for this — panel-level, header retained, body replaced by the explanation, **on screen rather than behind a hover, and not apologetic.** So the correct state delivers the teaching surface; `measured` was never needed to get it. **We do not have to misreport the state to tell the story — and if we did, the story wouldn't be worth telling.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D96 | `prefix_cache_hits` on scatter/batching = **`not-applicable`**, never `measured` | The tested value is a compile-time literal; the increment branch is statically dead |
+| D97 | **Never render a prefix hit-RATE.** `lookups` counts generations, not lookups | Ratio of a dead numerator over a mislabelled denominator |
+| D98 | A metric whose input is a constant is `not-applicable` **however well-wired the counter is** | Wiring proves the mechanism, not the observation |
