@@ -1,7 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 //
-// AC38: the launch command in the docs and the launch command in the UI must be
+// AC40: the launch command in the docs and the launch command in the UI must be
 // the same command, so they cannot drift.
+//
+// (This was AC38 before the spec reconstruction renumbered it. The substance is
+// unchanged; the number is not. Verified against the spec rather than carried
+// over from memory -- a citation nobody re-opens is how a test ends up
+// enforcing a criterion that has moved.)
 //
 // The command necessarily appears in four places, each of which needs a
 // different form, so a literal string comparison is not available:
@@ -219,7 +224,7 @@ test('both servers bind loopback by default', () => {
 });
 
 test('the README documents the deliberate divergence from diffusion-demo', () => {
-  // AC38 requires this to read as a decision rather than an oversight, so a
+  // AC40 requires this to read as a decision rather than an oversight, so a
   // future contributor does not "fix" it by adding a bundler.
   assert.match(readme, /diffusion-demo/, 'README must name examples/diffusion-demo');
   assert.match(
@@ -340,5 +345,29 @@ test('every documented demo URL carries the trailing slash', () => {
         'is a temporary redirect, so it works while costing a round-trip and ' +
         'breaking any byte-exact comparison.',
     );
+  }
+});
+
+// AC40, added after the spec reconstruction surfaced a clause this suite did
+// not yet enforce: "No server command in any document, UI string, or copy
+// button may show a `genai_config.json` path."
+//
+// The trap is built by our own tooling. `onnx-genai generate ./m/genai_config.json`
+// works, because resolve_model_dir() (cli/src/lib.rs:674) coerces a file to its
+// parent. The server has no equivalent, so the CLI teaches a habit the server
+// rejects. A config-file path in a copy-pasteable server command is therefore
+// not a typo -- it is the single most likely first-run failure, pasted.
+test('no copy-pasteable server command points --model at a config file', () => {
+  for (const [name, text] of Object.entries(copyPasteableCommands)) {
+    for (const invocation of serverInvocations(text)) {
+      assert.doesNotMatch(
+        invocation,
+        /--model[= ]\S*\.json\b/,
+        `${name} shows a server command pointing --model at a config file:\n` +
+          `  ${invocation.trim()}\n` +
+          `--model takes a model DIRECTORY. The onnx-genai CLI accepts a ` +
+          `config-file path and coerces it to the parent; the server does not.`,
+      );
+    }
   }
 });
