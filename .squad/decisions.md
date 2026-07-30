@@ -166,6 +166,173 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   #377 verbose, Matthias static-cache implementation, Johnny PackedVarlenAttention,
   Pris multiturn corrected measurements.
 
+### 2026-07-30: CUDA op-parity + reduce-f16 wave merged
+**By:** Squad (Coordinator) — requested by justinchuby
+**What:** Merged #418 (SiLU-marker harden + Instance/GroupNorm), #419 (LpPool/CenterCropPad/Col2Im, CUDA 154→157), #420 (extended reductions widened to f16/bf16, f32-accum). Each independently opus-reviewed (Lori #419, Kuato #420) with on-GPU parity re-run. #67 progress comment posted (157 ops). #384 updated with Mary's large-model root-cause; Doug isolated the ORT-CUDA abort to an upstream graph-optimizer bug (extended/all crashes, basic loads) on both 1.27 and 1.28.
+**Why:** Advances #67 CUDA parity and Justin's "beat ORT / support larger models" directive. #420 clears the native large-model reduce-fallback (96 FP16 ReduceSumSquare now CUDA-claimed); remaining native 27B blocker is explicit token metadata (#377 / mobius#434 pending Justin's merge).
+
+
+### 2026-07-30: ORT 1.28 CUDA Qwen3.6-27B INT4 basic-opt reference
+**By:** Doug
+
+**What:** Tested the official ONNX Runtime 1.28.0 CUDA 13 Linux x64 release on
+NVIDIA H200 GPU 7 against:
+`/home/justinchu/mary-models/qwen3.6-27b-int4-cuda`.
+
+ORT package:
+
+- Asset: `onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz`
+- Source: `https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz`
+- Installed at: `/home/justinchu/onnx-genai/.ort-cuda-1.28/root`
+- Release SHA-256: `84d28f27589090b280d4312743efd3d450cd4ac7d1e1d75e7d9076d9637bf9de` (verified)
+- `VERSION_NUMBER`: `1.28.0`
+- `GIT_COMMIT_ID`: `da9b5e364c465de65c49d91e696cd6485270757f`
+- `libonnxruntime.so.1.28.0` SHA-256:
+  `87097979b341c4df9c1bf71b14f7376f84a91206fbc64c0ccc4733dcbbab9e40`
+- CUDA provider dependencies are CUDA 13 (`libcublas.so.13`,
+  `libcudart.so.13`) and cuDNN 9, matching the current `.cudaenv.sh` library
+  environment.
+
+The ORT 1.27 session-init abort is **not cleared** by 1.28.0. The requested
+benchmark aborts before engine construction, warmup, or generation:
+
+```text
+/opt/rh/gcc-toolset-14/root/usr/include/c++/14/bits/stl_vector.h:1130:
+constexpr std::vector<_Tp, _Alloc>::reference
+std::vector<_Tp, _Alloc>::operator[](size_type)
+[with _Tp = onnxruntime::NodeArg*; ...]:
+Assertion '__n < this->size()' failed.
+```
+
+Exit status is 134 (`SIGABRT`). The last optimizer warning is constant folding
+`model/norm/Add_node_4200`. Peak GPU-7 memory observed before abort was only
+527 MiB. Therefore there is no valid 27B ORT-CUDA tok/s number or generated text
+to assess for coherence.
+
+Requested repro:
+
+```bash
+cd /home/justinchu/onnx-genai
+source .cudaenv.sh
+export ONNX_GENAI_ORT_LIB="$PWD/.ort-cuda-1.28/root/lib/libonnxruntime.so.1.28.0"
+CUDA_VISIBLE_DEVICES=7 taskset -c 7 ./target/release/profile_native \
+  --model /home/justinchu/mary-models/qwen3.6-27b-int4-cuda \
+  --ep cuda --backend ort --steady --tokens 128 --warmups 2 --runs 3 \
+  --decode-skip 8 \
+  --prompt 'Explain what a transformer is in two sentences.'
+```
+
+Minimal harness repro (same abort):
+
+```bash
+CUDA_VISIBLE_DEVICES=7 taskset -c 7 ./target/release/profile_native \
+  --model /home/justinchu/mary-models/qwen3.6-27b-int4-cuda \
+  --ep cuda --backend ort --steady --tokens 9 --warmups 0 --runs 1 \
+  --decode-skip 8 --prompt x
+```
+
+A standalone ORT C++ session-creation repro establishes that this is in ORT's
+optimizer, not generation or the Rust engine:
+
+| ORT graph optimization level | CUDA session creation |
+|---|---|
+| disabled | succeeds |
+| basic | succeeds |
+| extended | aborts |
+| all (project default) | aborts |
+
+The same 1.28 library with the CPU EP also completes session construction; its
+first generation then stops normally with the model package's ambiguous
+`model.io.token_input` metadata error. This further isolates the abort to the
+CUDA EP plus extended/all graph optimization.
+
+#### Labeled workaround reference
+
+**ORT-CUDA 1.28.0, graph-opt=basic (extended/all aborts upstream):**
+
+| Metric | Result |
+|---|---:|
+| Steady median decode | **17.38 tok/s** |
+| Median decode latency | 57.527 ms/token |
+| Measured runs | 17.32, 17.57, 17.38 tok/s |
+| Median prefill to first emitted token | 50.740 ms |
+| Peak H200 VRAM | **18,127 MiB** |
+
+Regime: H200 GPU 7, CPU core 7, 128 generated tokens, 2 warmups, 3 runs,
+`decode_skip=8`, greedy decode, prompt `Explain what a transformer is in two
+sentences.`.
+
+Generated text was syntactically coherent and non-repetitive, but did not follow
+the prompt; it began:
+
+```text
+---
+
+### 1. Introduction
+
+In this paper, we investigate the problem of finding the optimal control for a
+system governed by a partial differential equation (PDE)...
+```
+
+This likely reflects the raw prompt/model-package chat-format or artifact
+metadata, not token corruption. The output was deterministic across all three
+measured runs.
+
+Measurement required temporary, subsequently reverted scaffolding because the
+artifact was not yet a complete runnable model package:
+
+1. A temporary `ONNX_GENAI_ORT_GRAPH_OPT=basic` hook selected ORT optimization
+   level 1.
+2. `inference_metadata.yaml` was temporarily completed with the graph's explicit
+   token, mask, position, logits, 32 growing KV, and 96 fixed recurrent-state
+   port pairs.
+3. The symbolic `batch` dimension on recurrent state ports was temporarily
+   specialized to batch 1. Without this, the engine correctly refuses to
+   zero-initialize fixed state with shape `[-1, 10240, 3]`.
+
+Command:
+
+```bash
+source .cudaenv.sh
+export ONNX_GENAI_ORT_LIB="$PWD/.ort-cuda-1.28/root/lib/libonnxruntime.so.1.28.0"
+export ONNX_GENAI_ORT_GRAPH_OPT=basic  # temporary benchmark scaffold
+CUDA_VISIBLE_DEVICES=7 taskset -c 7 ./target/release/profile_native \
+  --model /home/justinchu/mary-models/qwen3.6-27b-int4-cuda \
+  --ep cuda --backend ort --steady --tokens 128 --warmups 2 --runs 3 \
+  --decode-skip 8 \
+  --prompt 'Explain what a transformer is in two sentences.'
+```
+
+Current native CUDA status: it loads the artifact but does **not** execute on
+CUDA. The CUDA EP declines 96 fp16 `ReduceSumSquare` nodes (`Float16 unsupported;
+expected Float32`), heterogeneous CUDA+CPU placement is unavailable, and the
+whole session falls back to `cpu_ep`. A one-token status run measured only
+0.04 tok/s after a 274-second prefill, so it is not a native-CUDA reference.
+
+The failing boundary is ORT's Level2/extended optimizer set: basic/Level1
+succeeds, while extended/Level2 aborts. The exact individual Level2 transformer
+was not isolated; candidates include the CUDA-specific Level2 attention,
+normalization, gather/split, and QDQ selector/fusion transformations. This is
+sufficiently narrow for an upstream issue without misattributing the assertion
+to the last Level1 constant-folding warning.
+
+**Why:** #384 now has a measured, explicitly qualified 27B-class ORT-CUDA
+baseline while preserving the stronger finding that the normal ORT extended/all
+configuration is unusable on this graph. The 17.38 tok/s figure is a workaround
+reference, not equivalent to the normal project-default ORT `all` configuration.
+No project ORT pin, Cargo file, environment example, or CUDA kernel was committed.
+
+
+### 2026-07-30: Land the remaining tractable CUDA index and pooling operators
+**By:** Kuato
+**What:** Added CUDA `LpPool`, `CenterCropPad`, and `Col2Im`, raising `CUDA_COVERED_OPS` from 154 to 157. `LpPool` uses a general N-D NVRTC window reduction, while the two index transforms share one dtype-aware NVRTC module.
+**Why:** All three operators have compact, model-agnostic GPU implementations and passed CPU-EP parity on GPU 3, including p=1/p=2 pooling geometry, odd mixed crop/pad, and overlapping/dilated Col2Im accumulation. This leaves the six heavier or data-dependent standard-domain gaps for focused waves.
+
+
+### 2026-07-29: Harden decomposed SiLU and add CUDA normalization parity
+**By:** Kuato
+**What:** Standalone CUDA `Silu` now honors `_cuda_decomposed_silu`, retaining the explicit fp16 sigmoid and multiply rounding when the downstream SwiGLU fusion does not fire. Added CUDA `InstanceNormalization` and `GroupNormalization` (opsets 18 and 21) for contiguous f32/f16/bf16 NCHW-style tensors, with GPU-vs-CPU conformance across all three dtypes, both GroupNormalization affine contracts, and a large-offset variance case. `CUDA_COVERED_OPS` rises from 152 to 154.
+**Why:** The SiLU marker previously affected only the fused path, leaving a correctness hole in the standalone fallback. Normalization was the cleanest next #67 batch because both operators share one model-agnostic two-pass NVRTC reduction/affine implementation. Deferred `LpPool` until its full arbitrary-rank window/auto-pad/ceil-mode contract can be implemented rather than shipping a rank-4 subset; deferred `CenterCropPad` and `Col2Im` to a focused index-transform batch; deferred `QLinearMatMul` because per-axis quantization, batched broadcasting, integer accumulation, and output requantization do not fit cleanly into the existing float dequant/GEMM path without a larger design.
 ## CLI charter — standing directives
 
 These two govern all ongoing CLI work and outlive the PRs that produced them. They were
