@@ -1919,3 +1919,64 @@ observation, not an instrument reading.
 `ITEM 9 -> f3ddf53d + 5cb6b52f + 1fb23794` (all three verified present and
 ancestors of HEAD, with an instrument control proving the check can return
 *not-an-ancestor*).
+
+### 8.19 The gate, scored once, against one commit
+
+**FROZEN COMMIT: `fca13038`.** Every item below was scored against that sha in a
+**detached worktree at zero porcelain**, with the `worktree add` exit status checked
+rather than read, a positive control proving the tree was fully populated, and no
+pipe anywhere in the measurement.
+
+```
+ 1  crates compile + clippy    🟡 QUALIFIED — see below. NOT caused by this branch.
+ 2  styled page + full suite   🟢 EXIT 0 · tests 627 · pass 627 · fail 0 · skipped 0
+ 3  cherry-picks               🟢
+ 4  QA plan current            🟢 withdrawn-id steps present and already corrected
+ 5  citation sweep             🟢 (asserted by the suite, not by inspection)
+ 6  AC33                       🟢
+ 7  launcher prose             🟢
+ 8  model path                 🟢
+ 9  model rebuildable          🟢 f3ddf53d + 5cb6b52f + 1fb23794, all ancestors
+10  one browser load           🔴 THE ONLY RED
+```
+
+**Item 1 is qualified rather than green, and qualified rather than red, and the
+distinction is the whole point of this document.** A clean checkout of `fca13038`
+fails `cargo check --workspace --all-targets` with exit **101** -- two build
+scripts, `mlas-sys` and `onnx-runtime-cpuinfo`, in a vendored x86 AVX2 kernel being
+compiled for `arm64-apple-macosx`. Measured attribution, with a control:
+
+```
+files changed by this branch in crates/mlas-sys              0
+files changed by this branch in crates/onnx-runtime-cpuinfo  0
+CONTROL: files changed in examples/serving-dashboard       100   (instrument works)
+last commit touching mlas-sys: 07-27 — two days BEFORE the branch base
+```
+
+**It is not ours, and it is not new. What is new is knowing it.** Every previous
+green on this item was taken in a tree with a warm `target/`, where cargo had no
+reason to re-run a build script that succeeded under some earlier configuration.
+
+> **A warm build directory is a cache of past success, and a build that only
+> succeeds warm is not reproducible from a checkout.** This is the same property
+> the suite item is required to have, and nobody thought to ask it of the crates,
+> because compiling is the one thing everybody assumes they have actually done.
+
+**Scoring this 🔴 would be false** -- it would blame a branch that never touched the
+code. **Scoring it 🟢 would also be false** -- the item claims the crates compile
+and from a clean checkout on this architecture they do not. **So it is rendered in
+neither state, with its reason attached** -- which is exactly what this product
+does to a telemetry field it cannot stand behind, and the gate does not get an
+exemption its own dashboard would refuse.
+
+**And item 10 is the only red, on a two-line deletion that five reviewers have
+independently concurred on and nobody has written:**
+
+```
+grep -n 'server\.model_path' — shipped JS at fca13038, tests excluded:
+  ui/model-card.js:25 · dashboard/system.js:89 · telemetry-provenance.js:150
+  -> 3 HITS. MUST REACH 1. Control: server.model_id fires 2/1/1.
+```
+
+> **Nine of ten is not a ship signal, and it never was.** The gate exists to be
+> read after it disagrees with the people who built it.
