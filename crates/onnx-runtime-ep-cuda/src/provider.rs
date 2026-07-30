@@ -319,6 +319,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "LinearAttention"
+            && op.domain == "com.microsoft"
+            && let Some(reason) =
+                crate::kernels::linear_attention::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "Attention"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =

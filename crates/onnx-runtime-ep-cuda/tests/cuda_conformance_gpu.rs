@@ -2392,6 +2392,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "grouped block-dequant expert GEMM",
     ));
     p.push(dedicated(
+        "LinearAttention",
+        "linear_attention_gpu.rs",
+        "gated delta-rule linear attention (Qwen3.5 hybrid)",
+    ));
+    p.push(dedicated(
         "BlockQuantizedMatMul",
         "block_quantized_matmul_gpu.rs",
         "block-quantized weights",
