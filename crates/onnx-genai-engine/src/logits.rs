@@ -5,7 +5,7 @@
 //! temperature -> top-k -> top-p -> min-p -> top-a -> typical-p ->
 //! Mirostat -> XTC.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::config::MirostatVersion;
@@ -1054,18 +1054,30 @@ pub struct TopKProcessor {
     pub top_k: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TopKLogit(f32);
+
+impl Eq for TopKLogit {}
+
+impl Ord for TopKLogit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for TopKLogit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl LogitProcessor for TopKProcessor {
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
-        if self.top_k == 0 || self.top_k >= logits.len() {
+        let Some(threshold) = top_k_threshold(logits, self.top_k) else {
             return;
-        }
-
-        let mut sorted: Vec<f32> = logits.iter().copied().filter(|v| !v.is_nan()).collect();
-        if sorted.is_empty() {
-            return;
-        }
-        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = sorted[self.top_k.saturating_sub(1).min(sorted.len() - 1)];
+        };
 
         for logit in logits.iter_mut() {
             if logit.is_nan() || *logit < threshold {
@@ -1089,23 +1101,22 @@ impl LogitProcessor for TopPProcessor {
             return;
         }
 
-        let Some(probabilities) = softmax_probabilities(logits) else {
+        let Some((mut probabilities, zero_probability_indices)) =
+            nonzero_softmax_probabilities(logits)
+        else {
             return;
         };
-        let probs = ranked_probabilities(&probabilities);
-
-        let mut cumulative = 0.0;
-        let mut keep_count = 0;
-        let cutoff = self.top_p.max(0.0);
-        for &(_, prob) in &probs {
-            keep_count += 1;
-            cumulative += prob;
-            if cumulative >= cutoff {
-                break;
-            }
+        if probabilities.is_empty() {
+            return;
         }
 
-        for &(idx, _) in probs.iter().skip(keep_count) {
+        let cutoff = self.top_p.max(0.0);
+        let keep_count = top_p_keep_count(&mut probabilities, cutoff);
+
+        for idx in zero_probability_indices {
+            logits[idx] = f32::NEG_INFINITY;
+        }
+        for &(idx, _) in probabilities.iter().skip(keep_count) {
             logits[idx] = f32::NEG_INFINITY;
         }
     }
@@ -1454,21 +1465,219 @@ fn softmax_probabilities(logits: &[f32]) -> Option<Vec<f32>> {
     Some(weights.into_iter().map(|weight| weight / total).collect())
 }
 
+/// Surviving `(index, probability)` pairs together with the indices whose
+/// probability is forced to zero. Named to keep the sampler helpers readable
+/// and satisfy `clippy::type_complexity`.
+type NonzeroProbabilities = (Vec<(usize, f32)>, Vec<usize>);
+
+fn nonzero_softmax_probabilities(logits: &[f32]) -> Option<NonzeroProbabilities> {
+    let mut finite_logits = Vec::new();
+    let mut zero_probability_indices = Vec::new();
+    let mut maximum_logit = f32::NEG_INFINITY;
+    for (index, &logit) in logits.iter().enumerate() {
+        if logit.is_nan() {
+            zero_probability_indices.push(index);
+        } else if logit != f32::NEG_INFINITY {
+            maximum_logit = maximum_logit.max(logit);
+            finite_logits.push((index, logit));
+        }
+    }
+    if !maximum_logit.is_finite() {
+        return None;
+    }
+
+    let mut weights = Vec::new();
+    let mut total = 0.0_f32;
+    for (index, logit) in finite_logits {
+        let weight = (logit - maximum_logit).exp();
+        total += weight;
+        if weight > 0.0 {
+            weights.push((index, weight));
+        } else {
+            zero_probability_indices.push(index);
+        }
+    }
+    if !total.is_finite() || total <= 0.0 {
+        return None;
+    }
+
+    for (_, weight) in &mut weights {
+        *weight /= total;
+    }
+    Some((weights, zero_probability_indices))
+}
+
+fn top_k_threshold(logits: &[f32], top_k: usize) -> Option<f32> {
+    if top_k == 0 || top_k >= logits.len() {
+        return None;
+    }
+
+    if top_k <= 256 {
+        return top_k_threshold_bounded_heap(logits, top_k);
+    }
+
+    let mut candidates: Vec<f32> = logits
+        .iter()
+        .copied()
+        .filter(|value| !value.is_nan())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let rank = top_k.saturating_sub(1).min(candidates.len() - 1);
+    let (_, threshold, _) = candidates.select_nth_unstable_by(rank, |left, right| {
+        right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(*threshold)
+}
+
+fn top_k_threshold_bounded_heap(logits: &[f32], top_k: usize) -> Option<f32> {
+    let mut heap = BinaryHeap::with_capacity(top_k);
+    for value in logits.iter().copied().filter(|value| !value.is_nan()) {
+        if heap.len() < top_k {
+            heap.push(std::cmp::Reverse(TopKLogit(value)));
+        } else if let Some(mut threshold) = heap.peek_mut()
+            && value > threshold.0.0
+        {
+            *threshold = std::cmp::Reverse(TopKLogit(value));
+        }
+    }
+    heap.peek().map(|threshold| threshold.0.0)
+}
+
+fn compare_ranked_probability(left: &(usize, f32), right: &(usize, f32)) -> std::cmp::Ordering {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
+}
+
+fn sorted_top_p_keep_count(probabilities: &mut [(usize, f32)], cutoff: f32) -> usize {
+    probabilities.sort_unstable_by(compare_ranked_probability);
+    let mut cumulative = 0.0_f32;
+    for (offset, &(_, probability)) in probabilities.iter().enumerate() {
+        cumulative += probability;
+        if cumulative >= cutoff {
+            return offset + 1;
+        }
+    }
+    probabilities.len()
+}
+
+fn top_p_keep_count(probabilities: &mut [(usize, f32)], cutoff: f32) -> usize {
+    if probabilities.is_empty() {
+        return 0;
+    }
+    if cutoff <= 0.0 {
+        probabilities.select_nth_unstable_by(0, compare_ranked_probability);
+        return 1;
+    }
+    if probabilities.len() <= 64 {
+        return sorted_top_p_keep_count(probabilities, cutoff);
+    }
+
+    partition_top_p_keep_count(probabilities, cutoff)
+}
+
+fn partition_top_p_keep_count(probabilities: &mut [(usize, f32)], cutoff: f32) -> usize {
+    if probabilities.len() <= 64 {
+        return sorted_top_p_keep_count(probabilities, cutoff);
+    }
+
+    let prefix_len = probabilities.len() / 2;
+    probabilities.select_nth_unstable_by(prefix_len - 1, compare_ranked_probability);
+    let prefix_mass: f32 = probabilities[..prefix_len]
+        .iter()
+        .map(|&(_, probability)| probability)
+        .sum();
+    if prefix_mass >= cutoff {
+        partition_top_p_keep_count(&mut probabilities[..prefix_len], cutoff)
+    } else {
+        prefix_len
+            + partition_top_p_keep_count(&mut probabilities[prefix_len..], cutoff - prefix_mass)
+    }
+}
+
 fn ranked_probabilities(probabilities: &[f32]) -> Vec<(usize, f32)> {
     let mut ranked: Vec<_> = probabilities.iter().copied().enumerate().collect();
-    ranked.sort_unstable_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
+    ranked.sort_unstable_by(compare_ranked_probability);
     ranked
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sampling::sample_greedy;
+    use crate::sampling::{sample_categorical, sample_greedy};
+
+    fn deterministic_logits(len: usize) -> Vec<f32> {
+        let mut state = 0x5EBA_571A_CAFE_F00D_u64;
+        (0..len)
+            .map(|index| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                if index % 997 == 0 {
+                    f32::NAN
+                } else {
+                    let bucket = (state >> 32) as u32;
+                    (bucket as f32 / u32::MAX as f32) * 40.0 - 20.0
+                }
+            })
+            .collect()
+    }
+
+    fn full_sort_top_k_threshold(logits: &[f32], top_k: usize) -> Option<f32> {
+        if top_k == 0 || top_k >= logits.len() {
+            return None;
+        }
+        let mut sorted: Vec<f32> = logits
+            .iter()
+            .copied()
+            .filter(|value| !value.is_nan())
+            .collect();
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_unstable_by(|left, right| {
+            right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(sorted[top_k.saturating_sub(1).min(sorted.len() - 1)])
+    }
+
+    fn full_sort_top_k(logits: &mut [f32], top_k: usize) {
+        let Some(threshold) = full_sort_top_k_threshold(logits, top_k) else {
+            return;
+        };
+        for logit in logits {
+            if logit.is_nan() || *logit < threshold {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    fn full_sort_top_p(logits: &mut [f32], top_p: f32) {
+        if !top_p.is_finite() || top_p >= 1.0 || logits.is_empty() {
+            return;
+        }
+        let Some(probabilities) = softmax_probabilities(logits) else {
+            return;
+        };
+        let probs = ranked_probabilities(&probabilities);
+        let mut cumulative = 0.0;
+        let mut keep_count = 0;
+        let cutoff = top_p.max(0.0);
+        for &(_, probability) in &probs {
+            keep_count += 1;
+            cumulative += probability;
+            if cumulative >= cutoff {
+                break;
+            }
+        }
+        for &(index, _) in probs.iter().skip(keep_count) {
+            logits[index] = f32::NEG_INFINITY;
+        }
+    }
 
     fn context(prompt_tokens: Vec<TokenId>, generated_tokens: Vec<TokenId>) -> ProcessorContext {
         ProcessorContext {
@@ -1555,6 +1764,22 @@ mod tests {
     }
 
     #[test]
+    fn top_k_selection_threshold_matches_full_sort_on_large_vocab() {
+        let logits = deterministic_logits(10_000);
+        for top_k in [1, 2, 20, 128, 1_024, 9_999] {
+            let expected = full_sort_top_k_threshold(&logits, top_k);
+            let actual = top_k_threshold(&logits, top_k);
+            assert_eq!(actual, expected, "top_k={top_k}");
+
+            let mut expected_logits = logits.clone();
+            let mut actual_logits = logits.clone();
+            full_sort_top_k(&mut expected_logits, top_k);
+            TopKProcessor { top_k }.process(&mut actual_logits, &ProcessorContext::default());
+            assert_eq!(actual_logits, expected_logits, "top_k={top_k}");
+        }
+    }
+
+    #[test]
     fn top_p_keeps_minimal_nucleus_and_at_least_one_token() {
         let processor = TopPProcessor { top_p: 0.6 };
         let mut logits = vec![3.0, 2.0, 1.0];
@@ -1562,6 +1787,36 @@ mod tests {
         assert!(logits[0].is_finite());
         assert_eq!(logits[1], f32::NEG_INFINITY);
         assert_eq!(logits[2], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn top_p_fast_path_keeps_same_nucleus_as_full_sort() {
+        let logits = deterministic_logits(10_000);
+        for top_p in [0.0, 0.25, 0.6, 0.95, 0.999] {
+            let mut expected = logits.clone();
+            let mut actual = logits.clone();
+            full_sort_top_p(&mut expected, top_p);
+            TopPProcessor { top_p }.process(&mut actual, &ProcessorContext::default());
+            assert_eq!(actual, expected, "top_p={top_p}");
+        }
+    }
+
+    #[test]
+    fn fixed_seed_sampling_matches_full_sort_top_k_top_p_chain() {
+        let logits = deterministic_logits(10_000);
+        let mut expected = logits.clone();
+        let mut actual = logits.clone();
+
+        full_sort_top_k(&mut expected, 20);
+        full_sort_top_p(&mut expected, 0.95);
+        TopKProcessor { top_k: 20 }.process(&mut actual, &ProcessorContext::default());
+        TopPProcessor { top_p: 0.95 }.process(&mut actual, &ProcessorContext::default());
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            sample_categorical(&actual, 0.424_242),
+            sample_categorical(&expected, 0.424_242)
+        );
     }
 
     #[test]
