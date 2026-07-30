@@ -3254,3 +3254,60 @@ The tension is real and the author's instinct was sound; it does not require cho
 | D139 | Panels display values and may group; tabs advertise capabilities and may not | A visitor cannot miss a feature that was never named |
 | D140 | All three tabs always render; unreachable = present, dimmed, focusable, non-navigating; the grouped note stays as explanation | Preserves the always-visible ruling, D133, and §31 together |
 | D141 | Dimmed tab uses opacity + on-screen sublabel, never the field-state palette | Legible-but-wrong-meaning is worse than illegible |
+
+---
+
+## 48. AC52 — THE GRAYSCALE CHECK, COMPUTED (D142–D144)
+
+I have owed an AC52 verification of the five treatments all session and kept deferring it to "when there's a browser." **There is now a browser-servable page — and it turns out the most important half of AC52 never needed one.** The question *"can `not-applicable` be told from `unavailable` without colour?"* is answered by arithmetic on the tokens, and arithmetic is the stronger instrument here: an eyeball on one monitor at one gamma is a sample of one.
+
+**EVIDENCE CLASS: COMPUTED from `styles/tokens.css`, not OBSERVED in a browser.** Stated plainly because §43 made evidence class a first-class property of every claim in this document, and because the remaining half of AC52 — that the treatments *survive a real render* — is still unobserved.
+
+### 48.1 The measurement
+
+Relative luminance (WCAG formula) of the four absence tokens, and the grayscale-equivalent contrast between each pair:
+
+| state | hex | rel. luminance | 8-bit gray |
+|---|---|---|---|
+| `unavailable` | `#758493` | 0.2239 | **129** |
+| `pending` | `#748494` | 0.2235 | **129** |
+| `stale` | `#7a8794` | 0.2360 | 132 |
+| `not-applicable` | `#7e8fa0` | 0.2662 | 140 |
+| `measured` | `#e6edf3` | 0.8386 | 235 |
+
+| pair | grayscale contrast |
+|---|---|
+| `unavailable` vs `pending` | **1.001 : 1** |
+| `unavailable` vs `stale` | 1.044 : 1 |
+| `pending` vs `stale` | 1.046 : 1 |
+| `not-applicable` vs `stale` | 1.105 : 1 |
+| `unavailable` vs `not-applicable` | 1.154 : 1 |
+
+### 48.2 🔒 D142 — COLOUR IS NOT A WEAK CHANNEL HERE. IT IS NOT A CHANNEL AT ALL.
+
+**`unavailable` and `pending` are the SAME GRAY — 129 and 129, 1.001:1.** Every absence pair sits under 1.16:1, where 3:1 is the floor for non-text UI distinction. **In grayscale, on a projector, or to a visitor with achromatopsia, the four absence states are ONE state.**
+
+This is the design working as intended — §21 chose near-identical foregrounds deliberately so that pattern would carry the meaning — **but I had been describing the second channel as REINFORCEMENT, and the numbers say it is the ENTIRE SIGNAL.** That is not a nuance:
+
+- **D142:** for the absence states, **the non-colour channel is load-bearing on its own.** Any state whose border/decoration is missing is not *harder* to identify — it is **exactly indistinguishable** from two others. There is no partial credit and no graceful degradation.
+
+### 48.3 D143 — WHAT THIS RETROSPECTIVELY PROVES ABOUT THE MUTATION TEST
+
+Earlier I deleted every `border-bottom` from the four non-default states and reported the suite stayed green while the states "rendered identically." **I wrote that from reading the CSS and I was understating it by accident.** These numbers show the mutation did not *degrade* the distinction — **it collapsed four states into one, completely, with a 1.001:1 residue.** A visitor would have had no way, by any means, to tell a value that is *coming* from one that is *structurally impossible*.
+
+- **D143:** **a test that guards the only channel is not a style test, it is a correctness test.** `state-channel.test.js` is now the single thing standing between the page and a total loss of absence semantics, and it should be treated with the seriousness of the provenance envelope itself — **not as a lint.**
+
+### 48.4 D144 — WHAT REMAINS GENUINELY UNOBSERVED
+
+Computation settles *separation*. It cannot settle:
+1. whether `3px double` and `1px dotted` are **telling apart at 14px on a real display** — sub-pixel rendering can turn `double` into a smear;
+2. whether the em-dash and `n/a` **hold their reserved width** when a number arrives beside them;
+3. whether any of it survives the **compressed screenshot** in AC8.
+
+- **D144:** these three go to @fc8b5d97's browser pass as named checks, not as "eyeball the states." **I am not marking AC52 satisfied on the strength of arithmetic, and this section is not a sign-off — it is the half I could do without a browser, labelled as such.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D142 | For absence states the non-colour channel is the ENTIRE signal, not reinforcement | All pairs ≤1.16:1 grayscale; `unavailable`/`pending` are 1.001:1 |
+| D143 | `state-channel.test.js` is a correctness test, not a lint | It guards the only channel that carries absence semantics |
+| D144 | AC52 stays OPEN; three named render checks go to the browser pass | Arithmetic settles separation, not legibility |
