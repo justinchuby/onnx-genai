@@ -8,7 +8,7 @@ use super::add::require_same_dtype;
 use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes};
 use crate::dispatch_arith;
 use crate::dtype::{
-    NumericElem, to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
+    NumericElem, to_dense, to_dense_bool, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
 };
 use crate::strided::numel;
 
@@ -648,12 +648,25 @@ impl Kernel for NonZeroKernel {
                 "NonZero: output must be Int64".into(),
             ));
         }
-        let x = to_dense_f32_widen("NonZero", &inputs[0])?;
         let rank = inputs[0].shape.len();
         let strides = contiguous(inputs[0].shape);
+        // `NonZero` is defined for every tensor type. Boolean masks are stored as
+        // one byte per element and fall outside the numeric widen dispatch, so
+        // read them directly; all other supported dtypes widen to f32.
+        let nonzero_flags: Vec<bool> = if inputs[0].dtype == DataType::Bool {
+            to_dense_bool(&inputs[0])?
+                .into_iter()
+                .map(|b| b != 0)
+                .collect()
+        } else {
+            to_dense_f32_widen("NonZero", &inputs[0])?
+                .iter()
+                .map(|&v| v != 0.)
+                .collect()
+        };
         let mut coordinates = vec![Vec::new(); rank];
-        for (linear, &v) in x.iter().enumerate() {
-            if v != 0. {
+        for (linear, &is_nonzero) in nonzero_flags.iter().enumerate() {
+            if is_nonzero {
                 let mut rem = linear;
                 for d in 0..rank {
                     coordinates[d].push((rem / strides[d]) as i64);
@@ -941,6 +954,17 @@ mod tests {
             .execute(&[input.view()], &mut [output.view_mut()])
             .unwrap();
         assert_eq!(output.to_i64(), vec![0, 1, 1, 2, 0, 2]);
+    }
+
+    #[test]
+    fn nonzero_accepts_bool() {
+        // Same true positions as the bf16 case above: (0,1), (0,2), (1,2).
+        let input = Owned::bool_(&[2, 3], &[false, true, true, false, false, true]);
+        let mut output = Owned::zeros(DataType::Int64, &[2, 3]);
+        NonZeroKernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_i64(), vec![0, 0, 1, 1, 2, 2]);
     }
 
     #[test]

@@ -1,12 +1,24 @@
 //! `com.microsoft::GatherBlockQuantized`: gather rows of a blockwise-quantized
 //! table and dequantize them in one capture-safe NVRTC kernel.
 //!
-//! This mirrors the ONNX Runtime CUDA contrib kernel numerics exactly for the
-//! `uint8` data path (bits in {2, 4, 8}): each output element resolves its source
+//! This matches the ONNX Runtime CUDA contrib kernel numerics for the `uint8`
+//! data path (bits in {2, 4, 8}): each output element resolves its source
 //! element in the flattened data, unpacks the quantized code (`get_val`), unpacks
 //! the optional per-block zero point, and writes `(code - zero_point) * scale`.
 //! The dequantized (`scales`/output) dtype may be fp32 or fp16, and the gather
 //! indices may be int32 or int64.
+//!
+//! ## Zero-point layout precondition (even blocks-per-row)
+//!
+//! CPU/ORT pack sub-byte (`bits < 8`) zero points PER ROW — each row's blocks
+//! start on a fresh byte — whereas this kernel addresses the zero-point nibbles
+//! GLOBALLY by `block_id`. The two layouts produce identical results only when
+//! there is an even number of blocks per row (a whole multiple of
+//! `components = 8 / bits`); `bits == 8` (`components == 1`) always agrees. Real
+//! int4 embedding tables use an even blocks-per-row layout, which this kernel
+//! handles exactly. An odd blocks-per-row layout with zero points present is
+//! refused explicitly (both at claim time and via a loud execute-path bail)
+//! rather than silently returning mismatched values.
 //!
 //! ONNX Runtime restricts the `uint8` layout to `gather_axis == 0` and
 //! `quantize_axis == last dim`; this kernel enforces the same and otherwise
@@ -15,6 +27,7 @@
 //! capture path, so it is legal inside the persistent decode CUDA graph (the
 //! `/model/embed_tokens` embedding lookup runs once per decode step).
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +36,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{DataType, Node, Shape};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
@@ -305,6 +318,24 @@ impl Kernel for GatherBlockQuantizedKernel {
             )));
         }
         if let Some(zp) = zero_points {
+            // The CUDA kernel unpacks 4-bit zero points with GLOBAL nibble
+            // addressing (by block_id), whereas CPU/ORT pack zero points PER ROW
+            // (each row's blocks start on a fresh byte). These coincide only when
+            // there is an even number of blocks per row, i.e. `blocks_per_row`
+            // is a whole multiple of `components` (always true for bits=8 where
+            // components==1). For odd blocks-per-row with sub-byte zero points the
+            // two layouts diverge, so refuse LOUDLY and explicitly rather than
+            // relying on the incidental size mismatch below.
+            let blocks_per_row = after_gather_dim / block_size;
+            if components > 1 && !blocks_per_row.is_multiple_of(components) {
+                return Err(not_implemented(format!(
+                    "GatherBlockQuantized CUDA bits={} zero_points use global nibble \
+                     addressing, which only matches CPU/ORT per-row packing for an even \
+                     number of blocks per row; got {blocks_per_row} blocks per row \
+                     (after_gather_dim={after_gather_dim}, block_size={block_size})",
+                    self.bits
+                )));
+            }
             let expected_zp = block_count.div_ceil(components);
             if zp.numel() != expected_zp {
                 return Err(EpError::KernelFailed(format!(
@@ -464,6 +495,74 @@ fn normalize_axis(axis: i64, rank: usize, what: &str) -> Result<usize> {
         )));
     }
     Ok(normalized as usize)
+}
+
+/// Claim-time refusal for the odd-blocks-per-row zero-point layout gap.
+///
+/// The CUDA kernel unpacks sub-byte (`bits < 8`) zero points with GLOBAL nibble
+/// addressing (by `block_id`), whereas CPU/ORT pack zero points PER ROW. The two
+/// layouts coincide only when there is an even number of blocks per row (a whole
+/// multiple of `components = 8 / bits`); for `bits == 8` (`components == 1`) they
+/// always agree. When the static shapes prove an odd blocks-per-row layout with
+/// zero points present, decline here so placement never claims-then-fails.
+/// Anything not statically provable is left to claim (the execute path carries a
+/// loud explicit bail as the backstop).
+pub(crate) fn unsupported_reason(node: &Node, shapes: &[Shape]) -> Option<Cow<'static, str>> {
+    // Zero points are the optional 4th input; without them the layout gap cannot
+    // occur.
+    let has_zero_points = matches!(node.inputs.get(3), Some(Some(_)));
+    if !has_zero_points {
+        return None;
+    }
+    let bits = node.attr("bits").and_then(|a| a.as_int())?;
+    if !matches!(bits, 2 | 4) {
+        // bits == 8 (or unsupported bit widths handled by the factory) never hits
+        // the sub-byte packing divergence.
+        return None;
+    }
+    let components = (8 / bits) as usize;
+    let block_size = node.attr("block_size").and_then(|a| a.as_int())? as usize;
+    if block_size == 0 {
+        return None;
+    }
+    let data_shape = shapes.first()?;
+    let data_rank = data_shape.len();
+    if data_rank == 0 {
+        return None;
+    }
+    let gather_axis = node
+        .attr("gather_axis")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0);
+    let gather_axis = if gather_axis < 0 {
+        gather_axis + data_rank as i64
+    } else {
+        gather_axis
+    };
+    if !(0..data_rank as i64).contains(&gather_axis) {
+        return None;
+    }
+    let gather_axis = gather_axis as usize;
+    // Unpacked after-gather extent = product(static dims after gather axis) * components.
+    let mut after_gather_packed: usize = 1;
+    for dim in &data_shape[gather_axis + 1..] {
+        let extent = dim.as_static()?;
+        after_gather_packed = after_gather_packed.checked_mul(extent)?;
+    }
+    let after_gather_dim = after_gather_packed.checked_mul(components)?;
+    if after_gather_dim % block_size != 0 {
+        // The execute path rejects this separately; not our concern here.
+        return None;
+    }
+    let blocks_per_row = after_gather_dim / block_size;
+    if !blocks_per_row.is_multiple_of(components) {
+        return Some(Cow::Owned(format!(
+            "GatherBlockQuantized CUDA bits={bits} zero_points use global nibble addressing, \
+             which only matches CPU/ORT per-row packing for an even number of blocks per row; \
+             this layout has {blocks_per_row} blocks per row (odd multiple of components={components})"
+        )));
+    }
+    None
 }
 
 #[cfg(test)]

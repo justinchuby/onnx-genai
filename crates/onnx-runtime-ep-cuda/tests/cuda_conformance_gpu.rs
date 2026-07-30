@@ -890,6 +890,16 @@ fn nonzero_cases() -> Vec<Case> {
             attrs: vec![],
             compare: Compare::ExactBytes,
         },
+        Case {
+            label: "NonZero[bool,rank2]".into(),
+            op: "NonZero",
+            domain: "",
+            opset: 13,
+            inputs: vec![input::<u8>(DataType::Bool, &[2, 3], &[0u8, 1, 1, 0, 0, 1])],
+            outputs: vec![(DataType::Int64, vec![2, 3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
     ]
 }
 

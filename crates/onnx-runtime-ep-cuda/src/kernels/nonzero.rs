@@ -36,6 +36,7 @@ extern "C" __global__ void nonzero_##SUFFIX( \
 DEFINE_NONZERO(float, f32)
 DEFINE_NONZERO(__half, f16)
 DEFINE_NONZERO(__nv_bfloat16, bf16)
+DEFINE_NONZERO(unsigned char, bool_)
 "#;
 
 pub struct NonZeroFactory {
@@ -70,6 +71,7 @@ impl Kernel for NonZeroKernel {
             DataType::Float32 => "f32",
             DataType::Float16 => "f16",
             DataType::BFloat16 => "bf16",
+            DataType::Bool => "bool_",
             dtype => return Err(not_implemented(format!("NonZero for dtype {dtype:?}"))),
         };
         let rank = input.shape.len();

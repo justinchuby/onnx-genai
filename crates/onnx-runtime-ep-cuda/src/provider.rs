@@ -312,6 +312,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "GatherBlockQuantized"
+            && op.domain == "com.microsoft"
+            && let Some(reason) =
+                crate::kernels::gather_block_quantized::unsupported_reason(op, shapes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "CausalConvWithState"
             && op.domain == "com.microsoft"
             && let Some(reason) =
@@ -334,8 +341,11 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "RotaryEmbedding"
-            && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) = crate::kernels::rotary_embedding::unsupported_reason(input_dtypes)
+            && matches!(op.domain.as_str(), "" | "ai.onnx" | "com.microsoft")
+            && let Some(reason) = crate::kernels::rotary_embedding::unsupported_reason(
+                op.domain == "com.microsoft",
+                input_dtypes,
+            )
         {
             return KernelMatch::unsupported(reason);
         }
