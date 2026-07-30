@@ -68,7 +68,14 @@
      give "not measurable yet" a consistent, dignified treatment that is
      instantly distinguishable from a real measured zero.                  */
   --og-unavail-fg: #758493;  /* AA 4.52:1 on --og-bg-raised */
-  --og-unavail-rule: #3d4855;
+  /* D270. WAS #3d4855, WHICH MEASURED 1.86:1 AND FAILED WCAG 1.4.11 (3:1 for
+     non-text). This underline is not decoration -- shell.css:179-181 calls it
+     "the second channel: absence is legible in greyscale, in a compressed
+     screenshot, and on a projector", and at 1.86:1 it was none of those. The
+     comment asserted the property the value failed, in my own file, for the
+     entire session. Sibling tokens carried a measured ratio; this one carried
+     no annotation at all, and an unannotated token is an unchecked one. */
+  --og-unavail-rule: #566a7b;  /* 3.09:1 on --og-bg-raised, WCAG 1.4.11 */
   --og-unavail-hatch: #212932;
   --og-unavail-bg: #131920;
   --og-unavail-label: #6e7d8c;

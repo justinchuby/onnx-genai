@@ -5094,3 +5094,167 @@ enforce; the prose rule stays a request.
 > identically**, which is @12e42da8's records-of-intent rule landing on my own file.
 
 **Suites: 9 + 7 + 5 + 3 + 3 = 27 green.**
+
+---
+
+## 80. 2.5 seconds of `pending`, in the only state without a second channel
+
+**@e00032a4 measured the thing nobody had measured, and it converts two of my open
+CSS asks from polish into headline risk. @376a0297 checked my D232 and reported four
+`--og-na-*` consumers in `shell.css`. Both reports are honest; one of them is about a
+different selector. Verified at HEAD with an AC106 control first
+(`data-state` → 11 hits in `shell.css`, root resolves).**
+
+### 80.1 D266 — the four consumers are a different component, and I overstated D232
+
+`shell.css:594-616` — the four `--og-na-*` consumers — are **`.scenario-switcher__note`,
+the unreachable-scenario note.** A real component, correctly styled, **and not the
+field-level state selector.** That one is unchanged:
+
+```css
+shell.css:201  [data-state='not-applicable'] {
+shell.css:202    color: var(--og-unavail-fg);            /* the UNAVAILABLE palette */
+shell.css:207    border-bottom: 3px double var(--og-unavail-rule);
+panels.css:886 .value[data-state='not-applicable'] { color: var(--og-na-fg); }
+```
+
+**@376a0297's conclusion — *`not-applicable` renders* — is TRUE.** Inside `.value` it
+gets the brighter `--og-na-*` set. **Outside it, the bare attribute selector hands the
+state the `unavailable` colours**, so **specificity decides which of two documented
+palettes a state receives**, and `tokens.css:76` says the na set is *"DELIBERATELY
+BRIGHTER THAN `unavailable`, and this is"* — an intent stated in the token file and
+erased by the selector in one of two contexts.
+
+**⚠️ AND I MUST CORRECT MYSELF: I said the dimmer rendering was PIXEL-IDENTICAL to
+`unavailable`. IT IS NOT.** `not-applicable` carries `3px double`; `unavailable`
+carries `1px dotted` (`shell.css:181`). **The second channel distinguishes them
+perfectly. Only the colour collides.** Per AC105 I checked this retraction as hard as
+I would check an accusation, because **it makes my own earlier finding smaller, and
+nobody challenges the person arguing for less.**
+
+> **D266. TWO HONEST AUDITS OF "THE SAME" SYMBOL DISAGREED BECAUSE ONE COUNTED
+> CONSUMERS AND THE OTHER COUNTED SELECTORS.** A token census answers *is this token
+> used*; it cannot answer *does this state get this token*, **because the binding is
+> decided by specificity at render time, not by presence at grep time.** The
+> instrument that settles it is neither grep nor the runtime — **it is the cascade.**
+
+### 80.2 D267 — `pending` is the one state with no second channel, and it now owns the most-watched second
+
+```css
+shell.css:167  [data-state='pending'] { color: var(--og-pending-fg); font-style: italic; }
+```
+
+**`font-style: italic` applied to `PENDING_TEXT = '···'` (`format.js:61`) is visually
+inert — three dots do not lean.** So `pending`'s only effective channel is **colour**,
+while `stale` has `1px dashed`, `unavailable` `1px dotted`, and `not-applicable`
+`3px double`. **Four states pass the greyscale gate. One does not, and it is the one
+that renders before any data arrives.**
+
+**@e00032a4's measurement is what turns this from a polish item into a headline
+item:**
+
+| `/v1/resources` | latency |
+|---|---|
+| idle (control, n=5) | **1.6 – 8.8 ms** |
+| **during generation, FIRST call** | **2.49 s / 3.03 s** |
+| during generation, subsequent | 27 – 170 ms |
+
+**For ~2.5 seconds at the exact moment generation begins — the one moment a visitor
+is watching — every field on the polled panels is in `pending`. The dashboard spends
+its most-watched second in the only state that fails the greyscale gate.**
+
+> **D267. THE STATE A PANEL SPENDS THE LEAST TIME IN IS NOT THE STATE THAT MATTERS
+> LEAST.** `pending` is rare in wall-clock terms and **guaranteed to be on screen at
+> the start of every demo.** Design attention had followed duration; it should follow
+> **attention.** ⛔ **`border-bottom: 1px solid var(--og-pending-rule)`** —
+> `@bb2ee824` / `@c8d9a40e`, this is D233 re-issued with a measurement attached.
+
+### 80.3 D268 — a 2.5 s response is 2.5 s old on arrival, and the field must say so
+
+D235 replaced payload-comparison with `observedAtMs` stamped **per successful poll.**
+**That stamp is taken at RECEIPT, and at 8 ms that is harmless. At 2.5 s it is a
+fabrication** — the sample was taken somewhere inside a 2,500 ms window and we do not
+know where.
+
+> **D268. STAMP BOTH ENDS: `requestedAtMs` AND `receivedAtMs`. THE OBSERVATION LIES
+> SOMEWHERE BETWEEN, AND THE FIELD CARRIES ITS OWN UNCERTAINTY WIDTH RATHER THAN A
+> POINT IT CANNOT JUSTIFY.** Idle, the interval collapses to a point and nothing
+> changes on screen. **Under load it opens to 2.5 s and the panel can say *as of at
+> worst 2.5 s ago* — which is D217 (never interpolate across an unobserved gap) and
+> D221 (an error bar is D217 at a point) meeting an actual number** instead of an
+> argument. **A single timestamp on a slow response is a claim about when we ASKED,
+> wearing the name of when we SAW.**
+
+### 80.4 D269 — a 4 Hz timer firing into a 2.5 s endpoint builds a queue of stale requests
+
+**A 250 ms interval against a response that can take 2,500 ms issues ten requests
+before the first returns.** Nine of them are already obsolete when sent, they contend
+with the decode loop that is *causing* the latency, and their responses arrive in a
+burst that a sparkline will plot as ten points at ten receipt times — **motion that
+never happened, which is D256 arriving through the time axis instead of the index.**
+
+> **D269. NEVER MORE THAN ONE IN-FLIGHT REQUEST PER ENDPOINT. Schedule the next poll
+> from the previous RESPONSE, not from a timer.** The poll rate becomes an upper
+> bound rather than a promise, **the dashboard stops adding load exactly when the
+> server is least able to absorb it, and the gap between samples becomes an honest
+> measurement of contention** — which is a thing worth showing. **@e00032a4's
+> threading argument for event-sampling now has the number underneath it, and the
+> number is a thousand times the idle case.**
+
+**Suites: 10 + 7 + 5 + 3 + 3 = 28 green.**
+
+### 80.5 D270 — the token whose comment asserted the property the value failed
+
+Computing a rule colour for D267 meant measuring its neighbours, and the neighbour
+was broken:
+
+```
+--og-unavail-rule: #3d4855   vs --og-bg-raised #151b23   ->  1.86:1
+WCAG 1.4.11 (non-text)                                   ->  3.00:1 required
+```
+
+**`shell.css:179-181` calls that underline *"the second channel: absence is legible
+in greyscale, in a compressed screenshot, and on a projector."* At 1.86:1 it was none
+of those** — on the projector this demo will actually run on, `unavailable` and
+`measured` differed by a colour cast and nothing else. **Fixed in `tokens.css`
+(my file, exclusive): `#566a7b`, 3.09:1, measured not eyeballed.**
+
+> **D270. EVERY SIBLING TOKEN CARRIED ITS MEASURED RATIO IN A COMMENT. THIS ONE
+> CARRIED NO ANNOTATION AT ALL — AND AN UNANNOTATED TOKEN IS AN UNCHECKED ONE.** The
+> absence of a claim is not a weaker claim; **it is the thing no reviewer's eye stops
+> on.** I have spent this session hunting fields that answer the wrong question, and
+> **this was a field that answered no question and was therefore never asked one.**
+> The accessibility argument for the second channel was made, believed, cited in
+> another file's comments, and **never once evaluated numerically.**
+
+### 80.6 D271 — my own orphan guard refused to let me ship half of an atomic pair
+
+Adding `--og-pending-rule` **reddened `asset-graph.test.js` immediately**: the token
+had no consumer, because its consumer belongs in `shell.css`, **which is not my
+file.** So the guard was correct and the situation is structural, not accidental.
+
+> **D271. A DESIGN TOKEN AND THE RULE THAT APPLIES IT ARE AN ATOMIC PAIR THAT SPANS
+> AN OWNERSHIP BOUNDARY — SO A DESIGNER CANNOT LAND A NEW STATE TREATMENT ALONE, EVER,
+> BY CONSTRUCTION.** I built that guard to catch dead tokens and it turns out to
+> encode a **handoff protocol** I never designed into it: **the correct unit of
+> delivery is not two asks, it is ONE PATCH.** Per D265 a request about someone
+> else's file must never be a red test in a shared tree at demo time — **so the token
+> is withdrawn until its consumer can land with it.**
+
+**⛔ THE PAIR, @bb2ee824 / @c8d9a40e — apply both hunks or neither:**
+
+```css
+/* styles/tokens.css — after --og-pending-fg (mine; I will land it on your word) */
+--og-pending-rule: #546b80;   /* 3.13:1 on --og-bg-raised, WCAG 1.4.11 */
+
+/* styles/shell.css:167 — yours */
+[data-state='pending'] {
+  color: var(--og-pending-fg);
+  font-style: italic;
+  border-bottom: 1px solid var(--og-pending-rule);   /* + THIS LINE */
+}
+```
+
+**`solid` is the fifth distinct border style** (`stale` dashed, `unavailable` dotted,
+`not-applicable` double, `measured` none) — **so all five states stay mutually
+distinguishable with the colour channel switched off entirely.**
