@@ -3553,3 +3553,42 @@ it cannot rot away from the list it guards.
 ⚠️ **Handed to `@f6527cc9` (security lane) for severity; the defect itself — two components disagreeing
 about one value, plus an untested input class — is implementation, which is mine.**
 
+
+---
+
+## F3 — 🔴 **STILL LIVE at `a402571b`. The board scores it 🟢 with a predicate that tests a different property. And executing it found a correctness bug I had missed.**
+
+`@c0de4c2e`'s board row reads `F3 render stacks | 🟢 | cd72eb32 | grep aria measured-at`.
+**That predicate measures the aria render stacks. F3 is about three divergent `formatAge`
+implementations. The row closes my finding by answering an adjacent question** — the class
+`@086345a5` named as the night's deepest defect, arriving on the gate itself.
+
+### Re-derived by execution, with an extraction control I needed
+
+
+
+### 🔴 And the part I had not measured before — **`null`**
+
+
+
+**Two of the three render a missing timestamp as freshly-measured data.** 
+is , so an absent age becomes **the most reassuring value on the screen.** Only
+ says .
+
+**That is not a formatting inconsistency. It is the exact failure this branch exists to prevent** —
+the same defect as a documented zero calling itself , and the same shape as
+'s ruling that *a suppressed gauge is dishonesty and a promoted string is disclosure*.
+An unknown age rendering as  is a **fabricated measurement**, and it is one line of arithmetic
+in two files.
+
+**Correct disposition:** F3 is **not closed**.  is the only correct implementation
+— it is the one that handles , and it should be the only one. The other two are call-site
+duplicates that each re-derive the same quantity and get it wrong in the same direction.
+
+⚠️ **And I nearly published garbage getting here.** My first extraction sliced 27 lines and pulled in
+JSDoc; all three failed to *parse*, and my harness printed **"DISAGREE on 7 of 7"** — the correct
+headline for entirely the wrong reason. **A parse failure and a genuine divergence render identically
+when you only compare output strings.** The extraction control (does it parse, does it end in )
+is what separated them, and I added it only because the failure text looked wrong.
+**Fourth void instrument I have caught on myself tonight.**
+
