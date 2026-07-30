@@ -13,6 +13,7 @@ import { after, before, describe, it } from 'node:test';
 
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
 import { createFakeStore, measured, series, unavailable } from './testing/fake-store.js';
+import { PROVENANCE, resolveForOrigin } from '../telemetry-provenance.js';
 
 let uninstallDom;
 before(() => {
@@ -128,6 +129,50 @@ describe('scheduling panel — the batch occupancy denominator', () => {
       bar.children.filter((slot) => slot.classList.contains('capacity-bar__slot--used')).length,
       3,
       'discrete slot ticks make "3 of 4" readable without estimating a proportion by eye',
+    );
+    handle.unmount();
+  });
+});
+
+describe('scheduling panel — the caption the catalogue rules', () => {
+  it('RATCHET — announces batch.capacity by the catalogue label, never a hardcoded one', () => {
+    // THE RENAME THAT DID NOT REACH THE PAGE. The catalogue retired
+    // 'Batch limit' for this key precisely because it names the WRONG QUANTITY:
+    // the value is `max_batch.min(max_queue_depth)`, which scheduling.js itself
+    // explains 90 lines above the render. "Batch limit" is the name of
+    // `max_batch` alone, so on a server whose queue is the binding constraint
+    // the caption states a number that is not the thing it names.
+    //
+    // The panel then passed `{ label: 'Batch limit' }` to renderField, which
+    // OVERRIDES the field's own label. So fixing the catalogue changed nothing
+    // a visitor could see, and the rename read as done from every angle except
+    // the rendered page. This test is anchored to the catalogue rather than to
+    // the replacement string, so it pins the COUPLING and not today's wording:
+    // rename the field again and the panel must follow.
+    const catalogueLabel = resolveForOrigin(PROVENANCE['batch.capacity'], null).label;
+    assert.ok(catalogueLabel, 'the catalogue must name this field for the test to mean anything');
+
+    const { root, handle } = mountPanel(
+      storeWith({
+        fields: {
+          'batch.active_size': measured(3, { unit: 'sequences' }),
+          'batch.capacity': measured(4, { unit: 'requests', label: catalogueLabel }),
+        },
+      }),
+    );
+
+    const labels = root
+      .findAllByTag('span')
+      .map((node) => node.getAttribute('aria-label'))
+      .filter(Boolean);
+    assert.ok(
+      labels.some((text) => text.startsWith(`${catalogueLabel}:`)),
+      `no rendered field announces itself as ${JSON.stringify(catalogueLabel)}. ` +
+        `A panel-level label override masks the catalogue. Saw: ${JSON.stringify(labels)}`,
+    );
+    assert.ok(
+      !labels.some((text) => /^Batch limit:/.test(text)),
+      'the retired caption is back on the page, overriding the catalogue',
     );
     handle.unmount();
   });

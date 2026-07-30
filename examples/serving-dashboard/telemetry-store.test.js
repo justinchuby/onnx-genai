@@ -1433,3 +1433,71 @@ test('every non-measured classification is listed in NEVER_MEASURED_CLASSIFICATI
     );
   }
 });
+
+test('the FIRST frame announces every field by its catalogue label', async () => {
+  // THE FRAME NOBODY TESTED. Every assertion about labels in this suite runs
+  // after `pollOnce()`, so they all describe the SECOND frame onward. The first
+  // one -- the seconds between mount and the server's first answer -- built its
+  // pending fields without a label at all, and `renderField` falls back to the
+  // literal word "value". A screen-reader user heard "value: no samples yet"
+  // for every field on the page, and heard it FIRST, before any correct label
+  // existed to replace it.
+  //
+  // It survived because it is invisible to sighted review (the label is the
+  // aria sentence, not the visible caption) and because the panel that first
+  // exposed it passed an explicit `label:` override that happened to paper over
+  // the gap -- while naming the wrong quantity, which is how it was found.
+  //
+  // Derived from the catalogue rather than enumerated: a new field added
+  // without a label, or a store path that drops one, fails here.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: async () => {
+      throw new Error('the first frame must exist before any request is made');
+    },
+  });
+
+  const missing = [];
+  for (const key of allFieldKeys()) {
+    const field = store.field(key);
+    const expected = resolveForOrigin(PROVENANCE[key], null).label;
+    if (field.label !== expected) {
+      missing.push(`${key}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(field.label)}`);
+    }
+  }
+  assert.deepEqual(
+    missing,
+    [],
+    'these fields announce themselves as the bare word "value" on the first ' +
+      `frame:\n  ${missing.join('\n  ')}`,
+  );
+  // Vacuity guard: allFieldKeys() returning nothing would pass the above.
+  assert.ok(allFieldKeys().length > 30, `only ${allFieldKeys().length} keys checked`);
+});
+
+test('the OFFLINE frame keeps every catalogue label too', async () => {
+  // The same defect, one frame over, and it is the frame most likely to be on
+  // screen when something has gone wrong -- the moment labels matter most.
+  // `agedFields` hand-rolled `{source, unit}` exactly as the first frame did,
+  // so a server disappearing silently renamed every non-measured field to
+  // "value" until it came back.
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: async () => {
+      throw new TypeError('Failed to fetch');
+    },
+  });
+
+  const snapshot = await store.pollOnce();
+  assert.equal(snapshot.connection.state, CONNECTION_STATES.UNREACHABLE);
+
+  const missing = [];
+  for (const key of allFieldKeys()) {
+    const expected = resolveForOrigin(PROVENANCE[key], null).label;
+    if (store.field(key).label !== expected) {
+      missing.push(`${key}: got ${JSON.stringify(store.field(key).label)}`);
+    }
+  }
+  assert.deepEqual(missing, [], `unlabelled while offline:\n  ${missing.join('\n  ')}`);
+  assert.ok(allFieldKeys().length > 30, 'vacuity guard');
+});

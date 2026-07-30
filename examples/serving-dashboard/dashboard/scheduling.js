@@ -207,7 +207,13 @@ function renderOccupancy(batchSize, maxBatch) {
 
   if (isRenderable(maxBatch)) {
     row.append(element('span', { className: 'occupancy__of', text: 'of' }));
-    row.append(renderField(maxBatch, { label: 'Batch limit' }));
+    // NO `label` OVERRIDE. The catalogue calls this 'Effective batch capacity'
+    // and that rename was our own written admission that 'Batch limit' names
+    // the wrong quantity: the value is `max_batch.min(max_queue_depth)`, as
+    // this file explains 90 lines above, while "batch limit" is the name of
+    // `max_batch` alone. Hardcoding a caption here masked the corrected label,
+    // so fixing the catalogue changed nothing on the page.
+    row.append(renderField(maxBatch));
     row.append(element('span', { className: 'occupancy__max-label', text: 'max' }));
     row.append(renderField(percentage, { label: 'Batch occupancy' }));
     row.append(renderCapacityBar(batchSize, maxBatch));

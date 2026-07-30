@@ -648,7 +648,7 @@ describe('AC59 — "batch size" never appears in UI copy', () => {
     // Must NOT fire on the permitted vocabulary — these are the replacements
     // actually shipping, and a lint that also banned them would be unusable.
     const permitted = [
-      "'Batch limit'",
+      "'Effective batch capacity'",
       "'Sequences in the current batch'",
       "'Batch occupancy'",
       "'Generations in flight'",

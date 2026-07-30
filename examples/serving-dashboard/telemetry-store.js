@@ -1073,11 +1073,11 @@ export function createTelemetryStore({
       // Never-measurable fields keep their permanent explanation — it is true
       // regardless of whether the server is up.
       aged[key] = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)
-        ? neverMeasuredField(entry, { source: entry.source, unit: entry.unit })
+        ? neverMeasuredField(entry, catalogueMeta(entry, origin))
         : pendingField(
             `The server at ${baseUrl} is not responding, so no measurement has arrived for this ` +
               'field yet. It will fill in when the server returns.',
-            { source: entry.source, unit: entry.unit },
+            catalogueMeta(entry, origin),
           );
     }
     return Object.freeze(aged);
@@ -1121,6 +1121,36 @@ export function createTelemetryStore({
  * FACT (this path never consults that subsystem). Same em-dash, different
  * sentence, and only one of them is owed future work.
  *
+ * The catalogue metadata every field carries on a frame with no server answer.
+ *
+ * The store has a `fieldMeta` for the healthy path, but it is a closure over
+ * `attribution`, so the three frames that exist BEFORE or WITHOUT a response --
+ * the first frame, the offline frame, and the never-measurable fields on both
+ * -- each hand-rolled `{source, unit}` instead. All three therefore dropped
+ * `label`, and `renderField` falls back to the literal word "value".
+ *
+ * That is the frame a visitor always sees and the one no test covered. Worse
+ * for the never-measurable fields: they have no second frame to correct it, so
+ * a documented zero announced itself as "value" permanently.
+ *
+ * `originModelId` is null rather than omitted: no server has spoken yet, and an
+ * unattributed value is honest where a guessed attribution is not.
+ *
+ * @param {object} entry A PROVENANCE entry, already resolved for the origin.
+ * @param {string} origin
+ */
+function catalogueMeta(entry, origin) {
+  return {
+    source: entry.source,
+    sourceClass: entry.derived ? SOURCE_CLASSES.DERIVED : SOURCE_CLASSES.SERVER,
+    origin,
+    originModelId: null,
+    label: entry.label,
+    unit: entry.unit,
+  };
+}
+
+/**
  * @param {{classification: string, reason: string}} entry
  * @param {object} meta
  */
@@ -1149,11 +1179,8 @@ function initialSnapshot(baseUrl, timestampMs, origin) {
     // because no amount of waiting will ever produce a value for it, and
     // showing a spinner for it would promise something that is never coming.
     fields[key] = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)
-      ? neverMeasuredField(entry, { source: entry.source, unit: entry.unit })
-      : pendingField('Waiting for the first poll to complete.', {
-          source: entry.source,
-          unit: entry.unit,
-        });
+      ? neverMeasuredField(entry, catalogueMeta(entry, origin))
+      : pendingField('Waiting for the first poll to complete.', catalogueMeta(entry, origin));
   }
   return Object.freeze({
     timestampMs,
