@@ -26,3 +26,9 @@
 - Cleared three 35B-A3B blockers: (1) generalized CUDA persistent-state binding to rank-3 `conv_state`; (2) added CUDA Conv rank-3 NCL with depthwise causal; (3) registered `com.microsoft::Silu` v1 unary shape inference (PRs #437, #438, #440 all merged).
 - Status: 35B-A3B now unblocked from empirical decode measurement; next blocker is `value#1414` executor error at graph lowering.
 - Issue #384 scoped: three increments to make `PipelineDecodeLoopBackend` drive native components. Inc1 routes `every_step` through `ComponentSession` trait; value seam is backend-neutral host-resident `ComponentTensor`. Proving native embedding in hybrid loop (embedding native, decoder ORT) with token parity as Inc1 deliverable.
+
+## 2026-07-30T15:20:00Z — Native pipeline Inc2a + Inc2b merged (#478, #479)
+
+- PR #478 merged (Melina APPROVED): Inc2a pure refactor — stateful `PipelineDecoderComponent` trait + `OrtPipelineDecoder`; `PipelineDecodeLoopBackend` drives the decoder through the trait. Behaviour-identical (e2e token output unchanged + explicit equivalence assertion).
+- PR #479 merged (Lori APPROVED, instrumented proof): Inc2b `NativePipelineDecoder` device-KV decoder — KV stays device-resident, one embedding uploaded/step, static cross-KV uploaded once. Token parity `[0,5,6,7] == ORT` on a small CPU model. Native step extended for routed/`inputs_embeds` inputs.
+- In flight: Inc3 (CUDA native decoder — device-KV paged mirroring + cross-component/vision, full 35B-A3B on native), PR pending.
