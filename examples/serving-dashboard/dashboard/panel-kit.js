@@ -21,7 +21,6 @@
 // replaced by re-exports and no panel changes.
 
 import {
-  DEFAULT_STALE_CEILING_MS,
   IS_DEVELOPMENT,
   RENDER_STATES,
   ageMsOf,
@@ -30,6 +29,7 @@ import {
   isRenderable,
   isStale,
   renderStateOf,
+  resolveStaleCeilingMs,
 } from './field-state.js';
 import {
   describeSparkline,
@@ -288,7 +288,7 @@ export function renderField(field, options = {}) {
   // "— bytes" says strictly more than "—".
   const showUnitWithValue = (options.showUnit ?? !options.format) && unitIsSuffixable;
 
-  const ceilingMs = options.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS;
+  const ceilingMs = resolveStaleCeilingMs(options.staleCeilingMs);
   const nowMs = options.nowMs ?? Date.now();
 
   const wrapper = element('span', {
@@ -467,11 +467,13 @@ export function metricRow(label, field, options = {}) {
  * ceiling is declared once in `meta` rather than repeated at every call site
  * — where one omission silently reverts that metric to the global default.
  *
- * @param {{staleCeilingMs?: number}} panelMeta
+ * @param {{staleCeilingMs?: number|null}} panelMeta `null` opts out of the
+ *   ceiling entirely; omitting the key inherits the global default. The two are
+ *   NOT the same, and this used to collapse them.
  * @returns {{metricRow: typeof metricRow, renderField: typeof renderField}}
  */
 export function bindPanel(panelMeta) {
-  const staleCeilingMs = panelMeta?.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS;
+  const staleCeilingMs = resolveStaleCeilingMs(panelMeta?.staleCeilingMs);
   return {
     metricRow: (label, field, options = {}) =>
       metricRow(label, field, { staleCeilingMs, ...options }),

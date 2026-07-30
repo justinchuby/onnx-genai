@@ -8,6 +8,7 @@
 // this" is either preserved or destroyed. These tests hold that line.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { after, before, describe, it } from 'node:test';
 
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
@@ -25,6 +26,7 @@ before(() => {
 after(() => uninstallDom());
 
 const {
+  bindPanel,
   capabilityNotice,
   createRepaintScheduler,
   describeFieldText,
@@ -657,5 +659,97 @@ describe('the unit suffix belongs to whoever formatted the number', () => {
     assert.ok(seen.mounted >= 5, `only ${seen.mounted} panels mounted; the scan proves nothing`);
     assert.ok(seen.values > 20, `only ${seen.values} value nodes scanned; the scan proves nothing`);
     assert.deepEqual(offenders, [], 'a scaled unit and a raw unit rendered together');
+  });
+});
+
+// A panel declares its freshness contract once, in `meta.staleCeilingMs`, and
+// `bindPanel` carries it to every render call. Three declarations must stay
+// distinguishable there:
+//
+//   omitted -> inherit the 10s default
+//   null    -> "I have no freshness contract"; never withhold a number for age
+//   number  -> that ceiling
+//
+// This guard exists because the middle one was UNIMPLEMENTABLE for a while.
+// Both call sites resolved the ceiling with `?? DEFAULT_STALE_CEILING_MS`, and
+// `??` fires on `null` as well as `undefined` — so a panel that explicitly
+// declined a ceiling was handed a 10-second one, and the option documented in
+// the panel contract could not be exercised by anybody. `prefix-cache.js` ships
+// exactly that declaration, so this was live, not hypothetical; it was invisible
+// only because that panel binds no telemetry after the counter cut.
+//
+// The rule about WHICH panels may declare `null` lives in staleness.test.js.
+// This is the other half, and the half that went missing: given the
+// declaration, does the renderer OBEY it. A source-level rule cannot answer
+// that — the defect was two `??` operators downstream of every meta it checked.
+describe('bindPanel: the declared stale ceiling reaches the renderer intact', () => {
+  const NOW = 1_000_000;
+  // Old enough to be past the default ceiling, so "opted out" and "inherited
+  // the default" cannot accidentally agree.
+  const staleField = {
+    state: 'stale',
+    value: 42,
+    unit: 'req/s',
+    source: 'server',
+    observedAtMs: NOW - 60_000,
+  };
+
+  const render = (meta) => bindPanel(meta).renderField(staleField, { nowMs: NOW });
+
+  it('honours a null ceiling: the number survives its own age', () => {
+    const row = render({ staleCeilingMs: null });
+    assert.equal(row.getAttribute('data-state'), 'stale');
+    assert.notEqual(
+      row.getAttribute('data-stale'),
+      'expired',
+      'a panel that declared no ceiling had its number withheld for being past one',
+    );
+    assert.match(row.textContent, /42/, 'the value vanished from a panel with no ceiling');
+  });
+
+  it('still tells the reader how old it is — opting out withholds nothing', () => {
+    // The escape hatch must not become a way to launder a stale number into a
+    // fresh-looking one. No ceiling means the NUMBER stays, not that the age
+    // goes away.
+    const row = render({ staleCeilingMs: null });
+    assert.match(row.textContent, /1m 0s old/);
+    assert.equal(row.getAttribute('data-stale'), 'true');
+  });
+
+  it('an omitted ceiling still inherits the default — positive control', () => {
+    // Without this the suite above would pass just as well against a renderer
+    // that had lost the ceiling machinery altogether.
+    const row = render({});
+    assert.equal(row.getAttribute('data-stale'), 'expired');
+    assert.doesNotMatch(row.textContent, /42/);
+  });
+
+  it('null and omitted must not render the same row', () => {
+    // The single assertion that fails against the original `??` defect: under
+    // it, these two were byte-identical.
+    assert.notEqual(
+      render({ staleCeilingMs: null }).textContent,
+      render({}).textContent,
+      'the opt-out is indistinguishable from the default — `??` is collapsing null into it',
+    );
+  });
+
+  it('a declared numeric ceiling is obeyed', () => {
+    assert.equal(render({ staleCeilingMs: 3_000 }).getAttribute('data-stale'), 'expired');
+    assert.notEqual(render({ staleCeilingMs: 120_000 }).getAttribute('data-stale'), 'expired');
+  });
+
+  it('the documented type admits the value a shipping panel passes', () => {
+    // The JSDoc typed this `{staleCeilingMs?: number}` while prefix-cache.js
+    // passed `null`. A declared type that excludes a live call site is a lie
+    // told to every editor and every reader.
+    const source = readFileSync(new URL('./panel-kit.js', import.meta.url), 'utf8');
+    const signature = source.match(/@param \{\{staleCeilingMs\?:[^}]*\}\} panelMeta/);
+    assert.ok(signature, 'the bindPanel @param for panelMeta moved or was renamed');
+    assert.match(
+      signature[0],
+      /null/,
+      'bindPanel is documented as taking only a number, but a shipping panel declares null',
+    );
   });
 });

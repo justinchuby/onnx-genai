@@ -148,6 +148,30 @@ export function ageMsOf(field, nowMs = Date.now()) {
 }
 
 /**
+ * Resolve a declared stale ceiling, distinguishing UNSET from OPTED OUT.
+ *
+ * `??` collapses `undefined` and `null` into one branch, and this contract
+ * needs them apart:
+ *
+ *   undefined -> the panel said nothing  -> inherit DEFAULT_STALE_CEILING_MS
+ *   null      -> the panel said "I have no freshness contract" -> no ceiling
+ *   number    -> that ceiling
+ *
+ * Written once, here, beside the ceiling it resolves. It used to be an inline
+ * `?? DEFAULT_STALE_CEILING_MS` at two separate call sites, which meant a panel
+ * declaring `staleCeilingMs: null` was silently handed a 10-second expiry it
+ * had explicitly declined — A DOCUMENTED OPTION THAT COULD NOT BE EXERCISED,
+ * which is worse than no option: an author configures it, re-reads the config,
+ * and gets the opposite behaviour with nothing anywhere reporting a conflict.
+ *
+ * @param {number|null|undefined} declared
+ * @returns {number|null} null means "no ceiling", never "use the default".
+ */
+export function resolveStaleCeilingMs(declared) {
+  return declared === undefined ? DEFAULT_STALE_CEILING_MS : declared;
+}
+
+/**
  * Whether a stale field has aged past the point where its number should still
  * be shown (AC45(b)).
  *
@@ -155,7 +179,8 @@ export function ageMsOf(field, nowMs = Date.now()) {
  * old it is, we cannot claim it is recent enough to show.
  *
  * @param {{state?: string, observedAtMs?: number|null}|null|undefined} field
- * @param {number} [ceilingMs]
+ * @param {number|null} [ceilingMs] null opts out entirely — see
+ *   resolveStaleCeilingMs.
  * @param {number} [nowMs]
  * @returns {boolean}
  */
@@ -166,6 +191,11 @@ export function isPastStaleCeiling(field, ceilingMs = DEFAULT_STALE_CEILING_MS, 
   // helper happened to touch it first, with a stack that points at staleness
   // rather than at vocabulary drift.
   if (renderStateOf(field, { strict: false }) !== RENDER_STATES.STALE) return false;
+  // No ceiling declared means nothing can be past it. The field still renders
+  // as STALE and still carries its age in words — opting out of the ceiling
+  // withholds nothing from the reader, it only stops the NUMBER being replaced
+  // by an em-dash on grounds of age.
+  if (ceilingMs === null) return false;
   const ageMs = ageMsOf(field, nowMs);
   return ageMs === null || ageMs > ceilingMs;
 }
