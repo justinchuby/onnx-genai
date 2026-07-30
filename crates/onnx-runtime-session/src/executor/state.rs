@@ -580,6 +580,20 @@ impl ExternalValue {
         }
         .ok_or_else(|| SessionError::Internal("external output binding has a null pointer".into()))
     }
+
+    pub(super) fn readable_buffer(&self) -> Result<DeviceBuffer> {
+        if self.ptr.is_null() {
+            return Err(SessionError::Internal(
+                "external input binding has a null pointer".into(),
+            ));
+        }
+        // SAFETY: `prepare_external_bindings` obtains this pointer from a live
+        // `DeviceIoBinding` borrowed for the complete run. This read-only alias
+        // neither owns nor mutates the binding's allocation.
+        Ok(unsafe {
+            DeviceBuffer::from_borrowed_parts(self.ptr, self.device, self.len, self.alignment)
+        })
+    }
 }
 
 #[derive(Default)]

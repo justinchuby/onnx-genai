@@ -86,7 +86,7 @@ impl Executor {
             (is_control_flow, is_sequence, span)
         };
         if is_control_flow {
-            self.exec_control_flow(pi, resolved, outer_scope)
+            self.exec_control_flow(pi, resolved, outer_scope, external)
         } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {
