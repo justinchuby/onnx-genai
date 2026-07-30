@@ -1052,6 +1052,31 @@ impl CudaRuntime {
             .map_err(|e| driver_err("cuStreamWaitEvent", e))
     }
 
+    /// Block the host until the work fenced by `fence_id` completes, then release
+    /// the event. Unlike [`CudaRuntime::sync_copy_stream`] / [`synchronize`] this
+    /// waits on a *single* recorded event rather than draining a whole stream, so
+    /// it can confirm one page's transfer or last-consumer kernel is done without
+    /// stalling unrelated in-flight work. For an event recorded long ago (e.g. a
+    /// cold LRU page's last use) it returns essentially immediately. Id `0` and an
+    /// unknown id are no-ops (already-signalled).
+    pub fn host_wait_fence(&self, fence_id: u64) -> Result<()> {
+        if fence_id == 0 {
+            return Ok(());
+        }
+        let event = self
+            .fences
+            .lock()
+            .expect("cuda fence registry poisoned")
+            .remove(&fence_id);
+        let Some(event) = event else {
+            return Ok(());
+        };
+        self.bind()?;
+        event
+            .synchronize()
+            .map_err(|e| driver_err("cuEventSynchronize", e))
+    }
+
     /// Block the host until every transfer queued on the copy stream completes.
     /// Used on teardown / test paths that read a prefetched buffer without an
     /// intervening event wait.

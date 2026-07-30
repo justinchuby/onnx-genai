@@ -88,8 +88,9 @@ pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
 pub use weight_paging::{
-    CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,
-    GlobalOffloadStats, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV,
+    CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency,
+    DEFAULT_PREFETCH_DEPTH, DeviceOffloadPolicy, GlobalOffloadStats,
+    WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV, WEIGHT_OFFLOAD_PREFETCH_DEPTH_ENV,
     WEIGHT_OFFLOAD_PREFETCH_ENV, global_offload_stats, reset_global_offload_stats,
 };
 

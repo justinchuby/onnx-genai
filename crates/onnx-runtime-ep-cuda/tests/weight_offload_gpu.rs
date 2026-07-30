@@ -559,3 +559,90 @@ fn async_prefetch_page_in_matches_sync_and_issues_async_copies() {
         "async page-in must issue async H2D copies (before={async_before}, after={async_after})"
     );
 }
+
+/// #87 Increment 2 — look-ahead double-buffer prefetch must be *transparent*:
+/// serving a weight also issues copy-stream page-ins for the next weights in the
+/// learned decode order (into free VRAM headroom), so a later access finds them
+/// already resident. This must produce output byte-identical to the synchronous
+/// path across a repeating access cycle, while (a) actually issuing look-ahead
+/// prefetches (`look_ahead_prefetches > 0`, proving the double-buffer path ran,
+/// not a silent fallback) and (b) staying correct under a tight budget where a
+/// prefetched page races eviction — the eviction path drains the transfer stream
+/// before freeing, so an in-flight prefetch copy can never corrupt a reused page.
+#[test]
+fn look_ahead_prefetch_matches_sync_and_pages_ahead() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    // Four distinct weights accessed in a repeating cycle (models the periodic
+    // autoregressive weight sequence of decode).
+    let bs: Vec<Vec<f32>> = (0..4)
+        .map(|w| {
+            (0..k * n)
+                .map(|i| (i as f32) * (0.2 + 0.1 * w as f32) - (w as f32))
+                .collect()
+        })
+        .collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    // Trusted resident baselines.
+    let rt = ep.runtime();
+    let resident_out = |b: &[f32]| {
+        let buf = ep.allocate(std::mem::size_of_val(b), 256).unwrap();
+        // SAFETY: buffer sized for b's bytes.
+        unsafe { rt.htod(f32_bytes(b), cuptr(buf.as_ptr())).unwrap() }
+        let out = run_matmul_with_b_ptr(&ep, &a, buf.as_ptr(), m, k, n);
+        ep.deallocate(buf).unwrap();
+        out
+    };
+    let resident: Vec<_> = bs.iter().map(|b| resident_out(b)).collect();
+
+    // Two-page budget with four weights: prefetch has room to page one weight
+    // ahead (headroom) but not the whole working set, so look-ahead competes with
+    // eviction — exactly the race we must survive token-exact.
+    let budget = 2 * page_bytes;
+    let (_host, lazies) = combined_weights(&bs, k, n);
+    let residency = ep.weight_residency_prefetch_depth(budget, 2);
+    assert_eq!(
+        residency.prefetch_depth(),
+        2,
+        "depth-2 look-ahead requested"
+    );
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+
+    // Drive several full cycles so the access trace repeats (freezing the learned
+    // successor map) and look-ahead actually fires on subsequent cycles.
+    for cycle in 0..5 {
+        for w in 0..bs.len() {
+            let page = residency
+                .resident_materialized(w as u64, &lazies[w])
+                .unwrap();
+            let out = run_matmul_with_b_ptr(&ep, &a, page.device_ptr(), m, k, n);
+            assert_eq!(
+                out, resident[w],
+                "cycle {cycle} weight {w}: look-ahead prefetch must be byte-identical to resident"
+            );
+        }
+    }
+
+    let global = onnx_runtime_ep_cuda::global_offload_stats();
+    assert!(
+        global.look_ahead_prefetches > 0,
+        "look-ahead double-buffer prefetch must have issued copies ahead of consumption: {global:?}"
+    );
+    assert!(
+        global.async_page_ins >= global.look_ahead_prefetches,
+        "look-ahead prefetches are a subset of async page-ins: {global:?}"
+    );
+    assert!(
+        global.evictions > 0,
+        "tight two-page budget over four weights must evict: {global:?}"
+    );
+}

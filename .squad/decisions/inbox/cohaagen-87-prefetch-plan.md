@@ -125,3 +125,32 @@ Defer the double-buffered look-ahead (Increment 2) to a follow-up once Increment
 Increment 1 is **correctness/safety infrastructure**, not a perf win by itself. At this budget every weight is re-paged each step (`hits=0`), and **single-buffer** async issues each weight's copy *immediately before its own kernel*, then the fence forces that same kernel to wait on that same copy — there is no *other* weight's compute to overlap it with. Latency hiding requires **look-ahead**: prefetch layer N+1's weights on the copy stream *while layer N computes*. That is **Increment 2 (double-buffered look-ahead)** — now clearly justified: the async machinery is proven live + safe + token-exact + non-regressing (0.997×), so Increment 2 only needs to add the look-ahead schedule + budget-aware second slot.
 
 **Recommendation:** merge Increment 1 as the safe, reversible, opt-in foundation (no regression); green-light Increment 2 for the actual overlap win. Keep prefetch opt-in until Increment 2 demonstrates tok/s ≥ sync at realistic budgets.
+
+---
+
+## 9. Increment 2 — IMPLEMENTED + A/B RESULT (2026-07-30)
+
+**Status:** GREEN-LIT and implemented (branch `squad/87-async-prefetch-inc2`, stacks on #447). Same env flag `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH=1`; look-ahead depth via `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH_DEPTH` (default 2 when prefetch on; `0` = Increment-1 single-buffer). Default/unset = synchronous #444 path, byte-identical.
+
+### What was implemented
+- **Self-learned access order:** the residency records the autoregressive weight-access sequence (decode replays the same order every token). On the first repeat it freezes a `successors` map (next `depth` unique keys per key) and caches cheap `LazyWeight` clones by key (`lazy_by_key`). Zero dispatch/EP-trait changes — the residency prefetches itself.
+- **Look-ahead page-in (`prefetch_admit`):** after serving a weight, issues async H2D copies for its learned successors on the copy stream into a **double-buffered pinned ring** (`depth+1` slots), recording a *deferred* copy fence per successor. On the later consume-HIT, `get_hit` does `compute_wait_fence(deferred)` so the consuming kernel waits only on the (already-overlapped) copy. The copy overlaps the intervening compute — the actual overlap the single-buffer path structurally can't do.
+- **Budget→depth policy:** a successor is prefetched only if the *protected* working set (pages a live kernel still references + in-flight prefetched pages) leaves room (`protected + len <= budget`); otherwise skipped → graceful fallback to single-buffer under tight budgets (no thrash). Eviction (`evict_cold_to_fit`) reclaims only cold, unprotected pages, never a sibling in-flight prefetch.
+- **Multi-fence eviction safety (the real hazard):** making room may evict a cold page, so `prefetch_admit` takes the same drains as the miss path — `synchronize()` (compute) + `sync_copy_stream()` (retires **every** outstanding look-ahead copy) — before freeing. So an evicted page never has an in-flight DMA writing it, even with multiple prefetch copies simultaneously in flight. WAR on the pinned ring is enforced per slot (host-wait the slot's prior copy fence before refilling). Two fences per copy (one WAR, one RAW) because fence events are single-use.
+
+### Validation (real numbers, Qwen3-0.6B int4, device 0, taskset-pinned, median of 3 + warmup)
+Token IDs **identical** across all three (baseline offload-OFF == single-buffer == depth-2) at every budget: `[12095, 11, 323, 279, 6722, 315, 15344, 374, 21718, 13, 576, ...]`. Look-ahead genuinely ran: `look_ahead_prefetches=12153` of `async_page_ins=12546` (proves the double-buffer path fired, not a silent fallback).
+
+| Budget | single-buffer tok/s | depth-2 tok/s | speedup | evictions (sb→d2) |
+|-------:|--------------------:|--------------:|--------:|-------------------|
+| 32 MiB | 2.72 (11.75 s)      | 2.68 (11.95 s)| **0.983×** | 12493 → 12495 |
+| 64 MiB | 2.73 (11.71 s)      | 2.65 (12.10 s)| **0.968×** | 12441 → 12441 |
+|128 MiB | 2.73 (11.73 s)      | 2.59 (12.35 s)| **0.950×** | 12333 → 12333 |
+
+### Honest verdict: REGRESSION (0.95–0.98×) — bankable negative, DO NOT MERGE the #87 stack
+Look-ahead double-buffer is token-exact and safe, but **consistently ~2–5% slower** than single-buffer across every budget tried. Root cause is structural: safe cold-page eviction under a full budget requires a host `synchronize()` per look-ahead `prefetch_admit` (no stream-ordered async allocator is in use). At steady state depth-2 issues ~`depth` prefetch admits per consumed weight vs the single-buffer path's ~1 miss-admit — roughly **doubling the host synchronizes**. The overlap the copies buy does not recover that added serialization: **offload decode on this graph at these budgets is not H2D-latency-bound** — it is issue/compute + sync-overhead bound. This matches our prior speculative-perf negatives (o_proj / gate-up GEMV SW-prefetch).
+
+**Consequence (per speculative-perf discipline):** keep #447 (Increment 1) and #448 (Increment 2) as **draft, unmerged**. Increment 1 remains the correct, safe, non-regressing async substrate; Increment 2's look-ahead does not turn it into a win, so the stack stays off `main`.
+
+### What a real win would require (future Increment 3, not in scope)
+Eliminate the per-eviction host `synchronize()` by adopting a **stream-ordered allocator** (`cuMemAllocAsync`/`cuMemFreeAsync` on the copy/compute streams) so cold pages free in stream order without a host block, letting the look-ahead copies overlap with *zero* added synchronization. That was assessed and deliberately deferred (cross-stream memory-pool reuse correctness is subtle/unverified on this driver — high blast radius). Only worth pursuing if a model/budget is shown to be genuinely H2D-bandwidth-bound (e.g. 7B/27B with larger per-weight bytes); 7B A/B is currently blocked on the genai_config→inference_metadata metadata workaround (the e2e harness requires `inference_metadata.yaml`; the Foundry 7B export ships only `genai_config.json`).

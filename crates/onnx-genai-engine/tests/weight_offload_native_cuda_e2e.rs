@@ -226,6 +226,24 @@ fn offloaded_run(
     std::time::Duration,
     onnx_runtime_ep_cuda::GlobalOffloadStats,
 )> {
+    offloaded_run_depth(dir, budget, prefetch, None)
+}
+
+/// Like [`offloaded_run`] but also pins the look-ahead prefetch depth (#87
+/// Increment 2) via `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH_DEPTH`. `depth = None`
+/// leaves it unset (the default depth applies when prefetch is on); `Some(0)`
+/// forces the single-buffer (#87 Increment 1) behaviour; `Some(d>=2)` enables
+/// look-ahead double-buffering.
+fn offloaded_run_depth(
+    dir: &Path,
+    budget: u64,
+    prefetch: bool,
+    depth: Option<usize>,
+) -> anyhow::Result<(
+    GenerateResult,
+    std::time::Duration,
+    onnx_runtime_ep_cuda::GlobalOffloadStats,
+)> {
     unsafe {
         std::env::set_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV, "1");
         std::env::set_var(
@@ -237,6 +255,13 @@ fn offloaded_run(
         } else {
             std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV);
         }
+        match depth {
+            Some(d) => std::env::set_var(
+                onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_DEPTH_ENV,
+                d.to_string(),
+            ),
+            None => std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_DEPTH_ENV),
+        }
     }
     onnx_runtime_ep_cuda::reset_global_offload_stats();
     let start = Instant::now();
@@ -247,6 +272,7 @@ fn offloaded_run(
         std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV);
         std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV);
         std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_DEPTH_ENV);
     }
     Ok((result, elapsed, stats))
 }
@@ -359,6 +385,136 @@ fn async_prefetch_native_cuda_decode_matches_sync_offload_and_pages() -> anyhow:
         async_stats.async_page_ins,
         off_tok_s,
         off_median,
+        on_tok_s,
+        on_median,
+        on_tok_s / off_tok_s,
+    );
+    Ok(())
+}
+
+/// #87 Increment 2 proof: look-ahead double-buffer prefetch (depth ≥ 2) is
+/// token-exact with both the synchronous page-in (#444) and the no-offload
+/// baseline, while actually issuing look-ahead copies ahead of consumption
+/// (`look_ahead_prefetches > 0`). Reports a perf A/B (median tok/s, single-buffer
+/// vs depth-2) at a realistic budget so the overlap benefit — or its absence — is
+/// recorded with real numbers. This is the A/B that decides whether the #87 stack
+/// merges: a wash/regression is a valid, bankable outcome and keeps it unmerged.
+#[test]
+#[ignore = "requires the real Qwen3-0.6B int4 postfix export and a CUDA device"]
+fn look_ahead_prefetch_native_cuda_decode_matches_sync_offload_and_pages_ahead()
+-> anyhow::Result<()> {
+    let Some(dir) = model_dir() else {
+        return Ok(());
+    };
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping look-ahead-prefetch native CUDA e2e: CUDA unavailable: {error}");
+        return Ok(());
+    }
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", "cuda");
+    }
+    let budget = ab_budget_bytes();
+    let depth = 2usize;
+
+    // --- Baseline: offload OFF (the trusted resident output) ------------------
+    unsafe {
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_ENV);
+        std::env::remove_var(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_PREFETCH_DEPTH_ENV);
+    }
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+    let baseline = match generate(&dir) {
+        Ok(result) => result,
+        Err(error) if is_load_chain_metadata_gap(&error) => {
+            eprintln!(
+                "skipping look-ahead-prefetch native CUDA e2e: export {} lacks declared \
+                 model.io ports (blocked on #384 load-chain): {error:#}",
+                dir.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    // --- Offload ON, single-buffer (prefetch OFF, synchronous #444 path) -------
+    let (sync_off, _sync_elapsed, sync_stats) = offloaded_run(&dir, budget, false)?;
+    assert!(
+        sync_stats.page_ins > 0 && sync_stats.evictions > 0,
+        "realistic budget {budget} did not force paging+eviction (single-buffer): {sync_stats:?} \
+         — lower WEIGHT_OFFLOAD_AB_BUDGET_BYTES"
+    );
+
+    // --- Offload ON, look-ahead depth-2 (async double-buffer) -----------------
+    let (depth_on, _depth_elapsed, depth_stats) =
+        offloaded_run_depth(&dir, budget, true, Some(depth))?;
+    assert!(
+        depth_stats.page_ins > 0 && depth_stats.evictions > 0,
+        "realistic budget {budget} did not force paging+eviction (depth-{depth}): {depth_stats:?}"
+    );
+    assert!(
+        depth_stats.async_page_ins > 0,
+        "depth-{depth} prefetch ran no async page-ins — the async path silently fell back: \
+         {depth_stats:?}"
+    );
+    assert!(
+        depth_stats.look_ahead_prefetches > 0,
+        "depth-{depth} prefetch issued no look-ahead copies ahead of consumption — the \
+         double-buffer path never ran: {depth_stats:?}"
+    );
+
+    // --- Correctness: all three token streams must be identical ---------------
+    assert_eq!(
+        baseline.token_ids, sync_off.token_ids,
+        "single-buffer offload changed the greedy token stream vs the no-offload baseline"
+    );
+    assert_eq!(
+        baseline.token_ids, depth_on.token_ids,
+        "look-ahead depth-{depth} prefetch changed the greedy token stream vs the no-offload \
+         baseline:\n  baseline={:?}\n  depth-{depth}={:?}",
+        baseline.token_ids, depth_on.token_ids
+    );
+
+    // --- Perf A/B: median tok/s, single-buffer vs depth-2, realistic budget ---
+    let tokens = MAX_NEW_TOKENS as f64;
+    let _ = offloaded_run(&dir, budget, false)?;
+    let mut off_secs = Vec::with_capacity(AB_RUNS);
+    for _ in 0..AB_RUNS {
+        off_secs.push(offloaded_run(&dir, budget, false)?.1.as_secs_f64());
+    }
+    let _ = offloaded_run_depth(&dir, budget, true, Some(depth))?;
+    let mut on_secs = Vec::with_capacity(AB_RUNS);
+    for _ in 0..AB_RUNS {
+        on_secs.push(
+            offloaded_run_depth(&dir, budget, true, Some(depth))?
+                .1
+                .as_secs_f64(),
+        );
+    }
+    let off_median = median_secs(off_secs);
+    let on_median = median_secs(on_secs);
+    let off_tok_s = tokens / off_median;
+    let on_tok_s = tokens / on_median;
+    eprintln!(
+        "look-ahead-prefetch native CUDA e2e OK (budget={} bytes, depth={}): tokens={:?}\n  \
+         single-buffer: page_ins={}, evictions={}, async_page_ins={}, look_ahead={}\n  \
+         depth-{}     : page_ins={}, evictions={}, async_page_ins={}, look_ahead={}\n  \
+         median tok/s  single-buffer={:.2} ({:.3}s)  depth-{}={:.2} ({:.3}s)  speedup={:.3}x",
+        budget,
+        depth,
+        depth_on.token_ids,
+        sync_stats.page_ins,
+        sync_stats.evictions,
+        sync_stats.async_page_ins,
+        sync_stats.look_ahead_prefetches,
+        depth,
+        depth_stats.page_ins,
+        depth_stats.evictions,
+        depth_stats.async_page_ins,
+        depth_stats.look_ahead_prefetches,
+        off_tok_s,
+        off_median,
+        depth,
         on_tok_s,
         on_median,
         on_tok_s / off_tok_s,

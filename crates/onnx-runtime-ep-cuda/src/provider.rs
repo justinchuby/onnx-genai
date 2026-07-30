@@ -81,10 +81,11 @@ impl CudaExecutionProvider {
             let budget = offload_policy
                 .device_budget_bytes
                 .unwrap_or(DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
-            Arc::new(CudaWeightResidency::new_with_prefetch(
+            Arc::new(CudaWeightResidency::new_with_prefetch_depth(
                 runtime.clone(),
                 budget,
                 offload_policy.prefetch,
+                offload_policy.prefetch_depth,
             ))
         });
         Ok(Self {
@@ -163,6 +164,22 @@ impl CudaExecutionProvider {
             Arc::clone(&self.runtime),
             budget_bytes,
             true,
+        )
+    }
+
+    /// Build a residency cache with async page-in and look-ahead double-buffer
+    /// prefetch at `depth` (#87 Increment 2). Tests use this to exercise real
+    /// look-ahead H2D overlap and the eviction-vs-prefetch race on a device.
+    pub fn weight_residency_prefetch_depth(
+        &self,
+        budget_bytes: u64,
+        depth: usize,
+    ) -> crate::weight_paging::CudaWeightResidency {
+        crate::weight_paging::CudaWeightResidency::new_with_prefetch_depth(
+            Arc::clone(&self.runtime),
+            budget_bytes,
+            true,
+            depth,
         )
     }
 
