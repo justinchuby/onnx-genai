@@ -280,13 +280,20 @@ test('every review document that declares a measurement SHA declares a real one'
       `reached a verdict. A document that is neither verified nor reported is a hole ` +
       `in the corpus, not a pass.`,
   );
-  console.log(`  verdicts: ${verified} fresh, ${problems.length} stale`);
+  // Say WHICH predicate this verdict is about. "fresh"/"stale" was used here AND by the
+  // review-point test below for two different questions -- "does every declared SHA
+  // resolve and sit on this branch" versus "is any declared SHA at or after the review
+  // point" -- so one run printed "0 stale" in the same breath as it failed for
+  // staleness. One word, two predicates, and a reader has no way to tell which one just
+  // spoke. This is the co-location defect in its smallest form: a summary line that does
+  // not name its own subject.
+  console.log(`  on-branch: ${verified} resolved, ${problems.length} unresolved-or-off-branch`);
 
   assert.deepEqual(
     problems,
     [],
-    `${problems.length} of ${adopters.length} review document(s) are stale at ` +
-      `${headSha}:\n  - ${problems.join('\n  - ')}`,
+    `${problems.length} of ${adopters.length} review document(s) declare a SHA that does ` +
+      `not resolve or is not on this branch at ${headSha}:\n  - ${problems.join('\n  - ')}`,
   );
 
   if (abstainers.length > 0) {
@@ -355,6 +362,7 @@ test('no review document was measured before the tree reviewers extract', () => 
   const boundary = git('rev-parse', `${declared[1]}^{commit}`);
   console.log(`  review point: ${declared[1]} -> ${boundary.slice(0, 8)}`);
 
+  const stale = [];
   for (const doc of REVIEW_DOCS) {
     const declared = declarationsIn(readFileSync(join(HERE, doc), 'utf8'));
     if (declared.length === 0) continue;
@@ -371,20 +379,47 @@ test('no review document was measured before the tree reviewers extract', () => 
     // review point exactly. Only review-3 is annotated, so this was one tag away from
     // firing at three reviewers at once.
     const fresh = declared.filter((measuredAt) => {
+      // RESOLVE FIRST, AND SEPARATELY. `merge-base --is-ancestor` exits non-zero for two
+      // unrelated reasons: "resolved, and is not an ancestor" -- which means the
+      // measurement sits at or after the boundary, i.e. genuinely fresh -- and "did not
+      // resolve at all", which means we can tell nothing. A single catch collapsed both
+      // into `return true`, so an UNREADABLE marker was scored FRESH. That is the
+      // fail-open shape, and it is the same line as `?? SOURCE_BADGES.derived` and
+      // `else { return true }` in the asset guard: unrecognised input granted the
+      // permissive answer. A marker that does not resolve is now stale, loudly -- which
+      // is the entire reason the marker was specified as a bare hex in the first place.
+      let commit;
       try {
-        git('merge-base', '--is-ancestor', measuredAt, boundary);
-        return git('rev-parse', `${measuredAt}^{commit}`) === boundary;
+        commit = git('rev-parse', `${measuredAt}^{commit}`);
       } catch {
-        return true; // not an ancestor of the boundary => at or after it
+        return false;
+      }
+      try {
+        git('merge-base', '--is-ancestor', commit, boundary);
+        return commit === boundary;
+      } catch {
+        return true; // resolved, and not an ancestor => at or after the boundary
       }
     });
 
-    assert.ok(
-      fresh.length > 0,
-      `${doc} declares ${declared.length} measurement SHA(s) -- ${declared.join(', ')} ` +
-        `-- and every one is a strict ancestor of the declared review point ` +
-        `${boundary.slice(0, 8)}. Every row in it describes a tree that the review has ` +
-        `already moved past. Re-measure and add a current MEASURED-AT.`,
-    );
+    if (fresh.length === 0) stale.push(`${doc} -- ${declared.join(', ')}`);
   }
+
+  // Report EVERY stale document, not merely the first. This assertion used to sit INSIDE
+  // the loop above, so it threw on the alphabetically-first offender and never evaluated
+  // the rest: an N-document audit silently degraded into a one-document report, and the
+  // number it never printed was the only number worth having. It accused
+  // ARCHITECTURE-SECURITY-REVIEW.md for hours; the moment that document was repaired it
+  // accused IMPLEMENTATION-REVIEW.md instead -- and READABILITY-REVIEW.md, this guard's
+  // own author's document, carrying 22 declarations with not one of them fresh, had been
+  // stale behind both of them the whole time and was never once named.
+  // A guard that stops at its first failure hides its own denominator, and sorts its
+  // author's own file to the back of the queue.
+  assert.ok(
+    stale.length === 0,
+    `${stale.length} of ${REVIEW_DOCS.length} review document(s) declare ONLY SHAs that ` +
+      `are strict ancestors of the review point ${boundary.slice(0, 8)}, so every row in ` +
+      `them describes a tree the review has already moved past. Re-measure and add a ` +
+      `current MEASURED-AT to each of:\n    ${stale.join('\n    ')}`,
+  );
 });
