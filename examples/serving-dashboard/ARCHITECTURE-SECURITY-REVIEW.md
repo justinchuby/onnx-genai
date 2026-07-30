@@ -2303,3 +2303,102 @@ newest commit) was one command away and I ran it only after committing.
 
 **Retractions and corrections by me this session: C12, C15, C22's prescription,
 and now §30.6 — four. Quote that number beside any of my findings.**
+
+## §32 — @d7cf9b84 AND I MEASURED THE SAME SITE AND DISAGREED ON THE WIRE. BOTH READINGS ARE CORRECT. AND THE FIX THEY ORDERED IS HALF A FIX.
+
+MEASURED-AT: `ac6c73cc`.
+
+### 1. There was never a site conflict — we named the same lines differently
+
+They report the false claim at `telemetry-provenance.js:949`. I reported it as
+`NEVER_BIND[1].why`. **`NEVER_BIND` starts at :906, so :949 is inside it.** Same
+bytes, one by coordinate and one by symbol. Occurrences of the claim in the
+file: **1** (control: `NEVER_BIND` = 4). **No second copy, so no half-defusal
+risk from duplication.** That was worth ruling out before anything else.
+
+### 2. The wire disagreement is real and both of us are right
+
+They measured a fresh binary and got `path="qwen2.5-0.5b-scatter-v2"` — the
+field **present**, carrying the basename. I measured the field **absent
+entirely**. Resolution:
+
+```
+b7f83e72 ('the model directory does not leave the process')
+  ancestor of HEAD ac6c73cc  : **YES**
+  ancestor of eca213ec       : **NO**    ⬅ THE SHA THEY MEASURED AT
+
+model_path_for_display, live in crates/ at HEAD: **1 file — tests.rs only**
+[CONTROL] `id:` struct fields in crates/       : 22 files (the instrument reaches)
+```
+
+**Their build predates the deletion.** Their reading was correct at `eca213ec`
+and is stale at HEAD. Mine is correct at HEAD. This is the fifth time tonight a
+correct measurement has been transported past the tree that made it true — and
+it is the first time it has happened to a measurement taken *on the wire*, which
+we have all been treating as the ground truth that settles source disputes.
+
+> **A wire reading is not more durable than a source reading. It is a source
+> reading with a build step in front of it — so it carries the staleness of the
+> tree it was compiled from, and unlike a grep it cannot be re-run at a SHA.**
+
+### 3. Their ruling is RIGHT, and right for a stronger reason than they gave
+
+They ruled: *the ban is now merely over-broad — it forbids a field that is
+already harmless. **DO NOT DELETE IT TONIGHT.** Fix the false sentence, keep the
+ban.*
+
+**Keep the ban — yes, and more emphatically than their reasoning implies.** At
+HEAD the ban does not forbid a harmless field; it forbids a field that **does
+not exist at all**. Neither the absolute form nor the basename is on the wire.
+That makes deletion *more* dangerous, not less, because the entry's own
+instruction says to bind the basename instead — and there is no longer a field
+to bind, so obeying it means **putting one back**.
+
+This is the Lead's ruling paid out again: *a conclusion is not invalidated when
+one argument for it is.*
+
+### 4. THE ACTIONABLE PART — the ordered fix defuses the wrong half
+
+The false sentence at :949 is a **stale fact**. Three lines below it, at
+:951–953, is a **stale instruction**:
+
+```
+:949  '`model_path_for_display` still returns the absolute form'   <- STALE FACT
+:951  'the predicate above goes to 0, this ban SHOULD BE DELETED,
+       and the basename -- NOT the id -- is the field to bind'     <- STALE ORDER
+```
+
+**Correcting :949 and stopping there leaves the deletion order intact, attached
+to a predicate that already reads 0.** The reader who arrives next sees a
+freshly-corrected, freshly-trustworthy comment block whose final instruction is
+to delete the ban and re-add a path field.
+
+> **@0837fdf9's law is the whole of this finding: A STALE FACT GETS CORRECTED; A
+> STALE INSTRUCTION GETS EXECUTED. Repairing the fact and leaving the order
+> raises the credibility of the block *without* disarming the dangerous half —
+> it makes the landmine look inspected.**
+
+This is structurally identical to the Lead's L10 warning that cutting one of two
+lines *half-defuses* it. **Both edits or neither.** The minimum honest repair is
+two hunks:
+
+1. `:949` — replace with what is true at HEAD: the field is gone; neither form
+   is on the wire.
+2. `:951–953` — **delete the lift instruction outright**, or invert it to match
+   the Rust tombstone, which permanently refuses the basename (*"safe by luck,
+   not by construction"*). It must not survive as an order.
+
+I am not making these edits. `telemetry-provenance.js` is not my file and we are
+frozen. **Filed, with both coordinates and the reason each is load-bearing.**
+
+### 5. What this does to C23
+
+C23's core claim is unchanged and now measured at two SHAs by two agents: the
+ban carries a self-deletion order whose trigger is satisfied by the *removal* of
+its subject rather than the *repair* of it. The wire evidence that appeared to
+contradict it in fact dates it.
+
+**And the one-assertion fix is unaffected and gets more valuable:** with a live
+assertion that `/v1/models` carries no value containing `MAIN_SEPARATOR`, all of
+this becomes safe. The stale order could be executed and the branch would still
+be defended, because the control would no longer live in a comment.
