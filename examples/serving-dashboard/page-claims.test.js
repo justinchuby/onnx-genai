@@ -42,6 +42,7 @@
 //   4. empty/absent <meta name="description">                -> cannot silently
 //      pass by deleting the string it checks
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -147,6 +148,151 @@ describe("the page's claims about itself", () => {
         'genuinely does -- honesty that removes the true claims along with the ' +
         'false ones has overcorrected, and undersells work that was measured. ' +
         `FOUND: ${text.trim()}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE DESIGN DOCUMENT IS A BUILD INSTRUCTION, AND NOTHING HAS EVER READ IT.
+//
+// Three cut-or-qualified field bindings were found in ONE hour tonight, all in
+// PROSE: the <meta> description above, the Profile D hero-strip slot, and a
+// benchmark sketch showing 2.46x with no per-stream figure. Every one of them
+// was invisible to all five test files in this directory, because:
+//   - state-channel / prefix-counters read MODULE IDENTIFIERS
+//   - page-claims (above) reads SHIPPED HTML
+//   - nothing at all reads demo-ux.md -- THE FILE DEVELOPERS BUILD FROM.
+//
+// A design document that names a cut field is worse than shipped code that
+// does, because code gets deleted once and prose gets BUILT FROM REPEATEDLY.
+// The Profile D slot proved it: `prefix hit rate` survived the cut by 40
+// minutes inside a table headed "to be used verbatim".
+//
+// SCOPE: FENCED CODE BLOCKS ONLY, and that restriction is the whole design.
+// demo-ux.md must keep discussing prefix caching at length -- the re-scoped
+// Scenario B SHIPS the null result, and D155 argues it is the most credible
+// artifact we have. Banning the words would forbid the honest treatment along
+// with the dishonest one. But a FENCED BLOCK is not discussion: it is a
+// layout a developer copies. Prose explains; a sketch instructs. Same
+// positional rule as D149 and as the claim-position rule above.
+const UX_DOC = fileURLToPath(new URL('./design/demo-ux.md', import.meta.url));
+const uxDoc = readFileSync(UX_DOC, 'utf8');
+
+const sketches = [...uxDoc.matchAll(/```[^\n]*\n([\s\S]*?)```/g)].map((m) => ({
+  body: m[1],
+  line: uxDoc.slice(0, m.index).split('\n').length,
+  hash: createHash('sha1')
+    .update(m[1].replace(/\s+/g, ' ').trim())
+    .digest('hex')
+    .slice(0, 12),
+}));
+
+describe('the design document does not instruct a build it has ruled against', () => {
+  it('has sketches to check at all', () => {
+    // Guards the guard. If the fence syntax or the filename ever changes, a
+    // zero-sketch scan would report PASS while checking nothing -- the exact
+    // "green because it looked at nothing" failure this suite exists to stop.
+    assert.ok(
+      sketches.length > 20,
+      `Expected demo-ux.md to contain many fenced sketches; found ${sketches.length}. ` +
+        'If the document moved or the fences changed, this scanner is silently ' +
+        'inspecting an empty set and every assertion below is vacuously true.',
+    );
+  });
+
+  it('binds no cut field in an unreviewed fenced sketch', () => {
+    // EXEMPTIONS ARE DECLARED, NEVER INFERRED, AND THE LIST ONLY SHRINKS.
+    //
+    // I first tried to infer this: exempt a sketch if a supersession marker
+    // appears within 15 lines above it. It "worked" -- and it was the wrong
+    // mechanism, because a heuristic exemption means NOBODY DECIDED. A sketch
+    // would go quiet because of its neighbours rather than because a person
+    // judged it, which is the same defect as a stale doc comment: authority
+    // with no author.
+    //
+    // Keyed on a hash of the sketch BODY, not on a line number, for two
+    // reasons: line numbers churn on every edit to a 3500-line document, and
+    // more importantly EDITING AN EXEMPTED SKETCH REVOKES ITS EXEMPTION. You
+    // cannot quietly add a field to a grandfathered layout.
+    const exempt = new Map([
+      ['8d37e2cc3656', 'file tree: names scenarios/prefix.js as a path, binds no field'],
+      ['970cf30e5349', "honesty footer sample: the generated WHAT'S REAL / DERIVED table"],
+      ['eb830f5dee14', 'PLACEHOLDER treatment: defines the confession copy, renders no value'],
+      ['652f178b3ebf', 'KV memory panel: ships; names eviction only in a not-plumbed row'],
+      ['b9cc9dfbf776', 'paged KV block table: ships, verified (allocated 3, freed 3, 14612 pages)'],
+      ['23e9cd2205fb', 'the not-applicable card itself -- the honest treatment, D30'],
+      ['041f176dc271', 'prose explanation of WHY the scatter engine never consults the trie'],
+      ['05fde69af3e7', 'lifecycle states; preemption named only to record that it is absent'],
+      ['c1df66654c38', 'not-applicable card with file:line evidence -- the honest treatment'],
+      ['d5ee792cbc61', 'source citation: pipeline/paged_decode.rs call sites'],
+      ['24674e7e5804', 'source citation: prefix_cache.rs:151 evict_lru, evidence not layout'],
+      ['07de135dbe16', 'source citation: page_table.rs:1068 evict_lru, evidence not layout'],
+      ['2be978152568', 'code citation showing the WRONG pattern being diagnosed'],
+      ['e1868d09d532', 'STRUCK S8.3: the fabricated 48x TTFT ladder, retained as evidence'],
+      ['dade37765504', 'the null-result panel (S51) -- ships, and must name what it tested'],
+    ]);
+
+    const offenders = [];
+    const seen = new Set();
+    for (const sketch of sketches) {
+      const bound = CUT_FEATURES.filter((f) => f.pattern.test(sketch.body));
+      if (bound.length === 0) continue;
+      if (exempt.has(sketch.hash)) {
+        seen.add(sketch.hash);
+        continue;
+      }
+      offenders.push(
+        `demo-ux.md:~${sketch.line} hash ${sketch.hash} binds ` +
+          bound.map((f) => `"${f.name}"`).join(', '),
+      );
+    }
+
+    assert.deepEqual(
+      offenders,
+      [],
+      'A fenced block in the design document binds a CUT field and is not on ' +
+        'the reviewed exemption list. Prose may discuss a cut feature at ' +
+        'length -- the re-scoped Scenario B SHIPS the null result and D155 ' +
+        'argues it is the most credible thing we have -- but a SKETCH is ' +
+        'copied rather than read, so it is a build instruction. Two sketches ' +
+        'in this document carried invented values under the `s` ' +
+        'SERVER-MEASURED badge (a 87.2% hit rate, and a 48x TTFT collapse) ' +
+        'drawn BEFORE the feature was measured, and the real measurement went ' +
+        'the other way. If this is honest, add the hash with a reason. If it ' +
+        `is a layout, strike it.\nFOUND:\n  ${offenders.join('\n  ')}`,
+    );
+
+    // The list only shrinks. A stale exemption is a permission that outlived
+    // the thing it permitted -- the same argument that deleted the CORS layer.
+    const stale = [...exempt.keys()].filter((h) => !seen.has(h));
+    assert.deepEqual(
+      stale,
+      [],
+      'Exemption(s) match no sketch that binds a cut field. Either the sketch ' +
+        'was fixed (delete the entry -- this list is a ratchet) or it was ' +
+        `edited, which REVOKES the exemption by design.\nSTALE: ${stale.join(', ')}`,
+    );
+  });
+
+  it('never sketches the aggregate speedup without its per-stream cost', () => {
+    // AC50 / D85. The hero is a TRADEOFF, not a number: aggregate decode is
+    // 2.46x at 4 concurrent, but per-stream throughput falls to ~0.62x.
+    // Batching makes no single request faster. 2.46x alone is technically
+    // accurate and substantively misleading -- a tradeoff presented as a pure
+    // win is a lie told with true numbers, which is the one failure class this
+    // project cannot ship, since every value in it would pass a provenance
+    // check individually.
+    const offenders = sketches
+      .filter((s) => /2\.46/.test(s.body) && !/0\.62/.test(s.body))
+      .map((s) => `demo-ux.md:${s.line}`);
+    assert.deepEqual(
+      offenders,
+      [],
+      'A sketch shows the 2.46x aggregate speedup with no per-stream figure ' +
+        'beside it. Per D85 the two render at IDENTICAL type size, because ' +
+        'typographic hierarchy is itself a claim about which number matters -- ' +
+        'a big number with a small caveat is still the lie, told more quietly. ' +
+        `FOUND: ${offenders.join(', ')}`,
     );
   });
 });

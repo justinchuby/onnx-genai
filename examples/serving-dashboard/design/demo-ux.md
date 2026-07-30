@@ -951,23 +951,30 @@ Surfacing **slot fill efficiency with its explanation inline** is a deliberate a
 
 Refcount distribution is a horizontal bar list, not a chart. Three-to-five discrete integers do not need an axis, and a bar list is exactly readable.
 
-### 5.5 Panel 4 — Prefix cache
+### 5.5 Panel 4 — Prefix cache — 🔴 STRUCK. CUT. DOES NOT SHIP, IN ANY FORM, ON EITHER SERVER.
 
-**This panel ships unconditionally, whatever the numbers say.** If the current `hits: 0 / lookups: 5` behaviour persists, this panel renders `0.0 %` at full contrast with `0 of 5 lookups hit` beneath it. That is a real measurement of a real system in a real state, and displaying it plainly is more valuable to this project's reputation than hiding it. The *scenario* is cuttable; the *panel* is not (§7.5).
+> 🔴 **SUPERSEDED — and this was the most dangerous prose left in this document, so the strike is verbose on purpose.**
+>
+> **It said, in bold: *"This panel ships unconditionally, whatever the numbers say… The scenario is cuttable; the panel is not."*** Now false at every level: @12e42da8 ruled **no prefix field ships in any form, either mode**, after @fc8b5d97 measured shared-prefix requests **7.0% SLOWER** than a zero-sharing control, against a sensitivity floor where a working cache would have collapsed TTFT ~90%. **Scatter records nothing (0/135); dynamic records everything (19/20, incrementing on six control requests that share nothing). Broken in opposite directions, neither trustworthy.**
+>
+> **And the sketch carried FABRICATED NUMBERS — `87.2 % hit rate ˢ`, `41 hits / 47 lookups ˢ`, a populated sparkline — every one marked `ˢ` FOR SERVER-MEASURED.** Nobody measured them; they were plausible filler for a layout. **A design sketch is a build instruction, and this one told a developer to render invented values under our own provenance badge, in the panel of the feature we later proved absent.** Retained struck rather than deleted, because it is the clearest example this project produced of the exact failure the honesty layer exists to prevent — **and it was OURS, in the document that DEFINES the honesty layer.**
+>
+> **What ships instead: the measured non-result (§51), both arms and the sensitivity check on screen.**
+
+~~**This panel ships unconditionally, whatever the numbers say.** The *scenario* is cuttable; the *panel* is not (§7.5).~~
 
 ```
-┌ Prefix cache ─────────────────── ⓘ ▾ ┐
-│   87.2 %  hit rate ˢ                  │
-│   41 hits / 47 lookups ˢ              │
-│   ▁▁▃▅▇███▇▇▇▇▇▇▇▇  60 s              │
-│   tokens reused    81 344 ˢ           │
-│   prefill skipped  81 344 ˢ           │
-│   time saved      ~ 340 ms ᴱ          │  ← "~" + ᴱ, never bare
-│   evictions             — ⊗           │
+STRUCK — FABRICATED VALUES UNDER A SERVER-MEASURED BADGE. DO NOT BUILD.
+┌ ...cache ─────────────────────── ⓘ ▾ ┐
+│   87.2 %  hit rate ˢ                  │  ← invented, badged as measured
+│   41 hits / 47 lookups ˢ              │  ← invented, badged as measured
+│   ▁▁▃▅▇███▇▇▇▇▇▇▇▇  60 s              │  ← a fabricated observation window
+│   tokens reused    81 344 ˢ           │  ← invented, badged as measured
 └───────────────────────────────────────┘
 ```
 
-`time saved` is the only intentionally estimated number on the page (skipped tokens × observed per-token prefill cost). It gets `~`, the `ᴱ` badge, and a hover stating the formula and its inputs. If we cannot state the formula, we do not show the number.
+**The sparkline is the worst line in it, and it generalises past this panel** (@e00032a4's formulation, adopted): **a chart asserts DURATION, not just value.** A table cell claims one reading; a plotted series claims *"we watched this for sixty seconds and it stayed there."* **It fabricates an observation window we never had** — which is why gap-bridging is banned outright in §51: **interpolation produces the most convincing false data there is, the kind that looks continuous.**
+
 
 ### 5.6 Panel 5 — Requests
 
@@ -1224,7 +1231,12 @@ Four, all already in the architecture, all costing nothing:
 
 The cut is therefore: delete `scenarios/prefix.js`, delete one registry line, delete one hero-tile config line. **No CSS changes, no layout changes, no other file touched.** That is what "cuttable" has to mean to be real, and it is verifiable by inspection before anyone commits to building it.
 
-### 8.3 The design, if it ships — the TTFT ladder
+### 8.3 The design, if it ships — the TTFT ladder — 🔴 STRUCK. IT DOES NOT SHIP.
+
+> 🔴 **SUPERSEDED. The conditional in this heading — *"if it ships"* — resolved to NO, and the sketch below is the second fabricated prefix ladder in this document.** `1 984 / 2 013 reused (98.6%)`, `#2 HIT 38 ms` against a `1 842 ms` cold bar: **a 48× TTFT collapse, invented, badged `ˢ` for server-measured.** The real measurement went the other way — **shared prefixes were 7.0% SLOWER than a zero-sharing control.**
+>
+> **This is why the strike is worth the space rather than a delete: the sketch is a near-perfect rendering of what a WORKING cache would have looked like, and we drew it before we measured.** The bars, the badges and the percentage were all chosen to be persuasive, and the only reason they are not on the page today is that someone ran the control arm. **A layout drawn from an expectation is a prediction wearing the costume of a result** — and nothing in our provenance envelope can catch it, because the fabrication happens upstream of every value it would check.
+
 
 ```
 ┌ Prefix caching ────────────────────────────────────── ⓘ ▾ ┐
@@ -1557,11 +1569,15 @@ Three requirements. The first is essential; the other two are cheap and make it 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  ● SERVER 1 · qwen2.5-0.5b-scatter-v2 · static KV           │
-│    continuous batching ✓   paged KV ✗   prefix cache ✗      │
+│    continuous batching ✓   paged KV ✗                       │
 └────────────────────────────────────────────────────────────┘
 ```
 
 The capability ticks are the honest part: they state up front what this server *cannot* do, so an em-dash later is a **confirmation rather than a surprise**. The visitor should never learn a limitation from a hole.
+
+> 🔴 **`prefix cache ✗` REMOVED FROM THIS STRIP (D164), and the reason is not that the feature was cut — it is that WE CANNOT HONESTLY RENDER EITHER TICK.** A ✓/✗ is a **binary capability assertion**, the most confident shape on the page. Our own measurements disagree about which one is true: **scatter records nothing (0/135), dynamic records everything (19/20, incrementing on six control requests that share nothing).** A `✗` claims *we checked and it is off*; a `✓` claims *we checked and it works*. **We checked, and what we found was an instrument that reports opposite falsehoods on the two servers.** There is no tick for that, and inventing one would be the highest-confidence widget on the page carrying our least-trustworthy fact.
+>
+> **The strip now lists only capabilities we can demonstrate on screen. A capability list is a PROMISE OF WHAT FOLLOWS — every entry must be answerable by something further down the page**, or the strip becomes a menu with items the kitchen does not serve.
 
 **2 — Narrate the transition; never let it be silent.** On a switch that changes server, the new scenario opens with one line, dismissible, not a modal:
 
@@ -2136,12 +2152,25 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 
 **I am not adding envelope keys** (it has been revised three times already). Instead: **a benchmark result is a claim, not a reading, and a claim shows its method adjacent to itself — on screen, not in a hover.** Same rule as `not-applicable`: the thing that makes it credible is the thing nobody hovers over.
 
+> 🔴 **THE SKETCH THAT WAS HERE SHOWED `2.46×` ALONE — STRUCK, and I am leaving the correction visible rather than silently patching it, because the failure is more instructive than the fix.** It carried `n`, `CV`, the EP and the conditions, and it **still violated AC50**, which was ratified five sections later as D85. **A sketch is a build instruction.** @bb2ee824 or @c8d9a40e reading this section in isolation would have built the lone hero and been *correct per §24.2* the entire time.
+>
+> **This is D158 landing on my own document for the third time tonight** — after the `<meta>` description and the Profile D hero slot. All three were **cut or qualified fields still bound in PROSE THAT INSTRUCTS**, and **none of the five test files I own can see any of them.** `page-claims.test.js` reads shipped HTML; the tripwire reads module identifiers; **nothing reads the design document, which is the file developers actually build from.**
+
+**Corrected sketch — AC50/D85 compliant, and this is the only benchmark form in this document:**
+
 ```
-      2.46×  batching speedup
-      82.130 vs 33.415 tok/s · n=15 · CV 1.98% · CPU EP · max_batch=4
+      4 concurrent requests vs 1
+
+      TOTAL  82.130 tok/s   2.46× faster
+      EACH   20.7   tok/s   0.62× as fast
+
+      Batching does not make any single request faster.
+      n=15 · CV 1.98% · CPU EP · max_batch from payload · one machine
 ```
 
-Rules: **never `~2.5×`** — a rounded benchmark figure with no interval is strictly less honest than the precise one, because rounding *looks* like modesty while actually discarding the only evidence of precision we have. Never a bare percentage. If `n` and `CV` aren't available for a number, it is not a benchmark result and must not be styled as one.
+Rules: **never `~2.5×`** — a rounded benchmark figure with no interval is strictly less honest than the precise one, because rounding *looks* like modesty while actually discarding the only evidence of precision we have. Never a bare percentage. If `n` and `CV` aren't available for a number, it is not a benchmark result and must not be styled as one. **And never `2.46×` without `0.62×` at identical type size — see §29.1: type size is a claim about which number matters, so a caveat set smaller is still the lie, told more quietly.**
+
+> **`max_batch` is read FROM THE PAYLOAD** (@e00032a4's 3-line emit, ruled by @12e42da8) — **never from `state.rs:25`.** The condition line of a benchmark is the last place a compile-time constant may pose as a measured run parameter: **it is the part of the display whose whole job is to say how the measurement was taken.**
 
 | # | Decision | Rationale |
 |---|---|---|
@@ -3558,3 +3587,41 @@ I published *"FIELD SHAPE IS FINAL — four states"* from `telemetry-field.js:19
 | D161 | `classification` never reaches a panel; panels branch on `state` only | It is input, not output; reading it re-derives a mapping already made |
 | D162 | `stale` renders age in the cell; unknown states throw | Stale is 1.001:1 from `ok` in grayscale — fall-through makes them identical, not similar |
 | D163 | Cite the executable line, never the annotation above it | A stale annotation converts "I should check" into "I already know" |
+
+---
+
+## 54. THE DESIGN DOCUMENT IS NOW UNDER TEST (D164–D167)
+
+AC50 arrived and I checked my own document against it. **§29/D85 already complied. §24.2 did not** — it sketched `2.46×` alone, with `n`, `CV`, the EP and its conditions, and **it was still an AC50 violation**, because a sketch is a build instruction and @bb2ee824 reading §24.2 in isolation would have built the lone hero and been *correct per this document*.
+
+That was the fourth cut-or-qualified binding found in PROSE in one hour. So I stopped finding them by hand.
+
+### 54.1 D165 — the scanner, and what it found
+
+`page-claims.test.js` now reads `demo-ux.md` and scans **fenced blocks only**. The scope restriction is the whole design: **prose must keep discussing prefix caching at length** — the re-scoped Scenario B ships the null result and D155 argues it is the most credible artifact we have — **but a fence is not discussion, it is a layout someone copies.** Prose explains; a sketch instructs. Same positional rule as D149.
+
+**It flagged 18 bindings across 16 sketches. Two were serious:**
+
+- **§5.5 — a full Prefix cache panel reading `87.2 % hit rate ˢ`, `41 hits / 47 lookups ˢ`, with a populated 60 s sparkline. Every figure invented; every figure badged `ˢ` FOR SERVER-MEASURED.** Its prose said, in bold, *"this panel ships unconditionally, whatever the numbers say… the scenario is cuttable; the panel is not."*
+- **§8.3 — a second fabricated ladder: `1 984 / 2 013 reused (98.6%)`, `#2 HIT 38 ms` against a `1 842 ms` cold bar. A 48× TTFT collapse, drawn from expectation.**
+
+> **D164 — BOTH ARE STRUCK IN PLACE, NOT DELETED, BECAUSE THE POINT IS THE TIMESTAMP: WE DREW THE RESULT BEFORE WE MEASURED IT, AND WHAT WE DREW WAS PERSUASIVE.** The real measurement went the other way — shared prefixes **7.0% slower** than a zero-sharing control. **A layout drawn from an expectation is a prediction wearing the costume of a result, and NOTHING in our provenance envelope can catch it, because the fabrication happens upstream of every value the envelope checks.** We built a machine that guarantees numbers can't lie, and then hand-drew four lying numbers into the specification of that machine.
+
+### 54.2 D166 — exemptions are DECLARED, and the list only shrinks
+
+My first implementation inferred the exemption: exempt a sketch if a supersession marker appears within 15 lines above it. **It worked, and it was the wrong mechanism** — a heuristic exemption means **nobody decided**. A sketch would fall silent because of its *neighbours* rather than because a person judged it: **authority with no author, which is the exact defect of the stale `@typedef` that cost us a shipped README (D163).**
+
+- **D166:** exemptions are an explicit list of **content hashes**, each with a written reason. Keyed on the body, not the line number, for one reason worth more than the churn argument: **editing an exempted sketch REVOKES its exemption.** You cannot quietly add a field to a grandfathered layout. And a **stale-entry assertion** makes the list shrink-only — *a permission that outlives the thing it permitted* is what deleted the CORS layer.
+
+### 54.3 D164 (cont.) — the tick we could not honestly draw
+
+§14.2's server-identity strip rendered `prefix cache ✗`. **Removed — and NOT because the feature was cut.** A ✓/✗ is a **binary capability assertion, the most confident shape available to us**, and our own measurements disagree about which one is true: **scatter records nothing (0/135); dynamic records everything (19/20, incrementing on six control requests sharing nothing).** `✗` claims *we checked and it's off*; `✓` claims *we checked and it works*. **We checked, and found an instrument reporting opposite falsehoods on the two servers. There is no tick for that** — and drawing one would put the page's highest-confidence widget around its least-trustworthy fact.
+
+> **D167 — A CAPABILITY LIST IS A PROMISE OF WHAT FOLLOWS. Every entry must be answerable by something further down the page**, or the strip is a menu with items the kitchen doesn't serve.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D164 | Both fabricated prefix sketches struck in place, retained as evidence | We drew the result before measuring, and it was persuasive. The envelope can't catch fabrication upstream of the values it checks |
+| D165 | The design document is scanned; fenced blocks only | Prose explains, a sketch instructs. Banning the words outright would forbid the honest treatment with the dishonest one |
+| D166 | Exemptions are hashed, written, and shrink-only | A heuristic exemption means nobody decided; a hash means editing the sketch revokes it |
+| D167 | No ✓/✗ for a capability our own instruments disagree about | A binary tick is the most confident shape on the page; it must not carry the least certain fact |
