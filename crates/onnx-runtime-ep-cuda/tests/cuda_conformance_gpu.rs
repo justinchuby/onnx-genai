@@ -354,6 +354,175 @@ fn group_normalization_cases() -> Vec<Case> {
     cases
 }
 
+fn lp_pool_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "LpPool[p=1,pad]".into(),
+            op: "LpPool",
+            domain: "",
+            opset: 18,
+            inputs: vec![float_input(
+                DataType::Float32,
+                &[1, 1, 3, 4],
+                &[
+                    -1.0, 2.0, -3.0, 4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 10.0, -11.0, 12.0,
+                ],
+            )],
+            outputs: vec![(DataType::Float32, vec![1, 1, 3, 4])],
+            attrs: vec![
+                ("kernel_shape", Attribute::Ints(vec![2, 2])),
+                ("pads", Attribute::Ints(vec![1, 0, 0, 1])),
+                ("p", Attribute::Int(1)),
+            ],
+            compare: Compare::Float { tol: 1e-4 },
+        },
+        Case {
+            label: "LpPool[p=2,stride,ceil]".into(),
+            op: "LpPool",
+            domain: "",
+            opset: 18,
+            inputs: vec![float_input(
+                DataType::Float16,
+                &[1, 1, 4, 5],
+                &[
+                    1.0, -2.0, 3.0, -4.0, 5.0, 6.0, -7.0, 8.0, -9.0, 10.0, 11.0, -12.0, 13.0,
+                    -14.0, 15.0, 16.0, -17.0, 18.0, -19.0, 20.0,
+                ],
+            )],
+            outputs: vec![(DataType::Float16, vec![1, 1, 3, 3])],
+            attrs: vec![
+                ("kernel_shape", Attribute::Ints(vec![2, 3])),
+                ("strides", Attribute::Ints(vec![2, 2])),
+                ("pads", Attribute::Ints(vec![1, 0, 1, 1])),
+                ("ceil_mode", Attribute::Int(1)),
+                ("p", Attribute::Int(2)),
+            ],
+            compare: Compare::Float { tol: 6e-3 },
+        },
+        Case {
+            label: "LpPool[p=2,dilation,bf16]".into(),
+            op: "LpPool",
+            domain: "",
+            opset: 18,
+            inputs: vec![float_input(
+                DataType::BFloat16,
+                &[1, 1, 4, 4],
+                &[
+                    1.0, 2.0, 3.0, 4.0, -5.0, -6.0, -7.0, -8.0, 9.0, 10.0, 11.0, 12.0, -13.0,
+                    -14.0, -15.0, -16.0,
+                ],
+            )],
+            outputs: vec![(DataType::BFloat16, vec![1, 1, 2, 2])],
+            attrs: vec![
+                ("kernel_shape", Attribute::Ints(vec![2, 2])),
+                ("dilations", Attribute::Ints(vec![2, 2])),
+                ("p", Attribute::Int(2)),
+            ],
+            compare: Compare::Float { tol: 6e-2 },
+        },
+    ]
+}
+
+fn center_crop_pad_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "CenterCropPad[crop-pad-odd]".into(),
+            op: "CenterCropPad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int32, &[3, 2], &[1i32, 2, 3, 4, 5, 6]),
+                input(DataType::Int64, &[2], &[2i64, 5]),
+            ],
+            outputs: vec![(DataType::Int32, vec![2, 5])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "CenterCropPad[selected-negative-axes]".into(),
+            op: "CenterCropPad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(
+                    DataType::Int16,
+                    &[2, 3, 4],
+                    &(0..24).map(|value| value as i16).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[5i64, 3]),
+            ],
+            outputs: vec![(DataType::Int16, vec![2, 5, 3])],
+            attrs: vec![("axes", Attribute::Ints(vec![-2, -1]))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn col2im_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "Col2Im[overlap]".into(),
+            op: "Col2Im",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(
+                    DataType::Float32,
+                    &[1, 4, 4],
+                    &(1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[3i64, 3]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 1, 3, 3])],
+            attrs: vec![],
+            compare: Compare::Float { tol: 1e-4 },
+        },
+        Case {
+            label: "Col2Im[padding-stride]".into(),
+            op: "Col2Im",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(
+                    DataType::Float16,
+                    &[1, 4, 4],
+                    &(1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[3i64, 3]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            outputs: vec![(DataType::Float16, vec![1, 1, 3, 3])],
+            attrs: vec![
+                ("pads", Attribute::Ints(vec![1, 1, 1, 1])),
+                ("strides", Attribute::Ints(vec![2, 2])),
+            ],
+            compare: Compare::Float { tol: 6e-3 },
+        },
+        Case {
+            label: "Col2Im[dilation-overlap]".into(),
+            op: "Col2Im",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(
+                    DataType::BFloat16,
+                    &[1, 4, 9],
+                    &(1..=36).map(|value| value as f32 / 4.0).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[5i64, 5]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![1, 1, 5, 5])],
+            attrs: vec![
+                ("dilations", Attribute::Ints(vec![2, 2])),
+                ("strides", Attribute::Ints(vec![1, 1])),
+            ],
+            compare: Compare::Float { tol: 6e-2 },
+        },
+    ]
+}
+
 fn nonzero_cases() -> Vec<Case> {
     vec![
         Case {
@@ -1800,6 +1969,9 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         instance_normalization_cases(),
     ));
     p.push(sweep("GroupNormalization", group_normalization_cases()));
+    p.push(sweep("LpPool", lp_pool_cases()));
+    p.push(sweep("CenterCropPad", center_crop_pad_cases()));
+    p.push(sweep("Col2Im", col2im_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // Batch 10 (issue #67): normalization, global reductions, quantization, and

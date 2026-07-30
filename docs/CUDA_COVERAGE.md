@@ -66,6 +66,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-----------------------|
 | `MaxPool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | 2-D NCHW f32/f16/bf16; kernel, strides, symmetric explicit padding, `VALID`, and symmetric `SAME_UPPER`/`SAME_LOWER`. `ceil_mode=1`, dilated pooling, `storage_order`, asymmetric padding, and the optional ONNX Indices output are rejected explicitly. |
 | `AveragePool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | Same geometry/dtypes; `count_include_pad` maps to cuDNN include/exclude-padding modes. `ceil_mode=1`, dilation, `storage_order`, and asymmetric padding are rejected explicitly. |
+| `LpPool` | `` | ✅ | **NVRTC-custom** | Arbitrary-rank NCHW-style f32/f16/bf16 Lp window reduction with positive integer `p`, strides, dilation, explicit/automatic padding, and `ceil_mode`; accumulation widens to f32 (`pooling.rs`). |
 | `GlobalAveragePool`, `GlobalMaxPool`, `GlobalLpPool` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank NCHW-style f32/f16/bf16 global spatial reduction. Average, max, and integer-`p` Lp semantics match the CPU EP (`global_reduction.rs`). |
 
 ### Elementwise — unary / activations
@@ -179,6 +180,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
 | `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
+| `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
+| `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 
 ## Source-derived coverage audit (2026-07-29)
 
@@ -190,14 +193,13 @@ pre-batch counts retained in the historical wave notes below.
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **173** |
 | CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **159** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **154** |
-| CPU pairs implemented by CUDA in the same domain | **157 / 173** |
-| CPU standard-domain op types implemented by CUDA | **136 / 145** |
+| CUDA registry `(domain, op_type)` pairs | **162** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **157** |
+| CPU pairs implemented by CUDA in the same domain | **160 / 173** |
+| CPU standard-domain op types implemented by CUDA | **139 / 145** |
 
-The **9 remaining CPU `ai.onnx` gaps** are `CenterCropPad`, `Col2Im`,
-`ConvTranspose`, `GridSample`, `LpPool`, `NonMaxSuppression`, `QLinearMatMul`,
-`Resize`, and `Unique`.
+The **6 remaining CPU `ai.onnx` gaps** are `ConvTranspose`, `GridSample`,
+`NonMaxSuppression`, `QLinearMatMul`, `Resize`, and `Unique`.
 
 The decode/transformer-oriented priority set from issue #67 is already covered:
 `LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
@@ -217,8 +219,7 @@ currently registered by the CPU EP include `Conv` (cuDNN).
 |---------|------------------------------|-----------|
 | **cuBLASLt / NVRTC** | `QLinearMatMul` | Quantized matrix multiplication should reuse the existing dequant/GEMM infrastructure. |
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
-| **cuDNN / NVRTC-custom** | `LpPool` | Pooling reduction with general ONNX window geometry. |
-| **NVRTC-custom** | `CenterCropPad`, `Col2Im`, `Unique` | Index transforms or data-dependent output construction with no suitable runtime library. |
+| **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
 | **deferred heavy operators** | `ConvTranspose`, `GridSample`, `NonMaxSuppression`, `Resize` | Larger numerical/geometry surfaces deserve dedicated follow-up waves and focused review. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
@@ -352,6 +353,15 @@ negative/interior normalization axes, and dynamic quantization for mixed-sign,
 constant, and empty inputs. Current source-derived coverage is **152**
 advertised CUDA op names, **157** CUDA `(domain, op_type)` pairs, and
 **134 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 11 adds `InstanceNormalization` and
+`GroupNormalization`; batch 12 adds `LpPool`, `CenterCropPad`, and `Col2Im`.
+The latter shares a general N-D pooling geometry path and a fixed-width index
+transform module. GPU parity covers p=1/p=2, asymmetric padding, strides,
+dilation, `ceil_mode`, mixed crop/pad with odd differences and selected axes,
+and overlapping Col2Im accumulation with both stride/padding and dilation.
+Current source-derived coverage is **157** advertised CUDA op names, **162**
+CUDA `(domain, op_type)` pairs, and **139 / 145** CPU standard-domain op types.
 
 ---
 
