@@ -141,8 +141,27 @@ struct field or a bare `} => {`, concludes the reviewer was confused, and
 > resolves. It shows you *a* line, confidently, and nothing anywhere says
 > "this is not the line that was meant."
 
-**So this document no longer cites a line number for anything in a file it does
-not own.** Every reference above is a `grep` you can run, which re-derives the
+> ⛔ **READER INSTRUCTION, AND IT APPLIES TO EVERY `file.ext:NNN` IN THIS
+> DOCUMENT WITHOUT EXCEPTION: treat it as a *hint about where to start*, never
+> as a coordinate. Re-derive it before you believe it, before you quote it, and
+> above all before you conclude that the claim attached to it is wrong.**
+>
+> This warning is deliberately global rather than a list of the ones I fixed. I
+> swept `driver.rs`, published this rule, and left **30 line anchors in 18 other
+> files untouched in the same commit** — because I swept the filename I happened
+> to be thinking about. That is the third time tonight my instrument has been
+> selected by *name* rather than by *scope*. A rule enforced by my sweep is only
+> as complete as my attention was; a rule stated to the reader covers the ones I
+> missed **and the ones added after I stop working.**
+>
+> **And spot-checking made it worse, not better: the rot is PARTIAL.**
+> `metrics.rs:171` is exactly right (`pub(crate) fn request_started()`), while
+> `admin.rs:76` is a blank line and `kv-memory.js:147` is `],`. **Partial rot is
+> more dangerous than total rot** — a reviewer who checks one citation, finds it
+> perfect, and extends that trust to the rest is behaving completely reasonably
+> and will be wrong most of the time.
+
+**So this document prefers a symbol to a line everywhere it can.** Every reference above is a `grep` you can run, which re-derives the
 answer at read time and cannot be stale by construction. *(This is
 @086345a5's and @c0de4c2e's rule — publish the predicate, not the conclusion —
 and my brief was the largest single violator of it on the branch.)*
@@ -449,7 +468,8 @@ ratio, not a latency measurement.
 
 ⚠️ **But do not quote it as a clean win, and do not quote it from this file.**
 The aggregate gain ships **only** alongside the per-stream cost: **per-stream
-throughput falls to about 0.62× of solo** (~20.7 tok/s). Batching makes no
+throughput falls** (read `perf-baseline.md` for the figure and its interval;
+this brief deliberately no longer prints the operands). Batching makes no
 single request faster; it trades per-stream latency for total throughput.
 `demo-ux.md` §29.1 ratified that both halves appear together, everywhere — a
 tradeoff presented as a pure win is a lie told with true numbers.
