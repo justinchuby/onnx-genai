@@ -404,8 +404,10 @@ async fn the_demo_origin_does_not_publish_the_source_tree() {
             StatusCode::NOT_FOUND,
             "{path} is readable on the demo origin"
         );
-        // A body would confirm the file exists; the refusal must be
-        // indistinguishable from absence.
+        // The refusal carries a body -- an empty 404 hands the screen to the
+        // browser's own error page -- but it is one shared constant, byte-identical
+        // to a genuine absence, and it never names what was requested. Asserted by
+        // `a_refused_demo_asset_is_byte_identical_to_an_absent_one`.
         assert!(
             !body_string(response).await.contains("internal findings"),
             "{path} leaked its contents in the refusal"

@@ -193,17 +193,28 @@ fn demo_path_is_servable(path: &str) -> bool {
 
 /// Serves only what the page loads, out of a directory that is a source tree.
 ///
-/// The asset directory is `examples/serving-dashboard`, which at the time of
-/// writing held 101 files: 15 markdown documents including an unpublished
-/// architecture and security review, two shell scripts, three Python scripts,
-/// and 47 test files. Every one of them answered `200` on the demo origin. The
-/// review document alone was 21KB of our own findings, served to any visitor
-/// of a machine running the demo.
+/// The asset directory is `examples/serving-dashboard`: a working source tree,
+/// not a build output. Alongside the dashboard it carries markdown documents
+/// including an unpublished architecture and security review, shell scripts,
+/// Python scripts, and the JavaScript test suite. Before the allowlist, every
+/// one of them answered `200` on the demo origin -- the review document alone
+/// was 21KB of our own findings, served to any visitor of a machine running the
+/// demo.
+///
+/// Deliberately no file counts here. An earlier version of this comment gave
+/// them, and by the time anyone read it the tree had grown past every figure it
+/// quoted -- the test-file count alone was understating the exposure by fifteen
+/// files. A frozen census is read as a fact and cannot be re-measured by the
+/// reader without leaving the file. The property is enforced instead by
+/// `the_demo_origin_does_not_publish_the_source_tree`, which cannot rot because
+/// it constructs the files it refuses.
 ///
 /// This is not a traversal bug -- `ServeDir` handles traversal correctly and
 /// these files are genuinely inside the directory it was pointed at. The defect
 /// is that "the directory the assets live in" and "the set of files the demo
-/// should publish" were assumed to be the same set, and they are not.
+/// should publish" were assumed to be the same set, and they are not. That
+/// assumption gets more wrong every time someone adds a file, which is why the
+/// allowlist names what may be served rather than what may not.
 pub(crate) async fn restrict_demo_assets(request: Request<Body>, next: Next) -> Response {
     if !demo_path_is_servable(request.uri().path()) {
         // Byte-identical to a path that does not exist: distinguishing
