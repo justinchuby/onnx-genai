@@ -1,0 +1,2 @@
+23:59  up 3 days, 17:27, 1 user, load averages: 14.90 25.91 27.49
+load captured during replication attempt

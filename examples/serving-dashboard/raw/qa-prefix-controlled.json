@@ -1,0 +1,29 @@
+{
+  "armA_shared_ttft_ms": [
+    1383.1814579898492,
+    1424.5383749948815,
+    1060.3332910104655,
+    1090.9159160219133,
+    1393.2352499687113,
+    1341.2472089985386
+  ],
+  "armB_unique_ttft_ms": [
+    1246.6732079628855,
+    1290.003333997447,
+    1261.1209999886341,
+    1066.0249160137028,
+    1085.1727920235135,
+    1446.4092499692924
+  ],
+  "warm_vs_control_pct": 6.966289717538688,
+  "final_kv": {
+    "prefix_cache_hits": 19,
+    "prefix_cache_lookups": 20,
+    "prefix_cache_hit_rate": 0.95,
+    "active_batch_size": 0,
+    "pending_queue_depth": 0,
+    "available_admission_slots": 256,
+    "rejected_requests": 0,
+    "engine_kv_introspection": "unavailable: engine does not yet expose KV page statistics"
+  }
+}

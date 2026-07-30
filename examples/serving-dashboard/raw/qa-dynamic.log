@@ -1,0 +1,7 @@
+[2m2026-07-30T06:30:28.133137Z[0m [32m INFO[0m [2monnx_genai_server::registry[0m[2m:[0m loading model [3mid[0m[2m=[0mqwen-dynamic [3mpath[0m[2m=[0m../onnx-genai/models/qwen2.5-0.5b
+onnx-genai: selected ONNX Runtime 1.27.0 (API 27) from /opt/homebrew/Caskroom/miniconda/base/lib/python3.13/site-packages/onnxruntime/capi/libonnxruntime.1.27.0.dylib (active conda environment from CONDA_PREFIX)
+[2m2026-07-30T06:30:28.278321Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
+[2m2026-07-30T06:30:34.612304Z[0m [32m INFO[0m [2monnx_genai_ort::session[0m[2m:[0m Loading model: ../onnx-genai/models/qwen2.5-0.5b/model.onnx
+[2m2026-07-30T06:30:34.612957Z[0m [32m INFO[0m [2monnx_genai_engine::engine::load[0m[2m:[0m No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)
+[2m2026-07-30T06:30:34.724116Z[0m [32m INFO[0m [2monnx_genai_server::driver[0m[2m:[0m continuous batch driver disabled; using per-request engine path
+[2m2026-07-30T06:30:34.724119Z[0m [32m INFO[0m [2monnx_genai_server::cli[0m[2m:[0m starting onnx-genai server [3maddr[0m[2m=[0m127.0.0.1:8126 [3mmodel[0m[2m=[0m"qwen-dynamic"

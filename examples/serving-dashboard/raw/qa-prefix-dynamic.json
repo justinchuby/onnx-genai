@@ -1,0 +1,54 @@
+{
+  "pairs": [
+    {
+      "seed": 0,
+      "ttft_cold_ms": 1694.753625022713,
+      "ttft_warm_ms": 1331.0682090232149,
+      "hits_before": 0,
+      "hits_mid": 0,
+      "hits_after": 1,
+      "lookups_after": 2,
+      "hit_rate": 0.5
+    },
+    {
+      "seed": 1,
+      "ttft_cold_ms": 1313.7510840315372,
+      "ttft_warm_ms": 1336.510332999751,
+      "hits_before": 1,
+      "hits_mid": 2,
+      "hits_after": 3,
+      "lookups_after": 4,
+      "hit_rate": 0.75
+    },
+    {
+      "seed": 2,
+      "ttft_cold_ms": 1572.4842919735238,
+      "ttft_warm_ms": 1550.5602919729427,
+      "hits_before": 3,
+      "hits_mid": 4,
+      "hits_after": 5,
+      "lookups_after": 6,
+      "hit_rate": 0.8333333333333334
+    },
+    {
+      "seed": 3,
+      "ttft_cold_ms": 1498.2049580430612,
+      "ttft_warm_ms": 1311.4503329852596,
+      "hits_before": 5,
+      "hits_mid": 6,
+      "hits_after": 7,
+      "lookups_after": 8,
+      "hit_rate": 0.875
+    }
+  ],
+  "final_kv": {
+    "prefix_cache_hits": 7,
+    "prefix_cache_lookups": 8,
+    "prefix_cache_hit_rate": 0.875,
+    "active_batch_size": 0,
+    "pending_queue_depth": 0,
+    "available_admission_slots": 256,
+    "rejected_requests": 0,
+    "engine_kv_introspection": "unavailable: engine does not yet expose KV page statistics"
+  }
+}

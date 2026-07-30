@@ -1,0 +1,465 @@
+{
+  "state": {
+    "utc": "2026-07-30T05:48:20Z",
+    "loadavg_start": [
+      4.744140625,
+      7.2607421875,
+      8.619140625
+    ],
+    "models": "{\"object\":\"list\",\"data\":[{\"id\":\"qwen-scatter\",\"object\":\"model\",\"created\":1785390500,\"owned_by\":\"onnx-genai\"}]}"
+  },
+  "config": {
+    "prompt": "Write a detailed explanation of how a hash table works, including collision resolution.",
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "single_warmup": 3,
+    "single_iters": 15,
+    "conc_warmup": 1,
+    "conc_rounds": 8,
+    "concurrency": 4
+  },
+  "single": {
+    "raw": [
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.1609769579954445,
+        "decode_span_s": 3.9289068750222214,
+        "decode_tps": 32.324512654498,
+        "e2e_s": 6.089921874983702,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 6.44921875
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 1.967499874997884,
+        "decode_span_s": 3.7417270410223864,
+        "decode_tps": 33.94154587110091,
+        "e2e_s": 5.709268291015178,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 7.2939453125
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.0996440000017174,
+        "decode_span_s": 3.9772848749998957,
+        "decode_tps": 31.931331044021164,
+        "e2e_s": 6.076969290967099,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 7.27001953125
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.401165583054535,
+        "decode_span_s": 3.6883814999600872,
+        "decode_tps": 34.432446860872254,
+        "e2e_s": 6.089587458001915,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 7.96875
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.2136820839950815,
+        "decode_span_s": 4.12092458299594,
+        "decode_tps": 30.8183266745615,
+        "e2e_s": 6.3346489170216955,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 7.97119140625
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.0298905840027146,
+        "decode_span_s": 3.597113083000295,
+        "decode_tps": 35.30609048689438,
+        "e2e_s": 5.627043458982371,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.2216796875
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.212088041997049,
+        "decode_span_s": 3.773979249992408,
+        "decode_tps": 33.65148337799035,
+        "e2e_s": 5.986107416974846,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.28369140625
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.1443785000010394,
+        "decode_span_s": 4.062584041967057,
+        "decode_tps": 31.260891759548205,
+        "e2e_s": 6.207006833981723,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.2607421875
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 1.9104710000101477,
+        "decode_span_s": 3.6750963749946095,
+        "decode_tps": 34.556916891787985,
+        "e2e_s": 5.585610000009183,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.07958984375
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.3247900829883292,
+        "decode_span_s": 3.5171424170257524,
+        "decode_tps": 36.10885910824069,
+        "e2e_s": 5.841969457978848,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 7.91259765625
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.140234957973007,
+        "decode_span_s": 3.7232955420040525,
+        "decode_tps": 34.1095673355123,
+        "e2e_s": 5.863568458007649,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 7.99267578125
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.141329207981471,
+        "decode_span_s": 3.743540707975626,
+        "decode_tps": 33.92510190404129,
+        "e2e_s": 5.884906540974043,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.2333984375
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 1.9557442079531029,
+        "decode_span_s": 3.545200709020719,
+        "decode_tps": 35.823077569867934,
+        "e2e_s": 5.5012036669650115,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.29443359375
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.281857374997344,
+        "decode_span_s": 3.802888875012286,
+        "decode_tps": 33.39566423685985,
+        "e2e_s": 6.084803083038423,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.2705078125
+      },
+      {
+        "n_tokens": 128,
+        "ttft_s": 2.1108720839838497,
+        "decode_span_s": 4.016172125004232,
+        "decode_tps": 31.622150656669422,
+        "e2e_s": 6.127101042016875,
+        "finish_reason": "length",
+        "text_head": "A hash table is a data structure that allows for efficient storage and retrieval",
+        "loadavg": 8.08837890625
+      }
+    ],
+    "decode_tps": {
+      "n": 15,
+      "min": 30.8183266745615,
+      "p25": 32.12792184925958,
+      "median": 33.92510190404129,
+      "p75": 34.49468187633012,
+      "max": 36.10885910824069,
+      "mean": 33.547197762164416,
+      "stdev": 1.6425759929189199,
+      "iqr": 2.3667600270705407,
+      "cv_pct": 4.896313559672244,
+      "spread_pct": 15.594742938853065
+    },
+    "ttft_ms": {
+      "n": 15,
+      "min": 1910.4710000101477,
+      "p25": 2064.767292002216,
+      "median": 2141.329207981471,
+      "p75": 2212.8850629960652,
+      "max": 2401.165583054535,
+      "mean": 2139.641636128848,
+      "stdev": 137.46541485215323,
+      "iqr": 148.11777099384926,
+      "cv_pct": 6.4246933940238184,
+      "spread_pct": 22.915420067843833
+    }
+  },
+  "concurrent": {
+    "raw": [
+      {
+        "round": 1,
+        "aggregate_decode_tps": 82.40402060155498,
+        "per_stream_decode_tps": [
+          20.58948645543886,
+          20.582167275541554,
+          20.6518108573646,
+          20.580556013209954
+        ],
+        "mean_per_stream_tps": 20.601005150388744,
+        "wall_s": 15.389209042012226,
+        "wall_throughput_tps": 33.27006596649967,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          9216.782666975632,
+          9216.608082992025,
+          9216.356292017736,
+          9216.327458969317
+        ],
+        "loadavg": 8.9169921875,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 2,
+        "aggregate_decode_tps": 64.61724131583557,
+        "per_stream_decode_tps": [
+          14.815662607775522,
+          14.816411967831428,
+          14.816321076062703,
+          20.168845664165925
+        ],
+        "mean_per_stream_tps": 16.154310328958893,
+        "wall_s": 15.819934582978021,
+        "wall_throughput_tps": 32.364229909705394,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          7245.159584039357,
+          7243.537249974906,
+          7242.129375052173,
+          9515.710959036369
+        ],
+        "loadavg": 8.41162109375,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 3,
+        "aggregate_decode_tps": 83.37082927831626,
+        "per_stream_decode_tps": [
+          20.842712013512383,
+          20.8432996650845,
+          20.84276574466131,
+          20.842051855058074
+        ],
+        "mean_per_stream_tps": 20.842707319579066,
+        "wall_s": 15.632130165991839,
+        "wall_throughput_tps": 32.753053778548434,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          9538.44074998051,
+          9538.377874996513,
+          9538.330874987878,
+          9538.140500022564
+        ],
+        "loadavg": 8.54638671875,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 4,
+        "aggregate_decode_tps": 82.62937183007979,
+        "per_stream_decode_tps": [
+          20.65690321100306,
+          20.658068601788706,
+          20.65702402694908,
+          20.65737599033894
+        ],
+        "mean_per_stream_tps": 20.657342957519948,
+        "wall_s": 15.857726291986182,
+        "wall_throughput_tps": 32.287100342925136,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          9709.40079097636,
+          9709.376457962207,
+          9709.18745797826,
+          9709.088417002931
+        ],
+        "loadavg": 9.041015625,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 5,
+        "aggregate_decode_tps": 85.77697487114929,
+        "per_stream_decode_tps": [
+          21.444045846472136,
+          21.444584308364607,
+          21.443761613981863,
+          21.444583102330693
+        ],
+        "mean_per_stream_tps": 21.444243717787323,
+        "wall_s": 15.511397082998883,
+        "wall_throughput_tps": 33.00798743403795,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          9588.78262504004,
+          9588.541832985356,
+          9588.502333965153,
+          9588.461874984205
+        ],
+        "loadavg": 10.1787109375,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 6,
+        "aggregate_decode_tps": 83.69756184160008,
+        "per_stream_decode_tps": [
+          20.924918326712156,
+          20.924577300386822,
+          20.92379444795138,
+          20.92427176654972
+        ],
+        "mean_per_stream_tps": 20.92439046040002,
+        "wall_s": 15.264110292016994,
+        "wall_throughput_tps": 33.542734571812666,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          9194.250417000148,
+          9194.148708018474,
+          9194.058875029441,
+          9193.939625052735
+        ],
+        "loadavg": 10.2705078125,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 7,
+        "aggregate_decode_tps": 86.04729812512403,
+        "per_stream_decode_tps": [
+          21.512059817442832,
+          21.512215895452467,
+          21.51132196339336,
+          21.511700448835374
+        ],
+        "mean_per_stream_tps": 21.511824531281007,
+        "wall_s": 15.084809958992992,
+        "wall_throughput_tps": 33.941428588880896,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          9180.820167006459,
+          9180.600124993362,
+          9180.545584007632,
+          9180.425625003409
+        ],
+        "loadavg": 9.59521484375,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      },
+      {
+        "round": 8,
+        "aggregate_decode_tps": 86.12906298547904,
+        "per_stream_decode_tps": [
+          21.531878124565996,
+          21.533018829551363,
+          21.532334148319656,
+          21.53183188304202
+        ],
+        "mean_per_stream_tps": 21.53226574636976,
+        "wall_s": 14.743887834018096,
+        "wall_throughput_tps": 34.726254415655475,
+        "total_tokens": 512,
+        "ttfts_ms": [
+          8845.442749967333,
+          8845.372250012588,
+          8845.251000020653,
+          8845.123334031086
+        ],
+        "loadavg": 9.1923828125,
+        "finish_reasons": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ]
+      }
+    ],
+    "aggregate_decode_tps": {
+      "n": 8,
+      "min": 64.61724131583557,
+      "p25": 82.57303402294859,
+      "median": 83.53419555995816,
+      "p75": 85.84455568464298,
+      "max": 86.12906298547904,
+      "mean": 81.83404510614238,
+      "stdev": 7.120950221001156,
+      "iqr": 3.2715216616943934,
+      "cv_pct": 8.701696478238327,
+      "spread_pct": 25.752114478917765
+    },
+    "wall_throughput_tps": {
+      "n": 8,
+      "min": 32.287100342925136,
+      "p25": 32.65584781133767,
+      "median": 33.139026700268815,
+      "p75": 33.642408076079725,
+      "max": 34.726254415655475,
+      "mean": 33.2366068760082,
+      "stdev": 0.8245649754525872,
+      "iqr": 0.986560264742053,
+      "cv_pct": 2.48089396889608,
+      "spread_pct": 7.360367263624414
+    },
+    "per_stream_decode_tps": {
+      "n": 8,
+      "min": 16.154310328958893,
+      "p25": 20.643258505737148,
+      "median": 20.88354888998954,
+      "p75": 21.461138921160746,
+      "max": 21.53226574636976,
+      "mean": 20.458511276535596,
+      "stdev": 1.780237555250289,
+      "iqr": 0.8178804154235984,
+      "cv_pct": 8.701696478238327,
+      "spread_pct": 25.752114478917765
+    }
+  },
+  "loadavg_end": [
+    10.15234375,
+    8.73583984375,
+    8.91796875
+  ]
+}

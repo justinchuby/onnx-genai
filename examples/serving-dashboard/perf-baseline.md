@@ -397,11 +397,11 @@ python3 harness/qa_baseline_harness.py /tmp/rerun.json
 
 ### 5.0 ⛔ MANDATORY PROTOCOL CHANGE — do NOT compare against the numbers in §1
 
-> 🔻 **RETRACTED — SEE §13.1. THE PRESERVED BINARY DOES NOT EXIST.** It was never tracked in
-> git on any branch, is not gitignored (so it was only ever an untracked local artifact), and
-> is absent from an exhaustive filesystem search. `d49d3c8` is a **SHA-256 content hash, not a
-> commit**. Everything below in §5.0 that depends on re-running the BEFORE arm is unexecutable.
-> Do not spend a window looking for this file.
+> 🔻 **THIS RETRACTION IS ITSELF RETRACTED — SEE §14. THE BINARY EXISTS.** It is at
+> `~/.flightdeck/artifacts/.../qa-tester-fc8b5d97/clean-binary/`, its SHA-256 begins `d49d3c8`
+> exactly as its filename claims, and a process has been serving from it on `:8151` since
+> 01:15:44. My "exhaustive search" never entered a hidden directory at depth 10. **§5.0 below
+> is CORRECT as originally written. Read it as authoritative.**
 
 **The clean-tree binary has been preserved.** This changes the correct protocol entirely,
 and supersedes any instruction to "match conditions" against the numbers in §1.
@@ -677,12 +677,10 @@ periodically-refreshed cached snapshot rather than round-tripping the driver.
 
 Archived next to this file:
 
-> 🔴 **NONE OF THE FILES BELOW EXIST — SEE §13.1.** Every path in this table (`raw/*`,
-> `clean-binary/*`, `harness/*`) is absent from disk *and* was never added in any commit on
-> any branch (`git log --all --diff-filter=A` → 0 hits for all three prefixes). "Archived next
-> to this file" is false: these were untracked local artifacts in a working directory that no
-> longer exists. **This document's entire evidence appendix is unavailable for audit.** The
-> numbers in §1–§7 cannot be re-derived from source data; they can only be re-measured.
+> 🔻 **THE WARNING I PUT HERE WAS FALSE AND IS WITHDRAWN — SEE §14.** All 21 files exist in
+> the agent workspace `~/.flightdeck/artifacts/.../qa-tester-fc8b5d97/{raw,harness,clean-binary}`.
+> They are **not tracked in git** — that part was true and remains the real hazard — but they
+> are **not lost**, and "archived next to this file" is a path error, not a fabrication.
 
 | file | contents |
 |---|---|
@@ -717,8 +715,8 @@ Archived next to this file:
   raw per-run numbers published (§1, §2, §8), conditions recorded as a first-class
   deliverable (§4), and the inconclusive-result rule plus 4 Hz polling condition folded
   into the acceptance spec (§5, §6b).
-- 🔻 **RETRACTED — SEE §13.1.** The binary is gone; the "unrecoverable measurement" premise is
-  **not** defused. The BEFORE arm cannot be re-run on demand or at all.
+- 🔻 **MY RETRACTION HERE WAS WRONG — SEE §14.** The binary exists and the bullet below is
+  correct as written. The BEFORE arm *can* be re-run on demand.
 - 🔒 **The clean-tree binary is preserved and validated** (§5.0). This largely defuses the
   "unrecoverable measurement" premise of this task: the BEFORE arm can now be re-run on
   demand, at any time, against the telemetry build in the same session. That is a strictly
@@ -1691,14 +1689,18 @@ exclusive window, announced, with every other timing lane held — not merely a 
 
 ---
 
-## 13. 🔴 AC33 IS UNRUNNABLE AS SPECIFIED — and the quiet window made the box *worse*, not better
+## 13. 🔴 AC33 DECLINED — and the quiet window made the box *worse*, not better
+
+> ⚠️ **§13.1 AND §13.2's FIRST GROUND ARE RETRACTED BY §14 — THE ARTIFACTS EXIST.** §13.3 and
+> §13.4 (the null measurement, which is the actual reason AC33 is declined) are **UNAFFECTED**
+> and stand. Read §14 before citing anything in §13.1.
 
 @12e42da8 told me the machine was finally quiet (four orphaned servers reaped, load 85 → under 10)
 and to take the throughput window before it closed. **I took it. This section is what the window
 produced, and it is not a hero number.** Every claim here is measured on a pinned SHA and carries
 `loadavg` per sample, per my standing constraint.
 
-### 13.1 The BEFORE arm does not exist, and neither does the evidence appendix
+### 13.1 ~~The BEFORE arm does not exist, and neither does the evidence appendix~~ 🔻 FALSE — SEE §14
 
 Three artifact classes this document treats as archived are **absent from disk and were never
 tracked in git on any branch**:
@@ -1827,3 +1829,91 @@ In priority order, none of which I can do alone:
 - 8 pairs establishes the envelope is large. It does not characterise its shape.
 - I did not attribute the load bursts to specific processes in this run; §12.4 records why
   `ps %cpu` is not adequate for that and what is.
+
+---
+
+## 14. 🔻 I RETRACT §13.1. THE ARTIFACTS EXIST, AND @c0de4c2e's `ps` OUTPUT IS WHAT PROVED IT
+
+**I published that the preserved binary, the harness and the entire raw appendix did not exist.
+That was false, and it was the strongest-worded claim in this document.** @c0de4c2e broadcast a
+process table showing `:8151` executing a binary I had just declared nonexistent. They were
+reading a live process; I was reading a failed search. **The live process wins.**
+
+```
+pid 73902, started Thu Jul 30 01:15:44 2026, STILL RUNNING:
+  ~/.flightdeck/artifacts/nxrt-bbcfe5/sessions/12e42da8-…/qa-tester-fc8b5d97/
+      clean-binary/onnx-genai-server-clean-d49d3c8   --model …/qwen2.5-0.5b --addr 127.0.0.1:8151
+
+FILE ON DISK:   29,033,360 bytes, Jul 29 23:22
+SHA-256:        d49d3c8fe1b8a98e1a06720870e30524a8ac970192e3b08e99661a40e1c31ec7
+                ^^^^^^^ THE FILENAME'S SUFFIX IS THE FIRST 7 HEX DIGITS OF ITS OWN CONTENT HASH.
+                        The provenance claim in the name is TRUE and self-verifying.
+
+ALSO PRESENT:   harness/  5 .py files incl. qa_baseline_harness.py (9,515 B)
+                raw/      21 files incl. every JSON cited in §8
+```
+
+### 14.1 Why my search returned empty, and why that is the interesting part
+
+The artifacts live at **depth 10, inside a dotted directory**:
+`/Users/justinc/.flightdeck/artifacts/<runtime>/sessions/<uuid>/qa-tester-fc8b5d97/…`
+
+My searches used a `-maxdepth` shallower than 10 and never descended into `.flightdeck`. **So my
+instrument could not have returned these files under any circumstances — the corpus excluded the
+answer before the search began.** I then reported the empty result as an exhaustive absence.
+
+**⚠️ AND I RAN FOUR "INDEPENDENT" CHANNELS THAT WERE NOT INDEPENDENT.** I checked: (1) a
+filesystem search, (2) `git log --diff-filter=A`, (3) `.gitignore`, (4) hashes of binaries on the
+box. Channels 2 and 3 answer *"is it tracked?"* — **they were TRUE, and they are not evidence of
+existence at all.** Channels 1 and 4 both walk the filesystem and **shared the same depth blind
+spot**, so they are one channel wearing two hats. **I had one real channel, it was broken, and
+the three corroborating results made the conclusion feel over-determined.** Corroboration across
+channels that share a failure mode is not corroboration; it is the same error, counted repeatedly.
+
+**This is precisely the error I have been auditing others for all session, in its purest form:
+I VALIDATED THE DETECTOR AND NEVER VALIDATED THE CORPUS. I never ran a positive control** — I
+never confirmed my `find` could locate a file I *knew* was there. One such control, against any
+artifact of mine, would have exposed the depth limit in seconds. **I have demanded that control
+from three other agents tonight and did not run it myself.**
+
+### 14.2 What actually changes, and what does not
+
+| §13 ground for declining AC33 | status now |
+|---|---|
+| **(1)** BEFORE binary does not exist | 🔻 **RETRACTED — it exists, hash-verified** |
+| **(2)** binding harness does not exist | 🔻 **RETRACTED — `qa_baseline_harness.py` recovered** |
+| **(3)** telemetry cannot be disabled in any build | ✅ **STANDS** (0.08 % binary delta, ungated `fetch_add`) |
+| **(4)** §13.3/§13.4 null: the box cannot resolve 2 % | ✅ **STANDS — and is the operative reason** |
+
+**AC33 is still declined, but my stated grounds were two-thirds wrong and I want the record to
+say so plainly.** The decline now rests where it always should have: **on the measurement, not on
+the archaeology.** A recovered BEFORE arm does not help when a true-zero effect reads +84.9 % —
+**a perfectly preserved baseline measured on an unresolvable instrument is still unresolvable.**
+
+**⚠️ One genuine limitation survives on the recovered binary**, and it is the objection I raised
+in §13.2 against the merge-base candidate, so I must apply it to my own artifact: `--help` on the
+clean binary offers **`--model-id` and `--addr` but no `--max-batch` and no `--demo-assets-dir`**.
+Whoever runs the A/B must confirm the batching configuration matches by reading the *startup log*
+(`raw/qa-baseline-server.log` records the `max_batch=4` line) rather than assuming flag parity.
+
+### 14.3 The artifacts are now tracked, which is the fix nobody had landed
+
+`harness/` (5 files) and `raw/` (21 files) are **committed to this repository** alongside my new
+`qa_null_calibration_512.py` / `qa-null-calibration-512.json` and the endpoint-stall probe —
+176 KB total, all text. Each copy was verified with `cmp` against its source, **byte-identical,
+not merely present**. The 29 MB binary is **not** committed; `clean-binary.sha256` records its
+digest and §14 records its path, so its identity is verifiable even if the file moves.
+
+**The real defect was never that the artifacts were lost. It is that a normative document pointed
+at paths that only ever existed in one agent's private scratch directory** — so every reader
+except me resolved them to nothing, and I resolved them to nothing too, the moment I looked from
+the wrong root. `git log --all --diff-filter=A` returning 0 for all three prefixes was **true when
+I measured it and remains true**; it was the one finding of mine that was both correct and
+load-bearing, and it is now fixed rather than merely reported.
+
+**🎖️ @c0de4c2e's line about this binary deserves to outlive the incident, because it was aimed at
+a trap I then fell into from the opposite side:** *"`clean` means UNCONTAMINATED, not CURRENT."*
+They warned the name asserts more freshness than it owns. **I made the mirror-image error — I
+concluded the object was absent because its name resolved to nothing from where I stood.**
+Existence versus identity, one more time, and this time the failure was mine and the correction
+came from someone reading `ps` while I was reading `find`.

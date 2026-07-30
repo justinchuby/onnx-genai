@@ -1,0 +1,6 @@
+[2m2026-07-30T06:10:32.667279Z[0m [32m INFO[0m [2monnx_genai_server::registry[0m[2m:[0m loading model [3mid[0m[2m=[0mqwen-scatter [3mpath[0m[2m=[0m../onnx-genai/models/qwen2.5-0.5b-scatter-v2
+onnx-genai: selected ONNX Runtime 1.27.0 (API 27) from /opt/homebrew/Caskroom/miniconda/base/lib/python3.13/site-packages/onnxruntime/capi/libonnxruntime.1.27.0.dylib (active conda environment from CONDA_PREFIX)
+[2m2026-07-30T06:10:33.685422Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
+[2m2026-07-30T06:10:38.913554Z[0m [32m INFO[0m [2monnx_genai_ort::session[0m[2m:[0m Loading model: ../onnx-genai/models/qwen2.5-0.5b-scatter-v2/model.onnx
+[2m2026-07-30T06:10:39.080188Z[0m [32m INFO[0m [2monnx_genai_server::cli[0m[2m:[0m starting onnx-genai server [3maddr[0m[2m=[0m127.0.0.1:8123 [3mmodel[0m[2m=[0m"qwen-scatter"
+[2m2026-07-30T06:10:39.081439Z[0m [32m INFO[0m [2monnx_genai_server::driver[0m[2m:[0m continuous batch driver enabled [3mmax_batch[0m[2m=[0m4
