@@ -21,7 +21,7 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
-import { assertShippingTree, SHIPPING_REF, announceShippingRef } from './shipping-tree.mjs';
+import { assertShippingTree, SHIPPING_REF, announceShippingRef, shippedPaths } from './shipping-tree.mjs';
 
 announceShippingRef();
 
@@ -60,7 +60,68 @@ function shippedFile(relFromRoot) {
   });
 }
 
-const readme = shippedFile('examples/serving-dashboard/README.md');
+// COVERAGE, AND WHY IT IS STATED RATHER THAN ASSUMED. This guard used to read
+// README.md and nothing else, and it reported green. That green was read across
+// the crew as "the citations are checked" when what it meant was "the README's
+// citations are checked" -- 18 of the 591 positional citations in this
+// directory, or 3%. The number was true and the sentence it produced was false,
+// which is this project's central defect class wearing my own badge.
+//
+// The set below is the four documents THIS LANE OWNS. It deliberately stops
+// there. Widening it to documents other agents are actively editing would turn
+// the tree red over prose nobody on this side can fix, which converts a guard
+// into an obstacle and gets it deleted. The DECLARED GAP test further down is
+// the honest record of what is still unchecked, and it ratchets: the uncovered
+// population may shrink without ceremony, but it may not grow silently.
+//
+// Joined with a blank line because `clipBefore` treats "\n\n" as a hard reset,
+// so no document can lend prose context to the citation that follows it in the
+// concatenation. Without that, README's last paragraph could anchor QA-PLAN's
+// first citation -- a false PASS, and the direction that hides defects.
+const OWNED_DOCS = [
+  'examples/serving-dashboard/README.md',
+  'examples/serving-dashboard/QA-PLAN.md',
+  'examples/serving-dashboard/CONTRACT.md',
+  'examples/serving-dashboard/PR-DESCRIPTION.md',
+];
+
+const OWNED_DOC_TEXTS = OWNED_DOCS.map((p) => shippedFile(p));
+
+// A blank line: `clipBefore` treats "\n\n" as a hard reset, so no document can
+// lend prose context to the citation that opens the next one.
+const DOC_SEPARATOR = '\n\n';
+const ownedDocs = OWNED_DOC_TEXTS.join(DOC_SEPARATOR);
+
+// Offset -> owning document.
+//
+// This exists because the first version of the multi-document scan located a
+// citation with `ownedDocs.indexOf(citation.text)`, which returns the FIRST
+// occurrence. The moment two of these documents cite the same line -- which
+// they do, because they argue about the same code -- every later duplicate was
+// scored against the FIRST document's surrounding prose. It manufactured three
+// failures on citations that were never wrong, and it would equally have hidden
+// a real one by anchoring it to a sentence from another file.
+//
+// The lesson is the concatenation's, not the citation's: JOINING DOCUMENTS
+// MAKES POSITION AMBIGUOUS, AND EVERY POSITION-DERIVED ANSWER INHERITS THAT
+// AMBIGUITY SILENTLY. Carry the match offset instead of searching for the text.
+const DOC_SPANS = (() => {
+  const spans = [];
+  let at = 0;
+  for (let i = 0; i < OWNED_DOCS.length; i += 1) {
+    const len = OWNED_DOC_TEXTS[i].length;
+    spans.push({ name: basename(OWNED_DOCS[i]), start: at, end: at + len });
+    at += len + DOC_SEPARATOR.length;
+  }
+  return spans;
+})();
+
+function docAt(offset) {
+  const span = DOC_SPANS.find((d) => offset >= d.start && offset < d.end);
+  // Never guess a filename. A wrong attribution in a failure message sends the
+  // reader to edit a file that is not broken.
+  return span ? span.name : 'an owned document';
+}
 
 // Citations are resolved by BASENAME, so the inventory must cover every kind of
 // file the README argues from -- not just Rust. An earlier version tracked only
@@ -118,11 +179,13 @@ const CITATION = new RegExp(
 
 function citations() {
   const found = [];
-  for (const match of readme.matchAll(CITATION)) {
+  for (const match of ownedDocs.matchAll(CITATION)) {
     found.push({
       text: match[0],
       path: match[1],
       file: basename(match[1]),
+      // The offset of THIS match, not of the first textual duplicate.
+      index: match.index,
       // The last line the citation claims to reference.
       line: Number(match[3] ?? match[2]),
     });
@@ -156,7 +219,7 @@ function resolve({ path, file }) {
   return byBasename.get(file) ?? [];
 }
 
-test('the README cites source at all', () => {
+test('the owned docs cite source at all', () => {
   // If this ever hits zero, the regex stopped matching and every assertion
   // below would pass over an empty list -- a green suite proving nothing.
   assert.ok(
@@ -167,7 +230,7 @@ test('the README cites source at all', () => {
   );
 });
 
-test('no citation in the README escapes the matcher', () => {
+test('no citation in the owned docs escapes the matcher', () => {
   // THE BUG THIS EXISTS FOR. The three tests above are only as good as the
   // regex feeding them, and a regex that matches nothing -- or matches most
   // things -- reports green either way. The count floor above does not help:
@@ -183,7 +246,7 @@ test('no citation in the README escapes the matcher', () => {
 
   const strict = new Set(citations().map((c) => c.text));
   const escaped = [];
-  for (const match of readme.matchAll(LOOSE)) {
+  for (const match of ownedDocs.matchAll(LOOSE)) {
     const ext = match[1].split('.').pop();
     if (!CITED_EXTENSIONS.includes(ext)) continue; // e.g. `Cargo.toml:187`
     if (!strict.has(match[0])) escaped.push(match[0]);
@@ -197,11 +260,11 @@ test('no citation in the README escapes the matcher', () => {
   );
 });
 
-test('every file the README cites still exists in the repository', () => {
+test('every file the owned docs cite still exists in the repository', () => {
   for (const citation of citations()) {
     assert.ok(
       resolve(citation).length > 0,
-      `README.md cites ${citation.text}, but no tracked file matches that path ` +
+      `${docAt(citation.index)} cites ${citation.text}, but no tracked file matches that path ` +
         `anywhere in the repository. It was renamed, moved or deleted -- a citation ` +
         `pointing at a file that is gone reads exactly like one that is fine. ` +
         `(This project deleted cors.rs while docs still cited it.)`,
@@ -209,7 +272,7 @@ test('every file the README cites still exists in the repository', () => {
   }
 });
 
-test('every line the README cites still exists in the file', () => {
+test('every line the owned docs cite still exists in the file', () => {
   for (const citation of citations()) {
     const candidates = resolve(citation);
     if (candidates.length === 0) continue; // reported by the test above
@@ -218,7 +281,7 @@ test('every line the README cites still exists in the file', () => {
 
     assert.ok(
       citation.line <= longest,
-      `README.md cites ${citation.text}, but that file has only ${longest} lines ` +
+      `${docAt(citation.index)} cites ${citation.text}, but that file has only ${longest} lines ` +
         `(${candidates.join(', ')}). The file shrank and the citation now points ` +
         `past the end of it.`,
     );
@@ -300,18 +363,38 @@ const SYMBOL_ANCHORED =
   // entirely by the matcher, on a citation that was never malformed.
   /`([A-Za-z0-9_./-]+\.(?:rs|js|css|html|sh))`,\s*`([A-Za-z_][^`\n]*)`/g;
 
+// The boundaries that end a claim, other than another citation.
+//
+// "\n\n" (paragraph) and "| " (table cell) were enough while this guard read
+// only the README, which is prose separated by blank lines. QA-PLAN.md is a
+// CHECKLIST -- one claim per `- [ ]` item, no blank lines between them -- and on
+// that shape the lookbehind walked straight out of its own item into the one
+// above. It produced two failures against citations that were correct, and one
+// of them was manufactured by a repair: lengthening a neighbouring citation to
+// carry a symbol name pushed that symbol into this citation's window.
+//
+// So a list marker is a claim boundary in exactly the sense the comment above
+// means, and omitting it made the check document-shape-dependent while
+// reporting a document-independent verdict.
+const CLAIM_BREAK = /\n\n|\|\s|\n\s*(?:[-*+]|\d+\.)\s/g;
+
 function clipBefore(text) {
   const last = [...text.matchAll(ANY_CITATION)].pop();
   const fromCitation = last ? last.index + last[0].length : 0;
-  const breaks = [...text.matchAll(/\n\n|\|\s/g)].pop();
+  const breaks = [...text.matchAll(CLAIM_BREAK)].pop();
   const fromBreak = breaks ? breaks.index + breaks[0].length : 0;
   return text.slice(Math.max(fromCitation, fromBreak));
 }
 
+// A claim also ENDS at the next list marker, for the same reason it starts
+// after one. Kept as its own literal rather than reusing CLAIM_BREAK because
+// the table-cell delimiter is asymmetric -- "| " opens a cell, " |" closes one.
+const CLAIM_BREAK_AFTER = /\n\n|\s\||\n\s*(?:[-*+]|\d+\.)\s/;
+
 function clipAfter(text) {
   const first = text.match(ANY_CITATION);
   const toCitation = first ? text.indexOf(first[0]) : text.length;
-  const brk = text.match(/\n\n|\s\|/);
+  const brk = text.match(CLAIM_BREAK_AFTER);
   const toBreak = brk ? brk.index : text.length;
   return text.slice(0, Math.min(toCitation, toBreak));
 }
@@ -343,14 +426,14 @@ function clipAfter(text) {
 function clipWide(text, side) {
   const brk =
     side === 'before'
-      ? [...text.matchAll(/\n\n|\|\s/g)].pop()
-      : text.match(/\n\n|\s\|/);
+      ? [...text.matchAll(CLAIM_BREAK)].pop()
+      : text.match(CLAIM_BREAK_AFTER);
   if (!brk) return text;
   return side === 'before' ? text.slice(brk.index + brk[0].length) : text.slice(0, brk.index);
 }
 
 function anchorsFor(citation, { tight }) {
-  const at = readme.indexOf(citation.text);
+  const at = citation.index;
 
   // Clip the lookbehind to the CURRENT claim. Without this, a citation inherits
   // symbols from the sentence before it and the check invents failures: the
@@ -363,7 +446,7 @@ function anchorsFor(citation, { tight }) {
   // OVER-REPORT. It would have pushed a correct citation to be "fixed" into a
   // wrong one, so the checker would have MANUFACTURED the defect it screens for.
   // An anchor is only evidence when it belongs to the same claim as the number.
-  const rawBefore = readme.slice(Math.max(0, at - PROSE_LOOKBEHIND), at);
+  const rawBefore = ownedDocs.slice(Math.max(0, at - PROSE_LOOKBEHIND), at);
   const before = tight ? clipBefore(rawBefore) : clipWide(rawBefore, 'before');
 
   // Prose usually names the symbol first ("`start()` (`metrics.rs:115`)"), but a
@@ -386,7 +469,7 @@ function anchorsFor(citation, { tight }) {
   // name at the call site, which is the same seam that let the bug live there.
   // The anchor that does work is `with_rng`, and it sits just past the old
   // 60-character horizon.
-  const rawAfter = readme.slice(at + citation.text.length, at + citation.text.length + PROSE_LOOKAHEAD);
+  const rawAfter = ownedDocs.slice(at + citation.text.length, at + citation.text.length + PROSE_LOOKAHEAD);
   const after = tight ? clipAfter(rawAfter) : clipWide(rawAfter, 'after');
 
   const anchors = new Set();
@@ -532,7 +615,7 @@ test('a cited line still sits beside the symbol the prose names', () => {
     // sends the reader away believing they are done; on a branch where the
     // tree moves under you, that costs a full edit-run cycle per citation.
     failures.push(
-      `README.md cites ${citation.text} while the surrounding prose names ` +
+      `${docAt(citation.index)} cites ${citation.text} while the surrounding prose names ` +
         `${anchors.map((a) => '`' + a + '`').join(', ')} — but no such symbol ` +
         `appears ANYWHERE in ` +
         `${reportFile}${candidates.length > 1 ? ` (or ${candidates.length - 1} other file(s) of that name)` : ''}.\n` +
@@ -577,7 +660,7 @@ test('a cited line still sits beside the symbol the prose names', () => {
   // reports nothing. Caught by asking where the array is read, not whether it
   // is written.
   const symbolFailures = [];
-  for (const m of readme.matchAll(SYMBOL_ANCHORED)) {
+  for (const m of ownedDocs.matchAll(SYMBOL_ANCHORED)) {
     const [, citedPath, symbol] = m;
     const candidates = trackedSourceFiles.filter(
       (f) => f === citedPath || f.endsWith(`/${citedPath}`),
@@ -605,7 +688,7 @@ test('a cited line still sits beside the symbol the prose names', () => {
   // matters: tighten the anchor rules or reword the prose and it starts
   // skipping everything while still reporting green.
   //
-  // The floor is set just under the CURRENT count (36), not at a token value.
+  // The floor is set just under the CURRENT count (79), not at a token value.
   // It was first written as `>= 8`, which was worse than useless: coverage could
   // have collapsed by three quarters and still passed. That is the same mistake
   // this suite already caught once -- a floor asks whether the matcher found
@@ -621,8 +704,8 @@ test('a cited line still sits beside the symbol the prose names', () => {
   // `/v1/admin/vram-limit` -> red. Citation `driver.rs:755` -> `:813` -> red,
   // listing every line the symbol actually occupies.
   assert.ok(
-    checked >= 30,
-    `Only ${checked} citations were anchor-checked, down from 36. This test ` +
+    checked >= 72,
+    `Only ${checked} citations were anchor-checked, down from 79. This test ` +
       `verifies nothing it cannot anchor, so a drop here means coverage ` +
       `evaporated rather than that the README improved. NOTE: converting a ` +
       `line-anchored citation to a symbol anchor does NOT reduce this count -- ` +
@@ -648,7 +731,7 @@ test('a cited line still sits beside the symbol the prose names', () => {
 // taken on the report, and the report's one DEAD path had already been fixed by
 // the time I looked -- which is itself the argument for a standing guard
 // instead of a periodic sweep.
-test('every source path the README cites resolves to exactly one tracked file', () => {
+test('every source path the owned docs cite resolves to exactly one tracked file', () => {
   const ambiguous = [];
   const dead = [];
   const seen = new Set();
@@ -665,7 +748,7 @@ test('every source path the README cites resolves to exactly one tracked file', 
     }
   };
 
-  for (const match of readme.matchAll(ANY_CITATION)) inspect(match[1]);
+  for (const match of ownedDocs.matchAll(ANY_CITATION)) inspect(match[1]);
 
   // SYMBOL-ANCHORED CITATIONS NAME A PATH TOO, AND IT WAS NOT BEING CHECKED.
   //
@@ -682,7 +765,7 @@ test('every source path the README cites resolves to exactly one tracked file', 
   // The honest repair is more coverage, not a lower bar: the path in a symbol
   // anchor must resolve to exactly one tracked file for the same reason the
   // path in a line anchor must, and until now nothing asserted that at all.
-  for (const match of readme.matchAll(SYMBOL_ANCHORED)) inspect(match[1]);
+  for (const match of ownedDocs.matchAll(SYMBOL_ANCHORED)) inspect(match[1]);
 
   // VACUITY FLOOR. Every list below is empty if the matcher stops matching, and
   // an empty offender list is exactly what success looks like. Prove we
@@ -773,5 +856,87 @@ test('RATCHET: this checker reads no source from the working tree', () => {
     shippedReads >= 4,
     `only ${shippedReads} shippedFile() call(s); this file has stopped reading ` +
       'the shipping tree rather than started reading it correctly',
+  );
+});
+
+// THE DECLARED GAP.
+//
+// This guard checks the four documents this lane owns. It does NOT check the
+// nine others in this directory, and the whole point of writing that down is
+// that a green run here has been read -- by me, in writing, more than once --
+// as "the citations are checked". It never meant that. It means 79 of the
+// several hundred positional citations in this directory resolve.
+//
+// So the ratchet is on the SET, not on the counts. Counts in the undeclared
+// files move every few minutes under other agents, and a count assertion would
+// go red on prose this lane must not edit -- a guard that fails for reasons its
+// owner cannot fix is a guard that gets deleted, which costs more than the
+// coverage it was protecting.
+//
+// What this DOES catch is the thing nobody would otherwise notice: A NEW
+// DOCUMENT APPEARING IN THIS DIRECTORY, FULL OF CITATIONS, CHECKED BY NOTHING.
+// That is how the gap grows -- not by anyone deciding to skip verification, but
+// by a file being added while the guard's denominator quietly stays the same.
+const DECLARED_UNCOVERED = [
+  'ARCHITECTURE-SECURITY-REVIEW.md',
+  'IMPLEMENTATION-REVIEW.md',
+  'READABILITY-REVIEW.md',
+  'REVIEWER-BRIEF.md',
+  'browser-render-verification.md',
+  'demo-spec.md',
+  'design/demo-ux.md',
+  'perf-baseline.md',
+  'prefix-cache-verification.md',
+];
+
+test('every citing document in this directory is either checked or declared unchecked', () => {
+  const DIR = 'examples/serving-dashboard/';
+  const owned = new Set(OWNED_DOCS.map((p) => p.slice(DIR.length)));
+
+  const citing = [];
+  for (const rel of shippedPaths()) {
+    // `shippedPaths()` is relative to THIS directory, not the repository root.
+    // The first version prefixed-matched it against the repo-root path and
+    // found nothing -- and would have reported a perfectly clean gap over an
+    // empty scan had the anti-vacuity floor below not refused it.
+    if (!rel.endsWith('.md')) continue;
+    const n = [...shippedFile(DIR + rel).matchAll(ANY_CITATION)].length;
+    if (n > 0) citing.push({ rel, n });
+  }
+
+  // Anti-vacuity. If `shippedPaths()` ever returns nothing matching, every
+  // assertion below passes over an empty list and reports a clean gap -- the
+  // failure mode this whole file exists to refuse.
+  assert.ok(
+    citing.length >= 10,
+    `found only ${citing.length} citing document(s) in ${DIR}; the scan has no ` +
+      'subject and its "all declared" verdict would be meaningless',
+  );
+
+  const undeclared = citing
+    .map((d) => d.rel)
+    .filter((rel) => !owned.has(rel) && !DECLARED_UNCOVERED.includes(rel));
+
+  assert.deepEqual(
+    undeclared,
+    [],
+    `${undeclared.length} document(s) in ${DIR} carry source citations that ` +
+      `NOTHING verifies and that this file does not admit to skipping:\n  ` +
+      undeclared.join('\n  ') +
+      '\n\nAdd each to OWNED_DOCS (it gets checked) or to DECLARED_UNCOVERED ' +
+      '(it does not, and this file says so out loud). Do not leave it in ' +
+      'neither list: that is the state where the gap grows without anyone ' +
+      'choosing it.',
+  );
+
+  // Reported, not asserted. The number is the honest denominator behind every
+  // green run of this file, and it belongs in the output rather than in a
+  // comment that drifts.
+  const checkedCount = citing.filter((d) => owned.has(d.rel)).reduce((a, d) => a + d.n, 0);
+  const skippedCount = citing.filter((d) => !owned.has(d.rel)).reduce((a, d) => a + d.n, 0);
+  console.log(
+    `\n  citation coverage: ${checkedCount} checked across ${owned.size} owned ` +
+      `document(s); ${skippedCount} NOT checked across ${citing.length - owned.size} ` +
+      `declared-uncovered document(s).\n`,
   );
 });
