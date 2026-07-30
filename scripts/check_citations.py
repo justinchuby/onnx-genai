@@ -83,6 +83,65 @@ DEFINITION_PATTERNS = [
     r"^#+\s*{sym}\s*$",                     # markdown heading (exact)
 ]
 
+# Inverted forms of the STRONG definition patterns above, used to build a
+# repo-wide index of "which files define a symbol of this name".
+#
+# WHY ONLY THE STRONG FORMS: the loose patterns above (`{sym}:` and `{sym} =`)
+# are correct for CONFIRMING a named symbol but useless for DISCOVERING names --
+# inverted, they match every struct field, every object key and every
+# assignment in the repository, and an index full of noise cannot distinguish
+# a genuine ambiguity from a coincidence. Ambiguity is only interesting for
+# named entities that a sentence can be *about*.
+DEFINITION_CAPTURE = [
+    re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+(\w+)\b"),
+    re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|union|type|mod|macro_rules!)\s+(\w+)\b"),
+    re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(?:mut\s+)?(\w+)\s*:"),
+    re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:const|let|var|function|class)\s+(\w+)\b"),
+    re.compile(r"^\s*def\s+(\w+)\b"),
+]
+
+INDEXED_SUFFIXES = (".rs", ".py", ".js", ".css", ".html", ".toml", ".sh")
+
+# Above this many definitions, a name is a LANGUAGE CONVENTION rather than a
+# confusable: `main` is defined in 92 files here, `load` in 22. Nobody reads
+# `main.rs::main` and wonders which `main` is meant, so reporting those buries
+# the two- and three-way collisions that are genuinely mistakable -- and a
+# checker that cries wolf gets its assertions loosened, which is how a
+# safeguard dies. The danger is a SMALL number of same-named owners, which is
+# precisely the shape that produced this check: `resource_snapshot` on
+# EngineDriver and on Engine, in two crates, both real, one meant.
+AMBIGUITY_MAX_OWNERS = 3
+
+
+def definition_index(repo: Path, tracked: set[str]) -> dict[str, set[str]]:
+    """symbol -> {files that define it}. One pass over tracked sources.
+
+    This exists to answer a question the per-citation check structurally
+    cannot. `driver.rs::resource_snapshot` resolves perfectly AND a different
+    `resource_snapshot` exists in another crate. The citation is correct; a
+    sentence naming the wrong owning type beside it is not -- and nothing in a
+    resolve-then-confirm check can see that, because both halves pass.
+
+    Reporting the collision is the most a citation harness can do here. It
+    cannot know which one the prose meant. It can only refuse to let the author
+    believe the question was asked and answered.
+    """
+    index: dict[str, set[str]] = {}
+    for rel in tracked:
+        if not rel.endswith(INDEXED_SUFFIXES):
+            continue
+        try:
+            text = (repo / rel).read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            for pat in DEFINITION_CAPTURE:
+                m = pat.match(line)
+                if m:
+                    index.setdefault(m.group(1), set()).add(rel)
+                    break
+    return index
+
 
 @dataclass
 class Citation:
@@ -185,8 +244,18 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
             c for c in candidates
             if find_definition((repo / c).read_text(errors="replace"), symbol) is not None
         ]
-        if len(defining) >= 1:
+        if len(defining) == 1:
             return defining[0]
+        if len(defining) > 1:
+            # Several candidates define it. Returning one would be a GUESS
+            # wearing the costume of a content check -- the caller cannot tell
+            # a decided answer from an arbitrary one. Prefer the non-test file
+            # so the AMBIGUOUS_SYMBOL report names something useful, and let
+            # that report -- not this silent pick -- carry the uncertainty.
+            non_test_defining = [
+                d for d in defining if "/tests/" not in d and not d.endswith("tests.rs")
+            ]
+            return (non_test_defining or defining)[0]
     # Ambiguous and undecidable by content: prefer src/ over tests/ so the
     # reported failure names the file the author most plausibly meant.
     non_test = [c for c in candidates if "/tests/" not in c and not c.endswith("tests.rs")]
@@ -195,6 +264,7 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
 
 def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     tracked = tracked_files(repo)
+    index = definition_index(repo, tracked)
     anchored, positional, mentions, continuations = extract(doc)
     failures: list[Failure] = []
     # Non-fatal observations. A deictic citation is a real defect but a slow
@@ -226,6 +296,20 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                     c,
                     f"'{real}' is tracked, but defines no '{c.symbol}'. The "
                     f"file is the right one; the symbol was renamed or removed.",
+                )
+            )
+            continue
+        owners = index.get(c.symbol, set())
+        if 2 <= len(owners) <= AMBIGUITY_MAX_OWNERS:
+            others = sorted(o for o in owners if o != real)
+            reports.append(
+                Failure(
+                    "AMBIGUOUS_SYMBOL",
+                    c,
+                    f"'{c.symbol}' is also defined in {', '.join(others)}. This "
+                    f"citation resolves correctly to '{real}' -- that is exactly "
+                    f"the danger, because the prose beside it can name the wrong "
+                    f"owner and every check here still passes.",
                 )
             )
 
@@ -359,18 +443,38 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
         # Printed BEFORE the verdict, and printed even when the run is green.
         # A known-unchecked citation that is never mentioned becomes an
         # unknown-unchecked one within a day.
-        print(f"\n--- {len(pending)} non-fatal: deictic citations that inherit "
-              f"their file from neighbouring prose (frozen by ratchet, not yet repaired) ---")
-        for f in pending[:5]:
-            print(f"  {f.citation.doc}:{f.citation.line_no}  {f.citation.raw}")
-        if len(pending) > 5:
-            print(f"  ... and {len(pending) - 5} more")
+        #
+        # GROUPED BY KIND, because a single header over two different defect
+        # classes is the same fault this harness exists to catch: a label that
+        # misdescribes what it covers. These two are not variants of one
+        # problem -- a deictic citation is UNCHECKABLE, an ambiguous symbol is
+        # CHECKED AND STILL INSUFFICIENT -- and they need opposite remedies.
+        groups: dict[str, list[Failure]] = {}
+        for f in pending:
+            groups.setdefault(f.kind, []).append(f)
+        headers = {
+            "CONTINUATION_UNATTRIBUTABLE": "deictic citations that inherit their file from neighbouring "
+                       "prose -- NOT content-checked at all (frozen by ratchet)",
+            "AMBIGUOUS_SYMBOL": "citations whose symbol name is defined in more than one "
+                                "tracked file -- each RESOLVES CORRECTLY, and the prose "
+                                "beside it can still name the wrong owner",
+        }
+        for kind, items in sorted(groups.items()):
+            print(f"\n--- {len(items)} non-fatal [{kind}]: "
+                  f"{headers.get(kind, 'see detail')} ---")
+            for f in items[:5]:
+                print(f"  {f.citation.doc}:{f.citation.line_no}  {f.citation.raw}")
+                if kind == "AMBIGUOUS_SYMBOL":
+                    print(f"      {f.detail}")
+            if len(items) > 5:
+                print(f"  ... and {len(items) - 5} more")
     if not failures:
         print("OK - every anchored citation resolves to a definition that exists.")
         if pending:
-            print(f"NOTE - this OK covers {stats['anchored']} anchored citations. "
-                  f"{len(pending)} deictic citations above are counted, frozen, "
-                  f"and NOT content-checked.")
+            print(f"NOTE - this OK covers {stats['anchored']} anchored citations, and it "
+                  f"means ONLY that each pointer lands on something real. It does NOT "
+                  f"mean the surrounding prose is correct: {len(pending)} citations above "
+                  f"are counted and NOT content-checked.")
         return 0
     by_kind: dict[str, list[Failure]] = {}
     for f in failures:
