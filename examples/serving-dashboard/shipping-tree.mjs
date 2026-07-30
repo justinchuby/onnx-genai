@@ -49,6 +49,60 @@ function git(...args) {
 }
 
 /**
+ * The commit every `shipped()` read resolves against, fixed for this process.
+ *
+ * WHY THIS IS RESOLVED ONCE INSTEAD OF PER CALL
+ * ---------------------------------------------
+ * `HEAD` is not a commit, it is a POINTER, and on a branch fourteen agents are
+ * committing to it moves every twenty to forty seconds. A guard that spells
+ * `HEAD` in ten separate `git show` invocations therefore reads up to ten
+ * DIFFERENT TREES within a single run, and reports the result as one
+ * measurement. That is not a hypothetical: `check-perf-claims` failed in a full
+ * suite run and passed in isolation, and the only difference was that HEAD
+ * moved three times while the suite was executing.
+ *
+ * The failure is invisible in exactly the way that matters. Each individual
+ * read is correct. The bytes are real, the paths resolve, no command errors.
+ * What is destroyed is the ONE property a cross-file check depends on: that
+ * file A and file B were read from the same tree. A check that asserts "the
+ * README quotes the figure the baseline publishes" can read a repaired README
+ * and a stale baseline and report a contradiction that never existed in any
+ * commit.
+ *
+ * Resolving to an immutable SHA at module load costs one `rev-parse` and makes
+ * every read in the process self-consistent. It does not make the answer more
+ * correct — it makes the answer be ABOUT SOMETHING, which is a different and
+ * more basic property, and the one that was missing.
+ *
+ * WHY THE OVERRIDE IS AN ENV VAR AND NOT AN ARGUMENT
+ * -------------------------------------------------
+ * Reviewers score a named tag (`review-1`) rather than a moving branch. The
+ * override has to reach ten check files that a reviewer runs through
+ * `node --test`, which passes no arguments through to them. An environment
+ * variable is the only channel that exists, and it costs a caller nothing:
+ *
+ *   SHIPPING_TREE_REF=review-1 node --test './*.test.js'
+ *
+ * An unresolvable ref throws HERE, at load, naming itself — rather than
+ * surfacing later as a confusing per-file "path does not exist in HEAD".
+ */
+export const SHIPPING_REF = (() => {
+  const requested = process.env.SHIPPING_TREE_REF?.trim() || 'HEAD';
+  try {
+    return git('rev-parse', requested);
+  } catch {
+    throw new Error(
+      `SHIPPING_TREE_REF is set to '${requested}', which this repository cannot ` +
+        `resolve to a commit.\n` +
+        `  Checks read their inputs from that commit, so there is nothing to read ` +
+        `and no honest result to report.\n` +
+        `  Unset it to score the current HEAD, or name a ref that exists ` +
+        `(e.g. a review tag).`,
+    );
+  }
+})();
+
+/**
  * Describe the tree this file physically lives in.
  *
  * Every field is resolved with `cwd: HERE` — the directory of THIS MODULE, not
@@ -61,6 +115,11 @@ export function describeTree() {
     branch: git('rev-parse', '--abbrev-ref', 'HEAD'),
     head: git('rev-parse', '--short', 'HEAD'),
     detached: git('rev-parse', '--abbrev-ref', 'HEAD') === 'HEAD',
+    // The commit checks actually READ, which is not necessarily `head`: it is
+    // pinned at load and can be overridden. A failure report that names only
+    // HEAD would send the reader to the wrong tree whenever they differ.
+    ref: SHIPPING_REF,
+    refIsOverridden: Boolean(process.env.SHIPPING_TREE_REF?.trim()),
   };
 }
 
@@ -104,10 +163,13 @@ export function describeTree() {
  * @returns {string} the file's bytes as committed at HEAD.
  */
 export function shipped(rel) {
-  // The `./` is load-bearing: `git show HEAD:<path>` resolves from the REPO
+  // The `./` is load-bearing: `git show <ref>:<path>` resolves from the REPO
   // ROOT, not the cwd, so a bare relative path silently resolves to nothing.
-  // `HEAD:./<path>` is the form that honours `cwd`.
-  return execFileSync('git', ['show', `HEAD:./${rel}`], {
+  // `<ref>:./<path>` is the form that honours `cwd`.
+  //
+  // SHIPPING_REF is a resolved SHA, never the literal 'HEAD'. See its docstring:
+  // spelling 'HEAD' here would let a single run read several different trees.
+  return execFileSync('git', ['show', `${SHIPPING_REF}:./${rel}`], {
     cwd: HERE,
     maxBuffer: 64 * 1024 * 1024,
   }).toString();
@@ -122,7 +184,9 @@ export function shipped(rel) {
  */
 export function assertShippingTree() {
   const tree = describeTree();
-  const where = `worktree ${tree.toplevel}\n  branch   ${tree.branch}\n  HEAD     ${tree.head}`;
+  const where =
+    `worktree ${tree.toplevel}\n  branch   ${tree.branch}\n  HEAD     ${tree.head}` +
+    (tree.refIsOverridden ? `\n  reading  ${tree.ref} (SHIPPING_TREE_REF)` : '');
 
   // MUTATION-TESTING ESCAPE HATCH, OPT-IN AND LOUD.
   //
@@ -149,6 +213,33 @@ export function assertShippingTree() {
         `  Valid for mutation testing only. Never quote it as a property of the branch.\n`,
     );
     return tree;
+  }
+
+  // An overridden ref is checked on ITS OWN merits, not HEAD's.
+  //
+  // Everything below this line validates the tree the process is STANDING IN.
+  // Once SHIPPING_TREE_REF is set, that is no longer the tree the checks READ,
+  // and the two can disagree: a reviewer standing on a perfectly good HEAD can
+  // point the checks at a ref from another branch entirely. HEAD would pass,
+  // every content assertion would describe an artefact nobody is merging, and
+  // nothing would say so. Provenance has to follow the bytes.
+  if (tree.refIsOverridden) {
+    let containing = '';
+    try {
+      containing = git('branch', '--contains', tree.ref, '--format=%(refname:short)');
+    } catch {
+      containing = '';
+    }
+    const branches = containing.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (!branches.includes(SHIPPING_BRANCH)) {
+      throw new Error(
+        `SHIPPING_TREE_REF resolves to ${tree.ref}, which is not contained in ` +
+          `'${SHIPPING_BRANCH}'.\n  ${where}\n  contained in: ${branches.join(', ') || '(no local branch)'}\n\n` +
+          `Pinning to a review tag is the right way to score this repo, but the ` +
+          `tag has to be on the branch we ship. Every result below would ` +
+          `describe an artefact nobody is merging.`,
+      );
+    }
   }
 
   if (tree.detached) {
