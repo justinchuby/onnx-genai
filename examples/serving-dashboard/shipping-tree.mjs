@@ -124,6 +124,33 @@ export function assertShippingTree() {
   const tree = describeTree();
   const where = `worktree ${tree.toplevel}\n  branch   ${tree.branch}\n  HEAD     ${tree.head}`;
 
+  // MUTATION-TESTING ESCAPE HATCH, OPT-IN AND LOUD.
+  //
+  // This crew's ratified way to prove a guard works is: mutate, commit, observe
+  // RED. For any guard that reads HEAD, that must happen in a throwaway
+  // detached worktree -- and the commit is then, BY CONSTRUCTION, not contained
+  // in the shipping branch. So this containment check threw FIRST, before any
+  // assertion ran, and produced a red that had nothing to do with the guard
+  // under test.
+  //
+  // That is the worst failure available to a verification method: IT RETURNS
+  // THE EXPECTED ANSWER FOR THE WRONG REASON. Two of my own mutations "passed"
+  // this way before I read the failure text instead of the exit status. A red
+  // you cannot attribute is not evidence, and this one was byte-indistinguish-
+  // able from the red I was hoping for.
+  //
+  // Opt-in, env-gated, and it announces itself on stderr on EVERY run, so a
+  // result produced under it cannot be quoted as a normal one.
+  if (process.env.SHIPPING_TREE_ALLOW_DETACHED === '1') {
+    process.stderr.write(
+      `⚠️  SHIPPING_TREE_ALLOW_DETACHED=1 — provenance check BYPASSED.\n` +
+        `  ${where}\n` +
+        `  This result describes an artefact that is NOT on the shipping branch.\n` +
+        `  Valid for mutation testing only. Never quote it as a property of the branch.\n`,
+    );
+    return tree;
+  }
+
   if (tree.detached) {
     // Content-addressed: is this commit actually ON the shipping branch?
     let containing = '';
