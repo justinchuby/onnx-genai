@@ -34,7 +34,27 @@ const repoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
   encoding: 'utf8',
 }).trim();
 
-const readme = readFileSync(join(demoDir, 'README.md'), 'utf8');
+// Every claim here is a claim about WHAT SHIPS, so read the committed bytes.
+// This used to `readFileSync` the working tree, which reads correctly and means
+// the wrong thing -- and the two are indistinguishable whenever the tree is
+// clean, which is exactly when you are most likely to trust the result. The
+// permitted failure is one-directional and it is the bad direction: a broken
+// citation still in HEAD but repaired only on disk scores GREEN, and the repair
+// evaporates on the next checkout. A reviewer clones HEAD. So does CI.
+//
+// It matters more here than almost anywhere else in this suite, because THIS
+// tree is shared and usually dirty with other agents' work: resolving a
+// citation against someone else's uncommitted edit can certify a line number
+// that has never existed on the branch.
+function shippedFile(relFromRoot) {
+  return execFileSync('git', ['show', `HEAD:${relFromRoot}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+const readme = shippedFile('examples/serving-dashboard/README.md');
 
 // Citations are resolved by BASENAME, so the inventory must cover every kind of
 // file the README argues from -- not just Rust. An earlier version tracked only
@@ -43,7 +63,9 @@ const CITED_EXTENSIONS = ['rs', 'js', 'css', 'html', 'sh'];
 
 const trackedSourceFiles = execFileSync(
   'git',
-  ['ls-files', ...CITED_EXTENSIONS.map((ext) => `*.${ext}`)],
+  // `ls-tree HEAD`, not `ls-files`: the index can contain a file that HEAD does
+  // not, so a citation into a newly-added-but-uncommitted file would resolve.
+  ['ls-tree', '-r', '--name-only', 'HEAD'],
   {
     cwd: repoRoot,
     encoding: 'utf8',
@@ -51,7 +73,8 @@ const trackedSourceFiles = execFileSync(
   },
 )
   .split('\n')
-  .filter(Boolean);
+  .filter(Boolean)
+  .filter((f) => CITED_EXTENSIONS.some((ext) => f.endsWith(`.${ext}`)));
 
 const byBasename = new Map();
 for (const path of trackedSourceFiles) {
@@ -63,7 +86,7 @@ for (const path of trackedSourceFiles) {
 const lineCounts = new Map();
 function lineCountOf(path) {
   if (!lineCounts.has(path)) {
-    lineCounts.set(path, readFileSync(join(repoRoot, path), 'utf8').split('\n').length);
+    lineCounts.set(path, shippedFile(path).split('\n').length);
   }
   return lineCounts.get(path);
 }
@@ -531,5 +554,71 @@ test('a cited line still sits beside the symbol the prose names', () => {
     `Only ${checked} citations were anchor-checked, down from 36. This test ` +
       `verifies nothing it cannot anchor, so a drop here means coverage ` +
       `evaporated rather than that the README improved.`,
+  );
+});
+
+// A citation that resolves to the WRONG FILE is worse than one that resolves to
+// nothing. A dead link tells the reader "this is stale" in one click; a bare
+// basename that matches several tracked files lands them on REAL CODE IN THE
+// WRONG CRATE, where every line looks plausible and nothing announces the
+// error. They then conclude the DOCS ARE WRONG ABOUT THE DESIGN rather than
+// that the docs are stale -- a strictly worse outcome that costs strictly more
+// to discover.
+//
+// The existing checks in this file resolve by basename and are satisfied by ANY
+// match, so they were green over ten citations that named a file in a crate the
+// sentence was not about. `governor.rs` was the sharp one: two crates have one,
+// both plausible in context.
+//
+// Reported by @1cb42f0e from @e00032a4's checker; re-measured here rather than
+// taken on the report, and the report's one DEAD path had already been fixed by
+// the time I looked -- which is itself the argument for a standing guard
+// instead of a periodic sweep.
+test('every source path the README cites resolves to exactly one tracked file', () => {
+  const ambiguous = [];
+  const dead = [];
+  const seen = new Set();
+
+  for (const match of readme.matchAll(ANY_CITATION)) {
+    const cited = match[1];
+    if (!cited || seen.has(cited)) continue;
+    seen.add(cited);
+    const candidates = cited.includes('/')
+      ? trackedSourceFiles.filter((f) => f === cited || f.endsWith(`/${cited}`))
+      : trackedSourceFiles.filter((f) => basename(f) === cited);
+    if (candidates.length === 0) dead.push(cited);
+    else if (candidates.length > 1) {
+      ambiguous.push(`${cited} -> ${candidates.length} files: ${candidates.slice(0, 3).join(', ')}`);
+    }
+  }
+
+  // VACUITY FLOOR. Every list below is empty if the matcher stops matching, and
+  // an empty offender list is exactly what success looks like. Prove we
+  // inspected something before believing we found nothing.
+  assert.ok(
+    seen.size >= 20,
+    `only ${seen.size} distinct source paths were extracted from the README; ` +
+      'the citation matcher has drifted and this test is passing vacuously.',
+  );
+
+  assert.deepEqual(
+    dead,
+    [],
+    `${dead.length} README citation(s) name a file that is not tracked at HEAD. ` +
+      'A reviewer clicking these gets nothing:\n  ' +
+      dead.join('\n  '),
+  );
+  assert.deepEqual(
+    ambiguous,
+    [],
+    `${ambiguous.length} README citation(s) use a BARE BASENAME that matches ` +
+      'more than one tracked file, so a reader cannot tell which crate is ' +
+      'meant and will land in the wrong one without being told.\n  ' +
+      ambiguous.join('\n  ') +
+      '\n\nReplacement: write the FULL PATH from the repository root, and let ' +
+      'the prose name the symbol. Do NOT fix this by correcting the line ' +
+      'number -- the line number is the part that rots, and a repaired one is ' +
+      'stale again by the next commit. The path plus a symbol name survives ' +
+      'every rebase.',
   );
 });

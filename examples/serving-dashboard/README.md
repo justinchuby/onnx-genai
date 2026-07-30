@@ -401,7 +401,7 @@ directions**, each time expecting something different:
 | --- | --- |
 | Prefix caching on the batching server | The paged KV cache owns *both* the page table and the prefix trie. Bypass the cache and you bypass the trie — one cause, two symptoms. |
 | A `preempted` state in the swimlane | Dead on **both** profiles, for four independent reasons — any one sufficient. Batching: `batched.rs:759` hardcodes `PreemptionPolicy::Disabled` (`:713-717` calls it structural — a batch owns its KV in physical rows that cannot be swapped out and resumed in place), and more decisively, `ContinuousBatchManager` (`batched.rs:101-110`) **has no scheduler field at all**, so the component that could preempt is not present. Dynamic: the server enters via the single-request FCFS path, and its driver runs generations serially, so there is never a second sequence to preempt. |
-| A memory-pressure knob that shrinks the KV budget | Not merely ineffective — **unreachable**. `EngineConfig::from_yaml` is the only code that can set a KV limit or flip `allow_runtime_override`, and it has **no callers outside its own unit tests**. The server builds its config at `cli.rs:127-133` from two fields plus `..Default::default()`, so `allow_runtime_override` is always `false` (`config.rs:602`). There is no flag, file, or env var that reaches it. |
+| A memory-pressure knob that shrinks the KV budget | Not merely ineffective — **unreachable**. `EngineConfig::from_yaml` is the only code that can set a KV limit or flip `allow_runtime_override`, and it has **no callers outside its own unit tests**. The server builds its config at `cli.rs:127-133` from two fields plus `..Default::default()`, so `allow_runtime_override` is always `false` (`crates/onnx-genai-engine/src/config.rs`). There is no flag, file, or env var that reaches it. |
 
 Three features, three investigations, one root cause. That is not bad luck —
 **it is a single architectural property expressing itself repeatedly**, and
@@ -512,7 +512,7 @@ is what the page reports — including an unflattering one.
 
 The most convincing wrong number available to this project is
 `onnx_genai_batch_size_current`. It is `fetch_add(1)` in
-`GenerationMetrics::start()` and decremented on drop (`metrics.rs:115`,
+`GenerationMetrics::start()` and decremented on drop (`crates/onnx-genai-server/src/metrics.rs`,
 `:156`), so it counts **generations in flight across the whole process** — it
 has no connection to `ContinuousBatchManager` and cannot see the engine's real
 batch. With `--max-batch 4`, eight concurrent requests make it read **8** while
@@ -529,7 +529,7 @@ and the engine's true batch size as **unavailable**, because nothing exposes it.
 
 ⚠️ **Do not derive queueing from `/v1/status`'s `batch_utilization`.** It is a
 genuine measurement — `current_batch_size / effective_batch_capacity()`, where
-the capacity is `max_batch.min(max_queue_depth)` (`state.rs:205`), which is
+the capacity is `max_batch.min(max_queue_depth)` (`crates/onnx-genai-server/src/state.rs`), which is
 correctly *tighter* than `max_batch` alone. But it is **clamped to `1.0`** by
 `batch_utilization` (`admin.rs:80`). The clamp is well-reasoned for a multi-model node, where
 in-flight work legitimately exceeds any single batch. It also means the value
@@ -547,8 +547,8 @@ come from the same scope.*
 
 | term | scope |
 |---|---|
-| `current_batch_size` (numerator) | the **process-global** registry (`metrics.rs:82`) — sums every generation on the node, across every loaded model and every driver |
-| `effective_batch_capacity()` (denominator) | **one config's** batch ceiling (`state.rs:205`) |
+| `current_batch_size` (numerator) | the **process-global** registry (`crates/onnx-genai-server/src/metrics.rs`) — sums every generation on the node, across every loaded model and every driver |
+| `effective_batch_capacity()` (denominator) | **one config's** batch ceiling (`crates/onnx-genai-server/src/state.rs`) |
 
 **The numerator can therefore legitimately exceed the denominator**, which is
 exactly what the clamp in `batch_utilization` (`admin.rs:80`) exists to absorb. Rendered as `n of m`
@@ -894,8 +894,8 @@ restores anything**:
 
 | | branch | what it does |
 |---|---|---|
-| **1** | `runtime.rs:1040` — taken when `uses_token_prefix_cache()` | Scans cached token sequences with `common_prefix_len` and keeps the longest overlap. **It never touches the page table and materialises no KV.** No prefill is skipped. |
-| **2** | `runtime.rs:1048` — the `else if` | `prefix_cache.lookup_shared(…, &mut page_table)` — the real one. Matches pages and materialises them, so prefill genuinely shrinks. |
+| **1** | `crates/onnx-genai-engine/src/engine/runtime.rs` — taken when `uses_token_prefix_cache()` | Scans cached token sequences with `common_prefix_len` and keeps the longest overlap. **It never touches the page table and materialises no KV.** No prefill is skipped. |
+| **2** | `crates/onnx-genai-engine/src/engine/runtime.rs` — the `else if` | `prefix_cache.lookup_shared(…, &mut page_table)` — the real one. Matches pages and materialises them, so prefill genuinely shrinks. |
 
 **Branch 1 wins first, and it wins for our models.**
 `uses_token_prefix_cache()` is `has_runner() || is_windowed()`
@@ -923,7 +923,7 @@ This predicts every number we measured, which is why it settles the question:
 scatter profile the counter records nothing — `prefix_cache_hit_len` is a
 hardcoded literal `0` (`batched.rs:262`, `:486`), passed as the *first*
 positional argument of a call named `with_rng` and read back 300 lines later, so
-the branch that increments hits (`metrics.rs:136`) is **statically dead**. Not
+the branch that increments hits (`crates/onnx-genai-server/src/metrics.rs`) is **statically dead**. Not
 "did not fire" — *cannot*. On the dynamic profile it records *everything*: it
 counts any nonzero match, so the few shared tokens of the chat template make it
 read ~95 % from the very first request, including for prefixes that differ from
@@ -941,7 +941,7 @@ deleted from the codebase.**
 > `generations_completed`, `generations_with_prefix_reuse` and
 > `generation_prefix_reuse_rate` — names that say what the numbers actually
 > count. The registry behind them is still `prefix_cache_lookups` /
-> `prefix_cache_hits` (`metrics.rs:83-86`). **That is the right order to fix it
+> `prefix_cache_hits` (`crates/onnx-genai-server/src/metrics.rs`). **That is the right order to fix it
 > in** — the name a visitor can see was wrong in a way the internal one is not,
 > because nobody reads an atomic and concludes anything about a cache. It does
 > mean a search for "the hit rate field" finds an honest name at the boundary
@@ -1020,12 +1020,12 @@ accounting *ceiling* only, resident KV is never released, and the repository's o
 test says so in its name (`reconfigure_lower_reports_overage_without_evicting`).
 Then it turned out the control **cannot succeed**, which is a different and
 more interesting claim. There *is* a route — `POST /v1/admin/resources/vram-limit`
-(`lib.rs:124`) — and reaching for it is the natural thing to do. It fails at
+(`crates/onnx-genai-server/src/lib.rs`) — and reaching for it is the natural thing to do. It fails at
 three independent points, any one of which is sufficient:
 
 1. It is **admin-gated**, and the demo deliberately ships without
    `--enable-admin-endpoints`, so it is a **404**.
-2. With the flag, the governor refuses: `governor.rs:168` returns
+2. With the flag, the governor refuses: `crates/onnx-genai-engine/src/engine/governor.rs` returns
    `RuntimeOverrideDisabled` unless `allow_runtime_override` is set — a **403**.
 3. That flag is **unsettable**. `EngineConfig::from_yaml` is the only code that
    can enable it, and **it has no callers outside its own unit tests**; the
