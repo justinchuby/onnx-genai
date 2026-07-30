@@ -9,7 +9,7 @@
    diagnostic** to go red; an exit code proves only that something failed. A positive fixture
    without a reachable negative is incomplete.
    Hash or diff the mutated file first: an unchanged file means the mutation never happened, so a
-   green result proves nothing.
+   green result proves nothing. This is more insidious than a false red because it looks robust.
 3. Trace test and production entrypoints to the same implementation and ordering.
 4. Resolve the production consumer and implementation by full path, not basename.
 5. Assert the real dimensions -- identity, order, freshness, scope -- not a correlated proxy.
@@ -17,24 +17,24 @@
 7. Commit, prove object and ancestry, inspect `git show HEAD:<path>` for the counterexample,
    assertion, and implementation, then verify disk and HEAD blob hashes agree.
 
-Run controls before dependent assertions. For zero findings, use synthetic data outside the corpus
-or a definitional occurrence that must exist while the guard matters. The control
-must differ structurally from findings and cross an explicit test boundary, not an exclusion in the
-predicate under test. Never anchor it on a repairable defect.
+Run controls first. For zero findings, use synthetic data outside the corpus or a definitional
+occurrence guaranteed while the guard matters. It must differ from findings and cross an explicit
+test boundary, not a predicate exclusion. Never anchor it on a repairable defect.
 
 ## Six false-green mechanisms observed here
 
 1. **Fixture derives assertion data.** `syntheticBlockTable()` derived `pages_shared` from
-   `refCounts`; window/whole-pool disagreement was inexpressible.
+   `refCounts`; another test shared one variable between input and expectation, comparing a value
+   with itself. Both made divergence inexpressible without a manual probe.
 2. **Test drives a helper; production drives an orchestrator.** Tests awaited `pollOnce()`;
-   production ran `start()`. The tested execution model did not ship.
-3. **Coupled inputs force one branch.** Pairing a path-bearing warning and value made cleanup
-   inevitable and the warning-only bypass unreachable.
+   production ran `start()`.
+3. **Coupled inputs force one branch.** Pairing a path-bearing warning and value made the
+   warning-only bypass unreachable.
 4. **A self-inspecting guard silently narrows its corpus.** It stops looking and reports clean:
    reassurance, not noise.
 5. **An absence assertion lacks anti-vacuity.** "Zero offenders" also passes when nothing ran.
-6. **The oracle asserts a proxy.** Older content `111@3000` overwrote newer `222@2000`; the
-   value rewound while `fetchedAtMs` looked fresher because it measured arrival.
+6. **The oracle asserts a proxy.** `111@3000` overwrote newer `222@2000`; value rewound while
+   `fetchedAtMs` looked fresher because it measured arrival.
 
 ## Oracle-dimension check
 
@@ -47,8 +47,8 @@ timestamp. A timestamp-only oracle is blind.
 
 ## Structural-fix check
 
-Hold a routing observable constant. The path repair kept `safeSame` true while both path flags
-became false. Had `safeSame` flipped, cleanup rerouting -- not an intrinsic fix -- removed the leak.
+Hold routing constant. The path repair kept `safeSame` true while both path flags became false.
+Had it flipped, cleanup rerouting -- not an intrinsic fix -- removed the leak.
 
 ## Corollaries
 
@@ -56,5 +56,5 @@ became false. Had `safeSame` flipped, cleanup rerouting -- not an intrinsic fix 
   Use synthetic data outside the corpus or a permanent definitional occurrence.
 - **Test data must not be indistinguishable from the thing it samples.** A guard scanning its
   own file can report its fixtures as production findings.
-- **Recognising an error shape does not prevent recurrence.** After finding ambiguous `metrics.rs`
-  basenames, the same developer used a basename predicate for a full-path question. Review structure.
+- **Recognition does not prevent recurrence.** After ambiguous `metrics.rs` basenames, the same
+  developer used a basename predicate for a full-path question. Review structure.
