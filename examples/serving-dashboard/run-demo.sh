@@ -189,6 +189,52 @@ require_static_cache() {
     "See examples/serving-dashboard/README.md, 'Getting the models'."
 }
 
+require_tokenizer_assets() {
+  local dir="$1" label="$2" rebuild="$3"
+  local missing=""
+
+  for required in tokenizer.json tokenizer_config.json; do
+    [[ -f "${dir}/${required}" ]] || missing="${missing} ${required}"
+  done
+  [[ -n "${missing}" ]] || return 0
+
+  # scripts/build_qwen.sh names both files in REQUIRED_ARTIFACTS for BOTH
+  # runtime targets, so a directory it produced cannot reach this line. What
+  # reaches it is a directory built before that check existed, or one assembled
+  # by hand, or a MODELS_DIR pointed at another checkout -- and models are
+  # gitignored, so those are the ordinary ways to obtain one.
+  #
+  # This is checked here rather than left to the server because the server does
+  # not treat it as an error. ChatTemplate::from_model_dir
+  # (crates/onnx-genai-ort/src/chat_template.rs:150) returns Ok with a generic
+  # role-tagged DEFAULT_CHAT_TEMPLATE when tokenizer_config.json is absent, and
+  # load_eos_token_ids (crates/onnx-genai-ort/src/tokenizer.rs:103) reads stop
+  # ids from generation_config.json and then tokenizer_config.json, treating
+  # both as optional. Qwen's stop token lives in tokenizer_config.json.
+  #
+  # So the whole run stays green while being wrong: the server starts, /health
+  # answers 200, wait_until_ready prints `ready`, and the dashboard fills in.
+  # The replies are the only symptom -- prompted with the wrong template and
+  # missing the token that ends a turn, they run to the token limit. A visitor
+  # reads that as this model is bad, which is the reading we can least afford.
+  fail "the ${label} model directory is missing tokenizer assets:${missing}" \
+    "" \
+    "  ${dir}" \
+    "" \
+    "tokenizer_config.json carries this model's chat template and its stop" \
+    "token. Without it the server still starts and still answers /health, so" \
+    "this script would report success and the dashboard would look correct." \
+    "Only the replies would be wrong: untemplated, and running to the token" \
+    "limit because nothing tells generation where a turn ends." \
+    "" \
+    "Rebuild the model -- the build script requires these files, so a" \
+    "completed build always has them:" \
+    "" \
+    "  ${rebuild}" \
+    "" \
+    "See examples/serving-dashboard/README.md, 'Getting the models'."
+}
+
 command -v curl >/dev/null 2>&1 || fail "curl is required to check server readiness."
 
 # Check the models BEFORE building. The build is slow, and being told about a
@@ -197,6 +243,10 @@ require_model "${SCATTER_MODEL}" "static-cache (scatter)" \
   "Continuous batching engages ONLY on static-cache models, so this one drives the batching scenario."
 require_model "${DYNAMIC_MODEL}" "dynamic" \
   "The paged KV allocator lives on the dynamic path, so this one drives those scenarios."
+require_tokenizer_assets "${SCATTER_MODEL}" "static-cache (scatter)" \
+  "STATIC_CACHE=1 MAX_SEQ_LEN=4096 OUT_DIR=${SCATTER_MODEL} scripts/build_qwen.sh"
+require_tokenizer_assets "${DYNAMIC_MODEL}" "dynamic" \
+  "OUT_DIR=${DYNAMIC_MODEL} scripts/build_qwen.sh"
 require_static_cache "${SCATTER_MODEL}"
 
 # Check the ports BEFORE starting anything, for the same reason the models are
@@ -271,11 +321,9 @@ cat <<EOF
 
     continuous batching   ${SCATTER_ORIGIN}/demo/?${TOPOLOGY}&scenario=continuous-batching
     paged KV block table  ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=paged-kv
-  There is deliberately no prefix-caching link. Prefix reuse was measured and
-  found absent on both execution paths -- the engine's hit counter fires on
-  every request, including controls that share no prefix -- so the scenario was
-  cut rather than shipped as a tab. The null result ships as evidence inside the
-  KV panel, which is a stronger thing to show than a tab would have been.
+
+  There is deliberately no prefix-caching link: the scenario was cut rather
+  than shipped as a tab. The Prefix cache panel is where that finding lives.
 
   Opening /demo/ without those parameters still works. The scenarios backed by
   the other server then report that it is not configured, rather than quietly

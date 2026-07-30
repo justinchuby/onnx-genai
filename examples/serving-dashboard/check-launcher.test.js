@@ -17,7 +17,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { assertShippingTree } from './shipping-tree.mjs';
@@ -188,4 +190,180 @@ test('every scenario URL we hand a visitor names a scenario that exists', async 
     });
 
   assert.deepEqual(bad, []);
+});
+
+// ---------------------------------------------------------------------------
+// The tokenizer-asset preflight, tested by RUNNING the launcher.
+//
+// Every other test in this file reads run-demo.sh as text. That is the wrong
+// instrument for a guard: a regex over a shell script establishes that a line
+// was typed, not that it executes, not that it executes BEFORE the thing it
+// protects, and not that it stays quiet on a good input. So these arms spawn
+// the real script against synthetic model directories and read its exit status.
+//
+// What the guard is for. run-demo.sh's require_model tests `[[ -d ]]` and
+// nothing more, so it accepts a model directory that scripts/build_qwen.sh
+// would have REJECTED -- build_qwen.sh names tokenizer.json and
+// tokenizer_config.json in REQUIRED_ARTIFACTS for both runtime targets. Models
+// are gitignored, so hand-assembled directories, directories built before that
+// check existed, and a MODELS_DIR aimed at another checkout are the ordinary
+// ways to get one.
+//
+// And the server does not object. ChatTemplate::from_model_dir
+// (crates/onnx-genai-ort/src/chat_template.rs:150) returns Ok with a generic
+// DEFAULT_CHAT_TEMPLATE when tokenizer_config.json is absent; load_eos_token_ids
+// (crates/onnx-genai-ort/src/tokenizer.rs:103) reads stop ids from
+// generation_config.json and then tokenizer_config.json and treats both as
+// optional. The run therefore goes green end to end -- server up, /health 200,
+// `ready` printed, dashboard populated -- and only the replies are wrong. That
+// is the same shape as the static-cache defect the neighbouring guard exists
+// for: nothing errors, nothing is fabricated, and the demo cannot demonstrate
+// the thing it exists to demonstrate.
+
+const SCATTER_DIR = 'qwen2.5-0.5b-scatter-v2';
+const DYNAMIC_DIR = 'qwen2.5-0.5b';
+
+// Build a models directory and run the launcher's preflight against it.
+//
+// Every arm below is engineered to fail during preflight, which is what keeps
+// this bounded: run-demo.sh checks models before ports and ports before
+// `cargo build --release`, so no arm here ever reaches a compiler or a socket.
+function runPreflight({ scatter = [], dynamic = [], staticCache = true }) {
+  const root = mkdtempSync(join(tmpdir(), '1cb-launcher-'));
+  try {
+    for (const [dir, assets] of [[SCATTER_DIR, scatter], [DYNAMIC_DIR, dynamic]]) {
+      mkdirSync(join(root, dir), { recursive: true });
+      for (const asset of assets) writeFileSync(join(root, dir, asset), '{}');
+    }
+    writeFileSync(
+      join(root, SCATTER_DIR, 'inference_metadata.yaml'),
+      staticCache ? 'model:\n  io:\n    static_cache: {}\n' : 'model: {}\n',
+    );
+
+    const run = spawnSync('bash', [join(HERE, 'run-demo.sh')], {
+      cwd: HERE,
+      encoding: 'utf8',
+      env: { ...process.env, MODELS_DIR: root },
+    });
+    return { status: run.status, output: `${run.stdout ?? ''}${run.stderr ?? ''}`, root };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const BOTH_ASSETS = ['tokenizer.json', 'tokenizer_config.json'];
+
+// The positive arm, once per asset and once per model, because "the check
+// fires" and "the check fires for the directory that is actually broken" are
+// different claims -- a guard wired to only one of two model paths passes the
+// first and fails the second, and the dynamic model is the one nothing else in
+// the preflight inspects at all.
+for (const [label, dir, present] of [
+  ['scatter', SCATTER_DIR, { scatter: ['tokenizer.json'], dynamic: BOTH_ASSETS }],
+  ['dynamic', DYNAMIC_DIR, { scatter: BOTH_ASSETS, dynamic: ['tokenizer.json'] }],
+]) {
+  test(`run-demo.sh refuses to launch when the ${label} model has no tokenizer_config.json`, () => {
+    const { status, output } = runPreflight(present);
+
+    assert.equal(
+      status,
+      1,
+      `run-demo.sh exited ${status} for a ${label} model with no ` +
+        `tokenizer_config.json. It must refuse: the server would start, answer ` +
+        `/health, and stream untemplated replies that never stop.\n${output}`,
+    );
+    assert.match(output, /missing tokenizer assets/);
+    assert.match(output, /tokenizer_config\.json/);
+    assert.ok(
+      output.includes(dir),
+      `the refusal must name the offending directory (${dir}) -- with two ` +
+        `models and a MODELS_DIR override, "a model" is not an actionable ` +
+        `answer.\n${output}`,
+    );
+  });
+}
+
+test('run-demo.sh refuses to launch when a model has no tokenizer.json either', () => {
+  const { status, output } = runPreflight({ scatter: [], dynamic: BOTH_ASSETS });
+
+  assert.equal(status, 1, output);
+  assert.match(output, /tokenizer\.json/);
+  assert.match(output, /tokenizer_config\.json/);
+});
+
+// ⚠️ This arm pins a defect the first draft of the guard actually shipped, and
+// it is the one worth keeping. The refusal offers a rebuild command, and a
+// single generic `OUT_DIR=... scripts/build_qwen.sh` is WRONG for the scatter
+// model: without STATIC_CACHE=1 that command overwrites the static-cache export
+// with a dynamic one. The user would follow correct-looking instructions, the
+// directory would refill with the missing files, this check would go quiet, and
+// require_static_cache would then reject the result -- or worse, an older
+// inference_metadata.yaml would survive and the demo would batch nothing.
+//
+// A remedy that destroys the artefact it claims to repair is worse than no
+// remedy, because it carries the authority of the tool that diagnosed it.
+test('the rebuild command offered for the scatter model preserves the static cache', () => {
+  const { output } = runPreflight({ scatter: ['tokenizer.json'], dynamic: BOTH_ASSETS });
+
+  const line = output.split('\n').find((l) => l.includes('scripts/build_qwen.sh'));
+  assert.ok(line, `the refusal must offer a rebuild command.\n${output}`);
+  assert.match(
+    line,
+    /STATIC_CACHE=1/,
+    `the scatter model's rebuild command omits STATIC_CACHE=1, so following it ` +
+      `would replace the static-cache export with a dynamic one and silently ` +
+      `disable the batching scenario this demo exists to show:\n  ${line}`,
+  );
+});
+
+// The negative control, and the reason the arms above mean anything.
+//
+// A guard that refuses EVERY model directory passes all four tests above while
+// making the demo unlaunchable. This arm gives both models complete tokenizer
+// assets and breaks the NEXT check instead: the run must fall through to
+// require_static_cache's message and must never mention tokenizer assets.
+//
+// It is doing two jobs. It proves the guard stays quiet on a good directory,
+// and it proves the guard is REACHED and passed rather than skipped -- because
+// the static-cache error is emitted from a line that runs after it. A check
+// deleted from the script entirely would also produce silence here; only the
+// pairing of this arm with the positive ones tells silence apart from absence.
+test('a model directory with complete tokenizer assets passes the preflight', () => {
+  const { status, output } = runPreflight({
+    scatter: BOTH_ASSETS,
+    dynamic: BOTH_ASSETS,
+    staticCache: false,
+  });
+
+  assert.equal(status, 1, output);
+  assert.doesNotMatch(
+    output,
+    /missing tokenizer assets/,
+    `the tokenizer preflight fired on a directory holding every asset it asks ` +
+      `for. A guard that cannot be satisfied gets deleted, not fixed.\n${output}`,
+  );
+  assert.match(
+    output,
+    /no static-cache declaration/,
+    `expected the run to reach require_static_cache, which runs AFTER the ` +
+      `tokenizer preflight. Not reaching it means this control proves nothing ` +
+      `about whether the preflight was executed at all.\n${output}`,
+  );
+
+  // The claim above -- "which runs AFTER the tokenizer preflight" -- is the
+  // only reason this arm demonstrates reachability, and it is a claim about
+  // the script's ORDER, which no arm here can observe. Moving the preflight
+  // below require_static_cache leaves all five arms green and quietly turns
+  // that sentence into a false one. So pin it. This is a source assertion and
+  // is deliberately the only one in this section: it guards the argument, not
+  // the behaviour.
+  const preflightAt = LAUNCHER.indexOf('\nrequire_tokenizer_assets "');
+  const staticCacheAt = LAUNCHER.indexOf('\nrequire_static_cache "');
+  assert.ok(preflightAt > 0 && staticCacheAt > 0, 'both preflight calls must exist');
+  assert.ok(
+    preflightAt < staticCacheAt,
+    'require_tokenizer_assets must be CALLED before require_static_cache. The ' +
+      'control above infers "the preflight ran" from seeing the static-cache ' +
+      'error, and that inference is only valid in this order.',
+  );
 });
