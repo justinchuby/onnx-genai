@@ -19,7 +19,7 @@ Three sentences, and every decision below descends from them.
 
 1. **The product is credibility.** This page's job is not to look impressive; it is to be *believed*. Every visual affordance that makes a number look more precise than it is costs more than it earns. Design for the skeptic in the third row, not the executive in the first.
 2. **Honesty must be structural, not behavioural.** A rule that says "don't render documented zeros" will be violated by a tired developer at 2am. A telemetry store whose only accessor returns `{value, state, source}` makes the violation *impossible to type*. We are choosing the second. This is the single most important decision in this document.
-3. **Motion is evidence, not decoration.** The only things allowed to animate are things that actually happened: a token arrived, a block was allocated, a sequence was preempted. Any animation not backed by an event is a lie told in the visual channel, where people's defences are lowest.
+3. **Motion is evidence, not decoration.** The only things allowed to animate are things that actually happened: a token arrived, a block was allocated, a request was admitted. Any animation not backed by an event is a lie told in the visual channel, where people's defences are lowest.
 
 ### The one design decision that matters most
 
@@ -542,7 +542,7 @@ export function mount(rootElement, telemetryStore) { /* … */ }
 3. **Never set an interval.** Subscribe to the store; it owns cadence. Canvas repaints coalesce through **one** `requestAnimationFrame`, and the panel must skip painting when `rootElement.hidden` or off-screen (`IntersectionObserver`) — this is most of AC23.
 4. **`unmount()` must be total**: unsubscribe, cancel rAF, disconnect observers, null canvas contexts. AC22's no-memory-growth is won or lost here.
 5. **Never render a raw number.** All values go through `renderField()` / `renderSeries()` from `format.js`. This is the mechanical enforcement of §4 — it is not stylistic advice.
-6. **`describe()` returns a plain-English sentence** of the panel's current state, used for the chart `aria-label` (AC28) and by the narration system. Example: `"KV memory: 318 of 512 blocks in use, 96 shared. Slot fill 90.4%. Preemptions not measurable yet."` Writing this well is the difference between an accessible page and a compliant one.
+6. **`describe()` returns a plain-English sentence** of the panel's current state, used for the chart `aria-label` (AC28) and by the narration system. Example: `"KV memory: 318 of 512 blocks in use, 96 shared. Slot fill 90.4%. Engine batch size not measurable."` Writing this well is the difference between an accessible page and a compliant one.
 7. **Class names are `panel-<id>__element--modifier`.** `panel-kv-memory__grid`, `panel-kv-memory__cell--shared`. No panel may style another panel, and no panel may define a token.
 
 ### 3.4 The DOM the shell guarantees
@@ -619,8 +619,8 @@ Three rules about the treatment:
 
 <!-- unavailable -->
 <span class="value" data-state="unavailable" data-source="server"
-      tabindex="0" role="button" aria-describedby="tip-preempt"
-      aria-label="Preemptions: not measurable yet. The scheduler has no preemption counter today.">
+      tabindex="0" role="button" aria-describedby="tip-batchsize"
+      aria-label="Engine batch size: not measurable. No endpoint exposes the engine's actual batch size; what you can see is requests in flight.">
   <span class="value__num value__num--unavailable" aria-hidden="true">—</span>
   <span class="value__unit">count</span>
 </span>
@@ -668,8 +668,10 @@ Reference copy, to be used verbatim:
 |---|---|
 | `kv.*` (introspection off) | "KV page statistics are computed by the engine but not yet exposed over HTTP. `Engine::page_usage()` exists; the server does not call it." |
 | `kv.*` (debug gated) | "Requires debug endpoints. Restart the server with `--enable-debug-endpoints`." |
-| `scheduler.preemptions_total` | "The scheduler performs preemption but keeps no counter for it. Not measurable today." |
-| `scheduler.batch_occupancy` | "Occupancy needs the server's max batch size, which isn't surfaced. The current batch size is real; the denominator isn't." |
+| ~~`scheduler.preemptions_total`~~ | 🔴 **STRUCK — FIELD DROPPED, AND THIS COPY WAS FALSE.** It claimed *"the scheduler performs preemption but keeps no counter for it."* **`ContinuousBatchManager` has no `Scheduler` field at all** — preemption is not uncounted, the component is **absent**. Bind nothing. See D148. |
+| ~~`scheduler.batch_occupancy`~~ | 🔴 **STRUCK — CONTAINED THE BANNED CLAIM (AC59).** It said *"the current batch size is real; the denominator isn't."* **The numerator is not a batch size either**: `onnx_genai_batch_size_current` is `fetch_add(1)` at the HTTP layer (`metrics.rs:111`/`:145`), counting requests in flight. **Both halves were wrong; only the denominator was ever suspected.** Replacement copy below. |
+| `batch.in_flight` | "Requests in flight at the HTTP layer. This is **not** the engine's batch size — eight simultaneous requests are not eight simultaneous decodes, which is the whole point of this scenario." |
+| `batch.true_size` | "The engine's actual batch size is not exposed by any endpoint. What you can see is how many requests are in flight and how many are waiting." |
 | `throughput.*` from `/v1/status` | "`/v1/status` reports this as a documented zero — the server records cumulative token totals only. This page derives throughput client-side instead." |
 | `server.quantization` | "Quantization is recorded in the model's inference metadata but not exposed by the server." |
 | `request.queue_wait_ms` | "The browser can only observe *sent → first token*. Queue wait and prefill are not separable from the client." |
@@ -692,7 +694,7 @@ A missing *number* is easy. A missing *series* is where a well-meaning dev draws
   │▚▚▚▚▚▚▚▚▚▚▚ NOT MEASURABLE YET ▚▚▚▚▚▚▚▚▚▚▚│
   │▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚│
   ╰──────────────────────────────────────────╯
-     preemptions / min                      ⓘ
+     engine batch size / step               ⓘ
 ```
 
 **Partially unavailable series** (server gained the capability mid-window, or the connection dropped): hatch only the affected time range, real line elsewhere, separated by a **vertical dashed rule** in `--og-unavail-rule`. **Never bridge a gap with a line segment.** Interpolating across a gap fabricates the most convincing kind of false data — data that looks continuous. This is what `Series.gaps: [[startMs, endMs]]` exists for; `renderSeries()` honours it and panels get it for free.
@@ -743,16 +745,17 @@ Every value carries a superscript source chip, `--og-type-2xs`, `--og-fg-subtle`
 
 Not a legal disclaimer. A three-column table, generated **from the same field registry the panels render from**, so it cannot drift:
 
+> 🔴 **THE BLOCK BELOW IS AN ILLUSTRATION OF SHAPE, NOT A LIST OF FIELDS. DO NOT TRANSCRIBE IT.** Under AC54 the only legal source of this table is the profile-keyed registry. An earlier revision of this very block listed **`prefix hits/looks` under WHAT'S REAL** — true on one server, false on the other, and false everywhere once the field was deleted — and listed **`batch size`**, which names a counter that counts something else (AC59). **A hand-written example of a generated table is the most likely thing on this page to be copied by hand**, which is precisely the failure AC54 exists to prevent. Field names below are placeholders.
+
 ```
-WHAT'S REAL                    WHAT'S DERIVED              WHAT ISN'T BUILT YET
-TTFT              server ˢ     aggregate tok/s      ᴰ     paged-attention kernels
-e2e latency       server ˢ     KV utilization %     ᴰ     preemption counter
-prefix hits/looks server ˢ     tokens per step      ᴰ     per-request server state
-queue depth       server ˢ     prefill saved     ~ ᴱ     quantization metadata
-batch size        server ˢ
-KV page usage     server ˢ
-first-token time  client ᶜ
-inter-token gap   client ᶜ
+WHAT'S REAL                     WHAT'S DERIVED               WHAT ISN'T BUILT YET
+TTFT               server ˢ     aggregate tok/s      ᴰ      paged-attention kernels
+e2e latency        server ˢ     KV utilization %     ᴰ      request preemption
+queue depth        server ˢ     requests waiting     ᴰ      per-request server state
+requests in flight server ˢ                                 engine's true batch size
+KV page usage      server ˢ                                 prefix reuse
+first-token time   client ᶜ
+inter-token gap    client ᶜ
 ```
 
 Generating it from the registry is the design decision that matters — a hand-maintained honesty footer is a lie waiting for its second sprint. Above the table, one paragraph in plain language, and the paged-attention statement **verbatim** (AC9), which also appears next to the block table title:
@@ -907,13 +910,14 @@ Per-request rows use the sequence marker + colour + id, tying to swimlanes and b
 │     peak 8 · now 2 ˢ                                          │
 │                                                               │
 │   decode steps/s   214 ᴰ      tokens / decode step   5.8 ᴰ    │
-│   preemptions        — ⓘ      rejections               0 ˢ    │
+│   engine batch size  — ⓘ      rejections               0 ˢ    │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-**Batch occupancy is the trap in this panel.** Occupancy is a *ratio*, and `recon-map.md` §7.4 says the denominator (`max_batch`) is not surfaced. The numerator is real. So: when `max_batch` is unavailable, render the **absolute count** as a real number with its sparkline, and render the **percentage** as an em-dash. Do not assume `DEFAULT_MAX_BATCH = 4` from reading `state.rs:25` — the server may have been built or configured differently, and a hard-coded denominator is a fabricated measurement wearing a division sign. This is the subtlest AC6 violation available on the page and it is worth calling out by name in review.
+**Batch occupancy is the trap in this panel — and the trap is WORSE than this section originally claimed.** I wrote that the denominator (`max_batch`) is unsurfaced while *"the numerator is real."* 🔴 **The numerator is not real either.** `onnx_genai_batch_size_current` is `fetch_add(1)` in `GenerationMetrics::start()` (`metrics.rs:111`/`:145`), decremented on `Drop` — it counts **generation requests in flight at the HTTP layer**, with no connection to `ContinuousBatchManager`. So the "occupancy" ratio was **a fabricated denominator under a mislabelled numerator, and only the denominator was ever suspected.** Render `batch.in_flight` as an absolute count labelled **"requests in flight"**, `batch.queued` as `max(0, in_flight − max_batch)` (derived), and the engine's true batch size as `unavailable`. **Never the words "batch size" for either (AC59).** Do not assume `DEFAULT_MAX_BATCH = 4` from `state.rs:25` — a hard-coded denominator is a fabricated measurement wearing a division sign.
 
-`rejections: 0` and `preemptions: —` sitting adjacent is the clearest teaching example of §4 anywhere in the UI: one is a real, good zero; the other is an absence. Their visual difference is the entire thesis, on one line. Worth screenshotting for the README.
+`rejections: 0` and `engine batch size: —` sitting adjacent is the clearest teaching example of §4 anywhere in the UI: one is a real, good zero; the other is an absence. Their visual difference is the entire thesis, on one line. Worth screenshotting for the README.
+> **This pairing replaces an earlier one that used `preemptions: —`, dropped when preemption was ruled out entirely (D148). The replacement is strictly better teaching: the engine's true batch size is absent *in the very panel whose headline claim is about batching*, so the visitor learns the distinction where it costs us something to admit — rather than about a subsystem they had no reason to expect.**
 
 `allocation_failures > 0` renders in `--og-bad` with an alarm affordance — the KV crate's own comment says a run with failures is thrashing, and the page should say so too.
 
@@ -3368,3 +3372,36 @@ Two corrections to the report, because the difference changes the fix:
 | D145 | Panels branch on `state` only; `classification` is registry/copy-only | `classification` is input, `state` is output; consuming an input reaches around the contract |
 | D146 | The extra classification detail is a CONTRIBUTOR signal, not a visitor one | There is no sixth glyph; routing it to panels grows the vocabulary silently |
 | D147 | `byOrigin` on `kv.*`/`batch.*` is a DATA gap, not an engineering gap; direction from the incrementing code | All 5 existing overrides sit on deleted prefix fields; a missing dimension never announces itself |
+
+---
+
+## 50. APPLYING THE DROP RULINGS AT THE POINT OF USE (D148–D149)
+
+Two rulings landed that invalidate copy inside this document: **`preempted_total`/`sessions.paused` DROPPED, final** (`ContinuousBatchManager` has no `Scheduler` field — preemption is not disabled, the component is *absent*), and **AC59: never the words "batch size" in UI copy**, because `onnx_genai_batch_size_current` is `fetch_add(1)` at the HTTP layer.
+
+**Per D131 I applied these AT THE POINT OF USE, not as a section at the end.** Appending a correction to a 2,700-line spec and calling it done is how §13(f) shipped a reversed instruction for four hours. Six sites edited in place: the verbatim `reason` table (§4.2), the treatment markup example, the unavailable-series sketch, the honesty footer block, the Scenario A panel, and the `describe()` example.
+
+### 50.1 🔴 D148 — THE STRUCK COPY WAS NOT MERELY STALE, IT WAS FALSE
+
+The dropped row in §4.2 read: *"The scheduler performs preemption but keeps no counter for it."* **That sentence asserts a capability that does not exist.** It was written to explain an absence and it invented a *different* absence — a scheduler that preempts silently, rather than no scheduler at all.
+
+- **D148:** **copy that explains why a number is missing is itself an unverified claim about the system, and it is the LEAST likely claim on the page to be audited** — because it sits in the `reason` field, which reviewers read as an apology rather than as an assertion. **A wrong number gets challenged; a wrong explanation gets sympathy.** Every `reason` string must cite the same way a value does.
+
+That table is headed *"Reference copy, to be used verbatim."* **Prose marked for verbatim reuse is executable — it is the one kind of writing in this document that a developer is instructed not to think about.** It must be held to the standard of code, and it was not.
+
+### 50.2 🔒 D149 — A NARROW DIVERGENCE FROM AC59'S LITERAL WORDING, DECLARED RATHER THAN TAKEN QUIETLY
+
+AC59 says **never the words "batch size" in UI copy.** The page now renders `engine batch size  — ⓘ`, which contains those words. **That is deliberate and I am flagging it rather than letting a reviewer find it.**
+
+- **The ban's target is the phrase used as a LABEL FOR A VALUE.** `batch size: 8` is the lie, because the 8 is in-flight HTTP requests.
+- **Naming the absent quantity is the opposite act.** Enforced literally, AC59 makes it impossible to say *"we cannot show you the engine's batch size"* — and that sentence is one the demo needs, because the gap between **requests in flight** and **actual batch** is the single most important idea in Scenario A. **Suppressing the term would leave the visitor with only the misleading number and no name for the honest one.**
+- **D149:** the phrase is banned **beside a number** and required **beside an em-dash**. Mechanically: `"batch size"` may appear in the DOM only within an element whose `data-state` is `unavailable`. **That is greppable, so it is enforceable** — @c0de4c2e, this belongs in QA-PLAN §7 as the check, and @376a0297, AC59 wants this one clause or it forbids its own purpose.
+
+### 50.3 The replacement teaching pair is better than the one it replaced
+
+§20's honesty pairing was `rejections: 0` beside `preemptions: —`. It is now `rejections: 0` beside `engine batch size: —`. **The absence now sits in the very panel whose headline claim is about batching** — so the visitor learns the good-zero-vs-absence distinction at the point where admitting it costs us something, instead of about a subsystem they had no reason to expect. **An absence we would rather not mention teaches the thesis better than a convenient one.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D148 | `reason` copy is an unverified claim and must be cited like a value | The struck line invented a scheduler that preempts silently; a wrong number gets challenged, a wrong explanation gets sympathy |
+| D149 | "batch size" banned beside a number, REQUIRED beside an em-dash; greppable via `data-state="unavailable"` | Enforced literally, AC59 would forbid the page from naming the honest quantity it exists to distinguish |
