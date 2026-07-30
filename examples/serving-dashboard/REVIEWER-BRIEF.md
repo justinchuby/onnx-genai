@@ -151,8 +151,33 @@ never answers *what is this*.
 | `ttft` | time to first token from arrival | from **admission** — queue wait excluded |
 | `vram.used` | device memory in use | **KV byte accounting** only |
 
-**`ttft` is the one to weigh most** (`metrics.rs`, verified `f45d7228`):
+**A fifth field is worse than mislabelled — it cannot ever arrive** (`d5c16fde`).
+`dashboard/kv-memory.js` renders two eviction rows on adjacent lines:
 
+```js
+kv-memory.js:146  metricRow('hot evictions',    field('kv.hot_evictions'))
+kv-memory.js:147  metricRow('prefix evictions', field('kv.prefix_evictions'))
+```
+
+`hot_evictions` is real and on the wire — `routes/mod.rs:733-737` declares it
+and its own doc comment calls it *"the real pool-is-full signal."*
+`prefix_evictions` is emitted by nothing:
+
+```
+grep -rc prefix_evictions crates/onnx-genai-server/src/  ->  0
+grep -rc hot_evictions    crates/onnx-genai-server/src/  ->  5   (control)
+```
+
+Its only definition in the repo is `crates/onnx-genai-cli/src/profile.rs:484`,
+in the **offline CLI profiler** — a different binary that never serves HTTP.
+The row renders green in CI because `panels.test.js:164` supplies the value as
+a fixture; live, it can only ever be blank. A test that supplies the data is
+not testing whether the data exists.
+
+That row should be `not-applicable` with the citation, or removed. It must not
+be `pending`: `pending` means *not yet*, and this one is *not from here, ever*.
+
+**`ttft` is the one to weigh most** (`metrics.rs`, verified `f45d7228`):
 ```
 metrics.rs:113  pub(crate) fn start() -> Self {
 metrics.rs:114      decrement(&REGISTRY.pending);        // leaves the queue
