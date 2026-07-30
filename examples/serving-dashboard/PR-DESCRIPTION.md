@@ -1,6 +1,6 @@
 # Serving dashboard demo: an honest view of a live inference server
 
-> **MEASURED-AT: 1e809173**
+> **MEASURED-AT: 37d0d72e**
 > Every number in this document was re-derived at that revision. Any claim you
 > cannot re-run from that revision alone is a defect in this document, not a
 > matter of trust. No tag names appear here: a tag is a mutable pointer to an
@@ -191,6 +191,17 @@ of them taken without reading the other first. This document does not re-run it
 because the machine is at 100% disk and creating a worktree currently fails
 part-way and silently, which is the exact condition that manufactures a
 plausible wrong number.
+
+### A dated document that cites an undated one is not dated
+
+It is a fresh wrapper around an unknown. *(Project Lead)*
+
+This is why the freshness stamp on this file names the shipping revision rather
+than the revision its author happened to be sitting on. A marker pointing at the
+author's desk certifies the author, not the tree. Every figure in this document
+has been re-derived at the stamped revision, and one of them changed when it was:
+a count taken on a working desk read 112 where the shipping tree holds 98. Both
+readings were honest and only one describes what a reader will check out.
 
 ### Where the variance lives
 
@@ -422,8 +433,8 @@ unrepresentable and lets the compiler catch the site nobody reviewed.**
 ### Our prose is not searchable by phrase
 
 ```
-lines ending in a string-concatenation join, telemetry-provenance.js .... 112
-file length ............................................................ 1035
+lines ending in a string-concatenation join, telemetry-provenance.js ..... 98
+file length ............................................................ 1010
 [negative control, freshly generated token] ............................. 0
 ```
 
