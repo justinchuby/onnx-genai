@@ -18,7 +18,11 @@ import {
   describeField,
   FIELD_STATES,
   SOURCE_CLASSES,
+  withoutSourceCitations,
 } from './telemetry-field.js';
+import { readFileSync } from 'node:fs';
+
+import { PROVENANCE } from './telemetry-provenance.js';
 
 test('an absence builder refuses an options object passed as the reason', () => {
   // Found by making this exact mistake while probing describeField. Every
@@ -227,4 +231,100 @@ test('the spoken and the visible channel agree about age', async () => {
         `visible ${JSON.stringify(visible)} vs spoken ${JSON.stringify(spoken)}`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// SOURCE CITATIONS REACH A VISITOR THROUGH TWO CHANNELS. ONE WAS SANITISED.
+//
+// app.js's provenance footer runs `entry.evidence` through a stripper before
+// putting it in the Evidence column. Nothing ran `reason` through anything --
+// and reason is rendered by format.js:227, telemetry-field.js:587 and
+// model-card.js:98. Eight byOrigin reasons carried a raw `file.rs:232-237` all
+// the way to the page.
+//
+// A line number is a coordinate into a tree that moves ~45 seconds per commit.
+// It is useless on a projector and wrong by morning. The FILE is the argument
+// and it stays; the LINE is the half that rots and it goes.
+//
+// Sanitised at the FAN-IN -- the four field constructors -- rather than at the
+// six render sites, because a rule every renderer must remember is discipline
+// and doing it once is construction.
+
+const CITATION = /[A-Za-z0-9_\-/.]+\.(?:rs|js|toml|md):\d+(?:-\d+)?/;
+
+test('the stripper removes the line and keeps the file', () => {
+  assert.equal(
+    withoutSourceCitations('see crates/onnx-genai-server/src/metrics.rs:232-237 for why'),
+    'see crates/onnx-genai-server/src/metrics.rs for why',
+  );
+  // The half that must SURVIVE. Deleting the citation entirely would be the
+  // over-correction: the reason must still say why, and the file is most of it.
+  assert.match(withoutSourceCitations('metrics.rs:232'), /metrics\.rs/);
+});
+
+test('every field constructor that accepts a reason sanitises it', () => {
+  const dirty = 'the counter is wrong, see crates/onnx-genai-server/src/metrics.rs:232-237';
+  const built = {
+    unavailableField: unavailableField(dirty),
+    notApplicableField: notApplicableField(dirty),
+    pendingField: pendingField(dirty),
+    staleField: staleField(measuredField(1, { label: 'x', source: '/v1/status' }), dirty),
+  };
+
+  // Derived, not hardcoded: if a fifth reason-bearing constructor is exported,
+  // this fails until somebody decides whether it sanitises.
+  assert.deepEqual(
+    Object.keys(built).sort(),
+    ['notApplicableField', 'pendingField', 'staleField', 'unavailableField'],
+    'a reason-bearing constructor is missing from this check',
+  );
+
+  for (const [name, field] of Object.entries(built)) {
+    assert.ok(field.reason, `${name} produced no reason at all`);
+    assert.doesNotMatch(
+      field.reason,
+      CITATION,
+      `${name}() puts a source line number on the page`,
+    );
+    assert.match(field.reason, /metrics\.rs/, `${name}() deleted the citation instead of trimming it`);
+  }
+});
+
+test('no reason in the shipped catalogue carries a line number to a visitor', () => {
+  const offenders = [];
+  let reasons = 0;
+  for (const [key, entry] of Object.entries(PROVENANCE)) {
+    for (const [origin, resolved] of Object.entries(entry.byOrigin ?? {})) {
+      if (typeof resolved.reason !== 'string') continue;
+      reasons += 1;
+      const rendered = unavailableField(resolved.reason).reason;
+      if (CITATION.test(rendered)) offenders.push(`${key} [${origin}]`);
+    }
+    if (typeof entry.reason === 'string') {
+      reasons += 1;
+      if (CITATION.test(unavailableField(entry.reason).reason)) offenders.push(key);
+    }
+  }
+
+  // ANTI-VACUITY. A catalogue with no reasons cannot leak one, and this test
+  // would be permanently green over a deleted byOrigin layer.
+  assert.ok(reasons >= 8, `CANNOT RUN: only ${reasons} reasons inspected, expected >= 8`);
+  assert.deepEqual(offenders, [], 'a source line number reaches the rendered reason text');
+});
+
+test('the Evidence column and the reason channel share ONE stripper', () => {
+  // The drift guard. app.js had its own copy of this regex; two sanitisers with
+  // the same job diverge the moment one is fixed, and the divergence is silent
+  // because both still look like they work.
+  const appSource = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  assert.match(
+    appSource,
+    /citationForVisitor\s*=\s*withoutSourceCitations/,
+    'app.js has re-grown its own citation stripper instead of importing the shared one',
+  );
+  assert.doesNotMatch(
+    appSource,
+    /replace\(\s*\/\(\[A-Za-z0-9_/,
+    'app.js carries a second copy of the citation regex',
+  );
 });

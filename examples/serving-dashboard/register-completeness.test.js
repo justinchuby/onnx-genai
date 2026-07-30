@@ -35,6 +35,7 @@ import { readFileSync } from 'node:fs';
 import { PROVENANCE, allFieldKeys, resolveForOrigin } from './telemetry-provenance.js';
 
 const appSource = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+const fieldSource = readFileSync(new URL('./telemetry-field.js', import.meta.url), 'utf8');
 const provenanceSource = readFileSync(
   new URL('./telemetry-provenance.js', import.meta.url),
   'utf8',
@@ -193,19 +194,36 @@ const SHIPPED_STRIPPER = (() => {
   // Anchored on the trailing `, '$1')` rather than on the closing delimiter:
   // the pattern contains an unescaped `/` inside its own character class, so a
   // non-greedy scan to the first `/` truncates it into an invalid expression.
-  const match = appSource.match(/evidence\s*\.replace\(\s*\/(.+)\/([gimsuy]*)\s*,\s*'\$1'\)/);
+  // REPOINTED. The stripper used to live inline in app.js and sanitised the
+  // Evidence column only -- so 8 byOrigin `reason` strings carried a raw
+  // `metrics.rs:232-237` to the page through format.js and model-card.js,
+  // which this suite could not see because it was auditing the wrong channel.
+  // The transform now lives in telemetry-field.js and is applied at the field
+  // constructors, so BOTH channels are covered by one implementation. This
+  // extractor follows it there rather than keeping a copy.
+  const match = fieldSource.match(
+    /return text\.replace\(\s*\/(.+)\/([gimsuy]*)\s*,\s*'\$1'\);/,
+  );
   assert.ok(
     match,
-    'Could not locate the citation stripper in app.js. This assertion is the ' +
-      'non-vacuity guard for every citation test below: if the transform is ' +
+    'Could not locate the citation stripper in telemetry-field.js. This assertion ' +
+      'is the non-vacuity guard for every citation test below: if the transform is ' +
       'renamed or restructured, they must fail loudly rather than silently ' +
       'auditing a regex that no longer ships.',
+  );
+  // And app.js must still CONSUME it rather than re-growing its own. Two
+  // sanitisers with one job drift the moment either is fixed, silently, because
+  // both continue to look like they work.
+  assert.match(
+    appSource,
+    /citationForVisitor\s*=\s*withoutSourceCitations/,
+    'app.js no longer imports the shared citation stripper',
   );
   try {
     return new RegExp(match[1], match[2] || '');
   } catch (cause) {
     throw new Error(
-      `Extracted an unusable pattern from app.js: /${match[1]}/${match[2]}. ` +
+      `Extracted an unusable pattern from telemetry-field.js: /${match[1]}/${match[2]}. ` +
         'The extractor, not the shipped transform, is what needs fixing here.',
       { cause },
     );

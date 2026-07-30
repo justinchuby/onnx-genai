@@ -107,6 +107,23 @@ export const SOURCE_CLASSES = Object.freeze({
 });
 
 /**
+ * Strip `:LINE` and `:LINE-LINE` from source citations, keeping the file path.
+ *
+ * A citation has two halves and they have opposite audiences. The FILE is the
+ * demo's thesis -- "this claim is backed by code you can go read" -- and it
+ * belongs on the page. The LINE NUMBER is a coordinate into a moving tree: it
+ * is useless to a visitor, it cannot be acted on from a projector, and it is
+ * wrong within about forty-five commits of being written. So this removes the
+ * half that rots and keeps the half that argues.
+ *
+ * NOT a deletion. @086345a5's rule -- the reason must still say WHY, minus the
+ * file:line -- and the file is most of the why.
+ */
+export function withoutSourceCitations(text) {
+  return text.replace(/([A-Za-z0-9_\-/.]+\.(?:rs|js|toml|md)):\d+(?:-\d+)?/g, '$1');
+}
+
+/**
  * Guard the `reason` argument of every absence builder.
  *
  * Checks the TYPE, not just truthiness. `if (!reason)` accepts an object, and
@@ -277,6 +294,11 @@ export function notApplicableField(
     'It must explain why this path never consults the subsystem; without it the state is ' +
       'indistinguishable from a missing feature.',
   );
+  // Sanitise at the FAN-IN, not at the six render sites. `reason` reaches a
+  // visitor through format.js, telemetry-field.js and model-card.js, and a rule
+  // that each renderer must remember is discipline; doing it once here is
+  // construction. Shadows the parameter so every use below is covered.
+  reason = withoutSourceCitations(reason);
   return Object.freeze({
     value: null,
     state: FIELD_STATES.NOT_APPLICABLE,
@@ -320,6 +342,11 @@ export function unavailableField(
     'unavailableField',
     '"No data" with no explanation reads as a bug; an explained absence reads as honesty.',
   );
+  // Sanitise at the FAN-IN, not at the six render sites. `reason` reaches a
+  // visitor through format.js, telemetry-field.js and model-card.js, and a rule
+  // that each renderer must remember is discipline; doing it once here is
+  // construction. Shadows the parameter so every use below is covered.
+  reason = withoutSourceCitations(reason);
   return Object.freeze({
     value: null,
     state: FIELD_STATES.UNAVAILABLE,
@@ -361,6 +388,9 @@ export function pendingField(
   } = {},
 ) {
   requireReason(reason, 'pendingField', 'It must explain what is being waited on.');
+  // Same fan-in sanitisation as the sibling constructors -- this one takes the
+  // single-line requireReason form and was missed by the first sweep.
+  reason = withoutSourceCitations(reason);
   return Object.freeze({
     value: null,
     state: FIELD_STATES.PENDING,
@@ -401,7 +431,9 @@ export function staleField(field, reason) {
   return Object.freeze({
     ...field,
     state: FIELD_STATES.STALE,
-    reason,
+    // The fourth entry point. staleField takes its reason positionally and
+    // never reaches requireReason, so a sweep of the constructors alone misses it.
+    reason: withoutSourceCitations(reason),
   });
 }
 

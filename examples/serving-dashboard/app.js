@@ -29,7 +29,7 @@ import { mountFailureStates } from './ui/failure-state.js';
 import { mountModelCard } from './ui/model-card.js';
 import { mountScenarioSwitcher } from './ui/scenario-switcher.js';
 import { PROVENANCE, allFieldKeys, resolveForOrigin } from './telemetry-provenance.js';
-import { FIELD_STATES } from './telemetry-field.js';
+import { FIELD_STATES, withoutSourceCitations } from './telemetry-field.js';
 
 /** Poll cadence. The spec fixes the dashboard between 250 and 500 ms. */
 const POLL_INTERVAL_MS = 250;
@@ -318,9 +318,10 @@ function formatAge(ageMs) {
  * @param {string} evidence
  * @returns {string} the citation with line numbers removed
  */
-function citationForVisitor(evidence) {
-  return evidence.replace(/([A-Za-z0-9_\-/.]+\.(?:rs|js|toml|md)):\d+(?:-\d+)?/g, '$1');
-}
+// One implementation, imported -- NOT a second copy of the regex. The Evidence
+// column and the reason channel are two routes to the same visitor, and two
+// sanitisers with the same job drift the moment one is fixed.
+const citationForVisitor = withoutSourceCitations;
 
 /**
  * @param {HTMLElement} rootElement
