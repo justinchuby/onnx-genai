@@ -228,3 +228,66 @@ with Nsight Compute on device 1, then, in a separate reviewed PR, add a
 grid-widened / split-K `general` variant gated on the grid-starvation check.
 Attention (#1) is already split-K-tuned; the higher-leverage, guardrail-safe
 target for the 7B is the o_proj GEMV.
+
+---
+
+# o_proj split-K attempt — NEGATIVE result (follow-up, 2026-07-27)
+
+Acting on the #2 localization above, I implemented the guardrail-safe candidate:
+route the grid-starved **square o_proj int4 GEMV** (`gemv_f16_general`,
+K=N=3584, symmetric int4, block_size=32, fp16 scales) through the **existing**
+`matmul_nbits_gemv_f16_scales_f16_splitk` machinery (PR #203), by widening the
+dispatch gate from #203's `n < SM*16` (~2 CTA/SM) to a device-driven
+**`< 1 wave/SM`** occupancy check (mirroring `use_accuracy4_stage64`: 64
+warps/SM on sm_80/sm_90, 48 on consumer). No new kernel was written.
+
+**Result: reverted.** The change is correct but does not beat baseline — it is a
+small, *repeatable regression* on 7B and parity elsewhere. Reported here so the
+next engineer does not re-try the same lever (cf. the register-prefetch negative
+memories).
+
+## What the gate did
+
+- `use_f16_symmetric_splitk(k, n, mp_count, compute_capability, max_threads)`:
+  split-K when the single-warp general grid `ceil(N/8)` CTAs is below one
+  resident wave (`mp_count * resident_warps/8`).
+- On H200 (132 SM, sm_90, one wave = 1056 CTAs) this newly routes 7B o_proj
+  (N=3584 → 448 CTAs) and qkv (N=4608 → 576 CTAs) to split-K; lm_head-width
+  stays single-warp; 0.5B/1.5B (N≤1152) already split under **both** gates, so
+  they are unchanged by construction.
+- Correctness held: GPU parity test at the exact K=N=3584 shape matched the f64
+  reference within int4 tolerance, and 7B greedy token IDs were **byte-identical**
+  before/after (no repetition/garbage).
+
+## A/B (device 1, H200, `--steady --tokens 128 --warmups 2 --runs 3`, alternating)
+
+BEFORE = `origin/main`; AFTER = split-K gate. Steady-decode tok/s (median of 3
+per trial):
+
+| model | BEFORE median | AFTER median | Δ | verdict |
+|---|---|---|---|---|
+| qwen2.5-7b  | **309.05** | 307.23 | **−0.59%** | repeatable regression |
+| qwen2.5-1.5b | 725.05 | 723.65 | −0.19% | parity (noise) |
+| qwen2.5-0.5b | ~993 | ~996 | +0.3% | parity (noise) |
+
+7B trials (BEFORE / AFTER tok/s): 309.21/307.55, 308.61/307.14, 309.05/307.10,
+309.21/307.75, 308.96/307.23 — intra-group spread < 0.3%, AFTER slower in 5/5.
+
+## Why it lost
+
+The **existing** split-K is `K_SPLIT = 2` — it only *doubles* the grid, lifting
+o_proj from ~0.42 → ~0.85 wave (still sub-wave), while adding a shared-memory
+cross-partition reduction to every column. At this occupancy the reduction
+overhead outweighs the partial grid-fill gain, so decode is marginally slower.
+This is consistent with PR #203 deliberately capping the symmetric gate at
+~2 CTA/SM: moderately-starved (not severely-starved) shapes do not benefit from
+a 2-way split. 0.5B/1.5B are unaffected because their narrower projections were
+already splitting.
+
+**Guardrail confirmed:** grid-widening the o_proj general GEMV with the current
+2-way split-K machinery does **not** widen the 7B native-vs-ORT lead. A real win
+would need a *larger* split factor (K_SPLIT>2) or a bespoke grid-widened
+`general` variant that fills ≥1 wave without the 2-way reduction tax — i.e. a
+new kernel, which is out of scope for the "reuse existing machinery" guardrail
+and would need its own reviewed A/B. Recommend **not** pursuing the 2-way lever
+for o_proj.
