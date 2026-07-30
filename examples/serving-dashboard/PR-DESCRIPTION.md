@@ -226,6 +226,51 @@ not claim this file existed there — it did not; a description of a reviewed
 revision is necessarily written after it. The distinction matters because the two
 readings are indistinguishable in the marker itself, and only one of them is true.
 
+### This file cannot be read at a review pin, and that is not a pin-choice problem
+
+A reviewer checked whether the tree the code is scored at also contains the
+*reviews*, and found a third of their own review missing from it. The same
+question asked of this file returns a worse answer, because this file is the
+pull request:
+
+```
+PIN CANDIDATE   CUT AT     THIS FILE THERE   MY LAST COMMIT IN IT?
+1f9fc70b        05:02:09      256 lines      NO   (reverse: YES — strictly newer)
+42c15622        05:17:24      256 lines      NO   (reverse: YES)
+37d0d72e        05:48:55      402 lines      NO   (reverse: YES)
+HEAD                          684 lines      —
+[CONTROL] demo-spec.md at the same four: 2284 · 2414 · 2457 · 2857  — varies, so
+          the reader is reading four different trees and not one tree four times
+[NEG CTL] a path that never existed: fatal, not a quiet zero
+```
+
+**62% of this document does not exist at the cut review pin, and every one of its
+31 sections is absent there.** That includes both suite blocks, all fourteen
+known gaps, and this sentence.
+
+**The structural point, which no choice of pin fixes.** A description of a merge
+is written after the thing it describes. It is therefore *always* newer than any
+revision it could be scored at, and the gap is widest at exactly the moment the
+work is most complete. Pinning is the correct discipline for code, for fixtures,
+and for the reviews — all of them are claims *about* a tree, and reading them at
+that tree is what makes them checkable. **This file is a claim about the
+difference between two trees, so there is no single revision at which it is
+true.** Freezing it to one is not conservative; it silently substitutes a draft.
+
+**So the rule this document asks for is the opposite of the rule everything else
+gets: read it at the tip, and never from a tag.** If that is inconvenient, the
+inconvenience is the honest shape of the artifact and not a defect to be
+engineered away.
+
+**And this retires an ambiguity in this file's own stamp rather than merely
+noting it.** The section below observes that `MEASURED-AT` cannot mean *this file
+existed at this revision*. The magnitude is now measured: at the stamped
+revision this file is 402 lines, and it is 684 here. **282 lines of the document
+carrying the stamp postdate the stamp.** The figures were re-derived at that
+revision and the marker is honest about them; it says nothing whatever about the
+prose around them, and a reader has no way to see where one ends and the other
+begins.
+
 ### The guard that enforces that marker cannot see this file
 
 ```
