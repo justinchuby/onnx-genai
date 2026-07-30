@@ -641,9 +641,8 @@ test('every source path the README cites resolves to exactly one tracked file', 
   const dead = [];
   const seen = new Set();
 
-  for (const match of readme.matchAll(ANY_CITATION)) {
-    const cited = match[1];
-    if (!cited || seen.has(cited)) continue;
+  const inspect = (cited) => {
+    if (!cited || seen.has(cited)) return;
     seen.add(cited);
     const candidates = cited.includes('/')
       ? trackedSourceFiles.filter((f) => f === cited || f.endsWith(`/${cited}`))
@@ -652,7 +651,26 @@ test('every source path the README cites resolves to exactly one tracked file', 
     else if (candidates.length > 1) {
       ambiguous.push(`${cited} -> ${candidates.length} files: ${candidates.slice(0, 3).join(', ')}`);
     }
-  }
+  };
+
+  for (const match of readme.matchAll(ANY_CITATION)) inspect(match[1]);
+
+  // SYMBOL-ANCHORED CITATIONS NAME A PATH TOO, AND IT WAS NOT BEING CHECKED.
+  //
+  // This loop was originally fed by ANY_CITATION alone, which matches only the
+  // line-anchored `path:NNN` form. That made the floor below shrink every time
+  // anyone did the exact thing the rest of this file tells them to do: convert
+  // a line anchor into a symbol anchor. The population is DISTINCT SPELLINGS,
+  // so replacing a bare `admin.rs:80` with a full path that is already cited
+  // elsewhere removes a spelling and adds none -- the count falls because the
+  // document got BETTER. A guard whose floor drops when you follow its own
+  // advice will be read as drift, and the cheap way to silence it is to lower
+  // the floor or revert the improvement. Both are wrong.
+  //
+  // The honest repair is more coverage, not a lower bar: the path in a symbol
+  // anchor must resolve to exactly one tracked file for the same reason the
+  // path in a line anchor must, and until now nothing asserted that at all.
+  for (const match of readme.matchAll(SYMBOL_ANCHORED)) inspect(match[1]);
 
   // VACUITY FLOOR. Every list below is empty if the matcher stops matching, and
   // an empty offender list is exactly what success looks like. Prove we
