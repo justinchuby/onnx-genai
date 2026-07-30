@@ -19,3 +19,10 @@
 
 - PR #438 merged native CUDA rank-3 Conv1D support, advancing the Qwen3.6-27B probe past `__fn0_Conv_node_12`.
 - PR #440 supplies `com.microsoft::Silu` unary shape inference and is in review; the next observed blocker is `value#1414 not produced`.
+
+## 2026-07-30T13:36:00Z — Issue #445 delivered; #35B-A3B unblocked; #384 scoped
+
+- PR #445 merged (TopK fp16/bf16 CUDA parity). Independently conducted native-CUDA correctness bring-up on DeepSeek-Coder, DeepSeek-V2-Lite (26-QMoE), DeepSeek-R1, GLM-4: exact token parity on Coder/V2-Lite, R1 isolated to GQA/KV parity gap, GLM-4 native coherent.
+- Cleared three 35B-A3B blockers: (1) generalized CUDA persistent-state binding to rank-3 `conv_state`; (2) added CUDA Conv rank-3 NCL with depthwise causal; (3) registered `com.microsoft::Silu` v1 unary shape inference (PRs #437, #438, #440 all merged).
+- Status: 35B-A3B now unblocked from empirical decode measurement; next blocker is `value#1414` executor error at graph lowering.
+- Issue #384 scoped: three increments to make `PipelineDecodeLoopBackend` drive native components. Inc1 routes `every_step` through `ComponentSession` trait; value seam is backend-neutral host-resident `ComponentTensor`. Proving native embedding in hybrid loop (embedding native, decoder ORT) with token parity as Inc1 deliverable.
