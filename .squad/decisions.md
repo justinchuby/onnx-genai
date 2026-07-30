@@ -1,13 +1,22 @@
 # Decisions — live standing directives
 
-Last compacted: 2026-07-30T04:10:00Z
+Last compacted: 2026-07-30T04:30:00Z (Scribe tidy round 2, merged with #427 at 04:10:00Z)
+
+This file is the resolution of two concurrent Scribe compactions that rewrote it in the same
+minutes: #427 ("consolidate CUDA parity 161 state", 04:10:00Z) and this round-2 tidy
+(04:30:00Z). Both were merged; where the two sides disagreed on a single entry (one kept it
+live, one archived it) the entry was kept live, because a wrongly-archived rule silently stops
+governing while a wrongly-kept record only costs bytes.
 
 Full historical ledger archived to `.squad/decisions-archive/2026-07.md`:
 - "Full decisions snapshot archived by size gate — 2026-07-28T11:30:55Z"
 - "Post-rebase decisions archived by size gate — 2026-07-28T11:35:49Z"
 - "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" (first run)
 - "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z" (merge resolution)
-- "Post-rebase narrative tail compacted by size gate — 2026-07-30T04:10:00Z"
+- "Post-rebase narrative tail compacted by size gate — 2026-07-30T04:10:00Z" (#427)
+- "Narrative entries compacted by size gate — 2026-07-30T04:30:00Z (Scribe tidy round 2)"
+  — CUDA op-parity wave records (Kuato/Doug), native-KV benchmark record, PTY-harness
+  technique notes, the reasoning-fixture review narrative, and the spent round-2 checklist.
 
 Older archives: `.squad/decisions/archive/`.
 
@@ -152,6 +161,14 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
 - Narrative entries compacted 2026-07-29 (two runs): `.squad/decisions-archive/2026-07.md`
   → "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" and
   "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z".
+- Round-2 compaction (2026-07-30): `.squad/decisions-archive/2026-07.md` → "Narrative
+  entries compacted by size gate — 2026-07-30T04:30:00Z (Scribe tidy round 2)". Holds the
+  archived CUDA op-parity wave changelog (Kuato/Doug: SiLU/Instance/GroupNorm 152→154,
+  LpPool/CenterCropPad/Col2Im 154→157, QLinearMatMul/Resize 139→141, the merged inbox drop
+  ConvTranspose/GridSample 159→161, and Doug's ORT-1.28 27B INT4 basic-opt 17.38 tok/s
+  workaround reference / extended-opt SIGABRT), the native multi-turn KV benchmark record
+  (Pris #408), the PTY-harness technique notes (Zhora #393), and the reasoning-fixture
+  review narrative (#410/#411). Standing CUDA/CLI/test rules stayed live.
 - Prior active-ledger archives: `.squad/decisions/archive/`.
 - Mac CPU EP load-bearing topics in the archive: PR #227 roofline lessons, load-adaptive
   opt-in, Apple Silicon portability directive, BNNS prefill/deprecation notes,
@@ -167,31 +184,16 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   #377 verbose, Matthias static-cache implementation, Johnny PackedVarlenAttention,
   Pris multiturn corrected measurements.
 
-## Compacted active directives — 2026-07-30T04:10:00Z
+## CUDA standard-domain parity — current state (through 161 ops)
 
-Details for the pre-161 CUDA wave, ORT 1.28 benchmark, CLI charter, CI, KV, REPL,
-terminal-test narratives, explicit-metadata reconstruction, reasoning-fixture review, and
-Scribe tidy-round notes were moved to `.squad/decisions-archive/2026-07.md` under the
-2026-07-30 compaction entries. Live standing rules that remain binding:
-
-- CLI work is a developer/maintainer tool investment; prioritize maintainer debug/iterate
-  leverage, not consumer registry/pull/fine-tune features. The inline ratatui REPL remains
-  the primary CLI surface; `/fork` and `/rewind` stay behind runtime capability gates.
-- Full CI platform execution is the gate; uninstrumented fast jobs and package-scoped local
-  commands do not substitute for the exact CI command.
-- Native multi-turn performance claims must use the session-persistent KV API, not the old
-  stateless path, unless explicitly labeled `--native-stateless`.
-- Verification must fail on bad downloads or malformed archives; warnings are not checks.
-- Model-declared generation defaults are canonical below explicit caller flags; engine
-  constants are fallback, not override.
-- All inference/pipeline metadata except io-shape must be explicit and general; name
-  guessing is forbidden. Static-cache metadata must be declared, with `StaticCacheAbi::classify`
-  authoritative and name-agnostic.
-- Probe the stream being written, use PTY-driven tests for terminal behavior, and treat
-  cfg-gated tests as unverified until they run on an admitted platform.
-- `.squad/decisions/inbox/` is a tracked durable queue. Merge each in-scope drop, dedupe,
-  delete processed files, and keep `inbox/README.md`.
-- Do not delete a worktree before Scribe has merged its decision inbox.
+Kept live from PR #427's `## Compacted active directives — 2026-07-30T04:10:00Z` section
+(merge round 2). PR #427 folded the CLI/CI/KV/verification/metadata/probe/PTY/inbox/worktree
+rules into one-line bullets and moved their full text to the archive; this merge instead keeps
+the fuller live sections below (a rule kept live governs at spawn; a wrongly-archived rule does
+not), and carries #427's CUDA records — the part it kept live — here. These are the current CUDA
+op-parity records; the earlier pre-161 wave narrative (SiLU/Instance/GroupNorm 152->154,
+LpPool/CenterCropPad/Col2Im 154->157, and Doug's ORT-1.28 27B INT4 benchmark) is archived
+under the 2026-07-30 compaction entries in `.squad/decisions-archive/2026-07.md`.
 
 ### 2026-07-30: Add QLinearMatMul and common Resize CUDA parity
 **By:** Kuato
@@ -212,3 +214,255 @@ Scribe tidy-round notes were moved to `.squad/decisions-archive/2026-07.md` unde
 **By:** Squad CUDA parity wave
 **What:** Merged #423 (`eed2fbf2`) for `QLinearMatMul` + common `Resize` and #424 (`1574e87a`, Mary revision `93d9e7b8`) for `ConvTranspose` + `GridSample`, raising advertised CUDA coverage from 157 to 161 ops. Lori approved #423 and, after requesting changes on #424, approved Mary's shape-aware correction with independent on-device evidence across 308 GPU parity cases.
 **Why:** The tractable CUDA parity wave is now landed through 161 ops while retaining fail-closed behavior for unsupported Resize cubic/coordinate modes, ConvTranspose output-shape/SAME modes, and GridSample cubic/volumetric modes. Remaining heavy gaps are NonMaxSuppression and Resize-cubic.
+
+## CLI charter — standing directives
+
+These two govern all ongoing CLI work and outlive the PRs that produced them. They were
+compacted into `.squad/decisions-archive/2026-07.md` on 2026-07-28 and are restated here
+because they are live policy, not history: an agent reading only this ledger must see them.
+
+### The CLI is a developer/maintainer tool, not a consumer product
+**By:** Justin Chu (2026-07-27)
+
+The `onnx-genai` CLI is scoped as a development and maintainer instrument. It is not
+competing with consumer local-inference tools. Rank CLI work by *does this shorten a
+maintainer's debug/iterate loop, or expose engine behavior we cannot otherwise observe?* —
+not by *does a competitor have it?*
+
+**Explicitly rejected, do not re-propose:** remote-client mode against an OpenAI-compatible
+server (third-party CLIs cover it); model registry / pull / consumer model lifecycle;
+conversion, quantization and fine-tune loops as CLI product features. See
+`docs/research/cli/00-backlog.md`.
+
+### The REPL is the primary CLI investment
+**By:** Justin Chu (2026-07-27)
+
+Target quality bar is GitHub Copilot CLI's interactive shell, with one deliberate
+divergence: **the terminal model is ratatui's inline viewport, not a full-screen alternate
+screen.** Native scrollback and terminal-native copy are features for a tool whose output is
+pasted into issues, benchmarks and traces, and the alternate screen costs both. Justin was
+shown the tradeoff and chose inline; see `docs/research/cli/05-repl-redesign.md` §2.
+
+Phase 1 landed in #289. Remaining phases cover session/runtime interaction — `/fork` and
+`/rewind` — which depend on runtime APIs tracked in
+`docs/research/cli/04-runtime-capability-inventory.md` and `06-fork-rewind-api.md`.
+Fork is reserved behind a type gate and **not yet enabled on any backend**.
+
+## CI: run tests on every platform; instrument for coverage only where informative
+
+**By:** Pris (2026-07-28)
+
+Full coverage required on PRs. A parallel uninstrumented Linux fast job (5–9 min
+warm/cold) offers early feedback but never substitutes for the full gate. Windows ARM64
+retains tests/clippy but not llvm-cov coverage (duplicates x64/macOS while owning the
+CI critical path — up to 26 min). Platform execution is the signal; instrumentation is
+the cost. Current critical path: `CLI ORT (Windows x86_64)` at ~18m50s.
+
+## 2026-07-29 — Native multi-turn performance claims must use the session-persistent KV API
+
+**By:** Pris (PR #408); kept live from PR #427's consolidation (merge round 2)
+
+Native multi-turn performance claims must use the session-persistent KV API, not the old
+stateless path, unless explicitly labeled `--native-stateless`. The full benchmark record
+(Qwen2.5-0.5B-f16 and TinyStories-33M, M1 Max) is archived under the 2026-07-30 compaction
+entries.
+
+## 2026-07-29 — Verification steps that warn instead of fail are not verification
+
+**By:** Holden; recorded by Scribe; PR #401
+
+A verification step that warns instead of failing is not verification. The ORT
+`osx-x86_64` download had no pinned checksum, so `verify_archive_checksum` warned and
+returned; `curl` exited 0 on a 404; three "successful" steps produced a corrupt input
+before `tar` objected.
+
+**Rules:** Check HTTP status explicitly (`curl -f` or `-w %{http_code}`); validate
+archive magic bytes (gzip `1f 8b` / zip `PK`) before extracting; every check that only
+warns on failure is a silent failure waiting for the worst moment.
+
+## 2026-07-29 — Model-declared generation defaults are canonical; our constants are fallback, not override
+
+**By:** Leon; PRs #385, #392; closes issues #290, #296
+
+Model `do_sample`, `temperature`, `top_p`, `top_k` were parsed then discarded, forcing
+greedy — on models that ship explicit values precisely because greedy degenerates (e.g.,
+DeepSeek, Qwen). **Precedence is now strict:** explicit caller flag > model-declared value >
+greedy fallback. Enforcement is in the engine so CLI, server, and Python all inherit it.
+
+## 2026-07-29 — The CUDA driver API ships with the display driver, not the toolkit
+
+**By:** Leon; clears PR #395 misconception
+
+`nvcuda.dll` is present whenever the GPU driver is installed. Both `cust` and `cudarc`
+fall back `*_13` → `*_12` cleanly.
+
+**Rule:** An inferred capability claim that turns out to be wrong costs more than the
+investigation it prevented. Never suppress an inferred bad fact without verifying it
+directly against a fresh environment.
+
+## 2026-07-29 — Probe the stream you are writing to
+
+**By:** Rachael; PR #372
+
+`emit_stats_line` chose its format from `io::stdout().is_terminal()` while writing to
+stderr — inverts under redirection. **Rule:** always probe the destination stream, never a
+convenient nearby one. Stats to stderr → test `stderr().is_terminal()`, not stdout.
+
+**Durable pattern:** Extract testable pure functions. `stats_text()` and
+`needs_trailing_newline()` had to become named pure functions before their branches could
+be unit-tested; inlining had hidden both defects in the production path.
+
+## 2026-07-29 — Run the gate command CI runs, verbatim
+
+**By:** Rachael; PR #372
+
+A package-scoped `cargo fmt --check` passed locally while the entire workspace was
+unformatted. CI's `cargo fmt --all --check` caught it in 37 seconds. **Rule:** use the
+exact gate command that CI uses, not a convenient subset. Local validation with a narrower
+scope is structurally untrustable.
+
+## 2026-07-29 — Terminal behaviour requires PTY-driven tests; piped I/O cannot cover it
+
+**By:** Rachael; PR #372
+
+Two `#[cfg(unix)]` PTY tests written on Windows compiled to zero tests on Windows and
+were reported alongside a green 168-test suite. **Rule:** A `cfg`-gated test is unverified
+until it runs on a platform where the gate admits it. Do not assume compilation equals
+verification. Piped-stdio tests structurally cannot cover PTY-specific behavior (control
+sequences, window size events, terminal probe responses).
+
+## 2026-07-29 — Type-ahead is not lost during generation on Unix or Windows
+
+**By:** Zhora; closes issue #298; PR #393
+
+ConPTY does not echo type-ahead during generation at all, so no REPL repaint can overwrite
+it. This is a terminal characteristic, not a backend bug. **Do not re-open as a
+native-backend issue.** Still unverified: native conhost (not IDE or ConPTY) mid-stream
+type-ahead, which may be cosmetic echo overpaint or real loss — test in a native terminal.
+
+## 2026-07-29 — Standing Operational Rule: Worktree lifecycle and decision merging
+
+**By:** Justin Chu (recorded by Scribe)
+
+Do not delete a worktree before Scribe has merged its decision inbox. `.squad/decisions/inbox/` is gitignored and per-worktree, so removing a worktree destroys any unmerged decision drops in it. Coordination workflow:
+
+1. Agent writes decision to `.squad/decisions/inbox/{agent}-{slug}.md` (in-worktree, gitignored).
+2. PR lands; worktree remains temporarily.
+3. Scribe runs (either same session or next): merges inbox → `.squad/decisions.md`, deletes merged files.
+4. Scribe commits and pushes.
+5. Safe to delete the worktree.
+
+Merging and deleting the inbox files produces no git diff (expected, not a failure). The loss that occurred here: Rachael, Zhora, Leon wrote inbox files in separate worktrees, those worktrees were deleted before Scribe ran, and inbox files were lost. The substance survived in merged `history.md` files and PR descriptions, but the durable-rule fragments did not make it to this ledger — they had to be manually recovered from context.
+
+## 2026-07-29 — All inference/pipeline metadata must be explicit; name guessing is forbidden
+
+**By:** Justin Chu directive #377; Cohaagen, Benny, Melina, Matthias (PRs #380, #382, #377/`squad/377-explicit-metadata`, #412)
+
+ALL inference/pipeline metadata except io-SHAPE must be EXPLICIT and GENERAL. Name
+guessing/historical-name fallback must be replaced by explicit metadata plus a clear ERROR
+naming the missing key. Only io-SHAPE may disambiguate. Do not re-propose deferral.
+
+**Active schema fields (Benny/mobius: emit these names verbatim):**
+- `pipeline.strategy.inner_embedding_output: Option<String>` — nested-AR inner decoder embedding output port. Absent ⇒ ERROR.
+- `model.io.static_cache: Option<StaticCacheIoSpec>` — `write_indices_input`, `kv_sequence_length_input`, per-layer `key/value_cache_inputs/outputs` (equal-length, positional). Inconsistent ⇒ ERROR. **Must be declared; convention-based binding removed (Matthias, PR #412).**
+- Encoder prompt-input role: from `model.encoder.inputs.audio_features` vs `.input_ids`; no port-name string matching.
+- Paged-KV bridge geometry: from `model.io.kv_inputs`/`kv_outputs` only; no metadata ⇒ `Ok(None)`.
+
+**Matthias (PR #412):** `detect_static_cache_by_convention` removed from
+`crates/onnx-genai-ort/src/decode/io.rs`. A TensorScatter static-cache graph without a
+declared `model.io.static_cache` block now fails closed with an error naming the missing
+key — never silently binds by hardcoded `write_indices`/`nonpad_kv_seqlen`/`key_cache.{i}`
+port names. `StaticCacheAbi::classify` stays authoritative and name-agnostic. In-repo
+static-cache fixtures now declare the block explicitly.
+
+**Remaining name path (off-limits scope):** `decode_contract.rs` `KvNamingConvention` — only for #99 speculative proposers; do not remove from this workstream.
+
+## 2026-07-29 — Warmup: shared registry method; error categories preserved at admin boundary
+
+**By:** Lull + Rachael; PR #407
+
+Opt-in `warmup` per-model setting and `POST /v1/admin/models/{id}/warm` both use
+`ModelRegistry::warmup` — one deterministic generated token, idempotent. **Rules:**
+- Share the registry method so configured and on-demand warmups are identical; failures
+  can be retried without corrupting registry state.
+- Return typed errors (absent-model, registry, runtime-failure); the admin endpoint maps
+  them 404 / 500 / 500. A loaded model's failed warmup must not be reported as a 404.
+
+## 2026-07-29 — Decision inbox is a tracked durable queue (not gitignored scratch)
+
+**By:** Scribe (tidy round 1)
+
+**What:** `.squad/decisions/inbox/` is now **tracked in git** rather than ignored.
+`.gitignore` no longer lists it; `inbox/README.md` keeps the directory present and
+documents the semantics. The charter's responsibility #2 is updated to match.
+
+**Why:** The inbox was gitignored in the 2026-07-12 "Add squad" commit, grouped with
+runtime scratch (logs, sessions) on the assumption that drops are consumed and cleared
+on the same machine that wrote them. With worktrees deleted before Scribe merges, and
+three teams writing decision logs concurrently on separate machines, that assumption is
+false — drops that live only locally are lost on worktree deletion (four records lost on
+2026-07-29, others earlier) and drops on other machines are invisible here until merged.
+Tracking fixes all three: drops survive worktree deletion, are visible in-flight across
+machines, and concurrent Scribes each add distinct files that git merges without
+conflict (the only overlap, merge-and-delete, is a clean delete/delete). This is the
+structural version of the fix already noted under "Concurrent Scribe runs are a
+structural hazard": assemble `decisions.md` from inbox drops instead of hand-merging.
+
+**Costs accepted (honest accounting):** more churn in git history; drops now appear in
+PR diffs where they previously did not; and we deliberately override a line that had
+been in place since the initial squad scaffolding. That line was not a considered
+inbox-specific decision — it was a bulk "ignore runtime state" grouping — and its one
+real premise (drops are transient and cleared) still holds: Scribe still deletes drops
+after merge. Only the durability assumption was wrong, so tracking is compatible with
+the original intent rather than a reversal of a deliberate choice.
+
+## Testing discipline — standing rules (distilled from reasoning-fixture review, PRs #410/#411)
+
+The full review narrative is archived (round-2 compaction). These are the binding rules:
+
+- **Assert on what the code did, not a summary of what it should have done.** Tests that
+  key on a display/summary line (e.g. `/session`) can stay green while the real path
+  (`resolve_sampling_defaults`) is broken. Instrument the boundary you care about and
+  assert on that — surface the resolved policy into `--stats`/`--profile` and check it.
+- **Run a new test in isolation before believing it.** A single green in a full parallel
+  suite can be a stderr-timestamp/interleave artifact; run it alone (a real fix survived
+  15/15 isolated runs that the suite hid).
+- **A fixture whose every assertion is "the turn was dropped" cannot distinguish correct
+  behaviour from total breakage.** Make the success path reachable so a regression fails.
+- **A near-deterministic fixture cannot witness sampling.** At low temperature/top_k decode
+  is effectively greedy; a token-stream assertion is ~95% false-fail — raising run count or
+  seeds does not rescue it. Assert on the resolved policy object, not sampled tokens.
+- **One policy resolved at two sites is the defect.** A summary that can disagree with what
+  generation did is a latent bug; resolve once via a shared helper both paths call, reading
+  the live backend on demand (no cache, no staleness across `/reload`/`/ep`/`/backend`).
+
+## 2026-07-30 — Scribe tidy round 3: what to check next
+
+**By:** Scribe (tidy round 2, post-merge)
+
+Round 2 compacted `decisions.md` from 40,477 → ~30 KB and then had to **merge a concurrent
+compaction**: PR #427 ("consolidate CUDA parity 161 state") rewrote the same file down to
+14,913 bytes in the same minutes, while I was pushing. Both were merged by property (union of
+standing rules live; disagreements resolved live). **The concurrent-Scribe collision is now
+observed, not predicted — the window was minutes, not days.** Two conflicting resolutions of a
+single hand-merged file is exactly the failure the tracked inbox was meant to remove but does
+not: the inbox stopped drop-loss, not the hand-merge rewrite. For round 3:
+
+- **Adopt the round-2 Task-D recommendation.** The cheap fix is structural: keep the live file
+  for **standing rules only** (rarely edited, low collision) and route **all dated wave/
+  changelog records** through inbox drops that Scribe files **straight into the monthly
+  archive, never into the live file**. #427 kept four CUDA wave records live; round 2 archived
+  the equivalents — that divergence *is* the collision. If wave records never enter the live
+  file, two Scribes cannot disagree about them.
+- **`decisions.md` size / dedup.** Re-measure against tip first. When two compactions race,
+  reconcile by property, keep every rule either side kept live, and dedupe the archive —
+  build it as `base + one clean appendix`, never by concatenating two rewritten tails.
+- **Inbox.** Still tracked. Merge every `*.md` except `README.md`; dedupe against **both** the
+  live file and the archive — another team's Scribe may have merged the same drop on another
+  machine (this round #427 merged `kuato-cuda-parity-4.md` live while I archived it; I had to
+  match prose because drops carry no team/machine attribution). Add attribution to drops.
+- **Histories.** Sweep all `.squad/agents/*/history.md` against the chronicle gate (>8 dated
+  entries, or oldest live entry predating the previous wave measured against that file's newest
+  entry — never against today). deckard/roy re-accumulate fastest.
+- **Do not archive agent directories.** Fail-closed; with three teams active elsewhere,
+  absence of local commits/drops/history proves nothing.
