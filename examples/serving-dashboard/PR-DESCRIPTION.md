@@ -534,3 +534,55 @@ reason rather than a boolean — `EpDeclined`, `SessionDeclined`, `NoMaxContext`
 and let the renderer show the one it actually got. **The decision is correct;
 only its explanation is lossy.** ***A capability that turns on the host should be
 reported as a fact about the host.***
+
+---
+
+## Known gap: a documented YAML config surface with zero production callers
+
+**Asked by @732c7548 as a one-line question about one flag. Measured at
+`78f335d7`, it is bigger than the flag.**
+
+```
+crates/onnx-genai-engine/src/config.rs
+
+:612  /// Decode the `serving.memory.limits` YAML surface documented in §26.11.4.
+:615  pub fn from_yaml(yaml: &str) -> Result<Self, EngineConfigError>
+:628      config.allow_runtime_override = yaml_limits.allow_runtime_override;
+
+  CALL SITES OF from_yaml:      729 · 749 · 759 · 767
+  #[cfg(test)] BEGINS AT:       654          <- ALL FOUR ARE BELOW IT
+  OUTSIDE config.rs, workspace-wide:  **0**
+
+[POSITIVE CONTROL] EngineConfig::default has callers in five other crates
+                   (bench/model.rs, compare.rs, multiturn.rs, profile_*.rs)
+                   -> the instrument reaches the workspace; the zero is real.
+[NEG CONTROL] from_zqx_9901 -> 0
+```
+
+**So `serving.memory.limits` is parsed, validated, tested and unreachable.**
+No shipped binary can construct an `EngineConfig` from YAML — the server's only
+config flag is `--models-config`, which builds a *different* type
+(`ModelsConfig::from_file`).
+
+**The consequence for the flag that was actually asked about:**
+`allow_runtime_override` is not a hardcode, and it is not "assigned from the
+YAML". **It is a `Default` impl value that no shipping code path can override,
+because the sole mechanism that could override it has no production caller.**
+The runtime-override refusal at `governor.rs:168` is therefore
+**unconditional in practice**, and its error message tells the operator to
+*"set `serving.memory.limits.allow_runtime_override: true`"* — **advice that
+cannot be taken by any binary we ship.**
+
+> **An error message that names a remedy the product cannot perform is worse
+> than a bare refusal. The bare refusal sends you to the maintainers; the
+> helpful one sends you to a config file that will never be read.**
+
+**This is the third confirmed member of the SPECIFIED-NOT-BUILT class in this
+release** (with D298 and D300), and it is the first one where **the gap is
+invisible from every angle a reviewer normally looks**: the parser exists, the
+struct exists, the tests pass, the documentation cross-references a numbered
+spec section, and the doc comment is accurate about what the function *does*.
+***Everything is true except that nobody calls it.***
+
+**Not a regression. Nothing in this PR changes it. Named so the next person
+does not spend an afternoon writing a YAML file that has no reader.**
