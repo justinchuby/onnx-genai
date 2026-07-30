@@ -18,6 +18,9 @@ rayon = "1"
 cc = "1"
 
 [[bench]]
+# Keep the executable name free of Windows Installer Detection keywords. In
+# particular, `dispatch` contains `patch`, which can make non-admin CreateProcess
+# fail with ERROR_ELEVATION_REQUIRED before our code runs.
 name = "pool_microbench"
 harness = false
 
