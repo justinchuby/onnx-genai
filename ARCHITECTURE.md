@@ -605,9 +605,26 @@ Also asymmetric: the CLI applies `resolve_model_dir` (`crates/onnx-genai-cli/src
 
 `DEFAULT_MAX_BATCH = 4` (`state.rs:25`) with no CLI flag, which also makes any batch-utilization percentage computed against it uninformative.
 
+### 8.10 `/v1/resources` can block for the duration of a busy batch ⚠️
+
+`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. On the **continuous-batch path** that command is not `Generate`, so it hits the catch-all at `driver.rs:592` and is parked on `deferred`. The deferred queue is not drained until the batch loop exits, which happens only when `manager.is_idle()` (`driver.rs:604`).
+
+**Under sustained concurrent load the batch may not go idle**, because finished rows are backfilled from new arrivals to maintain occupancy. The reply is therefore held for as long as the server stays busy — the request does not fail, it simply does not answer, and it eventually surfaces as a client-side timeout rather than an error the server reports.
+
+Two consequences worth separating:
+
+- **The endpoint appears to hang precisely when the machine is under load** — the condition a resource endpoint exists to report on.
+- **A poller gets a burst of identically-stale values** when the batch finally drains, because several deferred snapshots are serviced back-to-back against the same post-drain state.
+
+**Not the cause:** the pipeline driver arm is *not* at fault. It replies with an explicit `Err` for both `ResourceSnapshot` (`driver.rs:479-483`) and `SetVramLimit` (`driver.rs:485-489`) rather than dropping the oneshot, so pipeline models return a clean error instead of hanging. The deferral above is the whole mechanism.
+
+**This is the practical face of invariant §5.11**, and it is why observability must be collected inline in the batch loop rather than requested through the command channel: *the command channel is not serviced during batch decode, which is exactly when observability matters most.*
+
 ---
 
 ## 9. Where to look first
+
+---
 
 | Question | Start at |
 |---|---|
