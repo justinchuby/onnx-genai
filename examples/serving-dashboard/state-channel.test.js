@@ -159,12 +159,22 @@ describe('field states are legible without colour', () => {
 // states, and MEASURED's wire value is its own name.
 describe('the ruled field-state vocabulary', () => {
   it('is exactly five states', () => {
-    // Asserted on the WIRE VALUES rather than on the key count, because the
-    // invariant that matters is how many distinct states can reach a panel or
-    // a `[data-state=...]` selector. A deprecated alias pointing at an
-    // existing value adds a key but no state, and forbidding that would force
-    // the OK rename to land atomically across files other agents are editing
-    // right now. A genuinely new or a collapsed state still fails here.
+    // Two censuses, because they catch opposite failures and neither catches
+    // both. The WIRE census below catches a state being added or collapsed.
+    // The KEY census catches an ALIAS -- two names for one state -- which is
+    // invisible to a de-duplicated value census by construction.
+    assert.deepEqual(
+      Object.keys(FIELD_STATES).sort(),
+      ['NOT_APPLICABLE', 'OK', 'PENDING', 'STALE', 'UNAVAILABLE'],
+      'FIELD_STATES must expose exactly five KEYS. Ruled D160: an alias is ' +
+        'deleted, not deprecated. Both spellings shipping together is strictly ' +
+        'worse than the landmine it replaced, because the split now carries a ' +
+        'comment explaining why it is fine -- and FIELD_STATES.MEASURED still ' +
+        "evaluates to 'ok', so `field.state === 'measured'` remains false for " +
+        'every measured field on the dashboard. A transitional alias is a fork ' +
+        'with a deprecation notice.',
+    );
+
     assert.deepEqual(
       [...new Set(Object.values(FIELD_STATES))].sort(),
       ['not-applicable', 'ok', 'pending', 'stale', 'unavailable'],
@@ -203,10 +213,17 @@ describe('the ruled field-state vocabulary', () => {
         'unreachable server.',
     );
 
-    // The old spelling stays valid as a transitional alias, but it must never
-    // become a SECOND state on the wire -- a sixth string that no stylesheet
-    // renders and no panel branches on would fail silently in exactly the way
-    // this rename exists to stop.
-    assert.equal(FIELD_STATES.MEASURED, FIELD_STATES.OK);
+    // The alias does NOT stay valid. Ruled D160 after this assertion was
+    // written: `MEASURED` is removed, not deprecated. Keeping it costs the
+    // rename its entire point, since the mismatched name is still exported and
+    // still resolves to 'ok'. The same edit must fix telemetry-field.js:63-65,
+    // which says `reason` is "required when state !== 'measured'" -- under the
+    // current constant that condition is ALWAYS true, so the contract read
+    // literally demands an apology attached to every healthy number.
+    assert.equal(
+      FIELD_STATES.MEASURED,
+      undefined,
+      'FIELD_STATES.MEASURED must be gone, not aliased. See D160.',
+    );
   });
 });
