@@ -1,7 +1,0 @@
-=== run-level null test conditions ===
-2026-07-30T07:32:49Z
- 0:32  up 3 days, 18:01, 1 user, load averages: 24.69 32.18 30.35
---- heavy jobs present ---
-37029 352.1% /Users/justinc/.flightdeck/artifacts/nxrt-bbcfe5/sessions/12e42da8-f188-455f-930
-50903 0.0% bash /Users/justinc/Documents/GitHub/onnx-genai-demo/scripts/verify_model.sh /va
-44046 0.0% /bin/bash --norc --noprofile -c cd /Users/justinc/Documents/GitHub/onnx-genai-de

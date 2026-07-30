@@ -1691,6 +1691,10 @@ exclusive window, announced, with every other timing lane held — not merely a 
 
 ## 13. 🔴 AC33 DECLINED — and the quiet window made the box *worse*, not better
 
+> ⛔ **SUPERSEDED BY §15: AC33 WAS SUBSEQUENTLY *EXECUTED*, NOT DECLINED.** Both arms ran with a
+> matched null beside them; the gate is missed at **91.04 %** of BEFORE. §13.4's ±84.92 %
+> envelope **must not be quoted against §15's window** — see §15.3.
+
 > ⚠️ **§13.1 AND §13.2's FIRST GROUND ARE RETRACTED BY §14 — THE ARTIFACTS EXIST.** §13.3 and
 > §13.4 (the null measurement, which is the actual reason AC33 is declined) are **UNAFFECTED**
 > and stand. Read §14 before citing anything in §13.1.
@@ -1898,10 +1902,10 @@ Whoever runs the A/B must confirm the batching configuration matches by reading 
 
 ### 14.3 The artifacts are now tracked, which is the fix nobody had landed
 
-`harness/` (5 files) and `raw/` (21 files) are **committed to this repository** alongside my new
+`harness/` (5 files) and `raw/` (21 files) are **committed at `examples/qa-evidence/`** with my new
 `qa_null_calibration_512.py` / `qa-null-calibration-512.json` and the endpoint-stall probe —
 176 KB total, all text. Each copy was verified with `cmp` against its source, **byte-identical,
-not merely present**. The 29 MB binary is **not** committed; `clean-binary.sha256` records its
+not merely present**. The 29 MB binary is **not** committed; `qa-evidence/clean-binary.sha256` records its
 digest and §14 records its path, so its identity is verifiable even if the file moves.
 
 **The real defect was never that the artifacts were lost. It is that a normative document pointed
@@ -1917,3 +1921,135 @@ They warned the name asserts more freshness than it owns. **I made the mirror-im
 concluded the object was absent because its name resolved to nothing from where I stood.**
 Existence versus identity, one more time, and this time the failure was mine and the correction
 came from someone reading `ps` while I was reading `find`.
+
+---
+
+## 15. ✅ AC33 EXECUTED — both arms, real binaries, with a matched null beside it
+
+§13 declined AC33 partly on the belief that the BEFORE arm was gone. §14 retracted that. **So I
+ran it.** This section supersedes §13's decline: **AC33 is no longer declined, it is MEASURED and
+the verdict is INCONCLUSIVE-LEANING-FAIL.** It does not pass, and it cannot be failed at p<0.05.
+
+### 15.1 Both arms are real, and their identity is asserted on the wire
+
+```
+BEFORE  sha256 d49d3c8fe1b8a98e…   mtime Jul 29 23:22:11   the PRESERVED clean-tree binary
+AFTER   sha256 af01404555736aec…   mtime Jul 30 04:26:15   the shipping telemetry build
+BOTH    --model …/qwen2.5-0.5b-scatter-v2  --model-id qwen-scatter   SAME MODEL, SAME MACHINE
+
+STARTUP LOG, BOTH ARMS:  "continuous batch driver enabled max_batch=4"
+   ^ the §5.0 precondition, verified per-arm from the log rather than assumed from flags
+     (the clean binary has no --max-batch flag; the driver enables itself on a static-cache model)
+
+ARM IDENTITY, read in the same session as the measurement — /v1/models FIELD COUNT:
+   :9621 BEFORE -> 4   [created, id, object, owned_by]
+   :9622 AFTER  -> 7   [created, id, is_default, loaded, object, owned_by, path]
+   ^ THE ARMS ARE PROVABLY DIFFERENT BINARIES ON THE WIRE, not merely different paths on disk.
+```
+
+### 15.2 The A/B, and the matched null run beside it in the same window
+
+Interleaved BEFORE,AFTER within each pair; 512 tokens; `temperature=0`; every sample returned
+`finish_reason=length` with exactly 512 tokens. **The matched null (A/A) is the same protocol with
+both arms pointed at `:9621`, so its true effect is exactly zero — run in the same window, at the
+same load, so its envelope is comparable rather than borrowed from §13.3.**
+
+| pair | BEFORE tok/s | AFTER tok/s | delta |
+|---|---|---|---|
+| 0 | 32.949 | 32.187 | −2.3 % |
+| 1 | 29.597 | 22.026 | **−25.6 %** |
+| 2 | 31.771 | 29.308 | −7.8 % |
+| 3 | 30.036 | 29.608 | −1.4 % |
+| 4 | 30.634 | 25.927 | −15.4 % |
+| 5 | 28.954 | 29.700 | **+2.6 %** |
+| 6 | 27.380 | 22.443 | −18.0 % |
+| 7 | 32.731 | 23.053 | **−29.6 %** |
+
+```
+                       median    worst pair   negative   load1
+  A/A  (TRUE ZERO)     +1.36 %    +32.92 %      4 / 8    9.3 – 17.0
+  A/B  (BEFORE→AFTER) −11.56 %    −29.57 %      7 / 8    8.1 – 14.8
+
+  BEFORE median 30.335 tok/s      AFTER median 27.618 tok/s
+  AC33 §5.1 GATE: AFTER >= 98 % of BEFORE median  ->  MEASURED 91.04 %   ⛔ NOT MET
+  sign test A/B: 7/8 negative, two-tailed p = 0.070
+  sign test A/A: 4/8 negative  <- the control is balanced, as a true zero must be
+  CV BEFORE 5.88 %   CV AFTER 13.73 %
+```
+
+### 15.3 The verdict, stated at the precision the data supports
+
+**⛔ AC33 DOES NOT PASS.** The gate is ≥98 % and the measurement is **91.04 %**. Seven of eight
+pairs are negative and the one positive pair is the smallest in the set.
+
+**⚠️ AND IT CANNOT BE FAILED AT p<0.05 EITHER, WHICH I WILL NOT PAPER OVER: the matched null's
+worst pair is ±32.9 %, which exceeds the observed −11.56 % median.** So any *single* pair here is
+consistent with noise, and the sign test lands at **p = 0.070** — suggestive, not decisive.
+
+**🔑 The part that survives, and the reason this is worth more than §13's decline: THE MATCHED
+NULL IS THE POSITIVE CONTROL FOR THE EXPERIMENT ITSELF, AND IT PASSED.** A/A returned a median of
+**+1.36 %** and a **4/8** sign split — precisely what an unbiased instrument must return on a true
+zero. **So the harness does not manufacture a direction, and the 7/8 negative split in the A/B is
+therefore a property of the binaries, not of my method.** That distinction is the whole reason to
+run the null in the same window instead of quoting §13.3's number.
+
+**⚠️ AND I MUST CORRECT MY OWN §13.4 WHILE I AM HERE: quoting the ±84.92 % envelope against this
+run would have been wrong.** That envelope was measured at loadavg 12.6–25.3; this window ran at
+8.1–17.0 and is far tighter (A/A worst pair 32.9 % vs 84.9 %). **A noise envelope is a property of
+a window, not of a machine, and carrying one forward to a quieter window overstates the noise and
+would have let me wave away a real signal.** §13.4's conclusion — that quieting the box did not
+help — stands for the windows it compared; it does not license reusing its number here.
+
+### 15.4 What would settle it, and it is cheap
+
+**The sign test is one pair short of decisive.** At 7/8 it is p=0.070; the same effect at
+**11/12 pairs reaches p≈0.006**, and at 8/8 it is already p=0.008. **This is ~15 more minutes of
+the same harness in an exclusive window** — `examples/qa-evidence/harness/qa_ac33_ab.py` and
+`…/qa_ac33_matched_null.py` are committed, raw sets in `examples/qa-evidence/raw/`. I am not
+running it against 11 neighbouring listeners, because the one thing both this section and §13
+agree on is that contention is the dominant term.
+
+**📌 My recommendation to the gate: DO NOT CERTIFY AC33 GREEN.** The point estimate misses the
+gate by 7 points in the direction that costs users throughput, with a controlled harness and a
+passing null. **That is not proof of a regression, and it is emphatically not evidence of
+absence of one** — which is exactly the state a gate item should not be closed in.
+
+### 14.4 🔴 I THEN REINTRODUCED THE §11 PATH-DISCLOSURE P1 MYSELF, AND A TEST CAUGHT ME
+
+My first attempt at §14.3 committed the artifacts to `examples/serving-dashboard/{raw,harness}/`
+— the obvious place, and **the place §8 has always named.** `served-surface.test.js` went red:
+
+```
+✖ every tracked file is claimed by exactly one declared class   (23 files unclaimed)
+✖ the exposure ratchet has not been loosened
+```
+
+**That directory is the demo's document root. EVERY TRACKED FILE IN IT IS FETCHABLE BY ANY
+VISITOR** — the suite proves this by noting `/demo/asset-graph.test.js` returns 44,356 bytes. And
+two of my files carried the operator's absolute home path:
+
+```
+raw/qa-runlevel-null-conditions.txt   ->  /Users/<user>/.flightdeck/artifacts/…
+clean-binary.sha256                   ->  /Users/<user>/.flightdeck/…/clean-binary/…
+```
+
+**☠️ SO THE COMMIT THAT PRESERVED THE EVIDENCE FOR §11 WOULD HAVE RE-SHIPPED THE EXACT DEFECT §11
+CERTIFIES AS FIXED — as a static file, on both origins, for every visitor.**
+
+**⚠️ AND `model-path-disclosure.test.js` — the guard I mutation-tested in §11 and called
+un-neuterable — STAYED GREEN THROUGHOUT.** It sweeps a fixed `SOURCES` list (`dashboard/system.js`,
+`ui/model-card.js`). **It guards the two files where the defect once lived, not the origin the
+defect is served from.** My §11 mutation test proved it has teeth against *that* corpus and I
+generalised it to the defect class. **That was the same corpus-versus-detector error as §14.1,
+committed within the hour, by me, against my own guard.**
+
+✅ **Fix: the artifacts live at `examples/qa-evidence/`, outside the document root**, and both
+files were sanitised to `$HOME` (verified 0 remaining, with a positive control confirming the
+detector fires). **`raw/` — the path this document has cited since §8 — is unsafe by construction
+for any artifact recording real conditions, because conditions files record real paths.**
+
+**🔑 The rung, and it is the sharpest one I have earned tonight: `served-surface.test.js` reads
+`git ls-tree HEAD`, deliberately — not `ls-files`, not a disk walk. So it could not see my defect
+until I COMMITTED it, and it caught me on the very next run.** A guard that reads committed state
+is the only kind that can audit what ships, and the price is that it cannot warn you beforehand.
+**I was saved by someone else's test, aimed at a class I had already declared myself expert in.**
