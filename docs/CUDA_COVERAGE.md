@@ -193,12 +193,24 @@ pre-batch counts retained in the historical wave notes below.
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **173** |
 | CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **167** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **161** |
+| CUDA registry `(domain, op_type)` pairs | **168** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **163** |
 | CPU pairs implemented by CUDA in the same domain | **165 / 173** |
 | CPU standard-domain op types implemented by CUDA | **143 / 145** |
 
 The **2 remaining CPU `ai.onnx` gaps** are `NonMaxSuppression` and `Unique`.
+
+Issue #67 batch (2026-07-30): a data-driven placement audit over the real target
+decode models (Qwen2.5 0.5b/1.5b/7b, Phi-4-mini, Qwen3.6-27B, Qwen3.5-35B-A3B)
+found the classic transformer decode path already places 100% of EP-placeable
+nodes on CUDA (the only "uncovered" types are executor-handled control-flow
+`If`/`Loop`/`Scan`). The genuine remaining gaps are the **Qwen3.5 hybrid**
+(Mamba + linear-attention) family. This batch landed **`CausalConvWithState`**
+(new NVRTC fp32/fp16/bf16 kernel — depthwise causal short-conv with rolling
+state) and declared the already-registered **`GatherBlockQuantized`** in
+`CUDA_COVERED_OPS` with a dedicated GPU parity suite. Honest follow-ups:
+`com.microsoft::LinearAttention`, registering `RotaryEmbedding` for the
+`com.microsoft` domain, and a `Bool`-input `NonZero` path.
 
 The decode/transformer-oriented priority set from issue #67 is already covered:
 `LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
@@ -382,7 +394,7 @@ reflection padding with either `align_corners` setting. ConvTranspose
 `SAME_UPPER`/`SAME_LOWER` and output-shape-driven padding, plus cubic/bicubic and
 volumetric GridSample, remain explicitly fail-closed. GPU parity covers the
 supported narrow storage types and out-of-bounds sampling. Current source-derived
-coverage is **161** advertised CUDA op names, **167** CUDA `(domain, op_type)`
+coverage is **163** advertised CUDA op names, **168** CUDA `(domain, op_type)`
 pairs, and **143 / 145** CPU standard-domain op types.
 
 ---

@@ -2364,6 +2364,17 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         ));
     }
 
+    p.push(dedicated(
+        "GatherBlockQuantized",
+        "gather_block_quantized_gpu.rs",
+        "blockwise-quantized embedding lookup (issue #67)",
+    ));
+    p.push(dedicated(
+        "CausalConvWithState",
+        "causal_conv_with_state_gpu.rs",
+        "depthwise causal short-conv with rolling state (issue #67 Qwen3.5 hybrid)",
+    ));
+
     // GEMM / quantized-matmul family.
     p.push(dedicated(
         "MatMul",
