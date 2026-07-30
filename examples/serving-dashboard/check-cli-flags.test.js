@@ -229,6 +229,65 @@ test('every flag in a documented server command exists in cli.rs', () => {
   );
 });
 
+test('the parser does not accept a SUPERSET of the real flags', () => {
+  // @732c7548's drift test stayed green against an injected bogus flag: it
+  // collected both a field's name AND its `long = ".."` override as valid
+  // spellings, but clap uses the override INSTEAD of the field name. A test
+  // asserting a superset of reality cannot fail, and sits there looking like
+  // coverage indefinitely.
+  //
+  // The real cli.rs currently contains no `long = ".."` override, so this
+  // branch of the parser is never exercised by the production input -- which
+  // is precisely why it needs a synthetic case. Untested code that only runs
+  // once someone edits cli.rs is a trap armed for a future contributor.
+  const synthetic = `
+    pub struct ServeArgs {
+        /// Explicit override.
+        #[arg(long = "cors-allow-origin", env = "X")]
+        pub cors_allow_origins: Vec<String>,
+
+        /// Derived from the field name.
+        #[arg(long)]
+        pub max_batch: usize,
+
+        /// Short-only: clap exposes no long flag at all.
+        #[arg(short)]
+        pub verbose: bool,
+
+        /// A positional argument, not a flag.
+        pub model_path: PathBuf,
+    }
+  `;
+
+  const flags = parseServerFlags(synthetic);
+
+  assert.ok(flags.has('--cors-allow-origin'), 'the explicit override must be accepted');
+  assert.ok(
+    !flags.has('--cors-allow-origins'),
+    'the FIELD NAME must be rejected when an explicit long override is present — ' +
+      'accepting both is the superset bug that cannot fail',
+  );
+  assert.ok(flags.has('--max-batch'), 'a bare `long` must derive the flag from the field');
+  assert.ok(!flags.has('--verbose'), 'a short-only arg exposes no long flag');
+  assert.ok(!flags.has('--model-path'), 'a positional is not a flag');
+  assert.equal(flags.size, 2, `expected exactly 2 flags, got ${[...flags.keys()].join(', ')}`);
+});
+
+test('a cfg-gated flag is reported as unavailable, not as available', () => {
+  // `--native-device` exists only under the `native-backend` feature. A README
+  // that hands a visitor a cfg-gated flag is wrong for every default build,
+  // and the failure is an unrecognised-argument exit at first run.
+  const synthetic = `
+    pub struct ServeArgs {
+        #[cfg(feature = "native-backend")]
+        #[arg(long, env = "ONNX_GENAI_NATIVE_DEVICE")]
+        pub native_device: Option<NativeDecodeDevice>,
+    }
+  `;
+  const flags = parseServerFlags(synthetic);
+  assert.equal(flags.get('--native-device')?.feature, 'native-backend');
+});
+
 test('a documented command is audited at all — the audit has real subject matter', () => {
   // Without this, deleting every command from the README would make the test
   // above pass perfectly. An audit that can be satisfied by having nothing to
