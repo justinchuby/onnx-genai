@@ -375,7 +375,50 @@ tag name.
 
 Stated without softening. Every item here is re-runnable at `1e809173`.
 
-### The vocabulary in the types and the vocabulary in the code disagree
+### RETRACTED — the vocabulary claim below was mine, and it was wrong
+
+**I compared code written against one vocabulary to the union of a different
+one.** There are two state vocabularies in this dashboard, and only one of them
+retired `'ok'`:
+
+```
+FIELD states   telemetry-field.js  measured|pending|stale|unavailable|not-applicable
+                                   'ok' RETIRED — and it was a real landmine:
+                                   the constant once read MEASURED: 'ok'
+SERIES states  store-adapter.js:38 @property {'ok'|'unavailable'} state
+                                   'ok' DECLARED, CURRENT, CORRECT
+```
+
+```
+state: 'ok' in store-adapter.js .................. 5   <- I published 6
+state: 'ok' anywhere else in shipped non-test JS .. 0
+[POS CTL] any state: '…' in that file ............ 11  <- the grep can count
+[NEG CTL] state: 'zzq' ...........................  0  <- and can still say no
+```
+
+**Every site I counted is in the file that declares the union it satisfies.**
+The code and its type agree. The sentence below — *the type says one thing, the
+code does another* — was produced by measuring real occurrences correctly and
+checking them against the wrong specification, which is this document's most
+frequent failure and now its author's fourth instance. **My count was also wrong
+by one in the direction that made the finding sound larger.**
+
+**Why this is retracted in place rather than deleted.** A false gap in a document
+whose subject is honesty is worse than the same error anywhere else, and deleting
+it would leave the strongest evidence for that claim invisible. **The last
+surviving copy of a withdrawn figure is usually inside its own retraction**, so a
+retraction written in the language of the claim is indistinguishable from the
+claim — four people hit that property in four files tonight. The paragraph below
+is kept, marked, and must not be quoted as a finding.
+
+**What survives, and belongs to someone else.** A reviewer found the real
+divergence in the neighbouring vocabulary: the ratified source classes include
+`simulated`, the canonical enum is short that member, and the badge lookup falls
+back to `derived` — so an unknown class renders as *arithmetic on measured
+inputs*, which is a stronger claim than the truth. **That is a live finding, it
+is theirs, and it is not the one written below.**
+
+### ~~The vocabulary in the types and the vocabulary in the code disagree~~ (RETRACTED — see above)
 
 The render-state union is documented as
 `measured | pending | stale | unavailable | not-applicable`.
