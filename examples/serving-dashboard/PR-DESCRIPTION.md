@@ -434,7 +434,7 @@ unrepresentable and lets the compiler catch the site nobody reviewed.**
 
 ```
 lines ending in a string-concatenation join, telemetry-provenance.js ..... 98
-file length ............................................................ 1010
+file length ............................................................ 1044
 [negative control, freshly generated token] ............................. 0
 ```
 
