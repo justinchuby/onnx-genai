@@ -498,36 +498,52 @@ than one we made prettier.
 ## 7. Tests
 
 ```bash
-cd examples/serving-dashboard && node --test '*.test.js' 'dashboard/*.test.js'
+./examples/serving-dashboard/run-tests.sh
 ```
 
-> **Three parts of that line are load-bearing, and omitting any one of them
-> produces a GREEN run that measured less than you think — or nothing at all.**
->
-> - **The `cd`.** Globs resolve against the working directory, not against this
->   document. This section previously gave the command without one, and it was
->   wrong in two different ways depending on where you stood: from the
->   repository root it ran **279 of 582 tests and exited 0**; from the directory
->   this file lives in it ran **0 tests and exited 0**.
-> - **Both globs.** `dashboard/` is where the panel tests live — roughly half
->   the suite. One glob silently omits all of them.
-> - **The quotes.** They hand the patterns to Node, which expands them itself.
->   Unquoted, the shell expands them first and does not recurse.
->
-> ⚠️ **`node --test` treats "no files matched" as success, not as an error.** A
-> vacuous run is indistinguishable from a passing one by exit code alone, which
-> is why the floor below is part of the contract and not a nicety.
+Runnable from anywhere; it resolves its own directory. **This is the only
+documented form.** The command it replaced was correct prose about a command
+that had already drifted, and this section is kept as the reason the script
+exists rather than as a second copy of it.
 
-**Expected: 582 tests, 0 failures, on Node v25.6.1.** Treat **fewer than 500
-tests as a FAILED run even if it exits 0** — that means the command did not
-reach the whole suite, and a partial suite reporting success is the one result
-that cannot be distinguished from a good one by looking at it. The floor is a
-liveness assertion, not a quality bar: it asserts the instrument ran, and it
-gets *more* true as the suite grows, which is why it is `>=` and not `==`.
+> **A TEST COMMAND WRITTEN IN A MARKDOWN FENCE IS AN UNTESTED COPY OF A FACT.**
+> This command was documented in seven tracked files in five incompatible
+> forms. Each of the following was a real, green, wrong run:
+>
+> - **No `cd`.** Globs resolve against the working directory, not against this
+>   document. From the repository root the old command ran **279 of 582 tests
+>   and exited 0**; from the directory this file lives in it ran **0 tests and
+>   exited 0**.
+> - **One glob.** `dashboard/` holds roughly half the suite. One glob silently
+>   omitted all of it.
+> - **Two globs.** Also wrong, and this is the instructive one: `'*.test.js'
+>   'dashboard/*.test.js'` reaches **583 of 588** tests, because `ui/` is a
+>   third test directory. Four reviewers independently proposed exactly that
+>   two-glob fix and **all four missed `ui/`** — so the script *discovers* test
+>   files instead of listing them. A hardcoded list stops covering whatever was
+>   added last, which is always the thing most likely to be wrong.
+> - **Unquoted globs.** The shell expands them first, and shell expansion does
+>   not recurse.
+>
+> ⚠️ **`node --test` treats "no files matched" as success, not as an error**,
+> and a file that fails to *import* contributes zero tests rather than failing
+> ones — so a broken module makes the suite report **smaller**, not redder.
+> Both are why the script reconciles the number of discovered files against the
+> number of suites Node actually executed.
 
-📌 Bare `node --test` from this directory also works on Node v25.6.1, but
-directory recursion has changed across Node majors, so it is not the documented
-form — its coverage is a function of a runtime version that nothing here pins.
+**Treat fewer than 500 tests as a FAILED run even if it exits 0.** A partial
+suite reporting success is the one result that cannot be distinguished from a
+good one by looking at it. The script asserts this floor for you and fails
+loudly.
+
+📌 The floor is a **liveness** assertion, not a completeness one: it proves the
+instrument ran at all. It cannot see the silent loss of a single suite — only
+the file-count reconciliation can. Do not read a passing floor as coverage.
+
+📌 No exact expected count is written here on purpose. A number in prose is a
+fact that must be remembered in N places; the script computes it, prints it
+beside `pwd`, `HEAD` and the Node version, and asserts the properties that
+actually matter.
 
 Node's built-in runner. No dependencies, no install, consistent with the
 demo's no-build-step rule. `telemetry-store.test.js` locks down the behaviours

@@ -25,7 +25,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -294,49 +294,118 @@ test('every README server invocation passes --demo-assets-dir, absolutely', () =
 function documentedTestCommands() {
   const found = [];
   for (const name of ['README.md', 'CONTRACT.md']) {
+    // ONLY COMMANDS INSIDE A FENCED BLOCK COUNT, AND THIS IS LOAD-BEARING.
+    //
+    // A prose sentence may QUOTE a command in order to explain why it is
+    // WRONG. Scanning every line makes a cautionary counter-example
+    // indistinguishable from a prescription -- and the counter-example is
+    // usually the defective command, quoted verbatim, which is exactly the
+    // shape this test hunts.
+    //
+    // This is not hypothetical. CONTRACT.md documents the superseded two-glob
+    // form in a bullet explaining that it reaches 583 of 588 tests. Under a
+    // whole-file scan that bullet SATISFIED this check, so deleting the real
+    // documented command left the suite green: the file went on "documenting"
+    // a full-suite command it was in the middle of warning readers away from.
+    let inFence = false;
     for (const line of read(name).split('\n')) {
-      if (line.includes('node --test')) found.push({ name, line });
+      if (line.trimStart().startsWith('```')) {
+        inFence = !inFence;
+        continue;
+      }
+      if (!inFence) continue;
+      if (line.includes('node --test') || line.includes('run-tests.sh')) {
+        found.push({ name, line });
+      }
     }
   }
   return found;
 }
 
-test('every documented full-suite test command reaches the dashboard directory', () => {
+// MEASURED GAP, LEFT AS A MAP RATHER THAN A SILENT LIMIT: seven tracked files
+// document a full-suite command and this corpus reads TWO. Widening it is NOT
+// a one-line change, because `IMPLEMENTATION-REVIEW.md` records
+// `node --test '**/*.test.js'` inside a RESULTS TABLE -- a record of a past
+// measurement, not a prescription to run. A naive widening flags it and
+// produces a false red against a correct document.
+//
+// The distinction needed is the one `page-claims.test.js` already makes for
+// prose: ban the CLAIM, not the TOPIC. Whoever widens this must separate a
+// command a reader is told to run from a command a reader is told the results
+// of. Until then this test's title overstates its reach by five files.
+const FULL_SUITE_RUNNER = './run-tests.sh';
+
+test('no shipped document enumerates the test suite by hand', () => {
   const commands = documentedTestCommands();
 
-  assert.ok(
-    commands.length >= 2,
-    'no documented `node --test` command found; this check is inspecting nothing',
+  // A COMMAND is a line you could paste. Prose that *discusses* a command --
+  // including the history blockquotes that name the old globs on purpose --
+  // is not a command, and grading it as one would make this test unfixable:
+  // documenting the defect would trip the guard against the defect.
+  const isCommand = (line) => {
+    const t = line.trim().replace(/^\$\s*/, '');
+    return t.startsWith('node --test') || t.startsWith('./') || t.startsWith('cd ');
+  };
+
+  const runnerCitations = commands.filter(
+    ({ line }) => isCommand(line) && line.includes('run-tests.sh'),
   );
 
-  // Only the BROAD root glob is a full-suite claim. A deliberately narrow
-  // selector like `check-*.test.js` is honest about covering a subset, so the
-  // leading delimiter here is what separates "all root tests" from "some".
+  // ANTI-VACUITY, stated over the citations we REQUIRE rather than over the
+  // corpus. A floor on "lines mentioning node --test" goes green the moment
+  // the subject is deleted -- which is exactly how the previous version of
+  // this test failed when the documented command became a script. The cure
+  // and the drift produced the identical red.
+  assert.ok(
+    runnerCitations.length >= 2,
+    `only ${runnerCitations.length} document(s) cite run-tests.sh as a runnable ` +
+      `command; this check is inspecting nothing`,
+  );
+
+  // THE PROPERTY, and why it is a ban rather than a required pair of globs.
+  // The previous version demanded `*.test.js` AND `dashboard/*.test.js`, and a
+  // command satisfying it IN FULL still omitted `ui/` -- 589 tests where the
+  // suite has 594, exit code 0. Four reviewers specified that same pair and
+  // all four missed the same directory.
+  //
+  // A HAND-ENUMERATED LIST IS INCOMPLETE BY CONSTRUCTION: it names only the
+  // directories that existed when it was written, so it stops covering
+  // whatever was added last -- the code most likely to be wrong. No pattern
+  // this test could require would have caught `ui/`, because the enumeration
+  // IS the bug. Only discovery closes it, so the runner is mandatory.
   const broadRootGlob = /(?:^|['"/])\*\.test\.js/;
-
-  // NOT `line.includes('dashboard/')`. The demo lives in `serving-dashboard/`,
-  // so that substring is already present in the very path being globbed --
-  // `examples/serving-dashboard/*.test.js` "contains dashboard/" while globbing
-  // nothing inside it. The first version of this test used that check, and a
-  // landed mutation restoring the one-glob form left it GREEN. The leading
-  // delimiter is what makes this a directory segment rather than a word ending.
-  const panelGlob = /(?:^|['"/])dashboard\/\*\.test\.js/;
-
-  let fullSuiteClaims = 0;
   for (const { name, line } of commands) {
-    if (!broadRootGlob.test(line)) continue;
-    fullSuiteClaims += 1;
+    if (!isCommand(line)) continue;
     assert.ok(
-      panelGlob.test(line),
-      `${name} documents a full-suite command that never globs dashboard/, ` +
-        `so it silently omits roughly half the suite AND EXITS 0:\n  ${line.trim()}`,
+      !broadRootGlob.test(line),
+      `${name} documents a hand-enumerated full-suite command. Any such list ` +
+        `silently omits directories added after it was written, and \`node ` +
+        `--test\` reports a subset as SUCCESS. Cite ./run-tests.sh, which ` +
+        `discovers test files and reconciles the count:\n  ${line.trim()}`,
     );
   }
+});
 
+test('a documented runner script actually exists and is executable', () => {
+  // Repointing a document at a script is only an improvement if the script is
+  // there. A citation to a missing file is worse than the drifted glob it
+  // replaced: the glob ran something, and this would run nothing at all.
+  const citing = documentedTestCommands().filter(({ line }) =>
+    line.includes('run-tests.sh'),
+  );
+  assert.ok(citing.length >= 1, 'no document cites the runner; this check inspects nothing');
+
+  const runner = new URL(`./${FULL_SUITE_RUNNER.replace('./', '')}`, import.meta.url);
+  const stats = statSync(runner, { throwIfNoEntry: false });
   assert.ok(
-    fullSuiteClaims >= 2,
-    `only ${fullSuiteClaims} full-suite command(s) matched the glob pattern; ` +
-      `the matcher has probably drifted and this test is passing over an empty set`,
+    stats,
+    `${citing.length} document(s) tell a reader to run ${FULL_SUITE_RUNNER}, ` +
+      'and no such file exists',
+  );
+  assert.ok(
+    (stats.mode & 0o111) !== 0,
+    `${FULL_SUITE_RUNNER} exists but is not executable, so every documented ` +
+      'invocation of it fails with "permission denied"',
   );
 });
 
