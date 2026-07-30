@@ -143,6 +143,7 @@ export function measuredField(
     unit = null,
     observedAtMs = Date.now(),
     derivedFrom = null,
+    provenanceWarning = null,
   },
 ) {
   if (value === null || value === undefined) {
@@ -169,6 +170,10 @@ export function measuredField(
     // off a response. Still a real measurement, but a panel showing it owes the
     // viewer the inputs — a number we derived needs more disclosure, not less.
     derivedFrom,
+    // Set when the provenance table said this field should be a placeholder
+    // but the server sent something else. The value IS shown -- hiding a real
+    // number is the exact failure this warns about -- but never silently.
+    provenanceWarning,
   });
 }
 

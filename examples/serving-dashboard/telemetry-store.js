@@ -34,6 +34,7 @@ import {
   FEATURE_GATED_ENDPOINTS,
   PROVENANCE,
   NEVER_MEASURED_CLASSIFICATIONS,
+  matchesStub,
   allFieldKeys,
 } from './telemetry-provenance.js';
 import { parsePrometheusText, scalarOf, histogramMean } from './prometheus-parse.js';
@@ -208,6 +209,13 @@ export function createTelemetryStore({
   let mismatchWarned = false;
 
   /**
+   * Fields whose provenance classification the wire has contradicted, keyed by
+   * field path. Survives across polls so the AC10 honesty footer can list them.
+   * @type {Map<string, string>}
+   */
+  const provenanceWarnings = new Map();
+
+  /**
    * Previous sample of the cumulative token counter, for deriving a rate.
    * @type {{total: number, atMs: number}|null}
    */
@@ -243,6 +251,20 @@ export function createTelemetryStore({
 
     getSnapshot() {
       return snapshot;
+    },
+
+    /**
+     * Fields where the wire contradicted this build's provenance audit, keyed
+     * by field path.
+     *
+     * The AC10 honesty footer renders these. An empty map is the normal case
+     * and means the audit still matches the server; a non-empty one means
+     * telemetry-provenance.js needs editing, and says which rows.
+     *
+     * @returns {Record<string, string>}
+     */
+    provenanceWarnings() {
+      return Object.freeze(Object.fromEntries(provenanceWarnings));
     },
 
     field(key) {
@@ -601,6 +623,33 @@ export function createTelemetryStore({
     return { modelIds: [], primary: null };
   }
 
+    /**
+   * Explain, in terms a developer can act on, that this file's audit is stale.
+   *
+   * @param {string} key
+   * @param {import('./telemetry-provenance.js').ProvenanceEntry} entry
+   * @param {unknown} observed
+   * @returns {string}
+   */
+  function describeStaleProvenance(key, entry, observed) {
+    const expected = 'stubValue' in entry ? JSON.stringify(entry.stubValue) : 'no value at all';
+    return (
+      `"${key}" is classified ${entry.classification} in telemetry-provenance.js, which expects ` +
+      `${expected} from ${entry.source}. The server sent ${JSON.stringify(observed)}. ` +
+      'That means this field is now genuinely measured and the provenance table is out of date. ' +
+      `Update its classification and re-read the evidence citation (${entry.evidence}). ` +
+      'The value is being displayed rather than hidden, because suppressing a real measurement ' +
+      'is the failure this check exists to catch -- but it is flagged until the table is fixed.'
+    );
+  }
+
+  /** Record a stale-provenance finding, warning once per field rather than per poll. */
+  function recordProvenanceWarning(key, warning) {
+    if (provenanceWarnings.has(key)) return;
+    provenanceWarnings.set(key, warning);
+    console.warn(`[telemetry-store] provenance table is stale: ${warning}`);
+  }
+
   /**
    * The one case where per-origin classification can go silently wrong.
    *
@@ -654,15 +703,43 @@ export function createTelemetryStore({
       // Client-derived fields are produced after this loop, from other fields.
       if (entry.derived) continue;
 
-      if (entry.classification === 'STRUCTURALLY_BYPASSED') {
-        // Distinct from unavailable: this path never asks the question, so no
-        // amount of server plumbing would produce a value here.
-        fields[key] = notApplicableField(entry.reason, fieldMeta(entry));
-        continue;
-      }
+      const suppressed =
+        entry.classification === 'STRUCTURALLY_BYPASSED' ||
+        NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification);
 
-      if (NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)) {
-        fields[key] = unavailableField(entry.reason, fieldMeta(entry));
+      if (suppressed) {
+        // Do NOT return here without looking at the wire first. This table is a
+        // snapshot of server source, and the server team's job is to invalidate
+        // it. If we suppress without checking, the day a field becomes real is
+        // the day we start hiding a genuine measurement behind an em-dash --
+        // and that failure is invisible, because it looks like caution.
+        const source = sources[entry.source];
+        const observed = source?.ok ? readEntryValue(source.body, entry) : undefined;
+
+        // Absence is NOT evidence that a field became real: a proxy serving
+        // HTML at /metrics, or a build predating the field, both read as
+        // undefined. Only a value that is actually present can contradict the
+        // table -- and treating absence as a contradiction crashes the poll
+        // cycle, because there is nothing to render.
+        const present = observed !== undefined && observed !== null;
+        if (source?.ok && present && !matchesStub(entry, observed)) {
+          const warning = describeStaleProvenance(key, entry, observed);
+          recordProvenanceWarning(key, warning);
+          // Show the value. Hiding a real number is the exact failure this
+          // branch exists to catch -- but it is shown carrying the
+          // disagreement, so it can never pass as an ordinary measurement.
+          fields[key] = measuredField(observed, {
+            ...fieldMeta(entry),
+            observedAtMs: source.fetchedAtMs ?? timestampMs,
+            provenanceWarning: warning,
+          });
+          continue;
+        }
+
+        fields[key] =
+          entry.classification === 'STRUCTURALLY_BYPASSED'
+            ? notApplicableField(entry.reason, fieldMeta(entry))
+            : unavailableField(entry.reason, fieldMeta(entry));
         continue;
       }
 

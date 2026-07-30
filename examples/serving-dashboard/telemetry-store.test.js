@@ -14,7 +14,14 @@ import assert from 'node:assert/strict';
 
 import { createTelemetryStore, CONNECTION_STATES } from './telemetry-store.js';
 import { FIELD_STATES } from './telemetry-field.js';
-import { ENDPOINTS, allFieldKeys, provenanceFor } from './telemetry-provenance.js';
+import {
+  ENDPOINTS,
+  allFieldKeys,
+  provenanceFor,
+  PROVENANCE,
+  resolveForOrigin,
+  NEVER_MEASURED_CLASSIFICATIONS,
+} from './telemetry-provenance.js';
 
 const BASE_URL = 'http://127.0.0.1:8123';
 
@@ -38,11 +45,19 @@ function statusBody(overrides = {}) {
   };
 }
 
+// Models the SCATTER server, which is what storeWith() defaults to. The
+// prefix-cache counters are 0 here because that is the only thing a real
+// scatter server can send: engine/batched.rs:262 passes a hardcoded literal 0
+// as prefix_cache_hit_len, and ContinuousBatchManager holds no reference to
+// engine.prefix_cache at all. A fixture that emitted 4 hits here -- as this one
+// did until the stale-provenance check caught it -- describes a server that
+// cannot exist, and any test built on it is verifying an imaginary world.
+// Tests that want live cache numbers pass DYNAMIC and override explicitly.
 function debugKvBody(overrides = {}) {
   return {
-    prefix_cache_hits: 4,
-    prefix_cache_lookups: 5,
-    prefix_cache_hit_rate: 0.8,
+    prefix_cache_hits: 0,
+    prefix_cache_lookups: 0,
+    prefix_cache_hit_rate: 0,
     active_batch_size: 3,
     pending_queue_depth: 3,
     available_admission_slots: 253,
@@ -1074,4 +1089,113 @@ test('a correctly configured store is silent', async () => {
     console.warn = originalWarn;
   }
   assert.deepEqual(warnings, []);
+});
+
+// --------------------------------------------------------------- stale audit
+// telemetry-provenance.js is a snapshot of Rust source read at one commit, and
+// the server team's entire job is to invalidate it. These lock the behaviour
+// for the day that happens.
+
+test('a stub that starts returning real data is shown, not hidden', async () => {
+  // THE MIRRORED FABRICATION. Printing a hardcoded 0 as a measurement is the
+  // failure this codebase is built to prevent -- but em-dashing a number that
+  // has become real is the same lie inverted, and far harder to catch: it
+  // looks like caution, it survives review, and nobody files a bug reporting a
+  // number that is absent. They just conclude the feature does not work.
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  let store;
+  try {
+    // kv_usage is DOCUMENTED_ZERO (admin.rs:54). Pretend the plumbing landed.
+    store = storeWith(
+      healthyRoutes({
+        [ENDPOINTS.STATUS]: { body: { ...statusBody(), kv_usage: 0.42 } },
+      }),
+    );
+    await store.pollOnce();
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const field = store.field('kv.usage');
+  assert.equal(field.state, FIELD_STATES.MEASURED, 'a real measurement must not be suppressed');
+  assert.equal(field.value, 0.42);
+
+  // ...but it must never pass as an ordinary measurement while the table
+  // disagrees. The disagreement travels with the value.
+  assert.ok(field.provenanceWarning, 'the value carries the contradiction');
+  assert.match(field.provenanceWarning, /out of date/);
+  assert.equal(warnings.length, 1, 'warns once per field, not once per poll');
+  assert.deepEqual(Object.keys(store.provenanceWarnings()), ['kv.usage']);
+});
+
+test('a stub still returning its stub value stays suppressed and silent', async () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  let store;
+  try {
+    store = storeWith(healthyRoutes());
+    await store.pollOnce();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(store.field('kv.usage').state, FIELD_STATES.UNAVAILABLE);
+  assert.deepEqual(warnings, [], 'no false alarm at HEAD');
+  assert.deepEqual(store.provenanceWarnings(), {});
+});
+
+test('a counter that legitimately rises is not mistaken for a stale audit', async () => {
+  // prefix_cache_lookups is suppressed because it is MISNAMED -- metrics.rs:132-134
+  // increments it on every completed generation -- not because it is pinned.
+  // It rises on a healthy scatter server, and that proves nothing either way.
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  let store;
+  try {
+    store = storeWith(
+      healthyRoutes({
+        [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_lookups: 91 } },
+      }),
+    );
+    await store.pollOnce();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(store.field('prefix_cache.lookups').state, FIELD_STATES.NOT_APPLICABLE);
+  assert.deepEqual(warnings, []);
+});
+
+test('every suppressed field can be checked against the wire, or says why not', () => {
+  // The guard on the guard. A new suppressed entry added without a stubValue
+  // would silently opt out of staleness detection -- reintroducing exactly the
+  // blind spot this mechanism removes, one entry at a time.
+  const suppressed = [];
+  for (const [key, raw] of Object.entries(PROVENANCE)) {
+    if (raw.derived) continue;
+    for (const origin of ['scatter', 'dynamic']) {
+      const entry = resolveForOrigin(raw, origin);
+      const isSuppressed =
+        entry.classification === 'STRUCTURALLY_BYPASSED' ||
+        NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification);
+      if (!isSuppressed) continue;
+      // NOT_PLUMBED needs no declared stub: "the path carries nothing" is
+      // already a checkable claim, and the day it carries something is exactly
+      // the day the classification became false.
+      const checkable =
+        entry.classification === 'NOT_PLUMBED' ||
+        'stubValue' in entry ||
+        typeof entry.isStub === 'function' ||
+        Boolean(entry.unfalsifiable);
+      if (!checkable) suppressed.push(`${key} (${origin})`);
+    }
+  }
+  assert.deepEqual(
+    suppressed,
+    [],
+    'these entries hide a value with no way to notice when it becomes real:\n' +
+      suppressed.join('\n'),
+  );
 });

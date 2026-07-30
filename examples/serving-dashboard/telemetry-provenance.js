@@ -18,7 +18,11 @@
 // update the citation — one edit, and every panel in the page starts telling
 // the truth about it at once.
 //
-// Line citations were read from the worktree at branch feat/genai-demo-dashboard.
+// Line citations were read from the worktree at branch feat/genai-demo-dashboard,
+// commit 54c0bc98. That SHA is not decoration: this table is a snapshot of a
+// tree the server work is actively invalidating, so `matchesStub` below checks
+// each placeholder against the wire on every poll and reports when a row here
+// has gone stale. Update the citation in the same commit that makes a row false.
 
 /**
  * How a server field is classified. This is not a UI state — it is a statement
@@ -209,6 +213,7 @@ export const PROVENANCE = Object.freeze({
   'sessions.paused': {
     source: ENDPOINTS.STATUS,
     path: 'paused_sessions',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'sessions',
     evidence:
@@ -222,6 +227,7 @@ export const PROVENANCE = Object.freeze({
   'batch.utilization': {
     source: ENDPOINTS.STATUS,
     path: 'batch_utilization',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'ratio',
     evidence:
@@ -235,6 +241,7 @@ export const PROVENANCE = Object.freeze({
   'throughput.tokens_per_second': {
     source: ENDPOINTS.STATUS,
     path: 'tokens_per_second',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'tokens/s',
     evidence:
@@ -251,6 +258,7 @@ export const PROVENANCE = Object.freeze({
   'kv.usage': {
     source: ENDPOINTS.STATUS,
     path: 'kv_usage',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'ratio',
     evidence:
@@ -263,6 +271,7 @@ export const PROVENANCE = Object.freeze({
   'kv.pages_used': {
     source: ENDPOINTS.STATUS,
     path: 'kv_pages_used',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'pages',
     evidence:
@@ -273,6 +282,7 @@ export const PROVENANCE = Object.freeze({
   'kv.pages_total': {
     source: ENDPOINTS.STATUS,
     path: 'kv_pages_total',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'pages',
     evidence:
@@ -283,6 +293,7 @@ export const PROVENANCE = Object.freeze({
   'kv.pages_shared': {
     source: ENDPOINTS.STATUS,
     path: 'kv_pages_shared',
+    stubValue: 0,
     classification: 'DOCUMENTED_ZERO',
     unit: 'pages',
     evidence:
@@ -293,6 +304,9 @@ export const PROVENANCE = Object.freeze({
   'kv.introspection': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'engine_kv_introspection',
+    // This one carries a sentence rather than a number, and the exact wording is
+    // not worth pinning: what makes it a placeholder is the "unavailable:" prefix.
+    isStub: (value) => typeof value === 'string' && value.startsWith('unavailable'),
     classification: 'NOT_PLUMBED',
     unit: null,
     evidence:
@@ -320,6 +334,8 @@ export const PROVENANCE = Object.freeze({
     label: 'Prefix cache hits',
     byOrigin: {
       scatter: {
+        // Pinned at literal 0 by the bypass, so 0 is what "still true" looks like.
+        stubValue: 0,
         classification: 'STRUCTURALLY_BYPASSED',
         reason:
           'This server uses static-cache batching, and that path never consults the prefix ' +
@@ -346,6 +362,10 @@ export const PROVENANCE = Object.freeze({
     label: 'Completed generations',
     byOrigin: {
       scatter: {
+        unfalsifiable:
+          'This counter is not pinned -- it rises on every completed generation. It is ' +
+          'suppressed because it does not count what its name claims, and no value on ' +
+          'the wire can confirm or deny that.',
         classification: 'STRUCTURALLY_BYPASSED',
         reason:
           'This server uses static-cache batching, and that path never consults the prefix ' +
@@ -360,6 +380,7 @@ export const PROVENANCE = Object.freeze({
   'prefix_cache.hashes': {
     source: ENDPOINTS.STATUS,
     path: 'prefix_hashes',
+    stubValue: [],
     classification: 'DOCUMENTED_ZERO',
     unit: null,
     evidence:
@@ -521,6 +542,8 @@ export const PROVENANCE = Object.freeze({
     // The same 0 means two opposite things depending on which server answered.
     byOrigin: {
       scatter: {
+        // Pinned at literal 0 by the bypass, so 0 is what "still true" looks like.
+        stubValue: 0,
         classification: 'STRUCTURALLY_BYPASSED',
         reason:
           'This server uses static-cache batching, and that path never consults the prefix ' +
@@ -552,6 +575,10 @@ export const PROVENANCE = Object.freeze({
       // prefix-cache family and a visitor reads it in that context. On the
       // batching server there is no cache activity to contextualise it.
       scatter: {
+        unfalsifiable:
+          'This counter is not pinned -- it rises on every completed generation. It is ' +
+          'suppressed because it does not count what its name claims, and no value on ' +
+          'the wire can confirm or deny that.',
         classification: 'STRUCTURALLY_BYPASSED',
         reason:
           'This server batches with a static cache and never consults the prefix cache, so ' +
@@ -573,6 +600,8 @@ export const PROVENANCE = Object.freeze({
     label: 'Prefix-cache hit rate',
     byOrigin: {
       scatter: {
+        // Pinned at literal 0 by the bypass, so 0 is what "still true" looks like.
+        stubValue: 0,
         classification: 'STRUCTURALLY_BYPASSED',
         reason:
           'This server batches with a static cache, and that path never consults the prefix ' +
@@ -633,6 +662,49 @@ export const NEVER_MEASURED_CLASSIFICATIONS = Object.freeze(['DOCUMENTED_ZERO', 
 export function provenanceFor(key, origin = null) {
   if (!Object.prototype.hasOwnProperty.call(PROVENANCE, key)) return null;
   return resolveForOrigin(PROVENANCE[key], origin);
+}
+
+/**
+ * Does a value observed on the wire still match the placeholder this table was
+ * written against?
+ *
+ * WHY THIS EXISTS. Every classification in this file is a snapshot of server
+ * source read at one commit, and the server team's whole job is to invalidate
+ * it: when the telemetry work lands, these placeholders become real numbers.
+ * A stale table then fails in the direction nobody catches — a genuine
+ * measurement rendered as an em-dash. That reads as caution, survives review,
+ * and no visitor ever files a bug saying "this number is missing"; they just
+ * conclude the feature does not work. It is the same fabrication as printing a
+ * stub, only mirrored, and it is strictly harder to see.
+ *
+ * So the table records the exact literal the server writes today. If the wire
+ * value ever differs, this file is provably out of date and says so, loudly,
+ * instead of quietly suppressing a real measurement.
+ *
+ * LIMIT, STATED HONESTLY: when a field becomes real and its true value happens
+ * to equal the placeholder, this cannot tell the difference — a documented zero
+ * is byte-identical to a measured zero. Only the server can close that gap, by
+ * omitting or nulling what it does not compute. This catches every other case.
+ *
+ * @param {ProvenanceEntry} entry
+ * @param {unknown} value Raw value read at `entry.path`, or `undefined`.
+ * @returns {boolean} True while the entry's classification is still credible.
+ */
+export function matchesStub(entry, value) {
+  // Some fields are suppressed on SEMANTIC grounds, not because they hold a
+  // placeholder: the counter moves, it is simply not counting what its name
+  // says. No wire value can confirm or refute that, so there is nothing to
+  // check and a rising number is expected rather than suspicious. Entries in
+  // that position must say so, and say why.
+  if (entry.unfalsifiable) return true;
+  if (typeof entry.isStub === 'function') return entry.isStub(value);
+  // No declared stub means the path should carry nothing at all.
+  if (!('stubValue' in entry)) return value === undefined || value === null;
+  const stub = entry.stubValue;
+  if (typeof stub === 'object' && stub !== null) {
+    return JSON.stringify(value) === JSON.stringify(stub);
+  }
+  return value === stub;
 }
 
 /**
