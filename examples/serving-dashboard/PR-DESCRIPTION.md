@@ -1622,3 +1622,50 @@ an audience is not the person who discovers it.
 > **Every liveness check we write asks whether the system can answer. No liveness check we write
 > asks whether the system has anything to say. For a demo, the second question is the entire
 > product, and it is the one nobody writes a probe for.**
+
+### Correction to the section above: I defended the UI with a directory-level count
+
+The section above defends the empty state with "five files carry a no-data vocabulary." That
+number is real, but it is a count over a *directory*, and the question it was answering is about
+*specific panels*. Those are not the same claim, and the gap between them is the defect this
+crew has spent the session filing against itself. Re-measured, per file:
+
+```
+FILES CARRYING THE EMPTY-STATE VOCABULARY AT THE REVIEW POINT
+  panel-kit.js  ·  sparkline.js  ·  store-adapter.js   (+ their three test files)
+  [CORPUS FLOOR] tracked under dashboard/ = 34   <- a zero here would void all of it
+```
+
+**The real structure is better than what I claimed, and for a better reason.** The empty state is
+not scattered across five panels — it lives in the shared kit (`panel-kit.js`, `sparkline.js`,
+`store-adapter.js`), which is where an invariant belongs. Every panel built on the kit inherits
+it. That is a stronger guarantee than the one I asserted, and I had not earned it when I asserted
+it.
+
+**But the per-panel read also turned up something the directory count concealed:**
+
+```
+throughput.js     empty-state vocabulary  4   [352 lines read]
+prefix-cache.js   empty-state vocabulary  0   [196 lines read]  <- control fires; file is real
+```
+
+The prefix-cache panel — one of the two headline differentiators of this branch — carries no
+empty-state vocabulary *of its own*. It may well inherit the correct behaviour from the shared
+kit; **I have not established that it does, and I am not going to assert it in the direction that
+flatters the branch.** It is listed here as unverified, not as a defect.
+
+**Void probe, disclosed:** the same sweep read `batch.js` and reported zero. That file does not
+exist at the review point — the read returned **0 lines**, so the zero measures the absence of a
+corpus, not the absence of a property. It is struck rather than reported. A zero from an empty
+read is not a finding, and the only reason I caught it is that I printed the line count beside
+the result.
+
+> **A count over a directory answers a question about the directory. Every time I have used one
+> to answer a question about a member, it has been generous in the direction I was already
+> arguing — including here, in a paragraph I wrote to be scrupulously fair to someone else's code.**
+
+**Sequencing consequence, which is the practical output of all of this:** the warm-up gap must be
+closed *before* the latency panel is wired to the histogram, not after. With `_count` at zero a
+mean is `0/0`, so wiring first renders "unavailable" in every cell — the same thing the panel
+already shows — while spending a multi-file, multi-owner edit to get there. Warm the demo, then
+wire the panel. Two filed items, and the order between them is not optional.
