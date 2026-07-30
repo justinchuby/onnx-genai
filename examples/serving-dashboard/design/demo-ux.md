@@ -2203,7 +2203,7 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 >
 > **This is D158 landing on my own document for the third time tonight** — after the `<meta>` description and the Profile D hero slot. All three were **cut or qualified fields still bound in PROSE THAT INSTRUCTS**, and **none of the five test files I own can see any of them.** `page-claims.test.js` reads shipped HTML; the tripwire reads module identifiers; **nothing reads the design document, which is the file developers actually build from.**
 
-**Corrected sketch — AC50/D85 compliant, and this is the only benchmark form in this document:**
+**Corrected sketch — satisfies AC50 and D85. ⛔ It does NOT satisfy D341: the `TOTAL` figure below is a five-significant-figure point value, and the caveat inside the fence says so. A compliance badge names the rulings it was checked against and is silent on every other one, which is why this line now names the ruling it FAILS. This is the only benchmark form in this document:**
 
 ```
       4 concurrent requests vs 1
@@ -2213,6 +2213,10 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 
       Batching does not make any single request faster.
       Range spans 2 occasions · CPU EP · max_batch from payload · one machine
+      TOTAL was measured ONCE and never re-run. Its five figures are the
+      ABSENCE OF A SECOND OCCASION, not a demonstrated resolution (D341).
+      The interval is the DENOMINATOR arm moving 9.77%; the numerator was
+      held constant because nobody re-measured it, not because it is stable.
       The INTERVAL is the claim. `2.46×` alone is withdrawn (§101): it is
       the low end of two occasions, never the result.
 ```
@@ -2459,6 +2463,10 @@ Same principle as D83 (*layout space is a claim about significance*), one level 
   Batching does not make any single request faster.
   It trades per-stream latency for total throughput.
   Range spans 2 occasions · CPU EP · max_batch from payload · not a performance claim
+  TOTAL was measured ONCE and never re-run. Its five figures are the ABSENCE
+  OF A SECOND OCCASION, not a demonstrated resolution (D341). The interval is
+  the DENOMINATOR arm moving 9.77%; the numerator was held constant because
+  nobody re-measured it, not because it is stable.
   The INTERVAL is the claim. `2.46×` alone is withdrawn (§101): it is
   the low end of two occasions, never the result.
 ```
