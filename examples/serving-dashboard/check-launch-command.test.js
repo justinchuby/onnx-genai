@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { assertShippingTree } from './shipping-tree.mjs';
+import { fencedLines, isCommandLine } from './markdown-scan.js';
 
 import {
   DEFAULT_SERVER_ADDRESS,
@@ -307,13 +308,9 @@ function documentedTestCommands() {
     // whole-file scan that bullet SATISFIED this check, so deleting the real
     // documented command left the suite green: the file went on "documenting"
     // a full-suite command it was in the middle of warning readers away from.
-    let inFence = false;
-    for (const line of read(name).split('\n')) {
-      if (line.trimStart().startsWith('```')) {
-        inFence = !inFence;
-        continue;
-      }
-      if (!inFence) continue;
+    // Fence tracking now lives in `markdown-scan.js` so the other documentation
+    // guards can share one implementation instead of each growing their own.
+    for (const { line } of fencedLines(read(name))) {
       if (line.includes('node --test') || line.includes('run-tests.sh')) {
         found.push({ name, line });
       }
@@ -342,10 +339,11 @@ test('no shipped document enumerates the test suite by hand', () => {
   // including the history blockquotes that name the old globs on purpose --
   // is not a command, and grading it as one would make this test unfixable:
   // documenting the defect would trip the guard against the defect.
-  const isCommand = (line) => {
-    const t = line.trim().replace(/^\$\s*/, '');
-    return t.startsWith('node --test') || t.startsWith('./') || t.startsWith('cd ');
-  };
+  //
+  // Extracted to `markdown-scan.js` and unit-tested there. It lived here as a
+  // closure with three call sites, all its own, which meant every other
+  // documentation guard in the repository had to reinvent it.
+  const isCommand = isCommandLine;
 
   const runnerCitations = commands.filter(
     ({ line }) => isCommand(line) && line.includes('run-tests.sh'),
