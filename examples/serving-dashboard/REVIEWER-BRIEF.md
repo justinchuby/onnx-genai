@@ -4386,3 +4386,92 @@ I am not retroactively rewriting the 37 bare `review-0` citations in the section
 written** — RULE 24 forbids the silent repair as firmly as it forbids the stale claim.
 **The correction is this section plus the `MEASURED-AT` anchor at its head, which is
 mechanically checkable and which the prose above is not.**
+
+---
+
+## §9.5 — ITEM 1 CLOSES BY EXECUTION. I ran cargo. 264 pass, 0 fail, raw exit 0.
+
+**Nobody holding the gate had ever run this suite.** @086345a5 stated it plainly ("I have
+never run `cargo test`"); @c0de4c2e's board carries no cargo item at all; I retracted my
+own number under RULE 26. **So I ran it, rather than carrying anyone's — including the
+favourable one.**
+
+### The vehicle, asserted before the result
+
+```
+pwd                 /Users/justinc/Documents/GitHub/onnx-genai-demo
+HEAD                ac6c73cc
+crates/ TREE        e613bf7a2f908d9af7678a60a4f47d76c4582cc4
+crates/ porcelain   0          CONTROL: whole-tree porcelain 2  ✅ instrument sees dirt
+```
+
+**I did NOT cut a detached worktree, and that is a deliberate, disclosed trade.** A fresh
+worktree has no `target/`, so this would have been a cold build of 40 crates on a disk
+with 5.2 GiB free — unaffordable, and the reason nobody has run it all night. **Instead I
+proved the source is a named object: the working `crates/` tree hashes to exactly
+`HEAD:crates`, with zero dirty paths under it, while the rest of the tree is dirty.
+The bytes I compiled are a committed tree; only the build cache is local.**
+
+### The result — raw, unpiped, `--no-fail-fast`
+
+```
+cargo test -p onnx-genai-server --no-fail-fast
+RAW UNPIPED EXIT                0
+TOTAL   264 passed · 0 failed · 4 ignored     ACROSS **6 TEST BINARIES**
+
+  binary 1   211 passed  0 failed  3 ignored
+  binary 2     0    "    0    "    0    "
+  binary 3    15    "    0    "    0    "
+  binary 4    28    "    0    "    1 ignored
+  binary 5    10    "    0    "    0    "
+  binary 6     0    "    0    "    0    "
+lines saying "0 failed": 6      lines saying FAILED/panicked: 0
+```
+
+**All four skips are named and carry reasons** — the audio contract smoke test, tiny-vlm,
+the qwen real-model fixture, and the `vlm-executable` vision encoder. **`#[ignore]`
+discipline in this crate is real, not a laundering habit.**
+
+> ### GATE ITEM 1: **GREEN**, at `crates/` tree `e613bf7a`, by execution.
+
+### The structural finding, and it is the reason the numbers never reconciled
+
+**`cargo test -p <crate>` prints one `test result:` line PER TEST BINARY. There are six.**
+Every number quoted tonight — my 256, @12e42da8's 188 — was a confident total that matches
+no single line and no subset of mine (214 / 0 / 15 / 29 / 10 / 0). **Neither of us was
+careless; we were reading a format that offers a plausible-looking partial six times per
+run and never prints the sum.**
+
+> **RULE 31. `cargo test` has no total. It has six totals and a reader who wants one.
+> This is @12e42da8's "two suites, one word" defect one level down — and it is worse,
+> because JS at least made you *choose* the wrong suite, while cargo hands you a partial
+> that looks complete and is labelled `test result:`.**
+
+**And the second half is sharper than the first:** without `--no-fail-fast`, a failure in
+binary 1 aborts binaries 2-6.
+
+> **The denominator shrinks precisely when something is wrong.** A red run reports a
+> *smaller* suite, so the failure presents as one bad test out of a modest total instead
+> of one bad test out of 268. **The one moment you most need the full denominator is the
+> exact moment cargo stops computing it.** `--no-fail-fast` is not a convenience flag; it
+> is what makes a red run's arithmetic honest.
+
+### RULE 27 fired on me again, ninety seconds after I wrote it
+
+My aggregating `awk` printed **"across 338 result lines"** — `NR` is every line in the
+file, not the matched ones. The true count is **6**. **Caught in one glance because I had
+printed the itemisation beside the total, which is the entire content of RULE 27.** Second
+occurrence of my own newest rule, in the same session, in a different variable. **A rule
+you have just written is not a rule you have internalised.**
+
+### THE GATE, FINAL — and it is scored across two trees, which I state rather than hide
+
+```
+ITEMS 2-8, 10   GREEN   at 0bc86726 (review-2), JS 646/98/0, raw exit 0, detached
+ITEM 1          GREEN   at crates/ e613bf7a, cargo 264/0/4, raw exit 0, porcelain 0
+ITEM 9          GREEN   by tree identity — 0 of the commits in range touch crates/,
+                        AND its underlying measurement is now item 1's, which I ran
+```
+> **10 GREEN · 0 YELLOW · 0 RED — and the JS half and the cargo half are pinned to
+> DIFFERENT trees. Anyone quoting this must quote both anchors. There is no single sha
+> at which I have measured all ten, and saying so is the whole of RULE 26.**
