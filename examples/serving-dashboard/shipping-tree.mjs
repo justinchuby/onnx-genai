@@ -102,6 +102,38 @@ export const SHIPPING_REF = (() => {
   }
 })();
 
+let announced = false;
+
+/**
+ * Print the resolved shipping ref once per process, so a failure is self-dating.
+ *
+ * A red from one of these checks is read by someone who was not present when it
+ * ran, and their first question is always "against what?". Without an answer in
+ * the output the only available reading is "against now", which is the one thing
+ * a recorded failure can never mean. This branch moves every few tens of seconds;
+ * by the time a reviewer opens the log, `HEAD` denotes a different tree than the
+ * one that produced the message they are reading.
+ *
+ * So the ref is printed, not merely resolved. Pinning makes a run internally
+ * consistent; printing makes the run's SUBJECT recoverable afterwards. They are
+ * different properties and a review needs both — a deterministic result that
+ * cannot be attributed still costs an argument to re-derive.
+ *
+ * Print-once, because ten guards import this and ten identical banners would
+ * train readers to skip the line that carries the whole provenance. Emitted on
+ * stderr: TAP consumers parse stdout, and provenance is not a test result.
+ */
+export function announceShippingRef() {
+  if (announced) return SHIPPING_REF;
+  announced = true;
+  const overridden = Boolean(process.env.SHIPPING_TREE_REF?.trim());
+  const via = overridden
+    ? `SHIPPING_TREE_REF=${process.env.SHIPPING_TREE_REF.trim()}`
+    : 'default (HEAD at load)';
+  process.stderr.write(`# shipping ref: ${SHIPPING_REF} [${via}]\n`);
+  return SHIPPING_REF;
+}
+
 /**
  * Describe the tree this file physically lives in.
  *

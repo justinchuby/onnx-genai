@@ -25,7 +25,9 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { assertShippingTree } from './shipping-tree.mjs';
+import { assertShippingTree, SHIPPING_REF, announceShippingRef } from './shipping-tree.mjs';
+
+announceShippingRef();
 
 // Provenance before content. Every path below is resolved from import.meta.url,
 // so this file would read a parked worktree self-consistently and pass. Assert
@@ -48,9 +50,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // The inverse failure -- a fix on disk that is not yet committed reads RED --
 // is the safe one, and its remedy is the thing you were going to do anyway.
 function shipped(rel) {
-  // The `./` is load-bearing: `git show HEAD:<path>` resolves from the repo
+  // The `./` is load-bearing: `git show <ref>:<path>` resolves from the repo
   // root, not the cwd, so bare relative paths silently resolve to nothing.
-  return execFileSync('git', ['show', `HEAD:./${rel}`], {
+  //
+  // SHIPPING_REF, not the literal `HEAD`: this file reads several inputs and
+  // compares them against each other, and `HEAD` is a pointer that moves on
+  // this branch mid-run. Two reads through it can land in different trees and
+  // report a contradiction that existed in no commit.
+  return execFileSync('git', ['show', `${SHIPPING_REF}:./${rel}`], {
     cwd: HERE,
     maxBuffer: 64 * 1024 * 1024,
   }).toString();
@@ -935,7 +942,7 @@ test('every driver log line the README quotes still exists in the server source'
   const readme = shipped('README.md');
   const driver = execFileSync(
     'git',
-    ['show', 'HEAD:crates/onnx-genai-server/src/driver.rs'],
+    ['show', `${SHIPPING_REF}:crates/onnx-genai-server/src/driver.rs`],
     { cwd: HERE, maxBuffer: 64 * 1024 * 1024 },
   ).toString();
 
@@ -1050,10 +1057,10 @@ test('the README per-pane row counts match the measurement record', () => {
 // semantics are what the README describes.
 
 // Rust source lives above this directory, so it is addressed from the repo
-// root. `HEAD:./x` resolves relative to cwd and would need `../../`; the
+// root. `<ref>:./x` resolves relative to cwd and would need `../../`; the
 // root-anchored form says what it means.
 function shippedFromRoot(path) {
-  return execFileSync('git', ['show', `HEAD:${path}`], {
+  return execFileSync('git', ['show', `${SHIPPING_REF}:${path}`], {
     cwd: HERE,
     maxBuffer: 64 * 1024 * 1024,
   }).toString();

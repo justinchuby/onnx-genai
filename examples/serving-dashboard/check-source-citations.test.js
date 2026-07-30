@@ -21,7 +21,9 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
-import { assertShippingTree } from './shipping-tree.mjs';
+import { assertShippingTree, SHIPPING_REF, announceShippingRef } from './shipping-tree.mjs';
+
+announceShippingRef();
 
 // Provenance before content. Every path below is resolved from import.meta.url,
 // so this file would read a parked worktree self-consistently and pass. Assert
@@ -47,7 +49,11 @@ const repoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
 // citation against someone else's uncommitted edit can certify a line number
 // that has never existed on the branch.
 function shippedFile(relFromRoot) {
-  return execFileSync('git', ['show', `HEAD:${relFromRoot}`], {
+  // SHIPPING_REF rather than the literal `HEAD`. This file resolves a citation
+  // in one file against a line number in another, so the two reads MUST come
+  // from the same tree; a moving pointer can certify or condemn a line pairing
+  // that never coexisted in any commit.
+  return execFileSync('git', ['show', `${SHIPPING_REF}:${relFromRoot}`], {
     cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
