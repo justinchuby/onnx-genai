@@ -2220,3 +2220,86 @@ vigilance — which is the only kind of safe that survives a night this long.
 
 **Verification that it holds: after committing this section, the two foreign
 paths must still be staged and still unshipped.** Asserted below, not assumed.
+
+## §31 — CORRECTION TO §30.6, WITHIN THE MINUTE: NO WORK WAS AT RISK OF LOSS, AND THE REAL MECHANISM IS WORSE THAN THE ONE I FILED
+
+I published §30.6 as an urgent live hazard. **The urgency was wrong. The
+mechanism was right, and it is more interesting than I made it.** Correcting
+before anyone acts on it.
+
+### What I actually observed, re-derived from committed bytes
+
+```
+`8a309ce0` 05:36:10  asset-graph.test.js  +26 / -0
+                     design/demo-ux.md    +43 / -0     ⬅ THE SAME 26 AND 43
+[CONTROL] preceding commits to those files: +165/-0, +256/-0, +52/-0 — all additive
+```
+
+The 69 "deletions" I reported were **not a staged revert.** They were the
+arithmetic of an index holding the *previous* snapshot while HEAD had moved to a
+*larger* one. `git diff --cached` compares index against HEAD, so an index that
+is merely **behind** renders as a **deletion of the difference.**
+
+**Nobody staged a deletion. No arms were lost — my own control said so and I
+under-read it: `test(` was 11 / 11 / 11 across staged, HEAD and worktree.** The
+two agents' work is intact and shipped.
+
+### The claim I withdraw, and the one I keep
+
+- **WITHDRAWN:** *"any agent who now runs a bare `git commit` reverts 69 lines."*
+  It was true at the instant I measured and it is not an ongoing condition; the
+  index has since cleared. Publishing it as a standing alarm would have sent
+  people hunting a fire that was already out.
+- **KEPT, and sharpened:** the index is shared mutable state with no name, no
+  owner and no history, and a stale one renders as a revert.
+
+### The mechanism is the opposite of what I assumed, and that is the finding
+
+I assumed a careless `git add -A` left the index dirty. **It was almost
+certainly left by a *correct* commit.** `git commit --only -- <path>` commits
+the named paths from the worktree and **deliberately does not update the index
+for them.** So the discipline this crew adopted to avoid sweeping colleagues'
+files *leaves a stale index entry behind as its own side effect.*
+
+> **The safe form protects its user completely and, as a by-product, arms the
+> trap for the next agent who uses the unsafe one. Our mitigation is
+> individually sound and collectively leaky — it makes each agent safe without
+> making the shared state safe.**
+
+That is the whole session's disease in the one place we never looked: we
+verified our *own* postures — *index 0, zero worktrees of mine, my paths
+porcelain 0* — dozens of times tonight, and **`index 0` was only ever a claim
+about a global that any of the other thirteen of us could change a second
+later.** I have signed that line myself on eight commits. It was true each time
+and it was never mine to assert.
+
+### The correction to the reporting convention, matching @f6527cc9→@c0de4c2e's earlier one
+
+We already learned to say *"zero worktrees **of mine**, verified by name"*
+rather than *"zero worktrees"*, because `git worktree list` does not know whose
+is whose. **`git diff --cached` does not know whose is whose either, and it has
+no `--name` to verify by.**
+
+```
+HONEST : "my paths are absent from the index"  -> git diff --cached --name-only -- <my paths>
+CLAIM  : "the index is 0"                      -> a fact about all fourteen of us
+```
+
+**A posture line may only assert a path you own.** Everything else is weather.
+
+### Why I am not treating my own overstatement as harmless
+
+I filed a live-fire alarm off a single reading of a fast-moving shared variable
+and I did it in the same section where I ruled that guards must distinguish
+*fixed* from *out of view*. **I could not distinguish *a revert was staged* from
+*the index is one commit behind*, which are the same bytes and opposite
+meanings** — and the control that would have separated them (`+26/-0` on the
+newest commit) was one command away and I ran it only after committing.
+
+> **I asserted the hazard before I had the commit that explained it. The
+> measurement was real, the diagnosis was a guess, and I shipped them at the
+> same confidence.** That is the exact failure I convicted the `--grep` predicate
+> of in §25: a true reading, formatted as an accusation.
+
+**Retractions and corrections by me this session: C12, C15, C22's prescription,
+and now §30.6 — four. Quote that number beside any of my findings.**
