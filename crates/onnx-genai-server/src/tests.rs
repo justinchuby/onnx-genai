@@ -4210,35 +4210,59 @@ async fn model_created_is_stable_across_polls() {
     );
 }
 
-/// `/v1/models` discloses the basename and nothing more, on every bind address.
+/// `/v1/models` carries no filesystem path, in any field, on any bind address.
 ///
-/// This used to be conditional: loopback callers got the full path on the
-/// theory that they are already on the host and learn nothing new. The
-/// conditional keyed on the BIND address rather than the PEER, so a reverse
-/// proxy in front of a loopback-bound server made every remote caller look
-/// local and leaked the operator's home directory and username.
+/// This walks EVERY string in the response rather than asserting on the one
+/// field that used to be wrong. A field-specific check is only as good as the
+/// field list someone remembered to write down, and this endpoint has already
+/// disclosed a path under two different field shapes: first the configured
+/// directory, then its basename.
 ///
-/// The fix is a deletion rather than a repair, and the product had already
-/// conceded the argument for it: the non-loopback branch returned the basename
-/// and nobody ever reported it as insufficient. **When one branch of a security
-/// conditional is already proven adequate in production, the conditional is the
-/// bug** -- it can only ever be wrong in the disclosing direction.
+/// History, because the second fix looked complete and was not. The directory
+/// was originally sent in full to loopback callers, on the theory that they are
+/// already on the host and learn nothing new; that conditional keyed on the
+/// BIND address rather than the PEER, so a reverse proxy in front of a
+/// loopback-bound server made every remote caller look local. `2da3e851`
+/// deleted the conditional and reduced the value to a basename. **A basename is
+/// still the last segment of an operator-chosen path, so its contents are
+/// unbounded** -- ours happens to name a model, but nothing in the type system,
+/// the tests or the review said it had to. The field is now gone entirely and
+/// `id` carries the identity, because `id` is authored at launch rather than
+/// inherited from a directory.
 ///
-/// Asserted on BOTH addresses, because a test that only checks the public one
-/// would still pass if someone restored the loopback branch.
+/// Asserted on BOTH addresses: a test that only checked the public one would
+/// still pass if someone restored a loopback branch.
 #[tokio::test]
-async fn model_paths_never_disclose_more_than_the_basename() {
+async fn model_listing_carries_no_filesystem_path() {
     for bind in ["127.0.0.1:8123", "0.0.0.0:8123"] {
         let body = get_json(lazy_two_model_router().await, "/v1/models").await;
-        let path = body["data"][0]["path"].as_str().unwrap();
+
+        let mut strings = Vec::new();
+        collect_strings(&body, "", &mut strings);
+
+        // The control. An empty walk would satisfy every assertion below
+        // forever, which is exactly how a path-disclosure guard goes vacuous.
         assert!(
-            !path.contains(std::path::MAIN_SEPARATOR),
-            "bound to {bind}: the directory layout reached an ungated endpoint, \
-             got {path:?}"
+            strings
+                .iter()
+                .any(|(at, value)| at.ends_with(".id") && !value.is_empty()),
+            "bound to {bind}: the walk found no model id, so it is not reading \
+             the response and its silence proves nothing: {body}"
         );
+
+        for (at, value) in &strings {
+            assert!(
+                !value.contains(std::path::MAIN_SEPARATOR),
+                "bound to {bind}: {at} carries a filesystem path on an ungated, \
+                 already-polled endpoint, got {value:?}"
+            );
+        }
+
         assert!(
-            !path.is_empty(),
-            "bound to {bind}: the basename still has to identify the model"
+            body["data"][0].get("path").is_none(),
+            "bound to {bind}: the `path` field is back on /v1/models; publish \
+             `id`, which an operator authored, not a directory segment they did \
+             not choose for publication"
         );
     }
 }
@@ -4262,11 +4286,35 @@ fn no_configuration_can_re_enable_full_path_disclosure() {
              direction"
         );
         assert!(
+            !source.contains("model_path_for_display"),
+            "{name} reintroduced a writer for the model path field; the field \
+             was deleted from `/v1/models` because a basename is the last \
+             segment of an operator-chosen path and its contents are unbounded"
+        );
+        assert!(
             !source.contains("bind_addr"),
             "{name} stored the bind address again; it existed only to feed the \
              deleted conditional, and keying disclosure on the BIND address \
              rather than the PEER is what leaked paths behind a proxy"
         );
+    }
+}
+
+/// Walks a JSON value and collects every string with the path that reached it.
+fn collect_strings(value: &Value, at: &str, found: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(text) => found.push((at.to_string(), text.clone())),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_strings(item, &format!("{at}[{index}]"), found);
+            }
+        }
+        Value::Object(entries) => {
+            for (key, entry) in entries {
+                collect_strings(entry, &format!("{at}.{key}"), found);
+            }
+        }
+        _ => {}
     }
 }
 

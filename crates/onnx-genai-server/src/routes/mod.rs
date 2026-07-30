@@ -114,15 +114,21 @@ struct ModelObject {
     loaded: bool,
     /// Whether this is the model that an empty/omitted `model` field resolves to.
     is_default: bool,
-    /// Configured directory, reduced to its basename UNCONDITIONALLY, so that
-    /// this unauthenticated endpoint withholds the operator's username and
-    /// filesystem layout from every caller regardless of bind address.
-    ///
-    /// The loopback conditional this once described was deleted at `2da3e851`;
-    /// it keyed on the BIND address rather than the PEER. See
-    /// `admin::model_path_for_display`, the only writer of this field, which
-    /// carries the full reason.
-    path: String,
+    // NO PATH FIELD, AND NOTHING DERIVED FROM ONE. `/v1/models` is ungated and
+    // already polled, so anything here reaches a visitor on their first load.
+    //
+    // This carried the configured directory, then its basename, and the
+    // basename was still wrong: a basename is the last segment of an
+    // OPERATOR-CHOSEN path, so its contents are unbounded. `qwen2.5-0.5b` is
+    // harmless; nothing stops the next deployment serving from a directory
+    // named after a customer, a ticket or a person. The value was safe on this
+    // machine by luck, not by construction.
+    //
+    // `id` is the identity to publish instead: it is chosen deliberately at
+    // launch via `--model-id`, so it is a LABEL an operator authored rather
+    // than a filesystem artefact that leaked. Note that the admin-gated
+    // `AdminModelObject` never carried a path at all -- the UNGATED endpoint
+    // was disclosing strictly more than the gated one, which is backwards.
 }
 
 #[derive(Debug, Serialize)]
