@@ -298,6 +298,99 @@ test('an already-aborted caller signal aborts immediately', async () => {
   );
 });
 
+// C2. Everything above proves the deadline fires when NO caller signal is
+// present, and proves the composed signal has the right IDENTITY when one is.
+// Neither proves the deadline still FIRES on the composed path, and no test in
+// this file drove a stalling server and a caller signal at the same time.
+//
+// That gap is not theoretical. Removing `controller.signal` from the
+// composition -- `AbortSignal.any([callerSignal])`, nineteen bytes -- leaves a
+// request pending past its deadline forever and this file passed 13/13 on it.
+// The identity assertions cannot see it because a one-element `AbortSignal.any`
+// still returns a fresh object that is neither the caller's signal nor the
+// deadline's, which is all they check.
+//
+// THE OBSERVABLE IS THE ABORT, NOT THE OBJECT.
+
+/** Distinguishes "never settled" from "settled", which `await` alone cannot. */
+const PENDING = Object.freeze({ settled: 'pending' });
+
+/**
+ * Races `promise` against a wall clock and reports WHICH won.
+ *
+ * `assert.rejects` cannot express the defect under test: against a request that
+ * pends forever it does not fail, it HANGS, until the runner kills the process
+ * and reports a cancelled suite. A hang and a failure are different signals to
+ * whoever reads CI, and only one of them names what broke. The budget is
+ * generous because it is not measuring latency -- it separates "finished" from
+ * "never finishes", and those differ by infinity, not by milliseconds.
+ */
+async function settleOrPend(promise, budgetMs) {
+  let sentinel;
+  const pend = new Promise((resolve) => {
+    sentinel = setTimeout(() => resolve(PENDING), budgetMs);
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => ({ settled: 'resolved', value }),
+        (error) => ({ settled: 'rejected', error }),
+      ),
+      pend,
+    ]);
+  } finally {
+    // Otherwise a won race leaves a live timer and the file will not exit.
+    clearTimeout(sentinel);
+  }
+}
+
+test('the deadline still fires when the caller supplied a signal of their own (C2)', async () => {
+  // The caller's signal is never aborted. If composition drops the deadline,
+  // nothing can ever abort this request and the page hangs exactly as it did
+  // before the module existed.
+  const caller = new AbortController();
+
+  const outcome = await settleOrPend(
+    fetchWithDeadline('http://stalled.invalid/health', {
+      fetchImpl: stallingFetch(),
+      timeoutMs: 40,
+      signal: caller.signal,
+    }),
+    2_000,
+  );
+
+  assert.notEqual(
+    outcome.settled,
+    'pending',
+    'a caller-supplied signal displaced the deadline: this request never settles, ' +
+      'the poll loop never re-arms, and the page shows stale numbers forever (C2)',
+  );
+  assert.equal(outcome.settled, 'rejected', 'a stalling server produced a response');
+  assert.ok(
+    outcome.error instanceof RequestTimeoutError,
+    `the request ended, but not by the deadline: ${outcome.error}`,
+  );
+  // Attribution, not decoration: this proves the abort came from the DEADLINE
+  // rather than from the caller, without string-matching any runtime's wording.
+  assert.equal(
+    caller.signal.aborted,
+    false,
+    "the caller's signal fired, so this proves nothing about the deadline",
+  );
+});
+
+test('the pend detector can observe a pend — the control for the test above', async () => {
+  // Without this, `notEqual(outcome.settled, 'pending')` would be satisfied by a
+  // sentinel that can never report `pending` at all, and the C2 test would be a
+  // ceremony in exactly the way the test it replaces was. An empty is not a zero.
+  const outcome = await settleOrPend(new Promise(() => {}), 50);
+  assert.equal(
+    outcome.settled,
+    'pending',
+    'the sentinel cannot report a pending request, so the C2 assertion above is vacuous',
+  );
+});
+
 test('there is exactly one deadline value in the product', () => {
   // Two constants of the same name in two modules is how a duplicate
   // provenance key silently shipped a misnomer on this branch: JS raises no
