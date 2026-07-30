@@ -20,6 +20,10 @@ required-features = ["cuda", "native-backend"]
 name = "weight_offload_native_cuda_e2e"
 required-features = ["cuda", "native-backend"]
 
+[[test]]
+name = "native_step_component_parity"
+required-features = ["native-backend"]
+
 [features]
 default = []
 native-backend = [

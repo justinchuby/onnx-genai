@@ -33,7 +33,7 @@ pub mod value;
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
-pub use component::OrtComponentSession;
+pub use component::{OrtComponentSession, OrtComponentSessionRef};
 pub use decode::{
     BatchedDecodeSession, BatchedSharedBufferDecodeSession, BatchedStaticCacheDecodeSession,
     DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams,

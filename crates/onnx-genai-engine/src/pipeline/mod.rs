@@ -365,7 +365,76 @@ fn build_native_pipeline_components(
     Ok(components)
 }
 
-/// Components whose graphs contain only deterministic operators.
+/// Every_step components the operator explicitly requested be run on the native
+/// nxrt backend, from `ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS` (a
+/// comma-separated list of component names). Empty/unset means all every_step
+/// components run on the default ORT backend, so the ORT decode path is
+/// unchanged. This is the injection seam for the native multi-component inc1
+/// hybrid: it drives named every_step components natively inside an
+/// otherwise-ORT pipeline decode loop, proving the value-type seam.
+fn native_step_component_set() -> BTreeSet<String> {
+    std::env::var("ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the backend-neutral [`ComponentSession`](onnx_genai_metadata::ComponentSession)
+/// for one every_step component.
+///
+/// By default this borrows the already-loaded ORT session
+/// ([`OrtComponentSessionRef`]) so the ORT decode path is behaviour-identical.
+/// A component named in `native_components` is instead loaded and driven through
+/// the native nxrt backend, so the same decode loop drives both backends through
+/// the trait with no forked code path.
+fn build_step_component_session<'a>(
+    models: &'a PipelineModels,
+    component: &str,
+    native_components: &BTreeSet<String>,
+) -> anyhow::Result<Box<dyn onnx_genai_metadata::ComponentSession + 'a>> {
+    if native_components.contains(component) {
+        #[cfg(feature = "native-backend")]
+        {
+            let path = models
+                .directory
+                .model_paths
+                .get(component)
+                .with_context(|| {
+                    format!("native every_step component '{component}' has no model path")
+                })?;
+            // The every_step slice (inc1) stages tensors through the host
+            // `ComponentTensor` seam, so the native component runs on CPU; device
+            // placement of the pipeline decoder is the later (inc2/inc3) work.
+            let native = crate::native_component::NativeComponentSession::load(
+                path,
+                crate::native_decode::NativeDecodeDevice::Cpu,
+            )
+            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
+            return Ok(Box::new(native));
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            anyhow::bail!(
+                "every_step component '{component}' was requested on the native backend via \
+                 ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS, but this build was compiled without \
+                 the 'native-backend' feature. Rebuild with `--features native-backend`."
+            );
+        }
+    }
+    let session = models
+        .session(component)
+        .with_context(|| format!("pipeline every_step component '{component}' was not loaded"))?;
+    Ok(Box::new(onnx_genai_ort::OrtComponentSessionRef::new(
+        session,
+    )))
+}
+
 ///
 /// Read once at load, because a component's declared phase says when it runs,
 /// never that it is pure — a graph with `RandomNormal` in it would otherwise be
@@ -1301,6 +1370,46 @@ fn coerce_value_to_dtype(value: &Value, target: DataType) -> anyhow::Result<Valu
         }
         _ => clone_value(value),
     }
+}
+
+/// Convert a pool ORT [`Value`] into a backend-neutral [`ComponentTensor`] for
+/// the [`ComponentSession`](onnx_genai_metadata::ComponentSession) seam.
+///
+/// This is the pipeline side of the value-type seam: the decode-loop pool holds
+/// ORT `Value`s, but every_step components run through the backend-neutral trait
+/// whose boundary is a host-resident `ComponentTensor` (raw little-endian element
+/// bytes). The copy is `numel * dtype.size_of()` bytes; for the small every_step
+/// embedding outputs this is negligible relative to the decoder step.
+fn value_to_component_tensor(
+    value: &Value,
+) -> anyhow::Result<onnx_genai_metadata::ComponentTensor> {
+    let dtype = onnx_genai_metadata::ComponentDataType::from(value.dtype());
+    let bytes = value.to_raw_bytes()?;
+    onnx_genai_metadata::ComponentTensor::from_raw(dtype, value.shape().to_vec(), bytes)
+        .map_err(Into::into)
+}
+
+/// Convert a [`ComponentTensor`] produced by a component back into a pool ORT
+/// [`Value`]. Inverse of [`value_to_component_tensor`].
+fn component_tensor_to_value(
+    tensor: &onnx_genai_metadata::ComponentTensor,
+) -> anyhow::Result<Value> {
+    let dtype = DataType::from(tensor.dtype());
+    Value::from_raw_bytes(tensor.as_bytes().to_vec(), tensor.shape(), dtype).map_err(Into::into)
+}
+
+/// Build the running-token seed as a neutral `int64` [`ComponentTensor`] of shape
+/// `[1, seq]`, matching the ORT `Value::from_slice_i64` the loop previously fed.
+fn token_seed_component_tensor(
+    ids: &[i64],
+) -> anyhow::Result<onnx_genai_metadata::ComponentTensor> {
+    let bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+    onnx_genai_metadata::ComponentTensor::from_raw(
+        onnx_genai_metadata::ComponentDataType::Int64,
+        vec![1, ids.len() as i64],
+        bytes,
+    )
+    .map_err(Into::into)
 }
 
 #[derive(Debug, Clone)]
