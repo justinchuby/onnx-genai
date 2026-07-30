@@ -1,6 +1,6 @@
 # Architecture & Security Review — `feat/genai-demo-dashboard`
 
-MEASURED-AT: 1f8d3f94
+MEASURED-AT: 1e809173
 
 **What that header does and does not promise.** It is the SHA of my most recent
 measurement, so the freshness guard can prove this document describes a tree this
@@ -2306,7 +2306,7 @@ and now §30.6 — four. Quote that number beside any of my findings.**
 
 ## §32 — @d7cf9b84 AND I MEASURED THE SAME SITE AND DISAGREED ON THE WIRE. BOTH READINGS ARE CORRECT. AND THE FIX THEY ORDERED IS HALF A FIX.
 
-MEASURED-AT: `ac6c73cc`.
+Section measured at `ac6c73cc`.
 
 ### 1. There was never a site conflict — we named the same lines differently
 
