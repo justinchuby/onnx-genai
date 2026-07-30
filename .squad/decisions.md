@@ -591,9 +591,16 @@ CUDA_VISIBLE_DEVICES=0 taskset -c 0 \
 ```
 
 
-### 2026-07-27: DeepSeek R1-Distill GQA parity resolution
-**By:** Mary; reviewed by Lori-2
+### 2026-07-30: DeepSeek-R1 GQA decode resolution
 
-**What:** The earlier DeepSeek-R1-Distill native-CUDA divergence is resolved: the native grouped-query, non-interleaved-rotary decode path is correct. The observed native token `374` versus ORT-CUDA token `315` was an ORT-CUDA fp16 near-tie outlier; native matched the more accurate path. PR #430 landed test-only GQA 6:1 non-interleaved-rotary decode regressions at head dimensions 64 and 128 (`5c49c891`) to preserve the finding.
+**By:** Mary
 
-**Why:** Future DeepSeek/GLM native-CUDA bring-up should not chase this as a native GQA/KV correctness defect. Treat ORT-CUDA fp16 near-ties as potentially non-authoritative and keep independent higher-precision/native checks in the loop.
+**What:** Native R1 decode is correct: native CPU, native CUDA, and ORT CPU select token 374 with the f32 oracle margin. ORT CUDA's fp16 MatMulNBits near-tie flips generated token 7 to 315 and leads to repetition. CI regression coverage now exercises 12:2 grouped-query attention with non-interleaved rotary and multi-step KV decode at head widths 64 and 128.
+
+**Why:** The width-128 case mirrors the deployed R1 graph, while width 64 retains coverage for the originally reported geometry. Both guard rotary position advancement, 6:1 head grouping, causal attention, and chained past/present KV correctness.
+
+
+### 2026-07-30: Qwen 27B Unsqueeze blocker is already resolved
+**By:** Mary
+**What:** The reported native Unsqueeze rank failure does not reproduce on main. The real Qwen3.6-27B INT4 graph's only Unsqueeze maps rank-2 `position_ids` through constant axes `[0]` to the declared rank-3 output, and native CUDA proceeds past it. Existing dynamic, symbolic, negative-axis, legacy-attribute, modern-input, CPU, and CUDA tests all pass. Commit `8d9d2fa2` previously added the generic dynamic Unsqueeze runtime-shape fix. With explicit model I/O and recurrent-state metadata supplied, the next native load blocker is CUDA decoder state allocation rejecting rank-3 FP16 `past_key_values.12.conv_state` at `crates/onnx-genai-engine/src/native_decode/cuda.rs:480`; it currently accepts only rank-4 KV/state tensors.
+**Why:** A new Unsqueeze patch would duplicate existing coverage and risk regression. The next #384 work should generalize CUDA persistent decoder state bindings to fixed recurrent states of arbitrary declared rank, beginning with rank-3 convolution state, while preserving rank-4 KV behavior.
