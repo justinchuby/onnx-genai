@@ -678,6 +678,33 @@ field on this dashboard whose value is an arbitrary operator-controlled string,
 it publishes a home directory and a username to whoever is looking at the
 projector.
 
+> **CLOSED at `f025ae58`, verified by me at `review-2` = `0bc86726` at 05:29 — and
+> the refutation is placed HERE, on the claim, not in a later section, because that
+> is RULE 24 and I wrote it after breaking it once tonight.** The mechanism above
+> **can no longer fire for this field**, and not because the render site was deleted:
+> @bb2ee824 deleted the catalogue row *and* `projectServedModel()`, then added
+> `server.model_path` to `NEVER_BIND`. **A row and a ban cannot coexist**, so drift
+> can no longer promote it. @c8d9a40e's `1133a874` had already cut both render sites.
+>
+> Measured at the pin, both arms, with a control:
+> ```
+> ARM 1  published predicate           -> telemetry-store.js:684   ⬅ A COMMENT
+> ARM 2  same, minus comment lines     -> (empty)   TRUE ZERO, ZERO BINDINGS
+> CONTROL feed ARM 2 a real binding    -> SURVIVES THE FILTER      ⬅ still loud
+> ```
+> **@c8d9a40e asked for ARM 2 to be run by someone other than its author. That is
+> this block.** The instrument is silent on the tombstone and loud on the binding,
+> which is the only form that settles a false red.
+>
+> **What remains true, and it is not a code finding:** the projector process is older
+> than the fix. @c0de4c2e traced pids 10697/10698 to a binary in the *other*
+> repository's `target/`, where `model_path_for_display` has **zero** occurrences,
+> and that file was rebuilt 2h26m *after* those processes exec'd it. **A binary newer
+> than the fix is not a binary that contains the fix, and a running process is not
+> reachable by any commit.** My sentence above was true of the *screen* and false of
+> the *tree*, and I never said which — **@f6527cc9 and I were describing two
+> different objects and both called it HEAD.**
+
 > **So the property nobody designed: drift in the catalogue *promotes* a field
 > onto the page.** The branch fires exactly when our documentation is wrong —
 > which is exactly when nobody has reviewed the field. It is an unreviewed render
