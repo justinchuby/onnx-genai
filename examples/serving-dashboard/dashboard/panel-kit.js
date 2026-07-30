@@ -21,6 +21,12 @@
 // replaced by re-exports and no panel changes.
 
 import { RENDER_STATES, isRenderable, isStale, renderStateOf } from './field-state.js';
+import {
+  describeSparkline,
+  paintSparkline,
+  planSparkline,
+  tabulateSparkline,
+} from './sparkline.js';
 
 /**
  * Source classes, as rendered by the AC7 provenance badge (demo-ux.md §4.5).
@@ -419,10 +425,30 @@ export function withAcronyms(text, acronyms) {
  * @param {() => void} paint
  * @returns {{request(): void, cancel(): void, setVisible(visible: boolean): void}}
  */
-export function createRepaintScheduler(rootElement, paint) {
+export function createRepaintScheduler(rootElement, paint, options = {}) {
   let frameHandle = 0;
   let visible = true;
   let dirtyWhileHidden = false;
+  // `null` means "never painted", NOT "painted at time zero". performance.now()
+  // is measured from page load, so a zero sentinel makes the very first request
+  // look like it arrived milliseconds after a previous paint — and the first
+  // render of every panel would be deferred by up to a second at exactly the
+  // moment the dashboard mounts.
+  let lastPaintAtMs = null;
+  let trailingHandle = 0;
+
+  // AC30. The dashboard has no tweened animation, so the motion a visitor
+  // actually perceives is the repaint cadence itself: numbers and sparklines
+  // twitching four times a second. Under a reduced-motion preference that drops
+  // to roughly 1 Hz.
+  //
+  // The DATA is never reduced and updates are never dropped — a trailing
+  // repaint always lands, so the panel still ends up showing the newest value.
+  // Withholding measurements from someone with a vestibular disorder would be a
+  // strange reading of an accessibility preference; the fix is to move less
+  // often, not to know less.
+  const minIntervalMs = options.minIntervalMs ?? (prefersReducedMotion() ? 1000 : 0);
+  const now = () => (typeof performance === 'object' ? performance.now() : Date.now());
 
   const run = () => {
     frameHandle = 0;
@@ -430,6 +456,7 @@ export function createRepaintScheduler(rootElement, paint) {
       dirtyWhileHidden = true;
       return;
     }
+    lastPaintAtMs = now();
     paint();
   };
 
@@ -438,12 +465,28 @@ export function createRepaintScheduler(rootElement, paint) {
       if (frameHandle !== 0) {
         return;
       }
+      const sinceLastMs = lastPaintAtMs === null ? Infinity : now() - lastPaintAtMs;
+      if (minIntervalMs > 0 && sinceLastMs < minIntervalMs) {
+        // Too soon. Schedule one trailing repaint for when the interval is up
+        // rather than dropping this update on the floor.
+        if (trailingHandle === 0) {
+          trailingHandle = setTimeout(() => {
+            trailingHandle = 0;
+            this.request();
+          }, minIntervalMs - sinceLastMs);
+        }
+        return;
+      }
       frameHandle = requestAnimationFrame(run);
     },
     cancel() {
       if (frameHandle !== 0) {
         cancelAnimationFrame(frameHandle);
         frameHandle = 0;
+      }
+      if (trailingHandle !== 0) {
+        clearTimeout(trailingHandle);
+        trailingHandle = 0;
       }
     },
     setVisible(next) {
@@ -494,19 +537,102 @@ export function createSparklineSlot({ label, width = 180, height = 28 }) {
     className: 'spark__canvas',
     attrs: { width, height, role: 'img', 'aria-label': `${label}: loading` },
   });
+
+  // AC28: every canvas needs a view-as-table alternative. It is built here
+  // rather than per panel so it cannot be forgotten by one of them, and it
+  // lives in the DOM from the start rather than being constructed on toggle —
+  // a table that only exists after a click is a table that only some visitors
+  // can reach, and the ones who need it most are the least likely to click.
+  const tableBody = element('tbody', { className: 'spark-table__body' });
+  const table = element('table', {
+    className: 'spark-table',
+    attrs: { hidden: '' },
+    children: [
+      element('caption', { className: 'spark-table__caption', text: label }),
+      element('thead', {
+        children: [
+          element('tr', {
+            children: [
+              element('th', { text: 'time', attrs: { scope: 'col' } }),
+              element('th', { text: 'value', attrs: { scope: 'col' } }),
+            ],
+          }),
+        ],
+      }),
+      tableBody,
+    ],
+  });
+
   const root = element('figure', {
     className: 'spark',
-    attrs: { tabindex: '0' },
-    children: [canvas],
+    attrs: { tabindex: '0', 'data-view': 'chart' },
+    children: [canvas, table],
   });
+
   return {
     root,
     canvas: /** @type {HTMLCanvasElement} */ (canvas),
     setDescription(text) {
       canvas.setAttribute('aria-label', text);
       root.setAttribute('title', text);
+      table.querySelector?.('caption')?.setAttribute('title', text);
+    },
+
+    /**
+     * Populate the table alternative from the same plan the canvas paints, so
+     * the two can never disagree about what was measured.
+     *
+     * @param {Array<{label: string, value: string}>} rows
+     */
+    setTableRows(rows) {
+      replaceChildren(
+        tableBody,
+        rows.map((row) =>
+          element('tr', {
+            className: 'spark-table__row',
+            children: [
+              element('th', { text: row.label, attrs: { scope: 'row' } }),
+              element('td', { text: row.value }),
+            ],
+          }),
+        ),
+      );
+    },
+
+    /**
+     * @param {'chart'|'table'} view
+     */
+    setView(view) {
+      const asTable = view === 'table';
+      root.setAttribute('data-view', asTable ? 'table' : 'chart');
+      if (asTable) {
+        table.removeAttribute('hidden');
+        canvas.setAttribute('hidden', '');
+      } else {
+        canvas.removeAttribute('hidden');
+        table.setAttribute('hidden', '');
+      }
     },
   };
+}
+
+/**
+ * Whether the visitor has asked for reduced motion (AC30).
+ *
+ * Defaults to `false` when `matchMedia` is unavailable, which is the honest
+ * default: we cannot claim to know a preference that was never expressed, and
+ * assuming reduced motion would quietly degrade the charts for everyone in a
+ * test environment.
+ *
+ * @returns {boolean}
+ */
+export function prefersReducedMotion() {
+  if (typeof globalThis.matchMedia !== 'function') return false;
+  try {
+    return globalThis.matchMedia('(prefers-reduced-motion: reduce)').matches === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -611,3 +737,50 @@ export const REQUEST_TABLE_EMPTY = Object.freeze({
     'so this table is empty for a reason that has nothing to do with the server.',
   idle: 'No requests in this scenario yet.',
 });
+
+/**
+ * Paint a sparkline, describe it, and build its table alternative in one call.
+ *
+ * The three must happen together or AC28 fails silently: a canvas whose table
+ * was not refreshed shows stale numbers to exactly the visitors who cannot see
+ * that the chart beside it has moved on. Making it one function means a call
+ * site cannot do two of the three.
+ *
+ * @param {object} slot A slot from {@link createSparklineSlot}.
+ * @param {object} series
+ * @param {object} options
+ * @param {number} options.width
+ * @param {number} options.height
+ * @param {number} [options.windowMs]
+ * @param {boolean} [options.zeroBaseline]
+ * @param {string} options.label
+ * @param {string} [options.unit]
+ * @param {(value: number) => string} [options.format]
+ * @returns {object} The plan, for callers that need it.
+ */
+export function renderSparkline(slot, series, options) {
+  const plan = planSparkline(series, {
+    width: options.width,
+    height: options.height,
+    windowMs: options.windowMs,
+    zeroBaseline: options.zeroBaseline,
+    nowMs: options.nowMs ?? Date.now(),
+  });
+
+  // The painter does a straight redraw with no tweening, so there is no
+  // animation here to suppress for AC30. The motion a visitor actually
+  // perceives is the REPAINT CADENCE — a chart twitching four times a second —
+  // and that is throttled in createRepaintScheduler instead.
+  paintSparkline(slot.canvas, plan);
+
+  slot.setDescription(
+    describeSparkline(plan, {
+      label: options.label,
+      unit: options.unit,
+      windowSeconds: options.windowMs ? options.windowMs / 1000 : undefined,
+      reason: series?.reason,
+    }),
+  );
+  slot.setTableRows(tabulateSparkline(plan, { format: options.format }));
+  return plan;
+}

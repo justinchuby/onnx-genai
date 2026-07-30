@@ -95,7 +95,6 @@ class FakeElement extends FakeNode {
     this.ownText = null;
     /** @type {Record<string, Array<(event: unknown) => void>>} */
     this.listeners = {};
-    this.hidden = false;
   }
 
   get textContent() {
@@ -125,6 +124,29 @@ class FakeElement extends FakeNode {
   /** @param {string} name */
   hasAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this.attributes, name);
+  }
+
+  /** @param {string} name */
+  removeAttribute(name) {
+    delete this.attributes[name];
+  }
+
+  // In a real DOM, `hidden` the IDL property REFLECTS the `hidden` content
+  // attribute — setAttribute('hidden', '') makes element.hidden true, and
+  // element.hidden = false removes the attribute. Modelling it as a plain field
+  // let the two drift apart, which would have hidden a repaint scheduler that
+  // kept painting an off-screen panel in the browser while looking correct
+  // here.
+  get hidden() {
+    return this.hasAttribute('hidden');
+  }
+
+  set hidden(value) {
+    if (value) {
+      this.attributes.hidden = '';
+    } else {
+      delete this.attributes.hidden;
+    }
   }
 
   /** @param {...(FakeNode|string)} nodes */

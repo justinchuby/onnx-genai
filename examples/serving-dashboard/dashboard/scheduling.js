@@ -33,8 +33,8 @@ import {
   renderField,
   replaceChildren,
   sectionLabel,
+  renderSparkline,
 } from './panel-kit.js';
-import { describeSparkline, paintSparkline, planSparkline } from './sparkline.js';
 
 /** History window shared by every sparkline on the page. */
 const WINDOW_MS = 60_000;
@@ -283,21 +283,13 @@ function renderAllocationFailures(allocationFailures) {
  * @param {{label: string, unit: string}} options
  */
 function paintSpark(slot, series, options) {
-  const plan = planSparkline(series, {
+  renderSparkline(slot, series, {
     width: slot.canvas.width || 320,
     height: slot.canvas.height || 34,
     windowMs: WINDOW_MS,
-    nowMs: Date.now(),
+    label: options.label,
+    unit: options.unit,
   });
-  paintSparkline(slot.canvas, plan);
-  slot.setDescription(
-    describeSparkline(plan, {
-      label: options.label,
-      unit: options.unit,
-      windowSeconds: WINDOW_MS / 1000,
-      reason: series?.reason,
-    }),
-  );
 }
 
 /**

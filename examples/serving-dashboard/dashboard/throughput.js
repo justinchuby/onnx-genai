@@ -32,8 +32,8 @@ import {
   sectionLabel,
   readRequests,
   REQUEST_TABLE_EMPTY,
+  renderSparkline,
 } from './panel-kit.js';
-import { describeSparkline, paintSparkline, planSparkline } from './sparkline.js';
 
 const WINDOW_MS = 60_000;
 
@@ -119,21 +119,13 @@ export default function mount(rootElement, telemetryStore) {
     ]);
 
     const heroSeries = telemetryStore.rateSeries('metrics.tokens_generated_total', WINDOW_MS);
-    const plan = planSparkline(heroSeries, {
+    renderSparkline(heroSpark, heroSeries, {
       width: 260,
       height: 40,
       windowMs: WINDOW_MS,
-      nowMs: Date.now(),
+      label: 'Aggregate output tokens per second',
+      unit: 'tok/s',
     });
-    paintSparkline(heroSpark.canvas, plan);
-    heroSpark.setDescription(
-      describeSparkline(plan, {
-        label: 'Aggregate output tokens per second',
-        unit: 'tok/s',
-        windowSeconds: WINDOW_MS / 1000,
-        reason: heroSeries?.reason,
-      }),
-    );
 
     description = buildDescription(telemetryStore, aggregate);
   };

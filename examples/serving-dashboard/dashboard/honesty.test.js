@@ -128,3 +128,49 @@ describe('honesty lint — no unguarded value reads', () => {
     assert.deepEqual(offences, [], `use textContent:\n${offences.join('\n')}`);
   });
 });
+
+/**
+ * Modules that legitimately touch the raw painter: sparkline.js defines it and
+ * panel-kit.js is the wrapper that adds the table. Everything else is a panel.
+ *
+ * @returns {string[]}
+ */
+function panelSources() {
+  const infrastructure = new Set(['sparkline.js', 'store-adapter.js', 'index.js']);
+  return sourceFiles().filter((name) => !infrastructure.has(name));
+}
+
+describe('accessibility cannot be skipped one panel at a time', () => {
+  it('routes every panel chart through renderSparkline', () => {
+    // AC28 requires a table alternative for every canvas. renderSparkline is
+    // the only call site that builds one, so a panel that reaches for
+    // paintSparkline directly gets a chart with no readable alternative and
+    // still looks perfectly correct on screen. prefix-cache.js did exactly
+    // that, and nothing caught it until this rule existed: the accessible
+    // path has to be the ONLY path, not the recommended one.
+    const offenders = [];
+    for (const file of panelSources()) {
+      const source = readFileSync(`${DASHBOARD_DIR}${file}`, 'utf8');
+      if (/\bpaintSparkline\s*\(/.test(source)) {
+        offenders.push(`${file}: calls paintSparkline directly`);
+      }
+      if (/from '\.\/sparkline\.js'/.test(source)) {
+        offenders.push(`${file}: imports sparkline.js instead of using panel-kit`);
+      }
+    }
+    assert.deepEqual(offenders, [], offenders.join('\n'));
+  });
+
+  it('gives every sparkline slot a label to name its table', () => {
+    const offenders = [];
+    for (const file of panelSources()) {
+      const source = readFileSync(`${DASHBOARD_DIR}${file}`, 'utf8');
+      for (const [, args] of source.matchAll(/createSparklineSlot\(\{([^}]*)\}/g)) {
+        if (!/\blabel\s*:/.test(args)) {
+          offenders.push(`${file}: createSparklineSlot without a label`);
+        }
+      }
+    }
+    assert.deepEqual(offenders, [], offenders.join('\n'));
+  });
+});

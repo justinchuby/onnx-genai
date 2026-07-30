@@ -39,6 +39,7 @@ import { isRenderable, numericValueOf } from './field-state.js';
 import {
   createRepaintScheduler,
   createSparklineSlot,
+  renderSparkline,
   describeFieldText,
   element,
   formatDuration,
@@ -48,7 +49,6 @@ import {
   replaceChildren,
   sectionLabel,
 } from './panel-kit.js';
-import { describeSparkline, paintSparkline, planSparkline } from './sparkline.js';
 
 const WINDOW_MS = 60_000;
 
@@ -128,21 +128,14 @@ export default function mount(rootElement, telemetryStore) {
     ]);
 
     const hitSeries = telemetryStore.series('prefix_cache.hits', WINDOW_MS);
-    const plan = planSparkline(hitSeries, {
+    renderSparkline(spark, hitSeries, {
       width: 220,
       height: 30,
       windowMs: WINDOW_MS,
       nowMs: Date.now(),
+      label: 'Prefix cache hits',
+      unit: 'hits',
     });
-    paintSparkline(spark.canvas, plan);
-    spark.setDescription(
-      describeSparkline(plan, {
-        label: 'Prefix cache hits',
-        unit: 'hits',
-        windowSeconds: WINDOW_MS / 1000,
-        reason: hitSeries?.reason,
-      }),
-    );
 
     description = buildDescription({ hitRate, hits, generations, capability });
   };

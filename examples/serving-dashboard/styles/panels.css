@@ -790,3 +790,72 @@
 .resource-row--absent .resource-row__label {
   border-bottom-style: dashed;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   THE VIEW-AS-TABLE ALTERNATIVE (AC28)
+   Present in the DOM for every sparkline, hidden until the shell toggles the
+   figure to data-view="table". It is a real table, not a visually-hidden
+   paragraph, because the point is that the numbers can be read and compared —
+   by a screen reader, and equally by a sighted visitor who does not trust a
+   40-pixel chart to tell them what the value was.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+.spark-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.spark-table__caption {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  text-align: left;
+  padding: var(--og-space-2);
+}
+
+.spark-table th {
+  color: var(--og-fg-muted);
+  font-weight: var(--og-weight-normal);
+  text-align: left;
+  padding: var(--og-space-1) var(--og-space-2);
+}
+
+.spark-table td {
+  color: var(--og-fg);
+  text-align: right;
+  padding: var(--og-space-1) var(--og-space-2);
+}
+
+.spark-table__row:nth-child(even) {
+  background: var(--og-bg-sunken);
+}
+
+.spark-table__body:empty::after {
+  content: 'No samples in this window.';
+  color: var(--og-unavail-fg);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   REDUCED MOTION (AC30)
+   Motion is removed; DATA IS NOT. Charts still update — withholding
+   measurements from someone with a vestibular disorder would be a strange
+   reading of the preference. What goes away is anything that moves for its own
+   sake: transitions, and the eased redraw of a sparkline.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+@media (prefers-reduced-motion: reduce) {
+  .capability-notice__copy,
+  .utilization-bar__fill,
+  .refcounts__bar {
+    transition: none !important;
+  }
+
+  .spark__canvas {
+    /* Paired with the `animate: false` the painter receives, so the reduction
+       holds whether the movement came from CSS or from canvas. */
+    scroll-behavior: auto;
+  }
+}

@@ -173,6 +173,11 @@ export function planSparkline(series, options) {
     lastValue: visible[visible.length - 1].v,
     caption: null,
     stale: state === RENDER_STATES.STALE,
+    // Retained so the AC28 table alternative is built from the SAME windowed
+    // samples the canvas paints. Deriving the table from the raw series
+    // separately would let the two disagree about the window, and a table that
+    // contradicts the chart beside it is worse than no table.
+    samples: visible,
   };
 }
 
@@ -339,6 +344,7 @@ function emptyPlan(mode, width, height, caption, stale) {
     lastValue: null,
     caption,
     stale,
+    samples: [],
   };
 }
 
@@ -534,4 +540,58 @@ function makeTokenReader(canvas) {
 /** @param {number} value */
 function defaultFormat(value) {
   return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+/**
+ * The AC28 view-as-table alternative for a sparkline.
+ *
+ * Built from the plan rather than the series so it shows exactly the samples
+ * the canvas drew. Downsampled to `maxRows`, because a table of twelve hundred
+ * polls is not an accessible alternative — it is the same inaccessibility in a
+ * different format, and a screen-reader user would have to page through five
+ * minutes of noise to learn what the chart says at a glance.
+ *
+ * @param {object} plan A plan from {@link planSparkline}.
+ * @param {object} [options]
+ * @param {number} [options.maxRows]
+ * @param {(value: number) => string} [options.format]
+ * @returns {Array<{label: string, value: string}>}
+ */
+export function tabulateSparkline(plan, options = {}) {
+  const maxRows = options.maxRows ?? 12;
+  const format = options.format ?? ((value) => String(Math.round(value * 100) / 100));
+  const samples = plan?.samples ?? [];
+
+  if (samples.length === 0) {
+    // The caption already says why — unavailable and pending have different
+    // ones — so the table repeats it rather than showing an empty grid that
+    // looks like a rendering failure.
+    return [{ label: '—', value: plan?.caption ?? 'No samples.' }];
+  }
+
+  const step = Math.max(1, Math.ceil(samples.length / maxRows));
+  const rows = [];
+  for (let index = 0; index < samples.length; index += step) {
+    const sample = samples[index];
+    rows.push({ label: formatClockTime(sample.t), value: format(sample.v) });
+  }
+
+  // The most recent sample is the one a visitor is most likely to want, and
+  // fixed-step downsampling drops it whenever the count is not a multiple of
+  // the step.
+  const last = samples[samples.length - 1];
+  if (rows[rows.length - 1]?.label !== formatClockTime(last.t)) {
+    rows.push({ label: formatClockTime(last.t), value: format(last.v) });
+  }
+  return rows;
+}
+
+/**
+ * @param {number} timestampMs
+ * @returns {string}
+ */
+function formatClockTime(timestampMs) {
+  const date = new Date(timestampMs);
+  const pad = (part) => String(part).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
