@@ -336,6 +336,11 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // ---------------------------------------------------------------------
 
   const stillDirty = new Set();
+  // How MANY live-claim sites each deferred document carries, not merely
+  // whether it carries any. A Set answers "is this document deferred", which is
+  // the question the deferral already answered; it cannot see a deferred
+  // document acquiring ten new claims, because the set membership never changes.
+  const deferredLiveClaims = new Map();
   const sampleExemptionUsed = new Set();
 
   let inspected = 0;
@@ -379,7 +384,11 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
           hit.index + hit[0].length + WINDOW,
         );
         if (RETRACTION.test(near)) continue;
-        if (doc in DEFERRED) { stillDirty.add(doc); continue; }
+        if (doc in DEFERRED) {
+          stillDirty.add(doc);
+          deferredLiveClaims.set(doc, (deferredLiveClaims.get(doc) ?? 0) + 1);
+          continue;
+        }
         if (!offenders.includes(doc)) offenders.push(doc);
       }
     }
@@ -445,6 +454,82 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
       + 'the entries from DEFERRED so the gate covers them for real — an '
       + 'exemption that outlives its reason is indistinguishable from a '
       + 'suppression, and nobody reports a gap that has closed.',
+  );
+
+  // THE DRAINED CORPUS, RATCHETED. @12e42da8's rule, and the reason a plain
+  // intersection assertion is the wrong shape for it.
+  //
+  // THE RULE: an exemption is a statement about RAW EVIDENCE; the moment an
+  // exempt file states a CONCLUSION, the exemption is a suppression. Every
+  // document that still states the withdrawn ratio is exempt or deferred, so
+  // this guard is green because its corpus drained to exactly the set of files
+  // that no longer make the claim. No single decision was an error and the
+  // aggregate is a suppression -- there is no bad commit to find.
+  //
+  // WHY NOT `assert stillDirty is empty`, WHICH IS THE THREE-LINE VERSION:
+  // it is RED THE MOMENT IT IS WRITTEN, on three documents owned by three other
+  // agents, mid-review. A guard that reddens instantly gets an exemption bolted
+  // onto it within the hour, and we have rebuilt the disease one level up. The
+  // suppression is real; the emergency is not.
+  //
+  // WHY A COUNT AND NOT A SET: `stillDirty` is a Set, so it answers "is this
+  // document deferred" -- a question the deferral already answered. IT CANNOT
+  // SEE A DEFERRED DOCUMENT ACQUIRING TEN NEW CLAIMS, because membership never
+  // changes. That is the actual hole: today a deferral is an unmetered licence.
+  //
+  // Numbers measured at 53e5e7d9, not guessed. They count MATCH SITES that are
+  // NOT within +/-600 characters of retraction language -- so a struck figure,
+  // or one stated as the subject of a retraction, is already excused above and
+  // never reaches this map. Every site counted here is a bare live claim.
+  const DEFERRED_CLAIM_CEILING = Object.freeze({
+    'REVIEWER-BRIEF.md': 2,
+    'demo-spec.md': 1,
+    'design/demo-ux.md': 6,
+  });
+
+  for (const doc of Object.keys(DEFERRED)) {
+    const seen = deferredLiveClaims.get(doc) ?? 0;
+    const ceiling = DEFERRED_CLAIM_CEILING[doc];
+
+    assert.notEqual(
+      ceiling,
+      undefined,
+      `${doc} is DEFERRED but has no entry in DEFERRED_CLAIM_CEILING. A deferral `
+        + 'without a number is an unmetered licence: the document may acquire any '
+        + 'number of new claims and this gate will stay green, because set '
+        + 'membership never changes. Measure it and pin it.',
+    );
+    assert.ok(
+      seen <= ceiling,
+      `${doc} now states the withdrawn ratio as a LIVE claim at ${seen} site(s), `
+        + `up from the pinned ${ceiling}. THIS IS A REGRESSION AND THE GATE COULD `
+        + 'NOT HAVE SEEN IT BEFORE: the document is deferred, so its claims are '
+        + 'not reported as offences. Somebody added a bare statement of a '
+        + 'withdrawn figure to a document the gate is not covering. Remove the new '
+        + 'site, or state it next to its retraction so the vicinity rule excuses '
+        + 'it honestly.',
+    );
+    assert.equal(
+      seen,
+      ceiling,
+      `${doc} is down to ${seen} live claim site(s) from the pinned ${ceiling}. `
+        + 'THIS IS GOOD NEWS AND IT IS STILL A FAILURE, DELIBERATELY: lower the '
+        + `number to ${seen} in DEFERRED_CLAIM_CEILING in the same commit that `
+        + 'earned it, or delete the DEFERRED entry entirely if it is now 0 and '
+        + 'let the gate cover the file for real. A ceiling that is never lowered '
+        + 'stops being a ratchet and becomes a permanent allowance -- which is '
+        + 'the exact drain this guard exists to stop, one level up.',
+    );
+  }
+
+  // No ceiling entry may outlive its deferral, or the numbers accumulate as a
+  // record of documents nobody is watching any more.
+  assert.deepEqual(
+    Object.keys(DEFERRED_CLAIM_CEILING).filter((d) => !(d in DEFERRED)),
+    [],
+    'a DEFERRED_CLAIM_CEILING entry names a document that is no longer deferred. '
+      + 'Delete it: a ceiling on a document the gate now covers in full is a '
+      + 'number that can only mislead.',
   );
 
   assert.deepEqual(
