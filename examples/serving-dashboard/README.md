@@ -220,8 +220,8 @@ places:
 
 | path | handler | borrow | behaviour |
 |---|---|---|---|
-| batching (`:8123`) | `driver.rs:683` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
-| dynamic (`:8124`) | `driver.rs:813` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
+| batching (`:8123`) | `driver.rs:678` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
+| dynamic (`:8124`) | `driver.rs:755` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
 
 The shared-vs-exclusive borrow *is* the fix — nothing else differs.
 
@@ -472,12 +472,12 @@ is what the page reports — including an unflattering one.
 #### The demo never says "batch size", and the reason is worth reading
 
 The most convincing wrong number available to this project is
-`onnx_genai_batch_size_current`. It is `fetch_add(1)` when a generation starts
-and decremented on drop (`metrics.rs:112`, `:145`), so it counts **generation
-requests in flight at the HTTP layer** — it has no connection to
-`ContinuousBatchManager` and cannot see the engine's real batch. With
-`--max-batch 4`, eight concurrent requests make it read **8** while the engine
-is decoding **4**.
+`onnx_genai_batch_size_current`. It is `fetch_add(1)` in
+`GenerationMetrics::start()` and decremented on drop (`metrics.rs:115`,
+`:156`), so it counts **generations in flight across the whole process** — it
+has no connection to `ContinuousBatchManager` and cannot see the engine's real
+batch. With `--max-batch 4`, eight concurrent requests make it read **8** while
+the engine is decoding **4**.
 
 Every other trap in this project was a static zero, which looks suspicious. This
 one is real, live, and moves beautifully under load — and it is named after the
@@ -490,13 +490,48 @@ and the engine's true batch size as **unavailable**, because nothing exposes it.
 
 ⚠️ **Do not derive queueing from `/v1/status`'s `batch_utilization`.** It is a
 genuine measurement — `current_batch_size / effective_batch_capacity()`, where
-the capacity is `max_batch.min(max_queue_depth)` (`state.rs:201-206`), which is
-correctly *tighter* than `max_batch` alone. But it is **clamped to `1.0`**
-(`admin.rs:85`). The clamp is well-reasoned for a multi-model node, where
+the capacity is `max_batch.min(max_queue_depth)` (`state.rs:205`), which is
+correctly *tighter* than `max_batch` alone. But it is **clamped to `1.0`** by
+`batch_utilization` (`admin.rs:80`). The clamp is well-reasoned for a multi-model node, where
 in-flight work legitimately exceeds any single batch. It also means the value
 saturates at exactly the moment queueing begins, and the overflow — the entire
 queueing signal — is discarded before it reaches the wire. `max(0, in_flight -
 max_batch)` cannot be recovered from it. Read `current_batch_size` directly.
+
+🔴 **And do not render this pair as `n of m`, even though `m` is a small
+integer.** The house rule is that a ratio over a small integer denominator
+should show both terms — `3 of 4` rather than `75 %` — because a percentage over
+five reachable values invents a resolution the quantity does not have. That rule
+is right, and **this field is the exception that proves why it must be checked
+against provenance rather than applied on sight**: here the two terms *do not
+come from the same scope.*
+
+| term | scope |
+|---|---|
+| `current_batch_size` (numerator) | the **process-global** registry (`metrics.rs:82`) — sums every generation on the node, across every loaded model and every driver |
+| `effective_batch_capacity()` (denominator) | **one config's** batch ceiling (`state.rs:205`) |
+
+**The numerator can therefore legitimately exceed the denominator**, which is
+exactly what the clamp in `batch_utilization` (`admin.rs:80`) exists to absorb. Rendered as `n of m`
+that produces **`7 of 4`** — visibly absurd — where the percentage form silently
+shows `100 %`. **The clamp is not hiding a bug; it is hiding a scope mismatch,
+and `n of m` un-hides it.** Both forms are wrong here for the same underlying
+reason, and neither is fixable in the client.
+
+> **If you are asked to emit `max_batch` on the wire so the client can render a
+> denominator: emit `effective_batch_capacity()` instead, under a name that says
+> what it is.** `max_batch` is *not* the number the server divided by. Shipping
+> it would put a client-side `3 of 4` beside a server-side `100 %` — two honest
+> fields, computed from two different denominators, disagreeing on screen with
+> no way for a reader to tell which one is lying. **That is this project's whole
+> failure mode: not a wrong value, but a correct value in a wrong relationship.**
+
+On this demo the mismatch is **latent rather than active**, and only because of
+the one-model-per-server split described in [Why two servers](#why-two-servers):
+with a single driver per process the numerator's scope collapses onto the
+denominator's. **That is the two-server ruling paying for itself in a place
+nobody chose it for**, and it is worth noticing that the guarantee comes from
+the process boundary rather than from anyone remembering this caveat.
 
 **What the numbers looked like on one machine.** Measured on this repository
 before the dashboard existed, CPU execution provider, `qwen2.5-0.5b-scatter-v2`,
@@ -575,32 +610,57 @@ prompts differing from token 0. **So `hits 0 → 1` is exactly what an unrelated
 prompt produces, and the counter cannot distinguish reuse from no-reuse.** That
 is a counting fact: no sample size, no load, no noise.
 
-**The timing finding is not airtight, and we are not going to pretend it is.**
+**The timing finding is weaker than the counter finding, but it is not as weak
+as "inconclusive" — and separating those two claims is the whole trick.**
 An early check fired one identical long prefix twice, saw the counter move and
 latency fall 1.53 s → 1.22 s, and concluded the cache worked — with no control
 arm, so warm-up and a cache hit were the same observation. A later controlled
 run put the shared-prefix arm **7 % slower** than a control sharing nothing. A
 third run, warm and interleaved, put it **17 % faster**.
 
-**Those two results contradict each other, so the instrument is not resolving
-the effect.** The measurements were taken on a machine at load average 22 on ten
-cores, where a *byte-identical* binary has been observed to swing 9.8 %. A
-control arm rules out warm-up; it does not rule out noise larger than the signal.
+**Those last two contradict each other, so the instrument cannot resolve a
+difference of that size.** The measurements were taken on a machine at load
+average 22 on ten cores, where a *byte-identical* binary has been observed to
+swing 9.8 %. A control arm rules out warm-up; it does not rule out noise larger
+than the signal.
 
-> **Spread greater than effect size means inconclusive — not a pass, and not a
-> failure either.** It was tempting to keep the earlier "proven absent" wording,
-> because understating a capability feels like the safe direction. It is not:
+**But the effect we were looking for is not that size, and that is what closes
+the question.** A prefill/decode split on the same long prompt put prefill at
+**1241 ms of a 1380 ms TTFT — about 90 %** *(measured by QA; reported here, not
+re-derived at `file:line` by the author of this document)*. A prefix cache that
+actually restored KV would therefore have collapsed TTFT to roughly **140 ms**.
+
+| | magnitude |
+|---|---|
+| noise floor on this machine | ~10 % |
+| smallest difference we can resolve | ~10 % |
+| observed shared-vs-control difference | 7 % → **below the floor, unresolvable** |
+| **effect a working prefix cache must produce** | **~90 % → 9× the floor** |
+
+> **This is a sensitivity check, and it is the difference between "we did not
+> observe it" and "it is not there."** The same run that cannot tell 7 % from
+> 17 % can trivially tell 1380 ms from 140 ms. **Reporting a null result without
+> establishing that your instrument could have detected the alternative is not a
+> measurement, it is an absence of one** — and it is the same error, in the
+> mirror, as the uncontrolled n=2 that started this: both hand you the answer
+> you went in with.
+
+So the honest reading is **two findings at two strengths**: small timing
+differences are unresolvable here and we make no claim about them, while the
+large effect that prefix reuse is *supposed* to produce is **ruled out by a test
+that demonstrably could have seen it**.
+
+> **We were careful not to resolve this in the modest direction either.**
+> Understating a capability feels like the safe way to be wrong, and it is not:
 > **an honesty process that only ever ratchets toward understating is not
-> calibrated, it is just a differently-biased claim**, and "proven absent" is a
-> strong claim that this evidence did not support.
->
-> **We left it inconclusive rather than resolving it in the flattering
-> direction or the modest one — and that turned out to be what made the real
-> answer findable.** The next section is the answer, and it came from reading
-> the code rather than from taking more samples.
+> calibrated, it is just a differently-biased claim.** The earlier draft of this
+> section said "inconclusive" for *both* findings, which undersold the one that
+> was actually solid. **The fix was not to soften or harden the section but to
+> stop letting the weaker half set the confidence of the stronger half.**
 
-**The timing question is now settled by mechanism rather than by measurement,
-and that is a much stronger result than another round of benchmarking.** There
+**And the mechanism explains the measurement, which is why this is settled
+rather than merely observed.** A null result tells you nothing about *why*.
+Reading the code supplies the why, and it predicts every number above. There
 are two prefix branches in `prepare_session_prefix`
 (`crates/onnx-genai-engine/src/engine/runtime.rs:1009`), and **only one of them
 restores anything**:
@@ -732,7 +792,7 @@ force eviction. First it turned out not to work: lowering the limit moves the
 accounting *ceiling* only, resident KV is never released, and the repository's own
 test says so in its name (`reconfigure_lower_reports_overage_without_evicting`).
 Then it turned out the control **cannot succeed**, which is a different and
-more interesting claim. There *is* a route — `POST /v1/admin/vram-limit`
+more interesting claim. There *is* a route — `POST /v1/admin/resources/vram-limit`
 (`lib.rs:124`) — and reaching for it is the natural thing to do. It fails at
 three independent points, any one of which is sufficient:
 
