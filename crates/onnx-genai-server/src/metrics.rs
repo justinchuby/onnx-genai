@@ -81,6 +81,8 @@ struct Registry {
     pending: AtomicU64,
     batch_size: AtomicU64,
     prefix_cache_hits: AtomicU64,
+    /// Prompt tokens served from a cached prefix rather than recomputed.
+    prefix_cache_hit_tokens: AtomicU64,
     prefix_cache_lookups: AtomicU64,
     rejections: AtomicU64,
     trace_ids: AtomicU64,
@@ -96,6 +98,7 @@ static REGISTRY: Registry = Registry {
     pending: AtomicU64::new(0),
     batch_size: AtomicU64::new(0),
     prefix_cache_hits: AtomicU64::new(0),
+    prefix_cache_hit_tokens: AtomicU64::new(0),
     prefix_cache_lookups: AtomicU64::new(0),
     rejections: AtomicU64::new(0),
     trace_ids: AtomicU64::new(1),
@@ -133,8 +136,16 @@ impl GenerationMetrics {
         REGISTRY
             .prefix_cache_lookups
             .fetch_add(1, Ordering::Relaxed);
-        if prefix_cache_hit_len > 0 {
-            REGISTRY.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+        let (hits, tokens) = prefix_reuse_increments(prefix_cache_hit_len);
+        if hits > 0 {
+            REGISTRY
+                .prefix_cache_hits
+                .fetch_add(hits, Ordering::Relaxed);
+        }
+        if tokens > 0 {
+            REGISTRY
+                .prefix_cache_hit_tokens
+                .fetch_add(tokens, Ordering::Relaxed);
         }
     }
 }
@@ -199,12 +210,31 @@ pub(crate) fn snapshot() -> MetricsSnapshot {
         pending_requests: REGISTRY.pending.load(Ordering::Relaxed),
         current_batch_size: REGISTRY.batch_size.load(Ordering::Relaxed),
         prefix_cache_hits: REGISTRY.prefix_cache_hits.load(Ordering::Relaxed),
+        prefix_cache_hit_tokens: REGISTRY.prefix_cache_hit_tokens.load(Ordering::Relaxed),
         prefix_cache_lookups: REGISTRY.prefix_cache_lookups.load(Ordering::Relaxed),
         rejections: REGISTRY.rejections.load(Ordering::Relaxed),
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
     }
 }
 
+/// How much a single generation adds to the prefix-reuse counters, as
+/// `(hits, tokens_saved)`.
+///
+/// Split out from [`GenerationMetrics::result`] so it can be tested directly.
+/// The counters themselves live in a process-global `static REGISTRY` with no
+/// per-test isolation, so any test asserting deltas on them races every other
+/// test in the binary that completes a generation. Testing the decision instead
+/// of the global is deterministic and actually verifies the thing that could be
+/// wrong.
+///
+/// The token count exists because the hit count cannot express value: reusing 8
+/// tokens of a 900-token prompt and reusing 890 are both exactly one hit.
+pub(crate) fn prefix_reuse_increments(prefix_cache_hit_len: usize) -> (u64, u64) {
+    if prefix_cache_hit_len == 0 {
+        return (0, 0);
+    }
+    (1, prefix_cache_hit_len as u64)
+}
 /// A ratio that only exists once its denominator does.
 ///
 /// `0/0` is not `0.0`. Emitting zero for an undefined ratio reports "we have
@@ -224,6 +254,9 @@ pub(crate) struct MetricsSnapshot {
     pub(crate) total_tokens: u64,
     pub(crate) current_batch_size: u64,
     pub(crate) prefix_cache_hits: u64,
+    /// Prompt tokens served from cache instead of recomputed. The measure of
+    /// what prefix caching actually saved, as opposed to how often it fired.
+    pub(crate) prefix_cache_hit_tokens: u64,
     pub(crate) prefix_cache_lookups: u64,
     pub(crate) rejections: u64,
 }
@@ -302,6 +335,12 @@ pub(crate) fn encode_prometheus() -> String {
         "onnx_genai_prefix_cache_hits_total",
         "Generation requests with a prefix-cache hit.",
         hits,
+    );
+    counter(
+        &mut output,
+        "onnx_genai_prefix_cache_hit_tokens_total",
+        "Prompt tokens served from a cached prefix instead of recomputed.",
+        REGISTRY.prefix_cache_hit_tokens.load(Ordering::Relaxed),
     );
     counter(
         &mut output,

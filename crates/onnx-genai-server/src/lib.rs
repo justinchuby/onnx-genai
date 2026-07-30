@@ -103,6 +103,7 @@ pub fn app(state: AppState) -> Router {
             .route("/v1/debug/config", get(routes::debug_config))
             .route("/v1/debug/sessions", get(routes::debug_sessions))
             .route("/v1/debug/kv", get(routes::debug_kv))
+            .route("/v1/debug/kv/blocks", get(routes::debug_kv_blocks))
             .route("/v1/debug/trace", get(routes::debug_trace))
             .route("/v1/debug/profile", get(routes::debug_profile))
             .route(

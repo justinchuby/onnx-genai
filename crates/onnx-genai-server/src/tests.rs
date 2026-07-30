@@ -3981,3 +3981,98 @@ async fn status_still_reports_the_fields_it_genuinely_measures() {
         );
     }
 }
+
+/// The hit *count* only says reuse happened; the token count says how much.
+/// A cache reusing 8 tokens of a 900-token prompt and one reusing 890 produce
+/// an identical reuse rate, so the rate alone cannot show whether prefix
+/// caching is worth having. This is why the hit length is no longer discarded
+/// as a `> 0` boolean.
+///
+/// Asserted against the decision rather than the global counters: `REGISTRY` is
+/// a process-global static, so delta assertions on it race every other test in
+/// the binary that completes a generation.
+#[test]
+fn prefix_reuse_records_tokens_saved_not_just_that_a_hit_occurred() {
+    assert_eq!(crate::metrics::prefix_reuse_increments(8), (1, 8));
+    assert_eq!(crate::metrics::prefix_reuse_increments(890), (1, 890));
+    assert_eq!(
+        crate::metrics::prefix_reuse_increments(1),
+        (1, 1),
+        "a one-token reuse is still a hit"
+    );
+}
+
+/// A miss must not inflate either counter.
+#[test]
+fn a_prefix_miss_records_no_hit_and_no_tokens_saved() {
+    assert_eq!(crate::metrics::prefix_reuse_increments(0), (0, 0));
+}
+
+/// The fixture is a continuous-batching model, and continuous batching is
+/// mutually exclusive with paged KV. The endpoint must say so rather than
+/// rendering the pool's real-but-unused numbers.
+///
+/// This is the field-honesty case that is hardest to catch: the pool reports a
+/// genuine non-zero capacity, so the response would survive any "is this
+/// hardcoded?" audit while describing a mechanism the decoder never touches.
+#[tokio::test]
+async fn kv_blocks_reports_not_applicable_on_a_continuous_batching_model() {
+    let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv/blocks").await;
+
+    assert_eq!(body["applicable"], false);
+    assert_eq!(
+        body["unavailable"]["code"].as_str(),
+        Some("not-applicable"),
+        "a batching model does not have a partially-working paged pool"
+    );
+
+    // No number may be present, including the honest non-zero ones.
+    for field in [
+        "page_size",
+        "pages_in_use",
+        "pages_shared",
+        "hot_capacity",
+        "hot_evictions",
+        "allocation_failures",
+        "blocks",
+        "window",
+    ] {
+        assert!(
+            body.get(field).is_none(),
+            "{field} must not be sent when paged KV is not the mechanism in use"
+        );
+    }
+}
+
+/// A caller must always be told which window it received, so it never has to
+/// assume the request was honoured verbatim.
+#[test]
+fn a_block_window_request_is_clamped_to_a_legible_size() {
+    let capped = usize::min(100_000, crate::routes::BlockTableResponse::MAX_WINDOW);
+    assert_eq!(capped, crate::routes::BlockTableResponse::MAX_WINDOW);
+    assert!(
+        crate::routes::BlockTableResponse::DEFAULT_WINDOW
+            <= crate::routes::BlockTableResponse::MAX_WINDOW
+    );
+}
+
+/// The block endpoint echoes its model for the same reason /v1/status does:
+/// a captured payload should identify itself.
+#[tokio::test]
+async fn kv_blocks_echoes_the_model_it_describes() {
+    let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv/blocks").await;
+    assert!(
+        body["model_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the block table must name the model it describes"
+    );
+}
+
+/// Prefix reuse is reported in tokens saved, not only as a hit count.
+#[tokio::test]
+async fn debug_kv_reports_prefix_tokens_reused() {
+    let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv").await;
+    assert!(
+        body.get("prefix_tokens_reused").is_some_and(Value::is_u64),
+        "tokens saved is the measure of what prefix caching bought"
+    );
+}

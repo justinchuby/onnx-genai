@@ -644,7 +644,7 @@ impl ModelRegistry {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::{Semaphore, mpsc};
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::driver::EngineDriver;
@@ -665,10 +665,7 @@ mod tests {
         Arc::new(ModelHandle {
             id: id.to_string(),
             model_dir: PathBuf::new(),
-            engine: EngineDriver {
-                commands: tx,
-                generation_capacity: Arc::new(Semaphore::new(0)),
-            },
+            engine: EngineDriver::detached_for_test(tx),
             tokenizer,
             chat_template: None,
             model_max_context: None,

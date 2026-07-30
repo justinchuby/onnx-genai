@@ -243,6 +243,7 @@ pub(crate) async fn debug_kv(
         generations_with_prefix_reuse: snapshot.prefix_cache_hits,
         generations_completed: snapshot.prefix_cache_lookups,
         generation_prefix_reuse_rate,
+        prefix_tokens_reused: snapshot.prefix_cache_hit_tokens,
         active_batch_size: snapshot.current_batch_size,
         pending_queue_depth: snapshot.pending_requests,
         available_admission_slots: handle.engine.generation_capacity.available_permits(),
@@ -563,4 +564,49 @@ fn format_resource_limit(limit: ResourceLimit) -> String {
         ResourceLimit::Fraction(fraction) => fraction.to_string(),
         ResourceLimit::Auto => "auto".to_string(),
     }
+}
+
+/// Per-page KV block table, read live during generation.
+///
+/// Served from the lock-free telemetry mirror rather than the page table
+/// itself: the page table is owned by the driver thread and mutably borrowed
+/// for the whole of a generation, and paged-KV behaviour is only worth watching
+/// *during* one.
+pub(crate) async fn debug_kv_blocks(
+    State(state): State<AppState>,
+    Query(query): Query<BlockWindowQuery>,
+) -> Result<Json<BlockTableResponse>, ApiError> {
+    let handle = state
+        .registry
+        .resolve("")
+        .map_err(map_registry_error)?
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let model_id = Some(handle.id.clone());
+    let telemetry = handle.engine.kv_telemetry();
+
+    // Enforced server-side rather than left to the client. Continuous batching
+    // and paged KV are mutually exclusive, and on the batching path every
+    // counter here is a truthful read of a pool the decoder never consults --
+    // including the non-zero capacity, which is exactly what makes it
+    // dangerous. A client cannot be expected to know that.
+    if !telemetry.is_applicable() {
+        return Ok(Json(BlockTableResponse::not_applicable(
+            model_id,
+            "this model uses continuous batching, which is mutually exclusive \
+             with paged KV; the page pool exists but the decoder never uses it",
+        )));
+    }
+
+    let count = query
+        .count
+        .unwrap_or(BlockTableResponse::DEFAULT_WINDOW)
+        .min(BlockTableResponse::MAX_WINDOW);
+    let states = telemetry.block_window(query.start, count);
+    Ok(Json(BlockTableResponse::live(
+        model_id,
+        telemetry.snapshot(),
+        query.start,
+        telemetry.mirrored_block_capacity(),
+        states,
+    )))
 }

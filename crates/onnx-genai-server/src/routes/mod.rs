@@ -8,7 +8,9 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{FromRequest, Multipart, Path as AxumPath, Request, State, rejection::JsonRejection},
+    extract::{
+        FromRequest, Multipart, Path as AxumPath, Query, Request, State, rejection::JsonRejection,
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
@@ -61,8 +63,8 @@ mod sessions;
 pub(crate) use admin::prometheus_metrics;
 pub(crate) use admin::{
     admin_list_models, admin_load_model, admin_set_vram_limit, admin_unload_model,
-    admin_warmup_model, debug_config, debug_kv, debug_profile, debug_sessions, debug_trace,
-    debug_trace_perfetto, health, models, resources, status,
+    admin_warmup_model, debug_config, debug_kv, debug_kv_blocks, debug_profile, debug_sessions,
+    debug_trace, debug_trace_perfetto, health, models, resources, status,
 };
 pub use completions::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
@@ -257,6 +259,13 @@ pub(crate) struct DebugKvResponse {
     /// when no generation has completed -- 0/0 is not a 0% reuse rate.
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_prefix_reuse_rate: Option<f64>,
+    /// Prompt tokens served from a cached prefix instead of being recomputed.
+    ///
+    /// The reuse *rate* says how often caching fired; this says what it saved.
+    /// A cache reusing 8 tokens of a 900-token prompt and one reusing 890
+    /// produce the identical rate, so the rate alone cannot show whether prefix
+    /// caching is doing anything worth having.
+    prefix_tokens_reused: u64,
     active_batch_size: u64,
     pending_queue_depth: u64,
     available_admission_slots: usize,
@@ -632,4 +641,129 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Query for [`debug_kv_blocks`]. Both bounds are optional; the window is
+/// always reported back so a client never has to assume what it received.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BlockWindowQuery {
+    #[serde(default)]
+    pub(crate) start: usize,
+    pub(crate) count: Option<usize>,
+}
+
+/// Per-page KV block table, as parallel arrays.
+///
+/// Parallel arrays rather than an array of objects because this is polled at
+/// 1 Hz and every key would otherwise be repeated once per page. The four
+/// arrays are always the same length, indexed together.
+#[derive(Debug, Serialize)]
+pub(crate) struct BlockTable {
+    page_ids: Vec<u32>,
+    ref_counts: Vec<u32>,
+    filled_slots: Vec<usize>,
+    /// `0` = hot tier, `1` = cold. A page demoted to cold keeps its references,
+    /// so it is still in use -- tier is not a proxy for free.
+    tiers: Vec<u8>,
+}
+
+/// The window a [`BlockTableResponse`] actually covers.
+#[derive(Debug, Serialize)]
+pub(crate) struct BlockWindow {
+    start: usize,
+    count: usize,
+    /// Pages the mirror can describe, so a client knows when it has them all.
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BlockTableResponse {
+    /// Echoed so a captured response identifies the model it describes.
+    model_id: Option<String>,
+    /// **Check this before rendering.** False means paged KV is not the
+    /// mechanism this model uses, and every number below would describe a pool
+    /// the decoder never consults.
+    applicable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<FieldUnavailable>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pages_in_use: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pages_shared: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hot_capacity: Option<usize>,
+    /// Cumulative pressure signals. `hot_evictions` is the real "pool is full"
+    /// indicator; `allocation_failures` stays zero because the pool grows by
+    /// demoting to the cold tier rather than failing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hot_evictions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocation_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<BlockWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocks: Option<BlockTable>,
+}
+
+impl BlockTableResponse {
+    /// Default page count, chosen so a response stays legible as a block table
+    /// rather than becoming a texture.
+    pub(crate) const DEFAULT_WINDOW: usize = 256;
+    pub(crate) const MAX_WINDOW: usize = 1024;
+
+    pub(crate) fn not_applicable(model_id: Option<String>, detail: &'static str) -> Self {
+        Self {
+            model_id,
+            applicable: false,
+            unavailable: Some(FieldUnavailable::not_applicable(detail)),
+            page_size: None,
+            pages_in_use: None,
+            pages_shared: None,
+            hot_capacity: None,
+            hot_evictions: None,
+            allocation_failures: None,
+            window: None,
+            blocks: None,
+        }
+    }
+
+    pub(crate) fn live(
+        model_id: Option<String>,
+        snapshot: onnx_genai_engine::KvTelemetrySnapshot,
+        start: usize,
+        total: usize,
+        states: Vec<onnx_genai_engine::BlockState>,
+    ) -> Self {
+        let mut blocks = BlockTable {
+            page_ids: Vec::with_capacity(states.len()),
+            ref_counts: Vec::with_capacity(states.len()),
+            filled_slots: Vec::with_capacity(states.len()),
+            tiers: Vec::with_capacity(states.len()),
+        };
+        for state in &states {
+            blocks.page_ids.push(state.page_id);
+            blocks.ref_counts.push(state.ref_count);
+            blocks.filled_slots.push(state.filled_slots);
+            blocks.tiers.push(state.tier);
+        }
+        Self {
+            model_id,
+            applicable: true,
+            unavailable: None,
+            page_size: Some(snapshot.page_size),
+            pages_in_use: Some(snapshot.pages_in_use),
+            pages_shared: Some(snapshot.pages_shared),
+            hot_capacity: Some(snapshot.hot_capacity),
+            hot_evictions: Some(snapshot.hot_evictions),
+            allocation_failures: Some(snapshot.allocation_failures),
+            window: Some(BlockWindow {
+                start,
+                count: states.len(),
+                total,
+            }),
+            blocks: Some(blocks),
+        }
+    }
 }

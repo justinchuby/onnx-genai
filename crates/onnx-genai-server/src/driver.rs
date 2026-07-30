@@ -8,7 +8,7 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
-    GovernorSnapshot, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
+    GovernorSnapshot, KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -22,6 +22,9 @@ const DRIVER_OUTPUT_BUFFER: usize = 16;
 pub(crate) struct EngineDriver {
     pub(crate) commands: mpsc::Sender<DriverCommand>,
     pub(crate) generation_capacity: Arc<Semaphore>,
+    /// Shared with the driver thread's engine. Read directly by HTTP handlers,
+    /// never through the command channel.
+    kv_telemetry: Arc<KvTelemetry>,
 }
 
 pub(crate) enum DriverCommand {
@@ -114,27 +117,54 @@ impl EngineDriver {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
+        let kv_telemetry = Arc::new(KvTelemetry::default());
+        let driver_telemetry = Arc::clone(&kv_telemetry);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, max_batch))
+            .spawn(move || run_engine_driver(owner, rx, max_batch, driver_telemetry))
             .expect("failed to spawn onnx-genai engine driver");
         Self {
             commands,
             generation_capacity,
+            kv_telemetry,
         }
+    }
+
+    /// An [`EngineDriver`] with no driver thread behind it, for tests that
+    /// need a `ModelHandle` without loading a model. Its telemetry reports
+    /// not-applicable, because there is no pool.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(commands: mpsc::Sender<DriverCommand>) -> Self {
+        Self {
+            commands,
+            generation_capacity: Arc::new(Semaphore::new(0)),
+            kv_telemetry: Arc::new(KvTelemetry::default()),
+        }
+    }
+
+    /// Live paged-KV counters, readable while a generation is running.
+    ///
+    /// Deliberately not routed through [`DriverCommand`]: both driver loops run
+    /// generation inline, so a command cannot be serviced mid-generation, and
+    /// paged-KV behaviour is only interesting *during* one.
+    pub(crate) fn kv_telemetry(&self) -> &Arc<KvTelemetry> {
+        &self.kv_telemetry
     }
 
     pub(crate) fn start_pipeline(engine: PipelineEngine, max_queue_depth: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
+        let kv_telemetry = Arc::new(KvTelemetry::default());
+        let driver_telemetry = Arc::clone(&kv_telemetry);
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, 1))
+            .spawn(move || run_engine_driver(owner, rx, 1, driver_telemetry))
             .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
             generation_capacity,
+            kv_telemetry,
         }
     }
 
@@ -404,15 +434,35 @@ impl EngineDriver {
     }
 }
 
-fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
+fn run_engine_driver(
+    owner: EngineOwner,
+    rx: mpsc::Receiver<DriverCommand>,
+    max_batch: usize,
+    kv_telemetry: Arc<KvTelemetry>,
+) {
     let mut engine = match owner.0 {
         EngineBackend::Single(engine) => *engine,
         EngineBackend::Pipeline(mut pipeline) => {
+            // A pipeline decoder pages only when its KV can be paged; the
+            // accessor reports which, so we never claim applicability we
+            // haven't checked.
+            let paged = pipeline.attach_kv_telemetry(Arc::clone(&kv_telemetry));
+            kv_telemetry.set_applicable(paged);
             run_pipeline_driver(&mut pipeline, rx);
             return;
         }
     };
     let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+
+    // Continuous batching and paged KV are mutually exclusive. On the batching
+    // path the paged pool still exists and still reports a real capacity -- it
+    // is simply never used, so every reading from it would describe a mechanism
+    // that is not in play. Attach either way so the numbers stay truthful, but
+    // mark applicability so a client renders "not applicable" instead of an
+    // idle pool that looks merely quiet.
+    engine.attach_kv_telemetry(Arc::clone(&kv_telemetry));
+    kv_telemetry.set_applicable(!continuous_batch_supported);
+
     if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");
         run_static_engine_driver(&mut engine, rx, max_batch);

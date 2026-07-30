@@ -36,7 +36,7 @@
 //! hot path to make a dashboard's two numbers agree would be a bad trade.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Live, lock-free view of a page pool.
 ///
@@ -65,6 +65,11 @@ pub struct KvTelemetry {
     /// Sized once, on attach, because the pool's capacity is not known when the
     /// telemetry is constructed.
     blocks: OnceLock<Box<[AtomicU64]>>,
+    /// Whether the paged pool this mirrors is the one the decoder actually
+    /// uses. Continuous batching and paged KV are mutually exclusive, so on a
+    /// batching model every counter here is a truthful reading of a pool that
+    /// is never consulted.
+    applicable: AtomicBool,
 }
 
 /// Packs a page's mutable state into one atomic word so a reader gets a
@@ -121,6 +126,27 @@ impl KvTelemetry {
     pub(crate) fn set_geometry(&self, hot_capacity: usize, page_size: usize) {
         self.hot_capacity.store(hot_capacity, Ordering::Relaxed);
         self.page_size.store(page_size, Ordering::Relaxed);
+    }
+
+    /// Declares whether this pool is the one the decoder actually uses.
+    ///
+    /// Must be set by whoever knows the decode path. Defaults to `false` so a
+    /// caller that forgets reports "not applicable" rather than presenting
+    /// readings from an idle pool as live measurements.
+    pub fn set_applicable(&self, applicable: bool) {
+        self.applicable.store(applicable, Ordering::Relaxed);
+    }
+
+    /// Whether these counters describe a mechanism that is actually in play.
+    ///
+    /// **Check this before rendering anything.** The counters are all honest
+    /// reads of a real structure even when this is `false`, which is exactly
+    /// what makes them dangerous: `hot_capacity` is *non-zero* on a batching
+    /// model, so it survives any "is this hardcoded?" audit while describing a
+    /// pool the decoder never touches. A non-zero value is not evidence that a
+    /// mechanism is in use.
+    pub fn is_applicable(&self) -> bool {
+        self.applicable.load(Ordering::Relaxed)
     }
 
     /// Sizes the per-page mirror. Called once, on attach.
