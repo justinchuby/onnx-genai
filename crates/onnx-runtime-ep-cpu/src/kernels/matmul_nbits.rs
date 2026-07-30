@@ -187,8 +187,9 @@ fn mlas_no_shard() -> bool {
 }
 
 /// Override for the MLAS QNBit MatMulNBits route. `0`/`off` disables all MLAS
-/// QNBit calls; `1`/`on` also opts non-Apple ARM64 decode into the KleidiAI QNBit
-/// path for A/B perf probes. Unset keeps the established defaults.
+/// QNBit calls; unset or `1`/`on` enables it. On non-Apple ARM64 this makes the
+/// KleidiAI-backed MLAS QNBit shard path the default for Qwen-style bits4/bits8
+/// block-128 decode; set `0` to A/B against the native KAI fallback.
 #[cfg(feature = "mlas")]
 fn mlas_qnbit_env_override() -> Option<bool> {
     std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT")
@@ -206,7 +207,7 @@ fn mlas_qnbit_enabled() -> bool {
 
 #[cfg(feature = "mlas")]
 fn arm64_mlas_qnbit_decode_opted_in() -> bool {
-    mlas_qnbit_env_override() == Some(true)
+    mlas_qnbit_env_override().unwrap_or(true)
 }
 
 #[cfg(feature = "mlas")]
@@ -1302,17 +1303,19 @@ impl MatMulNBitsKernel {
         // MLAS weights and cached. This lets each M=1 decode projection fan its
         // output columns across the *persistent SPMD decode workers* (each worker
         // runs its shard's GEMV serially), instead of one `multithread=true` call
-        // that forks MLAS across the global Rayon pool -- which, under the
-        // default persistent decode pool, oversubscribes the machine against the
-        // pool's resident spinning workers and collapses f16 decode (measured
-        // 6->28 tok/s on Qwen2.5-0.5B, Xeon 8480C). Non-constant weights keep the
-        // single owned `multithread=true` path (they are never the decode hot
-        // path and re-sharding per call is not worth it). The `NO_SHARD` escape
-        // hatch forces that single full-width call too: MLAS's SIMD column-tiling
-        // is not bit-stable across N-partition boundaries (it can differ by ~1
-        // ULP), so this hatch restores byte-for-byte the pre-sharding output for
-        // A/B parity checks or a host where the reordering ever matters.
-        if can_prepack && !mlas_no_shard() && !prefer_arm64_mlas_decode {
+        // that asks MLAS to fork a Rayon parallel-for for every projection.
+        // That removes both known decode failure modes: x86 f16 decode's
+        // historical oversubscription against resident SPMD workers, and ARM64
+        // Qwen3's per-projection Rayon/MLAS dispatch overhead (197 QNBit nodes
+        // per token) while still executing the same KleidiAI SQNBit ukernel.
+        // Non-constant weights keep the single owned `multithread=true` path
+        // (they are never the decode hot path and re-sharding per call is not
+        // worth it). The `NO_SHARD` escape hatch forces that single full-width
+        // call too: MLAS's SIMD column-tiling is not bit-stable across
+        // N-partition boundaries (it can differ by ~1 ULP), so this hatch
+        // restores byte-for-byte the pre-sharding output for A/B parity checks
+        // or a host where the reordering ever matters.
+        if can_prepack && !mlas_no_shard() {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
@@ -2935,10 +2938,9 @@ pub fn with_decode_pool_scope<R: Send>(
     model_uses_spmd_pool: bool,
     f: impl FnOnce() -> R + Send,
 ) -> R {
-    // The persistent SPMD pool benefits both quantized and dense-f32 models when
-    // the NEON GEMV kernel dispatches to it (aarch64 without MLAS). With MLAS the
-    // SPMD workers contend with the MLAS GEMM's own Rayon workers, so the pool
-    // is skipped. Without MLAS, the pool is built and used by default.
+    // The persistent SPMD pool benefits quantized models whose decode kernels
+    // dispatch output shards through it, including the MLAS QNBit shard route.
+    // Keep the existing default/forced SPMD policy for all other callers.
     #[cfg(not(feature = "mlas"))]
     let spmd_pool_eligible = model_uses_spmd_pool
         || crate::decode_spmd::is_forced()
@@ -7185,66 +7187,77 @@ mod tests {
             .collect();
         let _guard = backend_env_lock().lock().unwrap();
         let previous = std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var in tests.
-        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", "1") };
-        for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
-            let weights: Vec<f32> = (0..n * k)
-                .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
-                .collect();
-            let (packed, scales, zps, _) = if bits == 4 {
-                quantize(&weights, n, k, block_size, true)
-            } else {
-                quantize_8bit(&weights, n, k, block_size, true)
-            };
-            let zps = zps.expect("asymmetric quantization must emit qzeros");
-            if mlas_sys::SQNBitPackedB::new(
-                n,
-                k,
-                bits,
-                block_size,
-                mlas_sys::SQNBitComputeType::Int8,
-                &packed,
-                &scales,
-                Some(&zps),
-            )
-            .is_none()
-            {
-                eprintln!("MLAS QNBit bits={bits} CompInt8 unavailable; skipping reachability");
-                continue;
+        for (label, override_value) in [("default", None), ("explicit", Some("1"))] {
+            // SAFETY: the backend env lock serializes readers/writers of this var in tests.
+            unsafe {
+                match override_value {
+                    Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                    None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+                }
             }
-
-            let mut kernel = accuracy4_kernel(k, n, block_size);
-            kernel.bits = bits;
-            kernel.set_constant_inputs(&[false, true, true, true]);
-            let blocks = k.div_ceil(block_size);
-            let blob = block_size * bits / 8;
-            let zp_blob = (blocks * bits).div_ceil(8);
-            let a = Owned::f32(&[1, k], &activations);
-            let b = Owned::u8(&[n, blocks, blob], &packed);
-            let scales = Owned::f32(&[n, blocks], &scales);
-            let zero_points = Owned::u8(&[n, zp_blob], &zps);
-            let mut y = Owned::zeros_f32(&[1, n]);
-
-            let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
-            kernel
-                .execute(
-                    &[a.view(), b.view(), scales.view(), zero_points.view()],
-                    &mut [y.view_mut()],
+            for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
+                let weights: Vec<f32> = (0..n * k)
+                    .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+                    .collect();
+                let (packed, scales, zps, _) = if bits == 4 {
+                    quantize(&weights, n, k, block_size, true)
+                } else {
+                    quantize_8bit(&weights, n, k, block_size, true)
+                };
+                let zps = zps.expect("asymmetric quantization must emit qzeros");
+                if mlas_sys::SQNBitPackedB::new(
+                    n,
+                    k,
+                    bits,
+                    block_size,
+                    mlas_sys::SQNBitComputeType::Int8,
+                    &packed,
+                    &scales,
+                    Some(&zps),
                 )
-                .unwrap();
-            assert!(
-                MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before,
-                "bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
-            );
-            assert!(
-                kernel.mlas_packed.get().and_then(Option::as_ref).is_some(),
-                "bits={bits} block{block_size} must prepack one full-width MLAS QNBit weight",
-            );
-            assert!(
-                kernel.packed_kai_qsi4_weight.get().is_none()
-                    && kernel.packed_kai_qsi8_weight.get().is_none(),
-                "bits={bits} block{block_size} must prefer MLAS over the native KAI fallback",
-            );
+                .is_none()
+                {
+                    eprintln!("MLAS QNBit bits={bits} CompInt8 unavailable; skipping reachability");
+                    continue;
+                }
+
+                let mut kernel = accuracy4_kernel(k, n, block_size);
+                kernel.bits = bits;
+                kernel.set_constant_inputs(&[false, true, true, true]);
+                let blocks = k.div_ceil(block_size);
+                let blob = block_size * bits / 8;
+                let zp_blob = (blocks * bits).div_ceil(8);
+                let a = Owned::f32(&[1, k], &activations);
+                let b = Owned::u8(&[n, blocks, blob], &packed);
+                let scales = Owned::f32(&[n, blocks], &scales);
+                let zero_points = Owned::u8(&[n, zp_blob], &zps);
+                let mut y = Owned::zeros_f32(&[1, n]);
+
+                let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+                kernel
+                    .execute(
+                        &[a.view(), b.view(), scales.view(), zero_points.view()],
+                        &mut [y.view_mut()],
+                    )
+                    .unwrap();
+                assert!(
+                    MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before,
+                    "{label}: bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
+                );
+                assert!(
+                    kernel.mlas_shards.get().and_then(Option::as_ref).is_some(),
+                    "{label}: bits={bits} block{block_size} must prepack MLAS QNBit shards for SPMD decode",
+                );
+                assert!(
+                    kernel.mlas_packed.get().is_none(),
+                    "{label}: bits={bits} block{block_size} decode must avoid the full-width Rayon MLAS path",
+                );
+                assert!(
+                    kernel.packed_kai_qsi4_weight.get().is_none()
+                        && kernel.packed_kai_qsi8_weight.get().is_none(),
+                    "{label}: bits={bits} block{block_size} must prefer MLAS over the native KAI fallback",
+                );
+            }
         }
         // SAFETY: still holding the backend env lock; restore prior value.
         unsafe {
