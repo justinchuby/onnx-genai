@@ -12,6 +12,21 @@
   copied into the shipping page as data — copy the CSS patterns, not the
   numbers.
 
+  ⚠ THIS FILE IS SERVED. It returns 200 at /demo/design/skeleton.html on every
+  demo origin. Its sibling design documents (demo-ux.md, README.md) return 404,
+  so this is the ONLY design artifact a visitor can read, and every numeral and
+  every tooltip in it is published rather than internal. Two consequences that
+  are easy to forget while editing:
+
+    1. A disclaimer in a banner does not travel with a figure. Screenshots get
+       cropped and tiles get copied. Placeholder numerals are therefore marked
+       AT THE GLYPH with class="ph", not by this comment and not by the <p
+       class="note"> below.
+    2. A tooltip explaining WHY a value is unavailable is a claim about the
+       state of the codebase, and nothing ages it. Prefer reasons transported
+       verbatim from the server's own payload over reasons written here, so
+       there is one copy to rot instead of two.
+
   The shipping page is ../index.html (demo dev) + ../dashboard/*.js (dashboard
   dev). Full specification: designer artifact `demo-ux.md`.
 
@@ -284,6 +299,25 @@
     font-size: var(--og-type-sm); margin: var(--og-space-3) 0 var(--og-space-4);
   }
   h3.sec { margin: var(--og-space-8) 0 var(--og-space-4); font-size: var(--og-type-lg); font-weight: var(--og-weight-medium); }
+
+  /* ── PLACEHOLDER NUMERALS ───────────────────────────────────────────────
+     This file is SERVED (200 on every demo origin), so its numerals reach a
+     visitor, and the banner at the top of <main> does not travel with them.
+     A disclaimer ten lines above a number is absent from a cropped
+     screenshot, absent from a copied tile, and absent from the one glance
+     that reads the figure. THE MARK MUST BE ON THE GLYPH, NOT IN A
+     PARAGRAPH ABOUT THE GLYPH.
+
+     Deliberately does NOT change font-size, weight, or alignment: the whole
+     purpose of a rendered mockup is to demonstrate type scale and tabular
+     alignment, so a placeholder marker that reflows the tile destroys the
+     artifact it is annotating. Underline + reduced opacity only. */
+  .ph {
+    text-decoration: underline dotted var(--og-fg-subtle);
+    text-underline-offset: 0.18em;
+    opacity: 0.75;
+    cursor: help;
+  }
 </style>
 </head>
 <body>
@@ -312,34 +346,54 @@
   <h3 class="sec">Hero strip <span class="caps">— auto-fit, so removing a tile leaves no hole</span></h3>
   <section class="hero">
     <div class="tile">
-      <div class="tile__num">98.7<span class="tile__unit">tok/s</span></div>
-      <div class="tile__label caps">aggregate output <abbr class="value__src" title="Derived: sum of SSE token deltas over a 2 s sliding window">ᴰ</abbr></div>
+      <div class="tile__num"><span class="ph" title="PLACEHOLDER. Illustrates type scale and unit placement only. This figure was never measured on any machine. Do not copy it into the shipping page and do not quote it anywhere.">98.7</span><span class="tile__unit">tok/s</span></div>
+      <div class="tile__label caps">aggregate output <abbr class="value__src" title="Treatment demo: this is where a DERIVED badge sits. The badge describes how a real value WOULD be obtained (sum of SSE token deltas over a 2 s sliding window); it does not certify the placeholder numeral beside it.">ᴰ</abbr></div>
     </div>
     <div class="tile">
-      <div class="tile__num value" data-state="unavailable">
-        <span class="value__num" title="Prefix caching lives in the paged KV manager, which the continuous-batch path bypasses. prefix_cache_hit_len is a hardcoded 0 at batched.rs:262. This is a fabricated zero, not a measurement. Run --model models/qwen2.5-0.5b to see real prefix caching.">—</span><span class="tile__unit">%</span>
+      <div class="tile__num value" data-state="ok">
+        <span class="value__num ph" title="PLACEHOLDER NUMERAL, REAL TREATMENT. This tile demonstrates a MEASURED ZERO: the server was asked, it answered, and the answer was zero. queue_depth is genuinely 0 on the live /v1/status payload. A measured zero is a fact and renders at full contrast like any other fact.">0</span><span class="tile__unit">queued</span>
       </div>
-      <div class="tile__label caps">prefix hit rate <span style="color:var(--og-fg-subtle)">· static profile</span></div>
+      <div class="tile__label caps">queue depth <abbr class="value__src" title="Server counter · queue_depth">ˢ</abbr></div>
     </div>
     <div class="tile">
       <div class="tile__num value" data-state="unavailable">
-        <span class="value__num" title="KV page statistics are computed by the engine but not yet exposed over HTTP. Engine::page_usage() exists; the server does not call it.">—</span><span class="tile__unit">%</span>
+        <span class="value__num" title="KV page statistics are not carried by this endpoint. Reason transported verbatim from the server's own /v1/status payload: 'paged-KV telemetry is served by the KV block-table endpoint; this node-status contract is model-agnostic and carries no engine reference.' This is a deliberate contract boundary, not an unfinished feature.">—</span><span class="tile__unit">%</span>
       </div>
       <div class="tile__label caps">KV block utilization</div>
     </div>
     <div class="tile">
-      <div class="tile__num">6<span class="tile__unit">/ 2</span></div>
+      <div class="tile__num"><span class="ph" title="PLACEHOLDER. Illustrates type scale and unit placement only. This figure was never measured on any machine. Do not copy it into the shipping page and do not quote it anywhere.">6</span><span class="tile__unit">/ 2</span></div>
       <div class="tile__label caps">running / waiting <abbr class="value__src" title="Server counters · batch_size_current, requests_waiting">ˢ</abbr></div>
     </div>
   </section>
 
   <p class="note">
-    Tiles two and three are the entire thesis of this design, side by side.
-    <strong>0.0 %</strong> is a <em>real measurement</em> — the prefix cache genuinely
-    did not hit, and we say so at full contrast. <strong>—</strong> is an
-    <em>absence</em> — the server cannot measure KV utilization yet, and rendering
-    the documented zero it returns would be a silent lie. Same glyph shape, opposite
-    meanings; they must never be confused.
+    The <strong>queue depth</strong> and <strong>KV block utilization</strong> tiles
+    above are the entire thesis of this design, side by side. (Named by label, never
+    by position: this caption previously said <em>"tiles two and three"</em> and went
+    on pointing confidently at whichever tiles happened to occupy those slots after
+    one of them was replaced.)
+    <strong>0</strong> is a <em>real measurement</em> — the server was asked, it
+    answered, and the answer was zero. We say so at full contrast, because a measured
+    zero is a fact. <strong>—</strong> is an <em>absence</em> — this endpoint does not
+    carry KV utilization by contract, and rendering the documented zero it returns
+    would be a silent lie. Same glyph shape, opposite meanings; they must never be
+    confused.
+  </p>
+
+  <p class="note">
+    <strong>Why this caption is now shorter than the page it describes.</strong>
+    Until this commit the paragraph above described a <em>prefix hit rate</em> tile
+    as <em>"a real measurement — the prefix cache genuinely did not hit"</em>, while
+    the tile itself carried a tooltip reading <em>"this is a fabricated zero, not a
+    measurement"</em>. Both statements were served to visitors, ten lines apart, for
+    the life of the file. The tile had been correctly flipped from a confident
+    <code>0.0 %</code> to an unavailable <code>—</code>; the caption that pointed at
+    it was not flipped with it. <strong>The demonstration and the doctrine drifted
+    apart, and the doctrine was the thing that kept insisting it was right.</strong>
+    The tile is gone (the field was cut at the registry), the contrast is restored
+    with a metric whose zero is genuinely measured, and the caption now names its
+    subjects rather than counting to them.
   </p>
 
   <!-- ── THE FOUR STATES ──────────────────────────────────────────────── -->
