@@ -1030,7 +1030,7 @@ three independent points, any one of which is sufficient:
 3. That flag is **unsettable**. `EngineConfig::from_yaml` is the only code that
    can enable it, and **it has no callers outside its own unit tests**; the
    server assembles its config from two fields plus defaults
-   (`cli.rs:127-133`). No CLI flag, config file, or environment variable
+   (`crates/onnx-genai-server/src/cli.rs`, `let server_config = ServerConfig {`). No CLI flag, config file, or environment variable
    reaches it. (`--models-config` looks like it should, but carries only a list
    of models.)
 
