@@ -34,9 +34,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, relative } from 'node:path';
 import { assertShippingTree } from './shipping-tree.mjs';
 
 // Provenance before content. Every path below is resolved from import.meta.url,
@@ -46,9 +46,21 @@ assertShippingTree();
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(demoDir, '..', '..');
-const read = (path) => readFileSync(path, 'utf8');
 
-const SERVER_CLI = join(repoRoot, 'crates', 'onnx-genai-server', 'src', 'cli.rs');
+// READ WHAT SHIPS, NOT WHAT IS ON MY DESK.
+//
+// This guard used to readFileSync the working tree. A documented flag repaired
+// only on disk scored GREEN and then evaporated on the next checkout, and the
+// two readings are byte-identical whenever the tree is clean -- which is
+// exactly when you are most likely to trust the result. A reviewer clones HEAD.
+// So does the demo. Nobody clones my working tree.
+const read = (relPath) =>
+  execFileSync('git', ['show', `HEAD:${relPath}`], {
+    cwd: repoRoot,
+    maxBuffer: 64 * 1024 * 1024,
+  }).toString();
+
+const SERVER_CLI = 'crates/onnx-genai-server/src/cli.rs';
 
 /** snake_case field name -> the kebab-case flag clap derives from it. */
 const toKebab = (field) => field.replace(/_/g, '-');
@@ -127,50 +139,112 @@ export function serverFlagsUsedIn(text) {
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    const invokes =
-      /(^|[\s`"'(=])(?:[\w./${}-]*\/)?onnx-genai-server(\s|$|\\)/.test(line) &&
-      !/^\s*(?:#|\/\/|\||>)/.test(line) &&
-      !/\b(?:cargo|rustup|-p)\b/.test(line);
-    if (!invokes) continue;
 
-    let block = line;
+    const names = /(^|[\s`"'(=])(?:[\w./${}-]*\/)?onnx-genai-server(\s|$|\\)/.test(line);
+    const commented = /^\s*(?:#|\/\/|\||>)/.test(line);
+    if (!names || commented) continue;
+
+    // `cargo run -p onnx-genai-server -- --model x` IS an invocation, and the
+    // previous blanket `cargo`/`-p` exclusion silently dropped every one of
+    // them. That exclusion was added to stop `cargo build --release -p
+    // onnx-genai-server` attributing `--release` to the server -- a real false
+    // positive -- but it over-corrected into a false NEGATIVE across the
+    // benchmark runbooks, where `--model-id` and `--addr` sit unaudited after a
+    // passthrough separator. Widening the corpus is what exposed this: the
+    // files became visible and the matcher still declined to look at them.
+    //
+    // The precise rule, which needs no exclusion at all: in a cargo passthrough
+    // EVERYTHING BEFORE THE BARE `--` IS CARGO'S AND EVERYTHING AFTER IT IS THE
+    // SERVER'S. That is the shell's own rule, so it cannot drift from reality.
+    const cargoPassthrough =
+      /\bcargo\s+run\b/.test(line) && /-p\s+onnx-genai-server\b/.test(line);
+    const namesOnly =
+      (/\b(?:cargo|rustup)\b/.test(line) || /-p\s+onnx-genai-server\b/.test(line)) &&
+      !cargoPassthrough;
+    if (namesOnly) continue;
+
+    const block = [{ n: i + 1, text: line }];
     let k = i;
     while (/\\\s*$/.test(lines[k]) && k + 1 < lines.length) {
       k += 1;
-      block += `\n${lines[k]}`;
+      block.push({ n: k + 1, text: lines[k] });
     }
     i = k;
 
-    for (const m of block.matchAll(/(?<![\w-])--([a-z][a-z0-9-]*)/g)) {
-      used.push({ flag: `--${m[1]}`, line: i + 1, command: block.trim() });
+    const command = block.map((b) => b.text).join('\n').trim();
+
+    // In a passthrough we are not scanning until we have crossed the separator.
+    let scanning = !cargoPassthrough;
+    for (const { n, text: lineText } of block) {
+      let segment = lineText;
+      if (!scanning) {
+        const sep = lineText.match(/(^|\s)--(?=\s|\\\s*$|$)/);
+        if (!sep) continue;
+        scanning = true;
+        segment = lineText.slice(sep.index + sep[0].length);
+      }
+      for (const m of segment.matchAll(/(?<![\w-])--([a-z][a-z0-9-]*)/g)) {
+        used.push({ flag: `--${m[1]}`, line: n, command });
+      }
     }
   }
 
   return used;
 }
 
-/** Demo-facing surfaces that may hand a visitor a server command. */
+/**
+ * Every tracked surface that could hand a visitor a server command.
+ *
+ * THIS USED TO BE A HARDCODED LIST OF SIX PATHS. That is the same defect this
+ * repository's test runner warns about in its own header -- A HARDCODED LIST
+ * STOPS COVERING WHATEVER WAS ADDED LAST, WHICH IS ALWAYS THE THING MOST LIKELY
+ * TO BE WRONG -- and I shipped it here while writing that warning there. The
+ * repository tracks 581 .md/.sh files; this guard was reading six of them, so
+ * it covered roughly 1% of the surface and reported green over the rest.
+ *
+ * DISCOVERY IS SAFE HERE BECAUSE THE MATCHER IS PRECISE, AND THAT IS THE WHOLE
+ * DESIGN: `serverFlagsUsedIn` only counts flags inside a line that actually
+ * INVOKES `onnx-genai-server`, so widening the corpus cannot produce false
+ * positives from prose, from other binaries' flags, from CSS custom properties
+ * or from BEM modifiers. A precise predicate is what buys you a broad corpus.
+ *
+ * The `git grep -l` prefilter is EXACT rather than a heuristic: an invocation
+ * requires the literal `onnx-genai-server` on the line, so a file that does not
+ * contain that string cannot contain an invocation. It is an optimisation that
+ * cannot change the answer.
+ */
 function surfaceFiles() {
-  const files = [];
-  const push = (p) => existsSync(p) && files.push(p);
-
-  push(join(demoDir, 'README.md'));
-  push(join(demoDir, 'QA-PLAN.md'));
-  push(join(demoDir, 'CONTRACT.md'));
-  push(join(demoDir, 'run-demo.sh'));
-  push(join(demoDir, 'index.html'));
-  push(join(repoRoot, 'README.md'));
-
-  for (const dir of ['ui', 'dashboard']) {
-    const full = join(demoDir, dir);
-    if (!existsSync(full)) continue;
-    for (const entry of readdirSync(full)) {
-      if (entry.endsWith('.js') && !entry.endsWith('.test.js')) push(join(full, entry));
-    }
+  let listed = '';
+  try {
+    listed = execFileSync(
+      'git',
+      ['grep', '-l', '--fixed-strings', 'onnx-genai-server', 'HEAD', '--', '.'],
+      { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024 },
+    ).toString();
+  } catch {
+    listed = '';
   }
 
-  return files;
+  return listed
+    .split('\n')
+    .filter(Boolean)
+    // `git grep HEAD` prefixes every path with `HEAD:`.
+    .map((l) => l.replace(/^HEAD:/, ''))
+    .filter((p) => /\.(md|sh)$/.test(p) || (/\.js$/.test(p) && !/\.test\.js$/.test(p)))
+    // NAMED REGION, NOT A VOCABULARY. `.squad/` is this crew's internal
+    // coordination state -- charters, decision archives, agent histories. No
+    // visitor is ever shown one, so a stale command in an agent's notebook is
+    // not a defect in the demo. Auditing it would let any agent's append-only
+    // history redden the release branch, and a guard that random notes can
+    // redden is a guard somebody eventually deletes.
+    //
+    // THIS IS A SCOPE LIMIT AND IT IS PRINTED ON PASSING RUNS BELOW, because an
+    // OK that hides what it declined to look at does the lying for you.
+    .filter((p) => !p.startsWith('.squad/'));
 }
+
+/** Paths deliberately outside the audit, reported alongside every result. */
+const EXCLUDED_REGION = '.squad/ (internal crew state, never shown to a visitor)';
 
 test('the server CLI parses into a non-empty, plausible flag set', () => {
   const flags = parseServerFlags(read(SERVER_CLI));
@@ -198,6 +272,19 @@ test('the invocation matcher ignores commands that merely NAME the server', () =
     ['--model', '--addr'],
   );
 
+  // A cargo passthrough is an invocation, and the separator is the whole rule.
+  // BOTH directions are pinned here because each one alone is satisfiable by a
+  // broken matcher: dropping the block entirely passes the first, and scanning
+  // the whole line passes the second.
+  const passthrough =
+    'ONNX_GENAI_EP=cpu cargo run --release --features cuda -p onnx-genai-server -- \\\n' +
+    '  --model models/q --model-id q --addr 127.0.0.1:8080';
+  const seen = serverFlagsUsedIn(passthrough).map((u) => u.flag);
+  assert.deepEqual(seen, ['--model', '--model-id', '--addr']);
+  for (const cargosOwn of ['--release', '--features']) {
+    assert.ok(!seen.includes(cargosOwn), `${cargosOwn} belongs to cargo, not to the server`);
+  }
+
   // Line continuations must be followed, or a multi-line README command would
   // be audited only as far as its first line.
   const continued = './target/release/onnx-genai-server \\\n  --model ./m \\\n  --max-batch 4';
@@ -216,12 +303,12 @@ test('every flag in a documented server command exists in cli.rs', () => {
       const known = flags.get(use.flag);
       if (!known) {
         problems.push(
-          `${file.replace(`${repoRoot}/`, '')}:${use.line} uses ${use.flag}, ` +
+          `${file}:${use.line} uses ${use.flag}, ` +
             `which is not an argument of onnx-genai-server`,
         );
       } else if (known.feature) {
         problems.push(
-          `${file.replace(`${repoRoot}/`, '')}:${use.line} uses ${use.flag}, which only ` +
+          `${file}:${use.line} uses ${use.flag}, which only ` +
             `exists under the non-default feature "${known.feature}"`,
         );
       }
@@ -298,6 +385,31 @@ test('a documented command is audited at all — the audit has real subject matt
   // Without this, deleting every command from the README would make the test
   // above pass perfectly. An audit that can be satisfied by having nothing to
   // audit is not an audit.
-  const total = surfaceFiles().reduce((n, f) => n + serverFlagsUsedIn(read(f)).length, 0);
+  //
+  // THE COUNT ALONE IS NOT ENOUGH NOW THAT THE CORPUS IS DISCOVERED. A failing
+  // `git grep` is caught here and returns [], and an empty corpus is
+  // byte-indistinguishable from a repository with no invocations in it -- the
+  // vacuous green this crew has hit repeatedly tonight. So assert the corpus by
+  // NAMED MEMBER: these two files are the demo's front door and its launcher,
+  // and if discovery ever stops finding them it is discovery that broke.
+  const files = surfaceFiles();
+  for (const required of [
+    'examples/serving-dashboard/README.md',
+    'examples/serving-dashboard/run-demo.sh',
+  ]) {
+    assert.ok(
+      files.includes(required),
+      `corpus discovery did not find ${required}; the prefilter or git grep has broken`,
+    );
+  }
+
+  const total = files.reduce((n, f) => n + serverFlagsUsedIn(read(f)).length, 0);
   assert.ok(total > 0, 'found no server invocations in any demo surface to audit');
+
+  // State the population, on green as well as on red. Every green on this board
+  // is a claim about a population and almost none of them name it.
+  console.log(
+    `      scope: ${files.length} tracked surfaces at HEAD, ${total} server ` +
+      `invocations audited; EXCLUDED: ${EXCLUDED_REGION}`,
+  );
 });
