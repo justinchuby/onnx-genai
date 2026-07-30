@@ -88,6 +88,16 @@ if truthy "$STATIC_CACHE"; then
   OUT_DIR="${OUT_DIR:-$ROOT/models/qwen2.5-0.5b-scatter}"
   CACHE_ARGS=(--static-cache --max-seq-len "$MAX_SEQ_LEN")
 
+  # A static-cache graph drives TensorScatter through integer control ports
+  # (write_indices / kv_sequence_length) that are shape-indistinguishable, so
+  # the runtime refuses to guess them and requires an explicit
+  # `model.io.static_cache` declaration. That declaration lives in
+  # inference_metadata.yaml, which only `--runtime onnx-genai` emits -
+  # `ort-genai` writes genai_config.json, which cannot express it, and the
+  # resulting model fails to load. See scripts/lib/write_static_cache_metadata.py.
+  RUNTIME_TARGET="onnx-genai"
+  REQUIRED_ARTIFACTS="inference_metadata.yaml model.onnx tokenizer.json"
+
   case "$MAX_SEQ_LEN" in
     ''|*[!0-9]*)
       printf 'error: MAX_SEQ_LEN must be a positive integer, got: %s\n' "$MAX_SEQ_LEN" >&2
@@ -96,6 +106,8 @@ if truthy "$STATIC_CACHE"; then
   esac
 else
   OUT_DIR="${OUT_DIR:-$ROOT/models/qwen2.5-0.5b}"
+  RUNTIME_TARGET="ort-genai"
+  REQUIRED_ARTIFACTS="genai_config.json model.onnx tokenizer.json"
 fi
 
 # Locate an interpreter that can import Mobius. Prints install instructions
@@ -113,15 +125,21 @@ if truthy "$STATIC_CACHE"; then
 else
   printf '  kv cache : dynamic\n'
 fi
+printf '  runtime  : %s\n' "$RUNTIME_TARGET"
 printf '  mobius   : %s\n' "$MOBIUS_SOURCE"
 printf '  python   : %s\n' "$MOBIUS_PYTHON"
 printf '\n'
 
 if truthy "$DRY_RUN"; then
   printf 'DRY_RUN=1, not building. Command would be:\n'
-  printf '%s -m mobius build --model %s %s --dtype %s --ep %s %s--runtime ort-genai\n' \
+  printf '%s -m mobius build --model %s %s --dtype %s --ep %s %s--runtime %s\n' \
     "$MOBIUS_PYTHON" "$MODEL_ID" "$OUT_DIR" "$DTYPE" "$EP" \
-    "$(if [ ${#CACHE_ARGS[@]} -gt 0 ]; then printf '%s ' "${CACHE_ARGS[@]}"; fi)"
+    "$(if [ ${#CACHE_ARGS[@]} -gt 0 ]; then printf '%s ' "${CACHE_ARGS[@]}"; fi)" \
+    "$RUNTIME_TARGET"
+  if truthy "$STATIC_CACHE"; then
+    printf '%s %s %s\n' \
+      "$MOBIUS_PYTHON" "$ROOT/scripts/lib/write_static_cache_metadata.py" "$OUT_DIR"
+  fi
   exit 0
 fi
 
@@ -139,12 +157,19 @@ PYTHONPATH="$MOBIUS_PYTHONPATH" \
   --dtype "$DTYPE" \
   --ep "$EP" \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
-  --runtime ort-genai
+  --runtime "$RUNTIME_TARGET"
+
+# Mobius does not emit the `io:` block for static-cache exports, so the model
+# it just wrote cannot be loaded yet. Derive the declaration from the graph.
+if truthy "$STATIC_CACHE"; then
+  PYTHONPATH="$MOBIUS_PYTHONPATH" \
+  "$MOBIUS_PYTHON" "$ROOT/scripts/lib/write_static_cache_metadata.py" "$OUT_DIR"
+fi
 
 # A partial export is worse than a failed one: the runtime would load it and
 # fail later with a confusing error. Verify the package is complete.
 missing=""
-for required in genai_config.json model.onnx tokenizer.json; do
+for required in $REQUIRED_ARTIFACTS; do
   if [ ! -f "$OUT_DIR/$required" ]; then
     missing="$missing $required"
   fi
@@ -155,6 +180,19 @@ if [ -n "$missing" ]; then
   printf '       %s is missing:%s\n' "$OUT_DIR" "$missing" >&2
   printf '       Delete the directory and re-run to retry:\n' >&2
   printf '           rm -rf %s && scripts/build_qwen.sh\n' "$OUT_DIR" >&2
+  exit 1
+fi
+
+# The whole point of a static-cache build is that it loads and engages
+# continuous batching. Confirm the declaration actually landed rather than
+# trusting that the helper ran.
+if truthy "$STATIC_CACHE" &&
+  ! grep -q 'static_cache:' "$OUT_DIR/inference_metadata.yaml"; then
+  printf '\nerror: %s/inference_metadata.yaml has no model.io.static_cache block.\n' \
+    "$OUT_DIR" >&2
+  printf '       The runtime will reject this model at load time. Re-run:\n' >&2
+  printf '           %s scripts/lib/write_static_cache_metadata.py %s\n' \
+    "$MOBIUS_PYTHON" "$OUT_DIR" >&2
   exit 1
 fi
 

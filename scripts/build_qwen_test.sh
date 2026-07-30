@@ -118,6 +118,25 @@ assert_contains "STATIC_CACHE=1 passes --static-cache" "$output" "--static-cache
 assert_contains "STATIC_CACHE=1 passes --max-seq-len" "$output" "--max-seq-len 8192"
 assert_contains "STATIC_CACHE=1 retargets output dir" "$output" "models/qwen2.5-0.5b-scatter"
 
+# A static-cache model is only loadable if it declares model.io.static_cache,
+# which lives in inference_metadata.yaml. Only --runtime onnx-genai emits that
+# file; --runtime ort-genai writes genai_config.json, which cannot express it,
+# and the runtime then rejects the model at load time.
+assert_contains "STATIC_CACHE=1 targets the onnx-genai runtime" \
+  "$output" "--runtime onnx-genai"
+assert_not_contains "STATIC_CACHE=1 does not use the ort-genai runtime" \
+  "$output" "--runtime ort-genai"
+assert_contains "STATIC_CACHE=1 writes the static_cache declaration" \
+  "$output" "write_static_cache_metadata.py"
+
+# The dynamic path is a different contract: genai_config.json is what the
+# runtime loads there, and it is known to work.
+output="$(run_build /bin/bash)"
+assert_contains "dynamic build targets the ort-genai runtime" \
+  "$output" "--runtime ort-genai"
+assert_not_contains "dynamic build does not write a static_cache declaration" \
+  "$output" "write_static_cache_metadata.py"
+
 # Legacy alias kept for existing docs and benchmark scripts.
 output="$(run_build /bin/bash SCATTER_CACHE=1)"
 assert_contains "SCATTER_CACHE=1 alias still enables static cache" "$output" "--static-cache"
@@ -226,6 +245,107 @@ if /bin/bash -c "set -euo pipefail
   pass "mobius_env.sh is sourceable and exports MOBIUS_PYTHON/MOBIUS_SOURCE"
 else
   fail "mobius_env.sh is sourceable and exports MOBIUS_PYTHON/MOBIUS_SOURCE"
+fi
+
+# ---------------------------------------------------------------------------
+# The static_cache metadata generator. A static-cache model that does not
+# declare model.io.static_cache is rejected at load time, so this block is what
+# makes the STATIC_CACHE=1 output usable at all.
+# ---------------------------------------------------------------------------
+GENERATOR="$ROOT/scripts/lib/write_static_cache_metadata.py"
+GENERATOR_PYTHON="${MOBIUS_PYTHON:-}"
+if [ -z "$GENERATOR_PYTHON" ]; then
+  # Reuse the script's own discovery so this works wherever the build does.
+  GENERATOR_PYTHON="$(
+    . "$ROOT/scripts/lib/mobius_env.sh" >/dev/null 2>&1
+    mobius_resolve "$ROOT" >/dev/null 2>&1 && printf '%s' "$MOBIUS_PYTHON"
+  )"
+fi
+
+# assert_derives_io <name> <model-dir> <ground-truth-yaml>
+# Derives the io block from the ONNX graph and compares it to a known-good
+# inference_metadata.yaml. --check is read-only, so this never mutates a model.
+assert_derives_io() {
+  TESTS_RUN=$((TESTS_RUN + 1))
+  local name="$1" model_dir="$2" truth="$3"
+  local derived
+  if ! derived="$("$GENERATOR_PYTHON" "$GENERATOR" "$model_dir" --check 2>&1)"; then
+    fail "$name" "generator failed: $derived"
+    return
+  fi
+  if printf '%s' "$derived" | "$GENERATOR_PYTHON" -c '
+import sys, yaml
+derived = yaml.safe_load(sys.stdin)["io"]
+truth = yaml.safe_load(open(sys.argv[1]))["model"]["io"]
+sys.exit(0 if derived == truth else 1)
+' "$truth"; then
+    pass "$name"
+  else
+    fail "$name" "derived io block does not match $truth"
+  fi
+}
+
+if [ -n "$GENERATOR_PYTHON" ] &&
+  "$GENERATOR_PYTHON" -c 'import onnx, yaml' >/dev/null 2>&1; then
+
+  # The committed fixture is the ground truth available to a fresh clone.
+  assert_derives_io "generator reproduces the tiny-llm-scatter fixture io block" \
+    "$ROOT/tests/fixtures/tiny-llm-scatter" \
+    "$ROOT/tests/fixtures/tiny-llm-scatter/inference_metadata.yaml"
+
+  # A real 24-layer export, when one has been built locally. This is the case
+  # that catches lexical-vs-numeric layer ordering: sorting the port names as
+  # strings puts key_cache.10 before key_cache.2 and silently mis-pairs every
+  # buffer past the ninth layer, which the 1-layer fixture cannot detect.
+  real_scatter="$ROOT/models/qwen2.5-0.5b-scatter-v2"
+  if [ -f "$real_scatter/model.onnx" ] && [ -f "$real_scatter/inference_metadata.yaml" ]; then
+    assert_derives_io "generator reproduces the 24-layer scatter model io block" \
+      "$real_scatter" "$real_scatter/inference_metadata.yaml"
+  else
+    printf 'skip  24-layer generator check (no local %s)\n' "$real_scatter"
+  fi
+
+  # Ordering is a correctness property, not a cosmetic one. Reuse the --check
+  # output captured in the shell; never invoke the generator without --check
+  # from the tests, since without it the generator WRITES to the model dir.
+  if [ -f "$real_scatter/model.onnx" ]; then
+    TESTS_RUN=$((TESTS_RUN + 1))
+    derived_block="$("$GENERATOR_PYTHON" "$GENERATOR" "$real_scatter" --check 2>&1)"
+    if printf '%s' "$derived_block" | "$GENERATOR_PYTHON" -c '
+import sys, yaml
+caches = yaml.safe_load(sys.stdin)["io"]["static_cache"]["key_cache_inputs"]
+indices = [int(name.split(".")[1]) for name in caches]
+sys.exit(0 if indices == list(range(len(indices))) else 1)
+'; then
+      pass "cache ports are ordered numerically by layer, not lexically"
+    else
+      fail "cache ports are ordered numerically by layer, not lexically" \
+        "got: $(printf '%s' "$derived_block" | grep -c 'key_cache\.') entries out of order"
+    fi
+  else
+    printf 'skip  numeric layer ordering check (no local scatter model)\n'
+  fi
+
+  # A dynamic-cache model has no scatter ABI; say so instead of emitting a
+  # bogus declaration.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  dynamic_model="$ROOT/models/qwen2.5-0.5b"
+  if [ -f "$dynamic_model/model.onnx" ]; then
+    if output="$("$GENERATOR_PYTHON" "$GENERATOR" "$dynamic_model" --check 2>&1)"; then
+      fail "generator rejects a dynamic-cache model"
+    else
+      case "$output" in
+        *"does not expose a static-cache scatter ABI"*)
+          pass "generator rejects a dynamic-cache model" ;;
+        *) fail "generator rejects a dynamic-cache model" "unhelpful error: $output" ;;
+      esac
+    fi
+  else
+    TESTS_RUN=$((TESTS_RUN - 1))
+    printf 'skip  dynamic-model rejection check (no local %s)\n' "$dynamic_model"
+  fi
+else
+  printf 'skip  static_cache generator checks (onnx/pyyaml unavailable)\n'
 fi
 
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
