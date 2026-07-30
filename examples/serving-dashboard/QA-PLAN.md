@@ -279,7 +279,7 @@ how it behaves here more than on the happy path.
         the feature does not exist yet when it is running fine three feet away.
 - [ ] **3.2b `--enable-debug-endpoints` is CONFIRMED load-bearing; `--enable-admin-endpoints` is
       CONFIRMED droppable.** The demo makes zero `/v1/admin/*` calls (only prose references at
-      `README.md:170` and `check-launch-command.test.js:156`, both correctly *explaining the
+      `README.md` (the *"deliberately not used"* paragraph) and `check-launch-command.test.js`, `Deliberately excluded`, both correctly *explaining the
       exclusion*). @732c7548's drop of the admin flag is verified correct at source — do not
       re-add it. Both flags were inherited together from the retired `/v1/debug/live` design;
       one survived the reversal on merit, one did not.
