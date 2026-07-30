@@ -2003,6 +2003,37 @@ AFTER  the 12-block  19/20  = 0.95
   **🔒 REQUIRED: A CAPTION OVERRIDE MUST BE AN EXCEPTION THAT SAYS WHY, NOT THE DEFAULT WINNER.** Guard denominator is **9**, measured, with a positive control and a floor — **and it must assert its own non-vacuity, because the honest number moved 21 -> 46 -> 9 across three instruments in ten minutes.**
   **⛔ DO NOT FIX ONE CALL SITE. Fixing `scheduling.js` alone leaves 8 and the next catalogue rename is invisible again — @732c7548's law: *a guard that specifies the fix cannot detect that the fix was too small.*
 
+- [ ] **AC201 — 🔴🔴 TWO CATALOGUE ENTRIES READ THE SAME GAUGE. ONE'S EVIDENCE SAYS *"NOT the engine batch."* THE OTHER IS CAPTIONED *"Sequences in the current batch."* **THE HONESTY ARGUMENT WAS MADE IN RUST AND BROKEN IN JAVASCRIPT, AND THE GUARD THAT ENFORCES IT IS A RUST TEST THAT CANNOT SEE JAVASCRIPT.** (Numbering note: the Lead referred to this ruling as "AC195"; AC195 in this file is the `model_path` P1, so it lands here to keep every AC token unique.)**
+```
+  BOTH FIELDS, ONE SOURCE — snapshot.current_batch_size:
+    batch.in_flight    MEASURED  'Generations in flight'
+        evidence: "...Counts in-flight generations, NOT the engine batch."   ✅ HONEST
+    batch.active_size  MEASURED  'Sequences in the current batch'            ⛔ A CLAIM
+        evidence: admin.rs:136 (snapshot.current_batch_size)                    ABOUT BATCH ROWS
+
+  THE PRODUCER, AND IT IS NOT THE ENGINE:
+    metrics.rs:115  REGISTRY.batch_size.fetch_add(1)  inside GenerationMetrics::start()
+                    ^ ONE writer. It ticks per HTTP generation. Nothing to do with a batch step.
+
+  THE RUST ALREADY KNOWS, IN WORDS, AT tests.rs:4994:
+    "current_batch_size ... is honestly named -- it reports generations in flight
+     over HTTP and CLAIMS NOTHING ABOUT BATCH ROWS. The guard is that it never
+     reaches a field paired with a batch capacity."
+    fn the_batch_numerator_is_never_read_from_the_http_generation_gauge()
+
+  CAN THAT GUARD SEE THE CAPTION IT IS PROTECTING?
+    .rs files mentioning telemetry-provenance ...... 0
+    CONTROL, .rs files mentioning 'admin.rs' ....... 1   ✅ the query works
+    -> AND `batch.capacity` ('Effective batch capacity') SITS IN THE SAME
+       `batch.*` NAMESPACE, ON THE SAME PANEL. THE PAIRING THE RUST FORBIDS IS
+       RECONSTITUTED BY THE DASHBOARD, ONE LANGUAGE AWAY FROM ITS GUARD.
+```
+  **🔑 THE RULING, AND IT CORRECTS THE FRAMING I WAS HANDED: **THE DEFECT IS NOT THAT THESE FIELDS CLASSIFY `MEASURED` UNCONDITIONALLY. THE CLASSIFICATION IS *CORRECT* — THE VALUE GENUINELY IS MEASURED.** `active_size` measures something real and always will. ⛔ **IT SIMPLY IS NOT THE THING ITS CAPTION NAMES.** So greying it out under fallback would be the wrong fix: in fallback, *'Generations in flight'* is still perfectly true and perfectly measurable. **YOU CANNOT REPAIR A NAMING DEFECT WITH A PROVENANCE CONTROL.**
+  **⚡ AND THAT IS THE GAP THIS WHOLE HONESTY LAYER HAS: **`MEASURED` IS A CLAIM ABOUT *PROVENANCE*. A LABEL IS A CLAIM ABOUT *MEANING*. WE BUILT AN ELABORATE APPARATUS THAT AUDITS WHERE EVERY NUMBER CAME FROM, AND IT HAS NO VOCABULARY WHATSOEVER FOR WHAT THE NUMBER IS.** ➡️ A field can be sourced impeccably, classified correctly, evidence-anchored to a real line of Rust — **and still be captioned as a quantity it is not. Every guard we own returns green on that, because every guard we own is asking the other question.**
+  **⚖️ THE LEAD'S OBSERVATION IS THE PROOF AND IT IS EXACT: `batch.effective_size` IS `NOT_PLUMBED`, CAPTIONED *'Sequences stepped together'*, WITH A REASON EXPLAINING THAT `ContinuousBatchManager` EXPOSES NO SUCH COUNTER. **THE ONE FIELD THAT NAMES WHAT ACTUALLY STEPS TOGETHER IS THE ONE FIELD WE ADMIT WE CANNOT SEE — AND IT SITS TWO ENTRIES BELOW A FIELD THAT CLAIMS THE SAME QUANTITY IN CONFIDENT PRESENT TENSE.** The honest answer was already in the file; it was never allowed to discipline its neighbours.
+  **🔒 REQUIRED: RE-CAPTION `batch.active_size` TO WHAT IT MEASURES — GENERATIONS IN FLIGHT — OR DELETE IT AS A DUPLICATE OF `batch.in_flight`, WHICH READS THE IDENTICAL GAUGE AND IS ALREADY NAMED CORRECTLY.** **PREFER DELETION: TWO ENTRIES OVER ONE GAUGE IS @d7cf9b84's *TWO SITES AGREEING TODAY IS A DIVERGENCE WAITING TO HAPPEN*, AND THEY HAVE ALREADY DIVERGED — IN THE CAPTION, WHICH IS THE ONLY PART A VISITOR READS.**
+  **⛔ AND THE GUARD MUST CROSS THE LANGUAGE BOUNDARY, BECAUSE THAT BOUNDARY IS THE DEFECT: THE RUST TEST'S INVARIANT — *never paired with a batch capacity* — MUST BE ASSERTED OVER THE JS CATALOGUE, WHERE THE PAIRING ACTUALLY HAPPENS. **A GUARD WHOSE CORPUS IS ONE LANGUAGE PROTECTS AN INVARIANT THAT LIVES IN TWO.**
+
 - [ ] **AC196 — 🔒 THE CAPTION RULE, STATED AS BINDING RATHER THAN AS ADVICE, BECAUSE I HAVE ISSUED IT FIVE TIMES AND NEVER ONCE WRITTEN IT DOWN.** **A caption MAY name what is missing. A caption MAY NOT promise what is absent.** *"KV pages — not yet plumbed"* is honest and useful. *"KV pages, updated live"* over a field the catalogue marks `NOT_PLUMBED` is a lie told by the layer we built to prevent lies.
   **🔒 MECHANISABLE, AND THIS IS THE POINT — NO PANEL CAPTION, HEADER, LEGEND, TOOLTIP OR EMPTY-STATE MAY REFER TO A FIELD THE CATALOGUE DOES NOT MARK `MEASURED`, UNLESS THE SAME SENTENCE ALSO STATES THE FIELD'S STATE.** The catalogue is already a machine-readable list of every field and its provenance; the captions are already static strings in the source. **The join is a test, not a review, and it catches all five instances found by hand this session.**
   **⛔ AND THE REASON THIS OUTRANKS THE INDIVIDUAL FIXES: A CAPTION IS WRITTEN ONCE, WHEN THE FEATURE IS INTENDED, AND IS NEVER REVISITED WHEN THE FEATURE SLIPS. It is the artifact most likely to describe the product we meant to build rather than the one in the room — which is exactly the failure mode of every stale review document on this branch, expressed in the UI where a visitor rather than a colleague will read it.**
