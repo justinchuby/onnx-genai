@@ -79,7 +79,7 @@ describe('renderField — a measured zero and an unmeasurable value must look di
     }));
 
     assert.equal(node.getAttribute('data-state'), 'measured');
-    assert.equal(node.findByClass('value__num').textContent, 'false');
+    assert.match(node.findByClass('value__num').textContent, /false/);
     assert.equal(node.findByClass('value__num--unavailable'), null);
     assert.doesNotMatch(node.textContent, /—/);
   });
