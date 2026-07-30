@@ -2993,3 +2993,49 @@ shell.css:221                 .connection-indicator[data-state='connected']  ←
 | D122 | Ban raw state literals post-rename; collapse `store-adapter.js:410`'s dual check | Defensive both-values code is the fork made visible |
 | D123 | No ownership data ⇒ occupancy bar, and rename to "KV cache occupancy" | A grid encoding one bit per cell promises structure it doesn't have |
 | D124 | Never render absolute server timestamps; only client-observed ages | A fabrication that MOVES defeats every motion-based honesty cue |
+
+---
+
+## 43. AC CITATION AUDIT COMPLETE — ALL 34 RESOLVE. BUT THE SPEC IS 78 ACs, NOT 46 OR 50, AND TWO OF MY OWN RULINGS NOW CONTRADICT IT.
+
+@12e42da8 asked every artifact owner to open `demo-spec.md` and confirm cited ACs still say what we built against. Done — mechanically, not by eye.
+
+### 43.1 Result: zero dangling citations
+
+```
+DEFINED:  78 ACs, AC1..AC78, contiguous, ZERO gaps
+CITED by demo-ux.md:  34 ACs
+ACs I cite that are NOT defined:  (none)
+```
+**Every AC number in my contract resolves.** Method — `grep -oE '^- \[[ x]\] \*\*AC[0-9]+'` for definitions vs all `AC[0-9]+` tokens in mine, `comm`'d. Anyone can re-run it; **the first regex I tried reported 6 definitions and I nearly published that — the definition format is `- [ ] **ACnn**`, and a citation audit that silently under-matches produces a clean bill of health, which is the worst possible failure for an audit.**
+
+### 43.2 🔴 THE COUNT IS WRONG IN BOTH DIRECTIONS, ASSERTED MINUTES APART
+
+- @12e42da8: *"IT IS 46 ACs — AC1–AC46 contiguous, no duplicates."*
+- @376a0297: *"Spec: 50 ACs, contiguous, backup current."*
+- **The file: AC1–AC78, contiguous, no gaps.**
+
+Both were stated *while instructing everyone else to open the file*. **This isn't a nit: the Lead's own standing rule is NEVER CITE AN AC FROM MEMORY, and the count is itself a citation.** More practically — **anyone who reads "46 ACs" and finds their AC number above 46 will conclude their artifact is stale and start editing.** AC48, AC57, AC61 and AC76 are all live and all cited in binding rulings from tonight.
+
+### 43.3 ✅ AC43 SURVIVED INTACT — my §39 stop worked
+
+AC43 now carries my copy substantially verbatim and still reads **"a managed page table for sharing and eviction."** The instruction to strike "eviction" did not land. **Closing that open item — and noting I nearly caused real damage by attaching a memorable framing to a claim I later retracted (D112).**
+
+### 43.4 🔴 MY D123 CONTRADICTS AC15. THE SPEC IS THE OLDER TEXT; I DEFER, WITH ONE AMENDMENT.
+
+AC15's degraded form mandates *"capacity, in-use, free, shared count, refcount histogram, and per-sequence block counts — but no per-cell ownership and no stable block identity."* **That is still a GRID.** Twenty minutes ago I ruled (D123) that the ownership-less fallback should be **replaced** by an occupancy bar, because a grid whose cells each carry one bit is a progress bar drawn as 400 squares.
+
+**I'm not overriding a ratified AC from my own doc.** But the amendment is small and I'd ask @376a0297 to take it:
+
+> **D125 — AC15's degraded form is accepted, with the naming clause: if per-cell ownership is cut, the panel MUST be retitled from "Paged KV block table" to "KV cache occupancy."** The listed fields (capacity, in-use, free, refcount histogram) are genuinely useful and I withdraw the objection to shipping them. **What I will not withdraw is the title.** *Block table* promises blocks with identity; **the sharing story — two sequences pointing at one physical block — is the entire pedagogical payload of pillar 2, and a title claiming it while the pixels cannot show it is the fabrication problem in typography rather than in numbers.** A refcount histogram *does* preserve the sharing story in aggregate, which is why the panel is worth shipping — it just isn't a table of blocks.
+
+### 43.5 🔴 D126 — AC20 IS DEFEATED BY `created`, AND THE FIX IS ONE CLAUSE
+
+AC20 reads: **"No metric is displayed that cannot move."** `created: now_unix()` (`routes/admin.rs:29`) **moves on every single call** and is pure fabrication. It passes AC20 perfectly.
+
+- **D126:** AC20 needs its inverse — **"and no metric is displayed that moves for a reason unrelated to the thing it names. Ask what would have to happen IN THE ENGINE for this number to change; if the answer is 'nothing,' it is a clock."** As written, AC20 tests for one failure mode and **silently certifies its mirror image.** @376a0297's §3.2 rule already says this; **it needs to be in AC20 itself, because AC20 is the one people will grep for.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D125 | AC15's degraded grid accepted; **the retitle to "KV cache occupancy" is not** negotiable | A title claiming block identity the pixels can't show is fabrication in typography |
+| D126 | AC20 gains the inverse clause: motion unrelated to the named quantity | AC20 currently certifies `created: now_unix()` as compliant |
