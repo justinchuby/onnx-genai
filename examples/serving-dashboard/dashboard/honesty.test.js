@@ -28,6 +28,21 @@ const GUARD_PATTERN =
   /\b(isRenderable|hasValue|numericValueOf|isUnavailable|isPending|isStale|renderStateOf|renderField|metricRow|Array\.isArray)\b/;
 
 /** @returns {string[]} */
+/**
+ * Source with comments removed.
+ *
+ * These lints scan text, so without this a comment SAYING "panels never call
+ * fetch()" would itself trip the rule forbidding fetch() — punishing the
+ * documentation of a rule for describing it. Block comments first, then line
+ * comments.
+ *
+ * @param {string} source
+ * @returns {string}
+ */
+function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
 function sourceFiles() {
   return readdirSync(DASHBOARD_DIR)
     .filter((name) => name.endsWith('.js'))
@@ -101,14 +116,38 @@ describe('honesty lint — no unguarded value reads', () => {
     assert.deepEqual(offences, [], offences.join('\n'));
   });
 
-  it('never calls fetch from a panel', () => {
-    // CONTRACT.md §4: one polling loop for the page. Independent polling drifts,
-    // and two panels showing different instants make the dashboard contradict
-    // itself.
-    const offenders = sourceFiles().filter((name) =>
-      /\bfetch\s*\(/.test(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8')),
-    );
-    assert.deepEqual(offenders, [], `panels must not fetch: ${offenders.join(', ')}`);
+  it('never opens its own connection or its own clock', () => {
+    // CONTRACT.md §4 and ARCHITECTURE.md I4: ONE polling loop for the page.
+    // Independent polling drifts, and two panels showing different instants
+    // make the dashboard contradict itself — the failure is not an error, it
+    // is two numbers that cannot both be true with nothing to say which is.
+    //
+    // fetch() is only the obvious route. A panel could just as easily open an
+    // EventSource, a WebSocket or an XMLHttpRequest, or run its own setInterval
+    // and drift its own cadence, and every one of those looks entirely normal
+    // in review. Relative URLs are a second trap: the page is served at /demo/
+    // WITH a trailing slash, so a relative fetch resolves somewhere surprising.
+    // Forbidding the whole class is cheaper than remembering the list.
+    const FORBIDDEN = [
+      [/\bfetch\s*\(/, 'fetch()'],
+      [/\bnew\s+EventSource\b/, 'EventSource'],
+      [/\bnew\s+WebSocket\b/, 'WebSocket'],
+      [/\bnew\s+XMLHttpRequest\b/, 'XMLHttpRequest'],
+      [/\bnavigator\s*\.\s*sendBeacon\b/, 'sendBeacon'],
+      [/\bsetInterval\s*\(/, 'setInterval()'],
+    ];
+
+    const offences = [];
+    for (const name of sourceFiles()) {
+      const source = stripComments(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8'));
+      for (const [pattern, what] of FORBIDDEN) {
+        if (pattern.test(source)) {
+          offences.push(`${name} uses ${what} — panels subscribe, they never poll`);
+        }
+      }
+    }
+
+    assert.deepEqual(offences, [], offences.join('\n'));
   });
 
   it('never assigns innerHTML with anything but a literal', () => {
