@@ -27,7 +27,8 @@
 // has no word for: MAY THIS BE SHOWN.
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { after, before, describe, it } from 'node:test';
 
@@ -329,6 +330,89 @@ describe('no field can put an absolute home path on screen, whatever its name', 
       [],
       `${stale.join(', ')} no longer discloses. Delete the declaration -- an exemption ` +
         'outliving its defect silently exempts whatever inherits that key.',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE SERVED TREE, not just the two renderers above.
+//
+// The header of this file says "a fixture cannot contain the one thing this
+// defect is made of". THAT WAS FALSE, and it was measured false at HEAD:
+// `/demo/fixtures/captures/scatter.json` answered 200 carrying
+// `.endpoints./v1/models.body.data[0].path` = the presenter's real home
+// directory, and `dynamic.json` the same. A CAPTURED FIXTURE FREEZES A PRE-FIX
+// RESPONSE, so the server-side basename redaction cannot reach it and the
+// SOURCES sweep above never looks at it.
+//
+// The discriminator is os.homedir(), deliberately: this file, and the two
+// sibling disclosure suites, contain INVENTED paths (/Users/presenter,
+// /Users/someone) that must keep passing. Only the machine actually running
+// the suite can be disclosed by it, and only that is a defect.
+describe('no file the launcher serves contains THIS machine home directory', () => {
+  const HOME = os.homedir();
+  const PKG = fileURLToPath(new URL('../', import.meta.url));
+
+  // Measured against a live origin rather than assumed: .md and *.test.js
+  // answer 404, while .js/.css/.html/.json answer 200.
+  const isServed = (rel) =>
+    /\.(js|mjs|css|html|json)$/.test(rel) && !/\.test\.js$/.test(rel);
+
+  const walk = (dir, base = '') => {
+    const out = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      const rel = base ? `${base}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) out.push(...walk(`${dir}/${entry.name}`, rel));
+      else if (isServed(rel)) out.push(rel);
+    }
+    return out;
+  };
+
+  it('the sweep reaches a real, non-trivial set of served files', () => {
+    const files = walk(PKG);
+    assert.ok(
+      files.length > 20,
+      `only ${files.length} served files found -- the walk is broken, and a broken ` +
+        'walk makes the next assertion vacuously green',
+    );
+    assert.ok(files.includes('app.js'), 'app.js must be in the swept set');
+    assert.ok(
+      files.some((f) => f.startsWith('fixtures/')),
+      'fixtures/ must be swept -- that is where the defect this block exists for lived',
+    );
+  });
+
+  it('no served file discloses the presenter home directory', () => {
+    const offenders = walk(PKG)
+      .map((rel) => ({ rel, text: readFileSync(`${PKG}${rel}`, 'utf8') }))
+      .filter(({ text }) => text.includes(HOME))
+      .map(({ rel }) => rel);
+
+    assert.deepEqual(
+      offenders,
+      [],
+      `${offenders.join(', ')} contain(s) this machine's home directory and is served ` +
+        "at /demo/. Replace it with the basename the server actually emits -- do NOT " +
+        'exempt the file, because the visitor fetches it either way.',
+    );
+  });
+
+  it('the detector can fire, so the green above means something', () => {
+    // Without this, a homedir() that returned '' would make the sweep pass forever.
+    assert.ok(HOME.length > 1, 'os.homedir() must be a real path for the sweep to mean anything');
+    const planted = `{"path": "${HOME}/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b"}`;
+    assert.ok(planted.includes(HOME), 'the predicate must match a planted disclosure');
+    assert.equal(
+      findAbsolutePaths(planted).length > 0,
+      true,
+      'the shared absolute-path detector must also see it',
+    );
+    // ...and must NOT fire on the invented paths this repository deliberately keeps.
+    assert.equal(
+      '/Users/presenter/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b'.includes(HOME),
+      false,
+      'an invented fixture path must not be reported as a disclosure of this machine',
     );
   });
 });
