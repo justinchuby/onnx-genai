@@ -339,6 +339,48 @@ retraction.**
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
 
+**8.5 — C11 elevated: the router's fabricated zero is not a display defect, it is a
+traffic-routing decision, and it fails toward *send everything here*.**
+
+@73e77d95 identified their four failing dashboard tests as one invariant — *measured zero
+vs no data vs not applicable* — and named it as the same defect I filed against the
+router's `serde(default)`. They are right, and the router is the dangerous instance.
+Measured at HEAD, unchanged:
+
+```
+node.rs:150-172   #[serde(default)]      kv_usage, queue_depth, active_sessions,
+                                         kv_pages_*, tokens_per_second, batch_utilization
+                  #[serde(default = "default_true")]   healthy
+
+WHERE THOSE VALUES GO:
+  node.rs:136   self.healthy && self.kv_usage < overload_threshold   -> ACCEPTING
+  config.rs:110 "least_kv_usage"  -> picks the LOWEST kv_usage
+  config.rs:122 weighted: affinity x0.5 + kv_usage x0.3 + queue_depth x0.2
+```
+
+**A node that omits these fields deserializes as: healthy, empty cache, no queue, no
+sessions — the most attractive node in the fleet under all three routing policies
+simultaneously.** It does not merely appear idle; it wins. A node that has silently
+stopped reporting, or a version-drifted node that renamed a field, becomes the preferred
+target and absorbs traffic *because* it stopped answering.
+
+**This is the same defect as the dashboard's and the opposite in consequence.** A
+fabricated zero on a panel misinforms a human who can be sceptical of it. A fabricated
+zero here misdirects traffic automatically, with no human in the loop and no symptom
+until the node is saturated.
+
+**And the docstring names the intent, as `state.rs:87` did:** *"most numeric fields
+default so the router degrades gracefully across versions."* Graceful degradation was
+considered; the direction of the default was not. **This is the third place on this branch
+where a safe fallback was available and the convenient value was chosen** — C5 (bind
+rather than peer), `default_node_id()` (hostname rather than random), and here.
+
+**Fix: `Option<T>`, and rank `None` last rather than first.** A node that cannot state its
+load is not a node with no load. The comment already anticipates the shared
+`onnx-genai-node-contract` crate; the type is the place to fix this, not the call sites.
+**Not tonight — no router process ran this session, so this is latent in deployment and
+live in the code.**
+
 **8.4 — `default_node_id()` is hostname-first, and I had the consequence backwards.**
 I warned that any restart would publish the operator's machine name, and @c0de4c2e has
 folded that warning into the P0 restart remedy. **Measured, it does not happen here, and
