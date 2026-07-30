@@ -1509,7 +1509,7 @@ It is not pedantry, because of what falls in the 243:
 telemetry-store.test.js          60   <- the gate's last red lived here
 check-source-citations.test.js    5   <- gate item 5 is certified on this file
 check-perf-claims.test.js         7       page-claims.test.js             10
-check-readme-claims.test.js       4       prefix-counters-forbidden.js     3
+check-readme-claims.test.js       4       prefix-counters-forbidden.test.js 3
 denominator-binding.test.js       3   <- F15's guard
 provenance-expiry.test.js         5       register-completeness.test.js    8
 check-docstring-drift.test.js     5       never-bind.test.js               3
@@ -2630,3 +2630,70 @@ not by report.**
 `cargo test` has still never been run by anyone tonight · `scenario-switcher.test.js`
 exists twice with different bytes · I re-verified 12 of ~22 F-rows and one of the
 twelve was wrong · **five retractions by me, plus one caught in flight.**
+
+---
+
+## F29 — path-citation audit of THIS document, ordered by `@12e42da8`. One real typo, and the sibling-repo collision is TOTAL, not per-file.
+
+**Measured at `HEAD` with `toplevel` asserted by absolute path** (`[ "$(git rev-parse --show-toplevel)" = "/Users/.../onnx-genai-demo" ] || exit 2`) — **not** `cd $(git rev-parse --show-toplevel)`, which the lead correctly withdrew because it normalises depth while preserving the wrong repository.
+
+```
+document 2632 lines · 118 distinct cited file paths · git ls-files 2155 tracked
+```
+
+**✅ The phantom `dashboard/telemetry-store.js` is NOT in my document.** My one
+apparent hit was `examples/serving-dashboard/telemetry-store.js:311-328` — **the
+real file** — matched because `serving-dashboard/` *contains* `dashboard/`. **I
+filed a defect against my own file for ten seconds using the exact substring
+collision that produced the phantom in the first place.** An exact `grep -qxF`
+against `git ls-files` clears it; a substring test cannot. **The instrument that
+finds this class is the same instrument that fabricates it, and only exact
+matching separates them.**
+
+**⛔ ONE REAL DEFECT, MINE, NOW FIXED IN THIS COMMIT:**
+
+```
+I wrote   prefix-counters-forbidden.js          <- resolves in NEITHER repo
+Real file examples/serving-dashboard/prefix-counters-forbidden.test.js
+```
+
+**Every other row in that table carries `.test.js`. Mine dropped it on exactly one
+row** — which is why it survived: **a name that is wrong in a way that matches the
+column's pattern is invisible, and a name that is wrong in a way that breaks the
+pattern gets caught by eye.** Two other unresolved names are **mentions, not
+citations**, and I am not "fixing" them: `file.rs:NNN` is a metasyntactic template
+describing *other* citations, and `cors.rs` appears in a sentence saying it was
+never in my findings. **A filename in prose is not a citation, and an audit that
+cannot tell them apart manufactures work.**
+
+**☠️ AND THE SYSTEMIC RESULT, WHICH IS MUCH LARGER THAN THE ORDER ANTICIPATED:**
+
+```
+distinct tracked basenames   demo 1577 · sibling 1448
+COLLIDING                    1448      <-  100% OF SIBLING BASENAMES
+  lib.rs   demo 40 copies · sibling 40      mod.rs  demo 27 · sibling 27
+  tests.rs demo 10 · sibling 10             driver.rs / admin.rs / cli.rs  1 · 1
+IN MY DOCUMENT: 19 dual-resolving citations · 0 sibling-only ✅ (all resolve here)
+```
+
+**The order named `driver.rs` (830 vs 1133 lines) as *the* file that resolves in
+both trees. It is not a file-level hazard. Every single basename in the sibling
+repo also exists in this one.** ➡️ **So no basename can ever disambiguate the
+repo, and neither can a fully-qualified `crates/...` path — that is the form the
+lead already showed resolves cleanly in the tree where we do not leak.** **The
+only disambiguator is the resolved root, which no citation format we use carries.**
+
+**✅ My 118 citations all resolve in the demo repo — verified, with `app.js`
+(1 hit) as a positive control — but 19 of them would also resolve, plausibly and
+silently, for any reader standing in the sibling.** That is not a defect I can fix
+by editing a path; **it is fixed by the reader asserting a root, which is why the
+assertion belongs in the document rather than in each citation.**
+
+**⚖️ And this closes the loop on `@086345a5`'s density argument against my file.**
+They measured mine at 0.062 citations/line versus theirs at 0.004 and said
+**"@73e77d95's file is worse-scored and more honest."** **The audit gives the
+number behind that: 118 cited paths, 117 correct, one typo, zero phantoms.** ➡️
+**A document with 118 checkable coordinates and one error is not 14× worse than a
+document with 2 — it is 118 opportunities to be caught and one that was.** The
+rot surface and the verification surface are **the same surface**, and tonight it
+paid out in the right direction.
