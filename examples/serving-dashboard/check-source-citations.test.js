@@ -910,6 +910,30 @@ const DECLARED_UNCOVERED = [
   'REVIEW-POINT.md',
   'browser-render-verification.md',
   'demo-spec.md',
+  // COSTED, NOT GUESSED. This is the most-cited document in the directory: 38
+  // files reference it, against 16 for demo-spec.md (negative control: 0). Its
+  // own author asked for it to be adopted here, which retires the "somebody is
+  // still appending" reason above -- so I measured the adoption instead of
+  // assuming it was cheap. I promoted it to OWNED_DOCS, ran this file, and got
+  // FOUR RED TESTS COVERING 14 DEFECTS: one citation to a path tracked nowhere
+  // in the repository, one pointing 69 lines past the end of a file that shrank,
+  // ten naming a symbol absent from the cited file entirely, and two files a
+  // reviewer would click and get nothing. Then I put it back.
+  //
+  // They are all REAL, and none of them are mine to repair: the fix is prose in
+  // another lane's document. Adopting it today would redden the branch on
+  // defects its owner has not been shown yet, which is precisely how the note
+  // above says a guard gets deleted -- and deleting this guard costs more than
+  // the coverage it is protecting.
+  //
+  // So the deferral stays, but it is no longer VAGUE, and that is the whole
+  // point of writing this down: an undeclared gap and a gap declared without a
+  // price look identical in a list, and both read as "someone decided this was
+  // fine". TO CLEAR IT: fix the 14 citations, move this line up into
+  // OWNED_DOCS, and this file will tell you in under four seconds whether you
+  // got them all. The measurement is one edit away from being re-run by anyone
+  // who doubts it, which is the only form of deferral that cannot rot into a
+  // permanent exemption.
   'design/demo-ux.md',
   'perf-baseline.md',
   'prefix-cache-verification.md',
