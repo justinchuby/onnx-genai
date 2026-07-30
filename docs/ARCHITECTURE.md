@@ -468,23 +468,6 @@ Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:575-59
 
 > ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`driver.rs:595-603`), and published through an atomic or a broadcast channel. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted.
 
-### 5.15 Telemetry must be *published* by the engine, never *requested* from it — ASSUMED ⚠️
-
-The engine holds no concurrent-reader path. Both driver paths take an **exclusive borrow** for the whole of a generation:
-
-- **Batched path:** non-`Generate` commands are deferred (`driver.rs:592`) until `manager.is_idle()` (`:604`), drained at `:520`. Under sustained load the batch may never idle. (§5.11)
-- **Pipeline/fallback path:** `handle_driver_command(engine: &mut Engine, ..)` (`driver.rs:674`) runs `run_fallback_generation` **inline** at `:696`. The generation completes *inside* the command handler, so the next command — telemetry or otherwise — is not read until it returns.
-
-**These look like two problems and are one.** The queue policy is not the cause; **`&mut Engine` is.** While a generation holds the exclusive borrow, no reader can observe the engine *at all* — not because a channel is busy, but because the borrow makes concurrent observation unrepresentable. Draining the queue faster cannot fix it, and neither can adding another command.
-
-**The consequence is uniform and severe:** the engine is observable only when idle. Every interesting quantity — page allocation, block sharing, batch occupancy — exists **only during** generation. The system can be measured precisely when it has nothing to say.
-
-**The shape that works** is to invert the direction. State written from *inside* the mutable borrow into shared, atomic storage (`Arc<...AtomicU64...>`) can be read from outside with **no borrow at all**: wait-free, no channel, no deferral, no borrow conflict — and cheaper in the decode loop than servicing a channel, since it is a relaxed store rather than a `try_recv` plus a reply.
-
-> **Stated as a rule:** *observability must not traverse the command channel — publish, don't request.* Any telemetry modelled as a `DriverCommand` inherits this ceiling by construction and will read as **frozen under load and fine when idle**, which is the hardest failure mode to catch, because every test that does not hold load passes.
-
----
-
 ### 5.12 Exactly one model-directory validator — **ASPIRATIONAL, CURRENTLY VIOLATED** ⚠️
 
 > A directory is a valid model directory if and only if `ModelDirectory::load` (`onnx-genai-ort/src/loader.rs:35`) accepts it. No other component may define its own criterion.
@@ -529,6 +512,23 @@ Three independent instances:
 **Why it holds:** each of these was a reasonable narrowing for its original caller — a length is all the original consumer needed.
 
 **What breaks if violated:** you discover mid-implementation that the data was computed and thrown away, and the fix is an API change in a lower crate rather than the "just call the getter" you planned for. Widening the return type is usually the right fix; recomputing at the call site duplicates the invariant.
+
+---
+
+### 5.15 Telemetry must be *published* by the engine, never *requested* from it — ASSUMED ⚠️
+
+The engine holds no concurrent-reader path. Both driver paths take an **exclusive borrow** for the whole of a generation:
+
+- **Batched path:** non-`Generate` commands are deferred (`driver.rs:592`) until `manager.is_idle()` (`:604`), drained at `:520`. Under sustained load the batch may never idle. (§5.11)
+- **Pipeline/fallback path:** `handle_driver_command(engine: &mut Engine, ..)` (`driver.rs:674`) runs `run_fallback_generation` **inline** at `:696`. The generation completes *inside* the command handler, so the next command — telemetry or otherwise — is not read until it returns.
+
+**These look like two problems and are one.** The queue policy is not the cause; **`&mut Engine` is.** While a generation holds the exclusive borrow, no reader can observe the engine *at all* — not because a channel is busy, but because the borrow makes concurrent observation unrepresentable. Draining the queue faster cannot fix it, and neither can adding another command.
+
+**The consequence is uniform and severe:** the engine is observable only when idle. Every interesting quantity — page allocation, block sharing, batch occupancy — exists **only during** generation. The system can be measured precisely when it has nothing to say.
+
+**The shape that works** is to invert the direction. State written from *inside* the mutable borrow into shared, atomic storage (`Arc<...AtomicU64...>`) can be read from outside with **no borrow at all**: wait-free, no channel, no deferral, no borrow conflict — and cheaper in the decode loop than servicing a channel, since it is a relaxed store rather than a `try_recv` plus a reply.
+
+> **Stated as a rule:** *observability must not traverse the command channel — publish, don't request.* Any telemetry modelled as a `DriverCommand` inherits this ceiling by construction and will read as **frozen under load and fine when idle**, which is the hardest failure mode to catch, because every test that does not hold load passes.
 
 ---
 
