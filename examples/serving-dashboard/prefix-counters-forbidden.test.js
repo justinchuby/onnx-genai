@@ -47,15 +47,30 @@
 // below is the debt, enumerated so it cannot be forgotten, and it may only ever
 // SHRINK. Any NEW module naming these fields fails immediately.
 //
-// MUTATION PROVING IT FAILS: add `prefix_cache_hits` to any .js file not on the
-// allowlist -- e.g. `echo "// prefix_cache_hits" >> dashboard/throughput.js`.
+// MUTATION PROVING IT FAILS -- AND IT MUST BE COMMITTED, WHICH IS NEW.
+//
+// This scan reads the SHIPPING TREE, not the desk, so the old instruction here
+// (`echo "// prefix_cache_hits" >> dashboard/throughput.js`) no longer reddens
+// anything: an uncommitted append is invisible to `git show` by construction.
+// Measured the same way on the sibling guard in this directory -- a working-tree
+// mutation left it at exit 0 -- so this is the mechanism, not a guess.
+//
+// The mutation that works, in a throwaway worktree so the shipping branch is
+// never polluted:
+//   git worktree add --detach /tmp/wt && cd /tmp/wt/examples/serving-dashboard
+//   echo '// prefix_cache_hits' >> dashboard/throughput.js
+//   git commit --only -m probe -- dashboard/throughput.js
+//
+// ⚠️ AND `assertShippingTree()` WILL REFUSE THAT WORKTREE, deliberately: the
+// probe commit is not contained in the shipping branch. That refusal is the
+// guard working, not the mutation failing. To exercise the ban itself, call
+// the two scanning arms against `shippedSourceFiles()` directly rather than
+// through the suite. A procedure that cannot be run is worse than none, so it
+// is written out here rather than left as "mutate it and see".
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { describe, it } from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { join, relative } from 'node:path';
 
-const ROOT = fileURLToPath(new URL('.', import.meta.url));
+import { assertShippingTree, shipped, shippedPaths } from './shipping-tree.mjs';
 
 /** The counters ruled unshippable. `hit_rate` is `hits / completed generations`. */
 // BOTH SPELLINGS. The wire format is underscored (`prefix_cache_hits`); the
@@ -85,18 +100,40 @@ const ALLOWLIST = new Map([
   ['telemetry-provenance.js', 'permanent: the register that forbids them'],
 ]);
 
-/** @returns {string[]} every .js file in the demo, excluding tests and deps */
-function sourceFiles(dir = ROOT, found = []) {
-  for (const entry of readdirSync(dir)) {
-    if (entry === 'node_modules' || entry === '.git' || entry === 'design') continue;
-    const full = join(dir, entry);
-    if (statSync(full).isDirectory()) sourceFiles(full, found);
-    else if (entry.endsWith('.js') && !entry.endsWith('.test.js')) found.push(full);
-  }
-  return found;
+/**
+ * Every shipped .js module in the demo, from the SHIPPING TREE rather than the desk.
+ *
+ * This used to walk the working directory with `readdirSync` and read each hit
+ * with `readFileSync`, which answers a different question than the one this
+ * file asks. A ban on shipping a counter is a claim about what is COMMITTED.
+ * Read from the desk it becomes a claim about one agent's uncommitted edits --
+ * and on a tree fourteen agents are writing to, those are not the same set in
+ * either direction. An untracked scratch file makes this go red for a defect
+ * nobody shipped; a tracked file someone has locally deleted makes it go green
+ * for a defect that is still on the branch.
+ *
+ * The desk-versus-index gap opens exactly when it matters. A clean tree makes
+ * the two identical, and a dirty tree is precisely when a forbidden counter is
+ * most likely to be mid-flight.
+ *
+ * `design/` stays excluded: it is source-adjacent documentation, not shipped JS.
+ */
+function shippedSourceFiles() {
+  return shippedPaths().filter(
+    (rel) =>
+      rel.endsWith('.js') &&
+      !rel.endsWith('.test.js') &&
+      !rel.startsWith('design/') &&
+      !rel.includes('node_modules/'),
+  );
 }
 
 describe('the prefix-cache counters are unnameable', () => {
+  // Provenance before content. A check that validates content before validating
+  // its own tree can report a confident, detailed, entirely accurate result
+  // about an artefact nobody will merge.
+  assertShippingTree();
+
   // ⚠️ THIS CHECK PASSED WITH THE ENTIRE DASHBOARD EMPTIED AND COMMITTED.
   //
   // Found by mutation: every tracked non-test file in examples/serving-dashboard
@@ -114,12 +151,12 @@ describe('the prefix-cache counters are unnameable', () => {
   // the product; it is the instrument's own calibration, and a red here
   // invalidates the two arms below rather than reporting a defect in the code.
   it('CAN RUN: the scan reaches real source and the scanner still fires', () => {
-    const files = sourceFiles();
+    const files = shippedSourceFiles();
 
     // A count alone would not have caught the mutation that found this: the
     // files were all still THERE, they were merely empty. Bytes are the
     // property that actually went to zero.
-    const bytes = files.reduce((total, file) => total + readFileSync(file, 'utf8').length, 0);
+    const bytes = files.reduce((total, rel) => total + shipped(rel).length, 0);
     assert.ok(
       files.length >= 20 && bytes >= 100_000,
       `the scan reached ${files.length} files totalling ${bytes} bytes. That is ` +
@@ -134,7 +171,7 @@ describe('the prefix-cache counters are unnameable', () => {
     // not, either the register stopped recording them -- which is a real
     // finding -- or `FORBIDDEN` no longer matches how they are spelled, which
     // would make every green below meaningless.
-    const register = readFileSync(join(ROOT, 'telemetry-provenance.js'), 'utf8');
+    const register = shipped('telemetry-provenance.js');
     const found = FORBIDDEN.filter((field) => register.includes(field));
     assert.ok(
       found.length > 0,
@@ -157,10 +194,9 @@ describe('the prefix-cache counters are unnameable', () => {
   it('is not referenced by any module outside the shrinking allowlist', () => {
     /** @type {string[]} */
     const violations = [];
-    for (const file of sourceFiles()) {
-      const rel = relative(ROOT, file);
+    for (const rel of shippedSourceFiles()) {
       if (ALLOWLIST.has(rel)) continue;
-      const source = readFileSync(file, 'utf8');
+      const source = shipped(rel);
       for (const field of FORBIDDEN) {
         if (source.includes(field)) violations.push(`${rel} names ${field}`);
       }
@@ -230,10 +266,9 @@ describe('the prefix-cache counters are unnameable', () => {
     // The deepest trap: `hit_rate` is hits / COMPLETED GENERATIONS. Even once
     // the counters are gone, the words remain inviting and the field stays on
     // the wire, so the vocabulary is banned from UI copy too.
-    for (const file of sourceFiles()) {
-      const rel = relative(ROOT, file);
+    for (const rel of shippedSourceFiles()) {
       if (ALLOWLIST.has(rel)) continue;
-      const source = readFileSync(file, 'utf8');
+      const source = shipped(rel);
       assert.equal(
         /['"`][^'"`]*\b(cache hit rate|prefix hit rate|cache lookups)\b/i.test(source),
         false,
