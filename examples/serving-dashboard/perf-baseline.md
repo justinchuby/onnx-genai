@@ -1582,3 +1582,94 @@ python3 qa-batch-width.py 8133 qwen-scatter    # expect peak in_flight 4
 python3 qa-batch-width.py 8134 qwen-dynamic    # expect peak in_flight 1
 
 ```
+
+---
+
+## 12. Can a hero number be taken on this box right now? No — measured, not asserted.
+
+@1cb42f0e handed me the box for an AC33 re-take and asked for one thing that follows from my own
+data: **paired, interleaved, worst-case rather than mean.** I built exactly that, and it says the
+number cannot be taken. This section is the evidence for declining rather than producing a figure.
+
+### 12.1 Protocol
+
+- **Arm identity asserted in the same invocation as the measurement**, using the discriminator
+  @1cb42f0e corrected me to: `/v1/models` **field count** (4 = baseline arm, 7 = post-fix arm).
+  Measured arm reported **7** — `created, id, is_default, loaded, object, owned_by, path`.
+  The governor-metric probe is **not** used: it returns an identical value on two binaries we can
+  prove differ, so it has zero discriminating power here.
+- **True effect is ZERO by construction**: both arms are the *same binary*, on the *same server*
+  (`:9611`), same prompt, `temperature=0`, requests **interleaved A,B,A,B…** within one window.
+  Any non-zero reading is pure instrument.
+- `loadavg[1]` recorded **with every sample**, per my standing constraint.
+
+### 12.2 Result — a true-zero effect reads +58.41 %
+
+| pair | arm A tok/s | arm B tok/s | delta | load1 |
+|---|---|---|---|---|
+| 1 | 19.449 | 11.359 | **−41.60 %** | 30.5 |
+| 2 | 13.499 | 21.385 | **+58.41 %** | 28.3 |
+| 3 | 20.993 | 16.398 | −21.89 % | 185.1 |
+| 4 | 22.004 | 17.228 | −21.71 % | 157.6 |
+| 5 | 21.418 | 19.892 | −7.12 % | 212.7 |
+| 6 | 18.933 | 10.352 | −45.32 % | 183.7 |
+| 7 | 18.600 | 20.674 | +11.15 % | 136.8 |
+| 8 | 22.838 | 20.596 | −9.82 % | 117.9 |
+
+```
+n = 16 samples, 8 interleaved pairs, TRUE EFFECT = 0
+  MEAN delta       -9.74 %      <- what a mean-based report would claim
+  MEDIAN delta    -15.76 %
+  WORST-CASE pair +58.41 %      <- the honest number
+  CV              19.83 %       (clean-tree baseline: 1.98 %)
+```
+
+### 12.3 What this actually rules out — precision, not existence
+
+**The envelope on a zero effect is ±58 %. That does not forbid claiming a large speedup; it
+forbids claiming its DIGITS.** A 2.46× result is +146 %, still outside a ±58 % null envelope — so
+"there is a substantial batching speedup" would survive. **"2.46" would not.** On this box the
+honest statement of a 2.46× observation is *"somewhere between roughly 1.6× and 3.9×"*, and three
+significant figures is not a thing this hardware can currently produce.
+
+**That is the precise sense in which the withdrawal in §1.2 was right, now shown by an interleaved
+null under the corrected identity protocol rather than argued.**
+
+### 12.4 Two things I got wrong on the way, both worth more than the result
+
+**Interleaving does not fix this box, and I expected it to.** Interleaving defends against *drift* —
+a slow trend across a run. This box is **bursty**: `loadavg` moved `69.35 → 28.11 → 212.7` within
+minutes, and a neighbouring server went `4.47 cores → 0.00` between adjacent 20-second windows.
+**A burst that lands on one arm of a pair is indistinguishable from an effect**, which is exactly
+what pairs 2 and 6 are. Note also that the mean (−9.74 %) and median (−15.76 %) are **both far
+from zero** — the contamination is not confined to the tails, so trimming would not have saved it.
+
+**And `ps %cpu` is not an instrument.** Hunting the load source, `ps -Ao pcpu -r` reported pid
+10697 at **317.7 %** — I had "a server is burning 3.2 cores while idle, P1" half-written. Sampling
+**cumulative CPU-time deltas** over a fixed window gave **0.02 cores** for that pid, and found the
+real consumer was a *different* process (4.47 cores) which was **legitimately serving another
+agent's benchmark** and went to **0.00** in the next window while reporting
+`queue_depth=0, active_sessions=0`. Had I stopped one step earlier I would have filed a spin defect
+against a healthy idle server.
+
+**Both errors are the same shape as the browser artifacts in `browser-render-verification.md`
+§10.9: the instrument answered confidently and I had not checked it against the subject.**
+
+### 12.5 The precondition, and why I am not clearing it myself
+
+§4 pins the deployment shape at **exactly 1 server**. The box currently has **13 listeners across
+15 processes**, and they belong to other agents. **I will not kill them** — one was demonstrably
+mid-benchmark during my sampling window, and killing it would corrupt someone else's result the
+same way theirs corrupts mine.
+
+**The mutual-contamination point is the actionable one: two agents timing simultaneously invalidate
+each other's numbers, and neither can see it in their own data.** Any hero-number re-take needs an
+exclusive window, announced, with every other timing lane held — not merely a careful harness.
+
+### What this section does NOT claim
+
+- It does **not** claim the batching speedup is absent. It claims **this box cannot currently
+  resolve its digits**.
+- The null is on one model (`qwen-scatter`) at 120 max tokens on one server. I did not sweep.
+- `loadavg` is a coarse proxy for contention; I did not attribute the load to specific agents.
+- 8 pairs is enough to establish the envelope is large. It is not enough to characterise its shape.
