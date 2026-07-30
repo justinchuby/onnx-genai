@@ -297,6 +297,23 @@ longer exists anywhere in the catalogue (`grep -c 'admin.rs:178'` → **0**; con
 state, and rewriting a number inside a quotation to satisfy a citation checker falsifies the
 quote.*
 
+**And the coordinate never resolved, which is measured, not assumed — `crates/onnx-genai-server/src/routes/admin.rs:178`
+is `"paused_sessions",`.** The real `batch_capacity` sites in that file are `:122`, `:231`, `:232`
+and `:240`; the file is 714 lines, so `:178` is **in range and simply wrong**. That is the
+strongest possible argument against "repairing" it: re-anchoring the number would invent an
+address for a string the source no longer contains, and would convert an honest quotation of a
+dead entry into a false claim about a live file. **A citation that cannot be repaired truthfully
+must be captioned, not corrected.**
+
+> **This reviewer's own scorecard, stated because it is unflattering and because the instrument
+> rewards the wrong thing.** This document has the *fewest* `file:NNN` citations of the three
+> reviewer deliverables — 2, against 90 and 43. That was published as evidence of cleanliness.
+> It is not. **Both of this document's citations are wrong, so its citation hit rate is 0 of 2.**
+> The census that scored it well counts citations; it has never validated one — neither bounds
+> nor content. *A document with almost no coordinates cannot rot and cannot be checked either.
+> Low citation density is a different trade, not rigour, and here it bought the worst hit rate
+> on the branch behind the best-looking number.*
+
 **And the guard recommended below was built, with a control I did not think to ask for.**
 `provenance-expiry.test.js` extracts the key literals and asserts the list equals its own `Set`
 — and it carries an **anti-vacuity** assertion, because a regex that matched nothing would
