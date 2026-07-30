@@ -2527,3 +2527,80 @@ and the shared-buffer reason that names the model when the host declined.
 > **The honesty layer can prove a value is measured, fresh, attributed and
 > non-guessed. It cannot prove the value is the thing the label says it is.
 > That gap is where every remaining defect on this page lives.**
+
+---
+
+## AC215 — A FALLBACK MUST BE AN ABSENCE, NEVER THE MOST FLATTERING MEMBER OF THE ENUM
+
+**Verified at `7ebf5888` by reading every site and its surrounding block, not by
+counting hits. @12e42da8 named two sites; there are THREE, and they answer three
+DIFFERENT questions with one confident sentence.**
+
+```
+panel-kit.js:62   derived: { glyph: 'ᴰ',
+                    title: 'Derived by arithmetic on measured inputs.' }
+                  ⬅ A POSITIVE, SPECIFIC, FALSIFIABLE CLAIM ABOUT PROVENANCE
+
+:191   SOURCE_BADGES[sourceClass] ?? SOURCE_BADGES.derived
+         ⬅ the CLASS is not in the badge table
+:1300  if (!source) return 'derived';
+         ⬅ there is NO SOURCE AT ALL
+:1308  return 'derived';
+         ⬅ a source was supplied and WE DID NOT RECOGNISE IT   ** the worst one **
+
+THREE DISTINCT UNKNOWNS -> ONE ANSWER, AND THE ANSWER IS NOT 'UNKNOWN'.
+[CONTROL] field-state.js:236  STATE_ALIASES[state] ?? null
+          ⬅ THE HONEST FORM ALREADY EXISTS IN THIS REPOSITORY.
+```
+
+### Why this is worse than a wrong value
+
+**The default is not neutral. It is the most favourable label available.** The
+enum already contains honest words for lower confidence — `estimated:
+"ESTIMATED, not measured"`, `simulated: "SIMULATED — not measured at all"` —
+**and the fallback reaches past both of them for the one that asserts a
+measured lineage.**
+
+> **When we do not know where a number came from, we tell the user it was
+> computed by arithmetic on measured inputs. That is not a missing badge. It is
+> the strongest provenance claim in the vocabulary, awarded by default, at
+> exactly the moment we have the least evidence for it.**
+
+***A guard that fails toward accepting is a bug; an honesty layer that fails
+toward CLAIMING is a contradiction in terms.*** Every other mechanism on this
+page fails safe: absent fields are omitted rather than zeroed, an unidentifiable
+model yields no value rather than a guess, `NEVER_BIND` refuses rather than
+redacts. **This one site fails loud in the wrong direction and is invisible
+precisely because it looks like the other badges.**
+
+**And `:1308` is the sharpest of the three: a writer supplied a source string,
+we failed to recognise it, and we replaced their claim with a stronger one of
+our own.** *A misspelt source is upgraded to a measured lineage.*
+
+### Acceptance
+
+1. **An unrecognised, absent, or unmappable source renders as an ABSENCE** —
+   no glyph, no `abbr`, no hover text — **not as `derived` and not as a new
+   "unknown" badge that would become a fourth claim to keep in sync.**
+2. **All three sites change together.** Two sites agreeing today is a divergence
+   waiting to happen, not defence in depth. **The count is THREE; a fix that
+   repairs the two that were reported leaves the worst one live.**
+3. **The guard asserts the absence, not the glyph.** A test that pins the
+   current string locks the lie in — six test files already mention `derived`,
+   so **the repair must check those tests are asserting the new behaviour rather
+   than the old one, or the suite will defend the defect.**
+4. **The fix is a copy, not an invention.** `field-state.js:236` already returns
+   `null`. **Do not author a third convention.**
+
+### The general law
+
+> **A default answers a question you were not asked. Choose it by asking:
+> if this default is wrong, does the user believe MORE than the truth, or LESS?
+> Only the second is permissible in a surface whose entire product claim is
+> that it does not overstate what it knows.**
+
+**This is AC214's twin.** AC214: the caption must not outrun the value's
+specificity. AC215: **the badge must not outrun the value's provenance.** In
+both, the number is correct, the arithmetic is correct, and the *sentence
+wrapped around it* is the falsehood — **which is why every counter, ratchet and
+freshness check on this page reads them as healthy.**
