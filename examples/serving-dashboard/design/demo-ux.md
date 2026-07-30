@@ -3207,3 +3207,50 @@ Both of their closing items are **already closed**, and I'd rather they spend th
 | D136 | `state` is a **total pure function** of classification + liveness, throwing on unknown | Two ways to compute one value is a divergence generator |
 | D137 | Panels branch on `state` only; `classification` is audit metadata | A second copy of the mapping always misses the newest state |
 | D138 | `not-applicable` is the only public name; my `Bypassed` is retired | A synonym's cost is paid by every future reader |
+
+---
+
+## 47. 🔴 SWITCHER REVIEW — THE FILTERING CAME BACK UNDER A DIFFERENT PREDICATE (D139–D141)
+
+`ui/scenario-switcher.js` landed minutes after §45. **Most of it is right, and two things in it are better than my spec.** One thing reintroduces a reversed ruling, and it is invisible from inside the file.
+
+### 47.1 ✅ What is right, including where the author beat the spec
+
+- **D134 satisfied exactly.** `<a>` elements, `aria-current="page"`, `aria-label="Scenarios"`, **no `role="tab"`, no keydown traversal.** The comment gives the correct reason unprompted: *"Announcing them as tabs would promise in-place panel switching that this control genuinely does not do."*
+- **The remote hint is marked in TEXT, not colour** — `on the dynamic server` — with the reason written in the file. That is D21 applied without being asked.
+- **Better than my spec:** the `title` explains *"The two servers are separate processes, so this is a page load rather than a panel switch."* **I specified naming the destination; they explained the mechanism, which is the part that stops the navigation feeling like a misclick.**
+
+### 47.2 🔴 D139 — UNREACHABLE SCENARIOS ARE NOT RENDERED AS TABS AT ALL
+
+```js
+const reachable = plans.filter(({ plan }) => plan.available);
+for (const { id, plan } of reachable) list.append(buildTab(...));   // ← only reachable
+```
+Everything unreachable is moved into a grouped `<aside>`. **So a scenario whose server is not running DISAPPEARS FROM THE TAB LIST.**
+
+**This is the ruling @12e42da8 reversed and I struck from §13(f) forty minutes ago — returning under a different predicate.** The reversal was about filtering by **profile**; this filters by **reachability**. **The author has almost certainly not violated any rule they were aware of.** But the visitor-facing effect is identical and lands harder:
+
+> **THE MOST COMMON FIRST-RUN STATE IS ONE SERVER RUNNING.** A visitor who starts only the scatter server sees a product with **one scenario**, and **never learns that paged KV or prefix caching were ever part of the demo.** @376a0297's words for exactly this: *filtering the tabs would have hidden the existence of half the product from every visitor.*
+
+**And I must own the other half of why this happened: my own §31 says inactive PANELS collapse into ONE group card**, because six identical notices is the wall-of-zeros failure in a politer typeface. **The author applied my panel rule to the tabs, which is a completely reasonable reading of my contract.** The distinction I never wrote down:
+
+- **D139:** **panels display VALUES; tabs advertise CAPABILITIES.** Collapsing an empty panel hides a *number the visitor can see is missing*. **Collapsing a tab hides the EXISTENCE of a feature — the visitor cannot miss what was never named.** Grouping is right for the first and wrong for the second. **The two rules read alike and point opposite ways, which is my failure to distinguish them, not the author's to infer it.**
+
+### 47.3 🔒 D140 — THE RESOLUTION KEEPS BOTH RULINGS, AND KEEPS THEIR NOTE
+
+The tension is real and the author's instinct was sound; it does not require choosing.
+
+- **All three tabs render, always.** An unreachable one is **present, dimmed, and FOCUSABLE**, carrying `:8124 not responding` **on screen** — not in a `title`, because a hover is not a channel for a keyboard or touch visitor, and per §45.2 the port belongs on screen for the skeptic who wants to `curl` it.
+- **It does not navigate** (D133 preserved — their removal solved this correctly, and interception solves it while keeping the tab). Activating it reveals the launch command **inline**.
+- **`buildUnreachableNote` STAYS** — as the single grouped *explanation*, which is the right shape and satisfies §31. **It is a supplement to the tabs, never a substitute for them.**
+- **D141:** the dimmed tab uses **opacity + the on-screen sublabel**, never `--og-unavail-*` or the dotted underline (D132). Four vocabularies are live; a tab wearing the field-state palette would be **legible and mean the wrong thing, which is worse than illegible.**
+
+### 47.4 The transferable part
+
+**This is the first defect tonight caused by a rule of mine being applied CORRECTLY somewhere it didn't belong.** Every other one was a stale premise, a wrong tree, or an unenforced claim. **A rule that generalises further than its author intended is indistinguishable, from the reader's side, from a rule that was meant to.** The fix is not more prose — it is to state the *boundary* alongside the rule. §31 now carries D139's distinction inline.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D139 | Panels display values and may group; tabs advertise capabilities and may not | A visitor cannot miss a feature that was never named |
+| D140 | All three tabs always render; unreachable = present, dimmed, focusable, non-navigating; the grouped note stays as explanation | Preserves the always-visible ruling, D133, and §31 together |
+| D141 | Dimmed tab uses opacity + on-screen sublabel, never the field-state palette | Legible-but-wrong-meaning is worse than illegible |
