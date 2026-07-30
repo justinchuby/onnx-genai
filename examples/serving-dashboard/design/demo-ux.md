@@ -7057,3 +7057,55 @@ with `cp`; `git checkout --` restores to HEAD, which is not where you were.**
 | D331 | Assert the channel that CARRIES a pair, not a uniform floor across channels | Border style separates 6 of 6 pairs including all three where rule colour collapses; nothing asserted it |
 | D332 | `git checkout --` restores to HEAD, so it is a destroy for any file with uncommitted work | It wiped five finished tests mid-proof; `cp` is the correct backup for a dirty file |
 | D333 | Score a mutation by the NAME of the failing test, never by the count | `#ff0000` scored fail=1 against a pre-existing annotation test, proving nothing about the new arm |
+
+---
+
+## §98 — `fail` is not the complement of `pass`, and my own sweep never knew
+
+@73e77d95 measured that `git archive` as a review vehicle produces 12 failures
+and **66 silently missing tests** where `git worktree --detach` is 608/608 green
+at the same SHA. I reproduced the mechanism against my own six guards, in a
+directory with no `.git`, with a named-failing file as a control in the same
+output. **Two of my six degrade, for two different root causes, and one of them
+degrades silently.**
+
+| guard | in extract | cause |
+|---|---|---|
+| `asset-graph` · `state-channel` · `state-treatments` · `page-claims` | ✅ unchanged | read only files under the dashboard |
+| `check-field-states` | ⛔ `pass=0 fail=1` | imports `shipping-tree.mjs`, which calls git |
+| `provenance-expiry` | ⚠️ **`pass=0 fail=0`** | reads `crates/…/admin.rs`, **outside the extract root** |
+
+**Two things I got wrong, both of which I had already published rules against.**
+
+**① A transitive dependency is invisible to a grep of the file.** I checked all
+six guards for `git`, `execSync`, `rev-parse` and got **zero** on every one —
+then `check-field-states` crashed inside git anyway. The call is one `import`
+away, in `shipping-tree.mjs`. *Grepping a file cannot find what its imports do.*
+The control saved this: the file @73e77d95 named as failing scored 1, so the
+instrument discriminated — it simply wasn't looking at the right graph.
+
+**② `pass=0 fail=0` is what a CRASHED suite looks like, and it reads as
+benign.** `provenance-expiry` aborted in a `before` hook, and the runner
+reported:
+
+```
+ℹ tests 5   ℹ pass 0   ℹ fail 0   ℹ cancelled 5      exit 1
+```
+
+**`cancelled` is a third counter, and my sweep harness has only ever read two.**
+Every "all six suites green, fail=0" I published tonight came from a two-counter
+reading of a five-counter reality. Those reports were *correct* — every suite had
+`pass > 0`, which incidentally acted as a floor — **but they were correct by luck,
+not by construction, and the harness could never have told me otherwise.** A
+suite that vanishes and a suite that passes nothing render identically.
+
+This is the defect I have been building guards against all night, sitting in the
+instrument I used to verify those guards. **The remedy is the one this file
+already applies to everything else: assert `tests === pass`, read the exit code,
+and never infer a green from the absence of a red.**
+
+| ID | Decision | Rationale |
+|---|---|---|
+| D334 | Score a suite on `tests === pass` plus the exit code, never on `fail === 0` | `cancelled` is a third counter; a crashed suite reports `pass=0 fail=0`, identical to an empty one |
+| D335 | A grep of a file cannot find a git dependency one import away | Six guards scored zero git references; one crashed inside git via `shipping-tree.mjs` |
+| D336 | A guard that reads outside its own subtree cannot run in an extract | `provenance-expiry` reads `crates/…/admin.rs` and fails on a path, not on git — a second root cause for the same symptom |
