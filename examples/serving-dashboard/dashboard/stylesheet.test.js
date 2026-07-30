@@ -26,6 +26,10 @@ import { createFakeStore, measured, series } from './testing/fake-store.js';
 const CSS_PATH = fileURLToPath(new URL('../styles/panels.css', import.meta.url));
 const css = readFileSync(CSS_PATH, 'utf8');
 
+const PAGE_PATH = fileURLToPath(new URL('../index.html', import.meta.url));
+const page = readFileSync(PAGE_PATH, 'utf8');
+
+
 let uninstallDom;
 before(() => {
   uninstallDom = installFakeDom();
@@ -332,5 +336,34 @@ describe('stylesheet contract', () => {
       );
     }
     handle.unmount();
+  });
+});
+
+describe('the panel stylesheet is actually reachable from the page', () => {
+  it('is linked by index.html', () => {
+    // This is the only failure mode in the whole dashboard that produces NO
+    // signal at all: an unlinked stylesheet is not a 404, not a console
+    // warning, not a DevTools entry. The file is present and correct and
+    // simply never requested, so every panel renders unstyled while looking
+    // like a CSS bug. Hatch fills, the stale age suffix and the unavailable
+    // treatment are all carried by this file, which means the honesty
+    // affordances are the first thing to disappear.
+    //
+    // index.html belongs to the shell owner, not to me; this test does not
+    // edit it, it just refuses to let the link go missing quietly.
+    assert.match(
+      page,
+      /<link[^>]+href=["'][^"']*styles\/panels\.css["']/,
+      'index.html does not link styles/panels.css, so every panel renders ' +
+        'completely unstyled with no error anywhere. Fix is one line beside ' +
+        'the existing tokens.css link: <link rel="stylesheet" href="./styles/panels.css" />',
+    );
+  });
+
+  it('links tokens.css too, since panels.css only consumes --og-* variables', () => {
+    // panels.css defines no colours of its own by design. Linked without
+    // tokens.css it would render worse than unstyled: every custom property
+    // resolves to nothing, so text and hatches lose their colour entirely.
+    assert.match(page, /<link[^>]+href=["'][^"']*styles\/tokens\.css["']/);
   });
 });
