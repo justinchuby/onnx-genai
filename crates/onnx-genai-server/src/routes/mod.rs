@@ -675,8 +675,17 @@ pub(crate) struct BlockTable {
 /// The window a [`BlockTableResponse`] actually covers.
 #[derive(Debug, Serialize)]
 pub(crate) struct BlockWindow {
+    /// First page id examined.
     start: usize,
-    count: usize,
+    /// How many page ids were EXAMINED, after clamping to `MAX_WINDOW`.
+    ///
+    /// Distinct from `returned` on purpose. The query's `count` asks for a
+    /// range of page ids, not a number of results, and absent pages are
+    /// skipped -- so asking for 256 and receiving 8 is normal. Without both
+    /// numbers a client cannot tell a clamped request from a sparse pool.
+    scanned: usize,
+    /// How many pages in that range were live and are present in `blocks`.
+    returned: usize,
     /// Pages the mirror can describe, so a client knows when it has them all.
     total: usize,
 }
@@ -734,10 +743,22 @@ impl BlockTableResponse {
         }
     }
 
+    /// The decode path is not chosen yet. Distinct from `not_applicable`:
+    /// this one will change on its own, and a client should keep polling.
+    pub(crate) fn pending(model_id: Option<String>, detail: &'static str) -> Self {
+        let mut response = Self::not_applicable(model_id, detail);
+        response.unavailable = response.unavailable.map(|mut u| {
+            u.code = "pending";
+            u
+        });
+        response
+    }
+
     pub(crate) fn live(
         model_id: Option<String>,
         snapshot: onnx_genai_engine::KvTelemetrySnapshot,
         start: usize,
+        scanned: usize,
         total: usize,
         states: Vec<onnx_genai_engine::BlockState>,
     ) -> Self {
@@ -765,7 +786,8 @@ impl BlockTableResponse {
             allocation_failures: Some(snapshot.allocation_failures),
             window: Some(BlockWindow {
                 start,
-                count: states.len(),
+                scanned,
+                returned: states.len(),
                 total,
             }),
             blocks: Some(blocks),

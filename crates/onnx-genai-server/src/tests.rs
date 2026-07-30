@@ -4008,25 +4008,29 @@ fn a_prefix_miss_records_no_hit_and_no_tokens_saved() {
     assert_eq!(crate::metrics::prefix_reuse_increments(0), (0, 0));
 }
 
-/// The fixture is a continuous-batching model, and continuous batching is
-/// mutually exclusive with paged KV. The endpoint must say so rather than
-/// rendering the pool's real-but-unused numbers.
+/// No number may be rendered until the decode path is known to be paged.
 ///
-/// This is the field-honesty case that is hardest to catch: the pool reports a
-/// genuine non-zero capacity, so the response would survive any "is this
-/// hardcoded?" audit while describing a mechanism the decoder never touches.
+/// The fixture never reaches an applicable state, and the endpoint must say so
+/// with `pending` or `not-applicable` -- never by falling through to live
+/// numbers. `hot_capacity` is the trap: it is a truthful read of a real pool
+/// and it is NON-ZERO, so it survives any "is this hardcoded?" audit while
+/// describing a mechanism the decoder never consults.
+///
+/// Asserting the invariant rather than one specific code is deliberate. The
+/// first version of this test demanded `not-applicable`, which is what the
+/// buggy tri-state-less implementation happened to emit, so the test defended
+/// the bug instead of catching it.
 #[tokio::test]
-async fn kv_blocks_reports_not_applicable_on_a_continuous_batching_model() {
+async fn kv_blocks_renders_no_numbers_until_paged_kv_is_known_to_be_in_use() {
     let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv/blocks").await;
 
     assert_eq!(body["applicable"], false);
-    assert_eq!(
-        body["unavailable"]["code"].as_str(),
-        Some("not-applicable"),
-        "a batching model does not have a partially-working paged pool"
+    let code = body["unavailable"]["code"].as_str().expect("a reason code");
+    assert!(
+        matches!(code, "pending" | "not-applicable"),
+        "expected pending or not-applicable, got {code:?}"
     );
 
-    // No number may be present, including the honest non-zero ones.
     for field in [
         "page_size",
         "pages_in_use",
@@ -4039,9 +4043,32 @@ async fn kv_blocks_reports_not_applicable_on_a_continuous_batching_model() {
     ] {
         assert!(
             body.get(field).is_none(),
-            "{field} must not be sent when paged KV is not the mechanism in use"
+            "{field} must not be sent while applicable is false -- \
+             a non-zero value is not evidence of applicability"
         );
     }
+}
+
+/// "We have not determined the decode path yet" and "the decoder does not use
+/// paged KV" are different claims, and only one of them resolves by waiting.
+#[test]
+fn pending_and_not_applicable_are_distinct_codes() {
+    let pending = crate::routes::BlockTableResponse::pending(Some("m".into()), "starting");
+    let settled = crate::routes::BlockTableResponse::not_applicable(Some("m".into()), "batching");
+
+    let pending = serde_json::to_value(&pending).unwrap();
+    let settled = serde_json::to_value(&settled).unwrap();
+
+    assert_eq!(pending["unavailable"]["code"], "pending");
+    assert_eq!(settled["unavailable"]["code"], "not-applicable");
+    assert_ne!(
+        pending["unavailable"]["code"], settled["unavailable"]["code"],
+        "collapsing these told a paged model it was a batching one, confidently"
+    );
+    assert_eq!(
+        pending["applicable"], false,
+        "pending must still gate rendering"
+    );
 }
 
 /// A caller must always be told which window it received, so it never has to
@@ -4117,4 +4144,72 @@ async fn debug_kv_carries_no_unavailable_apology_strings() {
             );
         }
     }
+}
+
+/// The block table is columnar -- four parallel arrays indexed together. If
+/// they ever differ in length a consumer reads one page's ref_count against
+/// another page's tier, which is worse than no data because it still renders.
+#[test]
+fn a_block_table_keeps_its_columns_the_same_length() {
+    let states: Vec<onnx_genai_engine::BlockState> = (0..7)
+        .map(|i| onnx_genai_engine::BlockState {
+            page_id: i,
+            ref_count: i + 1,
+            filled_slots: (i as usize) * 2,
+            tier: (i % 2) as u8,
+        })
+        .collect();
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,
+        256,
+        4096,
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    let blocks = &value["blocks"];
+    let n = blocks["page_ids"].as_array().unwrap().len();
+    for column in ["page_ids", "ref_counts", "filled_slots", "tiers"] {
+        assert_eq!(
+            blocks[column].as_array().unwrap().len(),
+            n,
+            "column {column} is out of step with page_ids"
+        );
+    }
+    assert_eq!(n, 7);
+}
+
+/// `scanned` and `returned` must stay distinct: a sparse pool legitimately
+/// returns far fewer blocks than the range asked for, and a client has to be
+/// able to tell that apart from having its request clamped.
+#[test]
+fn a_block_window_distinguishes_pages_scanned_from_pages_returned() {
+    let states: Vec<onnx_genai_engine::BlockState> = (0..3)
+        .map(|i| onnx_genai_engine::BlockState {
+            page_id: i * 40,
+            ref_count: 1,
+            filled_slots: 0,
+            tier: 0,
+        })
+        .collect();
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,
+        256,
+        4096,
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    assert_eq!(value["window"]["scanned"], 256, "the range examined");
+    assert_eq!(value["window"]["returned"], 3, "live pages found in it");
+    assert_eq!(
+        value["window"]["total"], 4096,
+        "pages the mirror can describe"
+    );
+    assert_ne!(
+        value["window"]["scanned"], value["window"]["returned"],
+        "collapsing these two into one number is the bug this test exists for"
+    );
 }

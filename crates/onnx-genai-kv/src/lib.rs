@@ -46,7 +46,7 @@ pub use page_table::{
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;
-pub use telemetry::{BlockState, KvTelemetry, KvTelemetrySnapshot};
+pub use telemetry::{Applicability, BlockState, KvTelemetry, KvTelemetrySnapshot};
 
 /// Sequence identifier.
 pub type SequenceId = u64;

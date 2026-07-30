@@ -589,12 +589,25 @@ pub(crate) async fn debug_kv_blocks(
     // counter here is a truthful read of a pool the decoder never consults --
     // including the non-zero capacity, which is exactly what makes it
     // dangerous. A client cannot be expected to know that.
-    if !telemetry.is_applicable() {
-        return Ok(Json(BlockTableResponse::not_applicable(
-            model_id,
-            "this model uses continuous batching, which is mutually exclusive \
-             with paged KV; the page pool exists but the decoder never uses it",
-        )));
+    match telemetry.applicability() {
+        onnx_genai_engine::Applicability::NotApplicable => {
+            return Ok(Json(BlockTableResponse::not_applicable(
+                model_id,
+                "this model uses continuous batching, which is mutually exclusive \
+                 with paged KV; the page pool exists but the decoder never uses it",
+            )));
+        }
+        // The driver picks the decode path asynchronously at startup, so a poll
+        // can genuinely arrive before the answer exists. Saying "pending" costs
+        // one frame; saying "not applicable" would state the opposite of the
+        // truth with total confidence on a paged model.
+        onnx_genai_engine::Applicability::Unknown => {
+            return Ok(Json(BlockTableResponse::pending(
+                model_id,
+                "the driver has not finished selecting a decode path yet",
+            )));
+        }
+        onnx_genai_engine::Applicability::Applicable => {}
     }
 
     let count = query
@@ -606,6 +619,7 @@ pub(crate) async fn debug_kv_blocks(
         model_id,
         telemetry.snapshot(),
         query.start,
+        count,
         telemetry.mirrored_block_capacity(),
         states,
     )))

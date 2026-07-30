@@ -59,7 +59,8 @@ pub use native_decode::{
     NativeDecodeCudaOptions, NativeDecodeDevice, NativeDecodeSession,
 };
 pub use onnx_genai_kv::{
-    BlockState, CachePriority, KvDType, KvTelemetry, KvTelemetrySnapshot, LocalTieredConfig,
+    Applicability, BlockState, CachePriority, KvDType, KvTelemetry, KvTelemetrySnapshot,
+    LocalTieredConfig,
 };
 pub use onnx_genai_metadata::GenerationDefaults;
 pub use onnx_genai_scheduler::{

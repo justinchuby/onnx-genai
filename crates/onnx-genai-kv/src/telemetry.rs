@@ -36,7 +36,20 @@
 //! hot path to make a dashboard's two numbers agree would be a bad trade.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+/// Whether the paged pool is the mechanism the decoder actually uses.
+///
+/// `Unknown` is a real and necessary state: the driver picks the decode path
+/// asynchronously at startup, so a poll can genuinely arrive before the answer
+/// exists. Collapsing it into `NotApplicable` turns "we don't know yet" into a
+/// confident wrong claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applicability {
+    Unknown = 0,
+    Applicable = 1,
+    NotApplicable = 2,
+}
 
 /// Live, lock-free view of a page pool.
 ///
@@ -69,7 +82,7 @@ pub struct KvTelemetry {
     /// uses. Continuous batching and paged KV are mutually exclusive, so on a
     /// batching model every counter here is a truthful reading of a pool that
     /// is never consulted.
-    applicable: AtomicBool,
+    applicability: AtomicU8,
 }
 
 /// Packs a page's mutable state into one atomic word so a reader gets a
@@ -130,11 +143,16 @@ impl KvTelemetry {
 
     /// Declares whether this pool is the one the decoder actually uses.
     ///
-    /// Must be set by whoever knows the decode path. Defaults to `false` so a
-    /// caller that forgets reports "not applicable" rather than presenting
-    /// readings from an idle pool as live measurements.
+    /// Must be set by whoever knows the decode path -- which is only knowable
+    /// once the driver has chosen one, so this is set asynchronously at
+    /// startup.
     pub fn set_applicable(&self, applicable: bool) {
-        self.applicable.store(applicable, Ordering::Relaxed);
+        let state = if applicable {
+            Applicability::Applicable
+        } else {
+            Applicability::NotApplicable
+        };
+        self.applicability.store(state as u8, Ordering::Relaxed);
     }
 
     /// Whether these counters describe a mechanism that is actually in play.
@@ -146,7 +164,23 @@ impl KvTelemetry {
     /// pool the decoder never touches. A non-zero value is not evidence that a
     /// mechanism is in use.
     pub fn is_applicable(&self) -> bool {
-        self.applicable.load(Ordering::Relaxed)
+        self.applicability() == Applicability::Applicable
+    }
+
+    /// Whether the decode path has been chosen yet, and if so which.
+    ///
+    /// Tri-state on purpose. A plain bool defaulting to `false` meant that a
+    /// poll arriving before the driver finished starting got the confident
+    /// answer "not applicable: this model uses continuous batching" -- on a
+    /// *paged* model, that is not a missing answer, it is the opposite of the
+    /// truth, stated authoritatively. `Unknown` is reported as `pending`, which
+    /// is a claim we can always stand behind.
+    pub fn applicability(&self) -> Applicability {
+        match self.applicability.load(Ordering::Relaxed) {
+            1 => Applicability::Applicable,
+            2 => Applicability::NotApplicable,
+            _ => Applicability::Unknown,
+        }
     }
 
     /// Sizes the per-page mirror. Called once, on attach.
@@ -774,5 +808,41 @@ mod tests {
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.pages_in_use, 0, "must not wrap to usize::MAX");
         assert_eq!(snapshot.pages_shared, 0);
+    }
+
+    /// A pool nobody has classified must not claim the decoder skips it.
+    ///
+    /// This is the test that would have caught the original bug. `applicable`
+    /// was a bool defaulting to `false`, and `false` rendered as the confident
+    /// sentence "this model uses continuous batching" -- so during the window
+    /// before the driver finished starting, a paged model asserted the exact
+    /// opposite of the truth. The bug was invisible to every existing test
+    /// because the driver almost always won the race.
+    #[test]
+    fn an_unclassified_pool_says_unknown_rather_than_not_applicable() {
+        let telemetry = KvTelemetry::default();
+        assert_eq!(telemetry.applicability(), Applicability::Unknown);
+        assert!(
+            !telemetry.is_applicable(),
+            "unknown must still gate rendering"
+        );
+        assert_ne!(
+            telemetry.applicability(),
+            Applicability::NotApplicable,
+            "not knowing yet is not the same claim as knowing it does not apply"
+        );
+    }
+
+    #[test]
+    fn classifying_a_pool_moves_it_off_unknown_in_both_directions() {
+        let paged = KvTelemetry::default();
+        paged.set_applicable(true);
+        assert_eq!(paged.applicability(), Applicability::Applicable);
+        assert!(paged.is_applicable());
+
+        let batching = KvTelemetry::default();
+        batching.set_applicable(false);
+        assert_eq!(batching.applicability(), Applicability::NotApplicable);
+        assert!(!batching.is_applicable());
     }
 }
