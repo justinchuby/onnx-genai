@@ -3920,3 +3920,92 @@ form is theirs: ***IF YOU RAN IT ONCE, SAY `ONCE`.*** And my guard's own `4 fres
 too. **I have spent this review demanding denominators and omitted the one that counts the runs.**
 
 MEASURED-AT: 37d0d72e
+
+---
+
+## R86 — my own freshness guard certifies SHAs that have never existed
+
+MEASURED-AT: cd22dcb7
+
+Guard source read at `cd22dcb7`; predicate exercised against boundary `37d0d72e`.
+Four arms, run not argued (n=1 each; the predicate is pure, so repetition adds nothing).
+
+`check-review-freshness.test.js:373-380` decides freshness like this:
+
+```js
+const fresh = declared.filter((measuredAt) => {
+  try {
+    git('merge-base', '--is-ancestor', measuredAt, boundary);
+    return git('rev-parse', `${measuredAt}^{commit}`) === boundary;
+  } catch {
+    return true; // not an ancestor of the boundary => at or after it
+  }
+});
+```
+
+The comment states the intent exactly, and the intent is right: `--is-ancestor`
+exits non-zero when the SHA is *not* an ancestor, which means it sits at or after
+the boundary, which means fresh. But `execFileSync` throws on *any* non-zero exit,
+and "unknown object" is also non-zero.
+
+| arm | SHA | shape | resolves | verdict |
+|---|---|---|---|---|
+| A | `8230060c` (my oldest stamp) | ok | yes | `FRESH=false` — correct, stale |
+| B | `37d0d72e` (the boundary) | ok | yes | `FRESH=true` — correct |
+| C | `bc620c27` (freshly generated, fabricated) | ok | **no** | **`FRESH=true`** |
+| D | `deadbeef` | ok | **no** | **`FRESH=true`** |
+| E | `cd22dcb7` (real, after the boundary) | ok | yes | `FRESH=true` — correct |
+
+Arms C and D are the finding. **C and E are indistinguishable to the guard**, and
+one of them is a measurement while the other is eight characters of hex that has
+never named anything. The shape filter at `:91` (`/^[0-9a-f]{7,40}$/`) checks that
+a declaration *looks* like a SHA and never checks that it *is* one, so a fabrication
+passes shape, throws on resolve, and is caught by the branch that means "fresh".
+
+Root cause, and it is mine: **the catch conflates two different non-zero exits.**
+`--is-ancestor` returning 1 is an answer. `fatal: Not a valid object name` is the
+absence of an answer. The predicate treats "git said no" and "git could not tell"
+as the same fact, and resolves the ambiguity toward green.
+
+The same file already does this correctly one field over. `REVIEW-POINT-SHA` is
+resolved at `:355` **outside any try** — a bad boundary throws and the suite fails
+loudly. So one guard, two SHA-shaped fields, opposite failure directions: the
+boundary fails closed, the measurement fails open. Nothing in the file explains
+why, because it is not a decision — it is the accident of which line got wrapped.
+
+Fix is one line, and it goes *before* the try so the resolve failure stays fatal:
+
+```js
+const fresh = declared.filter((measuredAt) => {
+  git('rev-parse', `${measuredAt}^{commit}`); // fabricated SHA => throw, do not "fresh"
+  try {
+    git('merge-base', '--is-ancestor', measuredAt, boundary);
+    return git('rev-parse', `${measuredAt}^{commit}`) === boundary;
+  } catch {
+    return true;
+  }
+});
+```
+
+NOT BUILT. The guard is my file, but we are under a commit freeze and this changes
+a predicate three other owners are being asked to satisfy right now. It needs the
+lead's word, and it must land *with* `2067b0ee` (see R63) — the `matchAll` fix —
+because at the pin the guard still reads only the first declaration.
+
+### The law, and it is the sharpest one my lane has produced
+
+**A guard that cannot distinguish "no" from "I could not tell" has not failed
+closed or open — it has failed *silently*, and it will always choose the answer
+that ends the conversation.**
+
+@e00032a4 warned this hour that a `MEASURED-AT` applied without re-measuring
+converts staleness into a freshness certificate for free. This is that warning's
+worst case: the stamp does not even have to name a real commit. Their remedy —
+re-read, then *append* — is correct and I endorse it unchanged. My finding is
+that the instrument meant to verify the remedy cannot.
+
+And the credit I was given needs its qualifier. My document carries **12**
+declarations, not 10; **8** distinct SHAs; **5** of them the same pin. That is
+re-measuring against a fixed point, which is the discipline working as intended —
+but it is not twelve independent measurements, and I will not bank the compliment
+at the higher number.
