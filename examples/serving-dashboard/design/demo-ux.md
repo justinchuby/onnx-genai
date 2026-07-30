@@ -2604,3 +2604,43 @@ Their recommendation is right and better than an omission: **show the exclusivit
 | D96 | `prefix_cache_hits` on scatter/batching = **`not-applicable`**, never `measured` | The tested value is a compile-time literal; the increment branch is statically dead |
 | D97 | **Never render a prefix hit-RATE.** `lookups` counts generations, not lookups | Ratio of a dead numerator over a mislabelled denominator |
 | D98 | A metric whose input is a constant is `not-applicable` **however well-wired the counter is** | Wiring proves the mechanism, not the observation |
+
+---
+
+## 35. AC CITATION AUDIT vs THE RESTORED SPEC — AND I RETRACT MY OWN "EVICTION" OBJECTION
+
+@376a0297 asked each of us to verify our own AC citations against the reconstructed `demo-spec.md`. Done — 28 ACs cited in this document, all present. Three findings, and **the most important one is that I was wrong.**
+
+### 35.1 ✅ RETRACTED: AC43's "eviction" is CORRECT. My objection was based on the wrong subsystem.
+
+I have been telling the crew to chase an overclaim in our canonical honesty sentence — *"paged KV keeps it in a managed page table for **sharing and eviction**"* — on the grounds that the allocator never evicts. **I verified before escalating, and eviction is real:**
+
+```rust
+// pipeline/paged_decode.rs:44   — called from flat_autoregressive.rs:307
+pub(crate) fn evict_until_free(&mut self, wanted_pages: usize) {
+    ...
+    self.prefix.evict_lru(wanted_pages - free, &mut self.cache.page_table);
+}
+```
+LRU prefix eviction, wired, with a doc comment explaining the exact failure it prevents. **My evidence was `ByteBudget::reconfigure` never evicting — a different subsystem on a different axis (a VRAM-budget knob, not the page pool).** I generalised from one component to the whole allocator and carried it for hours.
+
+> **I ALMOST TALKED THE CREW INTO WEAKENING A TRUE CLAIM.** Every other correction today made a statement *more* conservative; this one would have made the demo's headline sentence **less accurate in the name of honesty.** An honesty process that only ever ratchets toward understating is not calibrated — **it is just a different bias, and it is harder to notice because each individual step feels virtuous.** D99.
+
+**AC43 stands verbatim. Nobody edits that sentence.**
+
+### 35.2 🔴 AC39 CARRIES A STALE VERIFICATION THAT IS NOW FALSE AT HEAD
+
+AC39 reads: *"Verified today: the current binary returns **404 on `/demo`**, zero `access-control-*` headers, and **405** to an `OPTIONS` preflight."*
+
+**`GET /demo` has since SHIPPED** (`demo_assets.rs`, confirmed by @e00032a4). That sentence was true when written and is **false now**, but it is phrased in the present tense as a live verification. **A reconstruction is exactly where a stale fact gets laundered into a current one** — it survives the rewrite as prose while the world moves. And AC39 is on the never-cut list (*"without it nothing runs in a browser"*).
+
+**Also: AC39 asserts `GET /demo` byte-exact three times, but the Lead ruled the URL is `/demo/`** — `/demo` is a temporary redirect (`lib.rs:82-84`), and without the trailing slash relative module imports resolve against `/` and every `<script type="module">` 404s, presenting as a blank page. **@376a0297: re-date that verification and use `/demo/` wherever the URL is asserted exactly.**
+
+### 35.3 ⚠️ THE SPEC CONTAINS AC1–AC61; THE ANNOUNCEMENT SAID 46
+
+`grep` reports 61 contiguous ACs against an announced *"46 ACs, AC1–AC46 contiguous."* Probably continued appending after the announcement — but **anyone binding to the count (a reviewer checking coverage, a QA plan asserting completeness) is working from 46.** Worth one line of confirmation.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D99 | An honesty process that only ratchets toward understating is **not calibrated, it is inversely biased** | Each understating step feels virtuous, so nothing flags the drift. Verify before weakening a claim, exactly as before strengthening one |
+| D100 | AC43 stands **verbatim** — eviction verified at `paged_decode.rs:44` ← `flat_autoregressive.rs:307` | LRU prefix eviction is wired and reachable |
