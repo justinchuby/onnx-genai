@@ -241,7 +241,7 @@ Two consequences worth carrying past this PR:
 | **C9** | Poll fan-out isolates failure but not latency: `Promise.all` means the slowest endpoint gates the cycle | **downgraded** — root cause fixed by `bd2197a4`; `/metrics` worst case now 71.3 ms. **The server fix removes today's instance; C2 removes the class** | measured |
 | **C4** | `batch_in_flight` ÷ `batch_capacity` scope mismatch | low, latent | read |
 | **C7/C8** | `ServeDir` publishes the whole assets directory; no CSP header | minor | read |
-| **C5** | `may_disclose_model_paths()` keys on bind address rather than peer | **RETRACTED — see §7.2** | executed |
+| **C5** | `may_disclose_model_paths()` keys on **bind address rather than peer** — and the demo binds `127.0.0.1` by default, so the disclosure branch is the **default path for every demo run**, not an edge case | 🔴 **LIVE AT `review-0`** · closed at HEAD by `2da3e851` (after the tag) — see §7.2 and §7.7 | executed |
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
 | **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
 | **C12** | ~~`fetchWithDeadline` is the only network path by discipline, not by construction; nothing asserts it~~ | **RETRACTED — false when filed. See §7.6** | executed |
@@ -323,6 +323,39 @@ retraction.**
 **7.4 — A false count caught before broadcast.** I nearly reported the router's
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
+
+**7.7 — I reported C5 STRUCK against `review-0` and it is LIVE there. That is a false
+green in my own lane, and the mechanism is new tonight.**
+
+`may_disclose_model_paths()` exists at `review-0:crates/onnx-genai-server/src/state.rs`
+and reads `self.bind_addr.is_some_and(|addr| addr.ip().is_loopback())`. It was deleted at
+`2da3e851` — *"delete the path-disclosure conditional, because one branch was already
+proven sufficient"* — which is **not an ancestor of the tag**. I measured at `HEAD`, saw
+the deletion, and reported the finding struck **against an artifact that predates the
+fix.**
+
+**The mechanism is created by the pin itself and did not exist before it.** While the
+review target was "HEAD, whatever it is now," measuring at HEAD was merely racy. Once the
+target is pinned to `review-0` and the tree keeps moving, **measuring at HEAD is
+systematically optimistic**: every defect fixed after the tag reads as struck. The tag was
+introduced to stop drift, and it does — but only for readers who measure *at the tag*.
+Habit measures at HEAD.
+
+**This is the inverse of the error the rest of the crew hit.** Eleven stale-order reports
+tonight came from measuring at a SHA *older* than the fix and reporting a defect still
+live — a **stale red**, which costs rework. Mine came from measuring at a SHA *newer* than
+the artifact and reporting a live defect closed — a **false green**, which costs the
+finding. A stale red gets argued down by the next reader; a false green stops the next
+reader looking. Same root cause, opposite sign, and the false green is the expensive one.
+
+**The substance is also worse than I originally filed it, and my retraction was wrong on
+its own terms.** I withdrew C5 because the residual needed a proxy or port-forward, which
+I judged unlikely. But `run-demo.sh:29` sets `BIND_HOST="${BIND_HOST:-127.0.0.1}"`, so
+`is_loopback()` is **true on every default demo run** and the disclosure branch is the
+one that always executes. This is **allow-by-default**: the gate's safe branch is the one
+the demo never takes. @bb2ee824's browser observation of a full home directory is not a
+separate finding — **it is this defect's observable effect**, and the two were tracked
+independently all night without being connected.
 
 **7.6 — C12 was false when I filed it, and my exclusion pattern is why.** I claimed
 nothing asserts that `fetchWithDeadline` is the only network path. `request-deadline.test.js`
