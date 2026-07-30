@@ -966,3 +966,142 @@ describe('a withdrawn figure keeps its withdrawal notice', () => {
     );
   });
 });
+
+// The palette/page boundary. Every guard above this line reads token
+// DEFINITIONS; the state rules read token USES. Nothing owned the wire between
+// them, which is how `[data-state='not-applicable']` spent the `--og-unavail-*`
+// family -- the palette declared a brightness gap, the page never asked for it,
+// and both halves were independently correct. Mutating a token value proves
+// nothing about that: `I broke it and it went red` is only evidence if the test
+// was looking at the thing you broke.
+//
+// COMMENTS ARE STRIPPED FIRST, and that is not defensive tidiness -- shell.css
+// contains `the colour is --og-pending-rule, NOT --og-pending-fg` inside the
+// `pending` block. Matching raw text reads a warning ABOUT a token as a USE of
+// it: the same defect class as a fix quoting the bug it killed.
+describe('every state selector consumes the token family named for it', () => {
+  const shell = read('./styles/shell.css');
+  // measured is a DOCUMENTED exemption and the documentation is NOT mine:
+  // tokens.css says there is deliberately NO --og-measured-fg, because measured
+  // "is not a treatment, it is the ABSENCE of one" -- full-contrast --og-fg, the
+  // page default. The exemption below is not a concession, it is that ruling.
+  //
+  // I first recorded this exemption as "--og-measured-fg exists and is consumed
+  // by nothing". FALSE: a name-only grep matched the token inside the very
+  // comment declaring it must never exist. Third time tonight that prose ABOUT
+  // a thing read as the thing. The control below binds this exemption to that
+  // note, so if anyone ever mints the token the exemption is revisited rather
+  // than silently protecting a state from the guard.
+  const FAMILY = {
+    measured: null,
+    pending: 'pending',
+    stale: 'stale',
+    unavailable: 'unavail',
+    'not-applicable': 'na',
+  };
+  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  const block = (state) => {
+    const m = shell.match(
+      new RegExp(`^\\[data-state='${state}'\\]\\s*\\{([\\s\\S]*?)^\\}`, 'm'),
+    );
+    return m ? stripComments(m[1]) : null;
+  };
+
+  it('finds a bare rule for every state (non-zero floor)', () => {
+    const missing = Object.keys(FAMILY).filter((s) => block(s) === null);
+    assert.deepEqual(
+      missing,
+      [],
+      `No [data-state='X'] block found in shell.css for: ${missing.join(', ')}. ` +
+        `Either the rule was deleted -- in which case that state falls through to ` +
+        `default contrast and renders like a measurement -- or this matcher no ` +
+        `longer matches, and every assertion below would pass by finding nothing.`,
+    );
+  });
+
+  // HONEST SCOPE: no state block contains `var(--og-…)` inside a comment TODAY,
+  // and the matcher requires `var(`, so stripping changes no current result. It
+  // is defence against where this file is already trending: the not-applicable
+  // block's comment names `--og-unavail-` in prose, and the more precisely a
+  // future author quotes the old wiring -- `var(--og-unavail-fg)` -- the more
+  // confidently an unstripped guard reports the defect that comment commemorates.
+  it('removes commented-out token uses before matching (control)', () => {
+    const synthetic = 'color: var(--og-na-fg);\n/* was var(--og-unavail-fg) */';
+    assert.ok(
+      /var\(\s*--og-unavail-fg\s*\)/.test(synthetic),
+      'Control setup is broken: the synthetic block does not contain the ' +
+        'commented token it exists to test.',
+    );
+    assert.ok(
+      !/var\(\s*--og-unavail-fg\s*\)/.test(stripComments(synthetic)),
+      'stripComments left a commented var() in place. Any state block whose ' +
+        'comment quotes the wiring it replaced would be read as still having it.',
+    );
+    const na = shell.match(/^\[data-state='not-applicable'\]\s*\{([\s\S]*?)^\}/m)[1];
+    assert.ok(
+      na.includes('--og-unavail-'),
+      'The not-applicable block no longer names --og-unavail- in its comment. ' +
+        'This half of the control is now dead: it proved the stripper runs on ' +
+        'REAL text, not just a synthetic string. Re-point it or drop it.',
+    );
+    assert.ok(
+      !stripComments(na).includes('--og-unavail-'),
+      'stripComments did not run on the real not-applicable block.',
+    );
+  });
+
+  it('keeps the measured exemption tied to the ruling that grants it', () => {
+    const tokens = read('./styles/tokens.css');
+    assert.ok(
+      /deliberately NO .*--og-measured-fg/.test(tokens),
+      'tokens.css no longer states that --og-measured-fg deliberately does not ' +
+        'exist. The measured exemption in this guard rests on that ruling, so ' +
+        'it is now an unexplained hole: measured is the ONE state this guard ' +
+        'does not check. Either restore the note or wire measured to a family ' +
+        'and delete the exemption.',
+    );
+    assert.ok(
+      !/var\(\s*--og-measured-fg\s*\)/.test(read('./styles/shell.css')),
+      'shell.css now CONSUMES --og-measured-fg, which tokens.css says must not ' +
+        'exist. One of the two is wrong and the page is the one that renders.',
+    );
+  });
+
+  it('wires each state to its own family, for colour and for rule', () => {
+    const wrong = [];
+    for (const [state, fam] of Object.entries(FAMILY)) {
+      const body = block(state);
+      if (body === null || fam === null) continue;
+      const used = [...body.matchAll(/var\(\s*(--og-[a-z-]+?)-(fg|rule)\s*\)/g)];
+      for (const [, prefix, kind] of used) {
+        const want = `--og-${fam}`;
+        if (prefix !== want) {
+          wrong.push(
+            `[data-state='${state}'] consumes ${prefix}-${kind} but is named ` +
+              `for the '${fam}' family (${want}-${kind}). A state that spends ` +
+              `its neighbour's tokens renders as that neighbour, and the ` +
+              `palette cannot tell you -- both halves stay individually correct.`,
+          );
+        }
+      }
+    }
+    assert.deepEqual(wrong, [], `Cross-family token use:\n  ${wrong.join('\n  ')}`);
+  });
+
+  it('actually inspected some token uses (anti-vacuity)', () => {
+    let n = 0;
+    for (const [state, fam] of Object.entries(FAMILY)) {
+      if (fam === null) continue;
+      const body = block(state);
+      if (body) n += [...body.matchAll(/var\(\s*--og-[a-z-]+?-(fg|rule)\s*\)/g)].length;
+    }
+    assert.ok(
+      n >= 6,
+      `Only ${n} state token use(s) inspected across 4 families. Every state ` +
+        `declares at least a colour, so a number this low means the var() ` +
+        `matcher or the block matcher narrowed and the wiring check above is ` +
+        `passing on an empty set.`,
+    );
+  });
+});

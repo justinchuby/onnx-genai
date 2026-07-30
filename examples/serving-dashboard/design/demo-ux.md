@@ -4650,7 +4650,7 @@ $ git log --format='%h %ad %s' --date=format:'%H:%M' -- '*demo-spec.md'
 **🔒 SO, RE-ISSUED EXPLICITLY, ALL FOUR STILL LIVE, NONE PART OF ANY RECONSTRUCTION:**
 | Ask | File | Owner |
 |---|---|---|
-| **D232** `[data-state='not-applicable']` → `--og-na-fg`/`--og-na-rule` (one state currently renders two brightnesses; the dimmer is pixel-identical to `unavailable`) | `styles/shell.css:201` | @bb2ee824 / @c8d9a40e |
+| ~~**D232** `[data-state='not-applicable']` → `--og-na-fg`/`--og-na-rule`~~ **✅ LANDED.** Verified by bytes: the rule consumes `--og-na-fg` and `--og-na-rule`, and its own comment records the fix. **Now mechanically pinned by §95's wiring guard — it cannot regress silently.** | anchor: the `[data-state='not-applicable']` rule in `styles/shell.css` (was cited `:201`, which had drifted to `:228`; **line anchors in this table are hints, not addresses**) | @bb2ee824 / @c8d9a40e |
 | **D233** `pending` → `border-bottom: 1px solid` (italic on `···` is inert; first-frame state is indistinguishable from permanent absence) | `styles/shell.css` | @bb2ee824 / @c8d9a40e |
 | **D240** design comments → `3 of batch_capacity`, never `3 of 4` | `field-state.js:338,371`, `telemetry-provenance.js:505` | @bb2ee824 / @c8d9a40e |
 | **D239** batch-denominator tripwire, mutation stated | batch panel module | @bb2ee824 / @c8d9a40e |
@@ -6792,3 +6792,126 @@ the list leaves the work unowned* — I simply am not an instance of it.
 | D319 | A number transcribed by eye is testimony, not measurement | Published 15/6; machine truth 16/5 — wrong in *opposite* directions, which only hand-counting produces |
 | D320 | A defect-string census is self-inflating and must not be published as a count | Committing §92 added 4 sites to the corpus §92 counts; publish the discriminator instead |
 | D321 | Analysis outranks its own subject in any search for it | 7 hits of commentary vs 1 hit of cause, with the cause sorting last |
+
+## 95. I WAS ORDERED TO EDIT TWO TOKEN NAMES THAT WERE ALREADY CORRECT (D322–D325)
+
+The Lead reassigned `shell.css` to me to change two token names on
+`[data-state='not-applicable']`, on the finding that it consumes `--og-unavail-*`
+where the palette declares a deliberate brightness gap. **I did not make that edit.
+The fix is already in HEAD, and making it would have been a regression.**
+
+```
+MEASURED AT HEAD, by content:
+  [data-state='not-applicable']  ->  color: var(--og-na-fg)
+                                     border-bottom: … var(--og-na-rule)   ✅ CORRECT
+
+AND THE COMMENT DIRECTLY ABOVE IT, IN THE SHIPPED FILE:
+  "--og-na-*, NOT --og-unavail-*. tokens.css declares this state DELIBERATELY
+   BRIGHTER THAN `unavailable` … and this rule spent the neighbouring family
+   instead … The palette was never wrong; the page asked it the wrong question."
+```
+
+**That paragraph is the order, in the past tense, written by whoever fixed it.** The
+order was produced by reading the tombstone as the corpse — the class @376a0297 named
+tonight (*a fix that quotes the bug it killed is byte-identical to the bug*), now
+reaching the **command channel**, which is where it is most expensive: **a broadcast
+invites scrutiny, an order invites obedience.**
+
+> **D322 — Refuse an order whose premise is measurably false, and publish the
+> measurement rather than the refusal.** The cited line numbers had also drifted
+> (`:215-220` is mid-comment; the rules are at `:205` and `:228`), and the cited
+> consumers of `--og-na-fg` omitted the decisive one — **`shell.css:235`, which *is*
+> `[data-state='not-applicable']`.** An order carrying stale coordinates is not a
+> weaker order; **it is one whose evidence has already been checked once and passed.**
+
+### 95.1 WHAT I BUILT INSTEAD, WHICH IS WHAT WAS ACTUALLY ASKED FOR
+
+The Lead's second instruction was the valuable one: **a guard over *wiring* rather than
+over *values* — every `[data-state='X']` selector must consume the token family named
+for X.** Every guard I own reads token **definitions**; the state rules read token
+**uses**; **nothing owned the wire between them**, which is exactly how the original
+defect survived: the palette was right, the page was right about everything it
+declared, and the two were connected wrongly.
+
+`asset-graph.test.js` **27 → 32**, five arms:
+
+```
+non-zero floor    a bare rule must exist for all five states -- otherwise
+                  DELETING a selector makes the guard pass, and that state falls
+                  through to default contrast and renders like a measurement
+wiring            every var(--og-X-fg|rule) inside a state block must match the
+                  family that state is named for
+exemption binding the `measured` exemption is tied to the tokens.css note that
+                  grants it, and to shell.css NOT consuming the banned token
+comment stripping a control, scoped honestly (see below)
+anti-vacuity      >= 6 token uses inspected, or the matcher narrowed
+```
+
+**MUTATIONS, each asserted to be a real change before being scored, `shell.css`
+restored with `git checkout --` and verified byte-identical:**
+
+| mutation | result |
+|---|---|
+| `not-applicable` → `--og-unavail-fg` (the exact regression I was ordered to make) | **RED 29/2**, names the `na` family |
+| `stale` rule deleted entirely | **RED 28/3**, non-zero floor fires |
+| `stale` spends `--og-na-rule` | **RED 30/1**, names the cross-family use |
+| tokens.css note reworded | **RED 31/1**, "now an unexplained hole" |
+| `shell.css` consumes `--og-measured-fg` | **RED 31/1**, "tokens.css says must not exist" |
+| baseline | **32/32**, `shell.css` porcelain 0 |
+
+> **D323 — A guard that reads only one side of a boundary cannot fail on the boundary
+> itself.** Mutation testing inherits the blind spot of the instrument it mutates: mutate
+> a token value and a definition-reading guard goes red *honestly*, about a layer that
+> was never broken. **"I broke it and it went red" is evidence only if the guard was
+> looking at the thing you broke** — and the only way to know that is to state which
+> layer the guard reads, in the guard.
+
+### 95.2 THE THIRD TOMBSTONE I READ AS A CORPSE TONIGHT — MINE, CAUGHT BEFORE PUBLICATION
+
+I wrote into this guard that *"`--og-measured-fg` exists in tokens.css and is consumed
+by nothing — a dead token."* **False.** `tokens.css` says:
+
+> *"NOTE — there is deliberately NO `--og-ok-fg` / `--og-measured-fg` token. `ok` is not
+> a treatment, it is the ABSENCE of one: full-contrast `--og-fg`, the page's default."*
+
+**A name-only grep matched the token inside the comment declaring it must never exist.**
+I had already published three sections on this exact class, and I committed it anyway —
+**twice more in the same hour**, both times with a windowed `grep` whose 15-line window
+crossed into the next rule and attributed `--og-pending-fg` to `[data-state='measured']`.
+
+> **D324 — Knowing a defect class by name does not confer immunity to it; only a
+> mechanism does.** I caught all three by reading raw bytes in the end, never by
+> recognising the pattern. **The rule that works is procedural, not cognitive: never
+> report a match without printing the surrounding block, and never trust a window whose
+> boundary you did not assert.**
+
+The exemption is now **bound to its source** rather than restated by me: the guard fails
+if `tokens.css` stops saying the token must not exist, **and** fails if `shell.css` ever
+starts consuming it. **A ruling I merely quote is a ruling that can silently expire; a
+ruling I test is one that tells me when it does.**
+
+### 95.3 `review-0` — THIRD MEASUREMENT, AND THE WORD "IMMUTABLE" IS NOT A PROPERTY IT HAS
+
+The order restates *"the immutable tag `review-0` = `6ecd9183`."* Measured, three
+instruments:
+
+```
+git rev-parse review-0            -> 0aac6bb1…
+git rev-parse review-0^{commit}   -> 0aac6bb1…      (same; no annotation layer)
+git cat-file -t review-0          -> commit          <- LIGHTWEIGHT. Not a tag object.
+/private/tmp/review-0 worktree    -> 0aac6bb1…       <- 8.2 GB of files on disk
+merge-base --is-ancestor          -> review-0 is NOT an ancestor of 6ecd9183
+```
+
+> **D325 — A lightweight tag cannot be immutable, because it carries no tagger, no date
+> and no signature: `git tag -f` moves it and leaves no trace that it moved.** Calling
+> it immutable is a claim about intent, and **the four agents scoring findings "at
+> `6ecd9183`" are scoring them against a tree the tag does not name.** This needs one
+> ruling, not a fourth measurement.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D322 | Refuse an order with a false premise; publish the measurement, not the refusal | The ordered edit was already in HEAD and making it would regress; its citations had drifted |
+| D323 | A guard reading one side of a boundary cannot fail on the boundary | Mutation testing inherits the blind spot of what it mutates; state the layer in the guard |
+| D324 | Knowing a defect class does not confer immunity; only a mechanism does | Three tombstone-as-corpse errors by me in one hour, after publishing three sections on it |
+| D325 | A lightweight tag cannot be immutable | No tagger, no date, movable by `git tag -f` without trace; three instruments say `0aac6bb1` |
