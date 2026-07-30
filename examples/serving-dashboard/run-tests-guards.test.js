@@ -175,21 +175,24 @@ test('--allow-untracked downgrades that to a WARNING and says the total is desk-
   assert.match(out, /NOT the branch/);
 });
 
-test('a deleted TEST file is caught by the incomplete-checkout abort, not by the check written for it', () => {
+test('a deleted TEST file is caught by the incomplete-checkout abort, not by the tracked-but-not-run check', () => {
   const root = repo(healthyFiles());
   rmSync(join(root, 'nested/beta.test.js'));
   const { status, out } = runRunner(root);
   assert.equal(status, 1);
-  // THE FINDING: `run-tests.sh` carries a check whose message is
-  // "tracked at HEAD but missing from disk", written specifically for this case.
-  // It is UNREACHABLE. A missing tracked test file is a missing tracked file,
-  // and the incomplete-checkout abort -- added later, broader, and running
-  // earlier -- takes it every time. This pins which guard actually does the
-  // work, so nobody trusts the dead one.
+  // WHICH GUARD DOES THE WORK MATTERS, AND I GOT THIS WRONG ONCE. A deleted
+  // tracked test file is caught by the incomplete-checkout abort, which runs
+  // first and refuses to start Node at all. From that I concluded the
+  // tracked-but-not-run check below it was dead code. It is not: it is the only
+  // thing that catches a file which is PRESENT and simply never discovered --
+  // a narrowed glob -- and the incomplete-checkout abort is correctly silent
+  // there. See the comment at that branch in `run-tests.sh`.
+  //
+  // So this pins the division of labour, not a redundancy.
   assert.match(out, /this checkout is INCOMPLETE/);
   assert.match(out, /beta\.test\.js/);
   assert.match(out, /NO TESTS WERE RUN/);
-  assert.doesNotMatch(out, /tracked at HEAD but missing from disk/);
+  assert.doesNotMatch(out, /tracked at HEAD but were NOT RUN/);
 });
 
 test('a discovered file that contributes NO tests fails the suites-vs-discovered check', () => {

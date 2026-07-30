@@ -204,21 +204,28 @@ fi
 
 
 if (( ${#absent[@]} > 0 )); then
-  # UNREACHABLE IN A GIT TREE, AND DELIBERATELY LEFT THAT WAY RATHER THAN
-  # DELETED WITH ITS DATA. A test file tracked at HEAD and missing from disk is
-  # BY DEFINITION an incomplete checkout, and the check above -- added later,
-  # scoped to every tracked file in the repository, and aborting BEFORE Node
-  # runs -- catches it first with a better message. Proved by
-  # `run-tests-guards.test.js`: deleting a committed test file produces
-  # "this checkout is INCOMPLETE", never this branch.
+  # THIS IS THE CHECK THAT CATCHES A NARROWED DISCOVERY, AND IT IS THE MOST
+  # IMPORTANT ONE IN THIS FILE. I first recorded it as dead code, because a
+  # DELETED tracked test file is caught earlier by the incomplete-checkout
+  # abort. That was a true observation and the wrong conclusion, and the
+  # mutation that was supposed to confirm it refuted it instead:
   #
-  # It survives for the one case the broader check cannot serve: a tree where
-  # `git rev-parse` succeeds but the toplevel scan is skipped. If you ever see
-  # this message, the fail-fast abort above did not run, and THAT is the finding.
-  echo "FAIL: ${#absent[@]} test file(s) are tracked at HEAD but missing from disk:" >&2
+  #   narrow the `find` above to `-maxdepth 1`, at 9b54d3a9, in a detached
+  #   worktree -> `nested/beta.test.js` is TRACKED and PRESENT ON DISK, so the
+  #   incomplete-checkout abort correctly stays silent, and THIS branch is the
+  #   only thing standing between a silently smaller run and a green.
+  #
+  # So the two checks are not duplicates. The abort answers "is the tree all
+  # here"; this answers "did I look at all of it". A file can be present and
+  # unseen, which is the exact failure mode -- a documented glob skipping 305
+  # tests and exiting 0 -- that this whole script was written for.
+  echo "FAIL: ${#absent[@]} test file(s) are tracked at HEAD but were NOT RUN:" >&2
   printf '      %s\n' "${absent[@]}" >&2
-  echo "      This run skipped them entirely and still exited green." >&2
-  echo "      NOTE: the incomplete-checkout abort should have caught this first." >&2
+  echo "      They are tracked at HEAD and this run did not execute them." >&2
+  echo "      Either they are missing from disk (a broken checkout), or they" >&2
+  echo "      are on disk and discovery did not reach them (a narrowed glob)." >&2
+  echo "      Check which: a present-but-unseen file is the failure this" >&2
+  echo "      script exists to catch, and it exits 0 everywhere else." >&2
   status=1
 fi
 
