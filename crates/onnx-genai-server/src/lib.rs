@@ -13,6 +13,7 @@ use std::{net::SocketAddr, time::Instant};
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request},
+    handler::HandlerWithoutStateExt,
     middleware,
     middleware::Next,
     response::Response,
@@ -95,7 +96,13 @@ pub fn app(state: AppState) -> Router {
     router = match state.config.demo_assets_dir.clone() {
         Some(dir) => router.nest_service(
             "/demo",
-            ServeDir::new(dir).append_index_html_on_directories(true),
+            ServeDir::new(dir)
+                .append_index_html_on_directories(true)
+                // `ServeDir` answers its own 404 with an empty body. That is
+                // the browser-supplied-error-page defect, and it also has to
+                // stay byte-identical to the refusal in `restrict_demo_assets`
+                // -- see `demo_not_found`.
+                .not_found_service(demo_assets::demo_not_found.into_service()),
         ),
         None => router
             .route("/demo/", get(demo_assets::missing_assets))

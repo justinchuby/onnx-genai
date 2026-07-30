@@ -178,6 +178,163 @@ async fn demo_returns_not_found_for_unknown_assets() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// A 404 with an empty body is not a smaller error page, it is *no* error page:
+/// the browser substitutes its own, in the operating system's locale, with the
+/// full URL on screen. Measured in Chrome on a machine with a non-English
+/// locale, that is what the audience sees. Any bytes at all take the page back,
+/// so this asserts the floor across every way a `/demo` request can miss.
+#[tokio::test]
+async fn every_demo_not_found_carries_a_body_the_browser_will_not_replace() {
+    let dir = demo_fixture();
+    std::fs::write(dir.path().join("notes.md"), "internal notes").unwrap();
+
+    let cases = [
+        (
+            "refused: on disk, not servable",
+            Some(dir.path()),
+            "/demo/notes.md",
+        ),
+        (
+            "absent: servable extension",
+            Some(dir.path()),
+            "/demo/missing.js",
+        ),
+        (
+            "absent: non-servable extension",
+            Some(dir.path()),
+            "/demo/missing.md",
+        ),
+        ("dotfile segment", Some(dir.path()), "/demo/.env"),
+        (
+            "nested dotfile directory",
+            Some(dir.path()),
+            "/demo/sub/.git/config",
+        ),
+        ("no asset directory configured", None, "/demo/"),
+    ];
+
+    for (label, assets, uri) in cases {
+        let response = app_with_demo_dir(assets).oneshot(get(uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+        let body = body_string(response).await;
+        assert!(
+            !body.is_empty(),
+            "{label}: an empty 404 body hands the screen to the browser's own error page",
+        );
+    }
+
+    // Positive control, deliberately after the loop: without it, a router that
+    // 404s absolutely everything would satisfy every assertion above.
+    let served = app_with_demo_dir(Some(dir.path()))
+        .oneshot(get("/demo/app.js"))
+        .await
+        .unwrap();
+    assert_eq!(
+        served.status(),
+        StatusCode::OK,
+        "control: a servable asset must still be served, or the loop proves nothing",
+    );
+}
+
+/// Refusing a file that exists must be indistinguishable from one that never
+/// existed, or the 404 itself confirms what is on disk.
+///
+/// Both answers come from one constant, so the equality holds by construction.
+/// This asserts it on the bytes anyway, because the previous version of this
+/// property held only because BOTH bodies were empty -- giving either one a
+/// body without the other would have leaked the difference as a length.
+#[tokio::test]
+async fn a_refused_demo_asset_is_byte_identical_to_an_absent_one() {
+    let dir = demo_fixture();
+    std::fs::write(dir.path().join("security-review.md"), "our own findings").unwrap();
+
+    let refused = body_string(
+        app_with_demo_dir(Some(dir.path()))
+            .oneshot(get("/demo/security-review.md"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let absent = body_string(
+        app_with_demo_dir(Some(dir.path()))
+            .oneshot(get("/demo/never-existed.md"))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        refused, absent,
+        "a refused file is distinguishable from an absent one, which confirms it is on disk",
+    );
+    assert!(
+        !refused.is_empty(),
+        "two empty bodies satisfy the equality above vacuously",
+    );
+    assert!(
+        !refused.contains("security-review"),
+        "the refusal named the file it refused: {refused}",
+    );
+
+    // Both requests above carry a non-servable extension, so both are answered
+    // by the refusal layer and agree by construction. The drift that actually
+    // costs us is between the TWO mechanisms: a servable extension with no file
+    // behind it is answered by `ServeDir`, which has its own not-found service.
+    // Without this, removing that service leaves this test green.
+    let from_serve_dir = body_string(
+        app_with_demo_dir(Some(dir.path()))
+            .oneshot(get("/demo/never-existed.js"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        from_serve_dir, refused,
+        "ServeDir's not-found body drifted from the refusal body; the two mechanisms \
+         answering the same question must answer it with the same bytes",
+    );
+}
+
+/// The error body is the surface most likely to be read by a stranger, and the
+/// one we just finished clearing of filesystem paths. It must not reintroduce a
+/// disclosure by quoting the request back, and must not name the asset
+/// directory it searched.
+#[tokio::test]
+async fn no_demo_error_body_echoes_the_request_or_an_absolute_path() {
+    let dir = demo_fixture();
+    let absolute = dir.path().to_str().expect("utf-8 tempdir").to_string();
+
+    for assets in [Some(dir.path()), None] {
+        let response = app_with_demo_dir(assets)
+            .oneshot(get("/demo/UNIQUEPATHMARKER.md?token=SECRETQUERYMARKER"))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+
+        assert!(
+            !body.contains("UNIQUEPATHMARKER"),
+            "the body echoed the requested path: {body}",
+        );
+        assert!(
+            !body.contains("SECRETQUERYMARKER"),
+            "the body echoed the query string: {body}",
+        );
+        assert!(
+            !body.contains(&absolute),
+            "the body disclosed the absolute asset directory: {body}",
+        );
+        // Absolute FILESYSTEM roots, not slashes. `/demo/` is a URL path and
+        // must stay quotable -- banning `/` outright is the false positive that
+        // makes a guard get loosened by whoever trips it.
+        for root in ["/Users/", "/home/", "/private/", "/var/folders/", "C:\\"] {
+            assert!(
+                !body.contains(root),
+                "the body contains an absolute filesystem path ({root}): {body}",
+            );
+        }
+    }
+}
+
 /// Starting the server from the wrong directory is the first thing anyone will
 /// do wrong, so the 404 has to name the flag and the expected location.
 #[tokio::test]

@@ -49,6 +49,35 @@ const MISSING_ASSETS_MESSAGE: &str = concat!(
     "  onnx-genai-server --model <MODEL_DIR> --demo-assets-dir examples/serving-dashboard\n",
 );
 
+/// Shown for every `/demo` address that does not resolve to a published file.
+///
+/// A 404 with no body is not a smaller error page, it is *no* error page: the
+/// browser supplies its own, in the operating system's locale, with the full
+/// URL on screen and `location.origin` reading `null`. On a projector that is
+/// a vendor's screen in a language nobody chose. Any bytes at all take the page
+/// back.
+///
+/// Deliberately says nothing about the address that was requested. Two
+/// properties depend on that, and they pull in the same direction:
+///
+///   * echoing the path or query would re-introduce the disclosure this
+///     surface was just cleaned of, and
+///   * this exact text is returned BOTH for a file that exists and is refused
+///     AND for one that was never there. Distinguishing them would confirm
+///     which files are on disk. One shared constant is what makes those two
+///     answers byte-identical -- an invariant a reader can check by seeing
+///     that there is only one message, rather than by diffing two.
+const DEMO_NOT_FOUND_MESSAGE: &str = concat!(
+    "The demo dashboard has no page at that address.\n\n",
+    "The dashboard is served at /demo/\n\n",
+    "Only the files the dashboard itself loads are published. Documents, \
+     scripts and test files sitting in the same directory are deliberately \
+     not served.\n\n",
+    "If /demo/ itself does not load, request it directly -- when the asset \
+     directory is misconfigured that page names the flag and the environment \
+     variable that fix it.\n",
+);
+
 /// The file a directory must be able to serve before it is treated as the demo.
 ///
 /// This is the page `/demo/` resolves to, so a directory without it cannot
@@ -100,6 +129,18 @@ pub fn resolve_demo_assets_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
 /// Fallback for every `/demo` route when no asset directory was configured.
 pub(crate) async fn missing_assets() -> Response {
     (StatusCode::NOT_FOUND, MISSING_ASSETS_MESSAGE).into_response()
+}
+
+/// The single `/demo` not-found response, for refused AND absent alike.
+///
+/// Mounted in two places that must not drift apart: the refusal in
+/// `restrict_demo_assets`, and `ServeDir`'s own not-found service. Before this
+/// existed both answered with an empty body, which made them indistinguishable
+/// by accident. Giving only one of them a body would have made them
+/// distinguishable by length and leaked exactly what the refusal is careful not
+/// to say.
+pub(crate) async fn demo_not_found() -> Response {
+    (StatusCode::NOT_FOUND, DEMO_NOT_FOUND_MESSAGE).into_response()
 }
 
 /// File extensions the demo dashboard actually loads in a browser.
@@ -165,9 +206,11 @@ fn demo_path_is_servable(path: &str) -> bool {
 /// should publish" were assumed to be the same set, and they are not.
 pub(crate) async fn restrict_demo_assets(request: Request<Body>, next: Next) -> Response {
     if !demo_path_is_servable(request.uri().path()) {
-        // A plain 404, identical to a path that does not exist: distinguishing
-        // "refused" from "absent" would confirm the file is there.
-        return StatusCode::NOT_FOUND.into_response();
+        // Byte-identical to a path that does not exist: distinguishing
+        // "refused" from "absent" would confirm the file is there. It carries
+        // a body because an empty 404 hands the screen to the browser's own
+        // localised error page, which is the worst thing a projector can show.
+        return demo_not_found().await;
     }
     next.run(request).await
 }
