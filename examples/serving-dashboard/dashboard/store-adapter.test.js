@@ -17,6 +17,8 @@ import {
   staleField,
   unavailableField,
 } from '../telemetry-field.js';
+import { formatField } from '../format.js';
+
 import { adaptStore } from './store-adapter.js';
 
 /**
@@ -352,5 +354,71 @@ describe('derivation contagion — not-applicable must dominate', () => {
 
     assert.equal(mixed.state, 'not-applicable');
     assert.equal(mixed.value, null);
+  });
+});
+
+// The adapter is the only place that writes a field state as a LITERAL rather
+// than through `FIELD_STATES`, and that is exactly how the bug below survived:
+// `telemetry-field.js` records that `MEASURED: 'ok'` was once a landmine and
+// fixes the CONSTANT, but a literal `'ok'` does not reference the constant, so
+// this site never moved with it. The formatter refuses an unrecognised state
+// and draws an em-dash, so `client.poll_interval_ms` rendered correctly while
+// it had no value and blanked the instant it had a real one. Every fixture in
+// this file agreed, because the fixtures spell the state the same way the code
+// under test does. A test cannot corroborate a vocabulary it shares.
+describe('store adapter — the states it manufactures are ones the formatter knows', () => {
+  it('renders a poll interval as a measurement once two polls have been observed', () => {
+    const store = createStoreDouble({ fields: {}, timestampMs: 1000 });
+    const adapted = adaptStore(store);
+    store.poll({}, 1250);
+
+    const field = adapted.field('client.poll_interval_ms');
+    assert.equal(field.value, 250, 'the median of a single 250ms gap is 250ms');
+    assert.equal(
+      field.state,
+      FIELD_STATES.MEASURED,
+      'a field the adapter measured must carry the MEASURED state, not a synonym',
+    );
+
+    const errors = [];
+    const realError = console.error;
+    console.error = (...args) => errors.push(args.join(' '));
+    let rendered;
+    try {
+      rendered = formatField(field);
+    } finally {
+      console.error = realError;
+    }
+
+    assert.deepEqual(errors, [], 'the formatter must not refuse a field the adapter measured');
+    assert.match(
+      rendered.text,
+      /250/,
+      'a measured poll interval must reach the page as a number, not as the absent glyph',
+    );
+  });
+
+  it('emits no field state outside the declared vocabulary, whatever the poll history', () => {
+    const store = createStoreDouble({ fields: { 'queue.depth': counter(3, 1000) } });
+    const adapted = adaptStore(store);
+    store.poll({ 'queue.depth': counter(4, 1250) }, 1250);
+    store.poll({ 'queue.depth': counter(5, 1600) }, 1600);
+
+    const known = new Set(Object.values(FIELD_STATES));
+    const keys = ['client.poll_interval_ms', 'queue.depth', 'kv.pages_used'];
+    const seen = [];
+    for (const key of keys) {
+      const field = adapted.field(key);
+      seen.push(field.state);
+      assert.ok(
+        known.has(field.state),
+        `${key} carries state ${JSON.stringify(field.state)}, which the formatter would refuse`,
+      );
+    }
+    assert.equal(seen.length, keys.length, 'every key must have been read');
+    assert.ok(
+      seen.includes(FIELD_STATES.MEASURED),
+      'CANNOT RUN: no field reached the MEASURED state, so this asserts nothing',
+    );
   });
 });

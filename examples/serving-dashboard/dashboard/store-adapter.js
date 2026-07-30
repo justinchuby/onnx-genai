@@ -519,7 +519,7 @@ function clientField(key, observedIntervalsMs) {
     const sorted = [...observedIntervalsMs].sort((a, b) => a - b);
     return {
       value: sorted[Math.floor(sorted.length / 2)],
-      state: 'ok',
+      state: 'measured',
       source: 'client',
       unit: 'ms',
       label: 'Poll interval',
