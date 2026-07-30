@@ -360,7 +360,24 @@ test('no review document was measured before the tree reviewers extract', () => 
   );
 
   const boundary = git('rev-parse', `${declared[1]}^{commit}`);
-  console.log(`  review point: ${declared[1]} -> ${boundary.slice(0, 8)}`);
+  // Print HOW FAR BACK the boundary sits, because this check's strength is entirely a
+  // function of a value chosen for other reasons. REVIEW-POINT-SHA is picked to name the
+  // tree reviewers should read CODE at -- stability is a virtue there, so it is chosen
+  // OLD on purpose. But this test uses it as a FRESHNESS BOUNDARY, where old is weak:
+  // measured here, moving the pin from d5da0061 back to 37d0d72e (205 commits) takes this
+  // test from 2 stale documents to 0 without a single document being re-measured.
+  // One field, two consumers, opposite requirements -- and the pin's own reason to move is
+  // invisible from inside this test. So the distance ships beside the verdict: a green
+  // against a boundary hundreds of commits behind HEAD is not the same green as one
+  // against a recent boundary, and nobody can tell them apart from a pass/fail alone.
+  const behind = git('rev-list', '--count', `${boundary}..HEAD`);
+  console.log(`  review point: ${declared[1]} -> ${boundary.slice(0, 8)} (${behind} commits behind HEAD)`);
+  if (Number(behind) > 50) {
+    console.log(
+      `  WEAK BOUNDARY: ${behind} commits behind HEAD. A document measured anywhere in ` +
+        `that window scores fresh. This test is only as strong as the pin is recent.`,
+    );
+  }
 
   const stale = [];
   for (const doc of REVIEW_DOCS) {
