@@ -1040,3 +1040,58 @@ disclosure -- and the three layers together mean **no single layer failing
 puts the path on the projector.** Deleting `projectServedModel()` rather than
 the row is what makes layer 2 hold: a ban stops a field being bound, removing
 the projection stops it being addressable.
+
+## 16. The prescribed pre-flight for the last P0 is vacuous — and its positive control passes
+
+@c0de4c2e promoted the runtime P0 correctly and prescribed a three-part
+restart predicate. Step 2 does not work, and I have both binaries on disk
+to prove it:
+
+    strings <binary> | grep -c may_disclose_model_paths     "MUST BE 0"
+
+      FIXED   demo worktree binary (basenames on the wire)  -> 0
+      LEAKING sibling binary (running on :8123 now)         -> 0
+
+      POSITIVE CONTROL, strings did read both:
+        demo    18455 strings      sibling 18412 strings
+
+The check passes identically on the binary that leaks and the binary that
+does not. `model_path_for_display` scores 0 in both as well: **private Rust
+function names do not survive into a release binary's string table**, so
+every symbol probe of this shape returns 0 regardless of the fix. I searched
+for any discriminating token and found none; the set difference is Rust
+string-table blob noise, not source symbols.
+
+**THIS IS THE IMPORTANT PART, AND IT IS A NEW CLASS.** The prescription
+already carried the positive control the Lead's four-part standard demands,
+and the control PASSES, and the check is still worthless. A positive control
+proves the instrument READ THE CORPUS. It does not prove the instrument CAN
+SEE THE PROPERTY. Those are different questions and we have been treating
+them as one. This is the Lead's doctrine correction 3 -- *a control must vary
+the instrument, not just the subject* -- landing on the remedy for the only
+remaining red.
+
+### 16.1 The replacement, which I ran rather than proposed
+
+Behaviour is the only discriminator, and it costs one curl:
+
+    launch the binary, then
+      curl -s 127.0.0.1:PORT/v1/models | grep -c '"path":"/'    MUST BE 0
+      FLOOR FIRST: the response must be non-empty, or a dead port
+      scores 0 and reads as a pass
+
+Measured, both arms, same model, same instant:
+
+      demo worktree binary   path = 'qwen2.5-0.5b-scatter-v2'   floor 175
+      sibling binary :8123   path = '/Users/justinc/.../qwen2.5-0.5b-scatter-v2'
+
+`strings` cannot tell these apart. The wire tells them apart in one field.
+**Test the property you care about, not a symbol you hope implies it.**
+
+### 16.2 Correction to @bb2ee824
+
+They wrote that my "~1-line admin.rs fix has NOT landed". It landed at
+`e556b7f4`, 00:18:30, and I executed a binary built from that tree and read
+the basename off the wire. Their 4-of-4 leak measurement is correct and is a
+measurement of processes started 01:41 and 02:07 from the OTHER checkout.
+The fix is real, shipped, and not running. That distinction is the whole P0.
