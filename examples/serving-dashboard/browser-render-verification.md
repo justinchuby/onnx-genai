@@ -609,24 +609,30 @@ The distinction the Lead asked for: a *mistyped asset directory* and *not-config
 `404` with **`content-length: 0`** (verified on `:8151`, launched without `--demo-assets-dir`).
 A mistyped directory returns a 404 with a body. Neither occurred here.
 
-### 10.2 The five-state model renders as three
+### 10.2 Four of the five ruled states are exercised; one I could not induce
 
-This is the item @0837fdf9 could not close without a browser, and it is the most consequential
-thing in this section.
+⚠️ **This subsection replaces an earlier, wrong version of itself. See §10.9 for the retraction.**
 
-| state | elements rendered | CSS rule exists |
-|---|---|---|
-| `measured` | 2 | yes |
-| `unavailable` | 42 | yes |
-| `pending` | 6 (transient, gone by ~2 s) | yes |
-| `not-applicable` | **0** | **yes** |
-| `bypass*` | **0** | **yes** |
+The ruled vocabulary is `measured, pending, stale, unavailable, not-applicable`
+(`dashboard/state-vocabulary.test.js:28`). Counts over **all** state-bearing elements
+(`n=94`, `n=93`, `n=94` for the three scenarios), not a filtered subset:
 
-Across all three scenarios, `not-applicable` and `structurally-bypassed` are **styled but never
-emitted**. The five-state model we ruled on nine times is a three-state model on screen. I cannot
-tell from the browser whether this is dead vocabulary or merely unreachable in these three
-scenarios — that is a ruling, not an observation, and it is the Lead's to make. **No test we own
-can see this**, which is exactly why it survived nine rulings.
+| state | continuous-batching | paged-kv | memory-pressure |
+|---|---|---|---|
+| `measured` | 30 | 23 | 30 |
+| `unavailable` | 57 | 58 | 57 |
+| `pending` | 6 | 11 | 6 |
+| `stale` | 0 | 0 | 0 |
+| `not-applicable` | **0** | **0** | **0** |
+
+`stale` is 0 in all three **because a healthy server never produces it** — that is correct
+behaviour, not an absence. **I induced it and it works** (§10.9): killing the origin the page
+polls moves `connected` 1→0, `stale` 0→2, `measured` 30→21, and surfaces
+*"Disconnected — last reading 20s ago"*. The vocabulary is live.
+
+**`not-applicable` is the one state I never observed and could not induce.** The source comments
+call it *"an intentional gap"*. I have no scenario that declares one, so I cannot say whether it
+is reachable or dead — only that **no scenario a reviewer will open ever renders it**.
 
 ### 10.3 Two absence states are distinguished by glyph only, not by colour
 
@@ -715,10 +721,72 @@ This closes the causal half I explicitly declined to assert there.
 ### What this section does NOT claim
 
 - Rendered on one engine (Chrome/CDP) at one viewport. No cross-browser or responsive check.
-- `not-applicable` and `bypass` are shown **unreached in these three scenarios**. I did not prove
-  they are unreachable in principle, and I did not read the emitter to find out.
+- `not-applicable` is shown **unreached in these three scenarios and uninducible by me**. I did not
+  prove it is unreachable in principle, and I did not read the emitter to find out.
 - The colour delta is measured from computed style, not from a screenshot; I did not test against
   any contrast standard.
 - Numbers were verified to *move and track the wire*, not to be *arithmetically correct*.
 - Idle steady state is ~42 em-dashes to ~6 measured values. Whether that is the intended density
   for a demo is a design question, not a defect I can assert.
+
+---
+
+## 10.9 Retraction: I reported the five-state model as three. It is four, and the fifth is not a defect.
+
+**⛔ WITHDRAWN — the claim in the first committed version of §10.2 (`643f1e72`), that the
+five-state model "renders as three" and that the two invisible states were `not-applicable` and
+`bypass`.** Both halves were wrong. This is the fifth instrument artifact in one evening's work on
+the same page, and it is the only one that reached a commit and a report to the Lead.
+
+**What was wrong, precisely:**
+
+1. **`bypass` is not one of the ruled five.** The ruled vocabulary is
+   `measured, pending, stale, unavailable, not-applicable`. I substituted a styled class I had
+   seen in CSS for a state I had never checked, and never counted `stale` at all.
+2. **The density figures were a filter artifact.** I reported `measured=2, unavailable=42` from a
+   sampler that excluded elements with more than two children. The true counts are
+   `measured=30, unavailable=57` of `n=94`.
+3. **`stale` is emitted, and the disconnect path works well.** Killing the origin the page polls:
+
+   ```
+   connected  1 -> 0
+   stale      0 -> 2
+   measured  30 -> 21      (nine values correctly demoted)
+   unavailable 57 -> 64
+   banner:   "Disconnected — last reading 20s ago"
+   polls continue (8 -> 14 attempts), so the loop survives its own failures
+   ```
+
+**How the error happened, because the mechanism matters more than the correction.** My first
+attempt at this experiment killed **the wrong process**. `lsof -ti tcp:9123` returns *every* socket
+on the port, including established client connections; the first line was a client holder
+(`21707`), not the listener (`53418`). I killed a socket, the server never went down, the dashboard
+correctly kept showing `measured` and `connected`, **and I wrote that up as a P1: "the dashboard
+does not detect server loss."**
+
+What caught it was not insight — it was a **stray inconsistency**: the launcher refused to restart
+with *"port 9123 is already in use"* after I believed I had killed it. The finding was already
+written.
+
+**The control I had skipped is one line**: confirm from *outside the browser* that the server
+actually refuses connections before interpreting anything the browser shows.
+
+```
+CONTROL curl after kill  -> 000 REFUSED
+CONTROL listener present -> NONE
+```
+
+With that control in place the experiment inverted completely and the product came out **well** —
+not merely not-broken, but with a demotion path and a human-readable banner that nobody had seen
+until now.
+
+**The pattern across all five artifacts tonight was identical: I kept validating the detector and
+never validating the target.** The sampler could see an injected change (but not the live cells).
+The load generator ran (but never reached the server). The kill command succeeded (but not against
+the listener). **Every one of those is a green light on the instrument and silence about the
+subject.** For a browser check specifically: *before believing any absence on screen, prove the
+condition you think you created actually exists on the wire.*
+
+**Net effect on the gate: the dashboard is in better shape than my first report said.** One state
+(`not-applicable`) is unobserved and uninducible by me; four of five are exercised; the disconnect
+path is genuinely good.
