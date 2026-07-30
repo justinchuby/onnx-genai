@@ -507,7 +507,7 @@ pub(crate) async fn admin_load_model(
         .registry
         .load(&id)
         .await
-        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))?;
+        .map_err(|err| crate::routes::map_model_load_error(&id, err))?;
     Ok(Json(AdminLoadResponse { id, loaded: true }))
 }
 

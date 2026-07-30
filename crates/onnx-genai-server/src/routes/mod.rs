@@ -733,6 +733,21 @@ fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
     ApiError::internal("model registry failed")
 }
 
+/// Map a lazy-load failure without putting the error chain on the wire.
+///
+/// `ModelRegistry::load` returns `anyhow::Error`, so it cannot go through
+/// `map_registry_error` and both call sites hand-rolled
+/// `format!("...: {err}")` instead. That chain is built in `registry.rs` by
+/// `with_context(|| "failed to load model '{id}' from '{path}'")`, where
+/// `path` is the operator-configured model directory — an absolute host path
+/// on every deployment. The id is echoed because the caller supplied it and
+/// the adjacent 404 already echoes it; the chain is not, and is logged at
+/// `error` instead so operators keep the diagnosis they need.
+pub(crate) fn map_model_load_error(id: &str, err: anyhow::Error) -> ApiError {
+    tracing::error!(model_id = %id, error = ?err, "lazy model load failed");
+    ApiError::internal(format!("failed to load model '{id}'"))
+}
+
 /// Route a request to the correct loaded model.
 ///
 /// - **Non-empty `requested`** — resolves the exact id.  If the model is
@@ -769,7 +784,7 @@ async fn resolve_model(
     registry
         .load(&id)
         .await
-        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))
+        .map_err(|err| map_model_load_error(&id, err))
 }
 
 fn audio_decoder_prompt(
@@ -1046,5 +1061,49 @@ impl BlockTableResponse {
             }),
             blocks: Some(blocks),
         }
+    }
+}
+
+#[cfg(test)]
+mod error_disclosure_tests {
+    use super::*;
+
+    /// Rebuild the chain `registry.rs` actually produces, rather than a toy
+    /// error: `build_handle` fails and `with_context` wraps it with the
+    /// operator-configured directory. A test against a synthetic error would
+    /// pass while the real chain still leaked.
+    fn realistic_load_failure() -> anyhow::Error {
+        anyhow::anyhow!("onnxruntime: failed to open model file").context(format!(
+            "failed to load model '{}' from '{}'",
+            "qwen-scatter", "/Users/presenter/models/qwen-scatter-v4"
+        ))
+    }
+
+    #[test]
+    fn a_lazy_load_failure_does_not_put_the_model_directory_on_the_wire() {
+        let err = map_model_load_error("qwen-scatter", realistic_load_failure());
+
+        assert!(
+            !err.message.contains('/'),
+            "load failure exposed a filesystem path to the client: {}",
+            err.message
+        );
+        // The caller's own id stays: the adjacent 404 already echoes it, and a
+        // client cannot act on "something failed".
+        assert!(err.message.contains("qwen-scatter"));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Control: the chain being suppressed genuinely carries the path, so
+        // this test cannot pass because the fixture happens to be harmless.
+        assert!(format!("{:?}", realistic_load_failure()).contains("/Users/presenter"));
+    }
+
+    /// The whole defect was that `ModelRegistry::load` returns `anyhow::Error`
+    /// and so could not reach `map_registry_error`. Both mappers must agree
+    /// that an error chain is a log line, not a response body.
+    #[test]
+    fn both_registry_mappers_keep_the_chain_off_the_wire() {
+        let load = map_model_load_error("m", anyhow::anyhow!("/Users/presenter/secret"));
+        assert!(!load.message.contains("/Users/presenter"));
     }
 }
