@@ -62,7 +62,34 @@ const REVIEW_DOCS = readdirSync(HERE)
   .filter((name) => name !== 'REVIEW-POINT.md')
   .sort();
 
-const MARKER = /^MEASURED-AT:\s*(\S+)\s*$/m;
+// WHY THE ANCHOR IS GONE. This was /^MEASURED-AT:\s*(\S+)\s*$/ -- end-of-line anchored.
+// Two of the four declarations on this branch write prose after the SHA on the same
+// line ("MEASURED-AT: `9b06d922`. Not at review-2, and the refusal is..."), so they did
+// not match AT ALL -- not mis-parsed, INVISIBLE. The newest declaration in the densest
+// review document was one of them. Capturing the first token and ignoring the rest of
+// the line costs nothing and is what every author already assumed the rule was.
+const MARKER = /^MEASURED-AT:\s*(\S+)/gm;
+
+// WHY EVERY DECLARATION AND NOT THE FIRST. This read `MARKER.exec(text)` until 06:40,
+// which returns match ONE. Re-measuring is an APPEND -- the project lead's own
+// amendment mandates appending in shared regions -- so the first marker in a file is
+// its OLDEST. The guard was therefore judging every document by the first measurement
+// it ever took and could never see a re-measurement. It read 4 of 8 live declarations,
+// and the 4 it skipped were the 4 that were current.
+//
+// WHY THE STRIPPING. Three declarations on this branch are written  MEASURED-AT: `sha`.
+// with backticks and a full stop, because markdown authors write markdown. `(\S+)`
+// captures those delimiters, `git rev-parse` rejects the result, and the catch below
+// scored it "stale". The delimiters are formatting, not identity.
+//
+// These two defects concealed each other: widening to matchAll() without stripping
+// turns this RED on three valid commits, and whoever did that would conclude they had
+// broken the guard and revert BOTH fixes. Order matters; they ship together.
+function declarationsIn(text) {
+  return [...text.matchAll(MARKER)]
+    .map(([, raw]) => raw.replace(/^[`'"(<[]+|[`'"),.\]>]+$/g, ''))
+    .filter((sha) => /^[0-9a-f]{7,40}$/.test(sha));
+}
 
 function git(...args) {
   return execFileSync('git', args, { cwd: HERE, encoding: 'utf8' }).trim();
@@ -123,8 +150,8 @@ test('every review document that declares a measurement SHA declares a real one'
   const abstainers = [];
 
   for (const doc of REVIEW_DOCS) {
-    const match = MARKER.exec(readFileSync(join(HERE, doc), 'utf8'));
-    if (match) adopters.push([doc, match[1]]);
+    const declared = declarationsIn(readFileSync(join(HERE, doc), 'utf8'));
+    if (declared.length > 0) adopters.push([doc, declared[declared.length - 1]]);
     else abstainers.push(doc);
   }
 
@@ -284,23 +311,27 @@ test('no review document was measured before the tree reviewers extract', () => 
   console.log(`  review point: ${declared[1]} -> ${boundary.slice(0, 8)}`);
 
   for (const doc of REVIEW_DOCS) {
-    const match = MARKER.exec(readFileSync(join(HERE, doc), 'utf8'));
-    if (!match) continue;
-    const measuredAt = match[1];
+    const declared = declarationsIn(readFileSync(join(HERE, doc), 'utf8'));
+    if (declared.length === 0) continue;
 
-    let predatesBoundary = false;
-    try {
-      git('merge-base', '--is-ancestor', measuredAt, boundary);
-      predatesBoundary = git('rev-parse', measuredAt) !== boundary;
-    } catch {
-      predatesBoundary = false;
-    }
+    // A document is fresh if ANY of its declarations is at-or-after the review point.
+    // Not the last one positionally: nothing forces append order, and a document that
+    // was re-measured is fresh regardless of where on the page it said so.
+    const fresh = declared.filter((measuredAt) => {
+      try {
+        git('merge-base', '--is-ancestor', measuredAt, boundary);
+        return git('rev-parse', measuredAt) === boundary;
+      } catch {
+        return true; // not an ancestor of the boundary => at or after it
+      }
+    });
 
     assert.ok(
-      !predatesBoundary,
-      `${doc} was measured at ${measuredAt}, which is an ancestor of the declared ` +
-        `review point ${boundary.slice(0, 8)}. Every row in it describes a tree that ` +
-        `the review has already moved past. Re-measure and update MEASURED-AT.`,
+      fresh.length > 0,
+      `${doc} declares ${declared.length} measurement SHA(s) -- ${declared.join(', ')} ` +
+        `-- and every one is a strict ancestor of the declared review point ` +
+        `${boundary.slice(0, 8)}. Every row in it describes a tree that the review has ` +
+        `already moved past. Re-measure and add a current MEASURED-AT.`,
     );
   }
 });
