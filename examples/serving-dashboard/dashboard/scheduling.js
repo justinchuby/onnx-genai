@@ -39,6 +39,13 @@ import {
 const WINDOW_MS = 60_000;
 
 export const meta = Object.freeze({
+  // §13(b). The ONE panel with a hard capability requirement: continuous
+  // batching is live on the static-cache profile and absent on the dynamic
+  // one, where every request runs its own path and there is no batch to show.
+  // The shell reads this and renders the group explanation in its place rather
+  // than a panel full of em-dashes -- em-dashes promise a number that is
+  // coming, and on that profile it never is.
+  requires: 'continuous-batch',
   id: 'scheduling',
   title: 'Scheduling & batching',
   group: 'scheduling',

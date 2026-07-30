@@ -30,6 +30,15 @@ import {
 } from './panel-kit.js';
 
 export const meta = Object.freeze({
+  // §13(d): deliberately null, NOT 'paged-kv'. This panel is one of the few
+  // that ADAPTS rather than disappears -- a paged block table over ~14,612
+  // pages on the dynamic profile, and decode-row occupancy (active rows of
+  // --max-batch) on the static-cache one. Same component, different noun.
+  //
+  // The title must follow the profile: rows are NOT pages, and calling them
+  // pages would re-import the exact confusion the capability-profile design
+  // exists to remove.
+  requires: null,
   id: 'kv-memory',
   title: 'KV memory',
   group: 'memory',

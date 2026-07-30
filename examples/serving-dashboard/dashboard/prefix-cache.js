@@ -70,6 +70,12 @@ const PREFIX_REASONS = Object.freeze({
 });
 
 export const meta = Object.freeze({
+  // Deliberately null. This panel SHIPS UNCONDITIONALLY and shows whatever is
+  // true, including a stark 0%. Hiding it where the story is weak would be the
+  // one genuinely dishonest move available here. On the static-cache profile
+  // the cache is never consulted, so the honest rendering is not-applicable
+  // with the reason -- not a 0% that falsely implies a lookup that missed.
+  requires: null,
   id: 'prefix-cache',
   title: 'Prefix cache',
   group: 'cache',

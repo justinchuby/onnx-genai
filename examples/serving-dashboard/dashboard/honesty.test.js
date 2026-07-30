@@ -230,3 +230,60 @@ describe('accessibility cannot be skipped one panel at a time', () => {
     assert.deepEqual(offenders, [], offenders.join('\n'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// §13(b): every panel declares the engine capability it needs.
+//
+// The shell uses this to decide what to mount. The reason it is asserted for
+// EVERY panel rather than only for the ones that need a capability is that the
+// dangerous value is the MISSING one: an undeclared panel is indistinguishable
+// from a panel declared as universal, so a KV panel that forgot to declare
+// would mount on a profile that cannot feed it and fill with em-dashes. Making
+// the declaration mandatory turns that from a silent default into a build
+// failure.
+// ---------------------------------------------------------------------------
+
+describe('panels declare their capability requirement', () => {
+  const VALID = new Set(['continuous-batch', 'paged-kv', null]);
+
+  it('every panel declares `requires` explicitly, including the universal ones', async () => {
+    for (const file of panelSources()) {
+      const module = await import(`./${file}`);
+      const meta = module.meta;
+
+      assert.ok(meta, `${file} exports no meta`);
+      assert.ok(
+        'requires' in meta,
+        `${file} does not declare meta.requires. Declare it as null if the panel ` +
+          'works on every profile — an absent declaration reads as universal, which ' +
+          'is exactly how a panel ends up mounted on an engine that cannot feed it.',
+      );
+      assert.ok(
+        VALID.has(meta.requires),
+        `${file} declares meta.requires = ${JSON.stringify(meta.requires)}, which is ` +
+          `not a capability the shell knows. A typo here silently means "universal".`,
+      );
+    }
+  });
+
+  it('keeps the KV panel universal, because it adapts rather than disappearing', async () => {
+    // §13(d). Guards a specific and tempting mistake: declaring 'paged-kv'
+    // here would look obviously correct and would DELETE the KV story from the
+    // static-cache profile — which is the profile the demo actually runs on.
+    // The panel adapts instead: a paged block table on one, decode-row
+    // occupancy on the other.
+    const { meta } = await import('./kv-memory.js');
+    assert.equal(meta.requires, null);
+  });
+
+  it('keeps the prefix panel universal, because it ships showing whatever is true', async () => {
+    const { meta } = await import('./prefix-cache.js');
+    assert.equal(
+      meta.requires,
+      null,
+      'The prefix panel ships unconditionally, including a stark 0%. Gating it ' +
+        'behind a capability would hide the panel exactly where its answer is ' +
+        'least flattering, which is the one genuinely dishonest move here.',
+    );
+  });
+});

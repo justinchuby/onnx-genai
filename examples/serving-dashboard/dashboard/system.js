@@ -42,6 +42,8 @@ import {
 const BYTE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
 
 export const meta = Object.freeze({
+  // Server identity and health exist on every profile.
+  requires: null,
   id: 'system',
   title: 'System',
   group: 'system',
