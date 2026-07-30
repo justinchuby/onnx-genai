@@ -72,20 +72,23 @@ mod pty_tty {
         out
     }
 
+    fn text_has_nearby_ansi_style(raw: &str, text: &str) -> bool {
+        raw.match_indices(text).any(|(index, _)| {
+            let window_start = index.saturating_sub(32);
+            raw[window_start..index].contains("\x1b[")
+        })
+    }
+
     /// Open a fresh PTY pair.  The slave is the child-side terminal device;
     /// the master is the parent-side pipe into/out of that device.
     ///
     /// The slave is given a real 24×80 window size on purpose — **do not pass
-    /// `None` here.**  `openpty(None, ..)` leaves the window at 0×0, and the
-    /// `run` REPL's inline viewport (`live_turn.rs`) renders through ratatui's
-    /// `insert_before_no_scrolling_regions`, which infinite-loops when the
-    /// screen height is 0 (`to_draw = min(h, 0) = 0`, so it never makes
-    /// forward progress).  A future type-ahead / streaming test that drives
-    /// `run` (rather than the one-shot `generate` the tests below use) would
-    /// hang the whole harness for the `drain_pty_master` idle timeout — and
-    /// then time out CI — with a 0×0 window.  24×80 is the smallest ordinary
-    /// terminal size that avoids that trap; the exact numbers are not magic,
-    /// only "non-zero and realistic".
+    ///   `None` here.**  `openpty(None, ..)` leaves the window at 0×0. The
+    /// append-only `run` renderer no longer depends on a viewport, but reedline
+    /// still renders an interactive prompt and needs a realistic terminal size
+    /// for wrapping/repaint behavior. 24×80 is the smallest ordinary terminal
+    /// size that avoids false terminal-harness failures; the exact numbers are
+    /// not magic, only "non-zero and realistic".
     ///
     /// Companion gotcha for anyone writing input into the master: a terminal
     /// sends **CR (`\r`)** for Enter, and crossterm maps CR → `Enter`.  Writing
@@ -414,6 +417,11 @@ mod pty_tty {
         let _ = child.wait();
 
         let transcript = strip_terminal_controls(&String::from_utf8_lossy(&bytes));
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            text_has_nearby_ansi_style(&raw, "first") && text_has_nearby_ansi_style(&raw, "second"),
+            "TTY reedline input should be styled distinctly from model output; raw transcript: {raw:?}"
+        );
         let first_input = transcript
             .find(">>> first")
             .unwrap_or_else(|| panic!("first submitted line was not preserved: {transcript:?}"));
@@ -442,7 +450,7 @@ mod pty_tty {
         for line in transcript.lines() {
             assert!(
                 !(line.trim().is_empty() && line.len() >= 8),
-                "renderer leaked a blank/whitespace viewport row into scrollback: {transcript:?}"
+                "renderer leaked a blank/whitespace row into scrollback: {transcript:?}"
             );
         }
     }

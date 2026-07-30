@@ -6,6 +6,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
+use nu_ansi_term::{Color as AnsiColor, Style as AnsiStyle};
 use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::GenerationDefaults;
 use onnx_genai::ort::profile::TraceVerbosity;
@@ -16,9 +17,10 @@ use onnx_genai::{
 };
 use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
 use reedline::{
-    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
-    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, default_emacs_keybindings,
+    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, Highlighter, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
+    Suggestion, default_emacs_keybindings,
 };
 
 use super::commands::{
@@ -104,6 +106,19 @@ impl Prompt for ReplPrompt {
             "({status}reverse-search: {}) ",
             history_search.term
         ))
+    }
+}
+
+struct ReplInputHighlighter;
+
+impl Highlighter for ReplInputHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+        styled.push((
+            AnsiStyle::new().bold().fg(AnsiColor::Cyan),
+            line.to_string(),
+        ));
+        styled
     }
 }
 
@@ -217,6 +232,7 @@ fn build_reedline_editor() -> Reedline {
         .with_completer(Box::new(SlashCompleter))
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_edit_mode(edit_mode)
+        .with_highlighter(Box::new(ReplInputHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
 }
 

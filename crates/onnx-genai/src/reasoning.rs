@@ -496,6 +496,60 @@ mod tests {
     }
 
     #[test]
+    fn streaming_classification_is_lossless_and_dims_markers_too() {
+        let text = "<think>because</think>Olympia";
+        let mut stream = ReasoningStream::new(think(), false);
+        let chunks = stream.push_segments(text);
+
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            text,
+            "rendering may add color, but it must not swallow marker text"
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                chunk("<think>", true),
+                chunk("because", true),
+                chunk("</think>", true),
+                chunk("Olympia", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn emoji_adjacent_to_marker_is_preserved_byte_for_byte() {
+        let text = "🙂<think>思考🙂</think>✅";
+        let mut stream = ReasoningStream::new(think(), false);
+        let mut chunks = Vec::new();
+        for piece in ["🙂<", "think>思", "考🙂</", "think>✅"] {
+            chunks.extend(stream.push_segments(piece));
+        }
+        chunks.extend(stream.finish());
+
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>()
+                .as_bytes(),
+            text.as_bytes(),
+            "UTF-8 content around markers must be emitted unchanged"
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.is_reasoning)
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            "<think>思考🙂</think>"
+        );
+    }
+
+    #[test]
     fn a_delimiter_split_across_tokens_is_still_recognized() {
         let mut stream = ReasoningStream::new(think(), true);
         assert!(stream.inside());
