@@ -283,8 +283,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 213);
-    assert_eq!(registry.entry_count(), 258);
+    assert_eq!(registry.operator_count(), 217);
+    assert_eq!(registry.entry_count(), 262);
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
@@ -5922,4 +5922,314 @@ fn sequence_construct_then_at_round_trips_the_element_type() {
     );
     assert_eq!(out_dtype(&recovered), DataType::Float32);
     assert_eq!(out_shape(&recovered), vec![c(2), c(4)]);
+}
+
+// --- container types: increment 2 (mutation + tensor⇔sequence conversion) -----
+
+#[test]
+fn sequence_insert_unifies_element_with_inserted_tensor() {
+    let out = run(
+        &node("SequenceInsert", 2, 1),
+        vec![
+            seq_in(DataType::Float32, Some(vec![c(2), c(3)])),
+            f32in(vec![c(2), c(3)]),
+        ],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.dtype, DataType::Float32);
+    assert_eq!(element.shape.as_deref(), Some([c(2), c(3)].as_slice()));
+}
+
+#[test]
+fn sequence_insert_disagreeing_extent_degrades_but_keeps_rank() {
+    let out = run(
+        &node("SequenceInsert", 3, 1),
+        vec![
+            seq_in(DataType::Float32, Some(vec![c(2), c(3)])),
+            f32in(vec![c(2), c(5)]),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    let shape = element.shape.as_ref().expect("rank preserved");
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape[0], c(2), "agreeing extent is preserved");
+    assert_symbolic(&shape[1]);
+}
+
+#[test]
+fn sequence_insert_preserves_symbolic_element_dims() {
+    let batch = sym(9);
+    let out = run(
+        &node("SequenceInsert", 2, 1),
+        vec![
+            seq_in(DataType::Float32, Some(vec![batch.clone(), c(4)])),
+            tin(DataType::Float32, vec![batch.clone(), c(4)]),
+        ],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.shape.as_deref(), Some([batch, c(4)].as_slice()));
+}
+
+#[test]
+fn sequence_insert_mismatched_dtype_errors() {
+    let error = try_run(
+        &node("SequenceInsert", 2, 1),
+        vec![
+            seq_in(DataType::Float32, Some(vec![c(2)])),
+            tin(DataType::Int64, vec![c(2)]),
+        ],
+        13,
+    )
+    .expect_err("mismatched inserted dtype must be rejected");
+    assert_invalid(error, "SequenceInsert", "share a dtype");
+}
+
+#[test]
+fn sequence_insert_into_dtype_only_sequence_keeps_dtype_but_unknown_shape() {
+    // `SequenceEmpty` -> `SequenceInsert`: the empty sequence has a dtype-only
+    // element, so a concrete inserted shape cannot be confirmed as the element
+    // shape; the dtype survives, the shape stays unknown.
+    let out = run(
+        &node("SequenceInsert", 2, 1),
+        vec![seq_in(DataType::Float32, None), f32in(vec![c(2), c(3)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.dtype, DataType::Float32);
+    assert!(
+        element.shape.is_none(),
+        "unconfirmed element shape stays unknown"
+    );
+}
+
+#[test]
+fn sequence_insert_into_untyped_sequence_adopts_inserted_tensor() {
+    // Input 0 carries no resolved container type: the inserted tensor is the
+    // only exemplar, so it becomes the element type.
+    let out = run(
+        &node("SequenceInsert", 2, 1),
+        vec![NodeIo::default(), f32in(vec![c(4), c(5)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.dtype, DataType::Float32);
+    assert_eq!(element.shape.as_deref(), Some([c(4), c(5)].as_slice()));
+}
+
+#[test]
+fn sequence_construct_insert_at_round_trips_the_element_type() {
+    let constructed = run(
+        &node("SequenceConstruct", 2, 1),
+        vec![f32in(vec![c(2), c(4)]), f32in(vec![c(2), c(4)])],
+        13,
+    );
+    let inserted = run(
+        &node("SequenceInsert", 2, 1),
+        vec![
+            constructed.into_iter().next().unwrap(),
+            f32in(vec![c(2), c(4)]),
+        ],
+        13,
+    );
+    let recovered = run(
+        &node("SequenceAt", 2, 1),
+        vec![
+            inserted.into_iter().next().unwrap(),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    assert_eq!(out_dtype(&recovered), DataType::Float32);
+    assert_eq!(out_shape(&recovered), vec![c(2), c(4)]);
+}
+
+#[test]
+fn sequence_erase_preserves_element_type() {
+    let seq = sym(3);
+    let erased = run(
+        &node("SequenceErase", 2, 1),
+        vec![
+            seq_in(DataType::Int64, Some(vec![seq.clone(), c(16)])),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    let element = seq_element_tensor(&erased);
+    assert_eq!(element.dtype, DataType::Int64);
+    assert_eq!(
+        element.shape.as_deref(),
+        Some([seq.clone(), c(16)].as_slice())
+    );
+
+    // Erase then read back: the element type survives unchanged.
+    let recovered = run(
+        &node("SequenceAt", 2, 1),
+        vec![
+            erased.into_iter().next().unwrap(),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    assert_eq!(out_dtype(&recovered), DataType::Int64);
+    assert_eq!(out_shape(&recovered), vec![seq, c(16)]);
+}
+
+#[test]
+fn split_to_sequence_default_keeps_split_axis_at_extent_one() {
+    for dtype in [DataType::Float32, DataType::Int64] {
+        let out = run(
+            &with_attr(node("SplitToSequence", 1, 1), "axis", Attribute::Int(1)),
+            vec![tin(dtype, vec![c(2), c(6)])],
+            13,
+        );
+        let element = seq_element_tensor(&out);
+        assert_eq!(element.dtype, dtype);
+        assert_eq!(element.shape.as_deref(), Some([c(2), c(1)].as_slice()));
+    }
+}
+
+#[test]
+fn split_to_sequence_keepdims_zero_removes_split_axis() {
+    let out = run(
+        &with_attr(
+            with_attr(node("SplitToSequence", 1, 1), "axis", Attribute::Int(1)),
+            "keepdims",
+            Attribute::Int(0),
+        ),
+        vec![f32in(vec![c(2), c(6)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.shape.as_deref(), Some([c(2)].as_slice()));
+}
+
+#[test]
+fn split_to_sequence_negative_axis_and_symbolic_dims() {
+    let batch = sym(5);
+    let out = run(
+        &with_attr(node("SplitToSequence", 1, 1), "axis", Attribute::Int(-1)),
+        vec![tin(DataType::Float32, vec![batch.clone(), c(8)])],
+        13,
+    );
+    // axis -1 == last axis: it collapses to extent 1, the batch dim is kept.
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.shape.as_deref(), Some([batch, c(1)].as_slice()));
+}
+
+#[test]
+fn split_to_sequence_explicit_split_makes_axis_symbolic() {
+    let out = run(
+        &with_attr(node("SplitToSequence", 2, 1), "axis", Attribute::Int(0)),
+        vec![f32in(vec![c(6), c(4)]), tin(DataType::Int64, vec![c(3)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    let shape = element.shape.as_ref().expect("rank preserved");
+    assert_eq!(shape.len(), 2);
+    assert_symbolic(&shape[0]);
+    assert_eq!(shape[1], c(4), "non-split axis preserved");
+}
+
+#[test]
+fn split_to_sequence_scalar_input_errors() {
+    let error = try_run(&node("SplitToSequence", 1, 1), vec![f32in(vec![])], 13)
+        .expect_err("cannot split a rank-0 tensor");
+    assert!(matches!(
+        error,
+        ShapeInferError::InvalidRank { op, index: 0, rank: 0, .. } if op == "SplitToSequence"
+    ));
+}
+
+#[test]
+fn concat_from_sequence_recovers_tensor_with_symbolic_concat_axis() {
+    let out = run(
+        &with_attr(node("ConcatFromSequence", 1, 1), "axis", Attribute::Int(1)),
+        vec![seq_in(DataType::Float32, Some(vec![c(2), c(3)]))],
+        13,
+    );
+    assert_eq!(out_dtype(&out), DataType::Float32);
+    let shape = out_shape(&out);
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape[0], c(2), "non-concat axis preserved");
+    assert_symbolic(&shape[1]);
+}
+
+#[test]
+fn concat_from_sequence_new_axis_inserts_a_symbolic_stack_dim() {
+    let out = run(
+        &with_attr(
+            with_attr(node("ConcatFromSequence", 1, 1), "axis", Attribute::Int(1)),
+            "new_axis",
+            Attribute::Int(1),
+        ),
+        vec![seq_in(DataType::Int64, Some(vec![c(2), c(3)]))],
+        13,
+    );
+    assert_eq!(out_dtype(&out), DataType::Int64);
+    let shape = out_shape(&out);
+    assert_eq!(shape.len(), 3, "new_axis raises the rank by one");
+    assert_eq!(shape[0], c(2));
+    assert_symbolic(&shape[1]);
+    assert_eq!(shape[2], c(3));
+}
+
+#[test]
+fn concat_from_sequence_preserves_symbolic_non_concat_dims() {
+    let feat = sym(4);
+    let out = run(
+        &with_attr(node("ConcatFromSequence", 1, 1), "axis", Attribute::Int(0)),
+        vec![seq_in(DataType::Float32, Some(vec![c(3), feat.clone()]))],
+        13,
+    );
+    let shape = out_shape(&out);
+    assert_symbolic(&shape[0]);
+    assert_eq!(shape[1], feat, "non-concat symbolic dim survives");
+}
+
+#[test]
+fn concat_from_sequence_missing_axis_errors() {
+    let error = try_run(
+        &node("ConcatFromSequence", 1, 1),
+        vec![seq_in(DataType::Float32, Some(vec![c(2), c(3)]))],
+        13,
+    )
+    .expect_err("axis is mandatory");
+    assert_invalid(error, "ConcatFromSequence", "mandatory 'axis'");
+}
+
+#[test]
+fn concat_from_sequence_dtype_only_element_stays_unresolved() {
+    // The element rank is unknown, so no tensor shape can be fabricated.
+    let out = run(
+        &with_attr(node("ConcatFromSequence", 1, 1), "axis", Attribute::Int(0)),
+        vec![seq_in(DataType::Float32, None)],
+        13,
+    );
+    assert!(out[0].type_info.is_none());
+}
+
+#[test]
+fn split_to_sequence_then_concat_from_sequence_recovers_a_tensor() {
+    // The full tensor -> sequence -> tensor seam: split a rank-2 tensor along
+    // axis 1, then concatenate the sequence back along axis 1. The dtype and
+    // rank are recovered; the concat axis extent is (honestly) symbolic.
+    let split = run(
+        &with_attr(node("SplitToSequence", 1, 1), "axis", Attribute::Int(1)),
+        vec![f32in(vec![c(2), c(6)])],
+        13,
+    );
+    let concat = run(
+        &with_attr(node("ConcatFromSequence", 1, 1), "axis", Attribute::Int(1)),
+        vec![split.into_iter().next().unwrap()],
+        13,
+    );
+    assert_eq!(out_dtype(&concat), DataType::Float32);
+    let shape = out_shape(&concat);
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape[0], c(2), "batch dim recovered");
+    assert_symbolic(&shape[1]);
 }
