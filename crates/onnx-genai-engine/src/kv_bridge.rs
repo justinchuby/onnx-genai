@@ -986,8 +986,8 @@ pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) ->
 mod tests {
     use super::*;
     use crate::decode::{
-        DecodeState, ModelDecodePath, detect_model_decode_path, extract_next_token_logits_with_io,
-        run_decode_session_logits, run_decode_step,
+        DecodeState, ModelDecodePath, detect_model_decode_path,
+        extract_next_token_logits_from_outputs, run_decode_session_logits, run_decode_step,
     };
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
     use onnx_genai_ort::{Environment, SessionOptions};
@@ -1737,8 +1737,11 @@ mod tests {
         // First step (prefill) over two tokens, then a single decode step that
         // must read the cached KV threaded via the declared kv pairs.
         let prefill = run_decode_step(&session, &mut state, &[2, 4], 0)?;
-        let prefill_logits =
-            extract_next_token_logits_with_io(&session, prefill, io.logits_output.as_deref())?;
+        let prefill_logits = extract_next_token_logits_from_outputs(
+            &session,
+            &prefill,
+            io.logits_output.as_deref(),
+        )?;
         assert_eq!(
             prefill_logits.len(),
             32,
@@ -1747,7 +1750,7 @@ mod tests {
 
         let step = run_decode_step(&session, &mut state, &[3], 2)?;
         let step_logits =
-            extract_next_token_logits_with_io(&session, step, io.logits_output.as_deref())?;
+            extract_next_token_logits_from_outputs(&session, &step, io.logits_output.as_deref())?;
         assert_eq!(step_logits.len(), 32);
         Ok(())
     }

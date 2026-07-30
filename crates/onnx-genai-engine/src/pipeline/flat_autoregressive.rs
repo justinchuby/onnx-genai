@@ -190,11 +190,12 @@ impl PipelineEngine {
             _ => None,
         };
         let mut backend = PipelineDecodeLoopBackend {
-            decoder,
-            decoder_state: self
-                .decoder_state
-                .as_mut()
-                .expect("autoregressive pipeline has decode state"),
+            decoder: Box::new(OrtPipelineDecoder::new(
+                decoder,
+                self.decoder_state
+                    .as_mut()
+                    .expect("autoregressive pipeline has decode state"),
+            )),
             paged: paged_mirror,
             pool: &mut tensors,
             step_components,
@@ -228,7 +229,7 @@ impl PipelineEngine {
         // and the next turn must prefill it.
         let mut final_context = backend.context_tokens.clone();
         final_context.truncate(backend.kv_len);
-        let retains_kv = backend.decoder_state.use_kv;
+        let retains_kv = backend.decoder.use_kv();
         // How far mirroring actually got. Equal to the context length unless
         // the page pool ran dry, in which case only this prefix may be
         // published for reuse.

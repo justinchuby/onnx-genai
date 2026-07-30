@@ -4,14 +4,6 @@
 
 use super::*;
 
-pub(crate) fn extract_next_token_logits_with_io(
-    session: &Session,
-    outputs: Vec<Value>,
-    logits_output: Option<&str>,
-) -> anyhow::Result<Vec<f32>> {
-    extract_next_token_logits_from_outputs(session, &outputs, logits_output)
-}
-
 /// Locate the logits output selected by the resolved I/O contract.
 fn logits_output_index(session: &Session, logits_output: Option<&str>) -> anyhow::Result<usize> {
     let declared = logits_output.context(
@@ -24,7 +16,7 @@ fn logits_output_index(session: &Session, logits_output: Option<&str>) -> anyhow
         .with_context(|| format!("declared logits output '{declared}' is not exposed by the graph"))
 }
 
-pub(super) fn extract_next_token_logits_from_outputs(
+pub(crate) fn extract_next_token_logits_from_outputs(
     session: &Session,
     outputs: &[Value],
     logits_output: Option<&str>,
