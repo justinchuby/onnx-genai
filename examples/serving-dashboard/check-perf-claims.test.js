@@ -181,7 +181,7 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // The `-fold` arm was added after a probe showed `2.5-fold` evading a digit
   // this matcher already claimed to cover. "fold" is how a figure gets written
   // when someone is deliberately avoiding the × they know is contested.
-  const RATIO = /\b2\.4[5-9]\s*(?:[×xX])|\b2\.5\s*(?:[×xX]|-?fold)|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
+  const RATIO = /\b2\.4[5-9]\s*(?:[×xX]|-?fold)|\b2\.5\s*(?:[×xX]|-?fold)|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
   const ARMS = /\b0\.62\s*×|\b82\.\d{3}\s*tok|\b33\.\d{3}\s*tok|\+147\s*%/;
 
   // THE ENVELOPE BOUNDS -- a laundering route that OPENED WHEN THE FIX LANDED.
@@ -208,11 +208,19 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // markdown reflows, and PR-DESCRIPTION.md:340 states the range with the two
   // bounds on adjacent lines. A pairing rule that only recognises a range on
   // one physical line would call that honest rendering a bare bound.
-  const SEP = '(?:[^.\\n]|\\n(?!\\n)){0,60}';
+  // ONE constant decides how far apart the two bounds may sit. PAIR_WINDOW used
+  // to be a second, independent knob, and widening it from 120 to 100000 changed
+  // no outcome and no test noticed -- because SEP's period-free limit was doing
+  // all the real work. Two spellings of one decision cannot be mutation-tested:
+  // they agree in every reachable state. The window is now DERIVED, so there is
+  // exactly one number to get wrong.
+  const PAIR_MAX_GAP = 60;
+  const SEP = `(?:[^.\\n]|\\n(?!\\n)){0,${PAIR_MAX_GAP}}`;
   const ENVELOPE_BOTH = new RegExp(
     `1\\.6\\s*[×xX]${SEP}3\\.9\\s*[×xX]|3\\.9\\s*[×xX]${SEP}1\\.6\\s*[×xX]`,
   );
-  const PAIR_WINDOW = 120;
+  // Wide enough that a legal pair is never cut in half by the slice itself.
+  const PAIR_WINDOW = PAIR_MAX_GAP + 60;
 
   // PERMANENT exclusions, SCOPED TO A PATTERN CLASS RATHER THAN TO A FILE.
   //
@@ -516,6 +524,13 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
       + 'the next person to hit it deletes the guard instead of the claim.',
   );
   assert.equal(
+    envLabels(`up to 3.9× and then${' padding '.repeat(30)}later a 1.6× mention`),
+    2,
+    'two bounds separated by 240 period-free characters are now pairing. '
+      + 'PAIR_MAX_GAP has been widened past a PASSAGE into a FILE, which is the '
+      + 'same widening this file was split to fix for the sample exemption.',
+  );
+  assert.equal(
     envLabels(`up to 3.9× in the headline.${' filler.'.repeat(400)} elsewhere 1.6× appears`),
     2,
     'two bounds thousands of characters apart are now excusing each other as a '
@@ -567,7 +582,7 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
       + 'pairing rule into a blanket exemption for both bounds.',
   );
   assert.ok(
-    RATIO.test('a 2.5-fold improvement') && RATIO.test('a 2.46 fold gain'),
+    RATIO.test('a 2.5-fold improvement') && RATIO.test('a 2.47-fold improvement'),
     'the fold-form arm has gone blind. "fold" is how a contested figure gets '
       + 'rewritten when the author knows the × is contested — it was found '
       + 'evading a digit this matcher already claimed to cover.',
