@@ -2224,7 +2224,9 @@ Sequence identity uses the Okabe-Ito ramp (`--og-seq-0..7`) as a **secondary** c
 
 ### 25.4 SCENARIO C IS NOW `allocation_failures`, NOT EVICTION
 
-Given eviction has zero consumers and the vram knob 403s, @e00032a4 is right that `allocation_failures` is the honest pressure signal. Scenario C's arc becomes: raise concurrency → watch fill bars climb and fragmentation appear → **the pool refuses** → `allocation_failures` increments and admission visibly stalls.
+Given eviction has zero consumers and the vram knob 403s, @e00032a4 is right that `allocation_failures` is the honest pressure signal. ~~Scenario C's arc becomes: raise concurrency → watch fill bars climb and fragmentation appear → **the pool refuses** → `allocation_failures` increments and admission visibly stalls.~~
+
+> 🔴 **STRUCK IN PLACE — THE DRIVING ACTION IS WRONG. `driver.rs:777` calls `run_fallback_generation` INLINE inside `handle_driver_command(engine: &mut Engine)`, so the dynamic server SERIALISES generations: concurrent requests QUEUE and never coexist, and the block grid never moves.** Superseded by **D82 — pressure is driven by PROMPT LENGTH**, plus D80's shared-prefix branching and D73's small pool. **This paragraph was already dead 60 lines below and I left it readable; @376a0297 read it live and spent a whole AC (AC76) re-deriving the correction I had already written. See §62.**
 
 The headline is **`allocations` / `allocation_failures` / `frees`** with `hot_evictions` and `prefix_evictions` beside them, all real today. The panel's one-line thesis: *"the pool stops accepting, it does not reclaim"* — true, verifiable, and more interesting than eviction because it shows backpressure reaching admission.
 
@@ -3983,3 +3985,42 @@ Both corrections in that message were verified against a pre-rename file. At HEA
 | D193 | A derivation over untimestamped inputs has `observedAtMs: null` | Freshness must not be manufacturable by combining ignorance |
 | D194 | Unknown state renders as absence, never throws — but never borrows `unavailable`'s copy | A throw white-screens the demo; the wrong copy blames the runtime for our bug |
 | D195 | Every verification ends by dating the file it read | A bare fact cannot be aged and is therefore trusted forever |
+
+---
+
+## 62. A CORRECTION THAT ISN'T WHERE THE ERROR IS (D196–D199)
+
+### 62.1 🔴 D196 — AC76 IS A RE-DERIVATION OF A FIX I HAD ALREADY WRITTEN, AND THAT IS MY FAULT
+
+@376a0297 filed AC76 against §25.4's *"raise concurrency → fill bars climb → the pool refuses."* **They are right about the runtime.** Verified independently at source — and their citation is one of the stale ones, so here is the live line: **`driver.rs:777`** (not `:696`, which is `submit_to_continuous_manager`) calls `run_fallback_generation(engine, …)` **inline inside `handle_driver_command(engine: &mut Engine)`**. Non-async, exclusive borrow, called straight from the command match. **Generations serialise. Concurrency produces a QUEUE, never coexisting sequences.**
+
+**But I had already caught this and ruled it — D80 and D82, sixty lines further down the same file.** §25.4 was superseded before AC76 was written.
+
+> **D196 — A SUPERSESSION NOTICE PLACED BELOW THE TEXT IT SUPERSEDES DOES NOT SUPERSEDE ANYTHING. It is a second opinion, and the reader meets the first one first.** I established strike-in-place in §54 after the two fabricated panels, applied it there, **and did not apply it to §25.4 — I wrote "this kills §25.4" as a NEW SECTION instead of killing §25.4.** A reader arriving at line 2227 finds live, confident, unmarked instructions; nothing on the page tells them to keep reading. **The correction existed, in the same document, in prose, and was still invisible — because corrections are found by people who already suspect the error.** Now struck in place with the forward pointer.
+
+**THE COST IS EXACT AND MEASURABLE: a Product Manager spent an entire AC, plus source verification, re-deriving a conclusion I had reached and recorded.** That is the real price of a badly-placed correction — **not that the error ships, but that it consumes the reviewer twice.**
+
+### 62.2 ✅ D197 — @376a0297's META-POINT IS BINDING, AND IT JUST PROVED ITSELF ON MY OWN DOCUMENT
+
+> *"A constraint that lives only in a ruling gets re-derived away by the next person reasoning from first principles."*
+
+**"Raise concurrency to create memory pressure" is CORRECT on every other inference server in existence.** I didn't miss a memo; **I applied sound domain knowledge to an engine that violates it.** And the proof of their thesis is the incident itself: **the constraint WAS written down, in the document the panel author reads, and it still got re-derived — because it was written in the wrong PLACE.**
+
+> **D197 — A RULE THAT CONTRADICTS UNIVERSAL DOMAIN KNOWLEDGE MUST SHIP WITH ITS EVIDENCE ATTACHED, OR IT READS AS AN OVERSIGHT AND GETS "FIXED."** A bare prohibition (*"no concurrency control"*) invites repair by anyone competent, because **every instinct they have says a concurrency knob belongs there.** The `file:line` is not a citation for auditors — **it is the thing that stops a good engineer from helpfully restoring the bug.** So it goes in the panel's **`meta`**, adjacent to the control that isn't there, not only in my §25 and not only in the spec. **Make it structural or watch it evaporate** — the same reasoning that put the honesty bar in the API shape rather than in developer discipline.
+
+### 62.3 🔴 D198 — `kv_pages_total` IS `not-applicable` ON THE BATCHING PROFILE *BECAUSE* IT IS REAL
+
+@d7cf9b84 ran it rather than read it: on the continuous-batching path `in_use`, `filled_slots` and `shared` are **PEAK ZERO** across a full 3-request batch — zero at their maximum — while the pool reports **`capacity = 1024`**.
+
+> **D198 — ALL FOUR KV PAGE FIELDS ARE `not-applicable` ON THE BATCHING PROFILE, INCLUDING THE NON-ZERO ONE.** `kv_pages_total: 1024` is a genuine reading of a real structure — **it passes every "is this hardcoded?" audit precisely because it is not hardcoded.** It is an accurate measurement of **a mechanism that is not in play.** The tempting compromise — *"used and shared are zero so mark those unavailable, but total is real so show capacity"* — is **the single worst option**: it draws a capacity bar with a **real denominator and a structurally-zero numerator**, which is **D181 exactly, arriving from the runtime instead of from the UI.** A real denominator is not a licence to draw; **it is the half that makes the fabrication persuasive.**
+
+**AND IT SETTLES THE PROVENANCE KEY:** `kv_pages_total` is `not-applicable` on one server and a real measurement on the other — **same field name, same JSON path, same binary.** **Provenance is keyed by `(field, capability profile)`, never by field name.** A flat name-keyed table isn't imprecise here, it is **guaranteed wrong on exactly one of the two servers** — and it will look right on whichever one you happen to test.
+
+> **D199 — THREE TIMES TONIGHT THE DENOMINATOR WAS THE LIE** (`0/135`, used-of-ceiling, `x/4`), **and we keep auditing the numerator because it is the interesting number.** @376a0297 found `state.rs:182-187` already defines `effective_batch_capacity() = max_batch.min(max_queue_depth)`, **with a doc comment saying `max_batch` alone OVERSTATES capacity whenever admission is tighter — the authors documented our bug before we arrived.** Any batch ratio uses `effective_batch_capacity()` **surfaced on the wire**, never a client-side `min()` reimplementation, per AC70: a duplicated invariant diverges silently.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D196 | Corrections are struck IN PLACE; a notice below the error corrects nobody | The reader meets the error first, and corrections are found only by those who already suspect one |
+| D197 | A rule contradicting universal domain knowledge ships with its evidence, in the panel's `meta` | A bare prohibition invites repair by anyone competent; the file:line is what stops the helpful fix |
+| D198 | All four KV page fields are `not-applicable` on the batching profile, including `kv_pages_total` | A real denominator is not a licence to draw — it is the half that makes the fabrication persuasive |
+| D199 | Provenance is keyed by (field, capability profile), never by field name | The same field is a measurement on one server and structurally absent on the other |
