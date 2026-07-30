@@ -189,3 +189,71 @@ describe('genuinely measured fields still render as numbers', () => {
     store.stop();
   });
 });
+
+describe('a structurally absent metric is explained, not apologised for', () => {
+  // `unavailable` and `not-applicable` were rendering identically on this
+  // panel: the headline hit rate said "—" with a NOT MEASURABLE YET chart while
+  // its own supporting rows correctly said n/a. Same panel, two voices, and the
+  // apologetic one was wrong — nothing is missing on the scatter server, the
+  // cache is simply never consulted. A first-time visitor reading "not
+  // measurable yet" concludes the demo is half broken, which is exactly the
+  // misreading the fifth state exists to prevent.
+
+  it('says not-applicable, never "not measurable yet", on the batching server', async () => {
+    const panel = await mountAgainstRealStore('scatter', 'prefix-cache');
+
+    assert.match(panel.text, /n\/a/i);
+    assert.doesNotMatch(
+      panel.text,
+      /NOT MEASURABLE YET/i,
+      'apologised for a metric that is absent by design, not by omission',
+    );
+    assert.match(panel.text, /NOT APPLICABLE HERE/i, 'the chart well lost its explanation');
+    panel.release();
+  });
+
+  it('explains WHY in the accessible description, not only on hover', async () => {
+    // For not-applicable the explanation IS the information. A tooltip-only
+    // reason is unreachable by keyboard, by touch and by screen reader.
+    const store = createTelemetryStore({ origin: 'scatter', fetchImpl: respondingServer() });
+    await store.pollOnce();
+    const adapter = adaptStore(store);
+    const panel = await import('./prefix-cache.js');
+    const root = document.createElement('div');
+    const handle = panel.mount(root, adapter);
+    flushAnimationFrames();
+
+    const description = handle.describe();
+    assert.match(description, /not applicable|never consulted/i);
+    assert.doesNotMatch(description, /not measurable yet/i);
+
+    handle.unmount();
+    adapter.destroy();
+    store.stop();
+  });
+
+  it('still renders a stark 0% on the paging server, with no apology at all', async () => {
+    // The opposite treatment of the same field. This is a REAL measurement and
+    // must not inherit any of the softening above.
+    const panel = await mountAgainstRealStore('dynamic', 'prefix-cache');
+
+    assert.match(panel.text, /0\s*%/, 'a real zero must be shown starkly');
+    assert.doesNotMatch(panel.text, /n\/a/i, 'softened a measurement the server really made');
+    assert.doesNotMatch(panel.text, /NOT APPLICABLE/i);
+    panel.release();
+  });
+
+  it('reports the capability as structurally absent rather than unplumbed', async () => {
+    const store = createTelemetryStore({ origin: 'scatter', fetchImpl: respondingServer() });
+    await store.pollOnce();
+    const adapter = adaptStore(store);
+
+    const capability = adapter.capability('prefix-cache');
+    assert.equal(capability.available, false);
+    assert.equal(capability.state, 'not-applicable');
+    assert.ok(capability.reason, 'a not-applicable capability must carry its explanation');
+
+    adapter.destroy();
+    store.stop();
+  });
+});

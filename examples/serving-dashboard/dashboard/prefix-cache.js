@@ -179,6 +179,27 @@ export default function mount(rootElement, telemetryStore) {
  * @returns {object}
  */
 export function deriveHitRate(hits, generations, capability = { available: true }) {
+  // Not-applicability outranks unavailability and is contagious: a rate whose
+  // inputs are meaningless on this execution path is itself meaningless, not
+  // "not measured yet". Getting this backwards is what made the headline number
+  // on this panel apologise on the scatter server while its own supporting rows
+  // correctly said n/a.
+  const structural =
+    capability.state === 'not-applicable' ||
+    hits?.state === 'not-applicable' ||
+    generations?.state === 'not-applicable';
+
+  if (structural) {
+    return {
+      value: null,
+      state: 'not-applicable',
+      source: 'derived',
+      unit: '%',
+      label: 'Prefix cache hit rate',
+      reason: capability.reason ?? hits?.reason ?? PREFIX_REASONS.PATH_PINNED_AT_ZERO,
+    };
+  }
+
   if (!capability.available) {
     return {
       value: null,
@@ -262,6 +283,10 @@ function buildDescription(fields) {
     parts.push(`hit rate ${Number(fields.hitRate.value).toFixed(1)} percent,`);
   } else if (fields.hitRate.state === 'pending') {
     parts.push('no generations have completed yet, so there is no hit rate to report,');
+  } else if (fields.hitRate.state === 'not-applicable') {
+    // The cache is never consulted on this path, so there is no rate to have.
+    // "Not measurable yet" would imply the cache tried and we failed to observe.
+    parts.push('there is no hit rate here because the cache is never consulted,');
   } else {
     parts.push('hit rate is not measurable yet,');
   }
@@ -275,6 +300,9 @@ function buildDescription(fields) {
   if (fields.capability.available === false) {
     parts.push(fields.capability.reason ?? PREFIX_REASONS.PATH_PINNED_AT_ZERO);
   }
+  // The panel ships unconditionally on every engine. It is never hidden to make
+  // a demo look stronger, so the description always ends up saying something
+  // true rather than nothing at all.
   return parts.join(' ');
 }
 

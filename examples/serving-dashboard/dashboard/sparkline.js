@@ -65,6 +65,15 @@ import { RENDER_STATES, renderStateOf } from './field-state.js';
 /** Caption for a series the server cannot measure. demo-ux.md §4.3, verbatim. */
 export const CAPTION_UNAVAILABLE = 'NOT MEASURABLE YET';
 
+/**
+ * Deliberately NOT 'NOT MEASURABLE YET'. That caption is apologetic and its
+ * "yet" promises a value once someone does the plumbing. A not-applicable
+ * series is not waiting on anyone: the metric is meaningless on this execution
+ * path by design, and saying so is a teaching surface rather than an apology.
+ * Rendering the two identically makes a correctly empty panel read as broken.
+ */
+export const CAPTION_NOT_APPLICABLE = 'NOT APPLICABLE HERE';
+
 /** Caption for a measurable series with no samples yet. demo-ux.md §4.3, verbatim. */
 export const CAPTION_PENDING = 'AWAITING DATA';
 
@@ -106,6 +115,10 @@ export function planSparkline(series, options) {
   const { width, height, windowMs, nowMs, cadenceMs, padY = 2, zeroBaseline = true } = options;
 
   const state = renderStateOf(seriesAsField(series));
+
+  if (state === RENDER_STATES.NOT_APPLICABLE) {
+    return emptyPlan('not-applicable', width, height, CAPTION_NOT_APPLICABLE, false);
+  }
 
   if (state === RENDER_STATES.UNAVAILABLE) {
     return emptyPlan('unavailable', width, height, CAPTION_UNAVAILABLE, false);
@@ -214,6 +227,15 @@ export function paintSparkline(canvas, plan, options = {}) {
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, plan.width, plan.height);
 
+  if (plan.mode === 'not-applicable') {
+    // No hatch. The hatch is the "we cannot measure this" texture, and this is
+    // not that: nothing is missing here, so an empty calm well with an
+    // explanation reads as intentional rather than as damage. It also keeps the
+    // two states distinguishable in grayscale, where a colour shift would not.
+    paintCaption(context, plan, readToken('--og-fg-muted') || '#8b98a5');
+    return;
+  }
+
   if (plan.mode === 'unavailable') {
     paintHatchedWell(context, 0, plan.width, plan.height, readToken);
     paintCaption(context, plan, readToken('--og-unavail-label') || '#6e7d8c');
@@ -289,6 +311,9 @@ export function describeSparkline(plan, context) {
   const { label, unit = '', windowSeconds = 60, reason, format = defaultFormat } = context;
   const unitSuffix = unit ? ` ${unit}` : '';
 
+  if (plan.mode === 'not-applicable') {
+    return `${label}: not applicable on this engine. ${reason ?? ''}`.trim();
+  }
   if (plan.mode === 'unavailable') {
     return `${label}: not measurable yet. ${reason ?? ''}`.trim();
   }

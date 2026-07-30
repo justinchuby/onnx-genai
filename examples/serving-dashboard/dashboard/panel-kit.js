@@ -961,9 +961,19 @@ export function createRovingGroup(container, options = {}) {
  */
 export function describeFieldText(label, field, format) {
   if (!isRenderable(field)) {
-    return renderStateOf(field) === RENDER_STATES.PENDING
-      ? `${label} has no samples yet`
-      : `${label} is not measurable yet`;
+    const state = renderStateOf(field);
+    if (state === RENDER_STATES.PENDING) return `${label} has no samples yet`;
+    // Not-applicable gets its own sentence, and it is not an apology. Saying
+    // "not measurable yet" here would promise a value that is never coming and
+    // would describe a correctly empty panel as a deficiency — which is the
+    // whole reason the state was added. The reason is appended because for this
+    // state the explanation IS the information, and a screen-reader user who
+    // cannot hover has no other route to it.
+    if (state === RENDER_STATES.NOT_APPLICABLE) {
+      const because = field?.reason ? ` — ${field.reason}` : '';
+      return `${label} is not applicable on this engine${because}`;
+    }
+    return `${label} is not measurable yet`;
   }
   const unit = field.unit ? ` ${field.unit}` : '';
   const value =

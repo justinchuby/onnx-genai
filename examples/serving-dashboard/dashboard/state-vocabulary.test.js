@@ -203,3 +203,58 @@ describe('the field shape the panels actually read', () => {
     store.stop();
   });
 });
+
+describe('no two of the five states render identically', () => {
+  // The lead's standing invitation: if any two would look the same, say so and
+  // they get collapsed. This answers it with evidence rather than opinion, and
+  // it answers it in TEXT — the comparison is on textContent, so a pair that is
+  // distinguished only by colour counts as identical here. That is the same bar
+  // as the grayscale-screenshot test, applied automatically on every run.
+  const RENDERABLE = { value: 41, unit: 'requests', label: 'Queue depth', source: 'server' };
+
+  it('produces five distinct renderings without relying on colour', async () => {
+    const { installFakeDom } = await import('./testing/fake-dom.js');
+    const uninstall = installFakeDom();
+    const { renderField } = await import('./panel-kit.js');
+    const now = Date.now();
+
+    const rendered = new Map();
+    for (const state of RULED_STATES) {
+      const field = {
+        ...RENDERABLE,
+        state,
+        reason: 'Prefix cache is never consulted on this execution path.',
+        observedAtMs: state === 'stale' ? now - 12_000 : now,
+      };
+      rendered.set(state, renderField(field, { staleCeilingMs: 30_000 }).textContent);
+    }
+
+    const seen = new Map();
+    for (const [state, text] of rendered) {
+      const clash = seen.get(text);
+      assert.equal(
+        clash,
+        undefined,
+        `"${state}" and "${clash}" both render as ${JSON.stringify(text)} — they are ` +
+          'indistinguishable without colour, so either the treatments must differ or the ' +
+          'two states should be collapsed.',
+      );
+      seen.set(text, state);
+    }
+
+    uninstall();
+  });
+
+  it('never renders a zero for a state that carries no value', async () => {
+    const { installFakeDom } = await import('./testing/fake-dom.js');
+    const uninstall = installFakeDom();
+    const { renderField } = await import('./panel-kit.js');
+
+    for (const state of ['pending', 'unavailable', 'not-applicable']) {
+      const text = renderField({ ...RENDERABLE, value: null, state, reason: 'n' }).textContent;
+      assert.doesNotMatch(text, /0/, `"${state}" rendered a zero it never measured`);
+    }
+
+    uninstall();
+  });
+});

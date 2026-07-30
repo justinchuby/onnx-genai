@@ -179,15 +179,25 @@ export function adaptStore(telemetryStore, options = {}) {
       const history = histories.get(key);
       if (!history || history.t.length === 0) {
         const field = telemetryStore.field(key);
+        // An empty history means three different things and they must not share
+        // one treatment. If the metric is structurally bypassed the chart says
+        // so and stops apologising; if the server cannot report it the chart is
+        // hatched; and if it is simply too early the chart is PENDING, not
+        // unavailable — a healthy metric that has not accumulated a sample yet
+        // must never be drawn as unmeasurable.
+        const state =
+          field.state === 'not-applicable' || field.state === 'unavailable'
+            ? field.state
+            : 'pending';
         return {
-          state: 'unavailable',
+          state,
           t: [],
           v: [],
           gaps: [],
           reason:
-            field.state === 'unavailable'
-              ? field.reason
-              : 'No samples have been recorded yet for this metric.',
+            state === 'pending'
+              ? 'No samples have been recorded yet for this metric.'
+              : field.reason,
         };
       }
       if (!windowMs) {
@@ -314,23 +324,47 @@ export function adaptStore(telemetryStore, options = {}) {
      * eventually disagree with them, and the fields are the ones telling the
      * truth.
      *
+     * `state` distinguishes the two ways a capability can be absent, because
+     * they deserve opposite voices: 'unavailable' is apologetic and resolves
+     * itself when someone does the plumbing, while 'not-applicable' means the
+     * metric is meaningless on this execution path by design and no amount of
+     * work will produce it. Callers must branch on `state`, never on the prose
+     * in `reason` — the reason exists to be displayed, not parsed.
+     *
      * @param {string} name
-     * @returns {{available: boolean, reason: string}}
+     * @returns {{available: boolean, state: string, reason: string}}
      */
     capability(name) {
       const keys = CAPABILITY_KEYS[name];
       if (!keys) {
-        return { available: true, reason: '' };
+        return { available: true, state: 'ok', reason: '' };
       }
+
+      let sawNotApplicable = false;
       for (const key of keys) {
         const field = telemetryStore.field(key);
+        if (field.state === 'not-applicable') {
+          sawNotApplicable = true;
+          continue;
+        }
         if (field.state !== 'unavailable') {
-          return { available: true, reason: '' };
+          return { available: true, state: 'ok', reason: '' };
         }
       }
+
+      // A capability whose every field is structurally bypassed is NOT the same
+      // as one nobody has plumbed. Before this distinction existed, the prefix
+      // cache panel on the scatter server rendered the apologetic treatment for
+      // a metric that is correctly and permanently absent there.
+      const explaining = sawNotApplicable
+        ? keys.find((key) => telemetryStore.field(key).state === 'not-applicable')
+        : keys[0];
+
       return {
         available: false,
-        reason: telemetryStore.field(keys[0]).reason ?? 'This server build does not report it.',
+        state: sawNotApplicable ? 'not-applicable' : 'unavailable',
+        reason:
+          telemetryStore.field(explaining).reason ?? 'This server build does not report it.',
       };
     },
 
