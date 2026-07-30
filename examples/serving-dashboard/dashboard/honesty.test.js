@@ -398,11 +398,13 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
       pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*prefix[_.]?cache[._][\w.]+['"`]/i,
       what: 'any prefix_cache.* value',
       why:
-        'a controlled A/B (n=6 per arm, with a sensitivity control proving the instrument ' +
-        'could resolve a 90% effect) found shared-prefix requests ran 7.0% SLOWER than a ' +
-        'zero-sharing control, while the hit counter fired on every request including all ' +
-        'six controls. The reuse is PROVEN ABSENT, not merely unmeasured — so every counter ' +
-        'in this namespace describes work that never happened.',
+        'the counter is disqualified on its own arithmetic, which needs no stopwatch: ' +
+        'twelve requests -- six repeated, six DELIBERATELY UNIQUE -- produced +12 hits, ' +
+        'one per completed generation, and the rate never left ~0.94. A counter that reads ' +
+        'the same whether prefixes are reused or not ' +
+        'cannot distinguish the two, so it measures nothing. (We could not measure a timing ' +
+        'effect above this machine noise floor — a byte-identical binary swung 9.8% from ' +
+        'ambient load alone — so we ship no prefix timing number at all.)',
       instead:
         'render the verified gap itself, with citations and no numbers. There is no ' +
         'client-side substitute either: the TTFT delta measures the same absent effect.',

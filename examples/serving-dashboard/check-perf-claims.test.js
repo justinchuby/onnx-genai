@@ -287,7 +287,23 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
     // mid-flight. Asserting them here today would only redden my suite with
     // their bug at the gate. THIS EXEMPTION IS A PROMISE TO COME BACK: when
     // those three paragraphs carry their noise floor, delete this filter.
-    .filter((f) => !/^design\//.test(f));
+    .filter((f) => !/^design\//.test(f))
+    // EXEMPTION, NAMED SO IT CANNOT DECAY INTO AN OVERSIGHT:
+    // prefix-cache-verification.md is @fc8b5d97's raw measurement record and
+    // is being actively written. It is exempt as a RECORD, like
+    // perf-baseline.md -- but with one finding attached that is NOT a records
+    // question and that I have reported to its author rather than edited into
+    // someone else's live file:
+    //
+    //   its VERDICT TABLE, the first thing anyone reads, still states
+    //   "+7.0 %, i.e. no benefit at all" as a live result, while the noise
+    //   floor that withdraws it appears ~350 lines further down.
+    //
+    // That is the same shape @fc8b5d97 themselves found in the honesty
+    // register: the number was removed from one surface and the CERTIFICATION
+    // survived on another. A reader who stops at the verdict table -- which is
+    // what a verdict table is for -- gets the withdrawn claim.
+    .filter((f) => f !== 'prefix-cache-verification.md');
 
   assert.ok(docs.length > 0, 'no tracked .md files found — this check would pass vacuously');
 
@@ -295,7 +311,18 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
   let paragraphsInspected = 0;
 
   for (const doc of docs) {
-    const text = readFileSync(join(HERE, doc), 'utf8');
+    // Strip fenced blocks and inline code BEFORE looking for claims. A grep
+    // pattern that searches for the withdrawn figure is not a statement of it
+    // -- READABILITY-REVIEW.md ships the literal command
+    // `grep -riE '7\.0%|...|1341|1254' $(git ls-files)`, which is a tool for
+    // finding the defect, and flagging it would punish the person hunting it.
+    // Same trap as the citation `page_table.rs:1254`, where the digits were a
+    // LINE NUMBER: matching characters is not matching meaning, and a checker
+    // that cannot tell a claim from a search for that claim will be trained
+    // away by its own false positives.
+    const text = readFileSync(join(HERE, doc), 'utf8')
+      .replace(/```[\s\S]*?```/g, '\n')
+      .replace(/`[^`\n]*`/g, ' ');
     for (const para of text.split(/\n\s*\n/)) {
       // Does this paragraph discuss prefix reuse AND state a timing delta?
       if (!/prefix/i.test(para)) continue;
@@ -339,5 +366,154 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
       `counter finding is the one that stands, and it needs no stopwatch: ` +
       `twelve requests with six deliberately unique prompts produced twelve ` +
       `hits and a 0.9375 rate, so the counter cannot tell reuse from no-reuse.`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A withdrawal has to reach the TREE, not just the chat.
+//
+// The +7.0% "shared prefixes are slower" result was the most careful
+// measurement anyone had, so it got copied into four files. Then its own
+// author withdrew it. The retraction was broadcast three times and reached
+// none of the copies.
+//
+// THE BETTER A MEASUREMENT IS, THE MORE PLACES IT GETS COPIED -- so our
+// propagation debt is proportional to our credibility, and until now nothing
+// connected a withdrawal to its copies. The .md gate above cannot see this
+// class at all: these live in code comments and, worse, in ASSERTION STRINGS,
+// which are the text a developer reads at the exact moment a test fails.
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a source file into units in which a qualifier is allowed to count.
+ *
+ * A qualifier three statements away does not travel with a quoted sentence,
+ * so proximity is not enough -- but neither is a fixed line window, which is
+ * a line checker wearing a better name. The unit here is structural:
+ *   - a contiguous run of comment lines, or
+ *   - a single statement (contiguous code lines up to a line ending in `;`).
+ * That is exactly the span a reader takes in as "one thing being said".
+ */
+function statementUnits(source) {
+  const lines = source.split('\n');
+  const isComment = (l) => /^\s*(\/\/|\*|\/\*)/.test(l);
+  const units = [];
+  let cur = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const kind = isComment(lines[i]) ? 'comment' : 'code';
+    if (!cur || cur.kind !== kind) {
+      cur = { kind, start: i + 1, lines: [] };
+      units.push(cur);
+    }
+    cur.lines.push(lines[i]);
+    if (kind === 'code' && /;\s*$/.test(lines[i])) cur = null;
+  }
+  return units.map((u) => ({ kind: u.kind, line: u.start, text: u.lines.join('\n') }));
+}
+
+test('no source file states the withdrawn prefix timing result as a live finding', () => {
+  assertShippingTree();
+
+  const sources = execFileSync('git', ['ls-files', '*.js', '*.mjs'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter(Boolean);
+  assert.ok(
+    sources.length > 0,
+    'no tracked .js/.mjs files found — this check would pass vacuously',
+  );
+
+  // The withdrawn artefacts, by content rather than by digits alone: the
+  // 7.0% delta and the 1341/1254 ms arm pair it was computed from.
+  const WITHDRAWN = /\b7\.0\s*%|\b1341\s*ms|\b1254\s*ms/;
+
+  // A citation being BURIED is not a citation being MADE. @376a0297 raised
+  // their own measured defect count by quoting the dead citations in a
+  // retraction table so readers could recognise them -- an honest correction
+  // scoring worse to its own checker. If we repeat that here, every agent
+  // learns that documenting a withdrawal is punished, which is the exact
+  // incentive we cannot afford. So words that mark the figure as dead --
+  // including the words this very comment is written in -- count as safe.
+  const RETRACTED =
+    /withdraw|withdrew|withdrawn|retract|noise floor|below the floor|SUPERSEDED|struck|no longer|opposite sign|9\.8\s*%|do not cite|historical|WAS THE CLAIM/i;
+
+  const SELF = 'check-perf-claims.test.js';
+  // POSITIVE CONTROL. Once the tree is clean, a dead matcher and a clean tree
+  // produce byte-identical output -- both are silent. So prove the matcher can
+  // still fire, against a synthetic sample rather than against the defect,
+  // which is the only way to keep that proof after the defect is gone.
+  assert.ok(
+    WITHDRAWN.test('shared prefixes ran 7.0% slower') &&
+      WITHDRAWN.test('warm TTFT 1341 ms vs 1254 ms'),
+    'the WITHDRAWN matcher no longer matches the figures it was written for — ' +
+      'this check has been silently disarmed.',
+  );
+  assert.ok(
+    !RETRACTED.test('shared prefixes ran 7.0% slower') &&
+      RETRACTED.test('that 7.0% figure was withdrawn by its author'),
+    'the RETRACTED matcher can no longer tell a claim being MADE from one ' +
+      'being BURIED — it will either flag honest retractions or excuse live claims.',
+  );
+
+  const offenders = [];
+  let unitsInspected = 0;
+  let withdrawnMentions = 0;
+
+  for (const rel of sources) {
+    const units = statementUnits(readFileSync(join(HERE, rel), 'utf8'));
+    if (rel !== SELF) unitsInspected += units.length;
+    for (const unit of units) {
+      if (!WITHDRAWN.test(unit.text)) continue;
+      // THE FLOOR MUST NOT BE SATISFIABLE BY THIS FILE'S OWN SOURCE. It was:
+      // the line `const WITHDRAWN = /.../` contains the word "withdrawn", so
+      // it matched the matcher AND the retraction pattern, quietly satisfying
+      // `unitsInspected > 0` forever. Neutering the matcher entirely still
+      // came back green, and I only found that by mutating -- reading it back
+      // ten times would never have shown it. A vacuity floor a checker can
+      // satisfy with its own text is not a floor, it is a self-portrait.
+      if (rel !== SELF) withdrawnMentions += 1;
+      if (RETRACTED.test(unit.text)) continue;
+      const isAssertionString =
+        /assert\.|['"`]/.test(unit.text) && unit.kind === 'code';
+      offenders.push(
+        `${rel}:${unit.line}${isAssertionString ? '  [ASSERTION STRING — printed on every failure]' : '  [comment]'}\n` +
+          `      ${unit.text.trim().split('\n')[0].slice(0, 96)}`,
+      );
+    }
+  }
+
+  // THE FLOOR ASKS WHETHER THE SCAN REACHED THE CORPUS -- NOT WHETHER THE
+  // DEFECT IS STILL PRESENT. My first version asserted that some file still
+  // mentioned the withdrawn figures, which meant the check could only stay
+  // green while the bug survived: finishing the cleanup turned it red and the
+  // obvious "fix" would have been to put a withdrawn number back. A guard
+  // that punishes its own success trains people to disable it.
+  assert.ok(
+    unitsInspected > 500,
+    `only ${unitsInspected} units parsed across ${sources.length} source files — ` +
+      'the scan is not reaching the corpus, so a green result here means nothing.',
+  );
+
+  // Zero mentions is the SUCCESS state and is allowed. It is reported rather
+  // than asserted, because the day it becomes true is the day this check has
+  // done its job, and that fact should be visible without being fatal.
+  if (withdrawnMentions === 0) {
+    console.log(
+      '      note: no source file outside this checker mentions the withdrawn ' +
+        'prefix figures. Cleanup is complete; this guard is now purely a ratchet.',
+    );
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} source site(s) state the WITHDRAWN prefix timing result as a live finding.\n` +
+      `Its own author withdrew it: the interleaved warm re-run came back with the OPPOSITE sign, ` +
+      `on a box where a byte-identical binary swung 9.8% from ambient load alone.\n` +
+      `Replacement (needs no stopwatch, so no re-run can withdraw it): "We could not measure a ` +
+      `prefix effect above this machine's noise floor, so we ship no prefix number. The counter is ` +
+      `disqualified on its own arithmetic instead: twelve requests with six deliberately unique ` +
+      `prompts produced twelve hits and a 0.9375 rate."\n\n` +
+      offenders.join('\n'),
   );
 });

@@ -15,9 +15,11 @@ import { PANELS, panelById, panelsForMode } from './index.js';
 
 describe('panel registry', () => {
   it('registers every panel module with a complete meta block', () => {
-    // Five since the prefix-cache panel was cut: a controlled A/B at n=20
-    // found shared-prefix requests 7.0% SLOWER than requests sharing nothing,
-    // so prefix reuse is absent by measurement rather than merely unobserved.
+    // Five since the prefix-cache panel was cut. The counters were ruled
+    // unshippable because the hit counter is disqualified by its own
+    // arithmetic: twelve requests -- six repeated, six deliberately unique --
+    // produced +12 hits, one per completed generation, and the rate never
+    // left ~0.94.
     // Pinned deliberately -- adding or removing a panel should require saying
     // so here, because that is a decision about what the demo claims.
     assert.equal(PANELS.length, 5);
@@ -33,9 +35,9 @@ describe('panel registry', () => {
     // Deleting the module is the ratchet; unregistering it is not. A module
     // left on disk gets re-imported by the next person who greps for "prefix"
     // and finds a working panel with a mount() -- which is how the counters
-    // would come back, and they are not merely unproven: at n=20, against a
-    // sensitivity floor where a working cache collapses TTFT by 90%,
-    // shared-prefix requests ran 7.0% SLOWER than requests sharing nothing.
+    // would come back, and they are not merely unproven: twelve requests --
+    // six repeated, six deliberately unique -- produced +12 hits, one per
+    // completed generation, so the counter cannot tell reuse from no-reuse.
     const { existsSync } = await import('node:fs');
     const { fileURLToPath } = await import('node:url');
     assert.equal(

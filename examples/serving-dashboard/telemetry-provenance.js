@@ -379,11 +379,11 @@ export const PROVENANCE = Object.freeze({
   // consulted, so `MEASURED` looks obviously right -- and it is the one place
   // the disproven number can still reach a panel as a genuine measurement.
   //
-  // The evidence that it is false: shared ~900-token prefix x6 gave 1341ms
-  // warm TTFT; six prefixes differing FROM TOKEN 0 gave 1254ms -- 7.0% FASTER
-  // with NO shared prefix. Prefill is ~90% of TTFT, so a working cache would
-  // have collapsed ~1380ms to ~140ms. Meanwhile the counter reported 19/20 =
-  // 95%, because it increments on ANY nonzero token match and every
+  // The evidence that it is false needs no stopwatch, which is why it
+  // survives every re-run: twelve requests -- six repeated, six DELIBERATELY
+  // UNIQUE -- produced +12 hits, one per completed generation. A counter that
+  // reads the same with and without reuse is not measuring reuse. It reports ~95%
+  // because it increments on ANY nonzero token match and every
   // /v1/chat/completions request shares the chat-template preamble.
   //
   // So this is not a stub and not a mislabelled-but-real number. It is

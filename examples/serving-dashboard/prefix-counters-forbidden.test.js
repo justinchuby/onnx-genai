@@ -1,12 +1,20 @@
 // NO MODULE MAY NAME THE PREFIX-CACHE COUNTERS. (@12e42da8, RULED, FINAL.)
 //
 // WHY THIS IS THE MOST IMPORTANT TRIPWIRE IN THE TREE:
-// @fc8b5d97 measured prefix reuse with a control arm and it is ABSENT.
-//   - shared ~900-token prefix x6, warm TTFT      1341 ms
-//   - six prefixes differing FROM TOKEN 0         1254 ms   <- 7.0% FASTER
-//   - sensitivity: prefill is ~90% of TTFT, so a working cache would have
-//     collapsed 1380 ms -> ~140 ms. Observed: +7.0%.
-// Meanwhile `prefix_cache_hits` reported 19/20 = 95%, because it increments on
+// The counter is disqualified on its own arithmetic, and this argument needs
+// no stopwatch, so no re-run can withdraw it:
+//   - twelve requests: six repeated, SIX DELIBERATELY UNIQUE
+//   - +12 hits -- one per completed generation, unique prompts included
+//   - the rate never left ~0.94 (it read 15/16 before the experiment began)
+// A counter that reads the same whether prefixes are reused or not cannot
+// distinguish the two cases, so it is not measuring reuse.
+//
+// (An earlier timing arm reported shared prefixes slower. ITS OWN AUTHOR
+// WITHDREW IT: the interleaved warm re-run came back with the opposite sign,
+// on a box where a byte-identical binary swung 9.8% from ambient load alone.
+// We ship no prefix timing number. Do not cite one.)
+//
+// `prefix_cache_hits` reads ~95% because it increments on
 // ANY nonzero token match and every /v1/chat/completions request shares the
 // chat-template preamble. The counter reads ~95% from the first request and
 // never moves.
@@ -87,10 +95,10 @@ describe('the prefix-cache counters are unnameable', () => {
     assert.deepEqual(
       violations,
       [],
-      'A module has bound a prefix-cache counter. These report ~95% hits while ' +
-        'a control arm shows shared prefixes are 7.0% SLOWER than unshared ones ' +
-        '(@fc8b5d97, n=20) -- the number is precisely computed and entirely ' +
-        `false. Ruled unshippable in any form:\n  ${violations.join('\n  ')}`,
+      'A module has bound a prefix-cache counter. These report ~95% hits on ' +
+        'input that CANNOT produce reuse: twelve requests -- six repeated, six ' +
+        'deliberately unique -- gave +12 hits, one per completed generation. The number is ' +
+        `precisely computed and entirely false. Ruled unshippable in any form:\n  ${violations.join('\n  ')}`,
     );
   });
 
