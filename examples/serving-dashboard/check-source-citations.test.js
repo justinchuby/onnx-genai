@@ -770,23 +770,29 @@ test('every source path the owned docs cite resolves to exactly one tracked file
   // VACUITY FLOOR. Every list below is empty if the matcher stops matching, and
   // an empty offender list is exactly what success looks like. Prove we
   // inspected something before believing we found nothing.
+  // Floor set just under the CURRENT population (33), not at a token value, for
+  // the reason the coverage floor further up states: a floor far below actual
+  // coverage detects a matcher that DIES and is blind to one that NARROWS.
+  // It read `>= 20` while four documents were being scanned, so two thirds of
+  // the paths could have stopped being extracted with nothing to show for it.
   assert.ok(
-    seen.size >= 20,
-    `only ${seen.size} distinct source paths were extracted from the README; ` +
-      'the citation matcher has drifted and this test is passing vacuously.',
+    seen.size >= 30,
+    `only ${seen.size} distinct source paths were extracted from the owned ` +
+      'docs; the citation matcher has drifted and this test is passing vacuously.',
   );
 
   assert.deepEqual(
     dead,
     [],
-    `${dead.length} README citation(s) name a file that is not tracked at HEAD. ` +
-      'A reviewer clicking these gets nothing:\n  ' +
+    `${dead.length} citation(s) in the owned docs name a file that is not ` +
+      'tracked at HEAD. A reviewer clicking these gets nothing:\n  ' +
       dead.join('\n  '),
   );
   assert.deepEqual(
     ambiguous,
     [],
-    `${ambiguous.length} README citation(s) use a BARE BASENAME that matches ` +
+    `${ambiguous.length} citation(s) in the owned docs use a BARE BASENAME ` +
+      'that matches ' +
       'more than one tracked file, so a reader cannot tell which crate is ' +
       'meant and will land in the wrong one without being told.\n  ' +
       ambiguous.join('\n  ') +
