@@ -201,7 +201,7 @@ function renderOccupancy(batchSize, maxBatch) {
   row.append(
     element('span', {
       className: 'occupancy__count',
-      children: [renderField(batchSize, { label: 'Sequences in the current batch' })],
+      children: [renderField(batchSize)],
     }),
   );
 
@@ -215,13 +215,13 @@ function renderOccupancy(batchSize, maxBatch) {
     // so fixing the catalogue changed nothing on the page.
     row.append(renderField(maxBatch));
     row.append(element('span', { className: 'occupancy__max-label', text: 'max' }));
-    row.append(renderField(percentage, { label: 'Batch occupancy' }));
+    row.append(renderField(percentage));
     row.append(renderCapacityBar(batchSize, maxBatch));
   } else {
     // No denominator: state what IS known, name what is not, and make it
     // explicit that the visitor is watching a queue rather than a batch.
     row.append(element('span', { className: 'occupancy__of', text: 'sequences' }));
-    row.append(renderField(percentage, { label: 'Batch occupancy' }));
+    row.append(renderField(percentage));
     row.append(
       element('p', {
         className: 'occupancy__note',

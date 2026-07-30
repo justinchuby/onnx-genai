@@ -99,7 +99,7 @@ export default function mount(rootElement, telemetryStore) {
     const slotCapacity = telemetryStore.field('kv.slot_capacity');
 
     const utilization = ratioField(blocksUsed, blocksTotal, {
-      label: 'KV block utilization',
+      label: 'KV page utilization',
       unavailableReason: REASONS.KV_NOT_EXPOSED,
     });
     const sharedShare = ratioField(shared, blocksUsed, {
@@ -115,7 +115,7 @@ export default function mount(rootElement, telemetryStore) {
       element('div', {
         className: 'panel-kv-memory__hero',
         children: [
-          renderField(utilization, { label: 'KV block utilization' }),
+          renderField(utilization),
           element('span', { className: 'hero-figure__caption', text: 'utilization' }),
           renderBlockFraction(blocksUsed, blocksTotal),
         ],
@@ -179,13 +179,24 @@ export default function mount(rootElement, telemetryStore) {
  * @returns {HTMLElement}
  */
 function renderBlockFraction(blocksUsed, blocksTotal) {
+  // NO `label` OVERRIDE, DELIBERATELY. These two carried 'KV blocks in use'
+  // and 'KV blocks total', and the visible unit beside them read 'blocks'.
+  // The server does not have blocks. The wire fields are `kv_pages_used` and
+  // `kv_pages_total` (crates/onnx-genai-server/src/routes/mod.rs), the
+  // catalogue says 'KV pages in use' and 'KV pages total', and the
+  // provenance entry cites admin.rs by name. The noun was invented here.
+  //
+  // It survived because renderField resolves `options.label ?? field.label`,
+  // so a caller override silently wins over the catalogue and no amount of
+  // fixing the catalogue could reach this widget. Deleting the overrides is
+  // the fix; caption-catalogue.test.js is what stops it coming back.
   return element('span', {
     className: 'block-fraction',
     children: [
-      renderField(blocksUsed, { label: 'KV blocks in use' }),
+      renderField(blocksUsed, {}),
       element('span', { className: 'block-fraction__slash', text: '/' }),
-      renderField(blocksTotal, { label: 'KV blocks total' }),
-      element('span', { className: 'block-fraction__unit', text: 'blocks' }),
+      renderField(blocksTotal, {}),
+      element('span', { className: 'block-fraction__unit', text: 'pages' }),
     ],
   });
 }
