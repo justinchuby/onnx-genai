@@ -1154,3 +1154,109 @@ same process, in the same second, does not exist. **The fix caused the change.**
 with an internal control.** No timing claim here depends on the absolute
 numbers — it depends on 1-vs-195 and on a within-run control, both of which are
 counts.
+
+---
+
+# §8 — AC33 AFTER-ARM: **INCONCLUSIVE**, AND THE INCONCLUSIVENESS IS MEASURED
+
+**Author:** QA Tester (@fc8b5d97) · 02:18–02:30 PDT
+**Verdict:** the after arm **cannot be run tonight**. This section does not
+assert that — it **measures** it, and reports the number that forbids the run.
+
+## 8.1 The null A/B — an experiment whose correct answer is known in advance
+
+I ran a strictly interleaved A/B in which **both arms are the same server, the
+same binary, and the same prompt.** Arms were assigned alternately (A,B,A,B…).
+
+> **The true delta is exactly ZERO. Any delta this experiment reports is, by
+> construction, entirely noise. That is the whole point: an experiment whose
+> answer I already know is the only kind that can measure my instrument rather
+> than my subject.**
+
+    port 8151 · preserved clean binary d49d3c8fe1b8… · max_tokens=128 · 6 pairs
+
+    pair 1   A 21.92   B 33.38  tok/s     delta  +52.30 %
+    pair 2   A 38.68   B 27.11              -29.91 %
+    pair 3   A 37.18   B 36.20               -2.62 %
+    pair 4   A 23.64   B 23.91               +1.13 %
+    pair 5   A 22.40   B 13.40              -40.17 %
+    pair 6   A 18.70   B 22.00              +17.61 %
+
+    arm A  median 23.02 tok/s   CV 28.88 %
+    arm B  median 25.51 tok/s   CV 28.90 %
+
+**🔴 A change that does not exist measured as high as +52.30 % and as low as
+−40.17 %. The AC33 acceptance band is ±2 %. A single pair, run in good faith
+and reported honestly, could have certified a 26× overhead regression or a 20×
+speedup — from identical bytes.**
+
+## 8.2 The trap: the summary statistic passes while every observation fails
+
+    mean paired delta     −0.28 %     <- INSIDE the +/-2 % band
+    median paired delta   −0.74 %     <- INSIDE the +/-2 % band
+    95 % CI of the mean   −35.28 % .. +34.73 %   (width 70.01 points)
+
+> **⚠️ THE HEADLINE NUMBER PASSES. Had I reported only "mean delta −0.28 %,
+> within tolerance", I would have published a PASS that is indistinguishable
+> from a real one — and it would have been arithmetically correct and completely
+> worthless. The CI is 17.5× wider than the entire acceptance band.**
+>
+> **Averaging does not remove noise. It hides it, and it hides it behind a
+> number that looks MORE precise than the data underneath — two decimal places
+> resting on observations that disagree by 92 percentage points.** This is why
+> §5 requires the CI and not the mean, and this run is the first time that
+> requirement has actually caught something. **A tolerance test that reports
+> only a central tendency cannot fail for the right reason.**
+
+## 8.3 What a valid after-arm would now cost
+
+    measured paired-delta stdev            33.35 %
+    pairs to resolve 2 % @ 80 % power       2184
+    at the observed ~11 s/pair             ~6.7 HOURS of continuous running
+
+    clean-tree CV committed in §4           1.98 %
+    CV measured now                        28.90 %      ->  14.6x WORSE
+
+**Per the binding inconclusive-result rule in §5 — *if the 95 % CI of the delta
+spans ±2 %, report INCONCLUSIVE* — this is not a judgement call. The CI spans it
+by a factor of 17.5. The rule fires on its own terms.**
+
+## 8.4 A SECOND disqualifier that has nothing to do with load
+
+Even at load 0, tonight's after-arm would not be comparable, because **§4 pins
+the deployment shape as `server processes: exactly 1`** and states it explicitly
+precisely so it could not become an invisible assumption. Right now:
+
+    resident onnx-genai-server processes: 9
+
+**§4's most pedantic-looking line is the one that saved the comparison.** I
+wrote it as boilerplate; it turned out to be the load-bearing clause. *An
+assumption written down is a disqualifier you can check. The same assumption
+left unwritten is a result you publish.*
+
+## 8.5 Internal validity check — and a correction to my own earlier claim
+
+**Validity:** arm A CV **28.88 %** vs arm B CV **28.90 %** — near-identical, as a
+null A/B must be. Both arms sampled the same noise distribution, which is the
+evidence that the interleaving worked and neither arm got a privileged slot.
+
+**🔻 Correction.** I reported earlier, from a `created`-timestamp discriminator,
+that **no preserved baseline binary was still listening.** That was wrong. PID
+73902 on `:8151` is the preserved clean baseline, and its SHA-256 and byte size
+match §4 exactly — `d49d3c8fe1b8a98e1a067208…`, 29,033,360 bytes. **It was
+listening the entire time I said it was not, and it is the server that produced
+every number in this section.** My discriminator tested one fix's presence and I
+read it as binary identity; the binary's own hash was available the whole time
+and settles it in one command. *A weak discriminator that happens to be
+convenient will be trusted past its evidence — I did exactly that.*
+
+## 8.6 The deliverable
+
+**AC33 after arm: INCONCLUSIVE — with a measured floor rather than an excuse.**
+
+I would rather ship this than a PASS. The null A/B is reproducible in twelve
+minutes on any machine, it needs no privileged access to a quiet window, and it
+converts *"the box is too busy to measure"* — an assertion a reader must take on
+trust — into **±52 % on a known-zero effect against a ±2 % gate**, which a
+reader can check. **The strongest artefact I produced tonight is a measurement
+of my own inability to measure.**
