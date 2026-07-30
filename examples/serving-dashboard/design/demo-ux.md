@@ -2935,3 +2935,61 @@ I reversed on this enum three times. **My §21 four-state line, my `ok` concessi
 | D117 | No raw state literals anywhere; comparisons via `FIELD_STATES.*`/helpers, enforced by test | Kills the fork risk and the leak class together |
 | D118 | `field-state.js:28` typedef must list five states | A stale typedef is code-authority without code-guarantees |
 | D119 | **Two reversals on one question = hand it to the owner and stop ruling** | Each reversal was locally defensible; the sequence was the damage |
+
+---
+
+## 42. §41 IS RETRACTED ON EVIDENCE, NOT AUTHORITY — THE STYLESHEET ALREADY REQUIRES `measured`. PLUS: THE FIND-REPLACE TRAP THAT WOULD BREAK HEALTH DETECTION.
+
+@12e42da8 re-ruled `measured` minutes after I published §41 recommending `ok`. **I am not re-arguing — but the reason I was wrong is concrete and worth more than the compliance.**
+
+### 42.1 The CSS contract already says `measured`, and has all along
+
+```
+css/shell.css:154   [data-state='measured'] { color: var(--og-fg); }
+```
+Under a header reading **"THE MOST IMPORTANT RULES IN THIS FILE."** Meanwhile `panel-kit.test.js:39` asserts the DOM emits `data-state="ok"`.
+
+> **THAT SELECTOR MATCHES NOTHING TODAY.**
+
+**And it is invisible for the worst possible reason: `measured` is styled as `color: var(--og-fg)` — the inherited default — so a rule that matches nothing looks exactly like a rule that matches everything.** The one state whose treatment is *the absence of a treatment* is the one state whose selector can rot undetected. My own §21 note ("`measured` is not a treatment, it is the ABSENCE of one") is what made this undetectable.
+
+**So `measured` is not the Lead's preference winning a tie — it is what the stylesheet on disk has required from the beginning.** §41's core claim, that `ok` costs zero edits, was **false**: it costs a silent CSS mismatch in the file that guards the whole honesty system. **I checked the JS and the spec and never checked the CSS — my own layer.** D119 said hand it to the owner after two reversals; I should have handed it over *and gone to look at my own files*, which is where the answer was.
+
+### 42.2 🔴 D120 — THE MIGRATION MUST NOT BE A FIND-REPLACE. `'ok'` MEANS TWO UNRELATED THINGS.
+
+~50 raw `'ok'` literals are on disk. **They are not all field states, and a global replace corrupts a subsystem that has nothing to do with telemetry:**
+
+```
+telemetry-store.test.js:148   { status: 'ok', model: 'qwen-scatter' }   ← HTTP HEALTH PAYLOAD
+origin-integration.test.js:33 '/health': { status: 'ok' }               ← HTTP HEALTH PAYLOAD
+shell.css:221                 .connection-indicator[data-state='connected']  ← DIFFERENT ENUM
+```
+**`status: 'ok'` is the server's health response. Renaming it to `measured` breaks connection detection — and it breaks it INTO the "unreachable" state, so the page would render as a dead server while the server is fine.** The connection indicator is a *third* `data-state` vocabulary (`connected`/`connecting`/`no-model`/`unreachable`) that must not be touched either.
+
+- **D120:** the rename is **`FIELD_STATES.MEASURED: 'ok' → 'measured'` plus field-state call sites ONLY.** Never a project-wide replace of the string `'ok'`. Three distinct vocabularies share that token.
+- **D121:** `dashboard/state-vocabulary.test.js:28` hardcodes `RULED_STATES = ['ok', …]` — **it pins the wrong value and will fail loudly. Good.** That test is the migration's tripwire; update it *last*, so it stays red until every call site is done.
+- **D122 (supersedes §41's D117 framing, keeps its substance):** after the rename, ban raw state literals — comparisons via `FIELD_STATES.*`/`hasValue()`. `store-adapter.js:410` currently reads `field?.state !== 'ok' && field?.state !== 'measured'` — **someone already wrote defensive code accepting both.** That line is the fork made visible; it should end up as one constant.
+
+### 42.3 AC15 — @d7cf9b84's question answered directly: I would REPLACE the grid, not degrade it
+
+*"If the ~10-line engine accessor slips, is grid-minus-per-cell-ownership a degraded panel you'd still ship, or one you'd rather replace?"* — **Replace it.**
+
+**Without per-cell `refs`/`seqs`, every cell carries exactly one bit: allocated or free. A grid whose cells encode a single scalar is a progress bar rendered as 400 squares** — strictly worse than a progress bar, because the grid *form* promises per-cell identity and invites the viewer to hunt for structure that does not exist. That is the visual equivalent of a fabricated zero: **a container implying more information than it holds.**
+
+- **D123:** if ownership data is unavailable, **the block grid is replaced by a single occupancy bar plus the numeric fields** — not thinned, not greyed. And **the panel is renamed: "KV cache occupancy", NEVER "Paged KV block table."** *Block table* promises blocks with identity; **the sharing story — two sequences pointing at one physical block — IS the pedagogical content of pillar 2, and a grid that cannot show it is a title making a claim its pixels cannot support.** @e00032a4's finding that `page_table.rs:617 pub sequences` is already public makes this contingency unlikely, and I'd spend the ~10 lines rather than take the fallback.
+
+### 42.4 D124 — `created` IS A CLOCK. And it defeats my honesty treatments BY CONSTRUCTION.
+
+@376a0297/@d7cf9b84's `created: now_unix()` (`routes/admin.rs:29`) is the sharpest finding of the session against *my* layer specifically, and I want to name why:
+
+> **EVERY VISUAL HONESTY MECHANISM I DESIGNED USES ABSENCE OF MOTION AS THE CUE FOR DOUBT.** `stale`'s dashed underline, the age suffix, AC20's *no metric that cannot move* — **all of them treat a frozen number as the suspicious one. A fabrication that ticks is invisible to every one of them, and reads as MORE trustworthy than a real value that happens to be constant.**
+
+- **D124:** the model card **must not display `created`**, and more generally **no absolute server-supplied timestamp is ever rendered.** Times are shown only as **ages relative to an event the client itself observed** (`observedAtMs`), because that is the only clock whose provenance we can state. A server timestamp has no field state that describes it honestly — it is neither `measured` nor `unavailable`; it is *plausible*, which is the one thing our vocabulary has no word for.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D120 | Rename `FIELD_STATES.MEASURED` value + field-state call sites ONLY; never a global `'ok'` replace | `status:'ok'` is the health payload; renaming it fakes an unreachable server |
+| D121 | `state-vocabulary.test.js:28` is the migration tripwire; update it LAST | Keeps a loud red signal until every call site is converted |
+| D122 | Ban raw state literals post-rename; collapse `store-adapter.js:410`'s dual check | Defensive both-values code is the fork made visible |
+| D123 | No ownership data ⇒ occupancy bar, and rename to "KV cache occupancy" | A grid encoding one bit per cell promises structure it doesn't have |
+| D124 | Never render absolute server timestamps; only client-observed ages | A fabrication that MOVES defeats every motion-based honesty cue |
