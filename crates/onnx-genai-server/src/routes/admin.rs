@@ -170,6 +170,9 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
             snapshot.current_batch_size,
             state.config.effective_batch_capacity(),
         ),
+        // The raw numerator, unclamped, so the client never has to invert a
+        // saturating ratio to recover a count the server already knows.
+        batch_in_flight: u32::try_from(snapshot.current_batch_size).unwrap_or(u32::MAX),
         // The denominator itself, so the client never hardcodes a capacity no
         // endpoint confirms. Same source as the ratio above, read once.
         batch_capacity: u32::try_from(state.config.effective_batch_capacity()).unwrap_or(u32::MAX),

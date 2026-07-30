@@ -3665,6 +3665,66 @@ async fn status_publishes_the_denominator_it_actually_divided_by() {
     );
 }
 
+/// The clamp makes `batch_utilization` non-invertible, which is why the raw
+/// numerator must ship alongside it.
+///
+/// Four in flight and nine in flight both produce `1.0` against a capacity of
+/// 4. A client re-deriving the count as `round(ratio * capacity)` therefore
+/// reads "4 of 4" in both cases -- and cannot tell which it got, because 1.0 is
+/// also the honest reading of an exactly-full batch. BOTH INPUTS TO THAT
+/// DERIVATION ARE HONEST AND THE RESULT IS NOT: the clamp discards exactly the
+/// overload case, which is the state a continuous-batching demo exists to show.
+///
+/// This test pins the information loss itself, so that the argument for
+/// `batch_in_flight` survives in executable form rather than as a comment.
+#[test]
+fn the_clamped_ratio_cannot_distinguish_full_from_overloaded() {
+    let capacity = 4usize;
+    let exactly_full = crate::routes::admin::batch_utilization(4, capacity);
+    let badly_overloaded = crate::routes::admin::batch_utilization(9, capacity);
+
+    assert_eq!(
+        exactly_full, badly_overloaded,
+        "if these ever differ the clamp is gone and this rationale needs revisiting"
+    );
+
+    // The re-derivation a client is forced into without `batch_in_flight`.
+    let rederived = (badly_overloaded * capacity as f32).round() as u64;
+    assert_eq!(
+        rederived, 4,
+        "the ratio can only ever give back the capacity"
+    );
+    assert_ne!(
+        rederived, 9,
+        "9 generations were in flight; the ratio reports 4. \
+         This gap is the entire reason batch_in_flight is on the wire."
+    );
+}
+
+/// The numerator must be published unclamped, and must agree with the ratio in
+/// the ordinary case.
+#[tokio::test]
+async fn status_publishes_the_batch_numerator_not_just_the_ratio() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+
+    let in_flight = body["batch_in_flight"]
+        .as_u64()
+        .expect("batch_in_flight must be an integer count, not a ratio or a string");
+    let capacity = body["batch_capacity"]
+        .as_u64()
+        .expect("batch_capacity must be an integer");
+
+    // An idle fixture server: the honest reading is zero in flight. This also
+    // pins that the field is a real gauge read and not the capacity echoed
+    // back -- a bug that would render a permanently-saturated dial.
+    assert_eq!(in_flight, 0, "no generation was started in this test");
+    assert!(capacity >= 1, "capacity must be positive, got {capacity}");
+    assert_ne!(
+        in_flight, capacity,
+        "an idle server must not report a full batch"
+    );
+}
+
 #[test]
 fn batch_utilization_is_in_flight_over_capacity() {
     assert_eq!(crate::routes::admin::batch_utilization(0, 4), 0.0);
@@ -4003,6 +4063,7 @@ async fn status_still_reports_the_fields_it_genuinely_measures() {
         "queue_depth",
         "active_sessions",
         "batch_utilization",
+        "batch_in_flight",
         "batch_capacity",
         "sessions",
     ] {

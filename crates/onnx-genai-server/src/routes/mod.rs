@@ -201,6 +201,18 @@ pub(crate) struct NodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens_per_second: Option<f64>,
     batch_utilization: f32,
+    /// The numerator of [`Self::batch_utilization`], **unclamped**.
+    ///
+    /// Published because the ratio alone cannot be inverted. `batch_utilization`
+    /// saturates at 1.0 (see `batch_utilization`), so a client re-deriving
+    /// `round(ratio * capacity)` reads "4 of 4" whether four generations are in
+    /// flight or nine. Both inputs to that derivation are honest and the result
+    /// is not: the clamp discards precisely the overload case, which is the
+    /// most interesting state a continuous-batching demo has.
+    ///
+    /// With this field the client reads both terms directly and can detect
+    /// `batch_in_flight > batch_capacity` itself rather than being told "full".
+    batch_in_flight: u32,
     /// The denominator of [`Self::batch_utilization`], published so a client
     /// can render "3 of 4" rather than a bare percentage it must trust.
     ///
