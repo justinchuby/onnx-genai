@@ -4300,41 +4300,54 @@ async fn model_created_is_stable_across_polls() {
 /// `id` carries the identity, because `id` is authored at launch rather than
 /// inherited from a directory.
 ///
-/// Asserted on BOTH addresses: a test that only checked the public one would
-/// still pass if someone restored a loopback branch.
+/// This asserts ONCE, deliberately, and the reason is a defect this test used
+/// to contain. It previously looped over `["127.0.0.1:8123", "0.0.0.0:8123"]`
+/// and its doc comment claimed the loopback branch was covered. **The loop body
+/// never used the address.** `lazy_two_model_router()` takes no bind argument,
+/// so both iterations built the identical router from `ServerConfig::default()`
+/// and the variable reached nothing but the assertion messages. The test ran
+/// its body twice and reported that as two conditions.
+///
+/// That is worse than a missing case, because it OCCUPIED the slot where the
+/// real one would go: a reviewer grepping for loopback coverage found a
+/// confident sentence and a passing test, and stopped. The honest replacement
+/// is not a working loop -- it is the observation that makes the loop
+/// unnecessary. **`ServerConfig` has no bind address in it at all** (10 fields,
+/// none of them an address), so no handler can branch on one. The disclosure
+/// cannot be bind-conditional because the bind address is not reachable from
+/// the response path, and `no_configuration_can_re_enable_full_path_disclosure`
+/// is what keeps it that way.
 #[tokio::test]
 async fn model_listing_carries_no_filesystem_path() {
-    for bind in ["127.0.0.1:8123", "0.0.0.0:8123"] {
-        let body = get_json(lazy_two_model_router().await, "/v1/models").await;
+    let body = get_json(lazy_two_model_router().await, "/v1/models").await;
 
-        let mut strings = Vec::new();
-        collect_strings(&body, "", &mut strings);
+    let mut strings = Vec::new();
+    collect_strings(&body, "", &mut strings);
 
-        // The control. An empty walk would satisfy every assertion below
-        // forever, which is exactly how a path-disclosure guard goes vacuous.
+    // The control. An empty walk would satisfy every assertion below forever,
+    // which is exactly how a path-disclosure guard goes vacuous.
+    assert!(
+        strings
+            .iter()
+            .any(|(at, value)| at.ends_with(".id") && !value.is_empty()),
+        "the walk found no model id, so it is not reading the response and its \
+         silence proves nothing: {body}"
+    );
+
+    for (at, value) in &strings {
         assert!(
-            strings
-                .iter()
-                .any(|(at, value)| at.ends_with(".id") && !value.is_empty()),
-            "bound to {bind}: the walk found no model id, so it is not reading \
-             the response and its silence proves nothing: {body}"
-        );
-
-        for (at, value) in &strings {
-            assert!(
-                !value.contains(std::path::MAIN_SEPARATOR),
-                "bound to {bind}: {at} carries a filesystem path on an ungated, \
-                 already-polled endpoint, got {value:?}"
-            );
-        }
-
-        assert!(
-            body["data"][0].get("path").is_none(),
-            "bound to {bind}: the `path` field is back on /v1/models; publish \
-             `id`, which an operator authored, not a directory segment they did \
-             not choose for publication"
+            !value.contains(std::path::MAIN_SEPARATOR),
+            "{at} carries a filesystem path on an ungated, already-polled \
+             endpoint, got {value:?}"
         );
     }
+
+    assert!(
+        body["data"][0].get("path").is_none(),
+        "the `path` field is back on /v1/models; publish `id`, which an \
+         operator authored, not a directory segment they did not choose for \
+         publication"
+    );
 }
 
 /// There must be no configuration that turns path disclosure back on.
@@ -4357,6 +4370,14 @@ fn no_configuration_can_re_enable_full_path_disclosure() {
         ("state.rs", include_str!("state.rs")),
         ("routes/admin.rs", include_str!("routes/admin.rs")),
         ("cli.rs", include_str!("cli.rs")),
+        // Added after a reviewer re-filed this defect for the third time. They
+        // were wrong about the state -- the field has been gone from this file
+        // since `b7f83e72` -- and right about the risk, which is the useful
+        // half. `routes/mod.rs` DECLARES the serialized types and was outside
+        // this ban, so the three files above were fenced while the file that
+        // defines what they serialize was not. The disclosure lived here and
+        // was fixed here, and nothing would have gone red if it came back.
+        ("routes/mod.rs", include_str!("routes/mod.rs")),
     ] {
         assert!(
             !source.contains(disclosure_switch),
