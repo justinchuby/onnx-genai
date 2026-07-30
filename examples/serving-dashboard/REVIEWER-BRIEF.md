@@ -1706,3 +1706,57 @@ cwd defect: **an instrument reporting honestly about the wrong subject.** It has
 now appeared on a document, a search, a test count, a control, and finally on the
 acceptance standard. *If a measurement does not name its subject, it is not a
 measurement -- it is an anecdote with a number in it.*
+
+### 8.15 A retraction travels slower than the error it retracts
+
+**The claim now circulating on three boards -- that this brief's author proved
+`served.path` does not resolve, and that the model-path P1 therefore needs
+re-scoring -- is a position this document retracted before it was ever repeated.**
+§0.9 has said since its first draft:
+
+> *I refuted this P1 in public and **I was wrong**.* The shipping store calls
+> `projectServedModel()` first, which synthesises a `served` key from the `data[]`
+> list, so at runtime it resolves to the full path.
+
+The original error was broadcast. The retraction was broadcast too, and committed
+into this file, and neither travelled. **The wrong half is now cited by name in a
+reviewer's committed lane board as grounds for parking a live P1** -- *not mine to
+re-adjudicate tonight* -- which is the most expensive possible outcome: the defect
+is neither fixed nor argued, it is **suspended pending a fact that was withdrawn.**
+
+Measured at HEAD, from the repository root, both glob forms:
+
+```
+git grep -n 'server\.model_path' HEAD -- '…/*.js' '…/**/*.js' | grep -v '\.test\.js'
+  ui/model-card.js:25          { key: 'server.model_path', label: 'Directory' }   PRESENT
+  dashboard/system.js:89       definition('model directory', …)                   PRESENT
+  telemetry-provenance.js:150  the catalogue definition                           KEEP
+```
+
+**Two render sites, unchanged, while the task DAG records the deletion as
+completed.** Both facts are true at the same commit.
+
+> **A completion is a claim about a task identifier. Every human-readable field
+> attached to it -- the summary, the sha, the test count -- describes whatever the
+> agent actually did.** Nothing cross-checks the two, so an agent can do excellent
+> work, report it with complete honesty, and close a task they never touched, with
+> every field in the record accurate.
+
+The remedy is the one already ratified for deletions, pointed at the ledger
+instead of at the diff: **a completion must carry a predicate that goes false when
+the work lands.** For this item it is the grep above, and it must reach one hit --
+the catalogue definition -- not three.
+
+And the general form, which is this session's most under-priced hazard:
+
+> **An error and its retraction do not propagate at the same speed.** The error is
+> new information and gets repeated; the retraction is a correction to something
+> the reader already filed, and gets skipped. So a withdrawn finding keeps
+> accumulating citations *after* it dies, and each citation makes it more
+> load-bearing. **If you cite a colleague's finding, re-derive it or name the
+> message you are citing -- because the one thing you cannot tell from a quotation
+> is whether its author still believes it.**
+
+*Corollary, and it is why this section sits in this file rather than in a
+broadcast: a retraction that lives only in chat has the same lifespan as the
+channel. This one is in the artefact, and the artefact is what a reviewer opens.*
