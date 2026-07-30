@@ -109,11 +109,22 @@ def main() -> int:
         return 2
     doc = Path(sys.argv[1])
     apply = "--apply" in sys.argv
+    if not doc.exists():
+        print(f"CANNOT RUN: {doc} does not exist.", file=sys.stderr)
+        print("  This is NOT a finding about the document -- there is no "
+              "document. Exit 1 here would be indistinguishable from a real "
+              "conversion failure.", file=sys.stderr)
+        return CANNOT_RUN
     # tree_context.repo_root() derives the tree from THIS SCRIPT'S location and
     # never from the caller's cwd. That is a real behaviour change from the
     # deleted private copy, which used cwd, and it is the intended one: it is
     # what all four siblings already do, so the four instruments now agree on
-    # which tree they are talking about. The property is a known sharp edge and
+    # which tree they are talking about. SCOPED CLAIM, AND THE SCOPE IS LOAD-
+    # BEARING: they agree on TREE RESOLUTION only. They do not share a document
+    # interface at all -- check_provenance.py and check_provenance_wire.py have
+    # fixed corpora and ignore a path argument entirely. Measuring all four with
+    # one probe and reading their different answers as different SAFETY is a
+    # mistake this file's author has already made once. The property is a known sharp edge and
     # is documented at tree_context.repo_root; it is not rediscovered here.
     try:
         repo = tree_context.repo_root()

@@ -948,6 +948,42 @@ def self_test() -> int:
         lambda r: None, False,
     )
 
+    # 18/19. THE ABSENT DOCUMENT. The first exit-code case in this harness, and
+    #     it exists because the defect it guards lived in main() where every
+    #     case above is structurally blind: they all call check() directly and
+    #     therefore CANNOT observe an exit code at all. The bug survived
+    #     seventeen green mutations for exactly that reason.
+    #
+    #     The two arms differ in ONE respect -- whether the named document
+    #     exists -- and they must return DIFFERENT codes. An implementation
+    #     that returned CANNOT_RUN for everything passes arm A and fails arm B;
+    #     the old implementation, which returned 1 for both, passes B and fails
+    #     A. Only the pair pins the behaviour.
+    def exit_code_case(name: str, doc_body: str | None, expect: int):
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "d.md"
+            if doc_body is not None:
+                doc.write_text(doc_body)
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), str(doc)],
+                capture_output=True, text=True,
+            )
+            ok = proc.returncode == expect
+            results.append((
+                name, ok,
+                f"exit {proc.returncode}" if ok
+                else f"expected exit {expect}, got {proc.returncode}",
+            ))
+
+    exit_code_case(
+        "absent document must be CANNOT_RUN, not a finding",
+        None, tree_context.CANNOT_RUN,
+    )
+    exit_code_case(
+        "present document with a real defect must still be a finding",
+        "see `src/zz_definitely_not_tracked_ZZ.rs:1` for detail.\n", 1,
+    )
+
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name.ljust(width)}  {detail}")
     bad = [r for r in results if not r[1]]
@@ -987,9 +1023,16 @@ def main() -> int:
     doc = Path(args.doc)
     if not doc.exists():
         # Separate "this document is absent because the checkout is incomplete"
-        # from "you named a file that does not exist". Both used to exit 1,
-        # which is the code for A DEFECT WAS FOUND -- so a broken extract
-        # reported as a finding against the branch.
+        # from "you named a file that does not exist". BOTH used to exit 1,
+        # which is the code for A DEFECT WAS FOUND -- so a broken extract, and
+        # equally a typo, reported as a finding against the branch.
+        #
+        # The first version of this block fixed only the incomplete-checkout
+        # half and left the typo half returning 1, directly beneath a comment
+        # condemning exactly that. A half-defused case is worse than an
+        # undefused one: the next reader sees the CANNOT_RUN branch, concludes
+        # the class is handled, and never probes the sibling. Both arms now
+        # return CANNOT_RUN, and both say outright that they are not findings.
         try:
             rel = str(doc.resolve().relative_to(repo.resolve()))
         except ValueError:
@@ -1002,8 +1045,17 @@ def main() -> int:
                 file=sys.stderr,
             )
             return tree_context.CANNOT_RUN
-        print(f"FILE_NOT_IN_GIT: {doc} does not exist", file=sys.stderr)
-        return 1
+        print(
+            f"CANNOT RUN: {doc} does not exist, in the working tree or in HEAD.\n"
+            f"  This is NOT a finding about the document -- there is no document. "
+            f"It is a typo, a wrong --manifest root, or a command run from the "
+            f"wrong directory.\n"
+            f"  Exit 1 here would have been byte-identical to 'this document has "
+            f"a broken citation', which is how a mistyped CI path becomes a "
+            f"defect report against the branch.",
+            file=sys.stderr,
+        )
+        return tree_context.CANNOT_RUN
     mpath = repo / args.manifest
     manifest = json.loads(mpath.read_text()) if mpath.exists() else {}
     try:
