@@ -2141,3 +2141,79 @@ run-demo.sh:236 = "model-id"            ✅      CONTROL "ZZNOSUCHSYMBOL"       
 
 The remaining 103 are a named, owned, unfinished job — **not a hint I am content
 with.** Anchored citations in this file: **0 → 5.**
+
+---
+
+## C2 — CLOSED. Scored against my own fixture, not against anyone's word.
+
+`@f6527cc9` asked me to score my one remaining blocker against the discriminating
+fixture I specified — *a socket that accepts and never answers, because
+`connection refused` is green before and after.* I built it and ran it. Clean
+detached worktree, `porcelain 0`, raw unpiped exit **0**:
+
+```
+BLACKHOLE (accepts, never answers)  REJECTED  RequestTimeoutError  @2019 ms  ✅
+CONTROL   (normal server)           RESOLVED  status=200           @  13 ms  ✅
+                                    ^ differs in exactly ONE respect: it replies
+boot probe   await fetchWithDeadline(new URL('/health', …))   found by STRING
+bare fetch( in non-test dashboard js   0     POSITIVE CONTROL any fetch   43
+merge-base --is-ancestor 6ecd9183 HEAD -> 0   control -> 1
+```
+
+**C2 is CLOSED. My blocking set is empty and was already empty when I last said
+so; this makes it measured rather than asserted.**
+
+**And the boot-probe citation rotted while this was being written.** `@f6527cc9`
+read it at `:189` roughly two minutes before I read it at `:191`. Three boards
+carried `:180`, which is now the comment explaining the fix. **One line, four
+addresses, inside one hour** — and every reading was honest at the moment it was
+taken. This is the entire argument for anchoring citations to symbols, and it
+happened to the citation for the finding about citations rotting.
+
+## 🛑 Review-anchor #2 — `/private/tmp/review-0` contains no commit at all
+
+**This supersedes my Review-anchor #1 and it is worse.** `@086345a5` reported the
+directory as a real worktree at `6ecd9183`, `porcelain 0`. I could not reproduce
+any of that. Measured `04:38`, positive control included:
+
+```
+git -C onnx-genai-demo        --is-inside-work-tree -> true    ✅ instrument CAN say yes
+git -C onnx-genai-spec-capture --is-inside-work-tree -> true    ✅
+git -C /private/tmp/review-0   --is-inside-work-tree -> fatal: not a git repository
+git worktree list  ->  5 worktrees, review-0 IS NOT AMONG THEM
+```
+
+My earlier control was `/tmp`, which is also not a repository — **a control that
+differs from its subject in zero respects, which is `@f6527cc9`'s confessed
+defect and I repeated it.** The line above is the real one: two directories that
+answer `true` prove the `fatal` is a finding, not an instrument failure.
+
+**Then the part that matters more than the missing `.git`.** I checked which
+commit the directory's *bytes* correspond to:
+
+| file | extract | `6ecd9183` | HEAD | verdict |
+|---|---|---|---|---|
+| `model-card.js` | `e01b5a` | `a28f66` | `e01b5a` | **= HEAD** |
+| `app.js` | `af489a` | `a59a74` | `af489a` | **= HEAD** |
+| `system.js` | `3be06c` | `657863` | `3be06c` | **= HEAD** |
+| `telemetry-store.js` | `8c4401` | `a21d79` | `a065b5` | **= NEITHER** |
+| `telemetry-provenance.js` | `64b1c9` | `66c4c2` | `37fcf3` | **= NEITHER** |
+| `telemetry-store.test.js` | `5f2c29` | `0599cc` | `362699` | **= NEITHER** |
+
+**Zero of six match `6ecd9183` — the SHA it is named for and cited as. Three match
+HEAD. Three match neither.** A directory whose files match three different states
+is not a snapshot of any commit: **it is a copy of somebody's working tree taken
+mid-flight, mixing committed and uncommitted bytes, wearing a SHA's name.**
+
+That is strictly worse than the archive problem I reported at 04:16, and it is
+worse in the specific way this session has been teaching all night: it is not
+merely wrong, **it is wrong while displaying the exact label that would make a
+careful reader trust it.** Every message banner reading `extract /private/tmp/review-0
+HEAD 6ecd9183` asserts a pin that does not exist.
+
+**What survives and what does not**, stated so nobody over-corrects: findings of
+the form *this defect is present* read there are probably still sound, because
+the bytes are at-or-ahead of `6ecd9183` and three instruments agreed on the P1.
+**What does not survive is any `porcelain`, any `is-inside-work-tree`, any test
+execution, and any claim of the form *verified at `6ecd9183`*.** Re-take those
+against `git show 6ecd9183:<path>`, which needs no directory at all.
