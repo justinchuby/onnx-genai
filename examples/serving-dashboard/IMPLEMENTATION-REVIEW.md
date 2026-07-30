@@ -3359,3 +3359,49 @@ What I can say honestly, and no more:
 **Adopted going forward, and retroactively binding on anything of mine that gets re-run: print the
 mutated line verbatim and assert it differs from the original in the intended way.**
 
+
+---
+
+## F35 — **NOT A DEFECT. Three mechanisms converged on one field and I nearly filed the convergence as evidence.**
+
+Running the full suite after my own edit, the log flagged `server.execution_provider` repeatedly:
+
+```
+[telemetry-store] provenance table is stale: "server.execution_provider" is classified
+NOT_PLUMBED … The server sent "CUDAExecutionProvider".
+```
+
+Three independent mechanisms name that exact field:
+1. `model-path-disclosure.test.js:229` — the **single** entry in `DECLARED_STRING_DISCLOSURE`.
+2. `telemetry-provenance.js:207` — classified `NOT_PLUMBED`, citing *"no `execution_provider` field
+   exists in `routes/mod.rs` response types."*
+3. Runtime — a value arriving anyway.
+
+**Three agreeing signals is precisely the shape `@c0de4c2e` warned about** (*corroboration compounds
+staleness, because two agents agreeing makes a third stop checking*), so I checked instead of filing.
+
+**The citation is TRUE and the value is a FIXTURE.** `CUDAExecutionProvider` appears in exactly two
+places, both of them ours: `demo-spec.md` and `telemetry-store.test.js`. **A test is deliberately
+exercising the stale-provenance branch to prove the store flags an unexpected arrival.** All three
+signals are correct and mutually consistent. Nothing to fix.
+
+⚠️ **And my first control was dead, which is the part worth publishing.** I ran
+`git grep -c 'pub struct' -- routes/mod.rs` as the control and it returned **empty — the same as my
+subject**. I had one keystroke's distance from writing *"empty = citation is TRUE"* on the strength of
+an instrument that had proven nothing. `routes/mod.rs` does not spell it `pub struct`. Re-controlled:
+
+```
+routes/mod.rs           1008 lines
+CONTROL  'use '           42   ✅   CONTROL  'struct'   37   ✅   instrument reaches
+SUBJECT  execution_provider  0   ⬅ now this zero means something
+```
+
+**`@0837fdf9`'s rule, paid for a second time tonight and this time by me: a control returning the same
+value as the subject is a dead instrument, not a result.** The zero was right. My evidence for it was
+worthless until the second control, and the two are indistinguishable on the page.
+
+**This also confirms the disclosure guard's lone exemption is honestly written**, which I want on the
+record since I audited that guard hard earlier: `server.execution_provider` really is a string-typed,
+not-plumbed, surface-bound field, and the fixture proves the promotion path it names is live rather
+than theoretical. **The exemption describes a real hole and expires itself when the hole closes.**
+
