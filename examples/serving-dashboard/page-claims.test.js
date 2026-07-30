@@ -230,6 +230,14 @@ describe('the design document does not instruct a build it has ruled against', (
       ['2be978152568', 'code citation showing the WRONG pattern being diagnosed'],
       ['e1868d09d532', 'STRUCK S8.3: the fabricated 48x TTFT ladder, retained as evidence'],
       ['dade37765504', 'the null-result panel (S51) -- ships, and must name what it tested'],
+      // S58: verbatim quote of scenario-origins.js:56-61, the DEFECT ITSELF.
+      // This is the same legitimate use the sibling tripwire grants
+      // telemetry-provenance.js -- 'the register that forbids them'. A block
+      // that EXHIBITS a cut binding as evidence and a block that INSTRUCTS one
+      // are textually identical, and no scanner can separate them, which is
+      // precisely why the exemption must be WRITTEN rather than inferred (D166).
+      // The hash is the safeguard: edit the quote and the exemption dies.
+      ['30ffe828eee9', 'S58: verbatim quote of the defect being reported, not a layout'],
     ]);
 
     const offenders = [];

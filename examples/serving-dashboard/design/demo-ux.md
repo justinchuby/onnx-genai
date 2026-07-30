@@ -2515,7 +2515,7 @@ This also **removes the failure mode the fifth state was created to prevent**, r
 
 ### 31.3 The field-level state still exists, narrowly
 
-`not-applicable` remains in the enum, because rare mixed cases exist — a single field structurally pinned inside an otherwise-live panel (`preemptions_total` on the batching path, per D83). There it renders as `—` with the on-screen caption from §21. **But it is the exception; the panel-level treatment is the default**, and the panel treatment is what a visitor will actually encounter.
+`not-applicable` remains in the enum, because rare mixed cases exist — a single field structurally pinned inside an otherwise-live panel. ~~(`preemptions_total` on the batching path, per D83)~~ 🔴 **THAT EXAMPLE IS DEAD — `preempted_total` was DROPPED outright (Lead ruling 3). See §59.2: the exception survives as a rule with NO CURRENT INSTANCE, and is marked so deliberately.** There it renders as `—` with the on-screen caption from §21. **But it is the exception; the panel-level treatment is the default**, and the panel treatment is what a visitor will actually encounter.
 
 **The general principle, which I got wrong once already today (D83, the preemption lane):** *choose the SCOPE of a treatment before its appearance.* Both mistakes were the same one — I picked how something should look before asking what size of thing it was describing. Layout answers questions that decoration cannot.
 
@@ -3836,3 +3836,46 @@ Per **§47/D134** the switcher renders one real `<a>` per registered scenario. *
 | D181 | No utilization bar may be drawn from `/v1/resources` | It carries only limits and budgets — no consumption term exists to be the numerator |
 | D182 | A ratio that can exceed 1 is not a dial | Clamping hides oversubscription, which is Scenario C's entire payoff |
 | D183 | Every removal ships with a tripwire | A removed trap with no test returns silently, read as a clean file by whoever reintroduces it |
+
+---
+
+## 59. §31 RATIFIED, AND A RULE LEFT WITH NO INSTANCES (D184–D187)
+
+### 59.1 D184 — the em-dash design in `formatFieldText` is now OVERRULED IN WRITING
+
+@e00032a4's defect 3 is correct and I want to be precise about what changed, because the comment they quote was *right when it was written*. `formatFieldText:454-456` returns a bare `—` for **both** `unavailable` and `not-applicable`, and its comment states the intent plainly: *"the hover text is what distinguishes them."*
+
+Lead ruling 5 supersedes that: **§31 SUPERSEDES §21; `not-applicable` is PANEL-LEVEL and gets NO em-dash.**
+
+> **D184 — the two states are no longer distinguished by *what text* they render; they are distinguished by *what element* they occupy.** `unavailable` is a **field** treatment — the value is missing and may arrive. `not-applicable` is a **panel** treatment — header and frame kept, **body replaced by the explanation**. **They were never two labels for one slot, and trying to tell them apart inside one slot is what forced the design onto hover in the first place.** Hover is not a channel: touch and keyboard have none.
+
+**AND THE FAILURE MODE IS SPECIFICALLY MINE TO OWN:** I shipped `--og-na-note` at `968cb93a` as the always-visible caption and argued *"a fact nobody hovers over is a fact nobody learns."* @e00032a4 is right that the token was **nullified by a renderer that never emits a note.** So the fifth state has been, all session: **defined in the constant, absent from its own typedef, never emitted by the store, visually identical to `unavailable`, and unstyled.** **Five layers, each individually defensible, and the feature does not exist.** My `asset-graph.test.js` proved the token had consumers — **it could not prove the token had a MEANING.** A consumed token and a working feature are different claims, and I asserted the weaker one while believing the stronger.
+
+### 59.2 🔴 D185 — A RULE WITH NO INSTANCES IS A RULE THAT WILL BE MISAPPLIED
+
+Ruling 5 preserved the field-level exception: *"Field-level em-dash+caption survives only for a structurally-pinned field inside an otherwise-live panel."* **Correct — and ruling 3, in the same message, DROPPED `preempted_total`, which was the ONLY example §31 gave.** §31 has been struck in place accordingly.
+
+> **D185 — the exception STANDS as a rule and is hereby marked NO CURRENT INSTANCE.** Not deleted: the shape is real and something will qualify. But **an exception carrying a dead example is worse than one carrying none — a reader who checks the example finds a field that does not exist, and the natural repair is to substitute the nearest field they happen to be holding.** That is how an exception becomes the default. **When the last instance of a rule dies, say so IN the rule; a rule cannot advertise its own emptiness by staying silent.**
+
+**The nearest candidate, and it does NOT qualify — which is the useful part:** per AC70 the paged-KV block table ships and is genuinely verified, but **per-block ownership is absent because `page_usage()` collapses `pages: pages.len()`** (`page_table.rs:864-875`). One absent field inside a live panel — the right *shape*. But `PageTable.sequences` is `pub` and the data exists; only the getter discards it. **So ownership is `unavailable` — a PROMISE, repairable by widening a return type — never `not-applicable`, which is an ARCHITECTURAL FACT.** **A field is not `not-applicable` because we did not plumb it. It is `not-applicable` only when plumbing it would be meaningless.** @c8d9a40e's nullable-ownership panel is exactly right and needs no exception.
+
+### 59.3 D186 — an evidence block and an instruction block are textually identical
+
+§58 quoted `scenario-origins.js:56-61` verbatim to report the cut-scenario defect, and **my own sketch scanner immediately flagged my report as a build instruction.** It was right to: **a fenced block that EXHIBITS a bad binding and one that PRESCRIBES it are the same characters.**
+
+> **D186 — no scanner can separate evidence from instruction, which is exactly why the exemption must be WRITTEN and hashed rather than inferred (D166).** The exemption is granted with a stated reason; **the hash is the safeguard — edit the quote and the exemption dies.** This is the same legitimate use the sibling tripwire grants `telemetry-provenance.js` (*"the register that forbids them"*): **the document that forbids a thing must be allowed to spell it.**
+
+### 59.4 ✅ D187 — the atomic pair LANDED, and a broadcast now contradicts its own author's code
+
+Verified at HEAD: `telemetry-field.js:122` is `MEASURED: 'measured'`, the typedef at `:20` lists all five, `shell.css:163` selects `[data-state='measured']`, and `field-state.js:53` reads `OK: 'measured'`. **Both halves of the atomic pair are in. My two deliberate reds are green.**
+
+But @c8d9a40e's broadcast states *"the `'measured'` spelling is retired… anything outside `'ok'|…` now renders as an em-dash."* **Their own committed code says the opposite, and their own `state-vocabulary.test.js:28` lists `'measured'` in `RULED_STATES`.** The code is correct; **the announcement is inverted.**
+
+> **D187 — a broadcast is READ BY MORE AGENTS THAN A DIFF, and it arrives without the file attached.** Anyone who acts on that message emits `'ok'` and trips a test that is already right. **We have spent the session on stale prose outranking live code; this is the sharper form — prose that was NEVER true, published by the author of the code it misdescribes, in the same minute they committed it.** **Verify the field, verify the instrument, verify the fix — and now: verify the ANNOUNCEMENT, including your own.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D184 | `unavailable` vs `not-applicable` differ by ELEMENT, not by text | Two labels in one slot forced the design onto hover, which touch and keyboard do not have |
+| D185 | The field-level exception stands, marked NO CURRENT INSTANCE | A dead example invites substituting the nearest field to hand — that is how an exception becomes the default |
+| D186 | Evidence blocks are exempted by written, hashed grant | A quote and an instruction are the same characters; the document that forbids a thing must be able to spell it |
+| D187 | Verify the announcement, including your own | A broadcast reaches more agents than a diff and arrives without the file attached |
