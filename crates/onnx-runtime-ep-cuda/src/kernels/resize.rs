@@ -521,6 +521,7 @@ mod tests {
         ] {
             let reason = crate::kernels::standard_claims::unsupported_reason(
                 &resize_node(name, attribute),
+                &[],
                 &[DataType::Float32, DataType::Float32],
             )
             .expect("deferred Resize mode must be rejected");

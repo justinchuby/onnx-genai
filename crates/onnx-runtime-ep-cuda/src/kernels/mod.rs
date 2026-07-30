@@ -34,6 +34,7 @@ pub mod compressed_sparse_attention;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod conv;
+pub mod conv_transpose;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumprod;
@@ -51,6 +52,7 @@ pub mod gemm;
 pub mod global_reduction;
 mod gqa_decode;
 mod gqa_decode_fp16;
+pub mod grid_sample;
 pub mod group_normalization;
 pub mod group_query_attention;
 pub mod hardmax;
@@ -322,6 +324,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Col2Im",
     "QLinearMatMul",
     "Resize",
+    "ConvTranspose",
+    "GridSample",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -539,6 +543,21 @@ pub fn build_cuda_registry_with_metrics(
             since_version: 11,
         }),
     );
+    reg.register(
+        OpKey::new("ConvTranspose", "", 1),
+        Box::new(conv_transpose::ConvTransposeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for since_version in [16_u32, 20] {
+        reg.register(
+            OpKey::new("GridSample", "", u64::from(since_version)),
+            Box::new(grid_sample::GridSampleFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        );
+    }
     for version in [13, 22] {
         reg.register(
             OpKey::new("Dropout", "", version),

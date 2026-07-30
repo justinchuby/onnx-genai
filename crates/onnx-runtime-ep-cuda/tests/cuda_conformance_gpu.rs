@@ -448,6 +448,114 @@ fn resize_cases() -> Vec<Case> {
     ]
 }
 
+fn conv_transpose_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "ConvTranspose[1d,stride,dilation,output-padding,asymmetric-pads]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(DataType::Float32, &[1, 1, 3], &[1.0, -2.0, 3.0]),
+                float_input(DataType::Float32, &[1, 1, 2], &[0.5, 2.0]),
+                float_input(DataType::Float32, &[1], &[0.25]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 1, 7])],
+            attrs: vec![
+                ("strides", Attribute::Ints(vec![2])),
+                ("dilations", Attribute::Ints(vec![2])),
+                ("pads", Attribute::Ints(vec![1, 0])),
+                ("output_padding", Attribute::Ints(vec![1])),
+            ],
+            compare: Compare::Float { tol: 1e-5 },
+        },
+        Case {
+            label: "ConvTranspose[2d,depthwise,stride,asymmetric-pads]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(
+                    DataType::Float16,
+                    &[1, 2, 2, 2],
+                    &[1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0],
+                ),
+                float_input(
+                    DataType::Float16,
+                    &[2, 1, 2, 2],
+                    &[1.0, 0.5, -1.0, 2.0, 0.25, -0.5, 1.5, 1.0],
+                ),
+            ],
+            outputs: vec![(DataType::Float16, vec![1, 2, 2, 3])],
+            attrs: vec![
+                ("group", Attribute::Int(2)),
+                ("strides", Attribute::Ints(vec![1, 2])),
+                ("pads", Attribute::Ints(vec![0, 1, 1, 0])),
+            ],
+            compare: Compare::Float { tol: 3e-3 },
+        },
+        Case {
+            label: "ConvTranspose[2d,grouped,multiple-output-channels]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(
+                    DataType::BFloat16,
+                    &[1, 4, 2, 1],
+                    &[1.0, 2.0, -1.0, 3.0, 0.5, -2.0, 4.0, 1.0],
+                ),
+                float_input(
+                    DataType::BFloat16,
+                    &[4, 2, 1, 2],
+                    &[
+                        1.0, 0.5, -1.0, 2.0, 0.25, 1.0, 1.5, -0.5, 2.0, 0.5, -0.5, 1.0, 0.75, -1.0,
+                        1.25, 0.25,
+                    ],
+                ),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![1, 4, 2, 2])],
+            attrs: vec![("group", Attribute::Int(2))],
+            compare: Compare::Float { tol: 3e-2 },
+        },
+    ]
+}
+
+fn grid_sample_cases() -> Vec<Case> {
+    let image = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let grid = [-1.4, -1.2, 0.0, 0.0, 1.3, 1.4, 0.6, -0.7];
+    [
+        ("bilinear", "zeros", 0, DataType::Float32, 1e-5),
+        ("bilinear", "border", 1, DataType::Float16, 3e-3),
+        ("bilinear", "reflection", 0, DataType::BFloat16, 3e-2),
+        ("nearest", "zeros", 1, DataType::Float32, 1e-5),
+        ("nearest", "border", 0, DataType::Float16, 3e-3),
+        ("nearest", "reflection", 1, DataType::BFloat16, 3e-2),
+    ]
+    .into_iter()
+    .map(|(mode, padding, align_corners, dtype, tolerance)| Case {
+        label: format!("GridSample[{mode},{padding},align-corners={align_corners},out-of-bounds]"),
+        op: "GridSample",
+        domain: "",
+        opset: 20,
+        inputs: vec![
+            float_input(dtype, &[1, 1, 2, 3], &image),
+            float_input(dtype, &[1, 2, 2, 2], &grid),
+        ],
+        outputs: vec![(dtype, vec![1, 1, 2, 2])],
+        attrs: vec![
+            ("mode", Attribute::String(mode.as_bytes().to_vec())),
+            (
+                "padding_mode",
+                Attribute::String(padding.as_bytes().to_vec()),
+            ),
+            ("align_corners", Attribute::Int(align_corners)),
+        ],
+        compare: Compare::Float { tol: tolerance },
+    })
+    .collect()
+}
+
 fn dropout_cases() -> Vec<Case> {
     vec![
         Case {
@@ -2223,6 +2331,8 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("DequantizeLinear", dequantize_linear_cases()));
     p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
     p.push(sweep("Resize", resize_cases()));
+    p.push(sweep("ConvTranspose", conv_transpose_cases()));
+    p.push(sweep("GridSample", grid_sample_cases()));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
     p.push(sweep(
