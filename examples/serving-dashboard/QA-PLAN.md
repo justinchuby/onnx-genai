@@ -306,8 +306,8 @@ how it behaves here more than on the happy path.
       *Evidence:* `DecodeLoopState::with_rng(0, …)` at `batched.rs:262` and `:486` — the first
       arg IS `prefix_cache_hit_len`, a hardcoded literal. It is a compile-time constant wearing
       the costume of a measurement.
-- [ ] **4.4** Preemption counter is `not-applicable` — `batched.rs:757` hardcodes
-      `PreemptionPolicy::Disabled`, structurally per the `:713-717` comment.
+- [ ] **4.4** Preemption counter is `not-applicable` — `crates/onnx-genai-engine/src/batched.rs`,
+      `PreemptionPolicy::Disabled` is set structurally, per the comment directly above it.
 - [ ] **4.5** `active_sessions` — **fire 4 concurrent requests and expect the panel to read 0.**
       It counts persistent `X-Session-Id` sessions, not concurrent requests. At the busiest moment
       of Scenario A this panel is empty and *correct*. Either the label changes or the field goes.
@@ -417,7 +417,9 @@ how it behaves here more than on the happy path.
 ### 6.3 🔴 STAGE PRESSURE WITH SESSIONS AND REPEATED PREFIXES — **NOT** CONCURRENCY
 
 Supersedes the earlier "raise concurrency and prompt length" instruction, which is **wrong on
-this origin**. The dynamic server **serialises generations** (`driver.rs:696`): concurrent
+this origin**. The dynamic server **serialises generations**
+(`crates/onnx-genai-server/src/driver.rs`, `handle_driver_command` — it takes `&mut Engine` and
+runs generation inline under that exclusive borrow): concurrent
 requests do **not** overlap, they **queue**.
 
 - [ ] **6.3a Drive the pool with SEQUENTIAL requests** that (i) reuse `X-Session-Id` sessions,
@@ -696,7 +698,8 @@ broken that we already know is not built. Each item below is verified absent, wi
   structured `FieldUnavailable::pending` entries. **The absence is now total rather than
   self-declared, which makes this item MORE true, not less** -- but a tester grepping for the
   old string will find nothing and must not read that as the grid having gained a source.
-  `SequenceUsage` (`page_table.rs:867-875`) consumes `Vec<PageId>` into a length, and the raw map
+  `SequenceUsage` (`crates/onnx-genai-kv/src/page_table.rs`, `SequenceUsage`) consumes
+  `Vec<PageId>` into a length, and the raw map
   is behind a private `Engine.kv_cache`. **Test that the panel says so honestly; do not test the grid.**
   *(Scenario B is NOT in this category — its block table has its own source and IS in scope.
   Do not take that on anyone's word; re-derive it, because a wrong exclusion here costs a defect
@@ -720,15 +723,24 @@ broken that we already know is not built. Each item below is verified absent, wi
 - **11.2 `tokens_per_second` and `batch_utilization` on `/v1/status` are stubs** — literal `0.0`.
   The dashboard derives tok/s client-side. A zero here is a stub, not a measurement.
 - **11.3 `/v1/debug/kv` returns the literal string `"unavailable"`** on the scatter profile.
-- **11.4 The runtime VRAM-limit knob is dead twice over.** `state.rs:152` hardcodes
-  `allow_runtime_override: false` (so it 403s), and `ByteBudget::reconfigure`
-  (`byte_budget.rs:180-190`) sets `state.limit` but never touches `state.used` — the repo's own
+- **11.4 The runtime VRAM-limit knob.** `crates/onnx-genai-engine/src/config.rs`,
+  `allow_runtime_override` is `false` — but read the mechanism before trusting this exclusion:
+  the `false` is the **`Default` impl value, not a hardcode**. `EngineConfig::from_yaml` assigns
+  it from `serving.memory.limits.allow_runtime_override`, so YAML can turn it on.
+  ⚠️ **Whether the demo's launch path ever calls `from_yaml` is UNVERIFIED, so the "it 403s" half
+  of this exclusion is unconfirmed — if you get a 403, that is consistent; if you do NOT, this
+  item is wrong rather than you having found a bug. Confirm before filing either way.**
+  The second leg IS verified: `ByteBudget::reconfigure`
+  (`crates/onnx-genai-scheduler/src/byte_budget.rs`, `reconfigure`) sets `state.limit` but never
+  touches `state.used` — the repo's own
   test is named `reconfigure_lower_reports_overage_without_evicting`. **To fill the KV pool
   honestly, use sequential requests with repeated prefixes, persistent sessions and long
   prompts — see §6.3. NOT concurrency: the dynamic server serialises generations
-  (`driver.rs:696`), so a concurrency ramp fills a queue, not the pool.**
-- **11.5 Preemption is structurally disabled on the batching path** — `batched.rs:757` hardcodes
-  `PreemptionPolicy::Disabled` (see the `:713-717` comment). The preemption counter is
+  (`crates/onnx-genai-server/src/driver.rs`, `handle_driver_command`), so a concurrency ramp
+  fills a queue, not the pool.**
+- **11.5 Preemption is structurally disabled on the batching path** —
+  `crates/onnx-genai-engine/src/batched.rs`, `PreemptionPolicy::Disabled` (see the comment
+  directly above the assignment). The preemption counter is
   `not-applicable` on Profile S, not broken.
 - **11.6 `/v1/resources` on scatter reports `total_pages: 359128175` with 16-byte pages.**
   Precise, confident garbage. No Scenario A panel may bind to it.
