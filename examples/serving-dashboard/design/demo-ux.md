@@ -7109,3 +7109,46 @@ and never infer a green from the absence of a red.**
 | D334 | Score a suite on `tests === pass` plus the exit code, never on `fail === 0` | `cancelled` is a third counter; a crashed suite reports `pass=0 fail=0`, identical to an empty one |
 | D335 | A grep of a file cannot find a git dependency one import away | Six guards scored zero git references; one crashed inside git via `shipping-tree.mjs` |
 | D336 | A guard that reads outside its own subtree cannot run in an extract | `provenance-expiry` reads `crates/…/admin.rs` and fails on a path, not on git — a second root cause for the same symptom |
+
+## §99 — My own catch-all guard was blind to a rename, and every arm passed
+
+§96 built eight arms to prove that an unknown field state cannot render as a
+measured one. Tonight I mutated `shell.css` the way an ordinary refactor would —
+`[data-state]:not(…)` became `[data-XXXX]:not(…)`, one attribute renamed — and
+measured the result in a clean detached worktree:
+
+```
+BEFORE  740 tests · 740 pass · 0 fail · exit 0
+MUTANT  740 tests · 740 pass · 0 fail · exit 0    bytes verifiably changed
+```
+
+**The unknown-state treatment was completely dead and the entire suite was
+green.** No element in the DOM carries `data-XXXX`, so both catch-all rules
+matched nothing; an unknown state fell straight through to a bare `.value` and
+inherited `--og-fg` — pixel-identical to `measured`. That is precisely the
+FAILS-OPEN direction D326 claims to close.
+
+The cause is one line, and it is the same defect I documented and thought I had
+fixed:
+
+```js
+const catchAlls = rules.filter((r) => r.sel.includes(":not([data-state="));
+```
+
+A catch-all is identified **purely by its `:not()` chain — the negative half.**
+Renaming the positive attribute leaves every exemption byte-identical, so all
+eight arms still found their catch-all, parsed the correct exemption set, matched
+it against `FIELD_STATES`, located the chip, and passed. I had already learned
+that *a catch-all selector contains `[data-state='X']` for every state it
+exempts* and stripped `:not(…)` before testing for a **treatment** — but never
+before testing for the **subject**. I hardened the half I had been burned by.
+
+The general form, and it is the sharpest thing my lane produced tonight: **a
+guard that identifies its subject by the subject's exceptions will certify a
+subject that no longer exists.** The exception list is the most stable, most
+copied, most refactor-proof part of a selector — which is exactly why keying on
+it feels safe and is not.
+
+| ID | Decision | Rationale |
+|---|---|---|
+| D337 | A guard must assert its subject's POSITIVE binding, not only its exemptions | `[data-state]` → `[data-XXXX]` left 45/45 and 740/740 green with the treatment dead; the new arm reddens by name |

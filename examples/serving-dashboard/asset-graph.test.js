@@ -1189,6 +1189,32 @@ describe('an unknown state cannot render as a measured one', () => {
     );
   });
 
+  it('every catch-all still positively binds [data-state]', () => {
+    // The identification predicate above keys on the :not() chain -- the
+    // NEGATIVE half of the selector. Rename the POSITIVE attribute and every
+    // exemption survives verbatim: all the arms in this suite still find their
+    // catch-all, parse the right exemption set, match it against FIELD_STATES,
+    // locate the chip, and pass -- over a rule that selects NOTHING, because
+    // no element in the DOM carries the renamed attribute.
+    //
+    // This is not hypothetical. Measured: rewriting `[data-state]:not(...)` to
+    // `[data-XXXX]:not(...)` in shell.css left all 45 tests in this file green
+    // and the whole 740-test suite green, with the unknown-state treatment
+    // completely dead. A guard satisfied by the artefact it exists to reject.
+    for (const r of catchAlls) {
+      const positive = r.sel.replace(/:not\([^)]*\)/g, '').trim();
+      assert.ok(
+        positive.includes('[data-state]'),
+        `A catch-all exempts named states but no longer SELECTS on ` +
+          `[data-state]:\n  ${r.sel}\n` +
+          `Its positive half is \`${positive}\`. The :not() chain is intact, ` +
+          `so every other arm here passes over a rule that matches no element. ` +
+          `An unknown state falls through to a bare .value -- which is to say, ` +
+          `it renders as a measured one.`,
+      );
+    }
+  });
+
   it('parsed a non-empty exemption set and a non-empty enum (anti-vacuity)', () => {
     for (const r of catchAlls) {
       assert.ok(
