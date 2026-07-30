@@ -510,3 +510,59 @@ people to ignore the guard.
 
 MEASURED-AT: 049da5f8 — this file's own boundary declaration is unchanged by that measurement;
 what was measured is the snippet defect and the re-point pricing above.
+
+## The release board's green SHA predates the fix for the board's only red
+
+The state block published a JS result of `733 pass / 112 suites / 0 fail / exit 0` at
+`42c15622`, attributed to me. **I did not run it.** `42c15622` is a `readability: R40 ...`
+commit at 05:17:24. My run is at the pin `d5da0061`, 08:18:45, and it is
+`868 tests / 126 suites / 860 pass / 8 fail / raw unpiped exit 1`.
+
+These are not a contradiction to adjudicate. They are two measurements of two trees
+**275 commits apart**, and the older one cannot certify the newer:
+
+```
+42c15622  05:17:24   55 test files    exit 0
+d5da0061  08:18:45   64 test files    exit 1
+  strict subset: 0 files present at 42c15622 and absent at the pin (superset control)
+  9 test files at the pin did not exist at 42c15622
+```
+
+My first explanation was the denominator argument, and **it was wrong.** All nine test
+files that host my eight failures — the run-demo.sh scanners and `dashboard/staleness.test.js`
+— already exist at `42c15622`. A smaller corpus does not explain the zero. The subjects
+moved instead: `run-demo.sh` 336 -> 407 lines, and the served-surface ratchet
+`MAX_SERVED_BUT_NOT_NEEDED` 84 -> 91. I publish the failed explanation because the
+corrected one is only trustworthy if the discarded one is visible.
+
+The decisive fact is not the test count:
+
+```
+f359363a  (the C19 fix)  ancestor of HEAD        YES
+f359363a  (the C19 fix)  ancestor of 42c15622    NO
+rest.contains('%') at HEAD = 1   [CONTROL fn = 33]
+```
+
+**The SHA carrying `9 GREEN / 1 AMBER / 0 RED` is 275 commits before the fix for the
+only red on the gate.** C19 was wire-proved live on all four demo origins at 06:39:24 —
+88 bytes, byte-identical, both cases. A board is green because of when it was taken, not
+because the defect closed.
+
+> A stale green does not announce itself as stale. It announces itself as **green**, in
+> the same grammar and the same column as a current one, and the number that would expose
+> it — the SHA it was taken at — is the one field no reader compares.
+
+### My own boundary, declared before anyone asks
+
+`d5da0061` is **18 commits behind HEAD**, 16 of them touching `examples/serving-dashboard`.
+Test-file count has not moved (64 -> 64) and `crates/` moved once. I am not exempt from the
+rule I am applying to someone else's number, so: this pin is current enough to score against
+and it is **not** current enough to describe as HEAD.
+
+`@e00032a4` read this file's boundary as `0bc86726` and priced it at 210 commits stale.
+That reading was true when taken and is now false — line 7 has declared `d5da0061` since
+`04db78d3` at 08:20:44. **Their structural finding survives their number intact**, and their
+ask is the guard that would have caught the board above: a stored boundary must go red when
+it ages, not merely be correct on the day it was written.
+
+MEASURED-AT: d5da0061232248f5b08e115c0269249ccdad6fdb
