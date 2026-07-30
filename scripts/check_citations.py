@@ -479,6 +479,31 @@ def source_text(repo: Path, rel: str) -> str:
     return (repo / rel).read_text(errors="replace")
 
 
+def tree_qualifier() -> str:
+    """The tree this verdict is about, formatted to sit ON the verdict line.
+
+    The banner already prints the toplevel -- at the TOP, dozens of lines
+    above the verdict. That is not good enough, and the reason is measured:
+    of the 179 anchored citations in docs/ARCHITECTURE.md, 158 resolve
+    identically in BOTH this repository and the sibling checkout, because
+    both contain crates/onnx-genai-server/src/... at the same paths. So a
+    bare "OK - every anchored citation resolves" is true of two different
+    trees that disagree, and the tail of this output is the part people
+    paste. A qualifier that is not adjacent to the claim is not attached
+    to it.
+    """
+    try:
+        root = tree_context.repo_root()
+        branch = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        return f"{root.name} @ {branch}"
+    except Exception:
+        # Never let a cosmetic qualifier change a verdict. An unknown tree
+        # is reported as unknown, not as an error and not as silence.
+        return "UNKNOWN TREE"
+
+
 def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     print(f"citations in {doc}: anchored {stats['anchored']} | "
           f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']} "
@@ -525,7 +550,10 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
         if len(diverged) > 8:
             print(f"  ... and {len(diverged) - 8} more")
     if not failures:
-        print("OK - every anchored citation resolves to a definition that exists.")
+        print(f"OK [{tree_qualifier()}] - every anchored citation resolves to a "
+              f"definition that exists IN THAT TREE. The sibling checkout has "
+              f"files at identical paths; most citations resolve there too, so "
+              f"this OK does NOT identify which repository the document means.")
         if diverged:
             print(f"WARNING - this OK was computed from the WORKING TREE, and "
                   f"{len(diverged)} cited source file(s) above differ from HEAD. "
@@ -540,6 +568,8 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     by_kind: dict[str, list[Failure]] = {}
     for f in failures:
         by_kind.setdefault(f.kind, []).append(f)
+    print(f"\nFAILURES BELOW ARE RELATIVE TO [{tree_qualifier()}]. A citation that "
+          f"is wrong here may be correct in the sibling checkout, and vice versa.")
     for kind, group in by_kind.items():
         print(f"\n### {kind}: {len(group)}")
         for f in group:
