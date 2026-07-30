@@ -43,6 +43,9 @@ const DASHBOARD_DIR = fileURLToPath(new URL('./', import.meta.url));
 const UI_DIR = fileURLToPath(new URL('../ui/', import.meta.url));
 const PACKAGE_DIR = fileURLToPath(new URL('../', import.meta.url));
 
+// Census this extractor over its real inputs below, deduplicated by call site.
+// A whole-repository regex count includes fixture strings and vendored copies,
+// inflating the population and potentially hiding a real drop behind duplicates.
 const SOURCE_DIRS = [
   ['dashboard/', DASHBOARD_DIR],
   ['ui/', UI_DIR],
