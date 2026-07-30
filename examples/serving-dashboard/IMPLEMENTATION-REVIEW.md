@@ -3988,3 +3988,100 @@ passing test is read by nobody**, and this run is the only reason those 7 are no
 **If they are worth printing, they are worth a count that can be ratcheted down; if they are
 not, they are noise.** Suggest: assert the drift count is `<= N` and lower `N` opportunistically
 — **the same ratchet already applied four times in this file, pointed at its own warnings.**
+
+---
+
+## F42 — Suite reconciliation at `3d3f0fc1`, and a predicate defect in the crew's own path-disclosure check
+
+**Measured by agent:73e77d95. Canonical runner `run-tests.sh`, unpiped, raw exit captured directly.**
+
+### The number the release gate asked for
+
+```
+SHA BEFORE RUN : 3d3f0fc17ce5f9e295ce865b4bc3a11a096fbe1a
+SHA AFTER RUN  : 3d3f0fc17ce5f9e295ce865b4bc3a11a096fbe1a   <- did not move under me
+discovered     : 58 test files
+tests 763 | suites 116 | pass 761 | fail 2 | skipped 0
+RAW EXIT       : 1
+DESK POSTURE   : DIRTY, 2 files, NEITHER MINE
+                 examples/serving-dashboard/dashboard/testing/fake-store.js            (M)
+                 examples/serving-dashboard/dashboard/testing/fake-store-contract.test.js (A)
+```
+
+**This is a DESK number, not a branch number.** Both dirty files belong to another agent and
+went from `??` to `A` while I was auditing. I state both halves because either alone misleads.
+
+### The citation red is MOOT — do not fix it
+
+The lead asked in 60 seconds whether `check-source-citations.test.js` is still red. **It is green.**
+
+```
+▶ repair-citations reads the shipping tree, not the desk
+  ✔ REFUSES to resolve a citation to an untracked file
+  ✔ finds citations at all — anti-vacuity
+failures inside the citation suite: 0
+```
+
+Independently confirms my F41. **`@732c7548` must not fix a passing test.**
+
+### The only 2 failures in 763 tests are ONE suite, and they are on COMMITTED bytes
+
+Both in `served-surface.test.js` — `the served surface is a closed set`. Not desk noise: the
+dirty files are `fake-store*`, and `served-surface.test.js` references them **0** times.
+
+Eight tracked files under the served surface carry no declared exposure class:
+`clean-binary.sha256`, `raw/qa-baseline-{long512,nullab,polling,primary,raw,rep2}.json`,
+`raw/qa-baseline-server.log`.
+
+**This is a classification gap, NOT a leak.** I chased it as a disclosure and it came back clean:
+
+```
+PREDICATE = absolute filesystem path        SERVABLE   abs-path   /Users/
+clean-binary.sha256                            404        1          1
+raw/qa-baseline-*.json   (all six)          SERVED        0          0
+raw/qa-baseline-server.log                     404        1          0    <-- READ THIS ROW
+```
+
+The six files the allowlist WOULD serve are clean. The two holding absolute paths are `404`
+(`.log` and `.sha256` are absent from `SERVABLE_EXTENSIONS`). **No visitor-facing disclosure.**
+I am reporting this green rather than escalating it, because a false red is a dispatch that
+spends somebody else's last hour.
+
+Honesty on the instrument: my named positive control (`demo_assets.rs`) returned **0** — it was
+**DEAD**. What vouches for the measurement is the two in-set hits: the predicate demonstrably
+returned 1 twice in the same run against 6 zeros, so it discriminates.
+
+### The keepable finding: `/Users/` is not the predicate for "absolute path"
+
+`raw/qa-baseline-server.log` scores **`/Users/` = 0** and **absolute-path = 1**. It discloses:
+
+```
+selected ONNX Runtime 1.27.0 from
+  /opt/homebrew/Caskroom/miniconda/base/lib/python3.13/site-packages/onnxruntime/...
+```
+
+**I scored that file CLEAN and nearly published it.** I grepped the token from the P1 finding
+instead of the property the finding is about. It was a true negative for the pattern and a
+false negative for the property — the Critical Reviewer's correction landing on my own work
+inside an hour: *test the property you care about, not a symbol you hope implies it.*
+
+**➡️ ACTION FOR THE CREW: if the P1 `server.model_path` ban predicate is `/Users/`-shaped, it
+has a proven blind spot with a proven in-tree instance.** A demo run on any machine whose models
+live outside `/Users/` — every CI container, every Linux box — is invisible to it. Widen to
+`(^|[^A-Za-z0-9_.-])/(Users|opt|home|usr|var|private|tmp|Applications|Library)/`.
+
+### Self-disclosure: my unquoted heredoc had SIDE EFFECTS, not just corruption
+
+I previously reported that the unquoted heredoc at `a72def83` deleted backticked identifiers.
+That was incomplete. It also **wrote a file into the repository root**: my line
+
+```
+null  ->  '0s old'
+```
+
+was parsed by the shell as a redirection, creating an empty file named `0s old` (0 bytes,
+05:45). It sat untracked for ~15 minutes. Removed; absence verified; no other artefact.
+
+**The lesson is not "quote your heredocs" — I already knew that. It is that I verified the
+COMMIT and never asked what else the shell did.** A corrupted heredoc is a program you did not
+know you were running, and its output is not confined to the file you were writing.
