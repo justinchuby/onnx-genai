@@ -144,3 +144,49 @@ describe('field states are legible without colour', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// THE CENSUS. The one place in this file that HARDCODES, on purpose.
+//
+// Everything above derives its states from FIELD_STATES so that a RENAME lands
+// as a red test. That design is blind to the opposite move: a state being
+// DELETED. If NOT_APPLICABLE were dropped from the constant, every assertion
+// above would still pass -- it would simply stop checking the state that no
+// longer exists, and the suite would go green on a smaller, poorer contract.
+//
+// A test derived entirely from the artifact it is testing cannot notice the
+// artifact shrinking. So the RULING is written here literally, once: five
+// states, and MEASURED's wire value is its own name.
+describe('the ruled field-state vocabulary', () => {
+  it('is exactly five states', () => {
+    assert.deepEqual(
+      Object.keys(FIELD_STATES).sort(),
+      ['MEASURED', 'NOT_APPLICABLE', 'PENDING', 'STALE', 'UNAVAILABLE'],
+      'FIELD_STATES must carry exactly the five ruled states. NOT_APPLICABLE is ' +
+        'not interchangeable with UNAVAILABLE: `unavailable` is a PROMISE (the ' +
+        'number could exist once someone plumbs it), `not-applicable` is an ' +
+        'ARCHITECTURAL FACT (this execution path never computes it). Collapsing ' +
+        'them tells a visitor a correctly-working server is broken. If you are ' +
+        'here after a proposal to drop to four states: the fifth is already ' +
+        'implemented and already consumed -- deleting it is the migration, not ' +
+        'keeping it.',
+    );
+  });
+
+  it('gives MEASURED a wire value equal to its own name', () => {
+    assert.equal(
+      FIELD_STATES.MEASURED,
+      'measured',
+      "A constant named MEASURED whose value is 'ok' is a landmine with no " +
+        "symptom: `field.state === 'measured'` returns false for every measured " +
+        'field on the dashboard, and the field then renders as a plain number ' +
+        'anyway via the fall-through in formatFieldText -- so the check fails ' +
+        'silently while the output looks correct. This is a TWO-FILE ATOMIC ' +
+        "edit: telemetry-field.js:103 and the [data-state='ok'] selector in " +
+        'styles/shell.css must change together, or every absence treatment on ' +
+        'the page stops matching. Never global-replace the string `ok`: ' +
+        "`status: 'ok'` is the HTTP health payload and renaming it fakes an " +
+        'unreachable server.',
+    );
+  });
+});
