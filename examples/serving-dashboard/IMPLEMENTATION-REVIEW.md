@@ -2892,3 +2892,123 @@ later pin; I am closing it rather than leaving it to look unresolved.
 - My own `VERIFIED-AT` grep missed all three rows this pass because I searched a hyphen where the
   file has a backtick. **Caught only by the positive control.** Reported against myself.
 
+
+---
+
+## PASS 2 ADDENDUM — **I RAN THE RUST. MY OWN STANDING LIMIT IS RETIRED, AND IT WAS WRONG IN BOTH DIRECTIONS.**
+
+`@12e42da8` corrected their own pin — *"646/646 was the JS suite only; I ran `run-tests.sh` and called it
+'the suite'"* — and ordered reviewers to run both and report both denominators. **I have carried
+*"`cargo test` has never been run tonight"* as a limit on every verdict I have filed. It is now false,
+and I retired it by executing it rather than by reading someone else's number.**
+
+### Both denominators, executed by me
+
+```
+JS     ./run-tests.sh          646 pass ·  0 fail · 98 suites   · RAW UNPIPED EXIT 0
+                               (clean detached worktree @ 0bc86726, porcelain 0)
+
+RUST   cargo test -p onnx-genai-server
+                               264 pass ·  0 fail ·  4 ignored  · RAW UNPIPED EXIT 0
+                               TOTAL 268 across 6 binaries
+                               ⚠️ MAIN WORKING TREE, porcelain 4 (none mine, index empty).
+                                  NOT quotable as a gate score — a clean detached worktree
+                                  would need a cold 12G build. Quotable as: the Rust ran.
+```
+
+### The lead's 🔴 is **CLOSED**, and I am reporting that against a number I could have used to look diligent
+
+`@12e42da8` measured `188 tests · 185 pass · 1 FAIL · 2 ignored`. **I measure 0 failures.** The
+difference is not a dispute — **their own fix landed in between.** `src/tests.rs:1109` now carries
+`#[ignore = "requires a real vision encoder at …vlm-executable/vision.onnx"]`, and it is in
+**committed bytes at HEAD**, not merely on a desk. The unsatisfiable-by-construction fixture test is
+now a visible skip naming its gitignored prerequisite, exactly as they said they would do it.
+
+### But `188` vs `268` is **not** explained by that fix, and the residue is the collision class again
+
+One `#[ignore]` converts a fail; it does not move a denominator by 80. Measured:
+
+```
+crate onnx-genai-server, DEMO repo          crate onnx-genai-server, SIBLING repo
+  tests/demo_dashboard.rs      15 tests       (FILE DOES NOT EXIST)
+  tests/http.rs                29             tests/http.rs             29
+  tests/vlm_image_bundle.rs    10             tests/vlm_image_bundle.rs 10
+  src/tests.rs                156             src/tests.rs              96
+```
+
+**Same crate name, two repositories, two corpora — and the demo branch carries a whole demo-only
+test binary the sibling has never heard of.** This is `@c0de4c2e`'s `model_path_for_display` split
+(3 files here, 0 there) in the test corpus, and `@73e77d95`/F29's 1448-of-1448 basename collision
+arriving where it does the most damage: **`cargo test -p onnx-genai-server` names the same crate in
+both trees and answers differently.** Anyone quoting a Rust number without naming the repository is
+quoting an ambiguous one — **including me until this paragraph.** I am not asserting which tree the
+lead's 188 came from; I am asserting that the number alone cannot say.
+
+### F31 — **the census class reaches Rust. Fourth instance, third language, and it guards the C5 fix.**
+
+`routes/admin.rs:36 model_path_for_display` is **unconditional** — no flag, no config, `file_name()`
+and nothing else — and its docstring explains *why* the conditional was deleted rather than defaulted
+off (*"keyed on the BIND address rather than the PEER"*). **That is the correct fix and it is
+excellent.** `tests.rs:4252 no_configuration_can_re_enable_full_path_disclosure` **ran and passed** in
+my suite (not ignored, not filtered): it is a source-level guard forbidding the *capability*, which is
+strictly stronger than sampling settings, and it says so.
+
+**Its corpus is a hardcoded 3-file `include_str!` list against 23 `.rs` files in the crate.**
+Two arms, both restored byte-identical (`git diff --numstat` → 0 lines afterwards):
+
+```
+CONTROL  token added to routes/admin.rs  (COVERED)    numstat 2 0
+  -> FAILED · RAW EXIT 101 · "routes/admin.rs reintroduced a path-disclosure switch"   ✅ CAN say no
+
+PROBE    a real `pub fn may_disclose_model_paths() -> bool` added to
+         src/models_config.rs  (NOT covered)          numstat 6 0
+  -> test result: ok. 1 passed · RAW EXIT 0                                            ⚠️ SILENT
+```
+
+Four of the five `routes/*.rs` files read config and **none of them are in the corpus**. Coverage
+**3/23 ≈ 13%**.
+
+**Stated fairly, because the failure mode here is a reviewer inflating a good fix into a defect:**
+nothing is disclosing from source today, and this guard is not the reason the wire is still leaking —
+`@bb2ee824` measured 4-of-4 live origins still sending absolute paths, and `@c0de4c2e` explained it:
+**the running processes are a binary built from the branch where `model_path_for_display` has zero
+occurrences.** That is the P0, and no test in either suite can reach a running process. **My finding
+is narrower and it is only this: if someone reintroduces the switch in one of the twenty other files,
+the guard that exists to prevent exactly that will stay green.**
+
+### The unified finding — this is one defect class, not four coincidences
+
+| # | Mechanism | Census? | Bypass added to an uncovered file | Lang |
+|---|---|---|---|---|
+| 1 | `fetchWithDeadline` | **YES**, with an anti-vacuity floor | **RED, exit 1** ✅ | JS |
+| 2 | `resolveStaleCeilingMs` | no | 646/646 green ⚠️ | JS |
+| 3 | `server.model_path` ban (`SOURCES` 2/23) | no | 646/646 green 🔴 | JS |
+| 4 | `may_disclose_model_paths` ban (3/23) | no | exit 0 green 🔴 | Rust |
+
+**Row 1 is the fix for rows 2, 3 and 4, and it already exists in this repository.**
+`request-deadline.test.js:181` enumerates a discovered corpus and asserts its own denominator
+(`assert.ok(fetchSites > 0, …)`) so the census cannot pass by finding nothing. Rows 2–4 each hardcode
+the list of places the defect was *last* found — which is the one list guaranteed not to contain the
+next one.
+
+**Recommendation, unchanged in shape across all three languages:** replace each hardcoded corpus with
+a discovered one plus a non-zero floor. In Rust that is a `walkdir`/`glob` over `src/**/*.rs` instead
+of three `include_str!`s, with `assert!(files_scanned > 3)`. This is follow-up-branch work, not a
+blocker — **but rows 3 and 4 both guard fields that this branch has already had to remove once.**
+
+### Corrections against myself, this addendum
+
+- **My standing limit *"no Rust has been executed tonight"* was stale and I repeated it in my PASS 2
+  verdict, filed minutes before the lead ran it.** A limit is a claim with an expiry date and I never
+  gave mine one — the same defect I filed against others as F27 (a trigger that cannot tell stale
+  from closed). **I was carrying an unfalsifiable caveat and calling it rigour.**
+- I still have **not** executed the other 38 crates, and `crates compile+clippy` remains
+  `@c7a654ed`'s carried 🟡 (vendored AVX2 on arm64, exit 101, untouched by this branch). **One crate
+  is not the workspace.** That limit is now dated: `onnx-genai-server` only, at HEAD `23f4da0d`.
+
+### Verdict, unchanged
+
+**APPROVE. Blocking set: empty.** The Rust half is green at 264/0/4 and the lead's single 🔴 is closed
+in committed bytes. Everything I have raised in pass 2 — F3's three-way `formatAge` split, and the
+census class F24/F30/F31 — is real, is follow-up-branch work, and none of it should hold the tag.
+
