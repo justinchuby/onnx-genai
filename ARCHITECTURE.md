@@ -133,6 +133,49 @@ onnx-genai-kv        → onnx-genai-metadata
 
 **Cycle note.** `onnx-genai-cli` exists as a separate crate specifically to avoid a dependency cycle: it needs both the core `onnx-genai` crate and `onnx-genai-server`, so it cannot live inside either (`crates/onnx-genai-cli/Cargo.toml`, header comment).
 
+Dependencies flow **strictly downward**. Every red edge below is a rejection:
+
+```mermaid
+flowchart TD
+    subgraph L5["Layer 5 — entry points"]
+        CLI["onnx-genai-cli"]
+        SRV["onnx-genai-server"]
+    end
+    subgraph L4["Layer 4 — generation core"]
+        CORE["onnx-genai"]
+        ENG["onnx-genai-engine"]
+    end
+    subgraph L3["Layer 3 — generation support"]
+        KV["onnx-genai-kv"]
+        SCH["onnx-genai-scheduler"]
+        META["onnx-genai-metadata"]
+    end
+    subgraph L2["Layer 2 — ONNX Runtime"]
+        ORT["onnx-genai-ort<br/>onnx-runtime-*"]
+    end
+
+    CLI --> CORE
+    CLI --> SRV
+    SRV --> CORE
+    SRV --> ENG
+    CORE --> ENG
+    ENG --> KV
+    ENG --> SCH
+    ENG --> ORT
+    SCH --> KV
+    KV --> META
+    ENG --> META
+
+    KV -. "FORBIDDEN" .-> ENG
+    SCH -. "FORBIDDEN" .-> ENG
+    ENG -. "FORBIDDEN" .-> SRV
+    ORT -. "FORBIDDEN" .-> ENG
+
+    linkStyle 11,12,13,14 stroke:#c00,stroke-width:2px,stroke-dasharray:4
+```
+
+**Why this shape is worth defending:** `onnx-genai-kv` at the bottom is the reason the page table can be tested without a model, a session, or a server. That property is the codebase's single biggest testability asset, and exactly one upward edge would end it.
+
 ---
 
 ## 3. The request lifecycle
@@ -171,10 +214,41 @@ if engine.continuous_batch_manager(max_batch).is_ok() {
 
 `continuous_batch_manager` succeeds **only for static-cache models**. This single line determines which half of the system you are running. See §5.6.
 
+The fork, and everything downstream of it:
+
+```mermaid
+flowchart TD
+    A["run_engine_driver()<br/>driver.rs:576"] --> B{"engine.continuous_batch_manager(max_batch).is_ok()<br/>driver.rs:407-421"}
+
+    B -- "Ok — STATIC-CACHE model" --> C["run_static_engine_driver()<br/>driver.rs:419"]
+    B -- "Err — DYNAMIC-cache model<br/>⚠ the else-branch at driver.rs:420" --> D["run_fallback_engine_driver()<br/>driver.rs:421"]
+
+    C --> C1["run_static_batch_until_idle()<br/>driver.rs:546"]
+    C1 --> C2["manager.step() — ONE batched<br/>forward pass over all rows<br/>driver.rs:596"]
+    C2 --> C1
+
+    D --> D1["one request at a time<br/>engine owns kv_cache directly"]
+
+    C1 -.->|"NEVER touches"| K["engine.kv_cache<br/>engine.prefix_cache"]
+    D1 --> K
+
+    K --> K1["PageTable::allocate()<br/>page_table.rs:836"]
+    K --> K2["prefix trie<br/>reuse + CoW sharing"]
+
+    style B fill:#fff3cd,stroke:#856404
+    style D fill:#f8d7da,stroke:#721c24
+    style K fill:#d4edda,stroke:#155724
+```
+
+**Read this diagram as the map of what is available where.** The dotted line is the whole story: the batched path never reaches the KV cache, so paged allocation, prefix reuse, and preemption are all absent on it — not broken, just never invoked (§5.6).
+
+> ⚠️ **The most commonly missed line in this file is `driver.rs:420`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every dynamic-cache model takes the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
+
 ### 3.4 The decode step loop (continuous batch path)
 
 - `run_static_batch_until_idle` (`driver.rs:546`) is the outer loop.
-- Each iteration calls `manager.step()` (`driver.rs:595-603`) — **one shared batched forward pass across all active rows**.
+- Each iteration first drains newly arrived commands with `rx.try_recv()` (`driver.rs:577`), then calls `manager.step()` (`driver.rs:596`) — **one shared batched forward pass across all active rows**.
+- **Only `Generate { session_id: None, .. }` is handled inline.** Every other command hits the catch-all at `driver.rs:592` and is pushed onto `deferred`, which is not drained until `driver.rs:520` — after the batch goes idle. This is invariant §5.11 and it is the reason telemetry must be collected inline rather than requested via a command.
 - New arrivals are admitted at `driver.rs:610`; finished rows are backfilled so occupancy is maintained.
 - Admission eligibility, when scheduler-driven, is `run_continuous_batch_scheduled` (`batched.rs:718`): FCFS order gated by the shared KV byte budget and total-token ceiling (`batched.rs:750-760`).
 - Per-request events are funnelled through `route_continuous_events` (`driver.rs:637`) — **the single place where every request's lifecycle events pass**. TTFT is recorded at `driver.rs:650`.
