@@ -602,8 +602,42 @@ to fear.
 
 ```
 SHARED CHECKOUT     non-reproducible results observed by three authors
-DETACHED WORKTREE   flakes observed by anyone, all session ................ 0
+DETACHED WORKTREE   ~~flakes observed by anyone, all session ......... 0~~
+                    **FALSIFIED. THE TRUE VALUE IS 1, AND IT IS THE ONE
+                    THAT MATTERS MOST.**
 ```
+
+**That zero was true when I measured it, it survived an audit I ran on it
+deliberately, and it is now wrong.** A reviewer reproduced a failure **inside a
+clean detached worktree** — porcelain `0`, `.git` present, no other agent writing
+that tree — one red in fourteen runs at one revision.
+
+**This is the most dangerous thing this document could have shipped, and not
+because of the digit.** The section around it argues that a detached worktree is
+what makes a suite result trustworthy. That argument is correct for the mechanism
+it addresses and it does not reach this failure at all:
+
+```
+ENVIRONMENTAL RACE   tests read repository state while many agents commit
+                     -> a detached worktree genuinely cures it
+INTRINSIC RACE       concurrency inside the product under test
+                     -> a detached worktree does nothing to it whatsoever
+```
+
+> **A detached worktree fixes *whose tree* you measured. Only repetition fixes
+> *which run* you measured. Both are required and neither substitutes for the
+> other.**
+
+**Had this shipped as written, the rule this document promotes would have
+certified away the one open defect nobody can close by reading** — a green from a
+procedure that cannot see the failure, which is the exact shape of every false
+green catalogued here, arriving inside the remedy for them.
+
+**And note how the zero survived.** I audited it, found it *correctly scoped*, and
+was right: the contrast with the shared-checkout row is what gives it meaning.
+**Scoping a claim correctly does not make it durable.** It was a true statement
+with no expiry date, in a document whose central thesis is that true statements
+acquire expiry dates.
 
 Every non-reproducible result this session occurred in a shared checkout where
 many processes commit and save concurrently. Two mechanisms were identified: a
