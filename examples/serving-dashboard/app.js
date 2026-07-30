@@ -20,6 +20,7 @@ import {
   SERVER_MODE_BY_CLASS,
   currentScenarioId,
   planScenario,
+  reconcileSelfClasses,
   resolveOrigins,
   selfClassesFromModelId,
 } from './scenario-origins.js';
@@ -64,8 +65,17 @@ async function main() {
   // the provenance table classifies several fields differently per server --
   // prefix_cache_hits is a real measured zero on the dynamic server and
   // structurally not-applicable on the scatter one, from identical bytes.
-  const selfClasses = await determineSelfClasses();
+  const detection = await determineSelfClasses();
+  const selfClasses = detection.classes;
   const origins = resolveOrigins({ href: location.href, selfClasses });
+
+  // Drop declarations this server has DISPROVED about itself. Without this the
+  // page shows the contradiction notice and STILL offers a tab navigating back
+  // here for a capability we now know is absent -- explaining a lie while
+  // continuing to offer it.
+  for (const serverClass of detection.discredited) {
+    if (origins[serverClass] === location.origin) origins[serverClass] = null;
+  }
   const scenarioId = currentScenarioId(location.href, selfClasses);
   const plan = planScenario(scenarioId, origins, location.origin);
 
@@ -88,6 +98,7 @@ async function main() {
     origins,
     currentScenarioId: scenarioId,
     currentOrigin: location.origin,
+    contradiction: detection.contradiction,
   });
   mountConnectionIndicator(requireElement('connection-indicator'), telemetryStore);
   renderProvenanceFooter(requireElement('provenance-table'));
@@ -111,34 +122,43 @@ async function main() {
 /**
  * Which engine configurations this origin can serve.
  *
- * Declared by run-demo.sh in the URL it prints, because it is the process that
- * bound the ports. Falls back to inferring from the model id, since the server
- * exposes no cache-type field anywhere (routes/mod.rs:144-151).
+ * The IO half only: fetch what the URL claims and what the server reports,
+ * then hand both to reconcileSelfClasses, which owns the decision and is
+ * unit-tested there.
  *
- * @returns {Promise<string[]>}
+ * @returns {Promise<{classes: string[], declared: string[], contradiction: string|null}>}
  */
 async function determineSelfClasses() {
   // Parameters only: passing no selfClasses means same-origin defaults are not
   // applied yet, so this reads exactly what the launcher declared.
-  const declared = resolveOrigins({ href: location.href, selfClasses: [] });
-  const fromUrl = Object.entries(declared)
+  const declaredOrigins = resolveOrigins({ href: location.href, selfClasses: [] });
+  const declared = Object.entries(declaredOrigins)
     .filter(([, origin]) => origin === location.origin)
     .map(([serverClass]) => serverClass);
-  if (fromUrl.length > 0) return fromUrl;
 
+  let observed = [];
+  let observedModelId = null;
   try {
     // /health is never gated and is the only ungated identity endpoint.
     const response = await fetch(new URL('/health', location.origin), {
       headers: { accept: 'application/json' },
     });
-    if (!response.ok) return [];
-    const body = await response.json();
-    return selfClassesFromModelId(body?.model ?? null).classes;
+    if (response.ok) {
+      const body = await response.json();
+      observedModelId = body?.model ?? null;
+      observed = selfClassesFromModelId(observedModelId).classes;
+    }
   } catch {
     // Unreachable server. The failure states own this case and render the
     // launch command; mounting no panels is correct until it comes back.
-    return [];
   }
+
+  return reconcileSelfClasses({
+    declared,
+    observed,
+    observedModelId,
+    origin: location.origin,
+  });
 }
 
 /**

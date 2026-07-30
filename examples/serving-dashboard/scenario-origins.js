@@ -107,6 +107,63 @@ export function selfClassesFromModelId(modelId) {
 }
 
 /**
+ * Reconcile what the URL DECLARES about this server with what the server
+ * itself REPORTS.
+ *
+ * DETECTION BEATS SELECTION. run-demo.sh declares the classes in the URL it
+ * prints, because it is the process that bound the ports -- but a URL is an
+ * ASSERTION and the model id is a FACT. A visitor who points this page at
+ * their own server, or edits a port in a copied link, can trivially declare
+ * "scatter" over a dynamic server. Believing the URL there produces a fully
+ * rendered and entirely wrong dashboard: prefix-cache fields classified
+ * structurally-not-applicable on a server that genuinely measures them, and
+ * batching panels mounted on a server that cannot batch.
+ *
+ * When the two disagree the SERVER WINS, and the disagreement is returned so
+ * the page can say so. Silently correcting leaves the visitor with a working
+ * page and a link that keeps lying to the next person they send it to.
+ *
+ * @param {object} input
+ * @param {string[]} input.declared  Classes the URL claims for this origin.
+ * @param {string[]} input.observed  Classes inferred from the model id.
+ * @param {string|null} input.observedModelId
+ * @param {string} input.origin      This page's own origin, for the message.
+ * @returns {{classes: string[], declared: string[], contradiction: string|null}}
+ */
+export function reconcileSelfClasses({ declared, observed, observedModelId, origin }) {
+  if (declared.length === 0) {
+    return { classes: observed, declared: [], discredited: [], contradiction: null };
+  }
+
+  // Nothing to check against. An unreachable or unidentifiable server leaves
+  // the declaration as the only information available, and refusing it would
+  // mount nothing at all -- a worse outcome than trusting the launcher.
+  if (observed.length === 0) {
+    return { classes: declared, declared, discredited: [], contradiction: null };
+  }
+
+  if (observed.some((serverClass) => declared.includes(serverClass))) {
+    return { classes: declared, declared, discredited: [], contradiction: null };
+  }
+
+  return {
+    classes: observed,
+    declared,
+    // The classes the URL claimed for THIS origin that the server has now
+    // disproved. They must be dropped from the origins map: leaving them means
+    // offering a tab that navigates here promising a capability this server
+    // provably does not have.
+    discredited: declared.filter((serverClass) => !observed.includes(serverClass)),
+    contradiction:
+      `This page was opened with a URL declaring the ${declared.join(' and ')} server, but ` +
+      `${origin} reports the model "${observedModelId}", which is a ${observed.join(' and ')} ` +
+      "server. The server's own answer is being used, because a URL parameter is an assertion " +
+      'and the model id is a fact. Check the origin parameters against the servers that are ' +
+      'actually running.',
+  };
+}
+
+/**
  * Translation to the dashboard registry's vocabulary.
  *
  * @c8d9a40e's dashboard/index.js names the two engine configurations by what

@@ -30,13 +30,23 @@ import { SCENARIOS, planScenario, scenarioHref } from '../scenario-origins.js';
  * @param {Record<string, string|null>} options.origins  From resolveOrigins.
  * @param {string} options.currentScenarioId
  * @param {string} options.currentOrigin
+ * @param {string|null} [options.contradiction]  Set when the URL misdescribes
+ *   the server it points at; the server's answer has already won.
  * @returns {{ unmount: () => void, describe: () => string }}
  */
 export function mountScenarioSwitcher(rootElement, options) {
-  const { origins, currentScenarioId, currentOrigin } = options;
+  const { origins, currentScenarioId, currentOrigin, contradiction = null } = options;
 
   rootElement.className = 'scenario-switcher';
   rootElement.replaceChildren();
+
+  // A URL that misdescribes the server it points at is shown BEFORE the tabs.
+  // The page has already overruled it -- capability comes from the server's
+  // model id, not from a query parameter -- but silently correcting a bad link
+  // leaves the visitor with a working page and a link that keeps lying.
+  if (contradiction) {
+    rootElement.append(buildContradictionNotice(contradiction));
+  }
 
   const plans = Object.keys(SCENARIOS).map((id) => ({
     id,
@@ -70,6 +80,24 @@ export function mountScenarioSwitcher(rootElement, options) {
       return describeSwitcher(reachable, unreachable, currentScenarioId);
     },
   };
+}
+
+/**
+ * The notice shown when the URL's declaration lost to the server's own answer.
+ *
+ * role="status" rather than "alert": nothing is broken and nothing is being
+ * lost, so this must not interrupt a screen-reader user mid-sentence.
+ *
+ * @param {string} contradiction
+ * @returns {HTMLElement}
+ */
+function buildContradictionNotice(contradiction) {
+  const notice = document.createElement('p');
+  notice.className = 'scenario-switcher__contradiction';
+  notice.dataset.state = 'stale';
+  notice.setAttribute('role', 'status');
+  notice.textContent = contradiction;
+  return notice;
 }
 
 /**

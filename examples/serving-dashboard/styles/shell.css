@@ -614,3 +614,14 @@ body[data-blocked] .app {
   margin: var(--og-space-3) 0 0;
   color: var(--og-na-note);
 }
+
+/* A URL that misdescribes the server it points at. Uses the stale tokens: the
+   page is correct, but the LINK is out of date with reality. */
+.scenario-switcher__contradiction {
+  margin: 0 0 var(--og-space-4);
+  padding: var(--og-space-3) var(--og-space-4);
+  border-left: 3px solid var(--og-stale-rule);
+  border-radius: var(--og-radius-sm);
+  color: var(--og-stale-fg);
+  font: var(--og-type-sm) / var(--og-leading-body) var(--og-font-ui);
+}

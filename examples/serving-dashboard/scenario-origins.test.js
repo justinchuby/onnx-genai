@@ -13,6 +13,7 @@ import {
   parseOrigin,
   resolveOrigins,
   planScenario,
+  reconcileSelfClasses,
   scenarioHref,
   currentScenarioId,
 } from './scenario-origins.js';
@@ -161,4 +162,91 @@ test('every scenario names a real server class and says why', () => {
     // The `why` is rendered to the visitor when the scenario is unavailable.
     assert.ok(scenario.why.length > 20, `${id} needs a real explanation`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// reconcileSelfClasses -- detection beats selection.
+//
+// The URL is an assertion; the model id is a fact. Believing a URL that
+// misdescribes its server yields a fully rendered, entirely wrong dashboard:
+// prefix-cache fields marked structurally-not-applicable on a server that
+// genuinely measures them, and batching panels mounted where batching cannot
+// happen. Nothing on screen would look broken.
+// ---------------------------------------------------------------------------
+
+test('the server overrules a URL that misdescribes it', () => {
+  const result = reconcileSelfClasses({
+    declared: ['scatter'],
+    observed: ['dynamic'],
+    observedModelId: 'qwen2.5-0.5b',
+    origin: 'http://127.0.0.1:8124',
+  });
+
+  assert.deepEqual(result.classes, ['dynamic']);
+  assert.ok(result.contradiction, 'a disagreement must be surfaced, not silently corrected');
+  assert.match(result.contradiction, /qwen2\.5-0\.5b/);
+  assert.match(result.contradiction, /scatter/);
+});
+
+test('an agreeing URL produces no notice', () => {
+  const result = reconcileSelfClasses({
+    declared: ['scatter'],
+    observed: ['scatter'],
+    observedModelId: 'qwen2.5-0.5b-scatter-v2',
+    origin: 'http://127.0.0.1:8123',
+  });
+
+  assert.deepEqual(result.classes, ['scatter']);
+  assert.equal(result.contradiction, null);
+});
+
+test('an unreachable server leaves the launcher declaration standing', () => {
+  // Refusing the declaration here would mount nothing at all, which is worse
+  // than trusting the process that bound the ports.
+  const result = reconcileSelfClasses({
+    declared: ['dynamic'],
+    observed: [],
+    observedModelId: null,
+    origin: 'http://127.0.0.1:8124',
+  });
+
+  assert.deepEqual(result.classes, ['dynamic']);
+  assert.equal(result.contradiction, null);
+});
+
+test('a hand-started server with no URL parameters is detected from its model', () => {
+  const result = reconcileSelfClasses({
+    declared: [],
+    observed: ['scatter'],
+    observedModelId: 'qwen2.5-0.5b-scatter-v2',
+    origin: 'http://127.0.0.1:9999',
+  });
+
+  assert.deepEqual(result.classes, ['scatter']);
+  assert.equal(result.contradiction, null);
+});
+
+test('a disproved declaration is reported so it can be dropped from the map', () => {
+  const result = reconcileSelfClasses({
+    declared: ['scatter'],
+    observed: ['dynamic'],
+    observedModelId: 'qwen2.5-0.5b',
+    origin: 'http://127.0.0.1:8124',
+  });
+
+  // Explaining the contradiction is not enough: the scatter origin must stop
+  // pointing here, or the page offers a batching tab on a server that cannot
+  // batch while simultaneously explaining that it cannot.
+  assert.deepEqual(result.discredited, ['scatter']);
+});
+
+test('agreement discredits nothing', () => {
+  const result = reconcileSelfClasses({
+    declared: ['dynamic'],
+    observed: ['dynamic'],
+    observedModelId: 'qwen2.5-0.5b',
+    origin: 'http://127.0.0.1:8124',
+  });
+
+  assert.deepEqual(result.discredited, []);
 });
