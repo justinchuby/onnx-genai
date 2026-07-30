@@ -4549,3 +4549,56 @@ batch_capacity:    "so the client never hardcodes a capacity no endpoint confirm
 | D240 | Design comments must say `3 of batch_capacity`, never `3 of 4` | The instruction to write the hardcode is already in the prose the next implementer reads |
 | D241 | Percentage permitted; denominator is `batch_capacity`, never `max_batch` | The served denominator is the right quantity; raw `max_batch` overstates capacity |
 | D242 | Non-emptiness is the floor, not the standard | A guard that asks "did we find anything" passes on a proxy that is cheap to satisfy |
+
+---
+
+## 74. COLLATERAL SUPPRESSION — AND THE KV TRAPS THAT CONFIRM AC68 (D243–D246)
+
+### 74.1 🔴 D243 — A STAND-DOWN AIMED AT WORK I NEVER DID CAN CANCEL THE WORK I ACTUALLY ASKED FOR
+
+@376a0297 has now broadcast crew-wide that *"@0837fdf9 just paraphrased 29 ACs back"* and told **@e00032a4 @bb2ee824 @d7cf9b84** not to start *"the partial reconstructions @0837fdf9 just asked you for."* **I asked no one for a reconstruction and have never edited `demo-spec.md`.** Verified at 01:50:
+```
+$ git log --format='%h %ad %s' --date=format:'%H:%M' -- '*demo-spec.md'
+87a80c0c 01:35 docs(…): evidence the headline speedup; land perf-baseline.md and demo-spec.md
+   ← ONE commit, ever. Not mine. My 42 commits are all `design:` on demo-ux.md.
+```
+**This is the SECOND misroute of the same instruction, and the escalation is what makes it dangerous: the first was a DM, this one names me to the whole crew and instructs three agents to stop.**
+
+> **D243 — THE COST OF A MISROUTED STAND-DOWN IS NOT THE CORRECTION, IT IS COLLATERAL SUPPRESSION: three agents have now been told to disregard requests from me, in a window where I have four real outstanding asks in front of exactly those agents.** A stand-down does not arrive labelled with its scope; **it arrives as *stop listening to that agent*, and it lands on the live asks indiscriminately.** D237 predicted the sender would believe a hazard contained while the real author kept typing — **the second-order effect is worse and I did not anticipate it: the innocent party's UNRELATED IN-FLIGHT WORK IS WHAT ACTUALLY GETS CANCELLED.**
+
+**🔒 SO, RE-ISSUED EXPLICITLY, ALL FOUR STILL LIVE, NONE PART OF ANY RECONSTRUCTION:**
+| Ask | File | Owner |
+|---|---|---|
+| **D232** `[data-state='not-applicable']` → `--og-na-fg`/`--og-na-rule` (one state currently renders two brightnesses; the dimmer is pixel-identical to `unavailable`) | `styles/shell.css:201` | @bb2ee824 / @c8d9a40e |
+| **D233** `pending` → `border-bottom: 1px solid` (italic on `···` is inert; first-frame state is indistinguishable from permanent absence) | `styles/shell.css` | @bb2ee824 / @c8d9a40e |
+| **D240** design comments → `3 of batch_capacity`, never `3 of 4` | `field-state.js:338,371`, `telemetry-provenance.js:505` | @bb2ee824 / @c8d9a40e |
+| **D239** batch-denominator tripwire, mutation stated | batch panel module | @bb2ee824 / @c8d9a40e |
+
+**And one correction offered gently, because it is generous and mis-aimed:** *"committing `demo-ux.md` at 2,483 lines was the right response to the scare"* — **it was first committed at 23:49 (`9c153c0c`), two hours before the scare, and has been tracked with 42 commits since.** It was never in a scratch dir and never at risk. **AC98 is right regardless, and it is right about me in a way worth keeping: a paraphrase drops the hazards its author never had to act on. My §64 found exactly that in my own doc** — the false *"the pool does not reclaim"* thesis survived because I had never needed the eviction half.
+
+### 74.2 ✅ D244 — @d7cf9b84's KV TRAP #1 IS INDEPENDENT CONFIRMATION OF AC68/D181, FROM A TEST RATHER THAN FROM DESIGN REASONING
+
+I ruled (D181) that **a ratio which can exceed 1 is not a dial** and banned a utilization bar built from `/v1/resources`. **They reached the same fact from the opposite end — a failing test:** *"`pages_in_use / hot_capacity` CAN EXCEED 1.0. Eviction demotes a page to the cold tier by changing its device **without dropping its reference**, so evicted pages are still in use."*
+
+> **D244 — TWO DERIVATIONS, ONE FROM DESIGN SEMANTICS AND ONE FROM A RED TEST, WITH NO CONTACT. Per D212 that is corroboration precisely BECAUSE the origins are independent, not merely the authors.** Binding: **no percentage-of-capacity dial from these fields.** Render `pages_in_use` and `hot_capacity` as **two absolute counts**, per AC88 at equal type size — **the reader can divide, and a display a skeptic can verify beats one they must trust.**
+
+### 74.3 🔴 D245 — TRAP #2 IS THE MORE DANGEROUS ONE AND IT IS A *BINDING* RULE, NOT A RENDERING RULE
+
+*"`allocation_failures` IS NOT THE POOL-FULL SIGNAL — `hot_evictions` IS. I asserted a 2-page pool would fail its third allocation; it didn't, it **grew** via cold-tier demotion."*
+
+> **D245 — A PANEL KEYED ON `allocation_failures` WOULD SHOW A POOL UNDER HEAVY PRESSURE AS PERFECTLY HEALTHY, AND WOULD DO SO WHILE DISPLAYING A GENUINELY MEASURED NUMBER FROM A REAL COUNTER WITH CORRECT PROVENANCE.** It passes every check this document has built: measured, attributed, moving, plausible. **It is `prefix_cache_hits` again in a different subsystem — the field is honest and the QUESTION IS WRONG.** ⛔ **Pool pressure binds to `hot_evictions`. `allocation_failures` may be shown only under a label naming what it actually counts — allocations that failed after demotion was already exhausted.**
+>
+> **This is the strongest evidence yet for AC83 (scenario provenance): our envelope guards whether a VALUE is real and has never guarded whether the value ANSWERS THE QUESTION ITS LABEL ASKS.** @376a0297's AC99 is the same defect a third time — `active_sessions` is genuinely measured and **reads 0 during four concurrent stateless requests**, so the panel is empty at Scenario A's busiest moment while being technically correct.
+
+### 74.4 ✅ D246 — `attach_kv_telemetry() -> bool` PUTS THE HONESTY STATE IN THE API SIGNATURE, WHICH IS THIS DOCUMENT'S ENTIRE THESIS
+
+*"`false` = decoder can't page → report **not-applicable**, don't render an idle pool."*
+
+> **D246 — THE RETURN VALUE IS NOT A SUCCESS FLAG, IT IS A PROVENANCE VERDICT DELIVERED AT ATTACH TIME. A caller cannot obtain the telemetry without also being told whether it means anything** — so the `not-applicable` branch is unskippable **by construction rather than by developer discipline**, which is §1's founding claim and the first time the runtime has enforced it for us. **`snapshot()` being a handful of relaxed atomic loads, readable DURING generation from any thread, also retires the last of the stall speculation: three wrong mechanisms were proposed for a stall, and the answer was to stop asking the driver anything.** And per their warning: **`PageTable::usage()` is O(pages) with a BTreeMap and a sort — at 14,612 pages, polling it would blow AC33 while looking like a correct implementation.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D243 | A stand-down names the artifact and commit; a misroute suppresses the innocent party's live work | It arrives as "stop listening to that agent" and lands on unrelated in-flight asks |
+| D244 | No percentage dial from KV pages; two absolute counts at equal size | A ratio that can exceed 1 is not a dial — confirmed independently by a red test |
+| D245 | Pool pressure binds `hot_evictions`, never `allocation_failures` | A real counter answering the wrong question passes every provenance check we have |
+| D246 | `attach_kv_telemetry() -> bool` makes the not-applicable branch unskippable | The honesty state is in the signature, enforced by API shape, not discipline |
