@@ -31,6 +31,7 @@ import { declaredKeys as scanKeys, duplicatesAmong, findLiteralOpener } from './
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
+import { summaryAllowlist } from '../unplumbed-registry.mjs';
 import { createTelemetryStore } from '../telemetry-store.js';
 
 const DASHBOARD_DIR = fileURLToPath(new URL('./', import.meta.url));
@@ -55,84 +56,19 @@ const SOURCE_DIRS = [
  * Keys the panels are known to request before anything publishes them, each
  * with the reason it is not a typo. Anything here renders an em-dash today.
  *
+ * DERIVED FROM `../unplumbed-registry.mjs`, NOT MAINTAINED HERE. This used to
+ * be a hand-written literal, and every key in it also had a second, longer,
+ * independently worded reason in check-unplumbed-claims.test.js. Keyset drift
+ * was guarded; the two REASONS were not, so one could be corrected and the
+ * other left stale with nothing going red.
+ *
+ * The registry also carries the falsifier (`absentWireNames`), the class of
+ * absence, and structured evidence. Add or retire a key THERE.
+ *
  * Keep this list SHRINKING. An entry that never shrinks is a panel promising a
  * metric nobody is building.
  */
-export const NOT_YET_PUBLISHED = Object.freeze({
-  // Paged-KV lifetime counters the block table does NOT carry.
-  //
-  // 🔴 TEN KEYS USED TO SIT HERE READING 'block-table endpoint, not yet
-  // landed'. THE BLOCK-TABLE ENDPOINT HAD LANDED. `/v1/debug/kv/blocks` is a
-  // registered route, and the already-polled `/v1/debug/kv` advertises its URL
-  // on the wire as `block_table_endpoint` -- so the refutation was in our own
-  // recorded captures while these lines claimed the opposite. Seven of the ten
-  // are now bound; these three survive because BlockTableResponse serves
-  // occupancy and pressure but keeps no cumulative alloc/free ledger and no
-  // eviction breakdown by cause.
-  //
-  // Nothing here could have caught that, and that is the structural point: the
-  // stale-entry check below only fires once a key is published BY OUR STORE,
-  // which happens when somebody edits telemetry-provenance.js. The trigger for
-  // noticing the server grew a feature was us noticing the server grew a
-  // feature. `check-unplumbed-claims.test.js` closes the loop by reading the
-  // Rust, and every key listed here must now carry a checkable claim there.
-  'kv.allocations': 'the pool keeps no cumulative allocation ledger',
-  'kv.frees': 'no free events are counted; a released page reports ref_count 0',
-  'kv.prefix_evictions': 'evictions are counted by tier, not by cause',
-
-  // Prefix-cache savings. Namespaced prefix_cache.* to match the four prefix
-  // metrics the store already publishes, so these bind on the day they ship
-  // instead of em-dashing against a namespace nobody uses.
-  'prefix_cache.evictions': 'savings metrics not yet plumbed server-side',
-  'prefix_cache.prefill_tokens_skipped': 'savings metrics not yet plumbed server-side',
-  'prefix_cache.time_saved_ms': 'savings metrics not yet plumbed server-side',
-  'prefix_cache.tokens_reused': 'savings metrics not yet plumbed server-side',
-
-  // Scheduler detail beyond queue.depth.
-  'queue.depth_peak': 'peak tracking not yet plumbed server-side',
-  'scheduler.preemptions_total': 'scheduler introspection not yet plumbed',
-
-  // Latency percentiles -- SERVER ROWS ONLY. The nine client-measured rows
-  // that used to sit here are gone: they were never a plumbing gap, so listing
-  // them beside the server rows promised a server change that could not
-  // possibly deliver them. They are now classified STRUCTURALLY_BYPASSED in
-  // telemetry-provenance.js and render `not-applicable` with the reason,
-  // rather than the same em-dash a typo produces.
-  //
-  // What is left IS a real gap, and a narrow one: the server measures these
-  // latencies and publishes them as a BUCKETED HISTOGRAM (_bucket/_sum/_count
-  // over 14 fixed bounds), never as a percentile -- there is no `quantile`
-  // label in the crate. The MEAN is recoverable and is bound as metrics.ttft
-  // and metrics.e2e_latency; interpolating a p95 from 14 coarse buckets and
-  // labelling it p95 would be a fabricated measurement in a plausible costume.
-  //
-  // Client and server are deliberately separate keys: the
-  // difference between them IS the finding, so they must never be merged.
-  //
-  // ALL FIFTEEN ARE LISTED, AND THAT IS THE POINT. Until the extractor learned
-  // to read `throughput.js`'s template literals, only the two `_p50` entries
-  // below were visible here -- not because anyone judged the other thirteen,
-  // but because a literal-scanner could not see them. Two hand-written entries
-  // and thirteen invisible ones are INDISTINGUISHABLE from a reviewed
-  // inventory, so this list read as a decision when it was a coincidence.
-  //
-  // Listing them by hand is deliberate: an exemption list generated from the
-  // panel sources would exempt whatever the panels ask for, and could never go
-  // red. Every line here has to be typed by someone.
-  'latency.ttft_server_p50': 'percentile aggregation not yet plumbed',
-  'latency.ttft_server_p95': 'percentile aggregation not yet plumbed',
-  'latency.ttft_server_max': 'percentile aggregation not yet plumbed',
-  'latency.e2e_server_p50': 'percentile aggregation not yet plumbed',
-  'latency.e2e_server_p95': 'percentile aggregation not yet plumbed',
-  'latency.e2e_server_max': 'percentile aggregation not yet plumbed',
-
-  // Build and host facts.
-  'scenario.makespan_ms': 'supplied by the scenario runner, not the server',
-  'server.decode_backend': 'build metadata not yet exposed',
-  'server.quantization': 'build metadata not yet exposed',
-  'server.uptime_ms': 'build metadata not yet exposed',
-  'server.version': 'build metadata not yet exposed',
-});
+export const NOT_YET_PUBLISHED = summaryAllowlist();
 
 /**
  * Comments are stripped first. A comment explaining why a panel deliberately

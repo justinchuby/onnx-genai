@@ -50,11 +50,13 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
-import { NOT_YET_PUBLISHED } from './dashboard/field-keys.test.js';
+import { CLASS, CLASSES_REQUIRING_EVIDENCE, UNPLUMBED } from './unplumbed-registry.mjs';
+import { REPO_ROOT, SHIPPING_REF, shipped, shippedPaths } from './shipping-tree.mjs';
 import { PROVENANCE } from './telemetry-provenance.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -95,185 +97,18 @@ const ABSENT_CONTROL = 'kv_flux_capacitor_discharge_total';
 const COMMENT_ONLY_CONTROL = 'uptime';
 
 /**
- * Every key still claimed unplumbed, with the names the server WOULD serve it
- * under and the evidence that it does not.
+ * Every key still claimed unplumbed. IMPORTED, not declared here.
  *
- * `absentWireNames` is the whole mechanism. A free-text reason cannot be
- * checked against anything; a wire name can. Entries must name the spelling a
- * server would ACTUALLY use — not the dashboard's key — because the dashboard
- * key is our vocabulary and proves nothing about theirs.
+ * This was a second hand-written copy of the deferral inventory: same keys as
+ * dashboard/field-keys.test.js's allowlist, but a separate, longer, separately
+ * worded reason for each. Keyset equality was asserted, so the KEYS could not
+ * drift -- but nothing compared the two reason texts, so one could be corrected
+ * and the other left stale while every suite stayed green.
  *
- * @type {Readonly<Record<string, {reason: string, absentWireNames: readonly string[]}>>}
+ * Both now derive from ../unplumbed-registry.mjs, which also carries the class
+ * of absence and structured evidence. See the single-source guard below.
  */
-const UNPLUMBED_CLAIMS = Object.freeze({
-  // ── Paged-KV lifetime counters the block table does NOT carry ──────────
-  //
-  // These three are the residue after `/v1/debug/kv/blocks` was wired up.
-  // BlockTableResponse serves pressure signals (`hot_evictions`,
-  // `allocation_failures`) but keeps no cumulative alloc/free ledger and no
-  // separate prefix-eviction counter, so these remain genuinely absent.
-  'kv.allocations': {
-    reason:
-      'The pool keeps no cumulative allocation ledger. BlockTableResponse serves occupancy ' +
-      '(pages_in_use) and pressure (hot_evictions, allocation_failures), never a lifetime ' +
-      'allocation count.',
-    absentWireNames: ['allocations_total', 'total_allocations'],
-  },
-  'kv.frees': {
-    reason:
-      'The counterpart to kv.allocations, and absent for the same reason: a released page ' +
-      'reports ref_count 0, which is an occupancy fact, not a free event anyone counts.',
-    absentWireNames: ['frees', 'frees_total', 'total_frees'],
-  },
-  'kv.prefix_evictions': {
-    reason:
-      'Evictions are counted by TIER, not by cause. `hot_evictions` is the only eviction ' +
-      'counter on the wire, and it does not distinguish a prefix-driven eviction from any ' +
-      'other. Splitting it here would invent a breakdown the server never computed.',
-    absentWireNames: ['prefix_evictions', 'prefix_evictions_total'],
-  },
-
-  // ── Scheduler detail beyond what /v1/debug/kv serves ────────────────────
-  'queue.depth_peak': {
-    reason:
-      'The server reports instantaneous depth (pending_queue_depth, queue_depth) and keeps ' +
-      'no high-water mark. A peak computed client-side would be the peak SINCE THIS TAB ' +
-      'OPENED, which is a different quantity wearing the same label.',
-    absentWireNames: ['depth_peak', 'peak_queue_depth', 'queue_depth_peak', 'high_water'],
-  },
-  'scheduler.preemptions_total': {
-    reason:
-      'The driver runs each generation to completion without preemption, so the event this ' +
-      'counter would count cannot occur. Consistent with `paused_sessions: None`, which the ' +
-      'server itself registers as not-applicable rather than unavailable.',
-    absentWireNames: ['preemptions', 'preemptions_total', 'preempted'],
-  },
-
-  // ── Prefix-cache savings ────────────────────────────────────────────────
-  'prefix_cache.evictions': {
-    reason: 'No prefix-cache eviction counter exists in metrics.rs or any route.',
-    absentWireNames: ['prefix_cache_evictions', 'prefix_cache_evictions_total'],
-  },
-  'prefix_cache.prefill_tokens_skipped': {
-    reason:
-      'The server counts tokens MATCHED (prefix_tokens_reused / prefix_cache_hit_tokens_total), ' +
-      'not tokens whose prefill was actually skipped. On the token-prefix branch a counted ' +
-      'reuse skips no prefill at all (engine/runtime.rs computes an LCP without retaining a ' +
-      'page), so binding matched tokens to this key would overstate the saving.',
-    absentWireNames: ['prefill_tokens_skipped', 'tokens_skipped', 'prefill_skipped'],
-  },
-  'prefix_cache.time_saved_ms': {
-    reason:
-      'No timer measures prefill time avoided. It could only be inferred from skipped tokens, ' +
-      'which are themselves not measured — an estimate stacked on an estimate.',
-    absentWireNames: ['time_saved', 'time_saved_ms', 'prefill_time_saved'],
-  },
-  'prefix_cache.tokens_reused': {
-    reason:
-      'The count IS on the wire, under `prefix_tokens_reused`, and is deliberately NOT bound: ' +
-      'prefix-counters-forbidden.test.js and the NEVER_BIND register ban this family because ' +
-      'the numerator scores one for any nonzero match. This is a BAN, not a gap — the only ' +
-      'entry here whose absence is our choice rather than the server\'s.',
-    // Named as a ban rather than an absence, so no wire name is claimed absent.
-    // A claim we know to be false must not be written down as true.
-    absentWireNames: [],
-  },
-
-  // ── Latency percentiles ─────────────────────────────────────────────────
-  //
-  // THE WIRE CARRIES HISTOGRAMS, NOT PERCENTILES. metrics.rs emits
-  // `_bucket{le=...}`, `_sum` and `_count` over 14 fixed LATENCY_BUCKETS_NS.
-  // There is no `quantile=` label anywhere in the crate. A p95 interpolated
-  // from 14 coarse buckets is an estimate with an error bar the width of a
-  // bucket, and rendering it as "p95" is a fabricated measurement wearing a
-  // plausible label — the exact defect telemetry-provenance.js exists to
-  // prevent. The MEAN is genuinely derivable (_sum / _count) and IS bound, as
-  // `metrics.ttft` and `metrics.e2e_latency`.
-  //
-  // The client rows are a different absence again and are handled in the
-  // provenance table as STRUCTURALLY_BYPASSED, not here: they need a scenario
-  // runner in the browser, and no server change could ever supply them.
-  'latency.ttft_server_p50': {
-    reason:
-      'The server exports a bucketed histogram, not percentiles: metrics.rs histogram() ' +
-      'writes _bucket{le=}/_sum/_count over 14 fixed bounds and no quantile label exists ' +
-      'in the crate. The mean is derivable and is bound as metrics.ttft / ' +
-      'metrics.e2e_latency; a percentile is not.',
-    absentWireNames: ['quantile'],
-  },
-  'latency.ttft_server_p95': {
-    reason:
-      'The server exports a bucketed histogram, not percentiles: metrics.rs histogram() ' +
-      'writes _bucket{le=}/_sum/_count over 14 fixed bounds and no quantile label exists ' +
-      'in the crate. The mean is derivable and is bound as metrics.ttft / ' +
-      'metrics.e2e_latency; a percentile is not.',
-    absentWireNames: ['quantile'],
-  },
-  'latency.ttft_server_max': {
-    reason:
-      'The server exports a bucketed histogram, not percentiles: metrics.rs histogram() ' +
-      'writes _bucket{le=}/_sum/_count over 14 fixed bounds and no quantile label exists ' +
-      'in the crate. The mean is derivable and is bound as metrics.ttft / ' +
-      'metrics.e2e_latency; a percentile is not.',
-    absentWireNames: ['quantile'],
-  },
-  'latency.e2e_server_p50': {
-    reason:
-      'The server exports a bucketed histogram, not percentiles: metrics.rs histogram() ' +
-      'writes _bucket{le=}/_sum/_count over 14 fixed bounds and no quantile label exists ' +
-      'in the crate. The mean is derivable and is bound as metrics.ttft / ' +
-      'metrics.e2e_latency; a percentile is not.',
-    absentWireNames: ['quantile'],
-  },
-  'latency.e2e_server_p95': {
-    reason:
-      'The server exports a bucketed histogram, not percentiles: metrics.rs histogram() ' +
-      'writes _bucket{le=}/_sum/_count over 14 fixed bounds and no quantile label exists ' +
-      'in the crate. The mean is derivable and is bound as metrics.ttft / ' +
-      'metrics.e2e_latency; a percentile is not.',
-    absentWireNames: ['quantile'],
-  },
-  'latency.e2e_server_max': {
-    reason:
-      'The server exports a bucketed histogram, not percentiles: metrics.rs histogram() ' +
-      'writes _bucket{le=}/_sum/_count over 14 fixed bounds and no quantile label exists ' +
-      'in the crate. The mean is derivable and is bound as metrics.ttft / ' +
-      'metrics.e2e_latency; a percentile is not.',
-    absentWireNames: ['quantile'],
-  },
-
-  // ── Build and host facts ────────────────────────────────────────────────
-  'scenario.makespan_ms': {
-    reason:
-      'Supplied by the scenario runner in the browser, never by the server. Listed so the key ' +
-      'is not mistaken for a typo; it is not a server gap and no server change would supply it.',
-    absentWireNames: ['makespan', 'makespan_ms'],
-  },
-  'server.decode_backend': {
-    reason:
-      'The decode path is chosen at runtime from the model config and is not echoed by any ' +
-      'route. /v1/debug/config serves `pipeline`, which names the model family, not the ' +
-      'decode backend.',
-    absentWireNames: ['decode_backend', 'decoder_backend'],
-  },
-  'server.quantization': {
-    reason: 'No route reports the weight quantization of the loaded model.',
-    absentWireNames: ['quantization', 'quant_type', 'weight_dtype'],
-  },
-  'server.uptime_ms': {
-    reason:
-      'No endpoint exposes uptime, start time or build id. The capture manifest records the ' +
-      'same finding independently: "no endpoint exposes uptime, start time or build id, so ' +
-      'nothing on the wire can date this capture".',
-    absentWireNames: ['uptime', 'uptime_ms', 'started_at', 'start_time'],
-  },
-  'server.version': {
-    reason:
-      'No binary carries its commit: no vergen, no env!("GIT_*"), no stamping build.rs and no ' +
-      'version endpoint. Recorded independently in fixtures/captures/manifest.json.',
-    absentWireNames: ['build_version', 'server_version', 'git_sha', 'commit_sha'],
-  },
-});
+const UNPLUMBED_CLAIMS = UNPLUMBED;
 
 /**
  * Provenance rows that name NO endpoint at all, and the wire names that would
@@ -419,21 +254,164 @@ describe('the unplumbed-claims scanner can see what it claims to scan', () => {
 });
 
 describe('every claim of absence is evidenced and still true', () => {
-  it('covers exactly the allowlist, with no drift in either direction', () => {
-    // Keyset equality rather than a subset test. A claim here for a key nobody
-    // allowlists is dead evidence that looks like diligence; an allowlisted key
-    // with no claim here is the bare unevidenced sentence this file exists to
-    // abolish, and a subset test in either direction would permit one of them.
-    const claimed = Object.keys(UNPLUMBED_CLAIMS).sort();
-    const allowlisted = Object.keys(NOT_YET_PUBLISHED).sort();
+  it('the inventory has exactly one definition — no second copy anywhere', () => {
+    // WHAT THIS REPLACED, AND WHY THE OLD TEST HAD TO GO.
+    //
+    // This was a keyset-equality assertion between UNPLUMBED_CLAIMS and
+    // NOT_YET_PUBLISHED, back when both were hand-written literals. It was a
+    // real guard then. It is VACUOUS now: both derive from the same registry,
+    // so it compares a list with itself and can never fail.
+    //
+    // Leaving it would have been worse than deleting it -- a green that reads
+    // like drift protection while proving nothing is exactly the false comfort
+    // this file exists to abolish. So it is replaced by the invariant that
+    // actually matters once the copies are collapsed: that no SECOND copy
+    // comes back.
+    //
+    // Both names are still asserted to agree, but the point is now structural:
+    // the only way to reintroduce drift is to redeclare one of them as its own
+    // literal, and that is what this scans for.
+    // The keyset comparison this replaced imported NOT_YET_PUBLISHED out of
+    // dashboard/field-keys.test.js. That import is now DELETED, for the same
+    // reason the readFileSync lift in check-binding-liveness was deleted:
+    // pulling one export out of a `.test.js` runs that file's whole suite
+    // inside this run, inflating the total by 13 and reporting its failures
+    // under this file's name. Fixing that in one consumer and leaving it in
+    // the other would have been a half-migration.
+    //
+    // Nothing is lost. The invariant it enforced -- that field-keys does not
+    // keep its own copy -- is enforced BELOW, structurally, against the
+    // shipped source rather than against a runtime value.
+    const REGISTRY = 'unplumbed-registry.mjs';
+    const redeclared = [];
+
+    for (const path of shippedPaths()) {
+      if (!/\.(?:js|mjs)$/.test(path)) continue;
+      if (path.endsWith(REGISTRY)) continue;
+      const source = stripRustComments(shipped(path));
+
+      for (const name of ['NOT_YET_PUBLISHED', 'UNPLUMBED_CLAIMS', 'UNPLUMBED']) {
+        // A declaration BOUND TO AN OBJECT LITERAL is a second inventory.
+        // Binding to a call or an identifier (`= summaryAllowlist();`,
+        // `= UNPLUMBED;`) is a derivation and is exactly what we want.
+        const literal = new RegExp(
+          `(?:const|let|var|export const)\\s+${name}\\s*=\\s*(?:Object\\.freeze\\(\\s*)?\\{`,
+        );
+        if (literal.test(source)) redeclared.push(`${path} declares ${name} as its own object literal`);
+      }
+    }
+
     assert.deepEqual(
-      claimed,
-      allowlisted,
-      'UNPLUMBED_CLAIMS and NOT_YET_PUBLISHED have drifted apart.\n' +
-        `  claimed here but not allowlisted: ${claimed.filter((k) => !allowlisted.includes(k)).join(', ') || '(none)'}\n` +
-        `  allowlisted but unevidenced here: ${allowlisted.filter((k) => !claimed.includes(k)).join(', ') || '(none)'}\n` +
-        'Every key deferred as "not yet plumbed" must name the wire names it is absent under, ' +
-        'so the claim can be re-evaluated against the server instead of trusted forever.',
+      redeclared,
+      [],
+      'The deferral inventory has been copied again:\n' +
+        `${redeclared.map((r) => `  ${r}`).join('\n')}\n\n` +
+        `There must be exactly one definition, in ${REGISTRY}. Every other site ` +
+        'derives from it. Two copies of one fact is how this inventory spent the ' +
+        'evening carrying two independently worded reasons per key with nothing ' +
+        'on earth reconciling them -- keyset drift was guarded, wording drift was ' +
+        'not, and a corrected reason beside a stale one is invisible.',
+    );
+  });
+
+  it('every entry is classified, and the taxonomy is not decorative', () => {
+    const valid = new Set(Object.values(CLASS));
+    const unclassified = Object.entries(UNPLUMBED_CLAIMS)
+      .filter(([, e]) => !valid.has(e.class))
+      .map(([key, e]) => `${key} has class ${JSON.stringify(e.class)}`);
+
+    assert.deepEqual(
+      unclassified,
+      [],
+      `Entries carry a class that is not in CLASS:\n${unclassified.join('\n')}\n\n` +
+        '"Not published" is not one situation. Flattening the classes is how six ' +
+        'client-measured rows once sat among server gaps, promising a server ' +
+        'change that could not possibly have delivered them.',
+    );
+
+    // ANTI-DECORATION. A taxonomy where everything lands in one bucket is a
+    // constant wearing a type's clothing. Deliberately NOT "every class is
+    // used" -- retiring the last DELIBERATE_BAN is a REPAIR and must not go red.
+    const inUse = new Set(Object.values(UNPLUMBED_CLAIMS).map((e) => e.class));
+    assert.ok(
+      inUse.size >= 3,
+      `All ${Object.keys(UNPLUMBED_CLAIMS).length} entries fall into only ` +
+        `${inUse.size} class(es): ${[...inUse].join(', ')}. Either the taxonomy ` +
+        'stopped being applied, or it is no longer earning its complexity.',
+    );
+  });
+
+  it('a claim about something PRESENT cites where it is present', () => {
+    // WHY ONLY SOME CLASSES NEED EVIDENCE.
+    //
+    // SERVER_GAP claims a name is ABSENT, and `absentWireNames` falsifies that
+    // mechanically -- the scan below reads the Rust and goes red when the name
+    // appears. That is the strongest evidence available and needs no citation.
+    //
+    // SHAPE_MISMATCH, DELIBERATE_BAN and EVENT_CANNOT_OCCUR are the opposite
+    // shape: they concede the thing EXISTS and argue it cannot or must not be
+    // used. A name scan cannot falsify those -- of course the name is there,
+    // that is the premise -- so the falsifiability has to MOVE to a citation.
+    // Without this rule they would be the one class of claim in this file that
+    // nothing can ever check, which is precisely where a wrong claim would hide.
+    const missing = [];
+    const unresolved = [];
+    const tracked = new Set(
+      execFileSync('git', ['ls-tree', '-r', '--name-only', SHIPPING_REF], {
+        cwd: REPO_ROOT,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+        .toString()
+        .split('\n')
+        .filter(Boolean),
+    );
+
+    for (const [key, entry] of Object.entries(UNPLUMBED_CLAIMS)) {
+      if (!CLASSES_REQUIRING_EVIDENCE.includes(entry.class)) continue;
+
+      if (entry.evidence.length === 0) {
+        missing.push(`${key} (${entry.class}) cites nothing`);
+        continue;
+      }
+
+      for (const citation of entry.evidence) {
+        if (!tracked.has(citation.file)) {
+          unresolved.push(`${key}: ${citation.file} is not tracked at the shipping ref`);
+          continue;
+        }
+        const body = readFileSync(join(REPO_ROOT, citation.file), 'utf8');
+        if (!body.includes(citation.symbol)) {
+          unresolved.push(`${key}: ${citation.file} no longer contains '${citation.symbol}'`);
+        }
+      }
+    }
+
+    assert.deepEqual(
+      missing,
+      [],
+      `These entries claim something exists but is unusable, and cite nothing:\n` +
+        `${missing.map((m) => `  ${m}`).join('\n')}\n\n` +
+        'absentWireNames cannot falsify a claim about a field that IS present. ' +
+        'Cite the file and symbol, or reclassify.',
+    );
+
+    assert.deepEqual(
+      unresolved,
+      [],
+      `Evidence citations no longer resolve:\n${unresolved.map((u) => `  ${u}`).join('\n')}\n\n` +
+        'The server moved and the claim did not. Re-read the cited source and ' +
+        'either update the citation or retire the entry -- a citation that points ' +
+        'nowhere is how a claim outlives the thing that justified it.',
+    );
+
+    // ANTI-VACUITY: the rule must actually be exercised by real entries.
+    const audited = Object.values(UNPLUMBED_CLAIMS).filter((e) =>
+      CLASSES_REQUIRING_EVIDENCE.includes(e.class),
+    );
+    assert.ok(
+      audited.length >= 3,
+      `Only ${audited.length} entries require evidence, so this check is nearly ` +
+        'vacuous. It audited 8 when written.',
     );
   });
 

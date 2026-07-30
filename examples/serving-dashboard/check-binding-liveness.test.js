@@ -30,6 +30,7 @@
 // or a detached worktree — has no untracked files, so there the desk IS the
 // branch.
 
+import { unplumbedKeys } from './unplumbed-registry.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -354,6 +355,13 @@ const D88_FAST_ENDPOINTS = Object.freeze([
   ENDPOINTS.DEBUG_KV,
 ]);
 
+const D88_PRODUCTION_ENDPOINTS = Object.freeze([
+  ...D88_FAST_ENDPOINTS,
+  ENDPOINTS.DEBUG_KV_BLOCKS,
+  ENDPOINTS.DEBUG_CONFIG,
+  ENDPOINTS.MODELS,
+]);
+
 /**
  * `telemetry-store.js` binds fields as the module that SERVES them, not as a
  * panel that renders them. Counting it as a consumer reports the store's own
@@ -373,6 +381,8 @@ const NOT_A_PANEL = 'telemetry-store.js';
  * suite stays green for a frozen branch while the defect stays executable and
  * un-loseable, rather than living in a broadcast nobody re-reads.
  */
+export const MAX_DECLARED_ROUTING_VIOLATIONS = 3;
+
 const DECLARED_ROUTING_VIOLATIONS = Object.freeze({
   'resources.vram_limit_bytes': {
     reason:
@@ -440,6 +450,28 @@ describe('no binding routes a panel to an endpoint D88 excluded', () => {
     );
   });
 
+  it('the routing-violation register stays under its ceiling', () => {
+    // This register carried, in its own doc comment, the sentence "the ceiling
+    // makes an addition a visible diff" -- while having no ceiling at all. The
+    // exemption list twelve screens up has had MAX_DECLARED_ABSENT since it was
+    // written; this one was documented as capped and shipped uncapped.
+    //
+    // That is this branch's entire defect class in miniature: a control that is
+    // described accurately, believed by everyone who reads the description, and
+    // absent from the executable text. Uncapped, the register degrades into the
+    // thing it was built to replace -- a list where adding one more open defect
+    // costs nothing and no reviewer is forced to look.
+    const count = Object.keys(DECLARED_ROUTING_VIOLATIONS).length;
+    assert.ok(
+      count <= MAX_DECLARED_ROUTING_VIOLATIONS,
+      `DECLARED_ROUTING_VIOLATIONS holds ${count} entries, ceiling is ` +
+        `${MAX_DECLARED_ROUTING_VIOLATIONS}. These are OPEN defects being carried, ` +
+        'not closed ones. Fix a binding rather than raising the ceiling; if the ' +
+        'ceiling must rise, that is a deliberate, reviewable diff -- which is what ' +
+        'the register documented all along.',
+    );
+  });
+
   it('is measuring real bindings, not an empty set', () => {
     // Non-vacuity. A drifted consumer scan would report a spotless dashboard
     // in bytes identical to a genuinely clean one.
@@ -483,6 +515,34 @@ describe('the poll loop is held to D88 by execution, not by reading it', () => {
         '4 Hz cycle; a denylist is insufficient because a newly added endpoint passes by omission.',
     );
   });
+
+  it('requests exactly the endpoints D88 permits in production', async () => {
+    const asked = [];
+    let sawLastBackgroundEndpoint;
+    const lastBackgroundEndpoint = new Promise((resolve) => {
+        sawLastBackgroundEndpoint = resolve;
+    });
+    const fetchImpl = async (url) => {
+        const path = new URL(url).pathname;
+        asked.push(path);
+        if (path === ENDPOINTS.MODELS) sawLastBackgroundEndpoint();
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const store = createTelemetryStore({ origin: 'scatter', fetchImpl });
+    store.start();
+    await lastBackgroundEndpoint;
+    store.stop();
+
+    const uniqueAsked = [...new Set(asked)].sort();
+    const allowed = [...D88_PRODUCTION_ENDPOINTS].sort();
+    assert.deepEqual(
+        uniqueAsked,
+        allowed,
+        `The production poll loop must request exactly ${allowed.join(', ')}. It actually requested ` +
+          `${uniqueAsked.join(', ')}. D88/D87/AC95 exclude /metrics and /v1/resources entirely ` +
+          'pending under-load measurement.',
+    );
+  });
 });
 
 describe('a declared-unplumbed key expires against the wire, not against us', () => {
@@ -522,17 +582,16 @@ describe('a declared-unplumbed key expires against the wire, not against us', ()
   });
 });
 
-/**
- * The declared-unplumbed keys, LIFTED from field-keys.test.js rather than
- * copied. A copy would be a second inventory that drifts from the first, and
- * this crew has paid full price twice tonight for two copies of one fact.
- */
-function unplumbedKeys() {
-  const src = readFileSync(join(HERE, 'dashboard', 'field-keys.test.js'), 'utf8');
-  const block = src.match(/NOT_YET_PUBLISHED = Object\.freeze\(\{([\s\S]*?)\n\}\);/);
-  assert.ok(block, 'Could not lift NOT_YET_PUBLISHED from field-keys.test.js.');
-  return [...block[1].matchAll(/^\s*'([^']+)':/gm)].map((m) => m[1]);
-}
+// `unplumbedKeys` is imported from ../unplumbed-registry.mjs.
+//
+// It used to be lifted out of dashboard/field-keys.test.js with a readFileSync
+// and a regex over that file's SOURCE TEXT. That was not carelessness: importing
+// a `.test.js` for one export runs that file's tests inside this run, inflating
+// the total and reporting another file's failures under this file's name.
+//
+// The regex was the workaround; the missing registry was the disease. A plain
+// .mjs module has no tests to trigger, so the by-name file read is now deleted
+// rather than merely guarded against renames.
 
 /** Every JSON object body in the captures, flattened one level. */
 function readCaptureBodies() {
