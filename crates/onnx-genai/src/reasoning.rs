@@ -117,6 +117,13 @@ pub struct ReasoningSplit<'a> {
     pub complete: bool,
 }
 
+/// One piece of a streamed chunk with its reasoning classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReasoningChunk<'a> {
+    pub text: &'a str,
+    pub is_reasoning: bool,
+}
+
 /// Tracks whether a token stream is currently inside a reasoning span.
 ///
 /// Streaming cannot buffer to the end of a turn without destroying the point of
@@ -147,39 +154,91 @@ impl ReasoningStream {
         self.inside
     }
 
+    /// Feed the next chunk, returning the reasoning classification for each
+    /// subspan of this chunk.
+    ///
+    /// A tokenizer may return `</think>` and the first answer word in one token.
+    /// A single boolean for the whole token would dim that answer as reasoning,
+    /// so this method splits at delimiter boundaries while retaining enough
+    /// recent output to recognize delimiters split across adjacent tokens.
+    pub fn push_segments<'a>(&mut self, chunk: &'a str) -> Vec<ReasoningChunk<'a>> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+
+        let previous_tail_len = self.tail.len();
+        let combined = {
+            let mut combined = String::with_capacity(previous_tail_len + chunk.len());
+            combined.push_str(&self.tail);
+            combined.push_str(chunk);
+            combined
+        };
+
+        let mut segments = Vec::new();
+        let mut state = self.inside;
+        let mut scan = 0usize;
+        let mut chunk_cursor = 0usize;
+        while scan < combined.len() {
+            let marker = if state {
+                self.markers.end.as_str()
+            } else {
+                self.markers.start.as_str()
+            };
+            let Some(relative_index) = combined[scan..].find(marker) else {
+                break;
+            };
+            let marker_start = scan + relative_index;
+            let marker_end = marker_start + marker.len();
+
+            let before_marker_in_chunk = marker_start
+                .saturating_sub(previous_tail_len)
+                .min(chunk.len());
+            if before_marker_in_chunk > chunk_cursor {
+                segments.push(ReasoningChunk {
+                    text: &chunk[chunk_cursor..before_marker_in_chunk],
+                    is_reasoning: state,
+                });
+            }
+
+            let marker_end_in_chunk = marker_end
+                .saturating_sub(previous_tail_len)
+                .min(chunk.len());
+            if marker_end_in_chunk > before_marker_in_chunk {
+                segments.push(ReasoningChunk {
+                    text: &chunk[before_marker_in_chunk..marker_end_in_chunk],
+                    is_reasoning: true,
+                });
+            }
+
+            chunk_cursor = marker_end_in_chunk;
+            state = !state;
+            scan = marker_end;
+        }
+
+        if chunk_cursor < chunk.len() {
+            segments.push(ReasoningChunk {
+                text: &chunk[chunk_cursor..],
+                is_reasoning: state,
+            });
+        }
+
+        self.inside = state;
+        let longest = self.markers.start.len().max(self.markers.end.len());
+        let min_keep = scan.max(combined.len().saturating_sub(longest));
+        let keep_from = (min_keep..=combined.len())
+            .find(|index| combined.is_char_boundary(*index))
+            .unwrap_or(combined.len());
+        self.tail = combined[keep_from..].to_string();
+        segments
+    }
+
     /// Feed the next chunk, returning whether it is reasoning.
     ///
     /// The state is updated after classifying, so the delimiter itself is
     /// attributed to the span it closes or opens.
     pub fn push(&mut self, chunk: &str) -> bool {
-        let was_inside = self.inside;
-        self.tail.push_str(chunk);
-        loop {
-            let marker = if self.inside {
-                &self.markers.end
-            } else {
-                &self.markers.start
-            };
-            match self.tail.find(marker.as_str()) {
-                Some(index) => {
-                    let consumed = index + marker.len();
-                    self.tail.drain(..consumed);
-                    self.inside = !self.inside;
-                }
-                None => break,
-            }
-        }
-        let longest = self.markers.start.len().max(self.markers.end.len());
-        if self.tail.len() > longest {
-            let drop_to = self.tail.len() - longest;
-            // Never split a UTF-8 character when trimming the retained tail.
-            let boundary = (0..=drop_to)
-                .rev()
-                .find(|index| self.tail.is_char_boundary(*index))
-                .unwrap_or(0);
-            self.tail.drain(..boundary);
-        }
-        was_inside || self.inside
+        let segments = self.push_segments(chunk);
+        segments.iter().any(|segment| segment.is_reasoning) || (chunk.is_empty() && self.inside)
     }
 }
 
@@ -290,6 +349,70 @@ mod tests {
         );
         assert!(!stream.inside());
         assert!(!stream.push("The answer."));
+    }
+
+    #[test]
+    fn a_stream_splits_an_answer_that_shares_the_closing_token() {
+        let mut stream = ReasoningStream::new(think(), false);
+
+        let segments = stream.push_segments("<think>because</think>Olympia");
+
+        assert_eq!(
+            segments,
+            vec![
+                ReasoningChunk {
+                    text: "<think>",
+                    is_reasoning: true,
+                },
+                ReasoningChunk {
+                    text: "because",
+                    is_reasoning: true,
+                },
+                ReasoningChunk {
+                    text: "</think>",
+                    is_reasoning: true,
+                },
+                ReasoningChunk {
+                    text: "Olympia",
+                    is_reasoning: false,
+                },
+            ]
+        );
+        assert!(!stream.inside());
+    }
+
+    #[test]
+    fn a_split_closing_delimiter_leaves_same_token_answer_outside_reasoning() {
+        let mut stream = ReasoningStream::new(think(), true);
+
+        assert_eq!(
+            stream.push_segments("</"),
+            vec![ReasoningChunk {
+                text: "</",
+                is_reasoning: true,
+            }]
+        );
+        assert_eq!(
+            stream.push_segments("think"),
+            vec![ReasoningChunk {
+                text: "think",
+                is_reasoning: true,
+            }]
+        );
+        assert_eq!(
+            stream.push_segments(">Olympia"),
+            vec![
+                ReasoningChunk {
+                    text: ">",
+                    is_reasoning: true,
+                },
+                ReasoningChunk {
+                    text: "Olympia",
+                    is_reasoning: false,
+                },
+            ]
+        );
+        assert!(!stream.inside());
     }
 
     #[test]

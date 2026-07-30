@@ -1,0 +1,4 @@
+### 2026-07-30: REPL reasoning rendering must use rendered templates and ratatui row counts
+**By:** Batty
+**What:** Reasoning-span detection now checks the chat template's rendered current generation prompt instead of scanning source text after the last `assistant` token, and streaming classification can split a token at `</think>` so answer text in the same token is not dimmed. Live inline viewport row reservation now uses ratatui's own wrapped-line count rather than `ceil(total_width / width)`.
+**Why:** Qwen3's template mentions `<think>` for prior assistant messages and the `enable_thinking=false` branch, but the default current generation prompt does not open a reasoning span. Source scanning reported `opened_by_template=true` while the rendered prompt did not contain `<think>`. Ratatui word-wrap can occupy more rows than a total-width ceiling, so under-reserving lets the inline viewport overwrite scrollback.
