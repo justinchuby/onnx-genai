@@ -398,15 +398,14 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
     .split('\n')
     .filter((f) => f.endsWith('.md'))
     .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f))
-    // EXEMPTION, DOCUMENTED SO IT CANNOT BECOME AN OVERSIGHT: design/demo-ux.md
-    // is @0837fdf9's design record and currently has THREE unqualified
-    // paragraphs (the +7.0% Scenario B line, the 1.53s->1.22s 20% speed-up
-    // line, and the ARM A/ARM B 1341ms/1254ms numbers). They are real and I
-    // have reported them to its owner rather than editing another agent's file
-    // mid-flight. Asserting them here today would only redden my suite with
-    // their bug at the gate. THIS EXEMPTION IS A PROMISE TO COME BACK: when
-    // those three paragraphs carry their noise floor, delete this filter.
-    .filter((f) => !/^design\//.test(f))
+    // EXEMPTION RETIRED by @0837fdf9. It was written as an explicit promise to
+    // come back, and the condition it named is now satisfied: all three
+    // unqualified paragraphs (+7.0% Scenario B, the 1.53s->1.22s speed-up, and
+    // the ARM A/ARM B 1341ms/1254ms pair) now carry their noise floor. Verified
+    // by re-running this suite with the filter gone, not by accepting the
+    // report: PARAGRAPHS INSPECTED WENT UP, 9 -> 10. That direction is the
+    // whole check. A rewrite that made the paragraphs stop matching would also
+    // return zero offenders, and it would look identical to a repair.
     // EXEMPTION RETIRED by @fc8b5d97. It was written as an explicit promise to
     // come back: the verdict table stated "+7.0 %, i.e. no benefit at all" as a
     // live result while the noise floor withdrawing it sat ~350 lines below.
@@ -847,8 +846,17 @@ test('no document attributes a hit RATE to the twelve-request block', () => {
     // The raw measurement records legitimately carry every reading, including
     // the mid-block ones. They are where the arithmetic above was RECOVERED
     // from; banning the figures there would delete the evidence.
-    .filter((f) => !/^(perf-baseline|demo-spec|prefix-cache-verification)\.md$/.test(f))
-    .filter((f) => !/^design\//.test(f));
+    .filter((f) => !/^(perf-baseline|demo-spec|prefix-cache-verification)\.md$/.test(f));
+  // A SECOND `design/` FILTER USED TO SIT HERE WITH NO REASON ATTACHED. The
+  // comment above justifies the raw-record names and stops; the design/ line
+  // was appended silently and almost certainly copied from the sibling check,
+  // whose exemption was real, specific, and about a DIFFERENT property
+  // (unqualified figures, not hit rates). Measured before deleting: design/
+  // contains 0 paragraphs that mention the twelve-request block at all, so
+  // this filter never suppressed anything -- it only made the corpus look
+  // deliberately narrowed. An exemption nobody can date and nobody can defend
+  // is indistinguishable from one that is load-bearing, which is exactly how
+  // a suppression survives review.
 
   assert.ok(docs.length > 0, 'no tracked .md files found — this check would pass vacuously');
 
