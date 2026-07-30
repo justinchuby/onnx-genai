@@ -2064,3 +2064,106 @@ rather than one I took.**
 correction owed to the QA tester. At the frozen commit the tree carries **94 suites
 / 627 tests**; earlier tonight it was 91 suites / 595 tests. **A pass count can
 rise while coverage falls**, and only the suite count would show it. Both rose.
+
+---
+
+## 8.22 — the board scored at `1bca52a8`, and the two zeros that needed controls
+
+Scored once, in a detached worktree at `porcelain 0`, all six guards. Two shas
+are involved and I am naming both rather than averaging them.
+
+| # | item | state | sha |
+|---|---|---|---|
+| 1 | crates compile + clippy | 🟡 **qualified — NOT re-measured here** | last measured `fca13038` |
+| 2 | styled page + suite | 🟢 **exit 0 · 641 tests · 97 suites · 0 fail · 0 skipped** | `1133a874` |
+| 3–8 | cherry-picks · QA-PLAN · citations · AC33 · launcher · model path | 🟢 | `1bca52a8` |
+| 9 | model rebuildable | 🟢 | `1bca52a8` |
+| 10 | one browser load | 🟢 **3 hits → 1** | `1bca52a8` |
+
+**9🟢 · 1🟡 · 0🔴.** The first board this session with no red.
+
+### why a two-sha board is legitimate here, and when it would not be
+
+The suite ran at `1133a874`; HEAD reached `1bca52a8` while the controls ran. I
+have said all session that a gate scored at two shas is not a gate. The escape
+is not seniority, it is a **measured delta**:
+
+```
+git merge-base --is-ancestor 1133a874 1bca52a8   -> yes, and not the reverse
+git diff --numstat 1133a874 1bca52a8
+  -> 126  14  examples/serving-dashboard/READABILITY-REVIEW.md   (ONE file)
+git diff --name-only … -- 'examples/serving-dashboard/**/*.js'   -> 0
+POSITIVE CONTROL: total files in delta                           -> 1
+```
+
+The delta is one markdown file and **zero executable files**. So the suite
+result transfers — not because the gap is small, but because the gap **cannot
+reach the thing measured**. Had one `.js` moved, item 2 would be unscored and I
+would have said so. *A stale measurement is rehabilitated by a delta that cannot
+touch it, never by a delta that is merely short.*
+
+### the two zeros, and why a zero is the most dangerous result I can publish
+
+Both closures this segment rest on a **zero**, and I gave a false RED earlier
+tonight by trusting an unexamined exit code. Every zero below ships with a
+control that differs from the subject in exactly one respect.
+
+**C2 — the fetch deadline. CLOSED.**
+```
+bare 'fetch('        in 25 non-test dashboard .js   -> 0
+POSITIVE CONTROL 'fetchWithDeadline('               -> 3   THE INSTRUMENT REACHES
+    request-deadline.js:72  export async function fetchWithDeadline
+    telemetry-store.js:448  await fetchWithDeadline(...)
+    app.js:191              await fetchWithDeadline(new URL('/health', ...))
+NEGATIVE CONTROL 'fetchZZZ('                        -> 0   it can still say no
+helper body: :79 new AbortController  :90 signal  :106 clearTimeout
+```
+Three reviewers measured `app.js:180` as a bare `fetch` with no signal and were
+**correct at the sha they read**. The call is now `app.js:191` and routed through
+the helper. Their finding is not wrong; it is **spent**.
+
+**F1 — the driver inferring a capability from an unrelated flag. CLOSED.**
+```
+'set_applicable(!' in crates/**/*.rs                     -> 1
+   tests.rs:5039  /// The shipped bug READ `set_applicable(!...`   <- PAST TENSE
+same, with ':!*tests.rs'                                 -> 0
+POSITIVE CONTROL 'classify_kv_applicability' ':!*tests.rs' -> driver.rs:3
+```
+@376a0297 is right and it belongs in this brief as a rule: **grep cannot see
+tense.** A good fix quotes the bug it killed, so the better the repair is
+documented, the more confidently a string search reports the defect as live. The
+hit and the proof-of-fix are byte-identical. A predicate must be scoped to
+exclude the prose that discusses it **and** ship the control proving the scoping
+did not blind it. Both are above.
+
+These two mechanisms are the same animal facing opposite directions, and between
+them they cover most of tonight's false reports:
+
+* a **well-factored fix is invisible** to a grep for its mechanism — `AbortSignal`
+  appears nowhere near the call sites. Fails toward *not yet fixed*.
+* a **well-documented fix is loudly present** to a grep for its defect. Fails
+  toward *still broken*.
+
+**Both failure modes point the same way: toward alarm.** That is the safer
+direction and it is still wrong, and it is why three reviewers have been holding
+REQUEST CHANGES on items that were repaired before their measurements were sent.
+
+### item 1 is 🟡 and I did not re-measure it
+
+A clean checkout still fails `cargo check --workspace --all-targets` (exit 101,
+vendored x86 AVX2 kernel on arm64). This branch changed **0 files** in the two
+failing crates, against **100** in serving-dashboard. It is not this branch's
+defect and it is not this branch's to clear. **I did not re-run it at
+`1bca52a8`** and the table says so. An item carried forward without
+re-measurement must be labelled as carried, or the board claims a freshness it
+does not have.
+
+### what this board does NOT say
+
+Nobody has run `cargo test` this session. The 641 passing tests are JavaScript
+and **not one of them can reach `driver.rs`**, where F1 and C14 live. F1 is
+closed by a *string predicate over committed bytes*, not by execution. Per the
+crew rule that a checker states its scope on its passing run: **the Rust on this
+branch was never executed tonight.** That sentence belongs beside `641/641`
+every time it is quoted, and a reviewer who takes the count without it has been
+given a number and denied its meaning.
