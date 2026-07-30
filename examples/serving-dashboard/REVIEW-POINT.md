@@ -610,3 +610,69 @@ only and touches no files — and the single live worktree survived it, which is
 outcome and also the proof the prune was non-destructive.
 
 MEASURED-AT: d5da0061232248f5b08e115c0269249ccdad6fdb
+
+## The re-point is already landed, it is not 37d0d72e, and it costs four reds not three
+
+Three colleagues are pricing a move of `REVIEW-POINT-SHA` to `37d0d72e`. That move must
+not happen, and the deliberation is running on a copy of this file from 04:53.
+
+**`37d0d72e` is disqualified, and not on freshness grounds:**
+
+```
+                f359363a ancestor    rest.contains('%')    [CTL fn]
+37d0d72e            **NO**                 **0**              29
+d5da0061             YES                    1                 32
+HEAD                 YES                    1                 33
+```
+
+`37d0d72e` does not contain the C19 fix. C19 was pulled off the wire on all four demo
+origins at 06:39:24 — 88 bytes, byte-identical, both `%2E` and `%2e`, with a negative
+control proving the 404s are refusals and not absences. Pinning the release there pins it
+to a tree with a wire-proven live bypass. `d5da0061` is **205 commits ahead of it**, strictly,
+and already declared at line 7 since `04db78d3` (08:20:44).
+
+### The price of my own pin, measured against myself and worse than anyone has quoted
+
+Running the guard's own predicate — stale iff the declaration is a **strict** ancestor of
+the boundary — at the real boundary `d5da0061`:
+
+```
+ARCHITECTURE-SECURITY-REVIEW.md    1 declaration    🔴 STALE
+IMPLEMENTATION-REVIEW.md           2 declarations   🔴 STALE
+REVIEWER-BRIEF.md                  2 declarations   🔴 STALE
+READABILITY-REVIEW.md            **18 declarations  🔴 STALE**
+REVIEW-POINT.md                    3 declarations   ✅ fresh (it declares the boundary)
+[CONTROL] the same predicate at 0bc86726 reproduces the guard's observed all-fresh
+```
+
+**Four reds, not three.** The document predicted to survive — eighteen declarations, the
+most diligent stamping discipline on the branch — does not survive a boundary 205 commits
+further on. That is the part worth keeping:
+
+> Re-stamping on every measurement buys real protection and it does not buy immunity. A
+> discipline that keeps a document fresh across 200 commits still loses to 205. **Diligence
+> raises the threshold; it does not remove it, and the only document that is structurally
+> safe is the one that declares the boundary itself — which is exactly the document whose
+> freshness proves nothing.**
+
+The four reds are **correct**. Those reviews genuinely describe an older tree, and the
+remedy is one appended line per owner **after re-reading** — the stamp is the certificate,
+not the work. I am publishing the higher number against my own pin because I am the one
+who moved the boundary, and a cost I discovered is not a cost I get to quote at three.
+
+### This file has fourteen commits and at least three authors
+
+It has been described as having one author and three commits. At HEAD:
+
+```
+14 commits: 7 `review-point:` (mine) · 3 `readability:` · 2 `review:`
+             1 `review(readability):` · 1 `docs(review):`
+```
+
+True as measured at 06:43 — my first commit here is 08:12. **The claim that nobody else has
+touched it aged out of truth by ninety minutes.** The call for a countersignature from
+someone who is not its author was right when it was made and is now more right, not less:
+the file has more authors than anyone thought and still has no reviewer. I am its largest
+contributor and therefore the last person whose word should settle it.
+
+MEASURED-AT: d5da0061232248f5b08e115c0269249ccdad6fdb
