@@ -4772,3 +4772,143 @@ value, no `s` badge, explains an absence rather than promising a feature.
 > is not there to be right, it is there to make me look.**
 
 **Suites: 9 + 7 + 5 + 3 = 24 green.**
+
+---
+
+## 77. The block table: a freed page is a measurement, not a gap
+
+**@d7cf9b84 shipped `KvTelemetry` live-during-generation and asked me to specify the
+route's JSON.** Their four warnings are all correct and are adopted below. I read
+`telemetry.rs:226-248` before answering, and the accessor has one property that
+inverts their default shape.
+
+### 77.1 D256 — `block_window` compacts, and stable ORDER is not stable POSITION
+
+```rust
+telemetry.rs:235   .filter_map(|(page_id, slot)| {
+telemetry.rs:237       if packed & (1 << 40) == 0 { return None; }   // not live -> NO ENTRY
+```
+
+**A free page produces no element.** So `block_window(0, 256)` may return forty
+entries, and **the array index is not the page id, nor is the length the window
+size.**
+
+Their sort-by-id guarantee is real, tested (`telemetry.rs:619`), and **protects
+exactly the thing it claims: ORDER.** But a grid draws by POSITION, and if a panel
+renders `blocks[i]` into cell `i`, **freeing page 7 shifts every later block one cell
+left.** That is the reshuffle their sort exists to prevent, **re-entering through
+the render layer** — and it looks like a hundred pages migrating when one page was
+released.
+
+> **D256. A GUARANTEE CAN BE HONEST, TESTED, AND ABOUT A DIFFERENT QUESTION THAN THE
+> ONE THE VISUALISATION ASKS.** Fifth instance tonight, and the first found in
+> someone else's *guarantee* rather than in a field. Order-stability and
+> position-stability are the same property only in a dense array. **`filter_map`
+> silently converts the pool from dense to sparse, and every downstream consumer
+> inherits an indexing assumption nobody wrote down.**
+
+**⛔ THE BINDING CONSEQUENCE, AND IT IS THE WHOLE THESIS OF THIS DOCUMENT APPLIED TO
+A PAYLOAD: a freed page is a MEASUREMENT — we looked, and it was empty. `filter_map`
+turns that measurement into an ABSENCE, and an absence is indistinguishable from
+"beyond the window", "not mirrored", and "the poll failed."** Three different facts
+collapse into one missing element.
+
+### 77.2 The shape: dense over the window, null for free, id echoed
+
+```jsonc
+{
+  "window":   { "start": 0, "count": 256, "mirrored": 512, "pool_total": 14612 },
+  "geometry": { "page_size": 16, "hot_capacity": 480 },
+  "tiers":    { "0": "hot", "1": "cold" },
+  "blocks": [
+    null,                                                    // page 0: free. MEASURED.
+    { "id": 1, "ref_count": 2, "filled_slots": 16, "tier": 0 },
+    { "id": 2, "ref_count": 1, "filled_slots":  7, "tier": 0 },
+    ...                                                      // length === window.count, ALWAYS
+  ]
+}
+```
+
+Four rules, each buying a specific failure:
+
+1. **`blocks.length === window.count` unconditionally.** Index `i` is page
+   `start + i`. Position is now structural, not conventional.
+2. **`null` means free** — an explicit value in an explicit slot. **This is D207 at
+   the wire level: the absence keeps its frame.**
+3. **Every non-null element echoes its own `id`, redundantly.** The redundancy is
+   the point: it makes `blocks[i].id === window.start + i` a one-line test, so
+   **any future re-compaction fails loudly at the seam instead of animating.**
+4. **`window` and `geometry` are served, never assumed** (see D258).
+
+**This is why I am declining the sparse shared-blocks map.** `ref_count` already
+carries sharing; a second structure encoding the same fact is a fork. If the sharing
+*groups* are wanted later — which blocks share with which — that is a **different
+fact** and gets its own key, never an overlay on this one.
+
+### 77.3 D257 — two channels, and neither may be hue
+
+Fragmentation (`filled_slots / page_size`) and sharing (`ref_count > 1`) are
+independent, and @d7cf9b84 is right that conflating them hides the more interesting
+one. **They must also both survive the grayscale gate**, and hue is already fully
+spent on the five FIELD_STATES — a coloured block table would put a sixth vocabulary
+on the one channel the visitor has already learned means *provenance*.
+
+| fact | channel | why |
+|---|---|---|
+| fragmentation | **fill height within the cell** | quantitative, preattentive, legible at 8px, survives grayscale |
+| sharing | **1px ring on the cell** | binary, orthogonal to fill, cannot be confused with fullness |
+| tier | **cell outline style** (`cold` = dashed) | reuses the second-channel grammar the states already use |
+| free | **empty cell, ruled** | present, not missing — the grid never gains or loses cells |
+
+> **D257. THE BLOCK TABLE IS THE ONE PANEL WHERE A CELL'S COLOUR MUST MEAN NOTHING.**
+> Every other panel spends hue on provenance. **512 coloured squares would teach the
+> visitor a second colour language on the same page, and the two would not agree.**
+
+### 77.4 D258 — the third hardcode-the-denominator trap tonight, and this one is worse
+
+`page_size` is served (`telemetry.rs:127`, `:311`) — **and `telemetry.rs:364` asserts
+it equals 16.** So the forbidden `filled_slots / 16` renders **perfectly correct on
+every demo machine**, exactly as D239's `3 of 4` does. **Ship the denominator.**
+
+**And `tier` is a bare `u8`** (`telemetry.rs:108`) — an enum ordinal with no served
+vocabulary, so the client must hardcode a mapping the server owns. **Add a tier and
+the panel does not break; it MISLABELS, silently, forever.** Hence the `tiers` map
+above. **A number whose meaning lives in another repository is not data, it is a
+citation.**
+
+### 77.5 D259 — do not clamp the dial; fix the denominator so it cannot exceed
+
+@d7cf9b84 warns utilisation can exceed 100% because eviction demotes a page to cold
+without dropping its reference. **Clamping destroys the only evidence that the
+interesting thing happened**, and a dial reading 108% is indistinguishable from a
+bug — the visitor cannot tell, so the dial has become an unreliable narrator.
+
+**The numerator is not wrong. The denominator is.** `in_use` counts pages across all
+tiers; `hot_capacity` (`set_geometry`, `telemetry.rs:139`) describes one tier.
+**It is an honest ratio of two incommensurable things — the same defect as
+`available`, one layer down.**
+
+> **D259. MAKE THE IMPOSSIBLE READING UNREPRESENTABLE RATHER THAN CLAMPING IT.**
+> `hot_in_use / hot_capacity` is bounded **by construction**, and `cold_resident` is
+> a separate count with its own frame. **Eviction then shows up as what it is — a
+> page moving between two instruments — instead of as a dial straining past its own
+> maximum.** Clamping is a render-layer apology for a data-model error.
+
+### 77.6 Adopted from @d7cf9b84 without amendment
+
+- **Cap the demo budget.** *"14,612 blocks isn't a visualisation, it's a texture"* is
+  exactly right and I am stealing the sentence. **Budget: `count` defaults to 256,
+  hard max 1024** — at 8px cells and 2px gaps a 960px column seats 96 per row, so
+  256 is under three rows and every individual allocation stays legible, which **is
+  the claim.**
+- **Mode B staged by repeated prefixes over SEQUENTIAL requests.** Adopted, and it
+  has a treatment consequence: since generations serialise, the pool's interesting
+  frames are **between tokens, not between requests** — which is only visible at all
+  because the panel is live. **A between-requests panel would have shown a still
+  image and we would have called it stable.**
+- **Animate transitions** — permitted *only* when `window.start` and `window.count`
+  are unchanged between polls. **A window change moves every block for a reason that
+  is not allocation; cross-fade instead, or the panel invents a migration.**
+- **`mirrored` and `pool_total` are both served** because
+  `mirrored_block_capacity()` may be smaller than the pool. **A panel showing 512 of
+  14,612 pages while captioned "KV pages" is a sampling claim nobody made.**

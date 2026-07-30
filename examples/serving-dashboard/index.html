@@ -55,12 +55,15 @@
         </p>
         <h2 class="failure-state__subtitle">Run the server, then open the demo</h2>
         <pre class="failure-state__command-text" tabindex="0">
+cd "$(git rev-parse --show-toplevel)"
+
 cargo build --release -p onnx-genai-server
 
 ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
   --model models/qwen2.5-0.5b-scatter-v2 \
   --model-id qwen-scatter \
   --addr 127.0.0.1:8123 \
+  --demo-assets-dir examples/serving-dashboard \
   --enable-debug-endpoints</pre
         >
         <p class="failure-state__note">

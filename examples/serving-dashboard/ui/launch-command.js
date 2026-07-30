@@ -66,12 +66,28 @@ export function launchCommandFor(serverClass) {
     );
   }
   return [
+    // ANCHOR THE WORKING DIRECTORY FIRST. Every path below is repo-relative,
+    // and a visitor pastes this into whatever directory they happen to be in.
+    // Without this line the command is silently environment-dependent: it works
+    // for whoever wrote it and fails for everyone else, with a cargo error that
+    // names a manifest rather than the real problem.
+    //
+    // `git rev-parse --show-toplevel` rather than a hardcoded absolute path,
+    // because the page is served from someone else's checkout, not ours.
+    'cd "$(git rev-parse --show-toplevel)"',
+    '',
     'cargo build --release -p onnx-genai-server',
     '',
     `ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \\`,
     `  --model ${server.modelDir} \\`,
     `  --model-id ${server.modelId} \\`,
     `  --addr ${server.address} \\`,
+    // The server resolves demo assets against its WORKING DIRECTORY
+    // (crates/onnx-genai-server/src/demo_assets.rs). Passing this explicitly
+    // means /demo still serves after the `cd` above is edited away, and it is
+    // the flag @732c7548's check-launch-command.test.js already requires of
+    // README.md and run-demo.sh -- this file was the disclosed exception.
+    '  --demo-assets-dir examples/serving-dashboard \\',
     '  --enable-debug-endpoints',
   ].join('\n');
 }
