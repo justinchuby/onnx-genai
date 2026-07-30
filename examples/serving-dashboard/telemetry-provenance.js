@@ -945,6 +945,31 @@ export const NEVER_BIND = Object.freeze([
       'directory and filesystem layout, verbatim, to anything that polls it. Defensible on the ' +
       'wire for an operator asking what is loaded; never defensible on a projector. The page ' +
       'wants IDENTITY, and `server.model_id` already carries it.',
+    // WHEN THIS BAN SHOULD BE LIFTED -- STATED AS A WIRE PREDICATE SO NOBODY
+    // HAS TO RE-ARGUE IT. The ban is on a VALUE SHAPE, not on the concept of
+    // showing which model build is loaded. Lift it when, and only when, this
+    // is true of a live origin:
+    //
+    //     curl -s localhost:PORT/v1/models | grep -c '"path":"/'   ->   0
+    //
+    // i.e. `path` no longer carries a leading-slash absolute path. Measured
+    // 4 of 4 demo origins at the time of writing and all four returned the
+    // operator's home directory, username and an unresolved `../` segment, so
+    // the ban is live, not precautionary.
+    //
+    // AND THE ALTERNATIVE WAS CONSIDERED AND IS BETTER THAN `id` -- recording
+    // it so it is not rediscovered as a novelty. @f6527cc9 argues for the
+    // BASENAME (`qwen2.5-0.5b-scatter-v2`), and they are right that it beats
+    // `server.model_id`: the id is a LABEL chosen at launch, not an IDENTITY,
+    // and they measured two origins reporting different ids for the SAME
+    // directory. The basename additionally names the BUILD, which the id does
+    // not. It is not adopted here for one reason only: the basename is not on
+    // the wire yet. `model_path_for_display` still returns the absolute form
+    // on loopback, and every origin this demo ships is loopback. The day that
+    // branch is removed server-side, the predicate above goes to 0, this ban
+    // should be deleted, and the basename -- NOT the id -- is the field to
+    // bind. Deleting the ban in the SAME commit that changes the wire is the
+    // whole point: neither half is safe to land alone.
     // WHY THIS ONE NEEDS EXEMPTIONS AND `created` DOES NOT. The broad scan below
     // looks for the field NAME being read off a parsed body. `created` is a
     // distinctive word; `path` is not -- it is also the name of the property on
