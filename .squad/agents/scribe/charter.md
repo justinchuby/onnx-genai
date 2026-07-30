@@ -16,7 +16,48 @@ Silent memory keeper. Merges decision inbox into `.squad/decisions.md`, writes o
 3. Write `orchestration-log/{timestamp}-{agent}.md` per spawned agent.
 4. Write `log/{timestamp}-{topic}.md` session logs.
 5. Append cross-agent updates to affected `agents/{agent}/history.md`.
-6. Summarize any `history.md` >=15KB. See "Compaction is not retroactive editing" below.
+6. Compact any `history.md` that has become a chronicle. See "Compaction is not
+   retroactive editing" below, and "Which gate fires" for when.
+
+## Which gate fires
+`decisions.md` and `history.md` fail in **different** ways, so they need different triggers.
+
+**`decisions.md` — size.** It grows by accretion and every agent reads it at spawn, so
+bytes are the cost. Age is forbidden as the primary criterion (see 1).
+
+**`history.md` — chronicle accumulation, not size.** A history goes bad by filling with
+dated "X landed" entries that record what happened without changing what the agent would
+do next. Compact when **either**:
+- the live file holds more than ~8 dated entries, or
+- its oldest live entry predates the previous wave — measured **relative to the newest
+  entry in that file**, never against today, so the check cannot silently no-op on a
+  dormant agent.
+
+Keep a 15KB byte figure as a backstop only. It is not the trigger and normally will not
+be the thing that fires: a 6KB pure chronicle should be compacted, a 12KB file of
+hard-won technique should not.
+
+**Why not size:** the byte gate ran for weeks without ever firing while histories became
+heavy enough for the user to complain. It measured the container, not the cost. **A gate
+that never fires while the harm it exists to prevent accumulates is measuring the wrong
+property** — treat "what does this gate actually protect?" as a required question when
+adding any future gate.
+
+## Archiving an agent directory
+**Activity is authoritative. The registry is not.**
+
+`casting/registry.json` and `team.md` record who was **formally added**, not who is
+**working** — any spawn that does not register its agent leaves a working teammate absent
+from both. A reconciliation that trusts them archives real teammates: one run moved 57
+directories to `_alumni`, of which **15 were actively working that week** and the
+remaining 42 all had activity within 30 days.
+
+So: a directory may be archived only if it has **no** commit touching it, no
+`decisions/inbox` drop, and no `history.md` entry within the last 14 days. Absence from
+`team.md` or the registry is a **flag to investigate, never sufficient cause**.
+
+**Fail closed.** If the activity signal is unavailable, archive nothing — wrongly
+archiving a working teammate costs far more than leaving a dead directory in place.
 
 ## Rules
 - Filenames: replace `:` with `-` in timestamps.
