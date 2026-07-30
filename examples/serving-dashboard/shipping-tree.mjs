@@ -518,6 +518,101 @@ export function divergentPaths(rels) {
 
   return { ...parsePorcelain(raw, HERE_PREFIX), computed: true };
 }
+
+/**
+ * The one wording for "this file also has work parked in a stash".
+ *
+ * DELIBERATELY NOT A MEMBER OF `DIVERGENCE_PHRASES`. That object is the
+ * cross-language contract with `scripts/tree_context.py` and a test asserts
+ * every key in it appears in the Python source. Python has no stash concept,
+ * so adding this there would redden a true statement about a real hazard —
+ * which is how a guard gets deleted instead of fixed.
+ */
+export const STASH_PHRASE = 'also has unlanded work in a stash, invisible to';
+
+/**
+ * Which of `rels` have content parked in a stash entry.
+ *
+ * WHY THIS EXISTS: A STASH IS INVISIBLE TO EVERY OTHER CHECK WE HAVE
+ * -----------------------------------------------------------------
+ * `git status --porcelain` does not mention stashes at all, and neither does
+ * `divergentPaths` above — it compares the desk against a commit, and stashed
+ * bytes are in neither. So a file with real unlanded work reports clean, and
+ * this module would say "differ on 0 of N" with a straight face.
+ *
+ * That is not hypothetical. This function was written because a stash on this
+ * branch was found holding five files of unlanded work, including
+ * `ui/model-card.js`, while `divergenceSummary` reported agreement on it.
+ *
+ * The incentive is the sharp end: several guards in this directory assert a
+ * clean `porcelain`, and THE CHEAPEST WAY TO TURN THAT GREEN IS TO STASH — to
+ * hide the evidence rather than land the work. A cleanliness check that can be
+ * satisfied by concealment needs a companion that looks where things are
+ * concealed.
+ *
+ * SCOPED, BECAUSE A CONSTANT CARRIES NO INFORMATION
+ * ------------------------------------------------
+ * Only stash entries touching the paths this run actually read are reported.
+ * This repository currently carries dozens of old stashes from unrelated
+ * branches; announcing those on every run is noise, and a banner that is
+ * always present is one nobody reads.
+ *
+ * @param {string[]} rels paths relative to THIS directory.
+ * @returns {{paths: string[], entries: number, unreadable: number,
+ *   computed: boolean}} `computed: false` means the stash list itself could not
+ *   be read — never confuse that with "no stashes", which is the failure this
+ *   module exists to prevent.
+ */
+export function stashedPaths(rels) {
+  const result = { paths: [], entries: 0, unreadable: 0, computed: true };
+  if (!Array.isArray(rels) || rels.length === 0) return result;
+
+  const run = (args) => execFileSync('git', args, {
+    cwd: HERE,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+
+  let listing;
+  try {
+    listing = run(['stash', 'list', '--format=%gd']);
+  } catch {
+    return { ...result, computed: false };
+  }
+
+  // Counted, then addressed by index. The `%gd` spelling of a stash ref honours
+  // the caller's date config, so it can come back as `stash@{2026-07-30 ...}`;
+  // `stash@{N}` is stable regardless of how the reflog chooses to print.
+  const entries = listing.split('\n').filter((line) => line.trim() !== '').length;
+  result.entries = entries;
+  if (entries === 0) return result;
+
+  // Stash listings, like porcelain, are REPO-ROOT-relative while `rels` are
+  // relative to this directory. Comparing the two coordinate systems directly
+  // is the hazard `shippedPaths()` warns about; translate before matching.
+  const wanted = new Map(rels.map((rel) => [`${HERE_PREFIX}${rel}`, rel]));
+  const found = new Set();
+
+  for (let i = 0; i < entries; i += 1) {
+    let names;
+    try {
+      names = run(['stash', 'show', '--name-only', `stash@{${i}}`]);
+    } catch {
+      // One unreadable entry must not be reported as "nothing stashed here".
+      result.unreadable += 1;
+      continue;
+    }
+    for (const name of names.split('\n')) {
+      const hit = wanted.get(name.trim());
+      if (hit !== undefined) found.add(hit);
+    }
+  }
+
+  result.paths = [...found];
+  if (result.unreadable > 0) result.computed = false;
+  return result;
+}
+
 /**
  * Human-readable disclosure lines. EMPTY MEANS AGREEMENT, not "unchecked".
  *
