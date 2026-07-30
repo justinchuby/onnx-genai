@@ -71,12 +71,14 @@ pub mod pad;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;
+pub mod qlinear_matmul;
 pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
 pub mod quantization;
 pub mod range;
 pub mod reduce;
+pub mod resize;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -318,6 +320,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "GroupNormalization",
     "CenterCropPad",
     "Col2Im",
+    "QLinearMatMul",
+    "Resize",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -513,6 +517,26 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         Box::new(quantization::DynamicQuantizeLinearFactory {
             runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("QLinearMatMul", "", 10),
+        Box::new(qlinear_matmul::QLinearMatMulFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 10),
+        Box::new(resize::ResizeFactory {
+            runtime: runtime.clone(),
+            since_version: 10,
+        }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 11),
+        Box::new(resize::ResizeFactory {
+            runtime: runtime.clone(),
+            since_version: 11,
         }),
     );
     for version in [13, 22] {

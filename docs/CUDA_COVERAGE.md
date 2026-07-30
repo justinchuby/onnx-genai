@@ -193,13 +193,13 @@ pre-batch counts retained in the historical wave notes below.
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **173** |
 | CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **162** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **157** |
-| CPU pairs implemented by CUDA in the same domain | **160 / 173** |
-| CPU standard-domain op types implemented by CUDA | **139 / 145** |
+| CUDA registry `(domain, op_type)` pairs | **164** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **159** |
+| CPU pairs implemented by CUDA in the same domain | **162 / 173** |
+| CPU standard-domain op types implemented by CUDA | **141 / 145** |
 
-The **6 remaining CPU `ai.onnx` gaps** are `ConvTranspose`, `GridSample`,
-`NonMaxSuppression`, `QLinearMatMul`, `Resize`, and `Unique`.
+The **4 remaining CPU `ai.onnx` gaps** are `ConvTranspose`, `GridSample`,
+`NonMaxSuppression`, and `Unique`.
 
 The decode/transformer-oriented priority set from issue #67 is already covered:
 `LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
@@ -217,10 +217,9 @@ currently registered by the CPU EP include `Conv` (cuDNN).
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
-| **cuBLASLt / NVRTC** | `QLinearMatMul` | Quantized matrix multiplication should reuse the existing dequant/GEMM infrastructure. |
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
-| **deferred heavy operators** | `ConvTranspose`, `GridSample`, `NonMaxSuppression`, `Resize` | Larger numerical/geometry surfaces deserve dedicated follow-up waves and focused review. |
+| **deferred heavy operators** | `ConvTranspose`, `GridSample`, `NonMaxSuppression` | Larger numerical/geometry surfaces deserve dedicated follow-up waves and focused review. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
@@ -362,6 +361,19 @@ dilation, `ceil_mode`, mixed crop/pad with odd differences and selected axes,
 and overlapping Col2Im accumulation with both stride/padding and dilation.
 Current source-derived coverage is **157** advertised CUDA op names, **162**
 CUDA `(domain, op_type)` pairs, and **139 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 13 adds `QLinearMatMul` and `Resize`.
+`QLinearMatMul` preserves the CPU reference's wrapping i32 accumulation,
+ties-to-even requantization, and per-tensor/per-row/per-column quantization for
+Int8 and Uint8. `Resize` supports nearest and N-D linear interpolation with
+`half_pixel`, `align_corners`, and `asymmetric` coordinates, scales or sizes,
+selected axes, and all four standard nearest rounding modes. Cubic,
+`pytorch_half_pixel`, `tf_crop_and_resize`, `half_pixel_symmetric`, antialiasing,
+and non-stretch aspect policies remain fail-closed at the claim gate. GPU parity
+covers quantized signed/unsigned and batched per-axis cases plus nearest/linear
+upsampling and downsampling across the supported coordinate and control modes.
+Current source-derived coverage is **159** advertised CUDA op names, **164**
+CUDA `(domain, op_type)` pairs, and **141 / 145** CPU standard-domain op types.
 
 ---
 

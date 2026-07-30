@@ -46,6 +46,8 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "LpPool" => lp_pool(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
+        "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
+        "Resize" => resize(node, input_dtypes),
         _ => return None,
     };
     result
@@ -142,6 +144,92 @@ fn col2im(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "input")?;
     require_dtype(input_dtypes, 1, DataType::Int64, "image_shape")?;
     require_dtype(input_dtypes, 2, DataType::Int64, "block_shape")
+}
+
+fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 8, 1, 1)?;
+    for (index, name) in [(0, "A"), (3, "B"), (7, "y_zero_point")] {
+        require_one_of(
+            input_dtypes,
+            index,
+            &[DataType::Int8, DataType::Uint8],
+            name,
+        )?;
+    }
+
+    for (index, name) in [(1, "a_scale"), (4, "b_scale"), (6, "y_scale")] {
+        require_dtype(input_dtypes, index, DataType::Float32, name)?;
+    }
+    if input_dtypes[2] != input_dtypes[0] {
+        return Err("a_zero_point dtype must match A".into());
+    }
+    if input_dtypes[5] != input_dtypes[3] {
+        return Err("b_zero_point dtype must match B".into());
+    }
+    Ok(())
+}
+
+fn resize(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    if node.outputs.len() != 1 || node.inputs.is_empty() || node.inputs.len() > 4 {
+        return Err("requires 1..=4 inputs and exactly 1 output".into());
+    }
+    metadata_arity(node, input_dtypes)?;
+    if node.inputs[0].is_none() {
+        return Err("requires present data input".into());
+    }
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    match node.attr("mode").and_then(Attribute::as_str) {
+        None | Some("nearest" | "linear") => {}
+        Some(value) => {
+            return Err(format!(
+                "mode {value:?} unsupported; expected nearest or linear"
+            ));
+        }
+    }
+    match node
+        .attr("coordinate_transformation_mode")
+        .and_then(Attribute::as_str)
+    {
+        None | Some("half_pixel" | "align_corners" | "asymmetric") => {}
+        Some(value) => {
+            return Err(format!(
+                "coordinate_transformation_mode {value:?} unsupported"
+            ));
+        }
+    }
+    match node.attr("nearest_mode").and_then(Attribute::as_str) {
+        None | Some("round_prefer_floor" | "round_prefer_ceil" | "floor" | "ceil") => {}
+        Some(value) => return Err(format!("nearest_mode {value:?} unsupported")),
+    }
+    match node.attr("antialias").and_then(Attribute::as_int) {
+        None | Some(0) => {}
+        Some(_) => return Err("antialias=1 unsupported".into()),
+    }
+    match node
+        .attr("keep_aspect_ratio_policy")
+        .and_then(Attribute::as_str)
+    {
+        None | Some("stretch") => {}
+        Some(value) => return Err(format!("keep_aspect_ratio_policy {value:?} unsupported")),
+    }
+    if node.inputs.len() == 2 {
+        if node.inputs[1].is_none() {
+            return Err("opset-10 form requires a present scales input".into());
+        }
+        return require_dtype(input_dtypes, 1, DataType::Float32, "scales");
+    }
+    let scales_present = node.inputs.get(2).is_some_and(Option::is_some);
+    let sizes_present = node.inputs.get(3).is_some_and(Option::is_some);
+    if !scales_present && !sizes_present {
+        return Err("requires a present scales or sizes input".into());
+    }
+    if scales_present {
+        require_dtype(input_dtypes, 2, DataType::Float32, "scales")?;
+    }
+    if sizes_present {
+        require_dtype(input_dtypes, 3, DataType::Int64, "sizes")?;
+    }
+    Ok(())
 }
 
 fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
@@ -288,12 +376,14 @@ fn rms_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
     if input_dtypes[0] == DataType::Float32 && input_dtypes[1] != DataType::Float32 {
         return Err("f32 X requires f32 scale".into());
     }
+
     if input_dtypes[0] != DataType::Float32
         && input_dtypes[1] != DataType::Float32
         && input_dtypes[1] != input_dtypes[0]
     {
         return Err("f16/bf16 X requires matching storage dtype or f32 scale".into());
     }
+
     match node.attr("stash_type") {
         None => Ok(()),
         Some(attribute) if attribute.as_int() == Some(1) => Ok(()),
