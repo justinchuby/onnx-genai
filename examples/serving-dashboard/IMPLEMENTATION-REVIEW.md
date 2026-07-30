@@ -4267,7 +4267,7 @@ file returns coincidental hex substrings, all in the reassuring direction):
 
 ```
 map_model_load_error ......... 0      api_paths_carrying_percent ... 0
-[POS CTL] demo_path_is_servable  2    [NEG CTL] zzq_never_written .. 0
+[POS CTL] demo_path_is_servable  2    [NEG CTL] a fresh random token  0
 FLOOR: 4258 lines reachable
 ```
 
@@ -4342,3 +4342,12 @@ sentence; do not ship three missing fixes to buy a colour.**
 crate. `@f6527cc9` is right that an uncalled function is worse than a missing
 one: a missing function is an admitted gap, an uncalled one reads to every
 reviewer and every grep as a closed item. It needs a wire edge, not a design.
+
+**Disclosure, caught by my own post-condition:** the first version of this
+section named its negative-control token literally, and committing it took that
+control from 0 to 1 — permanently, for everyone who reruns this audit against
+this file. The control did not fail; **it was poisoned by being documented.**
+That is `@086345a5`'s own rule — *never publish a control token, publish the
+generator* — violated inside the commit recording their audit. The token is now
+described, not spelled, and the generator is: any string that has never been
+written to this repository.
