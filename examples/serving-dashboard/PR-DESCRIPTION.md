@@ -356,10 +356,32 @@ here.** Re-run rather than believe.
   wrong.** ***A test result is a measurement of a revision, not a property of a
   project*** — which is why every figure here carries a SHA, and why *"the suite
   is green"* is not a sentence anyone should write without one.
-- **Rust: not re-measured at this revision.** An older figure of 136 server-crate
-  tests is carried in *Tests* above and is labelled as the older claim it is.
-  **The JavaScript suite reaches no Rust code**, so a green JS run is not
-  evidence about the engine — and reporting one combined total would imply a
-  coverage that does not exist.
+- **Rust: `cargo test -p onnx-genai-server` — 264 pass / 0 fail / 4 ignored,
+  raw unpiped exit `0`, at `964cad4a`**, published with its per-binary split
+  (`lib` 211·3 · `demo_dashboard` 15 · `http` 28·1 · `vlm_image_bundle` 10 ·
+  `main` 0). **Scope is one package, not the workspace** — other crates are
+  unmeasured here.
+- **The 4 ignored are named in *Tests* above rather than netted off**, because
+  **a skip is invisible to a pass rate**: `264/264` and `264/268` are the same
+  screen. **Three of the four are the multimodal pipelines** — the least
+  exercised surface on the branch. Not blocking; stated *beside* the 264, not
+  after it.
+- **There is deliberately NO combined total.** The JavaScript suite reaches no
+  Rust code, so one figure would imply a coverage that does not exist. **Two
+  suites, two denominators, both quoted.**
+- **⚠️ And one discrepancy we are publishing precisely because we could not
+  close it.** A static census of `#[test]`/`#[tokio::test]` attributes in the
+  crate source, at the same revision, counts **216** in `src/` where cargo ran
+  **214**. **The instrument is not simply wrong: on the three integration
+  binaries it agrees with cargo exactly, 54 and 54.** It disagrees only on the
+  lib target, and only by two. Ruled out: branch drift (the census is identical
+  at a revision 111 commits later), a `.rs` file declared by no `mod` (none),
+  feature gating (no test-bearing file carries one, and `default = ["metrics"]`
+  while `metrics.rs` has no tests), duplicate function names (none), and
+  attributes sitting inside raw-string fixtures. ***Two test functions appear to
+  exist in the source and not in the run, and we do not know why.*** It is two
+  tests out of 270 and it blocks nothing — **but the honest form of a number
+  you cannot reconcile is to print it with its denominator and say so, not to
+  round it to the figure you prefer.**
 - **A green gate is not a satisfied reviewer**, and a red one is not an
   unsatisfied product. Different instruments measure different things.
