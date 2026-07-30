@@ -2249,3 +2249,96 @@ stripped fences, so the prescribed fix would have created the blind spot it was 
 @732c7548 `38605db2`). **And I have twice declined to accept an attribution *in my own favour*
 that I could not reproduce — R37 and R39. *An attribution is a claim; it needs a SHA like every
 other claim, and that applies hardest when it flatters you.***
+
+---
+
+## R43 🔑 **@bb2ee824's VOCABULARY-GAP LAW IS THE CAUSE OF MY OWN R41 — plus I accept @c0de4c2e's porcelain correction, measured against my own bytes**
+
+**MEASURED-AT `7399e5d4` · clock `05:24:57` · toplevel asserted.**
+
+### 🔻 ACCEPTED IN FULL: I published the wrong safety instrument, and it is in the ARTIFACT
+
+**@c0de4c2e's ruling: *porcelain counts the WORKING TREE; the thing that can land in your commit is
+the INDEX. They are different sets.* They named me as one of four who published `porcelain N` as a
+safety claim. **I measured my own document rather than accept or deny it:**
+```
+'porcelain'      in READABILITY-REVIEW.md  ->  **6**
+'shared index'   in READABILITY-REVIEW.md  ->  **0**
+'index: 0'       in READABILITY-REVIEW.md  ->  **0**
+NEG CONTROL zzz7-unwritten -> 0
+RIGHT NOW: working tree 1 · INDEX 0  (they differ by 1 this second, not the 5 of ten minutes ago)
+```
+**⛔ GUILTY, AND IN THE WORST PLACE. I HAVE BEEN PRINTING `git diff --cached` IN MY SHELL AND MY
+BROADCASTS ALL SESSION — AND THE *DOCUMENT*, THE ONLY AUDITABLE ARTEFACT, CARRIES ONLY PORCELAIN.**
+➡️ ***That is my own R37/R40 asymmetry firing a third time: the durable record kept the weaker
+instrument and the chat kept the stronger one. I have now said three times that the artifact is
+what you are held to, and three times the artifact held the worse number.***
+
+**⚖️ AND @c0de4c2e's SELF-INDICTMENT IS THE SHARPER HALF AND I AM SECONDING IT: *every `porcelain 0`
+I published tonight was TRUE, and every one was answering a question nobody asked.* **A right answer
+from a wrong instrument is still a wrong instrument** — and a *true* reading is the hardest kind to
+retract, because nothing about it ever looked wrong.
+
+### ✅ THE ANNOTATED TAG LANDED, AND @c7a654ed's FORM IS BETTER THAN THE ONE I RECOMMENDED
+
+**I told the Lead three times to use `git tag -a`. @c7a654ed did it and improved on it. Verified by
+object type, not by trust:**
+```
+gate-scored-0aac6bb1   objecttype=**tag**     tagger=present  ✅
+review-0               objecttype=**commit**  tagger=(empty)  ⬅ LIGHTWEIGHT, PROVEN
+```
+> **🔑 MY VERSION SAID *make the tag carry a tagger so a move leaves a trace.* THEIRS SAYS **put the
+> SHA IN THE NAME, so a move makes the name CONTRADICT THE OBJECT.** ➡️ ***Mine required someone to
+> go looking. Theirs is detectable in one command by someone who is not suspicious.*** **A name that
+> cannot lie beats a record of the lie.**
+
+**🎖️ AND THEIR DIAGNOSIS OF WHY THEIR OWN DISCLOSURE FAILED IS A DOCUMENTATION LAW AND IT IS MY
+LANE, SO I AM ADOPTING IT VERBATIM:**
+> ***A CORRECTION HAS TO BE CHEAPER TO OBEY THAN THE THING IT CORRECTS — AND "REMEMBER THIS SHA" IS
+> NEVER CHEAPER THAN "TYPE THIS NAME."***
+**That is why fourteen agents kept typing `review-0` through five correcting broadcasts. It is also
+the general answer to every convention this crew has tried to establish by announcement tonight.**
+
+### 🔑 THE UNIFICATION — @bb2ee824's LAW IS THE *CAUSE* OF MY R41, AND I HAD THE SYMPTOM WITHOUT IT
+
+> # **A MISSING WORD IN A VOCABULARY DOES NOT READ AS A GAP. IT READS AS AGREEMENT.**
+
+**Their specimen: three fields were classified `MEASURED` not because anyone judged them measured,
+but because the enum had no word for *asked, answered, answering something else*. `MEASURED` was the
+only remaining option. **The classification was an artefact of the enum and looked like a judgement.**
+
+**⛔ THAT IS EXACTLY R41, AND IT REPLACES MY EXPLANATION WITH A BETTER ONE.** I found
+`scenario-switcher.js:202` writing `note.dataset.state = 'not-applicable'` onto an `<aside>` — an
+informational panel wearing the grammar of an absent numeric reading — and I filed it as a file that
+*declines* to import the enum. **The real mechanism is one level down:**
+```
+THE data-state VOCABULARY HAS WORDS FOR: measured · unavailable · not-applicable · stale
+IT HAS NO WORD FOR:                      **"this is an explanatory panel, not a reading"**
+➡️ THE AUTHOR DID NOT REACH FOR THE WRONG WORD. THEY REACHED FOR THE ONLY WORD.
+```
+**⚖️ And the neighbouring comment proves it — *"Informational, not an alert: nothing is broken"* —
+**the author wrote the missing enum member as a COMMENT because the vocabulary would not accept it
+as a VALUE.** ➡️ ***A comment explaining why a label is wrong is a vocabulary gap with a witness.***
+**That is now a searchable signature: wherever a value is immediately followed by prose excusing it,
+the enum is short a member.**
+
+**✅ SO R41's FIX IS UPGRADED AND SIMPLIFIED: I proposed a separate `data-note-kind` attribute. The
+better framing is @12e42da8's ruling on `MISATTRIBUTED` — ***when you cannot find the right label,
+that is a FINDING, not a prompt to pick the nearest one.*** **Either add the member or add the
+attribute; what is not acceptable is the current state, where the nearest word was picked and the
+enum silently gained a meaning nobody voted for.**
+
+### ⚖️ AND @0837fdf9's LAW SUPERSEDES MY R32, WHICH I FILED THREE HOURS AGO IN A WEAKER FORM
+
+> **R32 (mine): a window-bounded measurement's positive control proves the window is NON-EMPTY,
+> never that it is COMPLETE.**
+> **@0837fdf9 (general): A CONTROL PROVES THE INSTRUMENT RUNS. IT CANNOT PROVE THE INSTRUMENT IS
+> POINTED AT THE RIGHT THING — a control shares the finding's frame of reference (cwd, tree,
+> revision) and FAILS WITH IT, SILENTLY, IN AGREEMENT.**
+
+**⛔ Mine was a special case about line ranges. **Theirs covers cwd, wrong repo, wrong corpus, wrong
+tree and wrong window with one sentence, and it explains every false zero on the board tonight
+including three of my own.** ✅ **I am superseding R32's statement with theirs and keeping mine only
+as the worked example. *The generalisation is theirs and the credit should follow it.***
+**And their remedy is the one I have not been practising: *state your finding in its most falsifiable
+form and attack THAT, because a control will not kill it for you.***
