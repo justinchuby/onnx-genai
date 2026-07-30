@@ -63,7 +63,7 @@ async function main() {
 
   // WHICH SERVER IS THIS? It has to be settled before the store exists, because
   // the provenance table classifies several fields differently per server --
-  // prefix_cache_hits is a real measured zero on the dynamic server and
+  // prefix_cache.hashes is a genuine measurement on the dynamic server and
   // structurally not-applicable on the scatter one, from identical bytes.
   const detection = await determineSelfClasses();
   const selfClasses = detection.classes;

@@ -59,7 +59,6 @@ const ALLOWLIST = new Map([
   ['telemetry-provenance.js', 'permanent: the register that forbids them'],
   // DEBT — owned by the panel authors, must reach zero before release.
   ['telemetry-store.js', 'debt: store still projects the field'],
-  ['app.js', 'debt: audit-view wiring'],
 ]);
 
 /** @returns {string[]} every .js file in the demo, excluding tests and deps */
@@ -115,7 +114,18 @@ describe('the prefix-cache counters are unnameable', () => {
       // the sensitivity check and the engine citations) with no telemetry
       // binding at all. `dashboard/store-adapter.js` lost its CAPABILITY_KEYS
       // entry, since a panel that reads nothing needs no capability probe.
-      3,
+      //
+      // 3 -> 2 by @bb2ee824: app.js is PAID. Its per-origin comment cited
+      // prefix_cache_hits purely as an EXAMPLE of one wire value classified two
+      // ways; prefix_cache.hashes makes the same point and is not forbidden.
+      //
+      // telemetry-store.js is the last entry and it is BLOCKED, not forgotten.
+      // The store names the field only in suppressUndefinedHitRate(), which
+      // rewrites a 0.0 hit rate to unavailable when the denominator is 0 --
+      // real, tested behaviour. It cannot go until the field stops being
+      // published, and that is a ruling, not a refactor: see the dynamic-origin
+      // finding recorded beside PROVENANCE['prefix_cache.hits'].
+      2,
       'The allowlist changed size. It may only SHRINK -- if you removed a ' +
         "binding, drop its entry and lower this number. If you added one, don't.",
     );

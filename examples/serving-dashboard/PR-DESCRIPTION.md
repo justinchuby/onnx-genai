@@ -52,9 +52,15 @@ section.
 ## Measured numbers, with their conditions
 
 **Aggregate decode throughput is roughly 2.5× single-request decode**
-— 95 % CI [2.35, 2.59].
+— 95 % CI [2.35, 2.59] — **while per-stream throughput falls to about 0.62× of
+solo** (~20.7 tok/s).
 
-Everything behind that number is in
+**Both halves ship together, here and everywhere else.** Batching does not make
+any single request faster; it trades per-stream latency for total throughput.
+A tradeoff presented as a pure win is a lie told with true numbers, and the
+half an engineer is most likely to need is the second one.
+
+Everything behind those numbers is in
 [`examples/serving-dashboard/perf-baseline.md`](examples/serving-dashboard/perf-baseline.md):
 raw per-run samples, hardware, load average, the exact command, and the binary
 and model SHA-256s.
@@ -63,7 +69,8 @@ and model SHA-256s.
 |---|---|
 | single request, decode | n=15, mean 33.577 tok/s, CV 1.98 % |
 | aggregate, 4 concurrent | n=4 rounds, mean 82.847 tok/s, CV 2.93 % |
-| ratio | **2.467**, 95 % CI **[2.35, 2.59]** |
+| **per-stream, 4 concurrent** | **~20.7 tok/s — 0.62× of solo** |
+| ratio (aggregate ÷ single) | **2.467**, 95 % CI **[2.35, 2.59]** |
 | capture | both arms inside one 20-minute window, one binary, one model, clean tree |
 
 **Read the conditions before quoting the number.** This is an indicative figure

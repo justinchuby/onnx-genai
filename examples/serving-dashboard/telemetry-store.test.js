@@ -25,22 +25,32 @@ import {
 
 const BASE_URL = 'http://127.0.0.1:8123';
 
-/** A /v1/status body shaped exactly like the real server's, documented zeros and all. */
+/**
+ * A /v1/status body shaped exactly like the real server's.
+ *
+ * THE OMISSIONS ARE THE POINT, and they used to be zeros. The server now sends
+ * `None` for everything it cannot compute (routes/admin.rs:155-164), so those
+ * keys are ABSENT from the payload rather than present-and-zero. That is the
+ * fix this whole demo argued for: a documented zero is byte-identical to a
+ * measured zero, and only the server can tell them apart -- by omitting.
+ *
+ * So this fixture must OMIT them too. Sending `kv_usage: 0` here would test a
+ * server that no longer exists, and it would do it invisibly: the store would
+ * read 0, see it no longer matches a declared stub, and correctly announce
+ * that the plumbing had landed. The test would fail for a reason that has
+ * nothing to do with the behaviour it names.
+ */
 function statusBody(overrides = {}) {
   return {
     node_id: 'node-0',
     healthy: true,
-    kv_usage: 0.0,
-    kv_pages_used: 0,
-    kv_pages_total: 0,
-    kv_pages_shared: 0,
     queue_depth: 3,
     active_sessions: 2,
-    paused_sessions: 0,
-    tokens_per_second: 0.0,
-    batch_utilization: 0.0,
+    // Genuinely computed now: in-flight over assemblable batch capacity
+    // (routes/admin.rs:169-172). Not a stub, so it carries a real value.
+    batch_utilization: 0.5,
+    batch_in_flight: 2,
     sessions: [],
-    prefix_hashes: [],
     ...overrides,
   };
 }
@@ -202,20 +212,34 @@ test('documented zeros from /v1/status NEVER become measured values', async () =
   const store = storeWith(healthyRoutes());
   await store.pollOnce();
 
+  // NOT_PLUMBED: the server omits these entirely, so they are unavailable --
+  // "we cannot measure this", with a fix that exists and is someone's job.
   for (const key of [
     'kv.usage',
     'kv.pages_used',
     'kv.pages_total',
     'kv.pages_shared',
     'throughput.tokens_per_second',
-    'batch.utilization',
-    'sessions.paused',
   ]) {
     const field = store.field(key);
     assert.equal(field.state, FIELD_STATES.UNAVAILABLE, `${key} must be unavailable`);
     assert.equal(field.value, null, `${key} must carry no value`);
     assert.ok(field.reason && field.reason.length > 20, `${key} must explain itself`);
   }
+
+  // STRUCTURALLY_BYPASSED is a DIFFERENT claim and must not collapse into the
+  // one above: this path never pauses a session, so the question is never
+  // asked. No plumbing changes that, which is exactly why it renders n/a.
+  const paused = store.field('sessions.paused');
+  assert.equal(paused.state, FIELD_STATES.NOT_APPLICABLE, 'sessions.paused is bypassed, not missing');
+  assert.equal(paused.value, null);
+
+  // And the one that became REAL. batch_utilization is now computed from
+  // in-flight over assemblable capacity, so asserting it unavailable would
+  // deny working telemetry -- the inverse defect, and the harder one to see.
+  const utilisation = store.field('batch.utilization');
+  assert.equal(utilisation.state, FIELD_STATES.MEASURED, 'batch.utilization is measured now');
+  assert.equal(utilisation.value, 0.5);
 });
 
 test('a real zero from a measured field is still reported as a measurement', async () => {
@@ -502,7 +526,10 @@ test('an unavailable field never inherits an explanation from an unrelated earli
   assert.match(field.reason, /not responding/);
 
   // A permanently-unmeasurable field keeps its own true explanation throughout.
-  assert.match(store.field('kv.usage').reason, /hardcoded 0\.0/);
+  // The server stopped sending a hardcoded 0.0 and now omits the field, so the
+  // reason names the OMISSION. Pinning the old prose would assert a server
+  // behaviour that no longer exists.
+  assert.match(store.field('kv.usage').reason, /omits the field/);
 });
 
 test('the store is inert until start() is called', () => {

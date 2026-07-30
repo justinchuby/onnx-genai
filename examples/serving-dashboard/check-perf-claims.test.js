@@ -22,6 +22,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -191,5 +192,53 @@ test('the README does not restate an absolute figure the baseline calls irreprod
     /perf-baseline\.md/.test(README),
     'README.md states performance numbers without linking perf-baseline.md, ' +
       'so a skeptic has no way to reach the raw samples, hardware or commands.',
+  );
+});
+
+// THE TRADEOFF RULE. demo-ux.md §29.1 ratified it: the aggregate speedup NEVER
+// appears without the per-stream figure, at equal prominence. "A tradeoff
+// presented as a pure win is a lie told with true numbers."
+//
+// ⚠️ THIS CHECK EXISTS BECAUSE I BROKE THE RULE MYSELF, IN THE DOCUMENT MOST
+// REVIEWERS READ FIRST. The README states both halves in one sentence. Two
+// hours later I wrote PR-DESCRIPTION.md and led with the speedup alone -- same
+// author, same session, having already documented the rule. That is the whole
+// argument for mechanising it: I did not forget the rule, I forgot to apply it
+// to a NEW SURFACE. Prose rules bind the document their author is looking at.
+//
+// So the check is deliberately scoped by CONTENT, not by filename: any tracked
+// markdown that states the speedup is covered the moment it is written. A list
+// of files to check would have been just as blind as I was -- PR-DESCRIPTION.md
+// did not exist when the rule was ratified, and adding a file to a list is a
+// step someone has to remember, which is the failure being guarded.
+test('no document states the speedup without the per-stream tradeoff', () => {
+  const docs = execFileSync('git', ['ls-files', '*.md'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter(Boolean)
+    // perf-baseline.md is the raw record and demo-spec.md is the contract;
+    // both discuss the figures analytically rather than presenting them.
+    .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f));
+
+  const offenders = [];
+  for (const doc of docs) {
+    const text = readFileSync(join(HERE, doc), 'utf8');
+    // A PRESENTATION of the speedup: "2.5x"/"2.46x" tied to throughput prose.
+    const presents = /\b2\.[45]\d?\s*×[\s\S]{0,200}?(?:aggregate|throughput|decode)/i.test(text)
+      || /(?:aggregate|throughput)[\s\S]{0,200}?\b2\.[45]\d?\s*×/i.test(text);
+    if (!presents) continue;
+
+    const statesTradeoff = /0\.6\d\s*×/.test(text) && /per[- ]stream/i.test(text);
+    if (!statesTradeoff) offenders.push(doc);
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.join(', ')} state(s) the aggregate speedup without the ` +
+      `per-stream figure (0.62× / ~20.7 tok/s). demo-ux.md §29.1: both halves ` +
+      `ship together, everywhere. Batching does not make any single request ` +
+      `faster — it trades per-stream latency for total throughput, and a ` +
+      `tradeoff presented as a pure win is a lie told with true numbers.`,
   );
 });

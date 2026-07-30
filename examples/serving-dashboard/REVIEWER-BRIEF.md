@@ -230,10 +230,23 @@ zero at one concurrent request and grows with concurrency — it is largest in
 the 4-concurrent regime that carries our headline number, and it flatters us.
 `request_started()` already exists at `metrics.rs:171` if you want the fix.
 
-**The 2.46× headline is not affected by this.** It is an aggregate decode
-*throughput* ratio (82.130 / 33.415 = 2.458, n=15, CV 1.98%), not a latency
-measurement. Its receipt file is missing, which is a documentation gap, not a
-measurement defect — see §6.
+**The headline is not affected by this.** It is an aggregate decode *throughput*
+ratio, not a latency measurement.
+
+⚠️ **But do not quote it as a clean win, and do not quote it from this file.**
+The aggregate gain ships **only** alongside the per-stream cost: **per-stream
+throughput falls to about 0.62× of solo** (~20.7 tok/s). Batching makes no
+single request faster; it trades per-stream latency for total throughput.
+`demo-ux.md` §29.1 ratified that both halves appear together, everywhere — a
+tradeoff presented as a pure win is a lie told with true numbers.
+
+**The receipt now exists: `perf-baseline.md` is tracked** (landed in `87a80c0c`),
+and it is the only place the figure should be read from. It gives the ratio as
+**≈2.5×, 95 % CI [2.35, 2.59]** from raw per-run samples. This section
+previously printed `2.46×` and `82.130 / 33.415 = 2.458` — **two different
+values for one quantity, neither carrying an interval**, which is exactly the
+hand-maintained duplication that produced the drift. Cite the file, never the
+number.
 
 ---
 
@@ -392,7 +405,7 @@ Two notes for anyone re-running:
   in `87a80c0c` and is tracked** (`7d528de7`). This claim was true when written
   and expired about ten minutes later. The file carries what the measurement
   needed: `n=15`, `CV 1.98%`, per-repetition tables with stdev, and the
-  derivation `82.13 / 33.41 = 2.46×` at `perf-baseline.md:93`. `demo-spec.md`
+  derivation at `perf-baseline.md:93` (≈2.5×, 95 % CI [2.35, 2.59]). `demo-spec.md`
   landed in the same commit and is also tracked.
 - The dashboard has been verified served (`/demo/` and all eight JS modules
   return 200 over HTTP) only **at rest**, with no generation in flight. Three
