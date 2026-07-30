@@ -327,9 +327,22 @@ def check_cite_markers(repo: Path, doc: Path) -> list[Failure]:
         actual = lines[lineno - 1]
         if want and want not in actual:
             # The repair is computable, so offer it rather than only complaining.
+            #
+            # BUT IT IS OFFERED, NEVER ORDERED, AND THE REASON IS A DEFECT CLASS
+            # THIS CHECK CANNOT SEE: A CITATION MAY BE AN **EPITAPH**. Review
+            # documents on this branch carry struck rows whose coordinates point
+            # at where a bug USED TO BE -- the citation is doing its job precisely
+            # BY no longer matching. As that document's own F1 cell puts it:
+            # "a grep cannot see tense: the hit and the proof-of-fix are
+            # byte-identical." An imperative here would order an author to
+            # falsify their own correction, so both readings are named and
+            # neither is chosen.
             hits = [i + 1 for i, ln in enumerate(lines) if want in ln]
             if len(hits) == 1:
-                fix = f" The text is at line {hits[0]}; rewrite the marker to {path}:{hits[0]}."
+                fix = (f" The text is now at line {hits[0]}. If this marker tracks a "
+                       f"LIVE claim, repoint it to {path}:{hits[0]}; if it is an "
+                       f"EPITAPH marking where something used to be, it is already "
+                       f"correct and this report is the expected result.")
             elif len(hits) > 1:
                 fix = f" The text appears on {len(hits)} lines ({hits[:5]}); pick one by hand."
             else:
@@ -789,10 +802,18 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
               f"file and CANNOT BE CONTENT-CHECKED AT ALL. `path:NNN` carries no "
               f"claim about what lives at that line, so nothing can confirm or "
               f"refute it. These are NOT included in any verified total.")
-        print(f"    A resolving citation is not a correct one: `state.rs:25` is "
-              f"cited 11 times in this repository for a batch-size claim and is "
+        print(f"    Nor can this harness see TENSE. A struck review row cites "
+              f"where a defect USED TO BE, and an epitaph is byte-identical to a "
+              f"live citation. Treat every positional number here as unverified "
+              f"in BOTH directions: possibly rotted, possibly deliberate.")
+        print(f"    A resolving citation is not a correct one: "
+              f"`crates/onnx-genai-server/src/state.rs:25` is cited repeatedly in "
+              f"these docs for a batch-size claim and is "
               f"DEFAULT_MAX_OUTPUT_TOKENS = 4096. The prose means line 28, "
-              f"DEFAULT_MAX_BATCH = 4. All eleven resolve cleanly.")
+              f"DEFAULT_MAX_BATCH = 4. Every one of them resolves cleanly. "
+              f"NOTE THE QUALIFIED PATH: most citations of it say bare "
+              f"`state.rs:25`, which matches FOUR tracked files, and the reading "
+              f"that makes this example true holds in exactly ONE of them.")
         for s in stats.get("positional_samples") or []:
             print(f"    e.g. {s}")
     else:
@@ -1058,6 +1079,26 @@ def self_test() -> int:
     run_ambiguity_case(
         "bare basename matching 2 files DISCLOSES the tie-break",
         SAMPLE_DOC + "see `dup.rs:2` here\n", "AMBIGUOUS_POSITIONAL_PATH")
+
+    # A COMPUTED REPAIR MUST NOT BE AN ORDER. If this check cannot tell a rotted
+    # citation from an epitaph -- and it cannot, they are byte-identical -- then
+    # naming only the "repair" would instruct an author to falsify a struck row.
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td)
+        (repo / "src").mkdir(); (repo / "docs").mkdir()
+        (repo / "src" / "sample.rs").write_text("\n" * 20 + _MARK_SRC)
+        (repo / "docs" / "d.md").write_text(
+            SAMPLE_DOC + '<!-- cite: src/sample.rs:2 = "pub fn cited_symbol" -->\n')
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        _, st = check(repo, repo / "docs" / "d.md", {})
+        det = " ".join(f.detail for f in st["reports"] if f.kind == "CITE_MARKER_ROTTEN")
+        ok = "EPITAPH" in det and "LIVE" in det and "22" in det
+        results.append((
+            "computed repair NAMES BOTH readings, orders neither",
+            ok,
+            "offers the line AND the epitaph reading" if ok
+            else f"detail did not name both readings: {det[:120]!r}"))
 
     # POSITIVE CONTROL: a qualified path is decided, not guessed, and must be
     # silent -- otherwise the case above proves only that it complains always.
