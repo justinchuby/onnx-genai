@@ -322,27 +322,20 @@ impl NativeDecodeSession {
         let total_len = past_len
             .checked_add(token_ids.len())
             .context("native decode context length overflow")?;
-        // A fused VLM decoder is driven by `inputs_embeds` (Inc3a): there is no
-        // token-id sequence input, so its per-step embedding arrives as a routed
-        // host tensor. Route it through the eager device path — the KV/mask
-        // bindings stay device-resident exactly as in the token path; only the
-        // sequence tensor bound each step differs. Generic (non-embeds) routed
-        // ports on CUDA are still unsupported and are refused below.
-        if let Some(embeds_input) = self
-            .step_input_name(NativeStepInputSource::InputsEmbeds)
-            .map(str::to_owned)
-        {
-            return self.decode_cuda_inputs_embeds(
-                &embeds_input,
-                token_ids,
-                past_len,
-                total_len,
-                step_inputs,
-            );
+        // Any declared `inputs_embeds` or generic `Routed` port forces the eager
+        // device path: those ports arrive as per-step host tensors and are bound
+        // as owned uploads, while the KV + attention-mask stay device-resident in
+        // the persistent bindings (never round-tripping). The captured single-
+        // token fast path below writes only the fixed token/mask/KV bindings, so
+        // it cannot carry routed ports — a pure token-id decode (no routed ports)
+        // keeps that byte-identical path. Inc3a introduced this for embeds; Inc3b
+        // generalizes it to arbitrary routed ports via one shared owned build.
+        if self.has_eager_step_inputs() {
+            return self.decode_cuda_eager_step_inputs(token_ids, past_len, total_len, step_inputs);
         }
         if let Some((name, _)) = step_inputs.first() {
             bail!(
-                "native CUDA target decode does not yet accept generic routed host step input '{name}'; only inputs_embeds and generated roles are supported on CUDA (use the CPU native device for arbitrary routed ports)"
+                "native CUDA target decode received routed host step input '{name}' but the decoder declares no matching inputs_embeds/routed port; declare a pipeline dataflow edge to this exact decoder port"
             );
         }
         let token_input = self
@@ -412,40 +405,37 @@ impl NativeDecodeSession {
         )
     }
 
-    /// CUDA `inputs_embeds` decode step (Inc3a). The routed one-token embedding
-    /// (`[1, K, hidden]`, produced host-side by the every_step embedding
-    /// component) is bound as the sequence input for an eager device forward,
-    /// while the attention mask and KV cache stay resident in the persistent
-    /// device bindings — so only the small embedding crosses host→device each
-    /// step and the KV never round-trips. Generated position ids (when the
-    /// decoder declares them) are supplied alongside, mirroring the CPU path.
-    fn decode_cuda_inputs_embeds(
+    /// True when the decoder declares any `inputs_embeds` or generic `Routed`
+    /// step input — the ports that must be uploaded per step and therefore force
+    /// the eager (uncaptured) CUDA device path in [`Self::decode_cuda`].
+    fn has_eager_step_inputs(&self) -> bool {
+        self.step_input_name(NativeStepInputSource::InputsEmbeds)
+            .is_some()
+            || self
+                .step_input_name(NativeStepInputSource::Routed)
+                .is_some()
+    }
+
+    /// Generic eager CUDA decode step for decoders with `inputs_embeds` and/or
+    /// arbitrary `Routed` ports (Inc3a embeds, generalized in Inc3b). Builds the
+    /// owned per-step upload set from **every** declared non-KV step input the
+    /// same way the CPU path does (`prepare_cpu_step_inputs`) — generating token
+    /// ids / position ids, pulling `inputs_embeds`/routed tensors from `supplied`
+    /// by exact graph-port name — with the single CUDA-specific exclusion that
+    /// `attention_mask` is a **persistent device binding** (filled by
+    /// `extend_mask`), never an owned input. So only the small per-step tensors
+    /// (embedding + any routed hidden/state, one token's worth) cross host→
+    /// device; the attention mask and KV cache stay device-resident on the GPU.
+    fn decode_cuda_eager_step_inputs(
         &mut self,
-        embeds_input: &str,
         token_ids: &[TokenId],
         past_len: usize,
         total_len: usize,
-        step_inputs: &[(String, Tensor)],
+        supplied: &[(String, Tensor)],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let position_input = self
-            .step_input_name(NativeStepInputSource::PositionIds)
-            .map(str::to_owned);
-        let embeds = step_inputs
-            .iter()
-            .find(|(name, _)| name == embeds_input)
-            .map(|(_, tensor)| tensor.clone())
-            .with_context(|| {
-                format!(
-                    "declared inputs_embeds input '{embeds_input}' was not supplied to the native CUDA decode step; route the current embedding component output to this exact decoder port"
-                )
-            })?;
-        for (name, _) in step_inputs {
-            if name != embeds_input {
-                bail!(
-                    "native CUDA target decode does not yet accept generic routed host step input '{name}'; only inputs_embeds and generated roles are supported on CUDA (use the CPU native device for arbitrary routed ports)"
-                );
-            }
-        }
+        let owned =
+            self.prepare_cuda_owned_step_inputs(token_ids, past_len, total_len, supplied)?;
+
         let state = self
             .cuda
             .as_mut()
@@ -454,23 +444,81 @@ impl NativeDecodeSession {
             bail!("{}", state.capacity_exceeded_error(total_len));
         }
         let grew = state.ensure_capacity(&mut self.session, total_len)?;
-        // The embedding is a fresh device upload every step, so this path is not
+        // These uploads are fresh device inputs every step, so this path is not
         // CUDA-graph captured; expose the growing logical mask width (matching the
         // eager token forward) rather than freezing to physical capacity.
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
 
-        let mut owned = Vec::with_capacity(2);
-        owned.push((embeds_input.to_owned(), embeds));
-        if let Some(position_ids_name) = position_input {
-            let positions = (past_len..total_len)
-                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            owned.push((
-                position_ids_name,
-                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
-            ));
-        }
         self.run_cuda_eager_rows_owned(owned, total_len, "decoder")
+    }
+
+    /// Build the owned per-step upload set for the eager CUDA path from every
+    /// declared non-KV step input, mirroring the CPU `prepare_cpu_step_inputs`
+    /// contract but skipping `attention_mask` (a persistent CUDA device binding).
+    /// Errors on any routed port that was not supplied, or any supplied tensor
+    /// that maps to no declared port — the same validation the CPU path applies.
+    fn prepare_cuda_owned_step_inputs(
+        &self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        total_len: usize,
+        supplied: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<(String, Tensor)>> {
+        let mut supplied_map = HashMap::with_capacity(supplied.len());
+        for (name, tensor) in supplied {
+            if supplied_map.insert(name.as_str(), tensor).is_some() {
+                bail!("native CUDA decode received duplicate routed step input '{name}'");
+            }
+        }
+
+        let mut owned = Vec::with_capacity(self.step_inputs.len());
+        for binding in &self.step_inputs {
+            let tensor = match binding.source {
+                // The attention mask is a persistent device binding on CUDA
+                // (filled by `extend_mask`), never an owned per-step upload.
+                NativeStepInputSource::AttentionMask => continue,
+                NativeStepInputSource::TokenIds => {
+                    let ids = token_ids.iter().map(|&id| i64::from(id)).collect::<Vec<_>>();
+                    Tensor::from_i64(&[1, token_ids.len()], &ids)?
+                }
+                NativeStepInputSource::PositionIds => {
+                    let positions = (past_len..total_len)
+                        .map(|position| {
+                            i64::try_from(position).context("position id exceeds i64 range")
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    Tensor::from_i64(&[1, token_ids.len()], &positions)?
+                }
+                NativeStepInputSource::InputsEmbeds => supplied_map
+                    .remove(binding.name.as_str())
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "declared inputs_embeds input '{}' was not supplied to the native CUDA decode step; route the current embedding component output to this exact decoder port",
+                            binding.name
+                        )
+                    })?,
+                NativeStepInputSource::Routed => supplied_map
+                    .remove(binding.name.as_str())
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "native CUDA decode graph input '{}' has no generated role and no routed step tensor; declare a pipeline dataflow edge to this exact decoder port",
+                            binding.name
+                        )
+                    })?,
+            };
+            owned.push((binding.name.clone(), tensor));
+        }
+
+        if !supplied_map.is_empty() {
+            let mut unknown = supplied_map.keys().copied().collect::<Vec<_>>();
+            unknown.sort_unstable();
+            bail!(
+                "native CUDA decode received routed step inputs that are not declared graph ports: {unknown:?}"
+            );
+        }
+        Ok(owned)
     }
 
     /// Speculative **verify** primitive (option (b): the safe eager M=K path).

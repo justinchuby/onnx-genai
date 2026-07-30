@@ -432,18 +432,14 @@ impl NativeDecodeSession {
         drop(io_span);
 
         let cuda = if session.device_id().device_type == DeviceType::Cuda {
-            // Inc3a: the CUDA native decoder now accepts a metadata-declared
-            // `inputs_embeds` sequence source (a fused VLM decoder). Generic
-            // arbitrary `Routed` ports are still unsupported on CUDA and remain
-            // refused here until per-port device bindings are implemented.
-            if step_inputs
-                .iter()
-                .any(|binding| binding.source == NativeStepInputSource::Routed)
-            {
-                bail!(
-                    "native CUDA target decode does not yet support arbitrary routed step inputs; use the CPU native device for this contract until generic device bindings are implemented"
-                );
-            }
+            // Inc3a: the CUDA native decoder accepts a metadata-declared
+            // `inputs_embeds` sequence source (a fused VLM decoder). Inc3b: it
+            // also accepts generic `Routed` non-KV ports — bound as owned per-
+            // step device uploads (see `decode_cuda_eager_step_inputs`), so no
+            // load-time refusal is needed. Vision cross-KV remains out of scope
+            // (blocked on the vision Attention float-mask fixes), but those ports
+            // are not declared on a text-decoder contract, so nothing to gate
+            // here.
             let attention_mask = attention_mask
                 .as_deref()
                 .context("native CUDA target decode requires a declared attention-mask input")?;
