@@ -9,8 +9,7 @@
 // by re-partitioning at the Rust level, we let MLAS keep its own partitioning
 // and give it a *pluggable parallel-for backend*: the vendored standalone
 // primitives call the `MlasStandalone*` hooks below, which forward the
-// parallel-for onto a real thread pool that Rust drives with Rayon (the same
-// global pool the rest of ep-cpu uses, so there is no oversubscription). When
+// parallel-for onto a persistent Rust work-stealing pool. When
 // no backend is registered (e.g. the mlas-sys unit tests, or the ep-cpu default
 // build) the hooks run serially — identical to the original spike behaviour.
 //
@@ -25,7 +24,7 @@
 #include <functional>
 #include <new>
 
-// ---- Pluggable parallel-for backend (driven from Rust/Rayon) ----------------
+// ---- Pluggable parallel-for backend (driven from Rust) ----------------------
 
 extern "C" {
 
@@ -167,7 +166,7 @@ extern "C" void mlas_sgemm_pack_b(
 //   3 = SQNBIT_CompInt8 (int8 activation, int32 accumulate) -- accuracy_level=4.
 //
 // Threading: like the SGEMM shim, MLAS's own N/M tile partitioning is routed
-// through the registered Rust/Rayon parallel-for backend (`MlasStandalone*`
+// through the registered Rust parallel-for backend (`MlasStandalone*`
 // hooks above). `MlasQNBitGemmBatch` only takes its parallel branch when
 // `ThreadPool != nullptr`, so pass a non-null sentinel (the pointer is never
 // dereferenced in the standalone build -- `MlasGetMaximumThreadCount` and

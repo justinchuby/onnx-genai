@@ -3,21 +3,19 @@
 //!
 //! The vendored MLAS is compiled in its standalone `BUILD_MLAS_NO_ONNXRUNTIME`
 //! mode, whose threading primitives normally serialize. This crate installs a
-//! Rayon-backed parallel-for backend (see [`ensure_threading`] and
+//! persistent work-stealing parallel-for backend (see [`ensure_threading`] and
 //! `vendor/shim.cpp`) so MLAS keeps its own cache-aware GEMM tile partitioning
-//! while executing the tiles across the current Rayon pool — the same pool the
-//! rest of `onnx-runtime-ep-cpu` uses, so there is no oversubscription. QNBit
-//! callers that need ORT-style one-call-per-node parallelism can instead use
-//! [`MlasThreadPool`], which installs a bounded Rayon pool around MLAS's
-//! standalone `MLAS_THREADPOOL` hooks. See `docs/MLAS_SYS_SPIKE.md` for the
-//! original single-thread feasibility spike.
+//! while executing the tiles across a low-overhead pool that is created once and
+//! reused. QNBit callers can pass `multithread=true` to run one full-width
+//! `MlasQNBitGemmBatch` call and let MLAS partition N internally, matching ORT's
+//! intra-op threadpool shape. See `docs/MLAS_SYS_SPIKE.md` for the original
+//! single-thread feasibility spike.
 
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::ptr::NonNull;
-use std::sync::Once;
-
-use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Once, OnceLock};
 
 mod work_stealing_pool;
 pub use work_stealing_pool::WorkStealingThreadPool;
@@ -235,10 +233,72 @@ type MlasParallelForFn = unsafe extern "C" fn(
 /// Backend that reports the degree of parallelism MLAS may use.
 type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
 
-/// Rayon-backed parallel-for. Runs on whatever pool is current at call time
-/// (i.e. the ep-cpu global pool, or a `ThreadPool::install` scope), so MLAS
-/// never spawns a second pool that would oversubscribe the machine.
-unsafe extern "C" fn rayon_parallel_for(
+const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS";
+
+static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
+static MLAS_PARALLEL_FOR_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot of the vendored-MLAS standalone threading backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MlasThreadingStats {
+    /// Number of `MlasStandaloneParallelFor` calls routed through Rust.
+    pub parallel_for_calls: usize,
+    /// Sum of MLAS partition indices scheduled through the backend.
+    pub scheduled_iterations: usize,
+    /// Number of calls that fell back to a serial loop because pool creation failed.
+    pub serial_fallback_calls: usize,
+    /// Degree of parallelism reported to MLAS by `MlasGetMaximumThreadCount`.
+    pub pool_threads: usize,
+}
+
+/// Return the current MLAS backend stats. Intended for diagnostics and microbenchmarks.
+pub fn mlas_threading_stats() -> MlasThreadingStats {
+    MlasThreadingStats {
+        parallel_for_calls: MLAS_PARALLEL_FOR_CALLS.load(Ordering::Relaxed),
+        scheduled_iterations: MLAS_PARALLEL_FOR_ITERATIONS.load(Ordering::Relaxed),
+        serial_fallback_calls: MLAS_PARALLEL_FOR_FALLBACKS.load(Ordering::Relaxed),
+        pool_threads: mlas_threading_degree(),
+    }
+}
+
+/// Reset the MLAS backend stats. Intended for tests and microbenchmarks.
+pub fn reset_mlas_threading_stats() {
+    MLAS_PARALLEL_FOR_CALLS.store(0, Ordering::Relaxed);
+    MLAS_PARALLEL_FOR_ITERATIONS.store(0, Ordering::Relaxed);
+    MLAS_PARALLEL_FOR_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+fn default_mlas_thread_count() -> usize {
+    if let Ok(raw) = std::env::var(MLAS_WORK_STEALING_THREADS_ENV) {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if n > 0 {
+                return n.min(64);
+            }
+        }
+    }
+
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+fn global_mlas_pool() -> Option<&'static WorkStealingThreadPool> {
+    static POOL: OnceLock<Option<WorkStealingThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| WorkStealingThreadPool::new(default_mlas_thread_count()).ok())
+        .as_ref()
+}
+
+/// Degree of parallelism MLAS sees for internal `TrySimpleParallel` partitioning.
+pub fn mlas_threading_degree() -> usize {
+    global_mlas_pool().map_or(1, WorkStealingThreadPool::thread_count)
+}
+
+/// Work-stealing parallel-for backend for standalone MLAS. MLAS still owns the
+/// GEMM tiling/partitioning; this callback only runs MLAS's partition indices on
+/// the persistent low-overhead pool instead of Rayon's per-region machinery.
+unsafe extern "C" fn work_stealing_parallel_for(
     _rust_ctx: *mut c_void,
     iterations: isize,
     task: MlasTaskFn,
@@ -247,37 +307,54 @@ unsafe extern "C" fn rayon_parallel_for(
     if iterations <= 0 {
         return;
     }
-    // Carry the opaque C++ closure pointer across Rayon worker threads as an
+
+    MLAS_PARALLEL_FOR_CALLS.fetch_add(1, Ordering::Relaxed);
+    MLAS_PARALLEL_FOR_ITERATIONS.fetch_add(iterations as usize, Ordering::Relaxed);
+
+    // Carry the opaque C++ closure pointer across worker threads as an
     // address (usize is Send + Sync). MLAS only *reads* the closure
     // (`std::function::operator() const`) and each `tid` writes a disjoint
     // output partition, so concurrent invocation is race-free.
     let task_ctx = task_ctx as usize;
-    (0..iterations).into_par_iter().for_each(|tid| {
-        // SAFETY: `task_ctx` is valid for the whole `MlasGemmBatch` call that
-        // drives this parallel-for; each `tid` touches a disjoint output range.
-        unsafe { task(task_ctx as *mut c_void, tid) };
-    });
+    if let Some(pool) = global_mlas_pool() {
+        pool.parallel_for(0, iterations as usize, 1, |begin, end| {
+            for tid in begin..end {
+                // SAFETY: `task_ctx` is valid for the whole MLAS call that
+                // drives this parallel-for; each `tid` touches a disjoint
+                // partition chosen by MLAS.
+                unsafe { task(task_ctx as *mut c_void, tid as isize) };
+            }
+        });
+    } else {
+        MLAS_PARALLEL_FOR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        for tid in 0..iterations {
+            unsafe { task(task_ctx as *mut c_void, tid) };
+        }
+    }
 }
 
-/// Report Rayon's current degree of parallelism to MLAS's partitioner, so the
-/// GEMM is split into as many tiles as there are worker threads available.
-unsafe extern "C" fn rayon_max_threads(_rust_ctx: *mut c_void) -> c_int {
-    rayon::current_num_threads().max(1) as c_int
+/// Report the persistent pool's degree of parallelism to MLAS's partitioner.
+unsafe extern "C" fn work_stealing_max_threads(_rust_ctx: *mut c_void) -> c_int {
+    mlas_threading_degree().max(1) as c_int
 }
 
 static THREADING_INIT: Once = Once::new();
 
-/// Install the Rayon-backed threading backend into the vendored MLAS build.
+/// Install the work-stealing threading backend into the vendored MLAS build.
 /// Idempotent; called before every GEMM entry point. Until this runs (e.g. in
 /// the mlas-sys unit tests that call the FFI directly) MLAS stays single
 /// threaded, matching the original spike behaviour.
 fn ensure_threading() {
     THREADING_INIT.call_once(|| unsafe {
-        mlas_set_threading(rayon_parallel_for, rayon_max_threads, std::ptr::null_mut());
+        mlas_set_threading(
+            work_stealing_parallel_for,
+            work_stealing_max_threads,
+            std::ptr::null_mut(),
+        );
     });
 }
 
-/// Bounded thread pool for driving standalone MLAS calls through the
+/// Compatibility handle for driving standalone MLAS calls through the
 /// `MLAS_THREADPOOL*` parameter.
 ///
 /// In the vendored standalone MLAS build, `MLAS_THREADPOOL` is only a forward
@@ -285,36 +362,36 @@ fn ensure_threading() {
 /// `vendor/mlas/onnxruntime/core/mlas/inc/mlas.h`). There is no standalone ORT
 /// thread-pool class to construct. Instead, `vendor/shim.cpp` passes a non-null
 /// sentinel to APIs such as `MlasQNBitGemmBatch`, and the standalone
-/// `MlasGetMaximumThreadCount` / `MlasTrySimpleParallel` hooks route work onto
-/// the Rayon pool active at the call site. Installing this wrapper bounds that
-/// active pool to exactly `thread_count` workers for the duration of the MLAS
-/// call.
+/// `MlasGetMaximumThreadCount` / `MlasTrySimpleParallel` hooks route work onto a
+/// process-global [`WorkStealingThreadPool`]. This handle no longer creates a
+/// per-call pool; it exists for older call sites while the fast path is simply
+/// [`sqnbit_gemm`] / [`sqnbit_gemm_with_workspace`] with `multithread=true`.
 pub struct MlasThreadPool {
-    pool: rayon::ThreadPool,
     thread_count: usize,
 }
 
 impl MlasThreadPool {
-    /// Create a bounded MLAS backing pool. A count of 6-8 is the intended
-    /// decode range on machines where roofline measurements show saturation
-    /// there; callers remain responsible for choosing the policy.
-    pub fn new(thread_count: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
+    /// Create a compatibility handle and initialize the process-global backing
+    /// pool. The global pool's actual degree of parallelism is selected once at
+    /// first use (default: `available_parallelism().clamp(1, 8)`, override via
+    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS`), so this `thread_count` is retained
+    /// only for diagnostics/backward-compatible tests.
+    pub fn new(thread_count: usize) -> std::io::Result<Self> {
         assert!(thread_count > 0, "thread_count must be non-zero");
         ensure_threading();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(thread_count)
-            .thread_name(|idx| format!("mlas-sys-{idx}"))
-            .build()?;
-        Ok(Self { pool, thread_count })
+        let _ = global_mlas_pool();
+        Ok(Self {
+            thread_count: mlas_threading_degree(),
+        })
     }
 
-    /// Number of worker threads available to MLAS while this pool is installed.
+    /// Number of worker threads reported to MLAS by the global backend.
     pub fn thread_count(&self) -> usize {
         self.thread_count
     }
 
     fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
-        self.pool.install(op)
+        op()
     }
 }
 
@@ -1095,9 +1172,10 @@ impl SQNBitGemmWorkspace {
 /// Compute `C = A * dequant(packed) + bias` for row-major `A` (`m x k`) and
 /// `C` (`m x n`), reusing a pre-packed blockwise-quantized weight.
 ///
-/// When `multithread` is true MLAS partitions the GEMM across the current Rayon
-/// pool (see [`PackedB`] threading notes); otherwise it runs serially. `bias`,
-/// when present, is added by MLAS itself (length `n`).
+/// When `multithread` is true MLAS sees a non-null threadpool sentinel and
+/// partitions the full-width GEMM internally across the process-global
+/// [`WorkStealingThreadPool`]; otherwise it runs serially. `bias`, when present,
+/// is added by MLAS itself (length `n`).
 pub fn sqnbit_gemm(
     packed: &SQNBitPackedB,
     m: usize,
@@ -1141,10 +1219,10 @@ pub fn sqnbit_gemm_with_workspace(
     };
 }
 
-/// Same as [`sqnbit_gemm_with_workspace`], but installs a bounded MLAS backing
-/// pool for this call. MLAS sees a non-null `MLAS_THREADPOOL*`, partitions the
+/// Same as [`sqnbit_gemm_with_workspace`], but keeps the older explicit handle
+/// in the call signature. MLAS sees a non-null `MLAS_THREADPOOL*`, partitions the
 /// QNBit batch internally, and the standalone hooks execute those partitions on
-/// `thread_pool.thread_count()` Rayon workers.
+/// the process-global [`WorkStealingThreadPool`].
 pub fn sqnbit_gemm_with_threadpool(
     packed: &SQNBitPackedB,
     m: usize,
@@ -1240,8 +1318,9 @@ pub unsafe fn sqnbit_gemm_into_with_workspace(
     }
 }
 
-/// Same as [`sqnbit_gemm_into_with_workspace`], but installs a bounded MLAS
-/// backing pool for the duration of the call.
+/// Same as [`sqnbit_gemm_into_with_workspace`], but keeps the older explicit
+/// handle in the call signature. The actual backing pool is the persistent
+/// process-global [`WorkStealingThreadPool`].
 ///
 /// # Safety
 /// Same requirements as [`sqnbit_gemm_into`].
@@ -1548,9 +1627,8 @@ mod tests {
         );
     }
 
-    /// Multi-thread scaling probe: measures the same 32x512x512 shape at 1 and
-    /// 8 Rayon threads to confirm MLAS's own tile partitioning now runs across
-    /// the pool. Ignored by default; run with:
+    /// Multi-thread scaling probe for the standalone MLAS SGEMM shim. Ignored
+    /// by default; run with:
     ///   cargo test -p mlas-sys --release -- --ignored --nocapture perf_sgemm_multithread
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
@@ -1813,8 +1891,8 @@ mod tests {
         let mut single = vec![0.0f32; m * n];
         sqnbit_gemm(&packed, m, &a, Some(&bias), &mut single, false);
 
-        let pool = MlasThreadPool::new(2).expect("bounded MLAS thread pool");
-        assert_eq!(pool.thread_count(), 2);
+        let pool = MlasThreadPool::new(2).expect("MLAS thread pool handle");
+        assert!(pool.thread_count() >= 1);
         let mut workspace = SQNBitGemmWorkspace::new();
         let required = sqnbit_gemm_workspace_size(&packed, m);
 
@@ -1859,6 +1937,51 @@ mod tests {
         assert_eq!(
             pooled.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             pooled_again.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sqnbit_multithread_uses_work_stealing_backend() {
+        let (m, n, k, block_size) = (1usize, 1024usize, 1024usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.017 + 0.11).sin()) * 1.3)
+            .collect();
+        let (packed_b, scales, zps, _) = quantize_int4(&weights, n, k, block_size, true);
+        let packed = match SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            SQNBitComputeType::Int8,
+            &packed_b,
+            &scales,
+            zps.as_deref(),
+        ) {
+            Some(p) => p,
+            None => {
+                eprintln!("SQNBit Int8 unavailable on host; skipping backend stats test");
+                return;
+            }
+        };
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.013 + 0.29).cos()) * 0.9)
+            .collect();
+        let mut c = vec![0.0f32; m * n];
+
+        reset_mlas_threading_stats();
+        sqnbit_gemm(&packed, m, &a, None, &mut c, true);
+        let stats = mlas_threading_stats();
+        assert!(
+            stats.parallel_for_calls > 0,
+            "multithread=true QNBit GEMM must route through MlasStandaloneParallelFor"
+        );
+        assert!(
+            stats.scheduled_iterations >= stats.pool_threads,
+            "MLAS should schedule at least one partition per reported pool lane: {stats:?}"
+        );
+        assert_eq!(
+            stats.serial_fallback_calls, 0,
+            "work-stealing backend should be available"
         );
     }
 

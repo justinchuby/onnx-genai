@@ -82,7 +82,6 @@ struct Shared {
     ready: AtomicUsize,
     remaining: AtomicUsize,
     active: AtomicUsize,
-    in_job: AtomicUsize,
     shutdown: AtomicBool,
     panicked: AtomicBool,
     queues: Vec<WorkerQueue>,
@@ -118,7 +117,6 @@ impl WorkStealingThreadPool {
             ready: AtomicUsize::new(0),
             remaining: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
-            in_job: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
             queues: (0..thread_count).map(|_| WorkerQueue::new()).collect(),
@@ -176,7 +174,6 @@ impl WorkStealingThreadPool {
 
         let chunks = len.div_ceil(grain);
         let _dispatch_guard = self.dispatch_lock.lock().unwrap();
-        wait_for_in_job(&self.shared);
         self.shared.panicked.store(false, Ordering::Relaxed);
 
         let lanes = self.thread_count();
@@ -299,19 +296,11 @@ fn wait_for_active(shared: &Shared) {
     }
 }
 
-fn wait_for_in_job(shared: &Shared) {
-    while shared.in_job.load(Ordering::Acquire) != 0 {
-        std::hint::spin_loop();
-    }
-}
-
 fn run_job(shared: &Shared, worker_id: usize) {
     let job = unsafe { *shared.job.get() };
     let Some(call) = job.call else {
         return;
     };
-    shared.in_job.fetch_add(1, Ordering::AcqRel);
-    let _in_job = InJobGuard { shared };
 
     while !shared.panicked.load(Ordering::Acquire) {
         let chunk = claim_chunk(shared, worker_id).or_else(|| steal_chunk(shared, worker_id));
@@ -331,16 +320,6 @@ fn run_job(shared: &Shared, worker_id: usize) {
             shared.panicked.store(true, Ordering::Release);
             break;
         }
-    }
-}
-
-struct InJobGuard<'a> {
-    shared: &'a Shared,
-}
-
-impl Drop for InJobGuard<'_> {
-    fn drop(&mut self) {
-        self.shared.in_job.fetch_sub(1, Ordering::Release);
     }
 }
 

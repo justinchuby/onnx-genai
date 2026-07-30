@@ -19,7 +19,7 @@ Abstract:
 #if defined(BUILD_MLAS_NO_ONNXRUNTIME)
 // nxrt-mlas-mt: pluggable parallel-for backend implemented in vendor/shim.cpp.
 // When a backend is registered (via mlas_set_threading from Rust) these route
-// MLAS's own tile partitioning onto a real thread pool (Rayon); otherwise they
+// MLAS's own tile partitioning onto a persistent Rust work-stealing pool; otherwise they
 // run serially. `work` points to the std::function<void(ptrdiff_t)> closure.
 extern "C" void MlasStandaloneParallelFor(std::ptrdiff_t Iterations, void* work);
 #endif
@@ -46,11 +46,11 @@ MlasExecuteThreaded(
 
     //
     // nxrt-mlas-mt: route MLAS's own partitioned iterations onto the registered
-    // parallel-for backend (Rayon), mirroring MlasTrySimpleParallel and the
+    // parallel-for backend, mirroring MlasTrySimpleParallel and the
     // upstream ORT MLAS_THREADPOOL::TrySimpleParallelFor path below. Without
     // this the standalone build ran every partition serially on the calling
-    // thread, so the NCHWc convolution/pooling/reorder/transpose kernels — which
-    // split into MlasGetMaximumThreadCount tiles — executed single-threaded.
+    // thread, so the NCHWc convolution/pooling/reorder/transpose kernels ï¿½ which
+    // split into MlasGetMaximumThreadCount tiles ï¿½ executed single-threaded.
     // MlasStandaloneParallelFor falls back to a serial loop when no backend is
     // registered, preserving the prior behaviour for tests that call the FFI
     // directly.
@@ -90,7 +90,7 @@ MlasTrySimpleParallel(
 
     //
     // nxrt-mlas-mt: route MLAS's own partitioned iterations onto the registered
-    // parallel-for backend (Rayon), falling back to a serial loop if none is
+    // parallel-for backend, falling back to a serial loop if none is
     // registered.
     //
     MlasStandaloneParallelFor(Iterations, const_cast<void*>(static_cast<const void*>(&Work)));
@@ -123,7 +123,7 @@ MlasTryBatchParallel(
 
     //
     // nxrt-mlas-mt: route MLAS's own partitioned iterations onto the registered
-    // parallel-for backend (Rayon), falling back to a serial loop if none is
+    // parallel-for backend, falling back to a serial loop if none is
     // registered.
     //
     MlasStandaloneParallelFor(Iterations, const_cast<void*>(static_cast<const void*>(&Work)));

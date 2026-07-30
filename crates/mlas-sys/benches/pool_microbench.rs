@@ -4,13 +4,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-use mlas_sys::WorkStealingThreadPool;
+use mlas_sys::{
+    mlas_threading_stats, reset_mlas_threading_stats, sqnbit_gemm_with_workspace,
+    SQNBitComputeType, SQNBitGemmWorkspace, SQNBitPackedB, WorkStealingThreadPool,
+};
 use rayon::prelude::*;
 
 type JobFn = unsafe fn(*const (), usize, usize);
 
 const DISPATCH_ITERS: usize = 10_000;
 const THROUGHPUT_ITERS: usize = 1_000;
+const QNBIT_ITERS: usize = 200;
 const ITEMS: usize = 8_192;
 const GRAIN: usize = 32;
 
@@ -102,7 +106,60 @@ fn main() {
         }),
     );
 
+    qnbit_internal_pool_bench();
+
     std::hint::black_box(checksum.load(Ordering::Relaxed));
+}
+
+fn qnbit_internal_pool_bench() {
+    let (m, n, k, block_size) = (1usize, 2048usize, 2048usize, 32usize);
+    let weights: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32 * 0.017 + 0.11).sin()) * 1.3)
+        .collect();
+    let (packed_b, scales, zps) = quantize_int4(&weights, n, k, block_size, true);
+    let Some((comp, packed)) = [SQNBitComputeType::Int8, SQNBitComputeType::Fp32]
+        .into_iter()
+        .find_map(|comp| {
+            SQNBitPackedB::new(
+                n,
+                k,
+                4,
+                block_size,
+                comp,
+                &packed_b,
+                &scales,
+                zps.as_deref(),
+            )
+            .map(|packed| (comp, packed))
+        })
+    else {
+        println!("mlas-qnbit/internal     skipped: SQNBit unavailable on this host");
+        return;
+    };
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i as f32 * 0.013 + 0.29).cos()) * 0.9)
+        .collect();
+    let mut c = vec![0.0f32; m * n];
+    let mut workspace = SQNBitGemmWorkspace::new();
+
+    for _ in 0..5 {
+        sqnbit_gemm_with_workspace(&packed, m, &a, None, &mut c, &mut workspace, true);
+    }
+    reset_mlas_threading_stats();
+    report(
+        "mlas-qnbit/internal",
+        measure(QNBIT_ITERS, |_| {
+            sqnbit_gemm_with_workspace(&packed, m, &a, None, &mut c, &mut workspace, true);
+        }),
+    );
+    let stats = mlas_threading_stats();
+    println!(
+        "mlas-qnbit/stats        comp={comp:?} calls={} iterations={} pool_threads={} fallbacks={}",
+        stats.parallel_for_calls,
+        stats.scheduled_iterations,
+        stats.pool_threads,
+        stats.serial_fallback_calls
+    );
 }
 
 fn simulated_contention(iter: usize, begin: usize) {
@@ -117,6 +174,46 @@ fn burn(checksum: &AtomicU64, begin: usize, end: usize) {
         local = local.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     }
     checksum.fetch_add(local, Ordering::Relaxed);
+}
+
+fn quantize_int4(
+    weights_nk: &[f32],
+    n: usize,
+    k: usize,
+    block_size: usize,
+    asymmetric: bool,
+) -> (Vec<u8>, Vec<f32>, Option<Vec<u8>>) {
+    let blocks = k.div_ceil(block_size);
+    let blob = block_size / 2;
+    let zp_row = blocks.div_ceil(2);
+    let mut packed = vec![0u8; n * blocks * blob];
+    let mut scales = vec![0.0f32; n * blocks];
+    let mut zps = vec![0u8; n * zp_row];
+    for row in 0..n {
+        for block in 0..blocks {
+            let start = block * block_size;
+            let end = (start + block_size).min(k);
+            let values = &weights_nk[row * k + start..row * k + end];
+            let (scale, zp) = if asymmetric {
+                let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let scale = ((max - min) / 15.0).max(1e-6);
+                (scale, (-min / scale).round().clamp(0.0, 15.0) as u8)
+            } else {
+                let max_abs = values.iter().map(|v| v.abs()).fold(0.0, f32::max);
+                ((max_abs / 7.0).max(1e-6), 8u8)
+            };
+            scales[row * blocks + block] = scale;
+            if asymmetric {
+                zps[row * zp_row + block / 2] |= zp << (4 * (block % 2));
+            }
+            for (offset, &value) in values.iter().enumerate() {
+                let q = (value / scale + zp as f32).round().clamp(0.0, 15.0) as u8;
+                packed[(row * blocks + block) * blob + offset / 2] |= q << (4 * (offset % 2));
+            }
+        }
+    }
+    (packed, scales, asymmetric.then_some(zps))
 }
 
 fn measure(mut iters: usize, mut f: impl FnMut(usize)) -> Stats {

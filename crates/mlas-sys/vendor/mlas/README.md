@@ -60,7 +60,7 @@ located with `grep`. The patches wire MLAS's standalone
 `BUILD_MLAS_NO_ONNXRUNTIME` parallel-for primitives to the pluggable host
 thread-pool hooks in `shim.cpp` (`MlasStandaloneParallelFor` and
 `MlasStandaloneMaxThreads`), so `MlasGemmBatch` runs multi-threaded on our
-Rayon pool.
+persistent Rust work-stealing pool.
 
 After re-vendoring from upstream, these patches **MUST** be re-applied:
 grep the old tree for `nxrt-mlas-mt` first to locate them, and keep this
