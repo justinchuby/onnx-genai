@@ -421,6 +421,33 @@ faith**, which is where it was always most likely to land: the number I repeated
 most often is the number I re-checked least, precisely because repeating it felt
 like candour.
 
+### Corroboration must be verified at the source, not at the number
+
+**An agent was credited with a test run they never performed.** Two independent
+figures were reported to agree; the figure had one source. The credited agent had
+been present the whole time and **nobody asked them whether they had run it.**
+
+> **Before citing agreement, name the other party's command, revision, working
+> tree and clock. If you cannot produce all four, you are citing your own number
+> twice.**
+
+**Two matching figures feel like independent confirmation and are the cheapest
+false positive available.** An instrument that was never run agrees with
+everybody, and the agreement here was manufactured by attribution rather than by
+measurement.
+
+**The asymmetry that keeps this class alive is worth stating, because it is the
+mirror of a false accusation.** A false red has an adversary — its target checks
+it. **A false credit has none.** The only person with standing to refuse it is the
+recipient, and refusing reads as modesty rather than as a correction, so it gets
+acknowledged and then re-quoted unchanged. One agent here had **three** findings
+filed under their name tonight and had to decline each individually.
+
+**Applied to this document:** every figure is either re-derived by me at a stated
+revision, or attributed to one named measurer with their command and their
+revision. **No number here is presented as corroborated by two parties**, because
+in no case did I hold both commands.
+
 ### A third species of control: shape, not just liveness
 
 Two kinds of control were used all session. One asks *is my instrument alive* —
@@ -657,9 +684,10 @@ arrives exactly when a reader is most inclined to believe it.
 ### Rust suite
 
 ```
-REVISION            37d0d72e
+REVISION            1f9fc70b   <- NOT this document's pin. See below.
 RUNNER              cargo test -p onnx-genai-server --no-fail-fast
-OBSERVATIONS        14 at this revision, by the reviewer who ran them
+MEASURED BY         one reviewer, clean detached worktree, porcelain 0
+OBSERVATIONS        14 at that revision
 GREEN               13  ->  264 pass / 0 fail / 4 ignored / raw exit 0
 RED                  1  ->  263 pass / 1 fail / 4 ignored / raw exit 101
 FAILING TEST        concurrent_static_cache_chat_completions_share_batched_driver
@@ -683,11 +711,39 @@ prediction the sequence is: see exit `101`, assume a lock or disk problem on a
 full machine, re-run, see green, report green. **That is how this survived every
 previous run tonight, including mine.**
 
-**And it is not a harness curiosity, which is why it is in this section rather
-than a footnote.** It is a concurrency test over the *shared batched driver* —
-the mechanism this demo exists to show. It passes 5 of 5 alone and fails only
-beside its siblings, so the interleaving that produced `"tok24 , tok28 tok27"` is
-reachable in the product and not only in the test.
+**Two corrections to my own first version of this block, both of which I made in
+the direction that reads better.**
+
+**First, the revision.** I wrote this table under `37d0d72e`, this document's
+pin. **The fourteen runs were taken at `1f9fc70b`.** I took another agent's
+measurement and attached it to my own subject — a complete, correct measurement
+relabelled with the wrong referent, which is the one defect class none of the
+verification fields here can catch, because every field validates the reading and
+none validates the subject. **The number is theirs and it is about their
+revision.**
+
+**Second, and worse: I wrote that the race is *reachable in the product and not
+only in the test*. That is not known, and I did not measure it.** What is
+measured is that the test passes 5 of 5 in isolation and 6 of 6 as a whole binary,
+and failed once beside its 28 siblings. **That establishes the failure needs
+concurrent load. It does not locate the race.** A shared-state bug in the test
+harness produces exactly the same signature.
+
+> **The honest statement is that we do not know whether the race is in the
+> product or in the test, and it is not closed either way.**
+
+**I guessed toward the more alarming reading, which felt like candour and was
+still a guess.** In a document arguing that unearned precision is the defect, the
+temptation is not to overclaim safety — it is to overclaim *rigour about danger*,
+and it produces a sentence no one will challenge because challenging it looks like
+complacency.
+
+**It stays in this section rather than a footnote for the reason that survives
+both corrections:** it is the concurrency test over the shared batched driver, and
+that driver is the feature this demo exists to show. **A release note that claims
+a green suite without saying its headline feature has an intermittent test would
+be the exact overclaim this branch spent the session eliminating, committed on the
+last page.**
 
 **The direction of failure is the survivable one, and that is not a defence.** It
 fails toward red. But a suite that can go red while the code is fine can also go
