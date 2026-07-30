@@ -882,7 +882,8 @@ pub(crate) struct BlockWindow {
     ///
     /// This is the MIRROR's reach, not the pool's size. Paging to `total` walks
     /// everything this endpoint can show and may still be a fraction of the
-    /// pool -- see `pool_total` and `truncated`.
+    /// pool -- see `pool_total`. `truncated` describes the returned request
+    /// window, which may be shorter than both values.
     total: usize,
     /// Pages the POOL holds.
     ///
@@ -892,12 +893,12 @@ pub(crate) struct BlockWindow {
     /// pages in use than exist on screen -- a visible arithmetic contradiction
     /// with no explanation available anywhere in the response.
     pool_total: usize,
-    /// Whether the mirror stops short of the pool.
+    /// Whether this response omits any pool page.
     ///
-    /// A derived boolean rather than something the client infers from
-    /// `pool_total > total`, because the inference is exactly what a client
-    /// renders a contradiction by failing to make. The cap is correct and
-    /// deliberate; what was wrong was that it was invisible on the wire.
+    /// This follows `start` and `scanned`, not the mirror's `total`: a default
+    /// 256-page request against a 1024-page pool is truncated even when the
+    /// mirror itself reaches all 1024 pages. A nonzero start is also partial
+    /// because the response omits the beginning of the pool.
     truncated: bool,
 }
 
@@ -1057,7 +1058,7 @@ impl BlockTableResponse {
                 observed,
                 total,
                 pool_total,
-                truncated: pool_total > total,
+                truncated: start > 0 || scanned < pool_total,
             }),
             blocks: Some(blocks),
         }
