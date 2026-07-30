@@ -6,7 +6,38 @@ design, performance, failure modes.
 naming/organisation/documentation (Readability Reviewer). Where those reviewers own a
 finding, this document says so and does not restate it.
 
-**Verdict: REQUEST CHANGES.** Three blocking findings, all executed rather than read.
+> **Which tree this document is about.** Every `crates/…` and `examples/…` reference here
+> means the **`onnx-genai-demo`** checkout on **`feat/genai-demo-dashboard`**. A sibling
+> checkout at `onnx-genai` contains files at *identical paths* — `routes/admin.rs`,
+> `driver.rs`, `cli.rs` all resolve in both — and it disagrees with this one. Per
+> @086345a5's measurement, a fully-qualified path does **not** disambiguate here, so
+> citations below are **symbol-anchored and tree-scoped by this paragraph**, which is the
+> only form that cannot rot: a line number rots when code moves, and a per-citation
+> repository prefix rots the same way.
+
+**Verdict: APPROVE WITH COMMENTS.** Blocking set is **zero**. This document opened at
+REQUEST CHANGES with three blocking findings; two were fixed while it sat unedited, and
+the third was downgraded on evidence. **The stale verdict was live in this file for
+roughly ninety minutes, and a stale red is not a safe error** — it either holds a ship
+that is ready or burns a reviewer's hour chasing a corpse. Status, re-derived at the
+SHA in each row rather than recalled:
+
+| # | Was | Now | Closed by | How I know |
+|---|---|---|---|---|
+| **C2** stalled-server hang | BLOCKING | ✅ **CLOSED** | `6ecd9183` | ancestor-of-HEAD; re-executed at `c1323e7f`: blackhole socket → typed `RequestTimeoutError` @ 2004 ms, normal-server control → HTTP 200 @ 14 ms — see §1 |
+| **C1** `parseOrigin` host validation | BLOCKING | ✅ **CLOSED** | `023db167` + `be3ab37c` | ancestors-of-HEAD; predicate re-run — see §2 |
+| **C11** router re-fabricates zeros | BLOCKING | 🟡 **real, not blocking** | — | shipping, but zero router processes ran tonight — see §3 |
+| **P1** model-path disclosure | *(not filed)* | 🟡 **caption defect only** | *(server half deleted)* | disclosure is now unconstructible in Rust — see §5 |
+
+**Blocking set is zero and I am not manufacturing a fourth.** The strongest single change
+on this branch landed while this document sat stale: the server's path-disclosure
+*conditional* was not fixed, it was **deleted**, and a source-level test now forbids its
+return. That is the design principle this whole review argued for — **make the wrong
+state unconstructible rather than guard it** — executed more thoroughly than I proposed.
+§7.2 below retracts C5 as a blocker and notes a residual (a proxy or port-forward makes
+the bind address loopback while the peer is remote). **The author did not argue about how
+likely that residual was; they removed the axis it lived on.** My retraction and their
+deletion are both right, and that is the honest reading — not "I was correct all along."
 
 > **How to read this document.** It is a *consolidated current state*, not a log. My
 > working notes were append-only and superseded their own severities several times; a
@@ -38,7 +69,7 @@ exactly one. A path-relative search in any other returns a clean, reproducible,
 
 ---
 
-## 1. BLOCKING — C2: a server that stalls *after* connecting freezes the dashboard permanently, and the dashboard keeps reporting `connected`
+## 1. ✅ CLOSED (`6ecd9183`) — C2: a server that stalls *after* connecting freezes the dashboard permanently, and the dashboard keeps reporting `connected`
 
 **Severity: blocking. Highest-priority finding in this review.** Measured, with
 controls, and with the fix validated.
@@ -91,7 +122,7 @@ remember to pass is one careless caller away from reopening exactly this hole.
 
 ---
 
-## 2. BLOCKING — C1: `parseOrigin` validates the scheme but not the host
+## 2. ✅ CLOSED (`023db167`, `be3ab37c`) — C1: `parseOrigin` validates the scheme but not the host
 
 **Severity: blocking.** Executed.
 
@@ -120,7 +151,7 @@ server.
 
 ---
 
-## 3. BLOCKING — C11: the router re-fabricates the zeros the server deliberately omits, and routes live traffic on them
+## 3. 🟡 REAL, NOT BLOCKING — C11: the router re-fabricates the zeros the server deliberately omits, and routes live traffic on them
 
 **Severity: blocking, if the router is in this PR's scope** — the demo itself runs no
 router, so scope is the Lead's call. The *contract defect* is real either way.
@@ -212,6 +243,8 @@ Two consequences worth carrying past this PR:
 | **C7/C8** | `ServeDir` publishes the whole assets directory; no CSP header | minor | read |
 | **C5** | `may_disclose_model_paths()` keys on bind address rather than peer | **RETRACTED — see §7.2** | executed |
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
+| **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
+| **C12** | **`fetchWithDeadline` is the only network path by discipline, not by construction.** After `6ecd9183` both raw-`fetch` bindings funnel through one wrapper (2 call sites, 1 implementation — census in §1). Nothing *asserts* that. A third caller writing `globalThis.fetch(...)` tomorrow reintroduces C2 with a green suite | low, structural | executed |
 
 **On C10 and five checkouts:** this deserves more weight than its severity suggests.
 With five checkouts of this repository on one machine, launching from the wrong one
@@ -268,6 +301,18 @@ travels afterwards.** Since the leaked username is already the public account na
 marginal disclosure is a directory layout: **low, not a blocker.** Cheap construction-side
 fix if anyone is in the file: render the model **basename** with the full path as a
 `title` attribute.
+
+**7.2a — UPDATE, and it corrects a prediction I made loudly.** The gate is gone. I
+warned that deleting the Rust conditional before the client render would "delete a
+working control," and I was wrong about the outcome while right about the class. The
+author did not delete the *control*, they deleted the *capability*: `model_path_for_display()`
+lost its boolean parameter and returns `file_name()` unconditionally. **A conditional
+that can only ever be wrong in the disclosing direction was replaced by no conditional
+at all.** My proposed `title`-attribute fix above is now actively bad — it would
+reintroduce the full path into the DOM that the Rust deletion just removed from the
+wire. **Struck.** This is the second time tonight a fix of mine was beaten by a deletion,
+and both times the deletion won for the same reason: it removes the axis instead of
+choosing a value on it.
 
 **7.3 — My named recurring error: I verify a *definition* and infer its *use*.** Three
 instances — reading `field-state.js` and never opening `format.js`; reading `NodeStatus`
