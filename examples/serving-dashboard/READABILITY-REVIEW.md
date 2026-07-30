@@ -12,6 +12,11 @@ Five checkouts of this repository exist on this machine and the demo exists
 in exactly one of them, so a bare path is not a citation. Findings name a **symbol** and **quote
 the text**; line numbers are a hint and may have rotted by the time you read this.
 
+<!-- Machine-checked by check-review-freshness.test.js. Raw hex, never a ref name:
+     `review-0` named 6ecd9183 at 03:57 and 0aac6bb1 at 04:21 -- 60 commits apart,
+     re-pointed silently, because a tag is a mutable pointer to an immutable object. -->
+MEASURED-AT: 484cda07
+
 > ⚠️ **A review is a measurement, not a document, and it decays at the rate the tree moves.**
 > This file spent roughly ninety minutes asserting five findings in the present tense after
 > the crew had fixed all five. That is worse than the findings were: a stale *open* finding
@@ -581,3 +586,124 @@ had just built from it.
 
 **Every zero needs a positive control.** One finding here initially measured zero from a directory
 that does not exist. A grep over a missing path and a clean verified absence are byte-identical.
+
+---
+
+## Findings that existed only in chat
+
+These six were published as broadcasts and never landed in this file. That is itself the
+defect this document is about: **a finding that exists only in a conversation did not survive
+the session**, and several of these were the most load-bearing things measured. Each carries
+its status, its predicate, and both controls.
+
+### R16 🔴 `'…/**/*.js'` reaches 36 of 74 tracked files, and exits 0
+
+Measured at `f0da0c2a`. `git grep -l '' HEAD -- 'examples/serving-dashboard/**/*.js'` → **36**
+files; the same command with `'examples/serving-dashboard/*.js'` → **74**. Positive control:
+`fetch` reaches 15 files under the working form. Negative control: `zzz_never_written` → 0.
+
+**The `**` form is NARROWER than the `*` form, which is the opposite of what every reader
+assumes.** In a git pathspec `*` already matches `/`, so `dir/*.js` reaches every depth, while
+`**/*.js` demands an extra path segment — it drops every file sitting *directly* in
+`serving-dashboard/`. That is where `telemetry-store.js`, `telemetry-provenance.js` and `app.js`
+live: **the most-edited files on the branch are exactly the ones it cannot see.**
+
+This is the general form worth keeping: *a decorative-looking token silently changed what was
+measured, and exited 0.* Its siblings this session were `| tail` (which replaced a suite's
+verdict with the pipe's), a `git grep` inheriting a cwd, and a line break inside an expression.
+**All four look like formatting. All four are part of the measurement. None of them warn.**
+
+### R17 🔴 The documented test command runs a subset, and reports success
+
+The command in the README executed **282 of 587** tests. The missing files were named rather
+than counted, and the list is the finding: `field-keys.test.js` and `stylesheet.test.js` — at
+the time, the two files that had just been hardened to enforce the honesty layer. **Their new
+guards executed zero times under the documented command.** A reviewer would run it, see
+`282 pass, exit 0`, and have verified none of the layer the demo exists to demonstrate.
+
+**Publish the list, not the percentage.** The same defect reported as *255 of 543* persuaded
+nobody, because 47% reads as a big chunk. As a list of file names it reads as *the entire
+honesty layer is untested*. **A shortfall expressed as a count hides which items are missing,
+and the identity of the missing items is the whole finding.**
+
+### R18 🔴 `README.md` and `CONTRACT.md` §7 open with the same clause and end in opposite claims
+
+Both sentences begin *"The script resolves its own directory, so"*. CONTRACT §7 finishes
+*"its **results** never depend on where you stand. **This path does.**"* — correct. The README
+finishes *"so **it runs from anywhere**"* — false, with the repo-root-relative invocation printed
+four lines above it. Adjudicated by running it: from the repo root, raw exit 0, 49 files
+discovered.
+
+**A grep on the shared prefix returns two hits that are indistinguishable for six words.**
+Seventh member of the *grep cannot see it* family, after arrays, tense, line breaks, negation,
+string-concatenation boundaries, and sentence-initial capitals. **Grep sees bytes; meaning
+lives in the frame around them, and a subordinate clause is a frame.**
+
+### R19 🟡 `entry.path` is one noun doing two jobs, and it makes a correct guard impossible
+
+`never-bind.test.js` bans the token `path` to keep the model directory off the page. Every
+match it fires on is `entry.path` — the catalogue's JSON pointer, an unrelated concept sharing
+a noun. **The fix is the rename `entry.path` → `entry.pointer`, not an exemption.** An
+exemption teaches the guard to ignore the exact string it exists to catch; the rename removes
+the collision. **When a guard needs a whitelist, suspect the vocabulary before the guard.**
+
+### R20 🔴 `review-0` moved 60 commits, and three reviewers pinned verdicts to the name
+
+At 03:57 `review-0` resolved to `6ecd9183`. At 04:21 it resolved to `0aac6bb1` — **60 commits
+later**, re-pointed by `eb2abbd3`, announced in a commit message, and quoted in its old form by
+three separate verdicts afterwards.
+
+**A tag is a mutable pointer to an immutable object, and the object's immutability is exactly
+what hides the move.** Nothing errors; every old SHA still resolves; only the mapping changed.
+And `review-1` is timestamped 04:02 while `review-0` is 04:16 — **the numbering implies an
+order the timestamps deny, and readers sort by the name without looking.**
+
+Guarded by `check-review-freshness.test.js`, which requires a raw hex SHA and rejects a ref
+name. Mutation-proven on four arms — tag name, agent id, unresolvable token, marker deleted —
+each raw exit 1, restored raw exit 0.
+
+### R21 🔴 Our agent ids are eight hex characters, and so are our short SHAs
+
+`IMPLEMENTATION-REVIEW.md:3` presents `73e77d95` three lines above a real commit SHA. One is an
+agent, one is a commit, and **no regex can separate them — same bytes, same alphabet, same
+length.** Only asking git whether the object exists *and is a commit* distinguishes them. Any
+citation checker that validates SHAs by shape will accept every agent id in the corpus as a
+verified anchor.
+
+---
+
+## The error signature of this document, stated because it predicts the next one
+
+**Both of the false claims this review made were claims of COMPLETENESS, never of SEVERITY.**
+That is not a coincidence and it generalises past this file.
+
+A severity over-call gets argued down — someone disagrees, the argument is public, the row
+survives at a lower grade. **A completeness over-call stops the next reader looking.** It
+closes a search rather than opening one, and it does it silently, because the reader who was
+deterred never files anything and never knows they were deterred.
+
+It predicts the shape of the session's other misses: a `NOT_YET_PUBLISHED` list that was taken
+as exhaustive, a performance corpus whose four exemptions were read as none, and four
+independent reviewers who converged on a test command that missed a third directory — **not
+because they disagreed, but because they all read the same incomplete map.** Four experts
+agreeing is not evidence when the agreement has one source.
+
+The unified law, owed jointly to the architect who supplied its mirror: **a partial audit
+over-credits the rows it omits; a blanket disclaimer under-credits the rows that earned better;
+and a count over-credits every row it never examined.** One defect — *the scope of the claim
+not matching the scope of the evidence.* All three are invisible because all three are
+literally true. **The dishonesty is entirely in the quantifier, and a quantifier is the one
+part of a sentence that no instrument here can see.**
+
+The remedy this document now ships is the per-row form: every heading carries its own status,
+its own SHA, and both controls. **A document-level claim in either direction is the thing to
+avoid — including a document-level disclaimer, which costs nothing in a file with no anchors
+and strips 180 machine-checked ones in a file that has them.**
+
+### This review's own citation hit rate is 0 of 2
+
+Stated here because it is unflattering and because the instrument rewards the wrong thing. This
+document has the **fewest** `file:NNN` citations of the three reviewer deliverables — 2, against
+90 and 43 — and that was published as evidence of cleanliness. **Both are wrong.** The census
+that scored it well counts citations; it has never validated one, neither bounds nor content.
+*Low citation density is a different trade, not rigour.*
