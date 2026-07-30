@@ -161,6 +161,23 @@ describe('accessibility cannot be skipped one panel at a time', () => {
     assert.deepEqual(offenders, [], offenders.join('\n'));
   });
 
+  it('never makes an annotation its own tab stop', () => {
+    // AC29. A panel of unavailable values must cost a keyboard user ONE tab
+    // stop, not one per em-dash. Read-only annotations join the roving cursor
+    // with tabindex -1; only genuinely operable controls (buttons, the chart
+    // figure) may be reached by Tab directly.
+    const offenders = [];
+    for (const file of panelSources()) {
+      const source = readFileSync(`${DASHBOARD_DIR}${file}`, 'utf8');
+      const lines = source.split('\n');
+      lines.forEach((line, index) => {
+        if (!/tabindex['"]?\s*:\s*'0'|['"]tabindex['"],\s*'0'/.test(line)) return;
+        offenders.push(`${file}:${index + 1}  ${line.trim()}`);
+      });
+    }
+    assert.deepEqual(offenders, [], offenders.join('\n'));
+  });
+
   it('gives every sparkline slot a label to name its table', () => {
     const offenders = [];
     for (const file of panelSources()) {

@@ -182,6 +182,60 @@ class FakeElement extends FakeNode {
   }
 
   /**
+   * Focus tracking, because AC29/AC30 behaviour is entirely about where focus
+   * is and whether it survives. A fake that cannot lose focus cannot show that
+   * the real one does.
+   */
+  focus() {
+    if (globalThis.document) {
+      globalThis.document.activeElement = this;
+    }
+  }
+
+  blur() {
+    if (globalThis.document?.activeElement === this) {
+      globalThis.document.activeElement = null;
+    }
+  }
+
+  /**
+   * @param {FakeNode|null} node
+   * @returns {boolean} Whether node is this element or a descendant of it.
+   */
+  contains(node) {
+    for (let cursor = node; cursor; cursor = cursor.parent) {
+      if (cursor === this) return true;
+    }
+    return false;
+  }
+
+  get ownerDocument() {
+    return globalThis.document ?? null;
+  }
+
+  /**
+   * Dispatch an event, bubbling to ancestors the way a real one does. Roving
+   * focus relies on delegation from a container that outlives its children, so
+   * a non-bubbling fake would make the design look broken.
+   *
+   * @param {{type: string, [key: string]: unknown}} event
+   */
+  dispatchEvent(event) {
+    const dispatched = { defaultPrevented: false, ...event };
+    dispatched.target ??= this;
+    dispatched.preventDefault = () => {
+      dispatched.defaultPrevented = true;
+    };
+    for (let cursor = this; cursor; cursor = cursor.parent) {
+      dispatched.currentTarget = cursor;
+      for (const handler of cursor.listeners?.[event.type] ?? []) {
+        handler(dispatched);
+      }
+    }
+    return !dispatched.defaultPrevented;
+  }
+
+  /**
    * Canvas panels call this. Returning null exercises the painter's
    * no-context early return, which is the same path a browser takes when a
    * context is unavailable — so panel tests cover the guard for free.
@@ -273,6 +327,7 @@ export function installFakeDom() {
 
   pendingFrames.length = 0;
   globalThis.document = {
+    activeElement: null,
     createElement: (tagName) => new FakeElement(tagName),
     createTextNode: (text) => new FakeText(text),
     createDocumentFragment: () => new FakeFragment(),

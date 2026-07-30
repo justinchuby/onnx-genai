@@ -183,7 +183,7 @@ function renderBudgetRow(label, budget, caveat) {
       element('span', {
         className: 'resource-row__label',
         text: label,
-        attrs: { title: caveat, tabindex: '0' },
+        attrs: { title: caveat, tabindex: '-1', 'data-roving-item': '' },
       }),
       renderField(budget, { label: `${label} (a configured ceiling, not a usage reading)`, format: formatBytes }),
       element('span', { className: 'resource-row__of', text: 'ceiling' }),
@@ -212,7 +212,8 @@ function renderDiskSpill(diskSpill) {
         className: 'resource-row__absent',
         text: 'not configured',
         attrs: {
-          tabindex: '0',
+          tabindex: '-1',
+          'data-roving-item': '',
           title:
             'No disk-spill tier is configured on this server. This is a configuration state, ' +
             'not a measurement of zero.',

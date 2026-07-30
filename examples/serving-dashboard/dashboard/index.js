@@ -24,6 +24,7 @@
 // one multi-model server, `modes` becomes the only thing that changes and no
 // panel is touched.
 
+import { createRovingGroup } from './panel-kit.js';
 import { adaptStore } from './store-adapter.js';
 
 import * as kvMemory from './kv-memory.js';
@@ -125,13 +126,19 @@ export function panelById(id) {
  */
 export function mountDashboard({ telemetryStore, resolveRoot, mode, requests }) {
   const adapter = adaptStore(telemetryStore, { requests });
-  /** @type {Array<{id: string, handle: {unmount: () => void}}>} */
+  /** @type {Array<{id: string, handle: {unmount: () => void}, roving: {destroy: () => void}}>} */
   const mounted = [];
 
   for (const panel of panelsForMode(mode)) {
     const root = resolveRoot(panel);
     if (!root) continue;
-    mounted.push({ id: panel.id, handle: panel.module.mount(root, adapter) });
+    const handle = panel.module.mount(root, adapter);
+    // AC29 is applied centrally rather than panel by panel: a panel author who
+    // forgets makes their whole panel a wall of tab stops, and nothing on
+    // screen would look wrong. One group per panel means the dashboard costs a
+    // keyboard user one Tab per panel, with arrows to read within it.
+    const roving = createRovingGroup(root, { label: panel.title });
+    mounted.push({ id: panel.id, handle, roving });
   }
 
   return {
@@ -142,6 +149,7 @@ export function mountDashboard({ telemetryStore, resolveRoot, mode, requests }) 
         // rest — an unmount path that gives up halfway is how a single-page app
         // leaks listeners across navigations.
         try {
+          entry.roving.destroy();
           entry.handle.unmount();
         } catch (error) {
           console.error(`[dashboard] ${entry.id} threw during unmount`, error);

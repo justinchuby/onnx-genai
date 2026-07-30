@@ -859,3 +859,17 @@
     scroll-behavior: auto;
   }
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   ROVING CURSOR (AC29 + AC30)
+   A panel is one tab stop; arrow keys move a cursor within it. Both the group
+   and the current item need a visible ring — focus that cannot be seen is not
+   focus, and the group is reached by Tab while items are reached
+   programmatically, where :focus-visible heuristics do not reliably fire.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+[data-roving-item]:focus,
+[role='group']:focus {
+  outline: var(--og-focus-ring);
+  outline-offset: var(--og-focus-offset);
+}

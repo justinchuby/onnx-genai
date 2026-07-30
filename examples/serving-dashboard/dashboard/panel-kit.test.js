@@ -72,7 +72,10 @@ describe('renderField — a measured zero and an unmeasurable value must look di
     const reason = 'KV page statistics are computed by the engine but not yet exposed over HTTP.';
     const node = renderField({ value: null, state: 'unavailable', label: 'KV blocks', reason });
 
-    assert.equal(node.getAttribute('tabindex'), '0', 'the explanation must be focusable');
+    // Focusable, but as a stop on a roving cursor rather than its own tab stop
+    // (AC29). createRovingGroup promotes one of these to tabindex 0.
+    assert.equal(node.getAttribute('tabindex'), '-1', 'the explanation must be focusable');
+    assert.equal(node.hasAttribute('data-roving-item'), true, 'must join the roving cursor');
     assert.match(node.getAttribute('aria-label'), /KV blocks: not measurable yet/);
     assert.match(node.getAttribute('aria-label'), /not yet exposed over HTTP/);
     assert.equal(node.getAttribute('title'), reason);

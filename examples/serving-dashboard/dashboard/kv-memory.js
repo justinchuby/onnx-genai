@@ -185,7 +185,8 @@ function renderUtilizationBar(utilization, blocksUsed, blocksTotal) {
     return element('div', {
       className: ['utilization-bar', 'utilization-bar--unavailable'],
       attrs: {
-        tabindex: '0',
+        tabindex: '-1',
+        'data-roving-item': '',
         role: 'note',
         'aria-label': `KV block utilization: not measurable yet. ${utilization.reason ?? ''}`,
         title: utilization.reason ?? REASONS.KV_NOT_EXPOSED,

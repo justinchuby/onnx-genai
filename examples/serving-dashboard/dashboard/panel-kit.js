@@ -219,10 +219,12 @@ export function renderField(field, options = {}) {
 
   if (state === RENDER_STATES.UNAVAILABLE) {
     const reason = field?.reason ?? 'This value is not measured by the server.';
-    // tabindex + aria-label, not just a title: these are the values whose
-    // explanation matters most, and an em-dash with no reachable reason is less
-    // honest than a zero because it withholds without offering recourse.
-    wrapper.setAttribute('tabindex', '0');
+    // Reachable and announced, but NOT its own tab stop: an em-dash with no
+    // reachable reason is less honest than a zero because it withholds without
+    // offering recourse, yet a panel full of them must still be one tab stop
+    // with a roving cursor (AC29).
+    wrapper.setAttribute(ROVING_ITEM_ATTR, '');
+    wrapper.setAttribute('tabindex', '-1');
     wrapper.setAttribute('role', 'note');
     wrapper.setAttribute('aria-label', `${label}: not measurable yet. ${reason}`);
     wrapper.setAttribute('title', reason);
@@ -240,7 +242,8 @@ export function renderField(field, options = {}) {
   }
 
   if (state === RENDER_STATES.PENDING) {
-    wrapper.setAttribute('tabindex', '0');
+    wrapper.setAttribute(ROVING_ITEM_ATTR, '');
+    wrapper.setAttribute('tabindex', '-1');
     wrapper.setAttribute('role', 'note');
     wrapper.setAttribute('aria-label', `${label}: no samples yet. Run a scenario.`);
     wrapper.setAttribute('title', 'No samples yet in the 60 s window. Run a scenario.');
@@ -643,7 +646,155 @@ export function prefersReducedMotion() {
  * @returns {void}
  */
 export function replaceChildren(container, children) {
+  // Panels re-render on every poll — two to four times a second. A keyboard
+  // user who has moved the roving cursor onto an unavailable value to read WHY
+  // it is unavailable would otherwise have the focused element destroyed under
+  // them within 250ms, dropping focus to <body>. The explanation would be
+  // literally unreachable by keyboard: you could never finish reading it.
+  //
+  // Restoring by POSITION rather than identity is deliberate. The new element
+  // at the same index is the same metric; the old node is gone no matter what
+  // we do.
+  const doc = container.ownerDocument ?? globalThis.document;
+  const active = doc?.activeElement ?? null;
+  const restoreIndex =
+    active && active !== container && container.contains?.(active)
+      ? rovingItems(container).indexOf(active)
+      : -1;
+
   container.replaceChildren(...children.filter(Boolean));
+
+  if (restoreIndex >= 0) {
+    const items = rovingItems(container);
+    const target = items[Math.min(restoreIndex, items.length - 1)];
+    if (target) {
+      setRovingCursor(items, target);
+      target.focus?.();
+    } else if (typeof container.focus === 'function') {
+      // The metric it was on has gone away entirely. The enclosing group is
+      // the nearest honest place to land — better than silently falling to
+      // <body> with no announcement of what happened.
+      container.focus();
+    }
+  }
+}
+
+/** Attribute marking an element as a stop on a roving cursor (AC29). */
+export const ROVING_ITEM_ATTR = 'data-roving-item';
+
+/**
+ * Collect roving stops in document order, without needing a selector engine.
+ *
+ * @param {HTMLElement} container
+ * @param {HTMLElement[]} [into]
+ * @returns {HTMLElement[]}
+ */
+export function rovingItems(container, into = []) {
+  for (const child of container.children ?? []) {
+    if (child.hasAttribute?.(ROVING_ITEM_ATTR)) {
+      into.push(child);
+    }
+    rovingItems(child, into);
+  }
+  return into;
+}
+
+/**
+ * @param {HTMLElement[]} items
+ * @param {HTMLElement|null} current
+ */
+function setRovingCursor(items, current) {
+  for (const item of items) {
+    item.setAttribute('tabindex', item === current ? '0' : '-1');
+  }
+}
+
+/**
+ * Make a container of many read-only annotations into ONE tab stop with a
+ * roving cursor (AC29).
+ *
+ * Without this, every em-dash carrying a "why is this not measured" note is its
+ * own tab stop. On the continuous-batching server, where the whole KV group is
+ * structurally unavailable, that is dozens of stops between a keyboard user and
+ * the first thing they can actually operate — the spec calls this out as the
+ * worst accessibility failure available to us.
+ *
+ * The listener lives on the container, which survives re-render, so the
+ * behaviour does not need re-attaching on every poll.
+ *
+ * @param {HTMLElement} container
+ * @param {{label?: string}} [options]
+ * @returns {{refresh: () => void, destroy: () => void}}
+ */
+export function createRovingGroup(container, options = {}) {
+  container.setAttribute('role', 'group');
+  if (options.label) {
+    container.setAttribute('aria-label', options.label);
+  }
+
+  const move = (delta, absolute) => {
+    const items = rovingItems(container);
+    if (items.length === 0) return;
+    const doc = container.ownerDocument ?? globalThis.document;
+    const active = doc?.activeElement ?? null;
+    const from = items.indexOf(active);
+    let next;
+    if (absolute === 'first') next = 0;
+    else if (absolute === 'last') next = items.length - 1;
+    else if (from === -1) next = 0;
+    else next = Math.min(items.length - 1, Math.max(0, from + delta));
+    setRovingCursor(items, items[next]);
+    items[next].focus?.();
+  };
+
+  /** @param {KeyboardEvent} event */
+  const onKeyDown = (event) => {
+    switch (event.key) {
+      case 'ArrowDown':
+      case 'ArrowRight':
+        move(1);
+        break;
+      case 'ArrowUp':
+      case 'ArrowLeft':
+        move(-1);
+        break;
+      case 'Home':
+        move(0, 'first');
+        break;
+      case 'End':
+        move(0, 'last');
+        break;
+      default:
+        return;
+    }
+    event.preventDefault?.();
+  };
+
+  const refresh = () => {
+    const items = rovingItems(container);
+    if (items.length === 0) {
+      // Nothing to rove over: do not leave an empty group as a tab stop that
+      // announces itself and then offers nowhere to go.
+      container.removeAttribute('tabindex');
+      return;
+    }
+    container.setAttribute('tabindex', '0');
+    const doc = container.ownerDocument ?? globalThis.document;
+    const active = doc?.activeElement ?? null;
+    setRovingCursor(items, items.includes(active) ? active : items[0]);
+  };
+
+  container.addEventListener('keydown', onKeyDown);
+  refresh();
+
+  return {
+    refresh,
+    destroy() {
+      container.removeEventListener('keydown', onKeyDown);
+      container.removeAttribute('tabindex');
+      container.removeAttribute('role');
+    },
+  };
 }
 
 /**

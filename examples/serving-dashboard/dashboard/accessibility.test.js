@@ -24,9 +24,16 @@ after(() => {
   uninstallDom();
 });
 
-const { createRepaintScheduler, createSparklineSlot, renderSparkline } = await import(
-  './panel-kit.js'
-);
+const {
+  createRepaintScheduler,
+  createRovingGroup,
+  createSparklineSlot,
+  element,
+  renderField,
+  renderSparkline,
+  replaceChildren,
+  rovingItems,
+} = await import('./panel-kit.js');
 const { planSparkline, tabulateSparkline } = await import('./sparkline.js');
 const throughput = await import('./throughput.js');
 const scheduling = await import('./scheduling.js');
@@ -222,3 +229,137 @@ function collectByTag(node, tagName, into = []) {
   for (const child of node.children ?? []) collectByTag(child, tagName, into);
   return into;
 }
+
+/**
+ * A container holding `count` unavailable values — the shape the KV panel takes
+ * on a continuous-batching server, where nothing in the group can be measured.
+ *
+ * @param {number} count
+ */
+function groupOfUnavailableValues(count) {
+  const container = document.createElement('div');
+  replaceChildren(
+    container,
+    Array.from({ length: count }, (_, index) =>
+      element('div', {
+        className: 'metric-row',
+        children: [
+          renderField({
+            value: null,
+            state: 'unavailable',
+            label: `metric ${index}`,
+            reason: 'Not exposed over HTTP.',
+          }),
+        ],
+      }),
+    ),
+  );
+  return container;
+}
+
+describe('AC29 — composite widgets are one tab stop with a roving cursor', () => {
+  it('costs a keyboard user one tab stop, not one per metric', () => {
+    const container = groupOfUnavailableValues(12);
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+
+    const items = rovingItems(container);
+    assert.equal(items.length, 12, 'fixture did not produce twelve roving stops');
+    const tabStops = items.filter((item) => item.getAttribute('tabindex') === '0');
+    assert.equal(tabStops.length, 1, `expected one tab stop, found ${tabStops.length}`);
+    roving.destroy();
+  });
+
+  it('moves the cursor with arrow keys and clamps at the ends', () => {
+    const container = groupOfUnavailableValues(3);
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+    const items = rovingItems(container);
+
+    items[0].focus();
+    container.dispatchEvent({ type: 'keydown', key: 'ArrowDown' });
+    assert.equal(document.activeElement, items[1]);
+    assert.equal(items[1].getAttribute('tabindex'), '0');
+    assert.equal(items[0].getAttribute('tabindex'), '-1', 'the old stop must stand down');
+
+    container.dispatchEvent({ type: 'keydown', key: 'End' });
+    assert.equal(document.activeElement, items[2]);
+    // Clamping, not wrapping: wrapping past the end of a list of measurements
+    // makes it impossible to tell by feel how long the list is.
+    container.dispatchEvent({ type: 'keydown', key: 'ArrowDown' });
+    assert.equal(document.activeElement, items[2]);
+
+    container.dispatchEvent({ type: 'keydown', key: 'Home' });
+    assert.equal(document.activeElement, items[0]);
+    roving.destroy();
+  });
+
+  it('leaves keys it does not handle alone', () => {
+    const container = groupOfUnavailableValues(3);
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+    const notPrevented = container.dispatchEvent({ type: 'keydown', key: 'Tab' });
+    assert.equal(notPrevented, true, 'Tab must still leave the group');
+    roving.destroy();
+  });
+
+  it('keeps focus on the same metric across a re-render', () => {
+    // Panels replaceChildren on every poll. Without this, a keyboard user
+    // reading why a value is unavailable loses focus to <body> within 250ms and
+    // can never finish reading the explanation.
+    const container = groupOfUnavailableValues(5);
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+    rovingItems(container)[3].focus();
+
+    const before = document.activeElement;
+    replaceChildren(
+      container,
+      Array.from({ length: 5 }, (_, index) =>
+        element('div', {
+          className: 'metric-row',
+          children: [
+            renderField({
+              value: null,
+              state: 'unavailable',
+              label: `metric ${index}`,
+              reason: 'Still not exposed.',
+            }),
+          ],
+        }),
+      ),
+    );
+
+    const after = document.activeElement;
+    assert.notEqual(after, null, 'focus was dropped to the document by a poll');
+    assert.notEqual(after, before, 'fixture did not actually replace the node');
+    assert.equal(after, rovingItems(container)[3], 'focus landed on a different metric');
+    assert.equal(after.getAttribute('tabindex'), '0');
+    roving.destroy();
+  });
+
+  it('falls back to the group when the focused metric disappears entirely', () => {
+    const container = groupOfUnavailableValues(4);
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+    rovingItems(container)[3].focus();
+
+    replaceChildren(container, []);
+    assert.equal(document.activeElement, container, 'focus vanished with the metric');
+    roving.destroy();
+  });
+
+  it('does not advertise an empty group as a tab stop', () => {
+    const container = document.createElement('div');
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+    assert.equal(
+      container.hasAttribute('tabindex'),
+      false,
+      'an empty group announces itself and then offers nowhere to go',
+    );
+    roving.destroy();
+  });
+
+  it('restores the container to inert markup on destroy', () => {
+    const container = groupOfUnavailableValues(2);
+    const roving = createRovingGroup(container, { label: 'KV cache' });
+    roving.destroy();
+    assert.equal(container.hasAttribute('tabindex'), false);
+    assert.equal(container.hasAttribute('role'), false);
+  });
+});
