@@ -7,6 +7,7 @@
 //! autoregressive driver constructs these adapters across the module boundary.
 
 use super::*;
+use onnx_genai_metadata::ComponentSession;
 
 /// Whether this error is the KV page pool being full, rather than a fault.
 ///
@@ -83,9 +84,12 @@ pub(crate) struct PipelineDecodeLoopBackend<'a> {
     /// Shared tensor pool: external inputs + prompt-phase outputs + the
     /// per-step outputs of the `every_step` components (refreshed each step).
     pub(crate) pool: &'a mut PipelineTensors,
-    /// Declared `every_step` components (with their loaded sessions), executed in
-    /// topological order on every step before the decoder runs.
-    pub(crate) step_components: Vec<(StepComponentBinding, &'a Session)>,
+    /// Declared `every_step` components (paired with their backend-neutral
+    /// [`ComponentSession`]), executed in topological order on every step before
+    /// the decoder runs. Boxed behind the trait so the same loop drives an ORT
+    /// session (via `OrtComponentSessionRef`) or a native nxrt component with no
+    /// forked code path — this is the value-type seam for the every_step slice.
+    pub(crate) step_components: Vec<(StepComponentBinding, Box<dyn ComponentSession + 'a>)>,
     /// `(source_endpoint, decoder_input_port)` routing recomputed each step.
     pub(crate) decoder_in_edges: Vec<(String, String)>,
     /// Static encoder-produced cross-attention KV bound to the decoder every
@@ -124,42 +128,44 @@ impl PipelineDecodeLoopBackend<'_> {
             return Ok(());
         }
         let ids: Vec<i64> = seed.iter().map(|&t| i64::from(t)).collect();
-        let seq = ids.len() as i64;
-        for (binding, session) in &self.step_components {
-            let mut inputs: Vec<(String, Value)> =
+        // Disjoint borrows: the step sessions run `&mut` while the pool is read
+        // for inputs and written for outputs.
+        let Self {
+            step_components,
+            pool,
+            ..
+        } = self;
+        for (binding, session) in step_components.iter_mut() {
+            let mut inputs: Vec<(String, onnx_genai_metadata::ComponentTensor)> =
                 Vec::with_capacity(binding.routed_inputs.len() + 1);
             for routed in &binding.routed_inputs {
-                let value = self
-                    .pool
+                let value = pool
                     .get(&routed.endpoint)
                     .or_else(|| {
                         routed
                             .routed_from
                             .as_deref()
-                            .and_then(|from| self.pool.get(from))
+                            .and_then(|from| pool.get(from))
                     })
                     .with_context(|| routed.missing_message.clone())?;
-                inputs.push((
-                    routed.port.clone(),
-                    coerce_value_to_dtype(value, routed.dtype)?,
-                ));
+                let coerced = coerce_value_to_dtype(value, routed.dtype)?;
+                inputs.push((routed.port.clone(), value_to_component_tensor(&coerced)?));
             }
             if let Some(port) = &binding.token_input {
-                inputs.push((port.clone(), Value::from_slice_i64(&ids, &[1, seq])?));
+                inputs.push((port.clone(), token_seed_component_tensor(&ids)?));
             }
             let refs = inputs
                 .iter()
-                .map(|(name, value)| (name.as_str(), value))
+                .map(|(name, tensor)| (name.as_str(), tensor))
                 .collect::<Vec<_>>();
             let outputs = session.run(&refs).map_err(|e| {
-                anyhow::anyhow!(
-                    "ORT every_step component '{}' failed: {e}",
-                    binding.component
-                )
+                anyhow::anyhow!("every_step component '{}' failed: {e}", binding.component)
             })?;
-            for (name, value) in session.output_names().iter().zip(outputs) {
-                self.pool
-                    .insert(format!("{}.{}", binding.component, name), value);
+            for (name, tensor) in outputs {
+                pool.insert(
+                    format!("{}.{}", binding.component, name),
+                    component_tensor_to_value(&tensor)?,
+                );
             }
         }
         Ok(())

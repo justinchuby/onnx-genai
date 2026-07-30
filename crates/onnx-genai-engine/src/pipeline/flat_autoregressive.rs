@@ -153,18 +153,23 @@ impl PipelineEngine {
             .models
             .session(&ar.decoder)
             .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-        // Pair every `every_step` binding with its loaded session. This is the
-        // generic replacement for the old one-output `inputs_embeds` fusion.
+        // Pair every `every_step` binding with a backend-neutral component
+        // session. By default this borrows the already-loaded ORT session
+        // (behaviour unchanged); components named in
+        // `ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS` are instead loaded and
+        // driven through the native nxrt backend, proving the value-type seam
+        // (native multi-component inc1) while the decoder stays on ORT.
+        let native_step_components = native_step_component_set();
         let step_components = step_bindings
             .into_iter()
             .map(|binding| {
-                let session = self.models.session(&binding.component).with_context(|| {
-                    format!(
-                        "pipeline every_step component '{}' was not loaded",
-                        binding.component
-                    )
-                })?;
-                Ok((binding, session))
+                let component: Box<dyn onnx_genai_metadata::ComponentSession> =
+                    build_step_component_session(
+                        &self.models,
+                        &binding.component,
+                        &native_step_components,
+                    )?;
+                Ok((binding, component))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let tokenizer = self
@@ -234,6 +239,12 @@ impl PipelineEngine {
                 mirror.mirrored_tokens
             }
         });
+        // The backend now owns its every_step component sessions behind
+        // `Box<dyn ComponentSession>`, so it carries drop glue and its borrows of
+        // `tensors` / `self` would otherwise live to end of scope. Everything
+        // needed downstream has been copied out above, so release it explicitly
+        // before the paged-sequence retirement and the `tensors` move below.
+        drop(backend);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
