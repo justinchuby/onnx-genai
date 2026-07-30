@@ -246,6 +246,57 @@ I tried it, and the two numbers are drawn from different populations — the pat
 a subset of the object's keys, so the counts agree while a duplicate is present and the check
 proves nothing. Compare a list against its own deduplication, in one population.
 
+### R13 — the launcher advertises, as a clickable URL, the one scenario the code says must not be addressable
+
+This is the first prose an operator ever reads — before the page loads, before any panel renders,
+outside every honesty mechanism this project built. `run-demo.sh`'s success banner prints three
+headline scenario URLs:
+
+```
+  continuous batching   ${SCATTER_ORIGIN}/demo/?${TOPOLOGY}&scenario=continuous-batching
+  paged KV block table  ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=paged-kv
+  prefix caching        ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=prefix-cache
+```
+
+`CUT_SCENARIOS` in `scenario-origins.js` says the opposite, and explains itself:
+
+> *"Keyed only, with no `id:` field, and that is deliberate: an `id` is what makes a scenario
+> addressable, **and this one must not be addressable.**"*
+
+The code went to deliberate lengths to make that route unaddressable — omitting the `id` field
+specifically so the scenario could not be linked — and the launcher links to it anyway. The URL
+returns **200**, identically to the working control, so nothing announces the discrepancy.
+
+Two more claims in the same file assert the same cut capability:
+
+```
+"The paged KV allocator and the prefix cache live on the dynamic path, so this one drives those scenarios."
+printf 'starting the dynamic server on :%s (paged KV, prefix caching)\n'
+```
+
+The second is the third independent copy of R6's false belief — the docstring, the classification,
+and now the launcher, none of which can see the other two.
+
+**Why this surface survived when four sibling claims were fixed:** `run-demo.sh` is *heavily*
+tested. Six suites read it — `check-launcher`, `check-cli-flags`, `check-endpoint-registration`,
+`check-launch-command`, `scenario-origins`, `scenario-switcher`. Every one of them tests
+**mechanism**: that it launches the right servers, passes `--demo-assets-dir`, uses an absolute
+path. None tests **prose**. And the guard that *does* check claims scans exactly three paths:
+
+```
+page-claims.test.js -> './index.html'  './scenario-origins.js'  './design/demo-ux.md'
+```
+
+`run-demo.sh` is not among them.
+
+> A file can be the most-tested artifact in the repository and still have an entirely unexamined
+> surface, because coverage is counted per *file* and claims live per *sentence*. The launcher
+> passed six suites while advertising a feature the code it launches declares cut.
+
+The fix is one line of deletion and one line of coverage: drop the third URL and the two prose
+claims, and add `run-demo.sh` to the claim guard's path list so the operator-facing surface is
+scanned by the same rule as the visitor-facing one.
+
 ---
 
 ## Withdrawn by me
