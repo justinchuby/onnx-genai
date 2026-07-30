@@ -1834,3 +1834,50 @@ fixing precisely because nothing would have told us when it started being wrong.
 strength of a code shape without measuring the runtime values it produces. The shape was genuinely
 bad. The claim I attached to it — that we were reporting a false capability to a visitor — was not
 verified, and it was the more serious half.
+
+---
+
+## Suite observation #4 — a red I caught, a flake I nearly invented, and P1 closing
+
+**Measured at `b04c6e8f` → `5e1a843d`, canonical runner, five confirming runs.**
+
+I ran `run-tests.sh` for a closing number and got **red twice** (2 fail, then 1 fail), then green,
+then **five consecutive greens at 646 tests / 98 suites / 0 fail / exit 0**.
+
+**I was one sentence from publishing "the canonical gate instrument is nondeterministic."** That
+would have been the most damaging false claim available tonight: it invalidates every green anyone
+has reported, including the Lead's `608/0` and my own. **It was false, and the thing that caught it
+was checking `HEAD` before and after rather than after only** — the tree moved `b04c6e8f` →
+`5e1a843d` underneath the experiment. *Three runs on "the same tree" were three runs on three trees.*
+
+**The reds were real, and both are explained by commits landing mid-experiment:**
+
+| observation | cause | not |
+|---|---|---|
+| `no shell module reads a never-bind field off a response body` | `f025ae58` added `server.model_path` to `NEVER_BIND` while a render site still read it. **The guard fired exactly as designed, during the landing it was written for.** | not a flake, not a regression |
+| `register-completeness.test.js` file-level ✖ | `5e1a843d` was rewriting that file. | not a misattribution by the runner |
+
+**I also had a wrong theory and killed it before filing.** The failing test name lives in
+`never-bind.test.js`, not in `register-completeness.test.js`, and I was ready to file the runner for
+misattributing a failure to the wrong file. **There were simply two independent failures**, and one
+of them was a whole file. *A single confusing output is not evidence of an instrument defect; check
+whether it is two ordinary things before filing one extraordinary one.*
+
+### P1 (`server.model_path`) is CLOSED, and the fix is better than the one that was ordered
+
+The board spent hours on this as "two line deletions, zero dissent, no owner." Predicate run
+unchanged at HEAD, with the published positive control:
+
+```
+server.model_path  (non-test, non-provenance)  ->  1 file
+   telemetry-store.js:684  — a COMMENT recording the deletion. The epitaph, not the defect.
+CONTROL server.model_id -> 3 files ✅ the instrument still reaches the tree
+dashboard/system.js 'model directory' -> GONE      ui/model-card.js 'Directory' -> GONE
+```
+
+**And they did more than delete two rows: `projectServedModel()` is deleted outright.** Its only
+consumer was that one row, and the comment states the reason for removing the *mechanism* rather
+than the *row* — it "lifted the absolute path out of a list nobody addresses and pinned it at a
+fixed, guessable location on the parsed body." **Deleting a render site removes what is painted;
+deleting the projection removes what is reachable.** That is the difference between fixing the
+instance and closing the class, and it is the right call.
