@@ -604,3 +604,49 @@ CUDA_VISIBLE_DEVICES=0 taskset -c 0 \
 **By:** Mary
 **What:** The reported native Unsqueeze rank failure does not reproduce on main. The real Qwen3.6-27B INT4 graph's only Unsqueeze maps rank-2 `position_ids` through constant axes `[0]` to the declared rank-3 output, and native CUDA proceeds past it. Existing dynamic, symbolic, negative-axis, legacy-attribute, modern-input, CPU, and CUDA tests all pass. Commit `8d9d2fa2` previously added the generic dynamic Unsqueeze runtime-shape fix. With explicit model I/O and recurrent-state metadata supplied, the next native load blocker is CUDA decoder state allocation rejecting rank-3 FP16 `past_key_values.12.conv_state` at `crates/onnx-genai-engine/src/native_decode/cuda.rs:480`; it currently accepts only rank-4 KV/state tensors.
 **Why:** A new Unsqueeze patch would duplicate existing coverage and risk regression. The next #384 work should generalize CUDA persistent decoder state bindings to fixed recurrent states of arbitrary declared rank, beginning with rank-3 convolution state, while preserving rank-4 KV behavior.
+
+
+# Decision: Foundry Local native CUDA EP vs ORT decode baseline
+
+**Author:** Cohaagen (perf)
+**Date:** 2026-07-27
+**Scope:** Baseline measurement — informational, no code change.
+
+## Headline finding
+
+On H200 (ORT 1.27.0, CUDA int4, greedy steady-state decode), the **native CUDA EP
+is faster than ORT on every Foundry Local target measured** — there is currently
+no native-slower case to optimize:
+
+| Model | Native tok/s | ORT tok/s | Ratio |
+| --- | --- | --- | --- |
+| qwen2.5-0.5b | 995 | 580 | 1.72× |
+| qwen2.5-1.5b | 720 | 438 | 1.64× |
+| qwen2.5-7b   | 308 | 272 | 1.13× |
+| Phi-4-mini   | 315 | 231 | 1.36× |
+
+Native's lead shrinks as the model grows (1.72× → 1.13×), consistent with large
+models becoming GEMM/bandwidth-bound where both backends share the same int4
+matmul kernels; native wins on per-step launch/scheduling overhead, which matters
+most on small models.
+
+Correctness: native/ort token-identical on 0.5B, 7B, and Phi-4-mini; 1.5B diverges
+after sentence 1 (expected greedy sensitivity) but both coherent. **No repetition /
+spacing / garbage artifacts on any model.**
+
+## Operational note (worth propagating)
+
+`.cudaenv.sh` does **not** set `ONNX_GENAI_ORT_LIB`, despite tasking docs implying
+it does. Without it, `profile_native --backend ort` silently loads the CPU-only
+prebuilt ORT and errors that `CUDAExecutionProvider` is unavailable. ORT-EP CUDA
+benchmarks must export
+`ONNX_GENAI_ORT_LIB=$ORT_ROOT/lib/libonnxruntime.so.1.27.0`.
+
+Full report: `docs/benchmarks/2026-07-27-foundry-native-vs-ort-cuda.md`
+(PR branch `squad/perf-foundry-native-vs-ort`).
+
+
+### 2026-07-30: Generalize native CUDA persistent recurrent-state bindings
+**By:** Mary
+**What:** Native CUDA now distinguishes metadata-declared fixed `state_pairs` from growable KV pairs. Growable rank-4 KV retains its existing capacity-bucket and logical sequence-axis behavior. Fixed recurrent state is allocated at its declared rank and static geometry, batch is bound to one, storage is zero-initialized, and the state is excluded from KV bytes-per-token accounting and capacity growth. The Qwen3.6-27B INT4 graph now clears the former rank-3 FP16 `conv_state` allocation failure and reaches its next blocker: unsupported rank-3/1-D CUDA Conv.
+**Why:** Hybrid attention/recurrent decoders carry fixed convolution and recurrent tensors that use replace semantics rather than sequence growth. Treating every past/present pair as rank-4 KV incorrectly applied axis-2 capacity growth to arbitrary declared state.
