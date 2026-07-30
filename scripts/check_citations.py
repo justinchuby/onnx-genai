@@ -479,6 +479,42 @@ def source_text(repo: Path, rel: str) -> str:
     return (repo / rel).read_text(errors="replace")
 
 
+def container_census(doc: Path) -> dict[str, int]:
+    """Count positional citations by the container they sit in.
+
+    MEASURED, not assumed -- I published the opposite of this and was wrong.
+    I told the crew this harness "strips fenced blocks". It does not. There
+    is no fence handling anywhere in this file. The real mechanism is that
+    POSITIONAL requires INLINE-CODE BACKTICKS, and most fenced content (ASCII
+    diagrams, mermaid labels, pasted terminal output) carries none. So:
+
+      fenced, no backticks   -> invisible  (not protected -- just unmatched)
+      fenced, WITH backticks -> COUNTED    (the fence protects NOTHING)
+      blockquoted            -> COUNTED
+      plain prose            -> COUNTED
+
+    That difference matters because it inverts the remedy. If a fence were an
+    exemption, wrapping a quoted finding in one would be a legal fix. It is
+    not. A fence is not a shield here and nobody should be told it is.
+    """
+    census = {"blockquoted": 0, "fenced": 0, "prose": 0}
+    in_fence = False
+    for line in doc.read_text().splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        hits = len(POSITIONAL.findall(line))
+        if not hits:
+            continue
+        if in_fence:
+            census["fenced"] += hits
+        elif line.lstrip().startswith(">"):
+            census["blockquoted"] += hits
+        else:
+            census["prose"] += hits
+    return census
+
+
 def tree_qualifier() -> str:
     """The tree this verdict is about, formatted to sit ON the verdict line.
 
@@ -508,6 +544,37 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     print(f"citations in {doc}: anchored {stats['anchored']} | "
           f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']} "
           f"| line-anchored continuations {stats['continuations']}")
+    if stats.get("unanchored"):
+        census = container_census(doc)
+        if census["blockquoted"] or census["fenced"]:
+            print(
+                f"  CONTAINER CENSUS of those positional citations: "
+                f"prose {census['prose']} | blockquoted {census['blockquoted']} | "
+                f"fenced {census['fenced']}"
+            )
+            # The predicate travels WITH the number. These counts are not
+            # comparable to any other blockquote count on this branch unless
+            # that one uses the same three rules, and at least one independent
+            # census used a different set and got a different total. A bare
+            # number invites exactly the false disagreement this line prevents.
+            print(
+                "    (counted per OCCURRENCE, not per line; requires INLINE-CODE "
+                "BACKTICKS; extensions rs/py/js/css/html/toml/md/sh)"
+            )
+        if census["blockquoted"]:
+            # The ratchet tells people to re-anchor positional citations. For a
+            # blockquoted one that order may have NO LEGAL COMPLIANCE PATH: if
+            # the line quotes someone else's finding, editing the number
+            # falsifies the quotation. A guard that can issue an unfollowable
+            # order must say so at the moment it issues it, not in a doc.
+            print(
+                f"  WARNING - {census['blockquoted']} of them are inside BLOCKQUOTES. "
+                f"This harness cannot tell a citation from a QUOTATION of someone "
+                f"else's citation. If a quoted line is being re-anchored, editing "
+                f"the number FALSIFIES THE QUOTE -- leave it and anchor the "
+                f"surrounding prose instead. Do NOT 'fix' a quotation to satisfy "
+                f"this tool."
+            )
     pending = stats.get("reports") or []
     if pending:
         # Printed BEFORE the verdict, and printed even when the run is green.
