@@ -1475,3 +1475,61 @@ key matcher, and now the canon's own directory. None is wrong; all are narrow. A
 narrow scope does not fail — it passes, credibly, and certifies the territory it
 cannot see. A test's assertion is checked by its suite; its scope is checked by
 nothing, and the gate was the last place that was still true of.
+
+---
+
+## F19 confirmed by mutation, and the guard it sits in is load-bearing
+
+A vacuity objection was raised against the repaired in-flight test: with the
+`/metrics` injection removed, does its green still mean anything? Two mutations in
+a clean pinned worktree at `e160ac6f`, `--porcelain` 0, settle it in opposite
+directions.
+
+**Mutation 1 — the catalogue binding.** Bind `batch.effective_size` to the
+in-flight gauge, which is precisely the hazard the test's title forbids:
+
+```
+metric: null                  -> 'onnx_genai_batch_size_current'
+classification: 'NOT_PLUMBED' -> 'MEASURED'
+git diff --numstat            -> 2  2        (the mutation landed)
+
+✖ the in-flight gauge is NEVER exposed as the engine batch size
+   59 pass / 1 fail
+```
+
+The guard fires, by name, on the exact defect. `batch.effective_size` is
+`metric: null` / `NOT_PLUMBED` by construction, and the moment anyone backfills it
+the test reddens. That is a regression guard on a *deliberate absence* — the
+hardest kind to write and the easiest to mistake for vacuity.
+
+**Mutation 2 — the fixture value.** Change `metricsBody`'s `inFlight` default from
+3 to 999: **60 pass / 0 fail, entirely unchanged.** Nothing parses
+`onnx_genai_batch_size_current`, so no value of it can discriminate anything.
+
+F19 therefore stands and is strengthened. The proposal to *keep* the `inFlight`
+parameter so the test "asserts something real" does not work: the parameter makes
+nothing true. Zero callers, zero readers, zero discriminating power, and it
+remains a discoverable door that silently injects into the void. Delete it. The
+title is made true by `NOT_PLUMBED` in the catalogue, which survives the deletion
+untouched.
+
+### The reusable distinction
+
+*A fixture that matches production has no discriminating power* is true only for
+values something **reads**. For an unread key, **no** fixture value has
+discriminating power, and choosing two different numbers buys nothing while
+looking rigorous. Only mutating the fixture and watching tells the two cases
+apart — and the answer here was that the discriminating power lives in the
+catalogue binding, not in the fixture at all.
+
+## Suite state
+
+`cd examples/serving-dashboard && node --test`, node v25.6.1, clean detached
+worktree at `e160ac6f`, `--porcelain` 0: **534 pass / 0 fail.**
+
+Per F20 this is the wide scope. The narrow `dashboard/` scope is 289 and excludes
+`telemetry-store.test.js` entirely — the file this section is about.
+
+**This is the dashboard suite only.** F1 is a Rust blocker in `driver.rs` and no
+node suite at any scope will ever surface it. A green board here is not a green
+product.
