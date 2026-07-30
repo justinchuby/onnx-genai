@@ -91,6 +91,179 @@ async function mountAgainstRealStore(origin, moduleName) {
   };
 }
 
+function syntheticBlockTable({
+  pageSize = 16,
+  pagesInUse,
+  refCounts,
+  filledSlots,
+  tiers = refCounts.map((value) => (value === null ? null : 0)),
+  total = pagesInUse,
+  poolTotal = pagesInUse,
+  truncated = poolTotal > total,
+}) {
+  const scanned = refCounts.length;
+  return {
+    model_id: 'phi-3',
+    applicable: true,
+    page_size: pageSize,
+    pages_in_use: pagesInUse,
+    pages_shared: refCounts.filter((value) => typeof value === 'number' && value > 1).length,
+    hot_capacity: poolTotal,
+    hot_evictions: 0,
+    allocation_failures: 0,
+    tiers: { 0: 'hot', 1: 'cold' },
+    window: {
+      start: 0,
+      scanned,
+      observed: refCounts.filter((value) => value !== null).length,
+      total,
+      pool_total: poolTotal,
+      truncated,
+    },
+    blocks: {
+      page_ids: Array.from({ length: scanned }, (_, index) => index),
+      ref_counts: refCounts,
+      filled_slots: filledSlots,
+      tiers,
+    },
+  };
+}
+
+function blockTableServer(baseServer, blockTable) {
+  return async (url) => {
+    if (new URL(url).pathname === '/v1/debug/kv/blocks') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => blockTable,
+        text: async () => JSON.stringify(blockTable),
+      };
+    }
+    return baseServer(url);
+  };
+}
+
+async function pollBlockTable(blockTable) {
+  const store = createTelemetryStore({
+    origin: 'dynamic',
+    fetchImpl: blockTableServer(respondingServer(), blockTable),
+  });
+  await store.pollOnce();
+  return store;
+}
+
+describe('KV block-window aggregation', () => {
+  it('renders a fully filled 300-page pool as 100%, not 85.33% from mixed scopes', async () => {
+    // SYNTHETIC: imitates BlockTableResponse's documented default-window wire
+    // shape: a 300-page pool, the first 256 dense page entries returned, and
+    // every returned page allocated and filled to page_size.
+    const returnedPages = 256;
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 300,
+      refCounts: Array(returnedPages).fill(1),
+      filledSlots: Array(returnedPages).fill(16),
+    });
+    const store = await pollBlockTable(blockTable);
+
+    const slotsFilled = store.field('kv.slots_filled');
+    const slotCapacity = store.field('kv.slot_capacity');
+    assert.equal(
+      slotsFilled.state,
+      'measured',
+      `synthetic block table did not publish kv.slots_filled: ${JSON.stringify(slotsFilled)}`,
+    );
+    assert.equal(
+      slotCapacity.state,
+      'measured',
+      `synthetic block table did not publish kv.slot_capacity: ${JSON.stringify(slotCapacity)}`,
+    );
+    const computedPercent = (slotsFilled.value / slotCapacity.value) * 100;
+    const adapter = adaptStore(store);
+    const panel = await import('./kv-memory.js');
+    const root = document.createElement('div');
+    const handle = panel.mount(root, adapter);
+    flushAnimationFrames();
+
+    assert.doesNotMatch(
+      root.textContent,
+      /85\.3%/,
+      `fully filled returned pages computed ${computedPercent.toFixed(2)}% and rendered "${root.textContent}"`,
+    );
+    assert.equal(computedPercent, 100, 'a fully filled returned window must compute to exactly 100%');
+    assert.match(root.textContent, /returned block-table window/i);
+
+    handle.unmount();
+    adapter.destroy();
+    store.stop();
+  });
+
+  it('keeps null pages distinct from observed released and allocated pages', async () => {
+    // SYNTHETIC: imitates the dense parallel-array contract in routes/mod.rs:
+    // null = never written, 0 = observed and released, positive = allocated.
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 2,
+      refCounts: [null, 0, 1, 2],
+      filledSlots: [null, 0, 7, 16],
+      tiers: [null, 0, 1, 0],
+      total: 4,
+      poolTotal: 4,
+    });
+    const store = await pollBlockTable(blockTable);
+
+    assert.equal(store.field('kv.slots_filled').value, 23);
+    assert.equal(store.field('kv.slot_capacity').value, 32);
+    assert.deepEqual(store.field('kv.refcount_histogram').value, [
+      { refcount: 0, blocks: 1 },
+      { refcount: 1, blocks: 1 },
+      { refcount: 2, blocks: 1 },
+    ]);
+    assert.deepEqual(store.field('kv.tiers').value, [
+      { name: 'hot', pages: 2 },
+      { name: 'cold', pages: 1 },
+    ]);
+    store.stop();
+  });
+
+  it('does not materialise never-written null pages as refcount or tier zeroes', async () => {
+    // SYNTHETIC: an untouched two-page mirror window. The all-null shape is
+    // explicitly documented by BlockTable's wire contract and occurs at startup.
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 0,
+      refCounts: [null, null],
+      filledSlots: [null, null],
+      tiers: [null, null],
+      total: 2,
+      poolTotal: 2,
+    });
+    const store = await pollBlockTable(blockTable);
+
+    assert.equal(store.field('kv.slots_filled').value, 0);
+    assert.equal(store.field('kv.slot_capacity').value, 0);
+    assert.deepEqual(store.field('kv.refcount_histogram').value, []);
+    assert.deepEqual(store.field('kv.tiers').value, []);
+    store.stop();
+  });
+
+  it('keeps slot fill window-scoped when the server mirror is truncated', async () => {
+    // SYNTHETIC: mirrors the real response shape when MAX_WINDOW caps the
+    // telemetry mirror below pool_total. The returned 256 pages are all full.
+    const returnedPages = 256;
+    const blockTable = syntheticBlockTable({
+      pagesInUse: 1200,
+      refCounts: Array(returnedPages).fill(1),
+      filledSlots: Array(returnedPages).fill(16),
+      total: 1024,
+      poolTotal: 1200,
+      truncated: true,
+    });
+    const store = await pollBlockTable(blockTable);
+
+    assert.equal(store.field('kv.slots_filled').value, 4096);
+    assert.equal(store.field('kv.slot_capacity').value, 4096);
+    store.stop();
+  });
+});
+
 describe('the omitted fields never reach the screen as zeros', () => {
   // batch.utilization was in this list and has been REMOVED from it, which is
   // the whole point of the change: it is a genuine computation now, so

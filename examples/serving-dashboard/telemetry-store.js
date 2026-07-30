@@ -975,6 +975,7 @@ export function createTelemetryStore({
     const filledSlots = Array.isArray(blocks.filled_slots) ? blocks.filled_slots : null;
     const refCounts = Array.isArray(blocks.ref_counts) ? blocks.ref_counts : null;
     const tierValues = Array.isArray(blocks.tiers) ? blocks.tiers : null;
+    const windowOccupancy = summarizeWindowOccupancy(filledSlots, refCounts);
 
     fields['kv.usage'] =
       pagesInUse !== null && poolTotal !== null && poolTotal > 0
@@ -985,18 +986,24 @@ export function createTelemetryStore({
             metaFor('kv.usage'),
           );
 
-    fields['kv.slots_filled'] = filledSlots
-      ? measuredField(sumDefined(filledSlots), { ...metaFor('kv.slots_filled'), observedAtMs })
+    fields['kv.slots_filled'] = windowOccupancy
+      ? measuredField(windowOccupancy.filledSlots, {
+          ...metaFor('kv.slots_filled'),
+          observedAtMs,
+        })
       : unavailableField(
-          'The block table carried no per-page slot occupancy.',
+          'Slot occupancy needs aligned filled_slots and ref_counts arrays from the same block window.',
           metaFor('kv.slots_filled'),
         );
 
     fields['kv.slot_capacity'] =
-      pageSize !== null && pagesInUse !== null
-        ? measuredField(pageSize * pagesInUse, { ...metaFor('kv.slot_capacity'), observedAtMs })
+      pageSize !== null && windowOccupancy
+        ? measuredField(pageSize * windowOccupancy.allocatedPages, {
+            ...metaFor('kv.slot_capacity'),
+            observedAtMs,
+          })
         : unavailableField(
-            'Slot capacity needs both the page size and the pages in use.',
+            'Slot capacity needs page_size plus aligned ref_counts and filled_slots from one block window.',
             metaFor('kv.slot_capacity'),
           );
 
@@ -1412,22 +1419,48 @@ function numberOrNull(value) {
 }
 
 /**
- * Sum the entries that are actually numbers, skipping nulls.
+ * Aggregate slot occupancy over one dense block-table window.
  *
- * Nulls are pages the pool has NEVER WRITTEN. They are an absence of
- * observation, not a zero, and the difference is served on the wire as
- * `window.scanned - window.observed`.
+ * Null entries are unobserved pages and are excluded. A numeric refcount of
+ * zero is different: it is an observed, released page, so it remains visible
+ * to the refcount histogram but contributes neither filled slots nor allocated
+ * capacity. Pairing the arrays here keeps the ratio's numerator and denominator
+ * on the identical page population.
  *
- * @param {readonly unknown[]} values
- * @returns {number}
+ * @param {readonly unknown[]|null} filledSlots
+ * @param {readonly unknown[]|null} refCounts
+ * @returns {{filledSlots: number, allocatedPages: number}|null}
  */
-function sumDefined(values) {
-  let total = 0;
-  for (const value of values) {
-    const numeric = numberOrNull(value);
-    if (numeric !== null) total += numeric;
+function summarizeWindowOccupancy(filledSlots, refCounts) {
+  if (!filledSlots || !refCounts || filledSlots.length !== refCounts.length) return null;
+
+  let totalFilledSlots = 0;
+  let allocatedPages = 0;
+  for (let index = 0; index < refCounts.length; index += 1) {
+    const refCountIsNull = refCounts[index] === null;
+    const filledSlotsIsNull = filledSlots[index] === null;
+    if (refCountIsNull || filledSlotsIsNull) {
+      if (refCountIsNull !== filledSlotsIsNull) return null;
+      continue;
+    }
+
+    const refCount = numberOrNull(refCounts[index]);
+    const pageFilledSlots = numberOrNull(filledSlots[index]);
+    if (
+      refCount === null ||
+      pageFilledSlots === null ||
+      refCount < 0 ||
+      pageFilledSlots < 0
+    ) {
+      return null;
+    }
+    if (refCount === 0) continue;
+
+    allocatedPages += 1;
+    totalFilledSlots += pageFilledSlots;
   }
-  return total;
+
+  return { filledSlots: totalFilledSlots, allocatedPages };
 }
 
 /**

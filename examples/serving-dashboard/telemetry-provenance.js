@@ -476,29 +476,28 @@ export const PROVENANCE = Object.freeze({
   'kv.slots_filled': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     derived: true,
-    derivedFrom: ['blocks.filled_slots'],
+    derivedFrom: ['blocks.filled_slots', 'blocks.ref_counts'],
     classification: 'MEASURED',
     unit: 'tokens',
     evidence:
-      'Summed client-side over BlockTable.filled_slots (routes/mod.rs), skipping nulls. A null ' +
-      'means the page has NEVER BEEN WRITTEN — the server documents that explicitly, and that ' +
-      'it does NOT mean free, because a released page reports ref_count 0. Counting nulls as ' +
-      'zeros would be correct here by accident and wrong the moment the field is reused, so ' +
-      'they are skipped rather than coerced.',
-    label: 'Token slots holding data',
+      'Summed client-side over aligned BlockTable.filled_slots and ref_counts entries in the ' +
+      'returned window (routes/mod.rs). Null pairs are unobserved and skipped; ref_count 0 is ' +
+      'an observed released page and contributes no occupancy. Pairing the arrays prevents a ' +
+      'partial-window numerator from being compared with a whole-pool denominator.',
+    label: 'Token slots holding data in returned window',
   },
   'kv.slot_capacity': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     derived: true,
-    derivedFrom: ['page_size', 'pages_in_use'],
+    derivedFrom: ['page_size', 'blocks.ref_counts', 'blocks.filled_slots'],
     classification: 'MEASURED',
     unit: 'tokens',
     evidence:
-      'Derived as page_size × pages_in_use (both BlockTableResponse fields, routes/mod.rs). ' +
-      'The denominator is the pages ACTUALLY ALLOCATED, not the pool: the quantity the panel ' +
-      'reports is paging waste — how much of what we took is in use — and dividing by the ' +
-      'whole pool would answer a different question with the same two numbers.',
-    label: 'Token slots allocated',
+      'Derived as page_size × pages with ref_count > 0 in the same returned block window used ' +
+      'for kv.slots_filled. It deliberately does not use whole-pool pages_in_use: the endpoint ' +
+      'defaults to a 256-page window, so mixing those scopes rendered a fully filled 300-page ' +
+      'pool as 85.33%.',
+    label: 'Token slots allocated in returned window',
   },
   'kv.refcount_histogram': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
