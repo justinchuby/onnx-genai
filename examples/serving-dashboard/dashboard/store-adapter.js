@@ -264,7 +264,15 @@ export function adaptStore(telemetryStore, options = {}) {
       // Contagion first: if the counter itself is unavailable or pending, the
       // rate inherits that and says which input it is waiting on.
       const gated = derivedField({ [key]: field }, () => 0, { unit });
-      if (gated.state === 'unavailable' || gated.state === 'pending') {
+      // not-applicable included: without it a structurally-bypassed counter
+      // reaches computeRate and a rate is manufactured for a subsystem this
+      // execution path never consults.
+      const gatedState = normaliseState(gated.state);
+      if (
+        gatedState === RENDER_STATES.UNAVAILABLE ||
+        gatedState === RENDER_STATES.PENDING ||
+        gatedState === RENDER_STATES.NOT_APPLICABLE
+      ) {
         return gated;
       }
 

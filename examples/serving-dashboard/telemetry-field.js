@@ -384,6 +384,35 @@ export function staleField(field, reason) {
  */
 export function derivedField(inputs, compute, { unit = null, label = null, undefinedReason } = {}) {
   const keys = Object.keys(inputs);
+
+  // NOT-APPLICABLE IS CHECKED FIRST, AND IT DOMINATES EVERY OTHER STATE.
+  //
+  // Without this branch a structurally-bypassed input falls through to the
+  // compute path and the result is returned as `ok` at full contrast, with no
+  // badge and no reason -- a confident number derived from a counter that is
+  // never observed. On the batching profile `prefix_cache.*` is pinned to a
+  // literal 0 in batched.rs, so a derived hit RATE over it renders as a
+  // measurement of something nothing ever measured. That is precisely the
+  // fabrication the five-state vocabulary exists to prevent, arriving through
+  // the one path that bypasses it.
+  //
+  // It dominates rather than merely participating because it is the STRONGEST
+  // claim available. `unavailable` and `pending` both leave the door open --
+  // someone may plumb it, or the next poll may fill it -- so a derivation over
+  // them may yet succeed. `not-applicable` says this execution path can never
+  // consult that subsystem, so the derivation can never succeed either.
+  // Reporting `unavailable` here would promise future work that will never
+  // happen, which is the exact distinction between the two states.
+  const inapplicable = keys.filter((key) => inputs[key].state === FIELD_STATES.NOT_APPLICABLE);
+  if (inapplicable.length > 0) {
+    return notApplicableField(
+      `Cannot be derived here: ${inapplicable.join(', ')} ${
+        inapplicable.length === 1 ? 'is' : 'are'
+      } not applicable on this execution path. ${inputs[inapplicable[0]].reason}`,
+      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
+    );
+  }
+
   const blocking = keys.filter((key) => inputs[key].state === FIELD_STATES.UNAVAILABLE);
   if (blocking.length > 0) {
     return unavailableField(

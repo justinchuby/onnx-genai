@@ -299,3 +299,56 @@ describe('store adapter — panel isolation', () => {
     adapter.destroy();
   });
 });
+
+describe('derivation contagion — not-applicable must dominate', () => {
+  it('never manufactures a number from a structurally-bypassed input', async () => {
+    // THE BUG THIS PINS: derivedField propagated unavailable, pending and
+    // stale, but had no branch for not-applicable at all. A bypassed input
+    // fell through to the compute path and came back `ok` at full contrast,
+    // with no badge and no reason — a confident number derived from a counter
+    // nothing ever observed.
+    //
+    // It is not hypothetical. On the batching profile prefix_cache.* is pinned
+    // to a literal 0 in batched.rs, so a derived hit RATE over it rendered as
+    // a measurement of something that was never measured — the exact
+    // fabrication the five-state vocabulary exists to prevent, arriving
+    // through the one path that bypassed the vocabulary entirely.
+    const { derivedField, notApplicableField } = await import('../telemetry-field.js');
+
+    const bypassed = notApplicableField('This path never consults the prefix cache.', {
+      label: 'Prefix cache hits',
+    });
+    const derived = derivedField({ 'prefix_cache.hits': bypassed }, () => 42, { unit: 'per second' });
+
+    assert.equal(derived.state, 'not-applicable');
+    assert.equal(derived.value, null, 'a bypassed derivation must carry no number at all');
+    assert.match(derived.reason, /not applicable on this execution path/);
+    // The upstream sentence must survive, or the panel explains nothing.
+    assert.match(derived.reason, /never consults the prefix cache/);
+  });
+
+  it('lets not-applicable beat unavailable, because only one of them is final', async () => {
+    // Ordering matters and is not arbitrary. `unavailable` and `pending` both
+    // leave the door open — someone may plumb it, the next poll may fill it —
+    // so a derivation over them may yet succeed. `not-applicable` says this
+    // execution path can NEVER consult that subsystem, so the derivation can
+    // never succeed either. Reporting `unavailable` here would promise future
+    // work that will never happen, collapsing the one distinction that carries
+    // the demo's central technical claim.
+    const { derivedField, notApplicableField, unavailableField } = await import(
+      '../telemetry-field.js'
+    );
+
+    const mixed = derivedField(
+      {
+        'prefix_cache.hits': notApplicableField('Never consulted on this path.'),
+        'queue.depth': unavailableField('Not plumbed through yet.'),
+      },
+      () => 7,
+      {},
+    );
+
+    assert.equal(mixed.state, 'not-applicable');
+    assert.equal(mixed.value, null);
+  });
+});
