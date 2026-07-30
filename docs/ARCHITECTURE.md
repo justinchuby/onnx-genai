@@ -346,6 +346,23 @@ Adding a model dimension is possible but is a **breaking change to a contract an
 
 ---
 
+### 4.8 The metrics registry is process-wide and has no model dimension
+
+`metrics.rs:89` declares `static REGISTRY: Registry` — a single, process-global instance. Every counter it holds is flat (`metrics.rs:74-87`): `prefix_cache_hits`, `prefix_cache_lookups`, `batch_size`, `pending`, `active_sessions`, `rejections`, and the `ttft` / `e2e` histograms. **None is keyed by model.**
+
+- **Guarantee:** these numbers describe *the process*, never a particular model.
+- **Deliberate design:** the registry is a lock-free static specifically so recording a metric costs a relaxed atomic add and never allocates. That property is why it is safe to touch from the decode path at all (§5.10).
+
+**The consequence for multi-model serving.** Loading two models gives each its own `Engine` and its own `EngineDriver` on its own thread (`state.rs:370`, `:376`) — so the two genuinely run concurrently, one batching and one paging. **But they share this one registry.** Their counters are summed, and nothing in the response says so.
+
+The sharpest instance follows from §5.13: `prefix_cache_lookups` increments on **every completed generation** (`metrics.rs:130-135`), so in a two-model process, generations served by a *static-cache* model — which never consults the prefix cache at all — inflate the denominator of the *dynamic* model's prefix hit rate. **The displayed rate is not merely blended; it is actively depressed by unrelated traffic**, while looking authoritative.
+
+Adding a model dimension means reworking a deliberately allocation-free static that sits on the hot path — precisely the change §5.10 warns against.
+
+> **Why this is architecture, not trivia.** `static` means *per process*. Running one server per model therefore makes every counter model-scoped **for free**, with no hot-path change and no new fields: two processes are two registries. This, together with §4.7's `NodeStatus` having no model dimension, is why per-model observability is obtained by running separate processes rather than by extending either contract. Both are cases of choosing a topology that makes a guarantee structural instead of defending it with discipline.
+
+---
+
 ## 5. Invariants
 
 Each states the rule, **where it is enforced**, and what breaks. Critically: whether the code **enforces** it or merely **assumes** it.
