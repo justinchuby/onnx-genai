@@ -174,3 +174,57 @@ test('the prefix-cache counters are not certified as measured on the batching se
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Visitor-facing citations. @fc8b5d97 counted 24 table cells rendering
+// file:LINE to a visitor. A line number is the one part of a citation that
+// rots, and a rendered table is where it rots unseen: a visitor cannot
+// re-resolve it, and unlike a code comment nobody re-reads it against the tree.
+
+/** The render-time citation transform, applied by app.js to every evidence cell. */
+function citationForVisitor(evidence) {
+  return evidence.replace(/([A-Za-z0-9_\-/.]+\.(?:rs|js|toml|md)):\d+(?:-\d+)?/g, '$1');
+}
+
+test('no source citation reaches a visitor with a line number', () => {
+  const offenders = [];
+  for (const key of allFieldKeys()) {
+    for (const origin of ORIGINS) {
+      const { evidence } = resolveForOrigin(PROVENANCE[key], origin);
+      if (!evidence) continue;
+      const rendered = citationForVisitor(evidence);
+      if (/\.(?:rs|js|toml|md):\d/.test(rendered)) offenders.push(`${key} @ ${origin ?? 'base'}`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.join(', ')} renders a line number to a visitor. Line numbers ` +
+      'drifted repeatedly in this tree, once onto a blank line. The file path and ' +
+      'the symbol survive a refactor; the number does not.',
+  );
+});
+
+test('stripping a line number keeps the file and the prose', () => {
+  // The failure mode that would make the previous test pass for the wrong
+  // reason: a transform that deleted the whole citation would satisfy it
+  // perfectly while destroying the checkability the register exists to provide.
+  const sample =
+    'crates/onnx-genai-server/src/routes/admin.rs:126-130 — hits/lookups, but emits 0.0.';
+  const rendered = citationForVisitor(sample);
+
+  assert.match(rendered, /crates\/onnx-genai-server\/src\/routes\/admin\.rs/);
+  assert.match(rendered, /hits\/lookups, but emits 0\.0\./);
+  assert.ok(!rendered.includes(':126-130'), 'the volatile range should be gone');
+  assert.equal(citationForVisitor('a rate of 0.9375 and 12 hits'), 'a rate of 0.9375 and 12 hits');
+});
+
+test('app.js applies the citation transform rather than the raw evidence', () => {
+  assert.match(
+    appSource,
+    /citationForVisitor\(entry\.evidence\)/,
+    'The register must render citationForVisitor(entry.evidence). Passing ' +
+      'entry.evidence directly puts line numbers back in front of a visitor, and ' +
+      'every other cell in the row would still be correct.',
+  );
+});

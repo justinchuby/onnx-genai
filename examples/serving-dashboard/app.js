@@ -284,6 +284,26 @@ function formatAge(ageMs) {
  * the page cannot claim a field is measured unless the store would actually
  * treat it that way.
  *
+ * Source citations rot by line number, and a rendered table is the worst place
+ * for that: a visitor cannot re-resolve it, and unlike a code comment it is
+ * frozen into an artefact nobody re-reads. Line numbers in this repository
+ * drifted repeatedly in files we open constantly -- one claim had already
+ * slipped onto a blank line. The ratified form is: name the symbol, quote the
+ * text; a line number may accompany both and may never substitute for either.
+ *
+ * So the file path and the surrounding prose survive, and only the volatile
+ * `:132-134` is dropped, and only for the visitor. The source keeps its line
+ * numbers, where a developer can re-resolve them against the tree they have
+ * checked out.
+ *
+ * @param {string} evidence
+ * @returns {string} the citation with line numbers removed
+ */
+function citationForVisitor(evidence) {
+  return evidence.replace(/([A-Za-z0-9_\-/.]+\.(?:rs|js|toml|md)):\d+(?:-\d+)?/g, '$1');
+}
+
+/**
  * @param {HTMLElement} rootElement
  * @param {string|null} origin the server class that served this page
  */
@@ -308,7 +328,7 @@ function renderProvenanceFooter(rootElement, origin) {
       entry.label,
       entry.source,
       classificationText(entry.classification),
-      entry.evidence,
+      citationForVisitor(entry.evidence),
     ]);
     row.dataset.classification = entry.classification;
     row.dataset.renderState =
