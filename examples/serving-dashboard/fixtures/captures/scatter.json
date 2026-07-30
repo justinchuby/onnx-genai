@@ -1,0 +1,135 @@
+{
+  "label": "scatter",
+  "base": "http://127.0.0.1:8133",
+  "endpoints": {
+    "/health": {
+      "status": 200,
+      "body": {
+        "status": "ok",
+        "model": "qwen-scatter"
+      }
+    },
+    "/v1/models": {
+      "status": 200,
+      "body": {
+        "object": "list",
+        "data": [
+          {
+            "id": "qwen-scatter",
+            "object": "model",
+            "created": 1785389982,
+            "owned_by": "onnx-genai",
+            "loaded": true,
+            "is_default": true,
+            "path": "/Users/justinc/Documents/GitHub/onnx-genai-demo/../onnx-genai/models/qwen2.5-0.5b-scatter-v2"
+          }
+        ]
+      }
+    },
+    "/v1/status": {
+      "status": 200,
+      "body": {
+        "node_id": "node-8a3670f4899ca2e7",
+        "model_id": "qwen-scatter",
+        "healthy": true,
+        "queue_depth": 0,
+        "active_sessions": 0,
+        "batch_utilization": 0,
+        "batch_in_flight": 0,
+        "batch_capacity": 4,
+        "sessions": [],
+        "unavailable": {
+          "kv_pages_shared": {
+            "code": "unavailable",
+            "detail": "paged-KV telemetry is served by the KV block-table endpoint; this node-status contract is model-agnostic and carries no engine reference"
+          },
+          "kv_pages_total": {
+            "code": "unavailable",
+            "detail": "paged-KV telemetry is served by the KV block-table endpoint; this node-status contract is model-agnostic and carries no engine reference"
+          },
+          "kv_pages_used": {
+            "code": "unavailable",
+            "detail": "paged-KV telemetry is served by the KV block-table endpoint; this node-status contract is model-agnostic and carries no engine reference"
+          },
+          "kv_usage": {
+            "code": "unavailable",
+            "detail": "paged-KV telemetry is served by the KV block-table endpoint; this node-status contract is model-agnostic and carries no engine reference"
+          },
+          "paused_sessions": {
+            "code": "not-applicable",
+            "detail": "the driver runs generations to completion without preemption, so no session can be paused"
+          },
+          "prefix_hashes": {
+            "code": "unavailable",
+            "detail": "the engine does not surface system-prompt prefix hashes; an empty list would claim none are cached"
+          },
+          "tokens_per_second": {
+            "code": "unavailable",
+            "detail": "only a cumulative token count is recorded; a lifetime average would misreport as a current rate -- see the latency histograms on /metrics"
+          }
+        }
+      }
+    },
+    "/v1/debug/kv": {
+      "status": 200,
+      "body": {
+        "generations_with_prefix_reuse": 0,
+        "generations_completed": 46,
+        "generation_prefix_reuse_rate": 0,
+        "prefix_tokens_reused": 0,
+        "active_batch_size": 0,
+        "pending_queue_depth": 0,
+        "available_admission_slots": 256,
+        "rejected_requests": 0,
+        "block_table_endpoint": "/v1/debug/kv/blocks"
+      }
+    },
+    "/v1/debug/config": {
+      "status": 200,
+      "body": {
+        "model_id": "qwen-scatter",
+        "pipeline": false,
+        "max_output_tokens": 4096,
+        "max_sessions": 256,
+        "max_queue_depth": 256,
+        "model_max_context": 4096
+      }
+    },
+    "/v1/resources": {
+      "status": 200,
+      "body": {
+        "configured_limits": {
+          "vram": "0.9",
+          "host_ram": "0.25",
+          "disk_spill": null
+        },
+        "resolved_limits": {
+          "vram_bytes": 7730940928,
+          "host_ram_bytes": 4294967296,
+          "disk_spill_bytes": null
+        },
+        "derived_kv_budget": {
+          "bytes": 5746050801,
+          "total_pages": 359128175,
+          "max_total_tokens": 5746050800,
+          "reserved_bytes": 1984890127
+        },
+        "vram": {
+          "used": 0,
+          "limit": 5746050801,
+          "headroom": 5746050801
+        },
+        "host_ram": {
+          "used": 0,
+          "limit": 4294967296,
+          "headroom": 4294967296
+        },
+        "disk_spill": null
+      }
+    },
+    "/metrics": {
+      "status": 200,
+      "body": "# HELP onnx_genai_requests_total Total HTTP requests.\n# TYPE onnx_genai_requests_total counter\nonnx_genai_requests_total{endpoint=\"/health\",status=\"200\"} 1209\nonnx_genai_requests_total{endpoint=\"/v1/models\",status=\"200\"} 47\nonnx_genai_requests_total{endpoint=\"/v1/completions\",status=\"200\"} 14\nonnx_genai_requests_total{endpoint=\"/v1/completions\",status=\"400\"} 3\nonnx_genai_requests_total{endpoint=\"/v1/chat/completions\",status=\"200\"} 32\nonnx_genai_requests_total{endpoint=\"/v1/status\",status=\"200\"} 2906\nonnx_genai_requests_total{endpoint=\"/metrics\",status=\"200\"} 620\nonnx_genai_requests_total{endpoint=\"/v1/debug/config\",status=\"200\"} 30\nonnx_genai_requests_total{endpoint=\"/v1/debug/kv\",status=\"200\"} 1257\nonnx_genai_requests_total{endpoint=\"unknown\",status=\"200\"} 406\nonnx_genai_requests_total{endpoint=\"unknown\",status=\"304\"} 84\nonnx_genai_requests_total{endpoint=\"unknown\",status=\"404\"} 12\n# HELP onnx_genai_prompt_tokens_total Prompt tokens processed.\n# TYPE onnx_genai_prompt_tokens_total counter\nonnx_genai_prompt_tokens_total 1410\n# HELP onnx_genai_completion_tokens_total Completion tokens generated.\n# TYPE onnx_genai_completion_tokens_total counter\nonnx_genai_completion_tokens_total 13480\n# HELP onnx_genai_tokens_generated_total Total prompt and completion tokens processed.\n# TYPE onnx_genai_tokens_generated_total counter\nonnx_genai_tokens_generated_total 14890\n# HELP onnx_genai_time_to_first_token_seconds Time to first generated token.\n# TYPE onnx_genai_time_to_first_token_seconds histogram\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.005\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.01\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.025\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.05\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.075\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.1\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.15\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.2\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.3\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.5\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"0.75\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"1\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"2.5\"} 0\nonnx_genai_time_to_first_token_seconds_bucket{le=\"5\"} 14\nonnx_genai_time_to_first_token_seconds_bucket{le=\"+Inf\"} 46\nonnx_genai_time_to_first_token_seconds_sum 563.331170713\nonnx_genai_time_to_first_token_seconds_count 46\n# HELP onnx_genai_e2e_request_latency_seconds End-to-end generation latency.\n# TYPE onnx_genai_e2e_request_latency_seconds histogram\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.005\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.01\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.025\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.05\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.075\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.1\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.15\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.2\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.3\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.5\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"0.75\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"1\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"2.5\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"5\"} 0\nonnx_genai_e2e_request_latency_seconds_bucket{le=\"+Inf\"} 46\nonnx_genai_e2e_request_latency_seconds_sum 1461.963359209\nonnx_genai_e2e_request_latency_seconds_count 46\n# HELP onnx_genai_sessions_active Currently active persistent sessions.\n# TYPE onnx_genai_sessions_active gauge\nonnx_genai_sessions_active 0\n# HELP onnx_genai_requests_waiting Generation requests waiting for driver execution.\n# TYPE onnx_genai_requests_waiting gauge\nonnx_genai_requests_waiting 0\n# HELP onnx_genai_batch_size_current Current generation batch size.\n# TYPE onnx_genai_batch_size_current gauge\nonnx_genai_batch_size_current 0\n# HELP onnx_genai_prefix_cache_hits_total Generation requests with a prefix-cache hit.\n# TYPE onnx_genai_prefix_cache_hits_total counter\nonnx_genai_prefix_cache_hits_total 0\n# HELP onnx_genai_prefix_cache_hit_tokens_total Prompt tokens served from a cached prefix instead of recomputed.\n# TYPE onnx_genai_prefix_cache_hit_tokens_total counter\nonnx_genai_prefix_cache_hit_tokens_total 0\n# HELP onnx_genai_prefix_cache_lookups_total Generation requests checked for prefix-cache reuse.\n# TYPE onnx_genai_prefix_cache_lookups_total counter\nonnx_genai_prefix_cache_lookups_total 46\n# HELP onnx_genai_prefix_cache_hit_rate Fraction of completed generations that reused a cached prefix.\n# TYPE onnx_genai_prefix_cache_hit_rate gauge\nonnx_genai_prefix_cache_hit_rate 0\n# HELP onnx_genai_rejections_total HTTP requests rejected for overload.\n# TYPE onnx_genai_rejections_total counter\nonnx_genai_rejections_total 0\n# HELP onnxgenai_resource_governor_available 1 when the resource governor was readable for this scrape and the onnxgenai_vram_*/host_ram_*/kv_* gauges below are present; 0 when it was not and those gauges are absent for that reason.\n# TYPE onnxgenai_resource_governor_available gauge\nonnxgenai_resource_governor_available 1\n# HELP onnxgenai_vram_used_bytes VRAM currently used.\n# TYPE onnxgenai_vram_used_bytes gauge\nonnxgenai_vram_used_bytes 0\n# HELP onnxgenai_vram_limit_bytes Configured VRAM ceiling.\n# TYPE onnxgenai_vram_limit_bytes gauge\nonnxgenai_vram_limit_bytes 5746050801\n# HELP onnxgenai_vram_headroom_bytes VRAM bytes below the configured ceiling.\n# TYPE onnxgenai_vram_headroom_bytes gauge\nonnxgenai_vram_headroom_bytes 5746050801\n# HELP onnxgenai_host_ram_used_bytes Host RAM currently used.\n# TYPE onnxgenai_host_ram_used_bytes gauge\nonnxgenai_host_ram_used_bytes 0\n# HELP onnxgenai_host_ram_limit_bytes Configured host RAM ceiling.\n# TYPE onnxgenai_host_ram_limit_bytes gauge\nonnxgenai_host_ram_limit_bytes 4294967296\n# HELP onnxgenai_host_ram_headroom_bytes Host RAM bytes below the configured ceiling.\n# TYPE onnxgenai_host_ram_headroom_bytes gauge\nonnxgenai_host_ram_headroom_bytes 4294967296\n# HELP onnxgenai_kv_budget_bytes Derived VRAM budget available to KV cache.\n# TYPE onnxgenai_kv_budget_bytes gauge\nonnxgenai_kv_budget_bytes 5746050801\n"
+    }
+  }
+}
