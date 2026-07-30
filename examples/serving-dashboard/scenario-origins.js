@@ -53,17 +53,41 @@ export const SCENARIOS = Object.freeze({
     serverClass: SERVER_CLASSES.DYNAMIC,
     why: 'The block allocator runs only on the dynamic path; static-cache models use runtime-owned in-place buffers.',
   }),
-  'prefix-cache': Object.freeze({
-    id: 'prefix-cache',
-    label: 'Prefix caching',
-    serverClass: SERVER_CLASSES.DYNAMIC,
-    why: 'The batching path never consults the prefix trie, which the engine tests assert (batched_static_decode.rs:53).',
-  }),
   'memory-pressure': Object.freeze({
     id: 'memory-pressure',
     label: 'Memory pressure',
     serverClass: SERVER_CLASSES.DYNAMIC,
     why: 'Pressure is created by genuinely filling the KV pool, which only the dynamic path allocates from.',
+  }),
+});
+
+/**
+ * Scenarios that were CUT, and why. Deliberately kept as a record rather than
+ * deleted, so the next person to reach for the id learns the finding instead of
+ * re-adding the tab.
+ *
+ * A tab is not a panel. A panel displays a value and can honestly say "n/a"; a
+ * TAB ADVERTISES A CAPABILITY — a labelled, clickable promise that the product
+ * does this, made before the visitor has seen a single number. Prefix reuse was
+ * measured and found ABSENT on both execution paths (QA, n=6 per arm with a
+ * sensitivity control: shared-prefix requests ran 7% SLOWER than a zero-sharing
+ * control, while the engine's hit counter fired on every request including all
+ * six controls). So a reachable `?scenario=prefix-cache` route is a navigable
+ * link to a feature we proved is not there.
+ *
+ * The finding itself still ships — it is the most credible thing the demo has
+ * to say — but it ships as evidence inside a panel, not as a capability tab.
+ */
+export const CUT_SCENARIOS = Object.freeze({
+  // Keyed only, with no `id:` field, and that is deliberate: an `id` is what
+  // makes a scenario addressable, and this one must not be addressable. It also
+  // keeps the page-claims guard honest, which scans for `id:`/`label:`
+  // declarations and cannot otherwise tell a record from a route.
+  'prefix-cache': Object.freeze({
+    reason:
+      'Prefix reuse was measured and found absent on both execution paths, so a tab ' +
+      'advertising it would promise a capability the engine does not have. The null ' +
+      'result is rendered as evidence instead.',
   }),
 });
 

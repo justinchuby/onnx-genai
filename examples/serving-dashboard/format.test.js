@@ -208,7 +208,12 @@ test('an unknown state is refused, never rendered as a measurement', () => {
   try {
     out = formatField({
       value: 999,
-      state: 'measured', // the value a stale spec would produce
+      // The RETIRED spelling of the measured state. Before D160 this test used
+      // 'measured' as its unknown state, because the wire value was 'ok'; the
+      // rename made that string valid and quietly turned this guard green while
+      // testing nothing. 'ok' is now the realistic stale-producer case: a module
+      // written against the old spec must render an em-dash and shout, never 999.
+      state: 'ok',
       source: '/v1/status',
       sourceClass: SOURCE_CLASSES.SERVER,
       label: 'Queue depth',
@@ -267,11 +272,18 @@ test('not-applicable does not render as unavailable', () => {
 });
 
 test('all five states render distinct text, so none relies on colour', () => {
-  const texts = ['ok', 'pending', 'stale', 'unavailable', 'not-applicable'].map(
+  // Derived from FIELD_STATES rather than spelled out. This test hardcoded
+  // 'ok' and went red on the D160 rename -- correctly, but for the wrong
+  // reason: 'ok' had become an UNKNOWN state, so it rendered an em-dash and
+  // collided with unavailable. Reading the enum means the guard tracks the
+  // vocabulary instead of a snapshot of it.
+  const carriesValue = new Set([FIELD_STATES.MEASURED, FIELD_STATES.STALE]);
+  const states = Object.values(FIELD_STATES);
+  const texts = states.map(
     (state) =>
       formatField(
         {
-          value: state === 'ok' || state === 'stale' ? 41 : null,
+          value: carriesValue.has(state) ? 41 : null,
           state,
           unit: 'reqs',
           label: 'queue depth',
@@ -281,6 +293,7 @@ test('all five states render distinct text, so none relies on colour', () => {
       ).text,
   );
 
+  assert.equal(states.length, 5, 'FIELD_STATES no longer has five states — update this test');
   assert.equal(new Set(texts).size, texts.length, `states collapsed: ${texts.join(' | ')}`);
 });
 

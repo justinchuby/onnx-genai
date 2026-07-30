@@ -145,11 +145,23 @@ test('the default scenario is one THIS server can actually serve', () => {
 
 test('an explicit scenario request is honoured, and a bogus one is not', () => {
   assert.equal(
-    currentScenarioId(`${SCATTER}/demo?scenario=prefix-cache`, [SERVER_CLASSES.SCATTER]),
-    'prefix-cache',
+    currentScenarioId(`${SCATTER}/demo?scenario=paged-kv`, [SERVER_CLASSES.SCATTER]),
+    'paged-kv',
   );
   assert.equal(
     currentScenarioId(`${SCATTER}/demo?scenario=../../etc/passwd`, [SERVER_CLASSES.SCATTER]),
+    'continuous-batching',
+  );
+});
+
+test('a CUT scenario is not addressable, even by hand-typed URL', () => {
+  // Removing the tab is not enough. The id was public for a while -- it is in
+  // chat logs, in the design doc and possibly in a bookmark -- so the URL has to
+  // stop resolving too, or the capability is still reachable by anyone who kept
+  // the link. Prefix reuse was measured and found ABSENT, so this route would be
+  // a navigable promise of a feature the engine does not have.
+  assert.equal(
+    currentScenarioId(`${SCATTER}/demo?scenario=prefix-cache`, [SERVER_CLASSES.SCATTER]),
     'continuous-batching',
   );
 });

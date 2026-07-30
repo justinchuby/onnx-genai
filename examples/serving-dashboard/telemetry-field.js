@@ -55,10 +55,17 @@
  * @property {number|string|boolean|Array|object|null} value
  *   The measurement. `null` whenever `state` is `unavailable` or `pending`.
  * @property {FieldState} state
- * @property {string} source
- *   Where the value came from, precisely enough to curl it. Examples:
- *   `'/v1/status'`, `'/v1/debug/kv'`, `'client'` (measured in the browser),
- *   `'derived'` (computed from other fields — `derivedFrom` says which).
+ * @property {string|null} source
+ *   The ENDPOINT, precisely enough to curl: `'/v1/status'`, `'/v1/debug/kv'`.
+ *   `null` when no endpoint applies — a client measurement, a derived value, or
+ *   a field the server never exposes.
+ *
+ *   NEVER put a class or a state name here. It carried the sentinels
+ *   `'unavailable'`, `'unknown'` and `'derived'` until D161, which is what
+ *   forced panels to sniff `source.startsWith('/')` to tell an endpoint from a
+ *   category — branching on a substring, and the exact thing we forbid for
+ *   `reason`. The class lives in `sourceClass`, which is authoritative; ask it,
+ *   never parse this.
  * @property {string|null} reason
  *   Required when `state !== 'measured'`. A complete sentence a visitor can
  *   read in a tooltip, ending with what they could do about it if anything.
@@ -71,7 +78,7 @@
  *   unavailable and pending fields. For `stale` fields this is the ORIGINAL
  *   observation time, which is exactly what a panel needs to render an age.
  * @property {string[]|null} derivedFrom
- *   For `source === 'derived'`, the field keys this was computed from, so the
+ *   For `sourceClass === 'derived'`, the field keys this was computed from, so the
  *   footer provenance table can be generated rather than hand-maintained.
  */
 
@@ -159,7 +166,9 @@ export const FIELD_STATES = Object.freeze({
  *
  * @param {number|string|boolean|Array|object} value
  * @param {object} options
- * @param {string} options.source        e.g. `'/v1/status'` or `'client'`.
+ * @param {string|null} options.source   The ENDPOINT, e.g. `'/v1/status'`, or
+ *                                       `null` for a client or derived value.
+ *                                       The CLASS goes in `sourceClass`.
  * @param {string|null} [options.unit]
  * @param {number} [options.observedAtMs] Defaults to now.
  * @returns {TelemetryField}
@@ -184,8 +193,13 @@ export function measuredField(
         'measurement — use unavailableField(reason) so the UI can render an em-dash.',
     );
   }
-  if (!source) {
-    throw new TypeError('measuredField() requires a `source` so the value can be audited.');
+  if (!source && sourceClass === SOURCE_CLASSES.SERVER) {
+    throw new TypeError(
+      'measuredField() requires a `source` endpoint for a server-sourced value, so the ' +
+        'claim can be audited by curling it. If this was measured in the browser or ' +
+        'computed from other fields, pass the matching `sourceClass` — a client or ' +
+        'derived value legitimately has no endpoint, and `source: null` is how it says so.',
+    );
   }
   return Object.freeze({
     value,
@@ -225,7 +239,7 @@ export function measuredField(
 export function notApplicableField(
   reason,
   {
-    source = 'unavailable',
+    source = null,
     sourceClass = SOURCE_CLASSES.SERVER,
     origin = null,
     originModelId = null,
@@ -261,14 +275,15 @@ export function notApplicableField(
  * @param {string} reason
  *   A complete sentence explaining why, shown verbatim in the tooltip.
  * @param {object} [options]
- * @param {string} [options.source] The endpoint that WOULD carry it, if known.
+ * @param {string|null} [options.source] The endpoint that WOULD carry it, if
+ *                                       known. `null` when none would.
  * @param {string|null} [options.unit]
  * @returns {TelemetryField}
  */
 export function unavailableField(
   reason,
   {
-    source = 'unavailable',
+    source = null,
     sourceClass = SOURCE_CLASSES.SERVER,
     origin = null,
     originModelId = null,
@@ -314,7 +329,7 @@ export function unavailableField(
 export function pendingField(
   reason,
   {
-    source = 'unknown',
+    source = null,
     sourceClass = SOURCE_CLASSES.SERVER,
     origin = null,
     originModelId = null,
@@ -412,7 +427,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
       `Cannot be derived here: ${inapplicable.join(', ')} ${
         inapplicable.length === 1 ? 'is' : 'are'
       } not applicable on this execution path. ${inputs[inapplicable[0]].reason}`,
-      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
+      { source: null, sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -422,7 +437,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
       `Cannot be derived because ${blocking.join(', ')} ${
         blocking.length === 1 ? 'is' : 'are'
       } unavailable: ${inputs[blocking[0]].reason}`,
-      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
+      { source: null, sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -432,7 +447,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
   if (waiting.length > 0) {
     return pendingField(
       `Waiting on ${waiting.join(', ')} before this can be derived.`,
-      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
+      { source: null, sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -444,7 +459,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
   if (result === null || result === undefined || Number.isNaN(result)) {
     return unavailableField(
       undefinedReason ?? 'The inputs are measured but the derived value is undefined for them.',
-      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
+      { source: null, sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -453,7 +468,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
   return Object.freeze({
     value: result,
     state: anyStale ? FIELD_STATES.STALE : FIELD_STATES.MEASURED,
-    source: 'derived',
+    source: null,
     sourceClass: SOURCE_CLASSES.DERIVED,
     // All inputs must share an origin for the result to be attributable to one
     // server; mixing two servers into one number would make it unattributable.
@@ -537,25 +552,34 @@ export function numericValueOf(field) {
  */
 export function describeField(field, nowMs = Date.now()) {
   const on = field.origin ? ` on the ${field.origin} server` : '';
+  // `source` names an ENDPOINT and is null when none is known. It must never be
+  // interpolated unguarded: it used to default to the sentinel 'unavailable',
+  // which rendered "would come from unavailable" -- a state name in an
+  // attribution slot, and the only place a screen-reader user meets provenance.
+  const from = field.source ? ` (would come from ${field.source}${on})` : on ? ` (${on.trim()})` : '';
   if (field.state === FIELD_STATES.NOT_APPLICABLE) {
     // Deliberately NOT phrased as "unavailable": nothing is missing here. The
     // wording has to make clear that plumbing would not produce a value.
     return `Not applicable${on} — ${field.reason}`;
   }
   if (field.state === FIELD_STATES.UNAVAILABLE) {
-    return `Unavailable — ${field.reason} (would come from ${field.source}${on})`;
+    return `Unavailable — ${field.reason}${from}`;
   }
   if (field.state === FIELD_STATES.PENDING) {
-    return `Waiting for the first measurement — ${field.reason} (from ${field.source})`;
+    const waitingFrom = field.source ? ` (from ${field.source})` : '';
+    return `Waiting for the first measurement — ${field.reason}${waitingFrom}`;
   }
   const unitSuffix = field.unit ? ` ${field.unit}` : '';
   const ageSeconds = Math.round((nowMs - (field.observedAtMs ?? nowMs)) / 1000);
   if (field.state === FIELD_STATES.STALE) {
-    return `${field.value}${unitSuffix} — STALE, last measured ${ageSeconds}s ago from ${field.source}. ${field.reason}`;
+    const lastFrom = field.source ? ` from ${field.source}` : '';
+    return `${field.value}${unitSuffix} — STALE, last measured ${ageSeconds}s ago${lastFrom}. ${field.reason}`;
   }
   const provenance = field.derivedFrom
     ? `derived from ${field.derivedFrom.join(', ')}`
-    : `source ${field.source}`;
+    : field.source
+      ? `source ${field.source}`
+      : `source ${field.sourceClass}`;
   return `${field.value}${unitSuffix} — measured${on}, ${provenance}`;
 }
 

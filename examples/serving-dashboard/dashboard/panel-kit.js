@@ -265,7 +265,9 @@ export function renderField(field, options = {}) {
   const state = renderStateOf(field, { strict: options.strict });
   const label = options.label ?? field?.label ?? 'value';
   const unit = field?.unit ?? '';
-  const sourceClass = normaliseSourceClass(options.sourceClass ?? field?.source);
+  const sourceClass = normaliseSourceClass(
+    options.sourceClass ? { sourceClass: options.sourceClass } : field,
+  );
   const showUnit = options.showUnit !== false && Boolean(unit) && unit !== '%';
 
   const ceilingMs = options.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS;
@@ -525,6 +527,103 @@ export function capabilityNotice({ title, body, command }) {
 }
 
 /**
+ * Collect every field wrapper `renderField` produced inside a subtree.
+ *
+ * Walks `children` rather than calling `querySelectorAll`, because the test DOM
+ * implements the tree but not the selector engine. A walk is the intersection
+ * of the two, so this behaves identically under `node --test` and in a browser
+ * — which is the whole point of having it in one place.
+ *
+ * @param {HTMLElement} rootElement
+ * @returns {Array<HTMLElement>}
+ */
+function collectFieldWrappers(rootElement) {
+  /** @type {Array<HTMLElement>} */
+  const found = [];
+  const visit = (node) => {
+    if (!node || typeof node.getAttribute !== 'function') return;
+    if (node.getAttribute('data-state') !== null && node.getAttribute('data-state') !== undefined) {
+      found.push(node);
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(rootElement);
+  return found;
+}
+
+/**
+ * §31/D89 — the PANEL-level not-applicable treatment.
+ *
+ * When every field in a panel is `not-applicable`, the panel keeps its header
+ * and frame and replaces its BODY with one explanation, instead of rendering a
+ * column of `n/a` glyphs that each repeat the same sentence.
+ *
+ * WHY THIS IS A LAYOUT FIX AND NOT A DECORATION
+ * `unavailable` is genuinely per-field: one stubbed metric beside working ones,
+ * where an em-dash holds the alignment and admits a local gap. But
+ * `not-applicable` is almost always per-PANEL, because its cause is structural
+ * — a whole subsystem is bypassed, so every field goes not-applicable at once.
+ * There is no mixed case to represent. Measured on this tree before the change,
+ * a fully bypassed `throughput` rendered SEVENTEEN `n/a` glyphs carrying one
+ * fact between them; `system` rendered fourteen and `scheduling` ten.
+ *
+ * Seventeen hole-glyphs do not read as seventeen honest admissions. They read
+ * as a broken panel — and honesty that reads as malfunction has failed at its
+ * only job. The collapse removes that failure rather than mitigating it: there
+ * is no row of absences left to scan, so there is nothing to misread.
+ *
+ * WHY IT LIVES IN THE REPAINT PATH RATHER THAN IN EACH PANEL
+ * Panels repaint on every store update, so anything applied once at mount is
+ * erased by the next frame. Running it immediately after `paint()` means it
+ * cannot fall out of sync, no panel author has to remember it, and a panel
+ * added later inherits it without knowing it exists.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * - With zero field wrappers it does nothing. A panel that binds no telemetry
+ *   (prefix-cache) or that already renders its own capability notice
+ *   (kv-memory) is not bypassed; it is speaking for itself, and overwriting
+ *   that would delete the more specific message.
+ * - With ANY field in another state it does nothing. A single structurally
+ *   pinned field inside a live panel is the rare mixed case, and it stays an
+ *   em-dash with a caption exactly as before.
+ * - It never invents prose. Every sentence shown comes from a `reason` the
+ *   server sent, and DISTINCT reasons are all preserved — collapsing three
+ *   different explanations into one would trade a repetitive truth for a
+ *   tidy falsehood.
+ *
+ * @param {HTMLElement} rootElement
+ * @returns {boolean} True if the body was replaced.
+ */
+export function collapseNotApplicableBody(rootElement) {
+  const wrappers = collectFieldWrappers(rootElement);
+  if (wrappers.length === 0) return false;
+  if (!wrappers.every((node) => node.getAttribute('data-state') === RENDER_STATES.NOT_APPLICABLE)) {
+    return false;
+  }
+
+  // Distinct, order-preserving. `title` carries the untruncated reason;
+  // the on-screen caption is only ever the first sentence.
+  const reasons = [];
+  for (const node of wrappers) {
+    const reason = node.getAttribute('title');
+    if (reason && !reasons.includes(reason)) reasons.push(reason);
+  }
+  if (reasons.length === 0) return false;
+
+  const notice = element('div', {
+    className: 'panel-bypass',
+    attrs: { role: 'note', 'data-state': RENDER_STATES.NOT_APPLICABLE },
+    children: [
+      element('p', { className: 'panel-bypass__title', text: 'Not applicable here' }),
+      ...reasons.map((reason) => element('p', { className: 'panel-bypass__reason', text: reason })),
+    ],
+  });
+
+  replaceChildren(rootElement, [notice]);
+  return true;
+}
+
+/**
  * Wrap first occurrences of known acronyms in `<abbr>` (AC30).
  *
  * @param {string} text
@@ -609,6 +708,12 @@ export function createRepaintScheduler(rootElement, paint, options = {}) {
     }
     lastPaintAtMs = now();
     paint();
+    // §31/D89. After the paint, never instead of it: the panel builds its
+    // fields exactly as it always has, and the collapse is a pure function of
+    // what those fields turned out to be. That ordering is what lets a panel
+    // become bypassed (or stop being bypassed) at runtime — when the visitor
+    // switches servers — with no panel-specific code on either transition.
+    collapseNotApplicableBody(rootElement);
   };
 
   return {
@@ -1030,16 +1135,27 @@ export function describeFieldText(label, field, format) {
 // ── internals ────────────────────────────────────────────────────────────────
 
 /**
- * Map whatever the store put in `source` onto a badge class.
+ * Resolve a field's provenance CLASS.
  *
- * The store may carry a source CLASS (`'server'`) or an endpoint PATH
- * (`'/v1/status'`) depending on which Field vocabulary wins in contract-team.
- * A path means the server produced it, so it maps to `server`.
+ * `field.sourceClass` is authoritative and is asked first. Inference from
+ * `source` remains only as a fallback for callers that predate the class key.
  *
- * @param {string|undefined} source
+ * This used to infer the class from the `source` string ALONE, treating
+ * anything starting with `/` as a server value and everything else as derived.
+ * That worked only because `source` carried category sentinels ('derived',
+ * 'client', 'unavailable'). Those are gone (D161) — `source` is now an endpoint
+ * or null — so inference alone would badge every stubbed server field as
+ * DERIVED, claiming we computed a number the server never gave us.
+ *
+ * @param {{sourceClass?: string, source?: string}|string|undefined} field
  * @returns {SourceClass}
  */
-function normaliseSourceClass(source) {
+function normaliseSourceClass(field) {
+  const candidate = typeof field === 'string' ? undefined : field?.sourceClass;
+  if (candidate && candidate in SOURCE_BADGES) {
+    return /** @type {SourceClass} */ (candidate);
+  }
+  const source = typeof field === 'string' ? field : field?.source;
   if (!source) {
     return 'derived';
   }

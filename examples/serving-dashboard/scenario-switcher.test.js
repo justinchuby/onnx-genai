@@ -49,14 +49,14 @@ test('scenarios on the other server are marked as requiring navigation', () => {
   const remote = reachable.filter(({ plan }) => plan.requiresNavigation).map(({ id }) => id);
 
   // Everything backed by the dynamic server, viewed from the scatter server.
-  assert.deepEqual(remote.sort(), ['memory-pressure', 'paged-kv', 'prefix-cache']);
+  assert.deepEqual(remote.sort(), ['memory-pressure', 'paged-kv']);
 });
 
 test('a scenario served by this very origin never navigates', () => {
   const { reachable } = planAll(BOTH, DYNAMIC);
 
   const local = reachable.filter(({ plan }) => !plan.requiresNavigation).map(({ id }) => id);
-  assert.deepEqual(local.sort(), ['memory-pressure', 'paged-kv', 'prefix-cache']);
+  assert.deepEqual(local.sort(), ['memory-pressure', 'paged-kv']);
 });
 
 test('an unconfigured peer makes its scenarios unreachable rather than broken links', () => {
@@ -66,7 +66,7 @@ test('an unconfigured peer makes its scenarios unreachable rather than broken li
     reachable.map(({ id }) => id),
     ['continuous-batching'],
   );
-  assert.equal(unreachable.length, 3);
+  assert.equal(unreachable.length, 2);
 
   // Each carries a reason naming the launcher, because the visitor's fix is to
   // start the demo properly rather than to hunt for a port.
@@ -93,7 +93,7 @@ test('describe() reports unreachable scenarios as a server that is not running',
   const { reachable, unreachable } = planAll(SCATTER_ONLY, SCATTER);
   const sentence = describeSwitcher(reachable, unreachable, 'continuous-batching');
 
-  assert.match(sentence, /3 more are unavailable/);
+  assert.match(sentence, /2 more are unavailable/);
   assert.match(sentence, /not running/);
 });
 

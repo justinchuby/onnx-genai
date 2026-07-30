@@ -153,7 +153,11 @@ describe('store adapter — rate', () => {
     // nothing about the behaviour it is checking.
     assert.equal(rate.state, FIELD_STATES.MEASURED);
     assert.equal(rate.value, 50);
-    assert.equal(rate.source, 'derived');
+    // The CLASS is what says "we computed this"; `source` is the ENDPOINT and is
+    // null for a derived value, because no endpoint carries it. It used to hold
+    // the sentinel 'derived', which is what forced panels to sniff the string.
+    assert.equal(rate.sourceClass, 'derived');
+    assert.equal(rate.source, null);
     assert.deepEqual(rate.derivedFrom, ['metrics.tokens_generated_total']);
     adapter.destroy();
   });
