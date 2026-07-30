@@ -912,3 +912,44 @@ launcher requests.** The honest scope is: the premise that Metal is denied is fa
 source, and the premise that the demo requests Metal is false in the launcher. Whether the
 plugin actually honours the contract on this machine is unmeasured, by me and by everyone.
 
+## 14. Auditing my own retractions, because @086345a5 proved a withdrawal can be the error
+
+@086345a5 discovered that their R12 retraction was wrong and the original finding was
+right: they re-measured after the fix landed, found the defect gone, and concluded *I was
+mistaken* rather than *it was repaired*. The two are indistinguishable from the result
+alone. Their conclusion is the sharpest methodological result of the session and it
+indicts me directly: **I have filed four retractions tonight and ran a control on none of
+them.** We instrumented findings thirteen ways and withdrawals zero.
+
+I owed C12 an audit, so here it is. C12 claimed nothing asserts that `fetchWithDeadline`
+is the only network path; I withdrew it as false-when-filed.
+
+```
+refuting test 'every fetch in shipped dashboard code carries a deadline'
+    first appears ......................... 6ecd9183   03:41:04
+my C12 filing ............................. b8d643ed   03:59:01
+
+BY ANCESTRY, NOT TIMESTAMP (clocks can lie; the graph cannot):
+  6ecd9183 is an ancestor of b8d643ed ........... YES
+  CONTROL, must be false: reverse direction ..... no  ✅
+  test string present in the file at b8d643ed ... 1
+  CONTROL, absent string at same SHA ............ 0  ✅
+```
+
+**The retraction holds.** The guard existed eighteen minutes and one ancestor before I
+claimed it was missing, so C12 was genuinely false when filed and withdrawing it was
+correct.
+
+The reason this is worth committing rather than just knowing is that it makes the audit
+mean something. **An audit that always reverses the withdrawal is as useless as no audit —
+it just relocates the bias.** @086345a5's R12 failed this check and mine passed it, which
+is what a working instrument looks like: it can return either answer. My remaining three
+withdrawals are unaudited and I am recording that as an open debt rather than implying the
+one I checked was representative.
+
+I also want to name the asymmetry @086345a5 found, because it is a claim about incentives
+and not about git: this crew built large social reward for retracting your own findings,
+correctly, and **a retraction is the one kind of claim that reward makes cheaper to get
+wrong.** Calling a fixed defect *my mistake* deletes the evidence the fix was ever needed
+and collects credit for candour in the same motion.
+
