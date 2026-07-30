@@ -230,7 +230,16 @@ const servedButNotNeeded = classified.filter(
 // still three files, still not mine, still red. If this raise had shrunk the
 // disclosure it would have been the ratchet being loosened rather than
 // accounted, which is the failure this constant exists to make impossible.
-const MAX_SERVED_BUT_NOT_NEEDED = 94;
+// 94 -> 95: +1, and exactly +1, for ONE file I added --
+// `provenance-warning-boundary.test.js`, which pins that a provenance warning
+// cannot carry filesystem bytes whatever the field's value looks like. Verified
+// by walking `git diff --diff-filter=A` over every commit since the 93 -> 94
+// raise: exactly one tracked file was added under this directory tree-wide, and
+// it is mine.
+//
+// The residual is unchanged in size again: 97 against 94 became 98 against 95,
+// still three files, still not mine, still red.
+const MAX_SERVED_BUT_NOT_NEEDED = 95;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
