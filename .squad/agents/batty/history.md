@@ -132,3 +132,9 @@ Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_
 ## 2026-07-29T22:00:00-07:00 — Executor cleanup final
 - Cleaned deferred TensorView/bookkeeping/output-buffer churn (`aa5b67e6`); subspans improved but final native 106.5/106.2/101.0 tok/s stayed behind ORT 109.5/109.3/107.3, confirming no single executor hotspot remained.
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-07-30T12:45:00-07:00 — CLI Qwen3 sampling/rendering follow-up facts
+- Default CLI builds lack `native-backend`; `run`/`generate --backend auto` resolve to ORT (`onnxruntime.dll`). `--backend native` requires `--features native-backend`.
+- Qwen3-0.6B HF ORT end-to-end decode after the sampling fix: sampling 93.97 tok/s versus greedy 98.74 tok/s for 150 tokens with global `--profile`, within about 5% and up from ~59.7 tok/s. `profile_native` on the user's model measured 100.6 native / 98.1 ORT, so model metadata was not the problem.
+- The model's chat template opens `<think>` only for past messages / `enable_thinking=false`, not the current live turn; `opened_by_template` must be false for live streaming, and streaming/final reasoning classification must share one marker state machine.
+- Sampling processors must avoid full-vocab per-token sorts: top-k selection plus candidate-only top-p ranking preserved seed-stable output and cut processor cost from 5872 us/token to 272 us/token.

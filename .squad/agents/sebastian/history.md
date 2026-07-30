@@ -48,3 +48,9 @@ PR #362 merged (5a079029): If/Loop/Scan inference landed; #355 container typing 
 ## 2026-07-29T22:00:00-07:00 — Qwen3 deep overhead verdict
 - Decomposed PR #398's residual gap: KV/sampling/prep tiny (~0.18 ms/token), executor dispatch ~1.1 ms/token, and remaining ORT lead primarily MLAS MatMulNBits/threading/invocation behavior rather than outer-loop runtime.
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-07-30T12:45:00-07:00 — CLI Qwen3 sampling/rendering follow-up facts
+- Default CLI builds lack `native-backend`; `run`/`generate --backend auto` resolve to ORT (`onnxruntime.dll`). `--backend native` requires `--features native-backend`.
+- Qwen3-0.6B HF ORT end-to-end decode after the sampling fix: sampling 93.97 tok/s versus greedy 98.74 tok/s for 150 tokens with global `--profile`, within about 5% and up from ~59.7 tok/s. `profile_native` on the user's model measured 100.6 native / 98.1 ORT, so model metadata was not the problem.
+- The model's chat template opens `<think>` only for past messages / `enable_thinking=false`, not the current live turn; `opened_by_template` must be false for live streaming, and streaming/final reasoning classification must share one marker state machine.
+- Sampling processors must avoid full-vocab per-token sorts: top-k selection plus candidate-only top-p ranking preserved seed-stable output and cut processor cost from 5872 us/token to 272 us/token.
