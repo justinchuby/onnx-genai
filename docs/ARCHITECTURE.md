@@ -670,6 +670,27 @@ The section that makes the rest of this document trustworthy.
 
 There is a paged **allocator** (`PageTable`, `PrefixCache`) that genuinely allocates, shares, reference-counts, and evicts pages. There are **no paged-attention kernels**. Attention does not read KV through the page table.
 
+> **⚠️ "Evicts" is true, but only of one of the two eviction mechanisms in this repo, and they must not be conflated in public copy.**
+>
+> * **The page allocator's LRU eviction is REAL and RUNS.** `PagedDecode::evict_until_free()`
+>   (`engine/src/pipeline/paged_decode.rs:44`) calls `evict_lru(..)` (`:53`), reached from
+>   `flat_autoregressive.rs:307` — i.e. on the **dynamic / per-request path**, which is the only
+>   path with a page table at all (§5.6.1). §5.4's liveness guarantee applies to *this* mechanism.
+> * **The resource governor's eviction plan is COMPUTED AND NEVER EXECUTED.**
+>   `GovernorReconfigureOutcome` produces `overage_bytes` and an ordered `eviction_order`
+>   (`scheduler/src/governor.rs:158-167`), and **the only references anywhere are its own tests**
+>   (`:786`, `:852`). `ByteBudget::reconfigure` moves `state.limit` and never touches `state.used`;
+>   the repo names the behaviour itself in `reconfigure_lower_reports_overage_without_evicting`.
+>   See §8.7 — lowering the VRAM limit affects new allocations only and never releases resident KV.
+>
+> **So neither "the allocator evicts" nor "the allocator does not evict" is a safe sentence.** The
+> first invites a reader to believe a VRAM-limit change reclaims memory; the second is flatly false
+> on the dynamic path and would be disproved by anyone who reads `paged_decode.rs`. **Correcting an
+> overclaim by installing the opposite underclaim is not a fix — it is the same error with the sign
+> flipped, and it is harder to catch because it sounds modest.** Public copy must name the
+> mechanism: *pages are reclaimed by LRU eviction when the pool is exhausted; changing the VRAM
+> ceiling does not reclaim anything.*
+
 Say "paged KV block table", not "paged attention". The distinction is not pedantry — it is the difference between what is implemented and what is not.
 
 ### 8.2 KV introspection is stubbed at the server seam
