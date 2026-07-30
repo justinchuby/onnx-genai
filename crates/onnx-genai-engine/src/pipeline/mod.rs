@@ -1,8 +1,7 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, apply_paged_sliding_window, clone_value, extract_next_token_logits_with_io,
-    run_decode_step_with_extra,
+    DecodeState, apply_paged_sliding_window, clone_value, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -11,7 +10,7 @@ use crate::engine::{
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
-    mirror_present_kv_to_pages, sequence_pages_for_len,
+    sequence_pages_for_len,
 };
 use crate::logits::TokenId;
 use crate::pipeline_cache::{
@@ -36,12 +35,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
+mod decoder_component;
 mod flat_autoregressive;
 mod iterative;
 mod nested_autoregressive;
 mod paged_decode;
 mod routing;
 mod schedulers;
+pub(crate) use decoder_component::{OrtPipelineDecoder, PipelineDecoderComponent};
 pub use schedulers::{Scheduler, SchedulerFactory, SchedulerRegistry};
 
 /// Named tensors supplied to or produced by pipeline components.

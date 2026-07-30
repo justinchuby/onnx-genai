@@ -567,7 +567,7 @@ impl DecodeState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::logits::extract_next_token_logits_with_io;
+    use super::super::logits::extract_next_token_logits_from_outputs;
     use super::super::step::run_decode_step_with_extra;
     use super::*;
     use onnx_genai_ort::{PipelineModels, Value};
@@ -599,8 +599,11 @@ mod tests {
         let extras = vec![("routed_sequence".to_string(), routed)];
 
         let outputs = run_decode_step_with_extra(session, &mut state, &[1, 2, 3], 0, &extras)?;
-        let logits =
-            extract_next_token_logits_with_io(session, outputs, state.io.logits_output.as_deref())?;
+        let logits = extract_next_token_logits_from_outputs(
+            session,
+            &outputs,
+            state.io.logits_output.as_deref(),
+        )?;
         assert_eq!(
             logits
                 .iter()
@@ -625,8 +628,11 @@ mod tests {
         );
 
         let outputs = run_decode_step_with_extra(session, &mut state, &[6], 3, &extras)?;
-        let logits =
-            extract_next_token_logits_with_io(session, outputs, state.io.logits_output.as_deref())?;
+        let logits = extract_next_token_logits_from_outputs(
+            session,
+            &outputs,
+            state.io.logits_output.as_deref(),
+        )?;
         assert_eq!(
             logits
                 .iter()
@@ -638,8 +644,11 @@ mod tests {
         assert_eq!(state.next_positions, Some(vec![4, 4, 4]));
 
         let outputs = run_decode_step_with_extra(session, &mut state, &[15], 4, &extras)?;
-        let logits =
-            extract_next_token_logits_with_io(session, outputs, state.io.logits_output.as_deref())?;
+        let logits = extract_next_token_logits_from_outputs(
+            session,
+            &outputs,
+            state.io.logits_output.as_deref(),
+        )?;
         assert_eq!(
             logits
                 .iter()

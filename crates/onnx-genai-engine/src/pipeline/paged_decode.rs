@@ -79,8 +79,12 @@ pub(crate) struct PagedMirror<'a> {
 }
 
 pub(crate) struct PipelineDecodeLoopBackend<'a> {
-    pub(crate) decoder: &'a Session,
-    pub(crate) decoder_state: &'a mut DecodeState,
+    /// The decoder driven each step, owning its KV state behind a stateful,
+    /// backend-neutral seam. Boxed behind [`PipelineDecoderComponent`] so the
+    /// same loop drives the ORT decoder (via [`OrtPipelineDecoder`]) or, in a
+    /// follow-up, a native decoder keeping KV device-resident — one code path,
+    /// no forked native copy (mirrors the Inc1 every_step seam, but stateful).
+    pub(crate) decoder: Box<dyn PipelineDecoderComponent + 'a>,
     /// Shared tensor pool: external inputs + prompt-phase outputs + the
     /// per-step outputs of the `every_step` components (refreshed each step).
     pub(crate) pool: &'a mut PipelineTensors,
@@ -206,7 +210,8 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
     }
 
     fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
-        let past_len = if self.decoder_state.use_kv {
+        let use_kv = self.decoder.use_kv();
+        let past_len = if use_kv {
             self.context_tokens
                 .len()
                 .saturating_sub(if self.generated_count == 0 {
@@ -220,7 +225,7 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         // On the first step feed only the tokens not already covered by
         // retained KV (`prompt_len` is the uncovered suffix, and equals the
         // whole prompt when nothing was retained); afterwards, the running token.
-        let input_tokens = if self.decoder_state.use_kv && self.generated_count > 0 {
+        let input_tokens = if use_kv && self.generated_count > 0 {
             self.context_tokens[self.context_tokens.len() - 1..].to_vec()
         } else {
             self.context_tokens[self.retained_len..].to_vec()
@@ -230,13 +235,10 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         // into the decoder for this step.
         self.run_step_components(&input_tokens)?;
         let extras = self.decoder_extras()?;
-        let outputs = run_decode_step_with_extra(
-            self.decoder,
-            self.decoder_state,
-            &input_tokens,
-            past_len,
-            &extras,
-        )?;
+        // Advance the decoder one step; it retains this step's outputs internally
+        // so the loop never handles a concrete tensor type (see
+        // `PipelineDecoderComponent`).
+        self.decoder.step(&input_tokens, past_len, &extras)?;
         self.kv_len = past_len + input_tokens.len();
         // Mirror this step's KV into pages before the outputs are consumed, so
         // a later request opening with the same prefix can attach these pages
@@ -247,13 +249,11 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             // evicted anything, an absolute index reads the wrong rows or runs
             // off the end. This is the same conversion the single-model decode
             // step does before mirroring.
-            let retained_past_len = self.decoder_state.retained_kv_len(past_len);
-            match mirror_present_kv_to_pages(
-                self.decoder,
+            let retained_past_len = self.decoder.retained_kv_len(past_len);
+            match self.decoder.mirror_last_present_kv(
                 paged.kv_model,
                 paged.cache,
                 paged.seq,
-                &outputs,
                 retained_past_len,
                 input_tokens.len(),
             ) {
@@ -284,8 +284,8 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             apply_paged_sliding_window(
                 paged.cache,
                 paged.seq,
-                self.decoder_state.sliding_window(),
-                self.decoder_state.sink_tokens(),
+                self.decoder.sliding_window(),
+                self.decoder.sink_tokens(),
             )?;
             let pages_after = paged
                 .cache
@@ -299,11 +299,7 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
                 paged.windowed = true;
             }
         }
-        extract_next_token_logits_with_io(
-            self.decoder,
-            outputs,
-            self.decoder_state.io.logits_output.as_deref(),
-        )
+        self.decoder.next_token_logits()
     }
 
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
