@@ -22,6 +22,21 @@ effect they were looking for, so the honest word today is **unverified**. Both
 arms and the detection floor ship on screen, because a result you can check is
 worth more than one you must take on faith.
 
+**And the mechanism explains the measurement, which is why this is a finding
+rather than a shrug.** *A null result tells you nothing about why.* Reading the
+code supplies the why: `prepare_session_prefix` has two prefix branches, and
+only one of them restores anything. The branch our models take computes a
+**textual overlap** and materialises no KV pages, so no prefill is skipped —
+which predicts every number we measured, including why prompts sharing nothing
+still scored hits and why time-to-first-token never moved. The branch that
+would genuinely shrink prefill is real, wired and tested, and simply
+unreachable from either server path as we run them. **So the honest claim is
+"on this path, the code that runs computes a textual overlap and restores
+nothing" — not "prefix caching does not work"**, which is a product-correctness
+claim that a configuration finding cannot support. The full derivation, with
+citations, is in [What you are looking
+at](#what-you-are-looking-at).
+
 **One constraint, stated here rather than discovered later:** batching and paged
 KV run on **different execution paths** in this runtime today, so they cannot be
 observed in the same process. The demo therefore runs **two servers** and shows
@@ -743,7 +758,7 @@ This predicts every number we measured, which is why it settles the question:
 
 | Observation | Mechanism |
 |---|---|
-| ~95 % hit rate from the very first request | *any* nonzero overlap counts, and the chat template shares its opening tokens |
+| ~95 % hit rate from the very first request (19 hits / 20 lookups, **cumulative since boot** — not an experiment result) | *any* nonzero overlap counts, and the chat template shares its opening tokens |
 | control prompts that differ from token 0 still scored hits | they still share that template prefix |
 | **TTFT unchanged (+7 %)** | **branch 1 skips no prefill — there is nothing to speed up** |
 | the predicted ~90 % collapse never appeared | branch 2, the only branch that materialises pages, is unreachable |
