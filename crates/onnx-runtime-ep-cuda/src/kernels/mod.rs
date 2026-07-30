@@ -60,6 +60,7 @@ pub mod hardmax;
 pub mod index_share;
 pub mod index_transform;
 pub mod indexing;
+pub mod linear_attention;
 pub mod log_softmax;
 pub mod matmul;
 pub mod matmul_nbits;
@@ -329,6 +330,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "GridSample",
     "GatherBlockQuantized",
     "CausalConvWithState",
+    "LinearAttention",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -724,6 +726,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("CausalConvWithState", "com.microsoft", 1),
         Box::new(causal_conv_with_state::CausalConvWithStateFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("LinearAttention", "com.microsoft", 1),
+        Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),
     );

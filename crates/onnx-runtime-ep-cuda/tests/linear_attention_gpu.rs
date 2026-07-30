@@ -1,0 +1,449 @@
+//! GPU parity regressions for `com.microsoft::LinearAttention` (Gated DeltaNet /
+//! gated delta-rule linear attention, the recurrent attention of the Qwen3.5 /
+//! Qwen3-Next hybrid family).
+//!
+//! Every case builds small synthetic query/key/value/past_state/decay/beta
+//! tensors, runs the **CPU EP** kernel as the parity oracle (never a
+//! self-comparison), and asserts the CUDA `LinearAttention` kernel reproduces
+//! both the `output` and the `present_state` within tolerance. Coverage spans
+//! the four `update_rule` variants, standard and inverse GQA, key-head sharing
+//! (`n_k < H_kv`), per-head vs per-key-dim decay, per-head vs shared beta,
+//! multi-timestep recurrence (state carry), a non-trivial past_state, and the
+//! Float32 / Float16 / BFloat16 dtypes. All cases graceful-skip without a GPU.
+
+mod common;
+
+use common::{Tensor, assert_close, cuda_ep, decode_floats, float_input, run_cpu, run_cuda};
+use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ir::{Attribute, DataType};
+
+const DOMAIN: &str = "com.microsoft";
+const OPSET: u64 = 1;
+
+/// Deterministic pseudo-random f32 values in `[lo, hi)` from a splitmix64 seed.
+fn values(seed: u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let unit = (z >> 40) as f32 / (1u64 << 24) as f32; // [0, 1)
+            lo + unit * (hi - lo)
+        })
+        .collect()
+}
+
+struct Config {
+    label: &'static str,
+    batch: usize,
+    seq: usize,
+    d_k: usize,
+    d_v: usize,
+    q_num_heads: usize,
+    kv_num_heads: usize,
+    n_k_heads: usize,
+    update_rule: &'static str,
+    scale: f32,
+    decay_per_key_dim: bool,
+    beta_shared: bool,
+    with_past: bool,
+}
+
+impl Config {
+    fn output_hidden(&self) -> usize {
+        self.q_num_heads.max(self.kv_num_heads) * self.d_v
+    }
+}
+
+/// Assemble the six-input tensor list (query, key, value, past_state, decay,
+/// beta) for one config in the given dtype. Trailing optionals are always
+/// present here to exercise the full path.
+fn build_inputs(cfg: &Config, dtype: DataType) -> Vec<Tensor> {
+    let bt = cfg.batch * cfg.seq;
+    let q = float_input(
+        dtype,
+        &[cfg.batch, cfg.seq, cfg.q_num_heads * cfg.d_k],
+        &values(1, bt * cfg.q_num_heads * cfg.d_k, -1.0, 1.0),
+    );
+    let k = float_input(
+        dtype,
+        &[cfg.batch, cfg.seq, cfg.n_k_heads * cfg.d_k],
+        &values(2, bt * cfg.n_k_heads * cfg.d_k, -1.0, 1.0),
+    );
+    let v = float_input(
+        dtype,
+        &[cfg.batch, cfg.seq, cfg.kv_num_heads * cfg.d_v],
+        &values(3, bt * cfg.kv_num_heads * cfg.d_v, -1.0, 1.0),
+    );
+    let past = if cfg.with_past {
+        float_input(
+            dtype,
+            &[cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v],
+            &values(
+                4,
+                cfg.batch * cfg.kv_num_heads * cfg.d_k * cfg.d_v,
+                -0.5,
+                0.5,
+            ),
+        )
+    } else {
+        float_input(
+            dtype,
+            &[cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v],
+            &vec![0.0; cfg.batch * cfg.kv_num_heads * cfg.d_k * cfg.d_v],
+        )
+    };
+    // decay is a log-gate; keep it mildly negative so exp(g) stays in (0, 1].
+    let decay_last = if cfg.decay_per_key_dim {
+        cfg.kv_num_heads * cfg.d_k
+    } else {
+        cfg.kv_num_heads
+    };
+    let decay = float_input(
+        dtype,
+        &[cfg.batch, cfg.seq, decay_last],
+        &values(5, bt * decay_last, -0.6, -0.02),
+    );
+    let beta_last = if cfg.beta_shared { 1 } else { cfg.kv_num_heads };
+    let beta = float_input(
+        dtype,
+        &[cfg.batch, cfg.seq, beta_last],
+        &values(6, bt * beta_last, 0.1, 0.9),
+    );
+    vec![q, k, v, past, decay, beta]
+}
+
+fn attrs(cfg: &Config) -> Vec<(&'static str, Attribute)> {
+    vec![
+        ("q_num_heads", Attribute::Int(cfg.q_num_heads as i64)),
+        ("kv_num_heads", Attribute::Int(cfg.kv_num_heads as i64)),
+        (
+            "update_rule",
+            Attribute::String(cfg.update_rule.as_bytes().to_vec()),
+        ),
+        ("scale", Attribute::Float(cfg.scale)),
+    ]
+}
+
+fn tolerance(dtype: DataType) -> f32 {
+    match dtype {
+        DataType::Float32 => 2e-4,
+        DataType::Float16 => 5e-2,
+        DataType::BFloat16 => 2e-1,
+        _ => unreachable!(),
+    }
+}
+
+/// Run one config on CUDA and the CPU oracle, comparing every output.
+fn check(cfg: &Config, dtype: DataType) {
+    let Some(ep) = cuda_ep() else {
+        eprintln!("skip {}: no CUDA GPU", cfg.label);
+        return;
+    };
+    run_check(&ep, cfg, dtype);
+}
+
+fn run_check(ep: &CudaExecutionProvider, cfg: &Config, dtype: DataType) {
+    let inputs = build_inputs(cfg, dtype);
+    let outputs = vec![
+        (dtype, vec![cfg.batch, cfg.seq, cfg.output_hidden()]),
+        (dtype, vec![cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v]),
+    ];
+    let a = attrs(cfg);
+    let cuda = run_cuda(ep, "LinearAttention", DOMAIN, OPSET, &inputs, &outputs, &a);
+    let cpu = run_cpu("LinearAttention", DOMAIN, OPSET, &inputs, &outputs, &a);
+    assert_eq!(cuda.len(), 2, "{}: expected 2 outputs", cfg.label);
+    assert_eq!(cpu.len(), 2, "{}: CPU expected 2 outputs", cfg.label);
+    let tol = tolerance(dtype);
+    for (idx, name) in ["output", "present_state"].iter().enumerate() {
+        let got = decode_floats(&cuda[idx], dtype);
+        let want = decode_floats(&cpu[idx], dtype);
+        assert_close(
+            &format!("{} [{name}] {dtype:?}", cfg.label),
+            dtype,
+            &got,
+            &want,
+            tol,
+        );
+    }
+}
+
+/// The full parity matrix. Shapes are small but non-trivial (multi-timestep so
+/// the recurrent state genuinely carries; GQA both directions; key sharing).
+fn configs() -> Vec<Config> {
+    vec![
+        // Standard GQA, gated_delta, per-head decay + per-head beta, with a
+        // non-zero past_state — the real Qwen3.5 0.8b/2b decode config in
+        // miniature (q == kv, multi-step recurrence).
+        Config {
+            label: "gated_delta/gqa1/past",
+            batch: 2,
+            seq: 4,
+            d_k: 6,
+            d_v: 5,
+            q_num_heads: 3,
+            kv_num_heads: 3,
+            n_k_heads: 3,
+            update_rule: "gated_delta",
+            scale: 0.7,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        // Standard GQA with grouping (q > kv) + key-head sharing (n_k < kv).
+        Config {
+            label: "gated_delta/gqa4/keyshare",
+            batch: 1,
+            seq: 5,
+            d_k: 4,
+            d_v: 4,
+            q_num_heads: 8,
+            kv_num_heads: 4,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.0, // resolves to 1/sqrt(d_k)
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        // Inverse GQA (q < kv) — the Qwen3.5 9b config shape (q=16, kv=32).
+        Config {
+            label: "gated_delta/inverse_gqa",
+            batch: 1,
+            seq: 3,
+            d_k: 4,
+            d_v: 5,
+            q_num_heads: 2,
+            kv_num_heads: 4,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 1.0,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        // Per-key-dim decay layout ([B, T, H_kv·d_k]).
+        Config {
+            label: "gated_delta/decay_per_key",
+            batch: 1,
+            seq: 4,
+            d_k: 3,
+            d_v: 3,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.5,
+            decay_per_key_dim: true,
+            beta_shared: false,
+            with_past: false,
+        },
+        // Shared beta ([B, T, 1]).
+        Config {
+            label: "delta/beta_shared",
+            batch: 2,
+            seq: 3,
+            d_k: 4,
+            d_v: 4,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "delta",
+            scale: 0.9,
+            decay_per_key_dim: false,
+            beta_shared: true,
+            with_past: false,
+        },
+        // Gated (decay, no delta).
+        Config {
+            label: "gated/no_delta",
+            batch: 1,
+            seq: 4,
+            d_k: 5,
+            d_v: 4,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated",
+            scale: 0.6,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        // Plain linear (no gates at all).
+        Config {
+            label: "linear/plain",
+            batch: 1,
+            seq: 5,
+            d_k: 4,
+            d_v: 3,
+            q_num_heads: 3,
+            kv_num_heads: 3,
+            n_k_heads: 3,
+            update_rule: "linear",
+            scale: 0.8,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: false,
+        },
+    ]
+}
+
+#[test]
+fn linear_attention_f32_parity() {
+    for cfg in configs() {
+        check(&cfg, DataType::Float32);
+    }
+}
+
+#[test]
+fn linear_attention_f16_parity() {
+    for cfg in configs() {
+        check(&cfg, DataType::Float16);
+    }
+}
+
+#[test]
+fn linear_attention_bf16_parity() {
+    for cfg in configs() {
+        check(&cfg, DataType::BFloat16);
+    }
+}
+
+/// The recurrent state must genuinely carry across timesteps: running two
+/// half-sequences chained through `past_state` must equal one full-sequence
+/// run. This proves the CUDA present_state is a faithful continuation state,
+/// not just a per-step artifact.
+#[test]
+fn linear_attention_state_carry_matches_chained() {
+    let Some(ep) = cuda_ep() else {
+        eprintln!("skip: no CUDA GPU");
+        return;
+    };
+    let dtype = DataType::Float32;
+    let (batch, d_k, d_v, heads) = (1usize, 5usize, 4usize, 2usize);
+    let a = vec![
+        ("q_num_heads", Attribute::Int(heads as i64)),
+        ("kv_num_heads", Attribute::Int(heads as i64)),
+        ("update_rule", Attribute::String(b"gated_delta".to_vec())),
+        ("scale", Attribute::Float(0.7)),
+    ];
+    let out_hidden = heads * d_v;
+
+    // Full 6-timestep run.
+    let full_cfg = Config {
+        label: "carry/full",
+        batch,
+        seq: 6,
+        d_k,
+        d_v,
+        q_num_heads: heads,
+        kv_num_heads: heads,
+        n_k_heads: heads,
+        update_rule: "gated_delta",
+        scale: 0.7,
+        decay_per_key_dim: false,
+        beta_shared: false,
+        with_past: false,
+    };
+    let full_inputs = build_inputs(&full_cfg, dtype);
+    let full_outputs = vec![
+        (dtype, vec![batch, 6, out_hidden]),
+        (dtype, vec![batch, heads, d_k, d_v]),
+    ];
+    let full = run_cuda(
+        &ep,
+        "LinearAttention",
+        DOMAIN,
+        OPSET,
+        &full_inputs,
+        &full_outputs,
+        &a,
+    );
+    let full_out = decode_floats(&full[0], dtype);
+
+    // Split the same q/k/v/decay/beta into two halves of 3 timesteps and chain
+    // the present_state of the first into the past_state of the second.
+    let split_at = 3usize;
+    let slice_seq = |t: &Tensor, start: usize, len: usize| -> Tensor {
+        let per = t.shape[2];
+        let row = t.dtype.storage_bytes(per);
+        let mut bytes = Vec::new();
+        for s in start..start + len {
+            bytes.extend_from_slice(&t.bytes[s * row..(s + 1) * row]);
+        }
+        Tensor {
+            dtype: t.dtype,
+            shape: vec![t.shape[0], len, per],
+            bytes,
+        }
+    };
+
+    let first_inputs: Vec<Tensor> = {
+        let mut v: Vec<Tensor> = full_inputs[..3]
+            .iter()
+            .map(|t| slice_seq(t, 0, split_at))
+            .collect();
+        v.push(full_inputs[3].clone()); // zero past_state
+        v.push(slice_seq(&full_inputs[4], 0, split_at));
+        v.push(slice_seq(&full_inputs[5], 0, split_at));
+        v
+    };
+    let first_outputs = vec![
+        (dtype, vec![batch, split_at, out_hidden]),
+        (dtype, vec![batch, heads, d_k, d_v]),
+    ];
+    let first = run_cuda(
+        &ep,
+        "LinearAttention",
+        DOMAIN,
+        OPSET,
+        &first_inputs,
+        &first_outputs,
+        &a,
+    );
+
+    let second_inputs: Vec<Tensor> = {
+        let mut v: Vec<Tensor> = full_inputs[..3]
+            .iter()
+            .map(|t| slice_seq(t, split_at, 6 - split_at))
+            .collect();
+        // past_state = present_state from the first half.
+        v.push(Tensor {
+            dtype,
+            shape: vec![batch, heads, d_k, d_v],
+            bytes: first[1].clone(),
+        });
+        v.push(slice_seq(&full_inputs[4], split_at, 6 - split_at));
+        v.push(slice_seq(&full_inputs[5], split_at, 6 - split_at));
+        v
+    };
+    let second_outputs = vec![
+        (dtype, vec![batch, 6 - split_at, out_hidden]),
+        (dtype, vec![batch, heads, d_k, d_v]),
+    ];
+    let second = run_cuda(
+        &ep,
+        "LinearAttention",
+        DOMAIN,
+        OPSET,
+        &second_inputs,
+        &second_outputs,
+        &a,
+    );
+
+    let first_out = decode_floats(&first[0], dtype);
+    let second_out = decode_floats(&second[0], dtype);
+    let mut chained = first_out;
+    chained.extend_from_slice(&second_out);
+    assert_close(
+        "state_carry chained==full",
+        dtype,
+        &chained,
+        &full_out,
+        2e-4,
+    );
+}

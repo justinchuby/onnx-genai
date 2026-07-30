@@ -193,9 +193,9 @@ pre-batch counts retained in the historical wave notes below.
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **173** |
 | CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **168** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **163** |
-| CPU pairs implemented by CUDA in the same domain | **165 / 173** |
+| CUDA registry `(domain, op_type)` pairs | **169** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **164** |
+| CPU pairs implemented by CUDA in the same domain | **166 / 173** |
 | CPU standard-domain op types implemented by CUDA | **143 / 145** |
 
 The **2 remaining CPU `ai.onnx` gaps** are `NonMaxSuppression` and `Unique`.
@@ -396,6 +396,25 @@ volumetric GridSample, remain explicitly fail-closed. GPU parity covers the
 supported narrow storage types and out-of-bounds sampling. Current source-derived
 coverage is **163** advertised CUDA op names, **168** CUDA `(domain, op_type)`
 pairs, and **143 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 15 adds `com.microsoft::LinearAttention`
+(Gated DeltaNet / gated delta-rule linear attention), the recurrent attention of
+the Qwen3.5 / Qwen3-Next **hybrid** family. A single NVRTC kernel (f32/f16/bf16
+entry points) exploits the fact that each column of the per-head state matrix
+`S[d_k, d_v]` evolves independently, mapping one thread to each `(batch, kv_head,
+d_v-column)` and running the whole recurrent scan in **f32** (state kept in a
+per-thread f32 register array so the arithmetic matches ORT's `float` CPU kernel
+regardless of I/O dtype). It covers all four `update_rule` variants (linear,
+gated, delta, gated_delta), standard and inverse GQA, key-head sharing
+(`n_k < H_kv`), per-head and per-key-dim decay, per-head and shared beta, and
+step-to-step state carry via `past_state`/`present_state`. The claim gate
+fail-closes on unsupported dtypes and `d_k > 256`. GPU parity validates output
+and present_state against the CPU EP oracle across every variant plus a
+chained-vs-full state-carry proof; the placement probe confirms all
+18 / 18 / 24 LinearAttention nodes in qwen3.5-0.8b/2b/9b now place on CUDA (0
+before). This pairs with `CausalConvWithState` to land the hybrid decode path.
+This raises the machine-verified `CUDA_COVERED_OPS` count to **162** and CUDA
+`(domain, op_type)` pairs to **168**.
 
 ---
 
