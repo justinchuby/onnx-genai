@@ -90,6 +90,7 @@
  * @typedef {object} ProvenanceEntry
  * @property {string} source     Endpoint that carries (or would carry) the field.
  * @property {string} path       Dotted path into that endpoint's JSON body.
+ * @property {'string'|'number'|'boolean'} wireType Required type for JSON-path values.
  * @property {Classification} classification
  * @property {string|null} unit
  * @property {string} evidence   `file:line` backing the classification.
@@ -145,6 +146,7 @@ export const PROVENANCE = Object.freeze({
   'server.model_id': {
     source: ENDPOINTS.HEALTH,
     path: 'model',
+    wireType: 'string',
     classification: 'MEASURED',
     unit: null,
     evidence: 'crates/onnx-genai-server/src/routes/mod.rs:105-108 (HealthResponse.model)',
@@ -153,6 +155,7 @@ export const PROVENANCE = Object.freeze({
   'server.healthy': {
     source: ENDPOINTS.STATUS,
     path: 'healthy',
+    wireType: 'boolean',
     classification: 'MEASURED',
     unit: null,
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:47-51 (registry default_id().is_some())',
@@ -161,6 +164,7 @@ export const PROVENANCE = Object.freeze({
   'server.node_id': {
     source: ENDPOINTS.STATUS,
     path: 'node_id',
+    wireType: 'string',
     classification: 'MEASURED',
     unit: null,
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:45 (config.node_id)',
@@ -169,6 +173,7 @@ export const PROVENANCE = Object.freeze({
   'server.context_length': {
     source: ENDPOINTS.DEBUG_CONFIG,
     path: 'model_max_context',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'tokens',
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:99 (handle.model_max_context)',
@@ -177,6 +182,7 @@ export const PROVENANCE = Object.freeze({
   'server.pipeline': {
     source: ENDPOINTS.DEBUG_CONFIG,
     path: 'pipeline',
+    wireType: 'boolean',
     classification: 'MEASURED',
     unit: null,
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:95 (handle.pipeline)',
@@ -209,6 +215,7 @@ export const PROVENANCE = Object.freeze({
   'server.execution_provider': {
     source: ENDPOINTS.STATUS,
     path: 'server.execution_provider',
+    wireType: 'string',
     classification: 'NOT_PLUMBED',
     unit: null,
     evidence:
@@ -230,6 +237,7 @@ export const PROVENANCE = Object.freeze({
   'scheduler.running': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'active_batch_size',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
@@ -245,6 +253,7 @@ export const PROVENANCE = Object.freeze({
   'scheduler.waiting': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'pending_queue_depth',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
@@ -257,6 +266,7 @@ export const PROVENANCE = Object.freeze({
   'queue.depth': {
     source: ENDPOINTS.STATUS,
     path: 'queue_depth',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
@@ -267,6 +277,7 @@ export const PROVENANCE = Object.freeze({
   'sessions.active': {
     source: ENDPOINTS.STATUS,
     path: 'active_sessions',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'sessions',
     evidence:
@@ -292,6 +303,7 @@ export const PROVENANCE = Object.freeze({
   'sessions.paused': {
     source: ENDPOINTS.STATUS,
     path: 'paused_sessions',
+    wireType: 'number',
     classification: 'STRUCTURALLY_BYPASSED',
     unit: 'sessions',
     // The wire carries nothing for this field, and that absence is itself the
@@ -315,6 +327,7 @@ export const PROVENANCE = Object.freeze({
   'batch.utilization': {
     source: ENDPOINTS.STATUS,
     path: 'batch_utilization',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'ratio',
     evidence:
@@ -330,6 +343,7 @@ export const PROVENANCE = Object.freeze({
   'throughput.tokens_per_second': {
     source: ENDPOINTS.STATUS,
     path: 'tokens_per_second',
+    wireType: 'number',
     classification: 'NOT_PLUMBED',
     // OLDER BINARIES SEND A LITERAL 0.0 HERE. The current server omits the
     // field, so absence is the normal case and is handled by the caller's
@@ -406,6 +420,7 @@ export const PROVENANCE = Object.freeze({
   'kv.pages_used': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     path: 'pages_in_use',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'pages',
     evidence:
@@ -417,6 +432,7 @@ export const PROVENANCE = Object.freeze({
   'kv.pages_total': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     path: 'window.pool_total',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'pages',
     evidence:
@@ -429,6 +445,7 @@ export const PROVENANCE = Object.freeze({
   'kv.pages_shared': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     path: 'pages_shared',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'pages',
     evidence:
@@ -441,6 +458,7 @@ export const PROVENANCE = Object.freeze({
   'kv.block_size': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     path: 'page_size',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'tokens',
     evidence:
@@ -451,6 +469,7 @@ export const PROVENANCE = Object.freeze({
   'kv.hot_evictions': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     path: 'hot_evictions',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'count',
     evidence:
@@ -461,6 +480,7 @@ export const PROVENANCE = Object.freeze({
   'kv.allocation_failures': {
     source: ENDPOINTS.DEBUG_KV_BLOCKS,
     path: 'allocation_failures',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'count',
     evidence:
@@ -596,6 +616,7 @@ export const PROVENANCE = Object.freeze({
   'prefix_cache.hits': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_hits',
+    wireType: 'number',
     // ⛔ NOT `MEASURED`, AND THE TOP LEVEL IS NOT DECORATION.
     // `resolveForOrigin(entry, origin)` returns an override ONLY when `origin`
     // is truthy AND names a declared arm. A null origin -- before the first
@@ -651,6 +672,7 @@ export const PROVENANCE = Object.freeze({
   'prefix_cache.lookups': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_lookups',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'count',
     evidence:
@@ -680,6 +702,7 @@ export const PROVENANCE = Object.freeze({
   'prefix_cache.hashes': {
     source: ENDPOINTS.STATUS,
     path: 'prefix_hashes',
+    wireType: 'number',
     classification: 'NOT_PLUMBED',
     unit: null,
     evidence:
@@ -697,6 +720,7 @@ export const PROVENANCE = Object.freeze({
   'batch.capacity': {
     source: ENDPOINTS.STATUS,
     path: 'batch_capacity',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
@@ -726,6 +750,7 @@ export const PROVENANCE = Object.freeze({
   'batch.active_size': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'active_batch_size',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
@@ -747,6 +772,7 @@ export const PROVENANCE = Object.freeze({
   'admission.slots_available': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'available_admission_slots',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'slots',
     evidence:
@@ -757,6 +783,7 @@ export const PROVENANCE = Object.freeze({
   'admission.rejections': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'rejected_requests',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'count',
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:139 (snapshot.rejections)',
@@ -843,6 +870,7 @@ export const PROVENANCE = Object.freeze({
   'batch.in_flight': {
     source: ENDPOINTS.STATUS,
     path: 'batch_in_flight',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
@@ -975,6 +1003,7 @@ export const PROVENANCE = Object.freeze({
   'resources.kv_budget_bytes': {
     source: ENDPOINTS.RESOURCES,
     path: 'derived_kv_budget.bytes',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'bytes',
     evidence:
@@ -985,6 +1014,7 @@ export const PROVENANCE = Object.freeze({
   'resources.vram_limit_bytes': {
     source: ENDPOINTS.RESOURCES,
     path: 'vram.limit',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'bytes',
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs — resolved from configured vram limit.',
@@ -1003,6 +1033,7 @@ export const PROVENANCE = Object.freeze({
   'resources.disk_spill_bytes': {
     source: ENDPOINTS.RESOURCES,
     path: 'resolved_limits.disk_spill_bytes',
+    wireType: 'number',
     classification: 'MEASURED',
     unit: 'bytes',
     evidence:

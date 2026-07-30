@@ -41,10 +41,46 @@ const STATUS_ENDPOINT = '/v1/status';
 
 let adminSource = '';
 let register = null;
+let textEndpoints = [];
 
 before(async () => {
   adminSource = readFileSync(ADMIN_RS, 'utf8');
-  register = (await import('./telemetry-provenance.js')).PROVENANCE;
+  const provenance = await import('./telemetry-provenance.js');
+  register = provenance.PROVENANCE;
+  textEndpoints = provenance.TEXT_ENDPOINTS;
+});
+
+const EXPECTED_JSON_WIRE_TYPES = Object.freeze({
+  'server.model_id': 'string',
+  'server.healthy': 'boolean',
+  'server.node_id': 'string',
+  'server.context_length': 'number',
+  'server.pipeline': 'boolean',
+  'server.execution_provider': 'string',
+  'scheduler.running': 'number',
+  'scheduler.waiting': 'number',
+  'queue.depth': 'number',
+  'sessions.active': 'number',
+  'sessions.paused': 'number',
+  'batch.utilization': 'number',
+  'throughput.tokens_per_second': 'number',
+  'kv.pages_used': 'number',
+  'kv.pages_total': 'number',
+  'kv.pages_shared': 'number',
+  'kv.block_size': 'number',
+  'kv.hot_evictions': 'number',
+  'kv.allocation_failures': 'number',
+  'prefix_cache.hits': 'number',
+  'prefix_cache.lookups': 'number',
+  'prefix_cache.hashes': 'number',
+  'batch.capacity': 'number',
+  'batch.active_size': 'number',
+  'admission.slots_available': 'number',
+  'admission.rejections': 'number',
+  'batch.in_flight': 'number',
+  'resources.kv_budget_bytes': 'number',
+  'resources.vram_limit_bytes': 'number',
+  'resources.disk_spill_bytes': 'number',
 });
 
 /**
@@ -70,6 +106,35 @@ describe('the provenance register expires when the server catches up', () => {
       `expected the status handler at ${ADMIN_RS}; read ${adminSource.length} bytes`,
     );
     assert.ok(register && Object.keys(register).length > 10, 'register did not load');
+  });
+
+  it('requires a wireType on every non-derived JSON-path row', () => {
+    const rows = Object.entries(register).filter(
+      ([, entry]) =>
+        !entry.derived &&
+        !entry.metric &&
+        entry.path &&
+        !textEndpoints.includes(entry.source),
+    );
+
+    assert.equal(rows.length, 30, 'the JSON-path census changed; classify the new or removed row');
+    assert.deepEqual(
+      rows.map(([key]) => key).sort(),
+      Object.keys(EXPECTED_JSON_WIRE_TYPES).sort(),
+      'the derived census and explicit type oracle disagree',
+    );
+
+    const invalid = rows
+      .filter(([key, entry]) => entry.wireType !== EXPECTED_JSON_WIRE_TYPES[key])
+      .map(
+        ([key, entry]) =>
+          `${key}: expected ${EXPECTED_JSON_WIRE_TYPES[key]}, declared ${String(entry.wireType)}`,
+      );
+    assert.deepEqual(
+      invalid,
+      [],
+      `wireType is required and must match the server contract:\n${invalid.join('\n')}`,
+    );
   });
 
   it('can tell a served field from an unserved one', () => {
