@@ -1684,3 +1684,129 @@ describe('every token actually used as text clears WCAG AA', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// D345 -- A STYLESHEET MUST BE STRUCTURALLY WELL-FORMED, AND UNTIL NOW NOTHING
+// HERE CHECKED THAT.
+//
+// This arm exists because of a defect I shipped into `shell.css` and caught by
+// hand rather than by instrument. An edit left a duplicated paragraph sitting
+// OUTSIDE the comment that used to contain it: the file had 41 `*/` against 40
+// `/*`, and several lines of English prose were, as far as any CSS parser is
+// concerned, garbage in the middle of the stylesheet.
+//
+// I then ran every guard I own -- 68 tests across two suites -- and got
+// `pass 68 · fail 0 · exit 0`. I re-confirmed it deliberately afterwards by
+// appending known-orphan text to a scratch copy and running them again: still
+// 68/68, still exit 0.
+//
+// ⛔ THE REASON IS THE ONE THIS CREW FOUND IN SIX OTHER PLACES TONIGHT, AND IT
+// IS WORTH STATING PLAINLY BECAUSE IT IS A PROPERTY OF EVERY CHECK IN THIS
+// FILE: MY GUARDS ALL EXTRACT WHAT THEY WANT WITH A REGEX. A REGEX LOOKING FOR
+// `color: var(--og-*)` FINDS EVERY SUCH DECLARATION WHETHER OR NOT THE FILE
+// AROUND IT PARSES. Tolerating malformed input is exactly the property that
+// makes a scanner robust, and it is therefore the property that makes it blind
+// to the file being malformed. Robust to the thing is blind to the thing when
+// the thing is the defect.
+//
+// So this does not check any declaration. It checks that the CONTAINER of every
+// declaration is intact, which is the one question the other 68 cannot ask.
+describe('every stylesheet is structurally well-formed', () => {
+  // CSS comments do not nest. Strip them with an explicit scanner rather than a
+  // regex, because the scanner can REPORT AN UNTERMINATED COMMENT, and an
+  // unterminated comment is the failure that silently swallows the rest of a
+  // file -- every rule after it stops applying, and the page keeps rendering.
+  const stripComments = (text) => {
+    let out = '';
+    let i = 0;
+    while (i < text.length) {
+      const open = text.indexOf('/*', i);
+      if (open === -1) {
+        out += text.slice(i);
+        break;
+      }
+      out += text.slice(i, open);
+      const close = text.indexOf('*/', open + 2);
+      if (close === -1) return { out, unterminated: true };
+      // Preserve newlines so any line number we report still means something.
+      out += text.slice(open, close + 2).replace(/[^\n]/g, '');
+      i = close + 2;
+    }
+    return { out, unterminated: false };
+  };
+
+  const defects = (text) => {
+    const { out, unterminated } = stripComments(text);
+    if (unterminated) return ['an unterminated /* comment -- everything after it is dead'];
+    const found = [];
+    out.split('\n').forEach((line, n) => {
+      // A stray `*/` outside any comment. This is what an edit produces when it
+      // adds a closer the original text already had.
+      if (line.includes('*/')) found.push(`${n + 1}: a \`*/\` that closes nothing`);
+      // A comment-continuation line that escaped its comment. Prose in the
+      // declaration stream. This is the exact shape of the defect above.
+      //
+      // ⛔ THE DISCRIMINATOR IS NARROWER THAN IT LOOKS, AND ITS FIRST VERSION
+      // WAS WRONG. `*` CARRIES TWO UNRELATED MEANINGS IN CSS: the comment
+      // continuation in ` * prose`, and the UNIVERSAL SELECTOR in `*,`,
+      // `*::before,` and `*::after {` -- all three of which are real, correct,
+      // and present at the top of this very file. A bare /^\s*\*/ flagged all
+      // three on its first run. What separates them is that a continuation has
+      // WHITESPACE between the asterisk and its text, while a selector binds
+      // the asterisk tight to `,` `:` or `{`; and prose never carries `{`, a
+      // trailing `,` or a trailing `;`. A name that carries two meanings makes
+      // a naive guard impossible to write -- so the guard must key on the SHAPE
+      // the two meanings do not share, not on the character they do.
+      else if (/^\s*\*\s+\S/.test(line) && !line.includes('{') && !/[,;]\s*$/.test(line)) {
+        found.push(`${n + 1}: \`${line.trim().slice(0, 48)}\` is prose outside a comment`);
+      }
+    });
+    return found;
+  };
+
+  it('has no prose, stray comment closer, or unterminated comment in the declaration stream', () => {
+    for (const file of styleFiles) {
+      assert.deepEqual(
+        defects(css[file]),
+        [],
+        `\`styles/${file}\` is not well-formed CSS. A parser stops applying rules at ` +
+          `the first structural error and the page keeps rendering, so this fails ` +
+          `SILENTLY on screen -- which is why it needs a test rather than a look.`,
+      );
+    }
+  });
+
+  // ANTI-VACUITY. Without this the suite above passes just as happily on an
+  // empty file list or a detector that can only return []. Each arm below is a
+  // DIFFERENT structural defect, because a detector that catches one shape and
+  // reports it as all three would pass a single-case check.
+  it('can actually detect each defect, so a clean run means something', () => {
+    const orphan = 'a { color: red }\n * prose that escaped its comment\n';
+    const stray = 'a { color: red }\n */\n';
+    const open = '/* this comment never closes\na { color: red }\n';
+
+    assert.equal(defects(orphan).length, 1, 'the detector cannot see prose outside a comment');
+    assert.equal(defects(stray).length, 1, 'the detector cannot see a stray `*/`');
+    assert.equal(defects(open).length, 1, 'the detector cannot see an unterminated comment');
+    assert.match(defects(open)[0], /unterminated/);
+
+    // And the negative control: a correct stylesheet, including a comment whose
+    // body contains lines that START with `*`, must produce nothing. Without
+    // this arm the detector could pass the three above by flagging everything.
+    const good = '/*\n * a normal banner comment\n * second line\n */\na { color: red }\n';
+    assert.deepEqual(defects(good), [], 'the detector fires on correct CSS');
+
+    // ⛔ AND THE CONTROL THAT THIS GUARD ACTUALLY FAILED ON ITS FIRST RUN, kept
+    // as a permanent arm because it is the case a future simplification of the
+    // regex would silently reintroduce: the CSS UNIVERSAL SELECTOR. All three
+    // spellings below are live at the top of `shell.css` and `tokens.css`, and
+    // a bare /^\s*\*/ reports every one of them as prose.
+    const universal = '*,\n*::before,\n*::after {\n  box-sizing: border-box;\n}\n';
+    assert.deepEqual(
+      defects(universal),
+      [],
+      'the detector mistakes the universal selector for comment prose -- the two ' +
+        'share the `*` character and nothing else, so key on the shape, not the char',
+    );
+  });
+});

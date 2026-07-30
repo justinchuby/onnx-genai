@@ -166,6 +166,36 @@ body[data-blocked] .app {
  * silently fell back to inherited styling, which looks close enough to correct
  * that only a cross-language check finds it. state-treatments.test.js is that
  * check, and it compares these selectors against the enum on every run.
+ *
+ * AND THIS WARNING HAS NOW EARNED ITS KEEP BY REFUSING A DESIGN, WHICH IS THE
+ * ONLY WAY A COMMENT EVER PROVES IT WAS WORTH WRITING.
+ *
+ * A proposed low-contrast treatment would have inverted the container behind
+ * these values. It was withdrawn for a reason worth stating in full, because
+ * the reasoning generalises past this file: inverting a container invalidates
+ * the entire palette inside it at once, since every token here was tuned
+ * against a dark background. Patching the one obviously-broken colour would
+ * have repaired that value and nothing else, because many unconditional rules
+ * across all three stylesheets set `color` on `.value` descendants, and most
+ * of the state tokens fail contrast on a light background.
+ *
+ * THOSE TWO QUANTITIES ARE DELIBERATELY NOT WRITTEN AS NUMBERS HERE. A COUNT
+ * OF WHICH RULES WIN IS A CASCADE CLAIM, AND A CASCADE CLAIM CANNOT BE SETTLED
+ * BY READING SELECTORS -- only `getComputedStyle` settles it, which is why the
+ * contrast suite in asset-graph.test.js measures rather than greps. A number
+ * printed here would be a selector-reading result wearing the authority of a
+ * measurement, and it would rot silently as rules move between these files.
+ *
+ * The replacement is the chip at the end of this section: it declares BOTH of
+ * its own colours and inherits nothing, so no existing child rule and no child
+ * element added later can break it.
+ *
+ * THE RULE, AND IT IS THE REASON THIS PARAGRAPH EXISTS RATHER THAN A CHANGELOG
+ * ENTRY SOMEWHERE ELSE: WHEN A PROPOSED CHANGE FORCES YOU TO REWRITE A WARNING
+ * THAT WAS CORRECT, THAT IS EVIDENCE ABOUT THE CHANGE, NOT ABOUT THE WARNING.
+ * The design that did NOT require editing this comment turned out to be the
+ * design that matched the system. Treat an urge to soften these words as a
+ * finding about whatever you are holding.
  */
 
 [data-state='measured'] {
