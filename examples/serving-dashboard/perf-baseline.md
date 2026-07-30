@@ -1508,3 +1508,77 @@ this file will not blur those. **The one thing that did work exactly as
 predicted is §2's claim that 512-token generations suppress variance: CV fell
 from 28.90 % at 128 tokens to 20.56 %/23.19 % at 512.** The protocol's
 statistical advice was sound; its scheduling advice was not.
+
+---
+
+## 11. 🔴 THE DEMO'S TWO PANES DIFFER BY WHETHER CONTINUOUS BATCHING RUNS AT ALL — AND THE PRE-FIX SERVER ADVERTISED A WIDTH IT WAS NOT USING
+
+Found while smoke-testing `d08d44b8` ("publish the batch width the driver will
+run at, not the ceiling it was configured with"), which landed on the exact field
+my AC189 P1 rests on. The server change is **correct**; what it exposed is not.
+
+### 11.1 The measured matrix — counts only, and why only counts
+
+Four arms, `n=4` concurrent completions each, `max_tokens=160`, identical prompt.
+`batch_in_flight` sampled every 500 ms via `/v1/status` for the whole generation.
+
+| binary | model / `--model-id` | `batch_capacity` | **peak `batch_in_flight`** | honest? |
+|---|---|---|---|---|
+| pre-`d08d44b8` | `qwen2.5-0.5b-scatter-v2` / `qwen-scatter` | 4 | **4** | ✅ |
+| pre-`d08d44b8` | `qwen2.5-0.5b` / `qwen-dynamic` | **4** | **1** | ❌ **advertises 4, runs 1** |
+| post-`d08d44b8` | `qwen2.5-0.5b` / `qwen-dynamic` | **1** | **1** | ✅ |
+| post-`d08d44b8` | `qwen2.5-0.5b-scatter-v2` / `qwen-scatter` | 4 | **4** | ✅ **positive control** |
+
+> **⚠️ THE FOURTH ROW IS THE ONLY REASON THE THIRD ROW MEANS ANYTHING.** A fix that
+> simply always published `1` would produce row 3 identically. Without an arm where
+> the corrected field is *required to come back large*, "it now reports 1" is
+> indistinguishable from "it now reports 1 always." **A correction needs a case it
+> could have failed, or it is not a test — it is a coincidence with good manners.**
+
+**No timing ratio is stated here and that is deliberate.** Load ranged **27.00 to
+60.82** across these arms — the wall-clock figures spanned 9.2 s to 42.9 s for
+byte-identical work and are worthless. **The claim is a COUNT: how many rows the
+driver actually ran. A count needs no arithmetic, no denominator and no quiet box,
+which is exactly why the crew resolved to ship the mechanism rather than the ratio
+(`2d6b36ac`), and it is why this section survives conditions in which §1 would not.**
+
+### 11.2 What this means for the demo, which is the part that matters
+
+`run-demo.sh:62-63` launches both panes from **different model artifacts**:
+
+```
+SCATTER_MODEL  qwen2.5-0.5b-scatter-v2   -> continuous batching ENGAGES (4 rows)
+DYNAMIC_MODEL  qwen2.5-0.5b              -> continuous batching DOES NOT ENGAGE (1 row)
+```
+
+> **🔴 THE TWO PANES DO NOT DIFFER ONLY IN THE VARIABLE THE DEMO NAMES. One pane
+> batches and the other does not. Any comparison drawn across the panes — throughput,
+> latency, occupancy, scheduling behaviour — is confounded by the presence or absence
+> of the headline feature itself.** The pane labelled **dynamic** is the one where
+> dynamic batching does not happen.
+
+And pre-`d08d44b8`, that pane served `batch_capacity: 4`, so the scheduling panel
+would render **"of 4 max"** on a driver running one row wide. **A capability claim
+about the product, rendered confidently, in the product's own UI, on the pane named
+after the capability.** This is the same failure shape as the AC189 P1 in
+`browser-render-verification.md` §7 — **a wrong number invites doubt; a wrong claim
+about the system closes the question** — except here the false statement originated
+in the server, not the dashboard.
+
+### 11.3 Status and what is NOT claimed
+
+- ✅ `d08d44b8` is **verified correct and discriminating**, by positive control.
+- ✅ The false `batch_capacity: 4` on the dynamic pane is **fixed in HEAD**.
+- ❗ **NOT fixed:** the two panes still differ by whether batching runs. That is a
+  demo-composition question, not a server bug, and it is not mine to decide.
+- 🚫 **NOT claimed:** *why* `qwen2.5-0.5b` lacks a continuous-batch manager. I
+  measured that it does not engage; I did not establish the cause, and I am not
+  going to infer one from a name.
+- 🚫 **NOT claimed:** any throughput ratio between these arms. See the load range above.
+
+**Reproduce:**
+```
+python3 qa-batch-width.py 8133 qwen-scatter    # expect peak in_flight 4
+python3 qa-batch-width.py 8134 qwen-dynamic    # expect peak in_flight 1
+
+```
