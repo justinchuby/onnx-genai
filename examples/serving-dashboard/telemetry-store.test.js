@@ -987,6 +987,108 @@ test('slow completion cannot roll a newer fast value or observation time backwar
   }
 });
 
+test('fast completion cannot erase a newer slow value or observation time', async () => {
+  let clock = 0;
+  let statusRequests = 0;
+  let releaseSlow;
+  let releaseSecondFast;
+  let markSecondFastStarted;
+  const slowResponse = new Promise((resolve) => {
+    releaseSlow = resolve;
+  });
+  const secondFastResponse = new Promise((resolve) => {
+    releaseSecondFast = resolve;
+  });
+  const secondFastStarted = new Promise((resolve) => {
+    markSecondFastStarted = resolve;
+  });
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    pollIntervalMs: 100,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname;
+      if (path === ENDPOINTS.STATUS) {
+        statusRequests += 1;
+        clock = statusRequests * 1_000;
+        if (statusRequests === 1) {
+          return jsonResponse(200, statusBody({ queue_depth: 1 }));
+        }
+        markSecondFastStarted();
+        return secondFastResponse;
+      }
+      if (path === ENDPOINTS.DEBUG_CONFIG) {
+        return slowResponse;
+      }
+      return fakeFetch(routes)(url);
+    },
+  });
+  const waitForField = (key, predicate, message) =>
+    new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(message));
+      }, 2_000);
+      const unsubscribe = store.subscribe((candidate) => {
+        const field = candidate.fields[key];
+        if (!predicate(field)) return;
+        clearTimeout(timeout);
+        unsubscribe();
+        resolve(field);
+      });
+    });
+
+  try {
+    store.start();
+    await waitForField(
+      'queue.depth',
+      (field) => field.value === 1,
+      'the first fast cycle never published queue.depth=1',
+    );
+    await secondFastStarted;
+
+    releaseSlow(
+      jsonResponse(200, {
+        node_id: 'node-0',
+        pipeline: false,
+        max_batch_size: 8,
+        max_output_tokens: 512,
+        max_sessions: 256,
+        max_queue_depth: 64,
+        model_max_context: 32768,
+      }),
+    );
+    const slowField = await waitForField(
+      'server.context_length',
+      (field) => field.state === FIELD_STATES.MEASURED,
+      'the slow result never published server.context_length',
+    );
+
+    releaseSecondFast(jsonResponse(200, statusBody({ queue_depth: 2 })));
+    await waitForField(
+      'queue.depth',
+      (field) => field.value === 2,
+      'the second fast cycle never published queue.depth=2',
+    );
+
+    const finalSlowField = store.field('server.context_length');
+    assert.equal(
+      finalSlowField.state,
+      FIELD_STATES.MEASURED,
+      'fast completion erased a slow key it did not fetch',
+    );
+    assert.equal(finalSlowField.value, 32768);
+    assert.ok(
+      finalSlowField.observedAtMs >= slowField.observedAtMs,
+      `fast completion moved slow freshness backward from ${slowField.observedAtMs} to ` +
+        `${finalSlowField.observedAtMs}`,
+    );
+  } finally {
+    store.stop();
+  }
+});
+
 test('an HTML error page served at /metrics does not crash the store', async () => {
   // A proxy or a wrong port realistically returns HTML with a 200.
   const store = createTelemetryStore({

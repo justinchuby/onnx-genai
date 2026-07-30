@@ -403,16 +403,12 @@ export function createTelemetryStore({
         snapshot.connection.state === CONNECTION_STATES.UNREACHABLE
           ? [ENDPOINTS.HEALTH, ENDPOINTS.STATUS]
           : D88_FAST_ENDPOINTS;
-      latestSourceResults = {
-        ...latestSourceResults,
-        ...(await fetchSources(fastPaths)),
-      };
+      const fastResults = await fetchSources(fastPaths);
+      applySourceResults(fastResults);
 
       if (slowMode === 'await') {
-        latestSourceResults = {
-          ...latestSourceResults,
-          ...(await fetchSources(ONE_SHOT_ENDPOINTS)),
-        };
+        const oneShotResults = await fetchSources(ONE_SHOT_ENDPOINTS);
+        applySourceResults(oneShotResults);
         publish(buildSnapshot(latestSourceResults));
       } else if (slowMode === 'background') {
         publish(buildSnapshot(latestSourceResults));
@@ -440,11 +436,15 @@ export function createTelemetryStore({
     slowPollInFlight = true;
     try {
       const slowResults = await fetchSources(BACKGROUND_SLOW_ENDPOINTS);
-      Object.assign(latestSourceResults, slowResults);
+      applySourceResults(slowResults);
       publish(buildSnapshot(latestSourceResults));
     } finally {
       slowPollInFlight = false;
     }
+  }
+
+  function applySourceResults(results) {
+    Object.assign(latestSourceResults, results);
   }
 
   /** Poll fast when healthy; back off while unreachable so we never flood. */
