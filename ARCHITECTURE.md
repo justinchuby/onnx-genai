@@ -239,6 +239,23 @@ For each boundary: what the **caller** must guarantee, what the **callee** guara
 - **Caller guarantees:** the same tokenizer instance is used for encoding a prompt and decoding its output.
 - **Why it matters:** `run_continuous_batch_scheduled` tokenizes every prompt **up front** and hands the manager token ids specifically so that "no re-tokenization can drift between the two" (`batched.rs:732-735`). Re-tokenizing mid-flight would desynchronize the scheduler's length accounting from the batch's actual rows.
 
+### 4.7 `/v1/status` is a **node**-level contract with no model dimension
+
+This is the clearest example in the codebase of a wire contract constraining an architecture decision, so it is worth stating precisely.
+
+`GET /v1/status` returns `NodeStatus` (`routes/mod.rs:118-131`, handler `routes/admin.rs:41-86`). Its own doc comment defines the scope (`routes/mod.rs:110-116`):
+
+> All values are model-agnostic; `node_id` names this node, never a model.
+
+- **Consumer:** the cluster router, not just local tooling. It is a shared contract, not an internal detail.
+- **Guarantee:** every field describes *the node*. There is no field identifying which model a number came from, and no place to put one without changing the struct.
+
+**The consequence, spelled out.** Multi-model mode gives each model its **own** `EngineDriver` (`state.rs:376`), so two models really do run in one process. But `/v1/status` has no model dimension, so with two drivers behind one node it can only report one engine's numbers or blend them — and **a consumer cannot tell which**. Blending is the dangerous outcome precisely because the response still looks well-formed and plausible.
+
+Adding a model dimension is possible but is a **breaking change to a contract another component consumes**. Running one server per model instead makes `/v1/status` unambiguous *by construction*: one engine per origin, no new fields, no migration, and no way to misattribute a number.
+
+> **Guidance for anyone extending this endpoint:** if you find yourself wanting to add per-model fields to `NodeStatus`, prefer a separate model-scoped endpoint. Node-level and model-level data have different cardinality, and merging them silently breaks the guarantee the cluster router depends on.
+
 ---
 
 ## 5. Invariants
@@ -321,6 +338,42 @@ Documented at `batched.rs:708-711`. There is no runtime assertion; it follows fr
 ### 5.9 Configuration asserts — ENFORCED, at construction
 
 `page_table.rs:740-741` requires non-empty layer configs; `:776` requires every page tensor config to validate. These are `assert!`, so violation panics at construction — loud and early, which is correct for configuration errors.
+
+### 5.10 The decode loop never blocks for observability — **ASSUMED, NOT ENFORCED** ⚠️
+
+> No code inside the decode step loop may `.await`, acquire a lock, block, or allocate unboundedly — including for telemetry.
+
+Nothing in the type system prevents it. The engine thread (`driver.rs:113-123`) is a plain OS thread that owns the `Engine` outright, so there is no borrow-checker or runtime guard that would reject a blocking call; it will compile and run and simply make every token slower.
+
+**Why it holds:** the loop at `driver.rs:575-603` runs once per decode step for *every* in-flight request. Latency added there is multiplied by steps and by batch size, and it lands directly in inter-token latency — the number users feel most.
+
+**What breaks if violated:** token generation stalls for every concurrent request at once. It degrades gradually rather than failing, so it survives review and shows up later as "the server got slower" with no obvious cause.
+
+**Safe primitives:** relaxed atomics (the pattern already used throughout `metrics.rs:74-101`), or `tokio::sync::broadcast::send`, which is deliberately non-`async` and returns immediately even with no receivers.
+
+### 5.11 Non-`Generate` commands are deferred until the batch drains — ENFORCED
+
+> While a continuous batch is running, the **only** command processed inline is `DriverCommand::Generate` with `session_id: None`. Every other command is queued and not handled until the batch goes idle.
+
+Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:575-594`): the `try_recv` drain matches `Generate { session_id: None, .. }` and submits it to the manager, and the catch-all arm at **`driver.rs:592`** pushes everything else onto `deferred`. That queue is only drained at `driver.rs:520`, after the batch loop has exited.
+
+**Why it holds:** the `Engine` is single-owner with no interior locking (§6). Servicing an arbitrary command mid-batch would need mutable access the batch loop is already holding.
+
+**What breaks if violated — and this is a live trap:** anything latency-sensitive implemented as a `DriverCommand` is answered **only when the server is idle**. A telemetry command is the worst case: batch occupancy, queue depth, and KV stats would be unavailable *precisely while the server is busy*, which is the only time they are interesting. A dashboard built that way appears to work in testing and freezes under load — looking like a UI bug rather than an architectural one.
+
+> ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`driver.rs:595-603`), and published through an atomic or a broadcast channel. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted.
+
+### 5.12 Exactly one model-directory validator — **ASPIRATIONAL, CURRENTLY VIOLATED** ⚠️
+
+> A directory is a valid model directory if and only if `ModelDirectory::load` (`onnx-genai-ort/src/loader.rs:35`) accepts it. No other component may define its own criterion.
+
+**This invariant is currently false**, and stating it as intent rather than behaviour would violate this document's own honesty rule. `looks_like_model_dir` (`models_config.rs:161-165`) is a second, weaker validator that accepts on an **OR** of conditions where the loader requires an **AND**. A directory can therefore pass admission and then fail at load, producing contradictory error text (`models_config.rs:155-158`).
+
+**Why the invariant is worth holding:** validation that disagrees with loading is unfalsifiable from the user's side — the error message names the wrong cause.
+
+**What breaks while it is violated:** a user is told their model directory is fine, then told it does not exist. Two duplicated error strings (`state.rs:366` and `engine/load.rs:30`) make the origin ambiguous when debugging.
+
+**Status:** the fix is funded — delete `looks_like_model_dir` and unify on `ModelDirectory::load(...).is_ok()`. Update this section to ENFORCED when it lands.
 
 ---
 

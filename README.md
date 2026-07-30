@@ -63,7 +63,7 @@ paged KV cache — so on a batching server the page table, the prefix cache, and
 preemption are all bypassed. On a dynamic-cache server the paging and prefix
 subsystems are fully active but requests are served one at a time. Both paths
 are supported and correct; they are simply not yet available at once. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.6.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §5.6.
 
 ## Quick Start
 
@@ -730,7 +730,7 @@ Remaining advanced work includes:
 - Automatic hardware-profile probing/matching beyond explicit EP selection and
   metadata capability validation.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the system is put
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how the system is put
 together — component hierarchy, the request lifecycle, the contracts and
 invariants between layers, and an honest inventory of what is stubbed.
 
