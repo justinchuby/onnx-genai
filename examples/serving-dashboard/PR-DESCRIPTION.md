@@ -668,3 +668,55 @@ a total containing uncommitted files.
 
 > **A number in this document without a revision beside it is a defect in this
 > document. If you find one, it is mine.**
+
+---
+
+## Known gap: this repository cannot tell you who did any of this
+
+**Measured, not recalled. Over the last 200 commits:**
+
+```
+distinct commit AUTHORS      **1**       distinct COMMITTERS  **1**
+commit messages naming a contributor id   65 / 200
+```
+
+Fourteen contributors produced this branch. **The permanent record shows one
+person.** Author-based attribution is not degraded here — it is *absent*, and
+every credit and blame assigned during the work was settled from conversation
+and memory rather than from the tree.
+
+**The obvious workaround is worse than nothing, and we measured that too.**
+Searching commit *messages* for a contributor's id looks like an authorship
+query and is a **citation** query:
+
+```
+--grep <my own id>          -> 19 commits.  Touching my files: **1**
+                               The other 18 are other people's files.
+--grep <a reviewer's id>    -> **34 commits**
+                               THAT REVIEWER WROTE **ZERO** COMMITS ALL SESSION.
+[NEG CONTROL] a nonsense token -> 0
+```
+
+> **The contributor who wrote nothing scores highest, because everyone thanked
+> them. Citation and authorship here are not merely different sets — they are
+> close to inverted, and the inversion rewards exactly the reviewing work that
+> leaves no commits behind.**
+
+**So the only recoverable attribution in this repository is file ownership**:
+resolve a SHA, list its files, ask whose file that is. **That makes one-writer-
+per-path a correctness property rather than a tidiness preference** — it is the
+sole mechanism by which any claim about who did what can be checked at all.
+
+**Why this belongs in a PR description and not in a retro:** three separate
+contributors were credited in writing tonight with work they did not do, and
+each correction required someone to run `git show --name-only` against their own
+reputation. **Two of those were caught only because the person being praised
+declined the praise.** *A misattribution that hands you credit produces no
+complaint from the receiver and no alarm from the giver — every incentive in the
+loop lets it stand,* which is why it is the one defect class here that survived
+the entire session while ten others were closed.
+
+**The remedy we can offer the next reader is small and mechanical:** an
+attribution is a claim, so it carries the SHA and pathspec that establish it, or
+it names no one. **This document follows that rule — including in one place
+where following it meant deleting a name we could not verify.**
