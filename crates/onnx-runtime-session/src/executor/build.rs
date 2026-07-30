@@ -953,6 +953,10 @@ impl Executor {
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
                 static_view,
+                outputs_pre_sized: node
+                    .outputs
+                    .iter()
+                    .all(|&vid| graph.value_shape_is_known(vid)),
             });
         }
         let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();

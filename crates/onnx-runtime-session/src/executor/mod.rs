@@ -339,6 +339,10 @@ pub(crate) struct NodePlan {
     /// so data-dependent output shapes are resolved at the right topological
     /// point, but they never dispatch through `get_kernel`.
     pub static_view: Option<StaticViewKind>,
+    /// All outputs have load-time-known symbolic/static shapes and are sized by
+    /// the run setup pass. Hot decode compute nodes can skip redundant per-node
+    /// output allocation checks unless an output is externally bound.
+    pub outputs_pre_sized: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
