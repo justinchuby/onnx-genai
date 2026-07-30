@@ -161,6 +161,33 @@ fn demo_path_is_servable(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/demo/") else {
         return true;
     };
+    // Refused before anything else looks at the shape of the path, because
+    // every check below reads a DIFFERENT STRING than the one `ServeDir` will
+    // open. This predicate is handed `Uri::path()`, which is still
+    // percent-encoded; `ServeDir` decodes first. So `%2Evite` has no segment
+    // starting with `.` to the rule below, and IS `.vite` on the filesystem --
+    // an authorisation decision taken about a string that is not the string
+    // that gets used.
+    //
+    // Decoding here would be the obvious fix and it is the wrong one: it
+    // creates a second decoder that must stay byte-compatible with `ServeDir`'s
+    // forever, which is the same defect with an extra moving part. Refusing the
+    // escape removes the differential instead of policing it, so it cannot
+    // drift.
+    //
+    // Measured, not assumed: of the assets under this directory carrying a
+    // servable extension, ZERO require percent-encoding to address, and zero
+    // filenames contain a space. This costs nothing real today, and a file that
+    // one day needs an escape gets a 404 rather than a bypass -- the safe
+    // direction for a rule whose only job is to keep two parsers from
+    // disagreeing.
+    //
+    // This must precede the directory case below: `/demo/node_modules/%2Evite/`
+    // ends with `/`, and returning true for it hands `ServeDir` a dot-directory
+    // to resolve `index.html` inside.
+    if rest.contains('%') {
+        return false;
+    }
     // A directory request; `ServeDir` resolves it to `index.html`, which is on
     // the list.
     if rest.is_empty() || rest.ends_with('/') {
@@ -423,6 +450,52 @@ mod tests {
     fn extensionless_paths_are_not_served() {
         assert!(!demo_path_is_servable("/demo/LICENSE"));
         assert!(!demo_path_is_servable("/demo/Dockerfile"));
+    }
+
+    /// The segment rule above reads a string `ServeDir` has not decoded yet.
+    ///
+    /// Every other test in this module hands the predicate an ALREADY-DECODED
+    /// literal, so all of them share the premise that the predicate's input is
+    /// the string `ServeDir` opens -- and not one of them asserts it. That
+    /// premise is false, and it was false on the wire: measured against a live
+    /// origin, `/demo/node_modules/.vite/.../results.json` answered 404 while
+    /// `%2Evite` answered 200 with 266 bytes byte-identical to disk.
+    ///
+    /// A guard tested only through its own front door never meets the decoder
+    /// sitting in front of it.
+    #[test]
+    fn a_percent_escape_cannot_smuggle_a_dot_segment_past_the_segment_rule() {
+        for path in [
+            "/demo/node_modules/%2Evite/vitest/results.json",
+            "/demo/node_modules/%2evite/vitest/results.json",
+            "/demo/%2Egit/config.json",
+            "/demo/%2Evscode/settings.json",
+            // The directory form: this ends with `/`, so without the escape
+            // check preceding the directory case it reaches `ServeDir` as a
+            // request to resolve `index.html` inside a dot-directory.
+            "/demo/node_modules/%2Evite/",
+        ] {
+            assert!(
+                !demo_path_is_servable(path),
+                "{path} authorises on a string ServeDir will decode into a \
+                 dot-segment; the escape must be refused, not decoded here"
+            );
+        }
+    }
+
+    /// The cost of the escape ban, stated rather than discovered later.
+    ///
+    /// Refusing every `%` refuses legitimately-escaped names too. Zero assets
+    /// under this directory need one today -- measured, and the refusal is a
+    /// 404 rather than a bypass -- but a future file with a space in its name
+    /// will be unreachable, and this is where that is written down.
+    #[test]
+    fn the_escape_ban_refuses_even_an_otherwise_servable_name() {
+        assert!(!demo_path_is_servable("/demo/my%20panel.js"));
+        // The control that keeps the two lines above from being vacuous: the
+        // same name without the escape is still served, so this test cannot
+        // pass against a predicate that refuses everything.
+        assert!(demo_path_is_servable("/demo/my-panel.js"));
     }
 
     /// Same host, any port: the demo runs two servers on one host and the page
