@@ -369,7 +369,7 @@ is the sharpest example of it anyone has produced tonight: same commit, 18 failu
 | **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **LIVE (as F4-REVISED) — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: the declaration is now `prefix-cache.js:88`, not `:77`. |
 | **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **STRUCK @ `1b4d76c6`** — `ROOT` now derives from `tree_context.repo_root()`; exits `CANNOT_RUN` with no worktree and exits 1 conditionally. Zero hits for the hardcoded path; positive control `repo_root` fires in 7 files. |
 | **F11** MAJOR | `index.js:179` `createRovingGroup(root, { label: panel.title })`; `panel.title` is not a key of the frozen registry entry. | **LIVE — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: now `dashboard/index.js:143`, not `:179`. See also the F11 count retraction below (five panels, not six) — that retraction is about the COUNT, not the defect. |
-| F2 | retracted — see #2 above. | **FIXED**, but its guard is not: `check-field-states.test.js:69` reads `FIELD_STATES.MEASURED ?? FIELD_STATES.OK`. The enum defines no `OK` key, so the fallback is dead code and the guard accepts either spelling — **it cannot fail on the very half-swept rename F2 filed.** |
+| F2 | retracted — see #2 above. | **FIXED, and so is its guard — I withdraw the claim that stood here.** I wrote that `check-field-states.test.js:69`'s `FIELD_STATES.MEASURED ?? FIELD_STATES.OK` made the guard unfailable. **Mutation-proven false at `1bca52a8`, against the real module and the real README, no file written:** point the README sentence at the retired spelling `'ok'` → **fires**; delete the sentence entirely → **fires**; unmutated control → **silent**. It is a working, non-vacuous drift guard that reads the wire value from the constant instead of hardcoding a spelling. **The only true residue is cosmetic and I should have filed it as such: `FIELD_STATES.OK` is `undefined`, so the `??` arm is dead code and `:73`'s failure message names a key the enum no longer defines.** Not a defect in the guard — a retired spelling surviving in the guard's own prose. |
 
 **Reader instruction, applying to this whole document:** every `file:NNN` here is a
 **hint, not an address**. Two of the five rows above drifted line numbers while their
@@ -380,6 +380,12 @@ substance was unchanged, and this branch took ~1.4 commits/minute during the rev
 *other* suite; F3, F4, F5 and F11 have no test that could fail. That is the finding behind the
 findings: **484 green JS tests coexist with an unnamed `role="group"` on every panel, a silently
 ignored null ceiling, a linter that cannot fail, and two render stacks that disagree.**
+> **TENSE STAMP (re-measured `1bca52a8`): this paragraph is a snapshot and two of its clauses have
+> since expired.** `484` was the JS count at the time of writing; the canonical runner reported
+> **632 / 95 suites / 0 fail** hours later. **"A linter that cannot fail" is F5, and F5 was STRUCK
+> at `1b4d76c6`** (ancestor of HEAD, checked). The clauses that still hold at re-measurement are the
+> unnamed `role="group"`, the null ceiling (F4-revised), and the two render stacks (F3). **Do not
+> quote this sentence as a current count or a current finding — it is neither.**
 
 ### The enum: the ordered audit comes back CLEAN, and the premise it rested on is stale
 
@@ -930,6 +936,14 @@ those is the same shape: an output that reads identically whether the thing is r
 never checked. The five findings above are not places the tests failed. They are places **no
 test was ever pointed**, and a green bar cannot tell you the difference.
 
+> **TENSE STAMP (re-measured `1bca52a8`) — and the passage above earned its own lesson the hard way.**
+> `484/484` was the count when written; the canonical runner later reported **632 / 95 suites / 0 fail**.
+> **"A linter that cannot fail" is F5, STRUCK at `1b4d76c6`.** The paragraph's *argument* stands and I
+> am not withdrawing it — but it is a closing note, the part a reader quotes, and it carried two
+> expired facts. **That is the whole thesis of this document happening to the sentence that states
+> the thesis.** A rhetorical passage is exactly where staleness hides, because nobody re-measures
+> a conclusion.
+
 
 ---
 
@@ -1156,7 +1170,22 @@ finding independently and withdrew it first. **Both of us verified the call site
 registry.** Two reviewers, one defect, one mechanism — which is why it is worth recording rather than
 quietly deleting. Merge-checklist item 4 is struck.
 
-### F16 (MAJOR, new) — a guard that is green because it cannot fail
+### F16 (~~MAJOR~~ → **LARGELY CLOSED, re-measured at `1bca52a8`**) — a guard whose scope, not construction, was too narrow
+
+> **READ THIS BEFORE THE TABLE BELOW. The table is a photograph of an older tree and its
+> headline conclusion no longer holds.** Re-censused at `1bca52a8` with the denominator published
+> first: **7** tracked `.md` files carry the withdrawn figure, and the guard's corpus now reaches
+> **5** of them. Only `demo-spec.md` and `design/demo-ux.md` remain exempt carriers, both as
+> *documented promises with named paragraphs* — and `check-perf-claims.test.js:240` now computes
+> `staleDeferrals`, failing when an exemption outlives its reason, on the stated ground that
+> *"an exemption that outlives its reason is indistinguishable from a suppression."* @fc8b5d97
+> retired one exemption outright and recorded the 0-occurrence measurement that justified it.
+> **My original conclusion — "every instance is unreachable except the one that does not carry the
+> defect" — was true when taken and is false now.** The finding that survives is much smaller: two
+> exempt carriers, both tracked by a mechanism that did not exist when I filed this.
+>
+> **And the row for F16 in Re-verification #3 named the wrong file entirely** — it described
+> `check-field-states.test.js`, which belongs to F2, not to F16. Two findings fused into one row.
 
 `check-perf-claims.test.js` contains a test named `no document presents a withdrawn prefix timing
 figure without its noise floor`. It is green. Its reach versus where the withdrawn figure actually
@@ -1773,7 +1802,7 @@ execution — not by reading the previous row.
 | **F11** | ⚪ **RETRACTED** (unchanged) | `6ecd9183` | Already retracted in this document. Re-measured anyway: 2 `role="group"` sites, 0 with a nearby `aria-label`. **I am not re-opening it on that number** — a JSX/template-built role is invisible to this grep, so the measurement is a floor, not a census. |
 | **F12** | 🟢 **STRUCK** | `6ecd9183` | `repair-citations.test.js` now exists — 6,145 bytes, **6 tests, 6 pass**. It tests the exact property I filed: `it('REFUSES a cited file with uncommitted changes')` asserting `/DECLINED/`. The tool no longer computes from the dirty tree; it declines. |
 | **F15** | 🟢 **CLOSED** (unchanged) | `6ecd9183` | Already closed in this document; no contrary evidence found. |
-| **F16** | 🔴 **LIVE** | `6ecd9183` | `check-field-states.test.js` still reads `FIELD_STATES.MEASURED ?? FIELD_STATES.OK`. The enum has no `OK`, so the fallback is dead and the guard fires only if **both** spellings vanish — a state no half-swept rename can produce. **A guard that is green because it cannot fail.** |
+| **F16** | 🔻 **LARGELY CLOSED — my LIVE was wrong three ways** | re-measured at `1bca52a8` | **This row named the wrong file.** F16's body is about `check-perf-claims.test.js` (a *scope* defect); the row described `check-field-states.test.js` (a *dead-fallback* claim). They are different findings and I fused them. **Both halves then failed re-measurement.** ① Scope: 7 tracked `.md` files carry the withdrawn figure and the corpus now reaches **5 of them** — `demo-spec.md` and `design/` are the only exempt carriers, both as documented promises, and `check-perf-claims.test.js:240` now *detects exemptions that outlive their reason*. @fc8b5d97 retired one exemption with a stated 0-occurrence measurement. My "every instance is unreachable" is **stale**. ② Dead fallback: **mutation-disproven, see below.** |
 
 ### Two instrument notes from this pass, both of which nearly cost a wrong row
 
