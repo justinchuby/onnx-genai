@@ -221,93 +221,108 @@ export const PROVENANCE = Object.freeze({
   'sessions.paused': {
     source: ENDPOINTS.STATUS,
     path: 'paused_sessions',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'STRUCTURALLY_BYPASSED',
     unit: 'sessions',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:62 — `paused_sessions: 0, ' +
-      '// not yet tracked (no preemption/pause state exposed)`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `paused_sessions: None`, registered in ' +
+      'the handler unavailable map via `FieldUnavailable::not_applicable`, reason ' +
+      '`the driver runs generations to completion without preemption, so no session can be ' +
+      'paused`.',
     label: 'Paused sessions',
     reason:
-      'The server has no preemption/pause state to report, so it sends a documented zero. ' +
-      'This demo will not render that zero as a measurement.',
+      'Not a missing number — a concept that does not apply to this scheduler. The driver ' +
+      'runs each generation inline to completion, so no session can ever be paused. The ' +
+      'server states the distinction itself: not-applicable, not unavailable.',
   },
   'batch.utilization': {
     source: ENDPOINTS.STATUS,
     path: 'batch_utilization',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'MEASURED',
     unit: 'ratio',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:64 — `batch_utilization: 0.0, ' +
-      '// not yet tracked (max batch size not surfaced to the server)`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `fn batch_utilization(in_flight: u64, ' +
+      'capacity: usize) -> f32` divides the live in-flight count by the capacity the server ' +
+      'admitted against, guards the zero-capacity case, and clamps to 1.0.',
     label: 'Batch utilization',
     reason:
-      'The server cannot compute this because the batch limit is not surfaced to the HTTP ' +
-      'layer, so it sends a hardcoded 0.0. A zero here would be a fabricated measurement.',
+      'This was a hardcoded 0.0 earlier in the project and this table said so. It is now a ' +
+      'real computation over two live values, and its denominator is published beside it as ' +
+      '`batch_capacity`, so the client never has to assume a capacity no endpoint confirms.',
   },
   'throughput.tokens_per_second': {
     source: ENDPOINTS.STATUS,
     path: 'tokens_per_second',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'NOT_PLUMBED',
     unit: 'tokens/s',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:63 — `tokens_per_second: 0.0, ' +
-      '// not yet tracked (only cumulative token totals recorded)`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `tokens_per_second: None`, registered ' +
+      'in the handler unavailable map via `FieldUnavailable::unavailable`, reason ' +
+      '`only a cumulative token count is recorded; a lifetime average would misreport as a ' +
+      'current rate -- see the latency histograms on /metrics`.',
     label: 'Server-reported tokens/sec',
     reason:
-      'The server records cumulative token totals but no rate, so it sends a hardcoded 0.0. ' +
-      'This demo measures throughput client-side from streamed tokens instead, and labels it ' +
-      'as client-measured.',
+      'Omitted, not zeroed. Only a cumulative total is recorded; dividing it by uptime gives ' +
+      'a lifetime average that reads as a current rate — lowest exactly when the node has ' +
+      'been idle longest. This demo measures throughput client-side from streamed tokens and ' +
+      'labels it as client-measured.',
   },
 
-  // ---------------------------------------------------------------- paged KV (all zeros today)
+  // ---------------------------------------------------------------- paged KV (omitted today, not zeroed)
   'kv.usage': {
     source: ENDPOINTS.STATUS,
     path: 'kv_usage',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'NOT_PLUMBED',
     unit: 'ratio',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:54 — `kv_usage: 0.0, // not yet tracked`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `kv_usage: None`. The four KV fields ' +
+      'travel together and are omitted from the payload, not sent as zeros.',
     label: 'KV utilization',
     reason:
-      'The engine does not expose paged-KV introspection to the HTTP layer yet, so /v1/status ' +
-      'sends a hardcoded 0.0.',
+      'The status handler holds no engine reference, so it cannot see the paged-KV pool and ' +
+      'omits the field rather than sending 0. An absent value renders as "not measured here", ' +
+      'which is a different and stronger claim than a zero. Live paged-KV data comes from the ' +
+      'KV block-table endpoint instead.',
   },
   'kv.pages_used': {
     source: ENDPOINTS.STATUS,
     path: 'kv_pages_used',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'NOT_PLUMBED',
     unit: 'pages',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:55 — `kv_pages_used: 0, // not yet tracked`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `kv_pages_used: None`, omitted from the ' +
+      'payload rather than sent as a zero.',
     label: 'KV pages in use',
-    reason: 'Not exposed to the HTTP layer yet; /v1/status sends a hardcoded 0.',
+    reason:
+      'Not exposed to the HTTP layer; the field is omitted, not zeroed. Absent says "not ' +
+      'measured here"; a zero would say "measured, and the pool is empty".',
   },
   'kv.pages_total': {
     source: ENDPOINTS.STATUS,
     path: 'kv_pages_total',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'NOT_PLUMBED',
     unit: 'pages',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:56 — `kv_pages_total: 0, // not yet tracked`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `kv_pages_total: None`, omitted from the ' +
+      'payload rather than sent as a zero.',
     label: 'KV pages total',
-    reason: 'Not exposed to the HTTP layer yet; /v1/status sends a hardcoded 0.',
+    reason:
+      'Not exposed to the HTTP layer; the field is omitted, not zeroed. This is the trap of ' +
+      'the group: it reads a real structure, so a non-zero value would survive any ' +
+      '"is this hardcoded?" audit while describing a pool the decoder never uses. A non-zero ' +
+      'value is not evidence that a mechanism is in play.',
   },
   'kv.pages_shared': {
     source: ENDPOINTS.STATUS,
     path: 'kv_pages_shared',
-    stubValue: 0,
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'NOT_PLUMBED',
     unit: 'pages',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:57 — `kv_pages_shared: 0, // not yet tracked`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `kv_pages_shared: None`, omitted from ' +
+      'the payload rather than sent as a zero.',
     label: 'KV pages shared',
-    reason: 'Not exposed to the HTTP layer yet; /v1/status sends a hardcoded 0.',
+    reason:
+      'Not exposed to the HTTP layer; the field is omitted, not zeroed. Sharing is ' +
+      'page-granular, so even when this is plumbed a zero will not mean "no reuse happened".',
   },
   'kv.introspection': {
     source: ENDPOINTS.DEBUG_KV,
@@ -329,6 +344,44 @@ export const PROVENANCE = Object.freeze({
   },
 
   // ---------------------------------------------------------------- prefix cache
+  //
+  // 🔴 OPEN FINDING, @bb2ee824 — THE DYNAMIC ORIGIN IS STILL CLASSIFIED
+  // `MEASURED` FOR ALL THREE COUNTERS, AND @fc8b5d97's CONTROL ARM SAYS IT
+  // SHOULD NOT BE.
+  //
+  // The scatter side is handled: STRUCTURALLY_BYPASSED, because that path
+  // never consults the cache. The dynamic side is not. There the cache IS
+  // consulted, so `MEASURED` looks obviously right -- and it is the one place
+  // the disproven number can still reach a panel as a genuine measurement.
+  //
+  // The evidence that it is false: shared ~900-token prefix x6 gave 1341ms
+  // warm TTFT; six prefixes differing FROM TOKEN 0 gave 1254ms -- 7.0% FASTER
+  // with NO shared prefix. Prefill is ~90% of TTFT, so a working cache would
+  // have collapsed ~1380ms to ~140ms. Meanwhile the counter reported 19/20 =
+  // 95%, because it increments on ANY nonzero token match and every
+  // /v1/chat/completions request shares the chat-template preamble.
+  //
+  // So this is not a stub and not a mislabelled-but-real number. It is
+  // precisely computed, beautifully behaved, and entirely false -- and every
+  // other safeguard in this tree hunts fabricated ZEROS. A 95% invites no
+  // scrutiny at all, which is exactly what makes it the dangerous one.
+  //
+  // WHY IT IS NOT FIXED HERE. The accurate home is NEVER_BIND, whose own
+  // definition is "a REAL, CORRECTLY-COMPUTED value under a name that
+  // describes a different quantity". But never-bind.test.js enforces that no
+  // PROVENANCE entry may read a never-bind field, so promoting these three
+  // DELETES their table entries -- and that takes 28 tests with it across
+  // three agents, including the ratified per-origin behaviour ("the same zero
+  // means opposite things on the two servers") and the zero-denominator hit
+  // rate guard. Measured, not guessed: I ran it.
+  //
+  // That is a ruling about which mechanism owns the field, not a refactor,
+  // so it is recorded here rather than decided unilaterally.
+  //
+  // CONTAINMENT TODAY: no panel binds these. dashboard/prefix-cache.js does
+  // not exist, and prefix-counters-forbidden.test.js fails any NEW module that
+  // names them, in either the underscored wire spelling or the dotted store
+  // key. The defect is latent, not on screen.
   'prefix_cache.hits': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_hits',
@@ -388,14 +441,17 @@ export const PROVENANCE = Object.freeze({
   'prefix_cache.hashes': {
     source: ENDPOINTS.STATUS,
     path: 'prefix_hashes',
-    stubValue: [],
-    classification: 'DOCUMENTED_ZERO',
+    classification: 'NOT_PLUMBED',
     unit: null,
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:80-81 — `// System-prompt prefix hashes ' +
-      'are not yet surfaced by the engine.` then `prefix_hashes: Vec::new()`',
+      'crates/onnx-genai-server/src/routes/admin.rs — `prefix_hashes: None`, registered in ' +
+      'the handler unavailable map rather than sent as an empty list.',
     label: 'Prefix hashes',
-    reason: 'The engine does not surface prefix hashes, so /v1/status always sends an empty list.',
+    reason:
+      'The engine does not surface prefix hashes to the HTTP layer, so the field is omitted. ' +
+      'It previously shipped as an empty list, which is the worst of the three options: an ' +
+      'empty collection reads as "measured, and there were none" rather than "not measured". ' +
+      'Absent says the second thing and cannot be mistaken for the first.',
   },
 
   // ---------------------------------------------------------------- batching / admission
@@ -518,7 +574,7 @@ export const PROVENANCE = Object.freeze({
     classification: 'NOT_PLUMBED',
     unit: 'sequences',
     evidence:
-      'crates/onnx-genai-engine/src/engine/batched.rs:101-110 — ContinuousBatchManager steps a ' +
+      'crates/onnx-genai-engine/src/batched.rs:101-110 — ContinuousBatchManager steps a ' +
       'batch but exposes no counter for it; onnx_genai_batch_size_current counts HTTP-layer ' +
       'in-flight generations instead.',
     label: 'Engine batch size',
