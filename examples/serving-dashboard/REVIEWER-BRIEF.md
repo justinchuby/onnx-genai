@@ -4827,3 +4827,83 @@ describing it.**
 'the only benchmark form'." They are the D85 rule and its application — the same form,
 twice, which is what the sentence means. Caught by reading the second one instead of
 counting it. RULE 33, again, on me.**
+
+---
+
+## §9.10 — I closed §24.2 too wide. The **rank** half was a false red; the **precision** half is a TRUE red, and @c0de4c2e's own citation for it has been withdrawn — by a correction that makes their case *stronger*.
+
+### 1. The bold is still not in the file — now tested at THEIR anchor
+
+```
+git show ffaef0cd:design/demo-ux.md
+  'TOTAL 82.130 tok/s **2.46'  ->  0        the quoted form
+  'TOTAL 82.130 tok/s   2.46'  ->  2        the actual bytes
+  CONTROL '**' in that file     ->  1821    the instrument sees bold fine
+```
+
+**RULE 35 holds at the reporter's own sha.** The emphasis entered in transit.
+
+### 2. But their SECOND argument is one my §9.9 never addressed, and it is right
+
+I tested *rank* — is `2.46×` the hero? It is not; the badge is accurate. **I then closed
+the whole item, which was an overreach: they also argued FALSE PRECISION, and that
+argument is untouched by anything I measured.**
+
+> **RULE 36. Refuting the stated reason for a finding is not refuting the finding. A
+> report carries a verdict and an argument, and they fail independently — dismantling
+> the argument you happened to test licenses closing only that argument.**
+
+**This is @12e42da8's "name the path, never say *the file*" one level up: I refuted *the*
+reason when there were two.**
+
+### 3. Their cited evidence is withdrawn — and the replacement is worse for the sketch
+
+They argued *"the denominator moved 9.77% from background load."* **`perf-baseline.md`
+§6f retracts exactly that:**
+
+```
+6f.1  "I cited 33.415 -> 30.151 (-9.8%) as proof that the perturbing variable is
+       UNATTRIBUTABLE ambient load. That specific claim is WITHDRAWN."
+       (two CPU-heavy Mobius ONNX exports, disclosed by @1cb42f0e at ~23:21/~23:25)
+
+6f.2  THE SURVIVING, LOAD-BEARING EVIDENCE — run-level null test, 00:32-01:11,
+      an hour clear of any heavy job, ONE BINARY AGAINST ITSELF:
+        between-run CV          12.98%      <- LARGER than the retracted 9.8%
+        phantom delta of means  +6.23%
+        max pairwise run diff   66.77%
+```
+
+**So the verdict survives and strengthens while its citation collapses.** That is RULE 30
+in the field: *a correct conclusion reached through a withdrawn instrument is not a
+vindication of the instrument.* **@c0de4c2e should re-file this on §6f.2, not on the −9.8%
+— the number they used is the one its author retracted, and they defined that exact class
+in the same message.**
+
+### 4. The sharpest form, which neither of us had: `CV 1.98%` is the WRONG STATISTIC
+
+The sketch prints `n=15 · CV 1.98%`. **That is the WITHIN-run dispersion. The claim the
+sketch makes is a BETWEEN-condition comparison, which is governed by the BETWEEN-run CV of
+12.98%.**
+
+> **The sketch attaches the smallest available dispersion to a number governed by the
+> largest. That is not optimism, it is a category error — and it is invisible precisely
+> because a CV *is* present, which is what every one of our guards checks for.**
+
+**`82.130` at five significant figures against ±12.98% is ±10.7 tok/s. The three printed
+decimals imply ±0.0005.**
+
+**One honest caveat I will not overstate:** the *ratio* `2.46×` may be more robust than
+either arm, because co-varying numerator and denominator cancel common-mode drift.
+**Nothing on that page establishes co-variance, and the two arms were not measured
+concurrently** — so the ratio is unestablished rather than refuted. **`82.130` is
+indefensible outright; `2.46×` needs the paired-run evidence that does not exist yet.**
+
+### 5. Corrected score
+
+```
+§24.2 RANK / "is 2.46x the hero"      ⚫ FALSE RED   badge accurate, pairing correct
+§24.2 PRECISION / "82.130, CV 1.98%"  🔴 TRUE RED    my §9.9 closed this in error
+```
+
+**@c0de4c2e was right to hold the item. I was right about the reason they gave and wrong
+to conclude the item from it.**
