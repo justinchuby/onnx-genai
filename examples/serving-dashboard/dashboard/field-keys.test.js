@@ -70,8 +70,32 @@ const NOT_YET_PUBLISHED = Object.freeze({
 
   // Latency percentiles. Client and server are deliberately separate keys: the
   // difference between them IS the finding, so they must never be merged.
+  //
+  // ALL FIFTEEN ARE LISTED, AND THAT IS THE POINT. Until the extractor learned
+  // to read `throughput.js`'s template literals, only the two `_p50` entries
+  // below were visible here -- not because anyone judged the other thirteen,
+  // but because a literal-scanner could not see them. Two hand-written entries
+  // and thirteen invisible ones are INDISTINGUISHABLE from a reviewed
+  // inventory, so this list read as a decision when it was a coincidence.
+  //
+  // Listing them by hand is deliberate: an exemption list generated from the
+  // panel sources would exempt whatever the panels ask for, and could never go
+  // red. Every line here has to be typed by someone.
   'latency.ttft_client_p50': 'percentile aggregation not yet plumbed',
+  'latency.ttft_client_p95': 'percentile aggregation not yet plumbed',
+  'latency.ttft_client_max': 'percentile aggregation not yet plumbed',
   'latency.ttft_server_p50': 'percentile aggregation not yet plumbed',
+  'latency.ttft_server_p95': 'percentile aggregation not yet plumbed',
+  'latency.ttft_server_max': 'percentile aggregation not yet plumbed',
+  'latency.itl_client_p50': 'percentile aggregation not yet plumbed',
+  'latency.itl_client_p95': 'percentile aggregation not yet plumbed',
+  'latency.itl_client_max': 'percentile aggregation not yet plumbed',
+  'latency.tpot_client_p50': 'percentile aggregation not yet plumbed',
+  'latency.tpot_client_p95': 'percentile aggregation not yet plumbed',
+  'latency.tpot_client_max': 'percentile aggregation not yet plumbed',
+  'latency.e2e_server_p50': 'percentile aggregation not yet plumbed',
+  'latency.e2e_server_p95': 'percentile aggregation not yet plumbed',
+  'latency.e2e_server_max': 'percentile aggregation not yet plumbed',
 
   // Build and host facts.
   'resources.disk_spill_bytes': 'spill accounting not yet plumbed',
@@ -93,17 +117,50 @@ function stripComments(source) {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
+// Percentile suffixes appended to every latency-row `prefix:`.
+const LATENCY_PERCENTILES = ['p50', 'p95', 'max'];
+
+// Panels are allowed to BUILD a key instead of writing it, but only if this
+// audit knows the rule that reconstructs it. A template literal is opaque to a
+// literal-scanner, and a scanner that shrugs at what it cannot read reports
+// "nothing wrong here" and "I could not look here" with the identical green.
+const DYNAMIC_KEY_SITES = new Map([
+  [
+    'throughput.js',
+    'latency rows build `${definition.prefix}_${percentile}`; reconstructed here ' +
+      'from each `prefix:` crossed with LATENCY_PERCENTILES',
+  ],
+]);
+
+// DELIBERATELY WIDER THAN THE KEYS WE SHIP. A narrow `[a-z0-9_.]` does not
+// merely miss `latency.TTFT_p50` -- it SKIPS it silently, and a skipped key is
+// scored as a clean file. The malformed key is the exact input this audit
+// exists to catch, and it was the one input invisible to it.
+const KEY_LITERAL = /\.(?:field|series)\(\s*'([A-Za-z0-9_.-]+)'/g;
+
+/** Panel sources, excluding tests. */
+function panelSources() {
+  return readdirSync(DASHBOARD_DIR)
+    .filter((name) => name.endsWith('.js') && !name.endsWith('.test.js'))
+    .map((name) => [name, stripComments(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8'))]);
+}
+
 /** Every field/series key any panel actually requests. */
 function requestedKeys() {
   const keys = new Map();
-  const files = readdirSync(DASHBOARD_DIR).filter(
-    (name) => name.endsWith('.js') && !name.endsWith('.test.js'),
-  );
 
-  for (const name of files) {
-    const source = stripComments(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8'));
-    for (const match of source.matchAll(/\.(?:field|series)\(\s*'([a-z0-9_.]+)'/g)) {
+  for (const [name, source] of panelSources()) {
+    for (const match of source.matchAll(KEY_LITERAL)) {
       if (!keys.has(match[1])) keys.set(match[1], name);
+    }
+
+    // Reconstruct the keys this file builds rather than writes.
+    if (!DYNAMIC_KEY_SITES.has(name)) continue;
+    for (const match of source.matchAll(/prefix: '([A-Za-z0-9_.-]+)'/g)) {
+      for (const percentile of LATENCY_PERCENTILES) {
+        const key = `${match[1]}_${percentile}`;
+        if (!keys.has(key)) keys.set(key, name);
+      }
     }
   }
   return keys;
@@ -178,6 +235,52 @@ async function publishedKeys() {
   }
   return published;
 }
+
+describe('the audit can see what it claims to audit', () => {
+  // ANTI-VACUITY. Every reconciliation below is scored against requestedKeys().
+  // A regex that drifted and matched nothing would report a spotless dashboard,
+  // byte-identical to a genuinely clean run. A zero is not a measurement until
+  // the instrument is proven able to return non-zero.
+  it('extracts a non-zero, non-trivial set of keys', () => {
+    const keys = requestedKeys();
+    assert.ok(
+      keys.size >= 40,
+      `extracted only ${keys.size} keys — the extraction pattern has drifted and ` +
+        'every reconciliation in this file is now scoring an empty set as clean',
+    );
+  });
+
+  it('reconstructs the keys that panels BUILD rather than write', () => {
+    const keys = requestedKeys();
+    const built = [...keys].filter(([key]) => key.startsWith('latency.'));
+    assert.ok(
+      built.length >= 15,
+      `only ${built.length} latency keys reconstructed — throughput.js builds them ` +
+        'from a template literal, which no literal-scanner can see',
+    );
+  });
+
+  it('fails loudly on a panel that builds keys by a rule this audit does not know', () => {
+    // The defect this whole file exists to prevent, aimed at the file itself:
+    // a key the scanner cannot parse must never be silently skipped. If a new
+    // panel starts composing keys, this goes red until someone teaches the
+    // extractor the rule -- rather than quietly auditing a smaller dashboard.
+    const unexplained = [];
+    for (const [name, source] of panelSources()) {
+      if (DYNAMIC_KEY_SITES.has(name)) continue;
+      if (/\.(?:field|series)\(\s*`/.test(source)) {
+        unexplained.push(name);
+      }
+    }
+    assert.deepEqual(
+      unexplained,
+      [],
+      `${unexplained.join(', ')} build field keys from a template literal, which this ` +
+        'audit cannot read. Add the file to DYNAMIC_KEY_SITES with the rule that ' +
+        'reconstructs its keys, or those keys are audited by nothing.',
+    );
+  });
+});
 
 describe('every field key a panel requests is reconciled against the store', () => {
   it('has no unexplained key — an unlisted one is almost certainly a typo', async () => {

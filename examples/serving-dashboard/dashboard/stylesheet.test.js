@@ -238,11 +238,14 @@ describe('stylesheet contract', () => {
     const requested = new Set();
     for (const file of PANEL_FILES) {
       const source = readFileSync(fileURLToPath(new URL(`./${file}`, import.meta.url)), 'utf8');
-      for (const match of source.matchAll(/\bfield\('([a-z0-9_.]+)'\)/g)) {
+      // Character class DELIBERATELY WIDER than the keys we ship: a narrow
+      // `[a-z0-9_.]` SKIPS a malformed key rather than flagging it, and a
+      // skipped key is scored as a clean panel.
+      for (const match of source.matchAll(/\bfield\('([A-Za-z0-9_.-]+)'\)/g)) {
         requested.add(match[1]);
       }
       // Latency rows are assembled as `${prefix}_${percentile}`; expand them.
-      for (const match of source.matchAll(/prefix: '([a-z0-9_.]+)'/g)) {
+      for (const match of source.matchAll(/prefix: '([A-Za-z0-9_.-]+)'/g)) {
         for (const percentile of ['p50', 'p95', 'max']) {
           requested.add(`${match[1]}_${percentile}`);
         }
