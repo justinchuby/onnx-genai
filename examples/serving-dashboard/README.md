@@ -694,14 +694,31 @@ always."
 > on and quietly wrong elsewhere** — which is why the only sound way to know is
 > to ask the running server.
 
-> **What remains open, stated at its true width.** The measurement puts
+> **This is now resolved, and not by watching the server.** The measurement puts
 > `qwen2.5-0.5b` on a *refused* arm, and the source says the refused arms are
-> `PastPresent { shared_buffer: false, .. }` and `Legacy`. **Which of those two
-> it lands on has not been observed**, because the server does not report its
-> decode path. That is a two-way ambiguity rather than an open question, and it
-> is narrower than the "not yet explained" this paragraph carried until
-> `d4ea31a4` — **corrected here in the direction of claiming more, which is the
-> direction nobody audits.**
+> `PastPresent { shared_buffer: false, .. }` and `Legacy`. **It is the first
+> one**, and you can establish that from the artifact without running anything.
+> In `crates/onnx-genai-engine/src/decode/metadata.rs`, `detect_model_decode_path`
+> selects `Legacy` only when the graph has *neither* KV inputs *nor* present
+> outputs; `model.onnx` in that directory names `past_key_values.0.key` and its
+> 47 siblings — 24 layers, key and value — so that branch is not reachable for
+> this model. What the directory
+> is actually missing is `inference_metadata.yaml` — absent here, present in
+> `qwen2.5-0.5b-scatter-v2` — which leaves `shared_kv_max_len` as `None` and
+> pins the shared-buffer flag to `false`.
+>
+> **So the refusal is a property of the declaration, not of the architecture.**
+> Of the 33 model directories on the disk this demo reads, 10 carry an
+> `inference_metadata.yaml` and **exactly one declares `static_cache`** — the
+> scatter build. **Nine models ship the file and still cannot batch**, which is
+> why "it is missing a file" is the wrong lesson to draw: the file has to
+> *declare a batching-capable decode path*, and nine of them do not.
+>
+> ⚠️ **That census is a fact about one laptop and you cannot check it from this
+> repository** — models are gitignored (`.gitignore:2`). The two predicates
+> behind it are checkable anywhere, and they are the ones to carry: does the
+> directory have `inference_metadata.yaml`, and does that file declare
+> `static_cache`?
 
 **You do not have to trust the log for this, because the number is on the
 page.** The fallback path is one row wide however large the configured ceiling
