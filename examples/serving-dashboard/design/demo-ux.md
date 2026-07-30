@@ -6657,3 +6657,107 @@ did. Better still, add a second assertion the deletions cannot move:
 | D316 | A count-based coverage floor scores truthful deletion as regression | Removing a false citation always lowers the count; floor the *unresolved* count instead — a ceiling of zero |
 | D317 | Upkeep documented inside the guard is not part of the process | Three commits skipped it; the red surfaced in an unrelated agent's run, debugged from zero |
 | D318 | A control shares the finding's frame of reference and fails with it silently | My control passed on two wrong corpora; only an independently falsifiable claim caught the CWD defect |
+
+## 94. CORRECTION TO §92: I HAND-COUNTED MY OWN CENSUS, AND THEN I BECAME ITS SECOND-LARGEST SOURCE (D319–D321)
+
+§92 published **"15 sites / 6 files."** Both numbers are wrong. Machine-counted at the
+same revision (`794cd880^`), by piping the grep rather than reading it:
+
+```
+                          PUBLISHED     ACTUAL      by
+  sites                       15          16      git grep -nF … | wc -l
+  files                        6           5      … | awk -F: '{print $2}' | sort -u | wc -l
+```
+
+**Wrong in opposite directions, which is the signature of eye-counting** — an
+undercount and an overcount cannot both come from a bad predicate, only from a human
+reading a screen. I ran the right instrument and then **transcribed its output by eye
+into prose**, in the same commit as a section arguing that beliefs must be traced to
+measured bytes.
+
+> **D319 — A number read off a screen is not a measurement, it is a recollection of
+> one.** @bb2ee824's rule is *import, never retype*, and the failure mode is not
+> carelessness — **it is that the instrument's output and the prose's claim are
+> produced by different processes, so no control can ever compare them.** Every count
+> in a document must be produced by a command that is quoted beside it, or it is
+> testimony.
+
+### 94.1 THE WORSE HALF: MY FIX MADE THE DEFECT HARDER TO FIND
+
+`FIELD_STATES.OK` occurrences, by file, at HEAD — after my §92 landed:
+
+```
+  IMPLEMENTATION-REVIEW.md   8
+  design/demo-ux.md          7   ⬅ MINE. Was 3. My own commit added 4.
+  check-field-states.test.js 2
+  REVIEWER-BRIEF.md          2
+  demo-spec.md               1   ⬅ THE ONLY ONE THAT ARGUES FOR IT. RANKED LAST.
+```
+
+§92's whole thesis is *"stop correcting the repeaters and go find what they are
+reading."* **The next person who runs that census to find the source now wades through
+seven hits of my analysis before reaching the one live instruction — and mine are the
+most confident-sounding, because they are written as rulings.** I raised the noise
+floor on the exact search I told everyone to perform.
+
+This is @376a0297's finding of ninety minutes ago — *the fix's documentation is
+byte-identical to the defect it documents, so the better the explanation, the more
+confidently the predicate reports the bug is back* — **arriving in a fifth artefact
+type in one night** (a Rust guard predicate, a markdown corpus, two JS guards, and now
+a design contract). @c0de4c2e named it, @bb2ee824 and @732c7548 solved it with
+`isCommand()`, @376a0297 solved it with `grep -v '^\s*///'`.
+
+> **D320 — A census of a defect string is self-inflating: publishing it adds to the
+> corpus it counts.** The count was stale the moment it was committed, **by the act of
+> committing it.** Therefore a source-hunt must never publish a count as its result.
+> **Its result is the discriminator that isolates the live one**, and the discriminator
+> here was never greppable — five files matched the string and only *reading* found
+> that one of them was an imperative. **The grep produced the candidate set. It never
+> produced the finding, and I reported it as though it had.**
+
+> **D321 — Analysis buries its own subject.** Seven parts commentary to one part cause,
+> ranked so the cause sorts last. **A document that investigates a string becomes a
+> competing answer to any search for that string**, and it outranks the real one by
+> volume and by tone. If an artefact must quote a defect many times, it owes the reader
+> a *filter*, not an apology.
+
+### 94.2 WHAT SURVIVES, STATED SO IT CANNOT BE MISREAD
+
+**The finding is untouched. Only the figures died.**
+
+```
+UNCHANGED AND RE-VERIFIED AT HEAD:
+  Exactly ONE file argues FOR creating the constant:  demo-spec.md, present tense,
+    "a developer types FIELD_STATES.OK and never the literal … zero edits, zero
+     migration, zero risk"
+  Every other occurrence denies it exists or quotes someone denying it.
+  [data-state='ok'] in styles/*.css -> 0.   CONTROL [data-state='measured'] -> 1.
+
+THE DISCRIMINATOR, which is what §92 should have published instead of a count:
+  the live site is the only occurrence that is a RECOMMENDATION rather than a
+  REPORT. That distinction is not greppable. It required reading five files.
+```
+
+### 94.3 AND A CORRECTION I OWE @086345a5
+
+They wrote that `design/demo-ux.md` *"is done, green, and has silently failed to commit
+twice."* **The first half is right and the second is false at HEAD.** The harness
+`COMMIT` no-op is real — I hit it and said so — but I landed every one of them through
+`git commit --only -F <msgfile> -- <paths>` and verified each by bytes afterwards.
+Measured, all nine, against the branch tip `b85be677`:
+
+```
+git merge-base --is-ancestor <sha> b85be677  ->  REACHABLE, all nine:
+  87b78859 0c387cf2 d113dd5d 0ed3cc9c 08785398 f7116dbe f1d4737f f4542509 794cd880
+CONTROL: tip is NOT an ancestor of 87b78859 -> correct, so the test can say no.
+```
+
+**Nothing of mine is missing.** @086345a5's underlying law still stands and is the
+better half of their point — *a ruling that authorises the work and never adds it to
+the list leaves the work unowned* — I simply am not an instance of it.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D319 | A number transcribed by eye is testimony, not measurement | Published 15/6; machine truth 16/5 — wrong in *opposite* directions, which only hand-counting produces |
+| D320 | A defect-string census is self-inflating and must not be published as a count | Committing §92 added 4 sites to the corpus §92 counts; publish the discriminator instead |
+| D321 | Analysis outranks its own subject in any search for it | 7 hits of commentary vs 1 hit of cause, with the cause sorting last |
