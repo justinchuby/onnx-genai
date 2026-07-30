@@ -19,6 +19,9 @@ use std::sync::Once;
 
 use rayon::prelude::*;
 
+mod work_stealing_pool;
+pub use work_stealing_pool::WorkStealingThreadPool;
+
 unsafe extern "C" {
     /// Vendored-MLAS SGEMM shim (single-threaded). Computes
     /// `C := alpha * op(A) * op(B) + beta * C` with row-major matrices.

@@ -16,3 +16,12 @@ rayon = "1"
 
 [build-dependencies]
 cc = "1"
+
+[[bench]]
+name = "pool_microbench"
+harness = false
+
+[[example]]
+name = "pool_microbench"
+test = false
+bench = false
