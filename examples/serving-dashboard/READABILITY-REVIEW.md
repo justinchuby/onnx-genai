@@ -2950,3 +2950,35 @@ SOURCE_CLASSES          47 ->  52   (canonical)
    -> STYLED AND CONSTRUCTIBLE, UNREACHABLE FROM THE CANONICAL ENUM. NO WRITER CAN EMIT IT.
 ```
 **⛔ THREE DECLARATIONS OF ONE CONCEPT, AND ***NOT ONE OF THEM SHRANK***. A vocabulary split does not heal on its own; **every edit night makes all three bigger.** ➡️ **AND `simulated` IS @bb2ee824's LAW EXACTLY — *a missing word in a vocabulary reads as agreement.* The styling exists, so the concept looks supported; the enum omits it, so it can never be produced. **The CSS is the missing enum member written in another language.**
+
+## ② SUBORDINATE-CLAUSE SWEEP — **BUILT THE INSTRUMENT, FOUND ONE REAL DEFECT, AND MANUFACTURED ONE FALSE ONE AGAINST MYSELF**
+**Grep cannot see a reversal that shares its opening clause, so I built a prefix-collision probe: split 5 shipped docs into sentences ≥10 words, group by the first six words, report groups whose members' full text differs.**
+```
+docs read 5/5 (named, not assumed) · sentences 6,669 [POS: must be >0]
+SIX-WORD PREFIXES SHARED BY >1 DISTINCT SENTENCE: **40**
+[NEG CONTROL] an impossible prefix -> 0
+```
+### 🔴 CONFIRMED — **ONE GATE ROW, THREE STATUSES, ONE DOCUMENT**
+```
+REVIEWER-BRIEF.md:2059   1 crates compile + clippy  🟡 QUALIFIED — see below. NOT caused by this branch.
+REVIEWER-BRIEF.md:2205   1 crates compile + clippy  🟡 qualified — NOT re-measured here | last measured `fca13038`
+REVIEWER-BRIEF.md:2313   1 crates compile + clippy  🟡 carried, NOT re-measured — see below
+```
+**⛔ THREE RENDERINGS OF ONE ROW, ALL 🟡, ALL SAYING SUBTLY DIFFERENT THINGS — AND THE MIDDLE ONE PINS ITS LAST MEASUREMENT TO `fca13038`, WHICH @c7a654ed HAS SINCE PROVEN IS AN ***ANCESTOR*** OF `review-0`, 27 COMMITS BEHIND.** ✅ **AND ALL THREE ARE NOW SUPERSEDED: @f6527cc9 ADJUDICATED ITEM 1 AS *PRE-EXISTING, OUT OF SCOPE, UNREACHABLE FROM THE SERVED ARTEFACT* WITH `cargo check --workspace` RAW EXIT 101 AND A 0-vs-17 DIFF CONTROL.** ➡️ ***A ROW RESTATED THREE TIMES HAS THREE PLACES TO GO STALE AND NO SINGLE PLACE TO FIX.*** **@c7a654ed — this is one edit, and it is the last thing standing between your brief and a reader who quotes the wrong copy.**
+
+### 🔻 AND THE FALSE ONE, WHICH IS THE HALF WORTH KEEPING — **I NEARLY ACCUSED `CONTRACT.md` OF LOSING THE PAYLOAD OF MY OWN LAW**
+```
+MY PROBE SAID:  'reads as agreement' in CONTRACT.md -> **0**    (demo-spec.md -> 2)
+I WAS COMPOSING: "the NORMATIVE document carries the setup without the punchline."
+
+THE BYTES:  '**A missing word in a vocabulary does not read as a gap; it reads
+             as agreement.**'                    ⬅ IT IS ALL THERE. IT WRAPS.
+```
+> # ☠️ **`grep` CANNOT SEE A LINE BREAK — MY OWN DOCUMENTED INSTRUMENT LIMIT, ***WALKED INTO WHILE RUNNING A SWEEP BUILT SPECIFICALLY TO CATCH WHAT `grep` CANNOT SEE.*** SEVENTH INSTANCE OF MY SIGNATURE DEFECT TONIGHT.**
+**✅ CAUGHT ONLY BY @0837fdf9's PROCEDURAL RULE, WHICH I ADOPTED AN HOUR AGO AND WHICH IS THE ONLY REASON THIS IS A PARAGRAPH INSTEAD OF AN ACCUSATION: ***NEVER REPORT A MATCH — OR A ZERO — WITHOUT PRINTING THE SURROUNDING BLOCK.*** **A rule I merely quote can silently expire; a rule I execute catches me.**
+**⚖️ WHAT SURVIVES IS MILDER AND STILL TRUE: THE SAME LAW IS STATED IN **THREE** DOCUMENTS WITH THREE DIFFERENT PUNCTUATIONS (`;` / `,` / `—`). **THAT IS RESTATEMENT, NOT CONTRADICTION, AND I WILL NOT INFLATE IT INTO A DEFECT** — but it is the same shape as the gate row above: **a sentence with three homes has three ways to drift and no source of truth. 40 shared prefixes is the size of that surface.**
+
+---
+# ✅ READABILITY ARM — VERDICT: **APPROVE. BLOCKING SET EMPTY.**
+**🔴 R9/R41 live** (`ui/scenario-switcher.js:113`/`:202` raw `dataset.state`; vocabulary gap) · **🔴 ① four items absent from `demo-spec.md`**, two of them absent from the code as well and therefore **not mine to score** · **🔴 R51 `D160` names two opposite propositions** · **🟡 ② one gate row, three statuses** · **🟡 ③ `?? 'value'` fallback survives (trigger fixed by @c8d9a40e)** · **🟡 ④ three vocabularies, all growing** · **🟡 R39, R47, R48, R50, R52.**
+**⛔ NONE OF THESE IS A SHIP BLOCKER. ALL ARE DOCUMENTATION-INTEGRITY OR NAMING FINDINGS, AND EVERY PRESCRIBED FIX ALREADY EXISTS SOMEWHERE IN THIS TREE.**
