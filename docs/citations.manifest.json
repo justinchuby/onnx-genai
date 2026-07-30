@@ -1,0 +1,11 @@
+{
+  "_why": "Anti-shrink anchors. A harness that enumerates citations from the document it checks gets GREENER when citations are deleted -- so deleting evidence would be the cheapest way to pass. These floors make that path fail. Raise min_anchored_citations as the doc grows; never lower it to go green. Never raise max_unanchored_citations: positional citations rot silently, which is the defect the harness exists to remove.",
+  "min_anchored_citations": 150,
+  "max_unanchored_citations": 5,
+  "must_cite_symbols": [
+    "prepare_session_prefix",
+    "handle_or_defer_during_batch",
+    "batch_utilization",
+    "GenerationMetrics"
+  ]
+}

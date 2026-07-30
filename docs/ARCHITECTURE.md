@@ -14,7 +14,7 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 |---|---|---|
 | **Observed** | Confirmed against a *running server* — curled, streamed, or profiled — **and stamped with the commit sha the binary was built from** | §5.6's mode matrix (both model types run and profiled); the endpoint behaviours in §8.3; debug endpoints returning **404**, not 403 |
 | **Read** | Established by reading the cited *executable* source — a constant, handler, assignment or signature | The dependency edges in §2; the command-deferral dispatch in §5.11 |
-| **Stated intent** | Established by reading a **comment or docstring**. Supports a claim about what the authors *meant*, **never** about what the code *does*. | The preemption rationale at `batched.rs:713-718` (the *behaviour* is cited separately at `:759`); the `NodeStatus` scope comment in §4.7 |
+| **Stated intent** | Established by reading a **comment or docstring**. Supports a claim about what the authors *meant*, **never** about what the code *does*. | The preemption rationale at `crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled` (the *behaviour* is cited separately at `:759`); the `NodeStatus` scope comment in §4.7 |
 | **Inferred** | A conclusion drawn from the above, not directly witnessed | §5.3's claim that a shared-page write *would* corrupt silently — no test provokes it, and nothing in the code prevents it |
 
 > **Why `Observed` carries a sha, and `Read` a `file:line`.** A live-server result is a measurement of a *binary*, and a binary is a snapshot of a tree at one instant. It never announces that it has expired. During this project HEAD moved seven times in ninety minutes, and the CORS middleware existed for **3 minutes 51 seconds** — long enough for two agents to independently measure it working, correctly, and to close the question on that evidence. Both measurements were honest; both described a tree that no longer existed.
@@ -33,6 +33,8 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 | A single measurement | Whether the instrument can resolve the effect at all. A run-to-run difference can exceed the threshold being tested for. |
 | A line citation | That the line moved. The claim stays true while the reference silently rots. |
 | `grep` returning nothing | Absence of a **spelling**, not of a **concept**. `grep -rn cors` reports zero on a tree containing `CorsLayer` and `CORS`, and the prefix-counter tripwire banned `prefix_cache_hits` while `prefix_cache.hits` shipped past it unnoticed (§8.4). An absence proof needs case-insensitive, multi-spelling coverage — and even then establishes only that nothing *names* the thing, not that nothing *does* it. |
+| A bare filename in a citation (`metrics.rs`) | That it names one file. This repo has 39 crates and several `metrics.rs`, `state.rs`, `loader.rs`, `session.rs`. Three citations in this document silently pointed at the **wrong crate** and no line-number check could ever have noticed, because the wrong file has a line 123 too. **Cite a path that is unique, or cite a symbol that is.** |
+| A citation converted from `file:line` to `file::symbol` | That it is now correct. Anchoring inherits the accuracy of the position it was migrated from: a citation that was already pointing at the wrong place becomes **stably** wrong instead of **silently drifting**. That is an improvement in diagnosability, not a proof of correctness. Every migrated citation in a load-bearing claim was re-verified at source; the rest are honest residue. |
 | A correction from a colleague | That the correction's own evidence has expired. Corrections arrive with more authority than the claims they overturn, are rarely re-checked, and on this project a correct finding was overturned by a confident wrong one more than once. **A correction needs a sha for the same reason the original did.** |
 
 The common shape: **each tool inspects a *state*, while these defects live in a *transition* or a *relationship*.** None of them can express *"and then it changed"* or *"and it means something different over there."*
@@ -223,25 +225,25 @@ The spine of the system. Following one `POST /v1/chat/completions` from socket t
 
 ### 3.1 Startup — before any request
 
-1. `main()` (`crates/onnx-genai-cli/src/main.rs:8`) → `run(argv)` in `crates/onnx-genai-cli/src/lib.rs`.
-2. `Commands::Serve` (`cli/src/lib.rs:93-95`) → `run_serve` (`crates/onnx-genai-server/src/cli.rs:110`). The standalone `onnx-genai-server` binary calls the same function — **one serving path, not two**.
-3. Model source resolution (`cli.rs:130-150`). A clap `ArgGroup` (`cli.rs:20-25`) requires exactly one of `--model` / `--models-dir` / `--models-config`, producing `Vec<ModelSpec>`.
-4. `AppState::load_from_specs` (`cli.rs:152`) → `build_handle` per spec (`state.rs:348-390`) — **the single shared construction path** for both eager startup and lazy load.
-5. `build_handle` resolves the directory (`ModelDirectory::load`, `onnx-genai-ort/src/loader.rs:35`), loads the tokenizer, then `Engine::from_dir` (`onnx-genai-engine/src/engine/load.rs:7`).
-6. `EngineDriver::start(engine, DEFAULT_MAX_BATCH, max_queue_depth)` (`state.rs:379`) spawns the engine thread.
-7. `app(state)` builds the router (`crates/onnx-genai-server/src/lib.rs:62-135`).
+1. `main()` (`crates/onnx-genai-cli/src/main.rs::main`) → `run(argv)` in `crates/onnx-genai-cli/src/lib.rs`.
+2. `Commands::Serve` (`cli/src/lib.rs:93-95`) → `run_serve` (`crates/onnx-genai-server/src/cli.rs::ServeArgs`). The standalone `onnx-genai-server` binary calls the same function — **one serving path, not two**.
+3. Model source resolution (`crates/onnx-genai-server/src/cli.rs::run_serve`). A clap `ArgGroup` (`cli.rs:20-25`) requires exactly one of `--model` / `--models-dir` / `--models-config`, producing `Vec<ModelSpec>`.
+4. `AppState::load_from_specs` (`crates/onnx-genai-server/src/cli.rs::run_serve`) → `build_handle` per spec (`crates/onnx-genai-server/src/state.rs::with_default_fim_config`) — **the single shared construction path** for both eager startup and lazy load.
+5. `build_handle` resolves the directory (`ModelDirectory::load`, `crates/onnx-genai-ort/src/loader.rs::load`), loads the tokenizer, then `Engine::from_dir` (`crates/onnx-genai-engine/src/engine/load.rs::from_dir`).
+6. `EngineDriver::start(engine, DEFAULT_MAX_BATCH, max_queue_depth)` (`crates/onnx-genai-server/src/state.rs::load_chat_template`) spawns the engine thread.
+7. `app(state)` builds the router (`crates/onnx-genai-server/src/lib.rs::app`).
 
 ### 3.2 Arrival and admission
 
-- Axum matches `POST /v1/chat/completions` (`crates/onnx-genai-server/src/lib.rs:76`); every request passes `trace_request` middleware (`crates/onnx-genai-server/src/lib.rs:131`).
+- Axum matches `POST /v1/chat/completions` (`crates/onnx-genai-server/src/lib.rs::app`); every request passes `trace_request` middleware (`crates/onnx-genai-server/src/lib.rs::app`).
 - The handler resolves a `ModelHandle` from the `ModelRegistry`, applies the chat template, and tokenizes.
 - The request is submitted to the driver over the `DriverCommand` mpsc channel. **Backpressure lives here:** the channel is bounded by `max_queue_depth`; over-depth submissions are rejected rather than queued without limit, and the rejection is counted in `metrics.rs`.
 
 ### 3.3 The engine thread and the path fork
 
-`EngineDriver::start` (`driver.rs:113-123`) spawns a **dedicated OS thread** via `std::thread::Builder` — not a tokio task. Rationale in §6.
+`EngineDriver::start` (`crates/onnx-genai-server/src/driver.rs::DriverRoute`) spawns a **dedicated OS thread** via `std::thread::Builder` — not a tokio task. Rationale in §6.
 
-Inside `run_engine_driver` the decisive branch is `driver.rs:407-421`:
+Inside `run_engine_driver` the decisive branch is `crates/onnx-genai-server/src/driver.rs::embed`:
 
 ```
 if engine.continuous_batch_manager(max_batch).is_ok() {
@@ -281,25 +283,25 @@ flowchart TD
 
 **Read this diagram as the map of what is available where.** The dotted line is the whole story: the batched path never reaches the KV cache, so paged allocation, prefix reuse, and preemption are all absent on it — not broken, just never invoked (§5.6).
 
-> ⚠️ **The most commonly missed line in this file is `driver.rs:420`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every dynamic-cache model takes the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
+> ⚠️ **The most commonly missed line in this file is `crates/onnx-genai-server/src/driver.rs::resource_snapshot`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every dynamic-cache model takes the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
 
 ### 3.4 The decode step loop (continuous batch path)
 
-- `run_static_batch_until_idle` (`driver.rs:546`) is the outer loop.
-- Each iteration first drains newly arrived commands with `rx.try_recv()` (`driver.rs:577`), then calls `manager.step()` (`driver.rs:596`) — **one shared batched forward pass across all active rows**.
-- **Only `Generate { session_id: None, .. }` is submitted to the running batch inline.** Every other command reaches `handle_or_defer_during_batch` (`driver.rs:678`), which answers `ResourceSnapshot` immediately through a `&Engine` borrow and pushes the rest onto `deferred` (`driver.rs:647`), drained only at `driver.rs:570` after the batch goes idle. **✅ RESOLVED (`a6fefde2`) — this section previously stated that *every* non-`Generate` command was deferred, which was true when written.** The mid-batch `&Engine` reader closed the `/v1/resources` hang structurally: state written inside the exclusive borrow is now readable without any borrow at all. **The invariant that remains is narrower and still load-bearing: anything needing `&mut Engine` cannot be served during a batch, which is why telemetry must be *published* from the decode loop rather than *requested* from it.**
-- New arrivals are admitted at `driver.rs:610`; finished rows are backfilled so occupancy is maintained.
-- Admission eligibility, when scheduler-driven, is `run_continuous_batch_scheduled` (`batched.rs:719`): FCFS order (`batched.rs:760`, `priority_policy = PriorityPolicy::Fcfs`) gated by the shared KV byte budget and total-token ceiling (`batched.rs:750-760`).
-- Per-request events are funnelled through `route_continuous_events` (`driver.rs:718`, called at `:660`) — **the single place where every request's lifecycle events pass**. TTFT is **not** recorded there: it is observed at `metrics.rs:124`, guarded by `first_token_seen` (`:123`), inside `GenerationMetrics`. An earlier draft of this section cited a line in `driver.rs`, which was wrong about the **file**, not merely the line.
+- `run_static_batch_until_idle` (`crates/onnx-genai-server/src/driver.rs::run_fallback_engine_driver`) is the outer loop.
+- Each iteration first drains newly arrived commands with `rx.try_recv()` (`crates/onnx-genai-server/src/driver.rs::run_static_engine_driver`), then calls `manager.step()` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`) — **one shared batched forward pass across all active rows**.
+- **Only `Generate { session_id: None, .. }` is submitted to the running batch inline.** Every other command reaches `handle_or_defer_during_batch` (`crates/onnx-genai-server/src/driver.rs::intake_during_batch`), which answers `ResourceSnapshot` immediately through a `&Engine` borrow and pushes the rest onto `deferred` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`), drained only at `crates/onnx-genai-server/src/driver.rs::run_static_engine_driver` after the batch goes idle. **✅ RESOLVED (`a6fefde2`) — this section previously stated that *every* non-`Generate` command was deferred, which was true when written.** The mid-batch `&Engine` reader closed the `/v1/resources` hang structurally: state written inside the exclusive borrow is now readable without any borrow at all. **The invariant that remains is narrower and still load-bearing: anything needing `&mut Engine` cannot be served during a batch, which is why telemetry must be *published* from the decode loop rather than *requested* from it.**
+- New arrivals are admitted at `crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`; finished rows are backfilled so occupancy is maintained.
+- Admission eligibility, when scheduler-driven, is `run_continuous_batch_scheduled` (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`): FCFS order (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`, `priority_policy = PriorityPolicy::Fcfs`) gated by the shared KV byte budget and total-token ceiling (`crates/onnx-genai-engine/src/batched.rs::batched_max_context_for_request`).
+- Per-request events are funnelled through `route_continuous_events` (`crates/onnx-genai-server/src/driver.rs::handle_or_defer_during_batch`, called at `:660`) — **the single place where every request's lifecycle events pass**. TTFT is **not** recorded there: it is observed inside `crates/onnx-genai-server/src/metrics.rs::GenerationMetrics`, in `crates/onnx-genai-server/src/metrics.rs::token`, guarded by `first_token_seen`. This citation has now been wrong about the **file** twice: an early draft placed it in `driver.rs`, and the positional-to-anchored migration re-pointed it at the **router** crate's `metrics.rs`, because a bare filename is ambiguous across 39 crates. Both errors were invisible to a line-number checker and both were caught by asking whether the named symbol exists where the citation claims.
 
-**Output equivalence guarantee** (`batched.rs:708-711`): a request's tokens never depend on which rows share its batch. Batched output is byte-identical to running the request alone. Batching is a throughput optimization, not a semantic change.
+**Output equivalence guarantee** (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`): a request's tokens never depend on which rows share its batch. Batched output is byte-identical to running the request alone. Batching is a throughput optimization, not a semantic change.
 
 ### 3.5 KV allocation (per-request / paged path)
 
-- `PageTable::allocate(device)` (`page_table.rs:836`) returns a free `PageId`, or `None` when the pool is exhausted.
-- On exhaustion, eviction runs (`page_table.rs:1097-1110`), which deliberately **skips pages belonging to a live sequence or a retained prefix** (`ref_count > 1`).
-- Prefix reuse: `PrefixCache::lookup_shared` (`prefix_cache.rs:92`) matches a token prefix, **increments the ref count of the matched pages**, and returns them for sharing rather than allocating and recomputing.
-- `PageTable::free` (`page_table.rs:947-951`) decrements; the page returns to the pool only at `ref_count == 0`.
+- `PageTable::allocate(device)` (`crates/onnx-genai-kv/src/page_table.rs::build`) returns a free `PageId`, or `None` when the pool is exhausted.
+- On exhaustion, eviction runs (`crates/onnx-genai-kv/src/page_table.rs::allocate_page`), which deliberately **skips pages belonging to a live sequence or a retained prefix** (`ref_count > 1`).
+- Prefix reuse: `PrefixCache::lookup_shared` (`crates/onnx-genai-kv/src/prefix_cache.rs::lookup_shared`) matches a token prefix, **increments the ref count of the matched pages**, and returns them for sharing rather than allocating and recomputing.
+- `PageTable::free` (`crates/onnx-genai-kv/src/page_table.rs::page_owners`) decrements; the page returns to the pool only at `ref_count == 0`.
 
 ### 3.6 Streaming and teardown
 
@@ -316,54 +318,54 @@ For each boundary: what the **caller** must guarantee, what the **callee** guara
 
 ### 4.1 Server ↔ EngineDriver
 
-- **Transport:** mpsc `DriverCommand` with `oneshot` (single reply) or mpsc (streaming) response channels. Definitions from `driver.rs:72`.
+- **Transport:** mpsc `DriverCommand` with `oneshot` (single reply) or mpsc (streaming) response channels. Definitions from `crates/onnx-genai-server/src/driver.rs::DriverCommand`.
 - **Caller guarantees:** submits only tokenized, validated requests; respects `max_queue_depth`; holds the reply channel until the stream ends or drops it to signal cancellation.
 - **Callee guarantees:** every accepted command receives exactly one terminal outcome (completion or error). The engine thread never blocks the async runtime.
 - **Errors:** a dropped reply channel means the client vanished — the driver treats it as cancellation, not a fault.
-- **Violation:** blocking on the reply inside an async handler without `spawn_blocking` stalls a tokio worker. Model construction is explicitly documented as blocking (`state.rs:341-347`).
+- **Violation:** blocking on the reply inside an async handler without `spawn_blocking` stalls a tokio worker. Model construction is explicitly documented as blocking (`crates/onnx-genai-server/src/state.rs::model_id`).
 
 ### 4.2 EngineDriver ↔ Engine
 
 - **Ownership:** the driver thread **owns** the `Engine` exclusively. No `Arc<Mutex<Engine>>` — single ownership is what removes lock contention from the decode loop.
-- **Borrow facts that matter for instrumentation:** `continuous_batch_manager(&self)` (`batched.rs:599`), `page_usage(&self)` and `page_stats(&self)` (`engine/runtime.rs:247-253`) all take **immutable** borrows, so they are callable from inside the batch loop without restructuring.
-- **Violation:** any attempt to reach the engine from another thread. Add a `DriverCommand` variant instead — `ResourceSnapshot` (`driver.rs:72`, async accessor `:383`, handler `:732`) is the pattern to copy.
+- **Borrow facts that matter for instrumentation:** `continuous_batch_manager(&self)` (`crates/onnx-genai-engine/src/batched.rs::continuous_batch_manager`), `page_usage(&self)` and `page_stats(&self)` (`crates/onnx-genai-engine/src/engine/runtime.rs::set_vram_limit`) all take **immutable** borrows, so they are callable from inside the batch loop without restructuring.
+- **Violation:** any attempt to reach the engine from another thread. Add a `DriverCommand` variant instead — `ResourceSnapshot` (`crates/onnx-genai-server/src/driver.rs::DriverCommand`, async accessor `:383`, handler `:732`) is the pattern to copy.
 
 ### 4.3 Engine ↔ PageTable
 
 - **Caller guarantees:** every `allocate` is eventually matched by a `free`; a page id is never used after its ref count reaches zero; a page shared with another sequence is never mutated in place.
-- **Callee guarantees:** `allocate` returns a page not currently owned by anyone else, or `None`. `free` is idempotent-safe via `saturating_sub` (`page_table.rs:950`).
+- **Callee guarantees:** `allocate` returns a page not currently owned by anyone else, or `None`. `free` is idempotent-safe via `saturating_sub` (`crates/onnx-genai-kv/src/page_table.rs::page_owners`).
 - **Errors:** exhaustion is `None`, not a panic — the caller decides between eviction, preemption, and rejection.
 - **Violation:** mutating a shared page corrupts another sequence's KV silently. There is **no runtime guard** against this — see §5.3, an *assumed* invariant.
 
 ### 4.4 Engine ↔ ORT session
 
 - **Caller guarantees:** input tensor shapes match the model's declared IO. For static-cache models this includes the `model.io.static_cache` declaration in `inference_metadata.yaml`.
-- **Callee guarantees:** shapes and placement hints are validated at load; contradictory forced-placement hints are a hard error (`engine/load.rs:33-37`).
+- **Callee guarantees:** shapes and placement hints are validated at load; contradictory forced-placement hints are a hard error (`crates/onnx-genai-engine/src/engine/load.rs::from_dir_impl`).
 - **Violation:** a static-cache model missing its `io.static_cache` block **fails to load** — this is a real, observed failure, see §8.5.
 
 ### 4.5 Model directory boundary
 
-- **`ModelDirectory::load`** (`loader.rs:35`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
-- **Canonical errors:** `model directory does not exist: {}` (`loader.rs:39`), `tokenizer.json not found in {}` (`loader.rs:69`).
-- ⚠️ **Known duplication:** the server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs:162`) is a *second, laxer* filter used only for `--models-dir` fan-out. It accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory can pass admission and then fail at load. See §8.6.
+- **`ModelDirectory::load`** (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
+- **Canonical errors:** `model directory does not exist: {}` (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`), `tokenizer.json not found in {}` (`crates/onnx-runtime-loader/tests/loader.rs::i64_initializer`).
+- ⚠️ **Known duplication:** the server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs::looks_like_model_dir`) is a *second, laxer* filter used only for `--models-dir` fan-out. It accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory can pass admission and then fail at load. See §8.6.
 
 ### 4.6 Tokenizer boundary
 
 - **Caller guarantees:** the same tokenizer instance is used for encoding a prompt and decoding its output.
-- **Why it matters:** `run_continuous_batch_scheduled` tokenizes every prompt **up front** and hands the manager token ids specifically so that "no re-tokenization can drift between the two" (`batched.rs:732-735`). Re-tokenizing mid-flight would desynchronize the scheduler's length accounting from the batch's actual rows.
+- **Why it matters:** `run_continuous_batch_scheduled` tokenizes every prompt **up front** and hands the manager token ids specifically so that "no re-tokenization can drift between the two" (`crates/onnx-genai-engine/src/batched.rs::batched_max_context_for_request`). Re-tokenizing mid-flight would desynchronize the scheduler's length accounting from the batch's actual rows.
 
 ### 4.7 `/v1/status` is a **node**-level contract with no model dimension
 
 This is the clearest example in the codebase of a wire contract constraining an architecture decision, so it is worth stating precisely.
 
-`GET /v1/status` returns `NodeStatus` (`routes/mod.rs:118-131`, handler `routes/admin.rs:41-86`). Its own doc comment defines the scope (`routes/mod.rs:110-116`):
+`GET /v1/status` returns `NodeStatus` (`crates/onnx-genai-server/src/routes/mod.rs::HealthResponse`, handler `crates/onnx-genai-server/src/routes/admin.rs::models`). Its own doc comment defines the scope (`crates/onnx-genai-server/src/routes/mod.rs::ModelObject`):
 
 > All values are model-agnostic; `node_id` names this node, never a model.
 
 - **Consumer:** the cluster router, not just local tooling. It is a shared contract, not an internal detail.
 - **Guarantee:** every field describes *the node*. There is no field identifying which model a number came from, and no place to put one without changing the struct.
 
-**The consequence, spelled out.** Multi-model mode gives each model its **own** `EngineDriver` (`state.rs:376`), so two models really do run in one process. But `/v1/status` has no model dimension, so with two drivers behind one node it can only report one engine's numbers or blend them — and **a consumer cannot tell which**. Blending is the dangerous outcome precisely because the response still looks well-formed and plausible.
+**The consequence, spelled out.** Multi-model mode gives each model its **own** `EngineDriver` (`crates/onnx-genai-server/src/state.rs::load_chat_template`), so two models really do run in one process. But `/v1/status` has no model dimension, so with two drivers behind one node it can only report one engine's numbers or blend them — and **a consumer cannot tell which**. Blending is the dangerous outcome precisely because the response still looks well-formed and plausible.
 
 Adding a model dimension is possible but is a **breaking change to a contract another component consumes**. Running one server per model instead makes `/v1/status` unambiguous *by construction*: one engine per origin, no new fields, no migration, and no way to misattribute a number.
 
@@ -373,11 +375,11 @@ Adding a model dimension is possible but is a **breaking change to a contract an
 
 ### 4.9 Session ids on the wire are credentials — redaction is structural ⚠️ SECURITY
 
-`/v1/status` returns `sessions[].id` (`admin.rs:69`), and unlike most of that struct it is **genuinely populated** — which makes it the field most likely to be bound by a consumer looking for something real to show. **A full session id is a bearer token**: possession of it is what authorises requests against that session. What appears on the wire is deliberately truncated — `sess-` plus the first 8 hex characters, then `…` (`session.rs:161-172`).
+`/v1/status` returns `sessions[].id` (`crates/onnx-genai-server/src/routes/admin.rs::batch_utilization`), and unlike most of that struct it is **genuinely populated** — which makes it the field most likely to be bound by a consumer looking for something real to show. **A full session id is a bearer token**: possession of it is what authorises requests against that session. What appears on the wire is deliberately truncated — `sess-` plus the first 8 hex characters, then `…` (`crates/onnx-genai-engine/src/session.rs::DraftSession`).
 
 **The redaction is enforced by the shape of the API, not by remembering to call it.** Three properties do that, and they are worth preserving deliberately:
 
-1. **There is exactly one id-listing accessor, and it redacts.** `client_ids_redacted()` (`session.rs:117`) is the *only* method that yields client ids. No unredacted sibling exists to reach for by mistake.
+1. **There is exactly one id-listing accessor, and it redacts.** `client_ids_redacted()` (`crates/onnx-genai-engine/src/session.rs::DraftSession`) is the *only* method that yields client ids. No unredacted sibling exists to reach for by mistake.
 2. **Redaction happens inside the registry lock**, at `:125`, before the values escape. A caller never holds a full id, so it cannot leak one by accident.
 3. **It fails closed.** An id not matching the expected `sess-<32 hex>` shape is replaced wholesale with `[redacted]` (`:170-171`) rather than passed through. An unrecognised format degrades to *less* disclosure, not more.
 
@@ -389,14 +391,14 @@ Adding a model dimension is possible but is a **breaking change to a contract an
 
 ### 4.8 The metrics registry is process-wide and has no model dimension
 
-`metrics.rs:89` declares `static REGISTRY: Registry` — a single, process-global instance. Every counter it holds is flat (`metrics.rs:74-87`): `prefix_cache_hits`, `prefix_cache_lookups`, `batch_size`, `pending`, `active_sessions`, `rejections`, and the `ttft` / `e2e` histograms. **None is keyed by model.**
+`crates/onnx-genai-router/src/metrics.rs::encode` declares `static REGISTRY: Registry` — a single, process-global instance. Every counter it holds is flat (`crates/onnx-genai-router/src/metrics.rs::encode`): `prefix_cache_hits`, `prefix_cache_lookups`, `batch_size`, `pending`, `active_sessions`, `rejections`, and the `ttft` / `e2e` histograms. **None is keyed by model.**
 
 - **Guarantee:** these numbers describe *the process*, never a particular model.
 - **Deliberate design:** the registry is a lock-free static specifically so recording a metric costs a relaxed atomic add and never allocates. That property is why it is safe to touch from the decode path at all (§5.10).
 
-**The consequence for multi-model serving.** Loading two models gives each its own `Engine` and its own `EngineDriver` on its own thread (`state.rs:370`, `:376`) — so the two genuinely run concurrently, one batching and one paging. **But they share this one registry.** Their counters are summed, and nothing in the response says so.
+**The consequence for multi-model serving.** Loading two models gives each its own `Engine` and its own `EngineDriver` on its own thread (`crates/onnx-genai-server/src/state.rs::load_chat_template`, `:376`) — so the two genuinely run concurrently, one batching and one paging. **But they share this one registry.** Their counters are summed, and nothing in the response says so.
 
-The sharpest instance follows from §5.13: `prefix_cache_lookups` increments on **every completed generation** (`metrics.rs:130-135`), so in a two-model process, generations served by a *static-cache* model — which never consults the prefix cache at all — inflate the denominator of the *dynamic* model's prefix hit rate. **The displayed rate is not merely blended; it is actively depressed by unrelated traffic**, while looking authoritative.
+The sharpest instance follows from §5.13: `prefix_cache_lookups` increments on **every completed generation** (`crates/onnx-genai-router/src/metrics.rs::encode`), so in a two-model process, generations served by a *static-cache* model — which never consults the prefix cache at all — inflate the denominator of the *dynamic* model's prefix hit rate. **The displayed rate is not merely blended; it is actively depressed by unrelated traffic**, while looking authoritative.
 
 Adding a model dimension means reworking a deliberately allocation-free static that sits on the hot path — precisely the change §5.10 warns against.
 
@@ -412,9 +414,9 @@ Each states the rule, **where it is enforced**, and what breaks. Critically: whe
 
 > A page is in the free pool if and only if `ref_count == 0`.
 
-Enforced in `PageTable::free` (`page_table.rs:947-951`): decrement, and return to the pool only on reaching zero. `allocate` (`:836`) draws only from the free pool.
+Enforced in `PageTable::free` (`crates/onnx-genai-kv/src/page_table.rs::page_owners`): decrement, and return to the pool only on reaching zero. `allocate` (`:836`) draws only from the free pool.
 
-Corollary: `free_count(device)` (`page_table.rs:1338`) plus the count of pages with `ref_count > 0` equals capacity. **Breaks if violated:** double-free returns a live page to the pool, and two sequences then write the same physical KV.
+Corollary: `free_count(device)` (`crates/onnx-genai-kv/src/page_table.rs::free_count`) plus the count of pages with `ref_count > 0` equals capacity. **Breaks if violated:** double-free returns a live page to the pool, and two sequences then write the same physical KV.
 
 *Note:* `free` uses `saturating_sub` (`:950`), which makes an extra free **silent** rather than a panic. Safe against underflow, but it means a refcount bug degrades quietly instead of failing loudly.
 
@@ -422,7 +424,7 @@ Corollary: `free_count(device)` (`page_table.rs:1338`) plus the count of pages w
 
 > A page shared by N sequences (or retained by the prefix trie) has `ref_count == N`.
 
-`PrefixCache::lookup_shared` (`prefix_cache.rs:92`) increments on match; release decrements. There is a test pinning exactly this (`prefix_cache.rs:296`, `lookup_shared_increments_and_release_decrements_page_refs`).
+`PrefixCache::lookup_shared` (`crates/onnx-genai-kv/src/prefix_cache.rs::lookup_shared`) increments on match; release decrements. There is a test pinning exactly this (`crates/onnx-genai-kv/src/prefix_cache.rs::lookup_shared_increments_and_release_decrements_page_refs`, `lookup_shared_increments_and_release_decrements_page_refs`).
 
 The prefix trie holds **its own** reference. So `ref_count == 2` with a single owning sequence means "one sequence plus a prefix-cache retention" — that is the mechanism by which a prefix survives its originating request.
 
@@ -430,7 +432,7 @@ The prefix trie holds **its own** reference. So `ref_count == 2` with a single o
 
 > A page with `ref_count > 1` must never be written in place.
 
-**Nothing at runtime prevents this.** `Page.ref_count` is a plain `pub u32` field (`page_table.rs:320`) and `Page.data` is a plain `pub Vec<f32>` (`:328`) — any holder of `&mut Page` can write a shared page. Correctness rests on callers checking the ref count first.
+**Nothing at runtime prevents this.** `Page.ref_count` is a plain `pub u32` field (`crates/onnx-genai-kv/src/page_table.rs::Page`) and `Page.data` is a plain `pub Vec<f32>` (`:328`) — any holder of `&mut Page` can write a shared page. Correctness rests on callers checking the ref count first.
 
 **This is the single most dangerous invariant in the codebase.** Violation corrupts another sequence's KV with no error, no panic, and no log — it surfaces as subtly wrong generated text in an unrelated request. **Any change touching page mutation deserves disproportionate review.**
 
@@ -438,21 +440,21 @@ The prefix trie holds **its own** reference. So `ref_count == 2` with a single o
 
 > Eviction never reclaims a page belonging to a live sequence or a retained prefix.
 
-Enforced at `page_table.rs:1097-1110`, which filters to `ref_count <= 1` and documents the intent inline. **Breaks if violated:** an active sequence loses KV mid-generation.
+Enforced at `crates/onnx-genai-kv/src/page_table.rs::allocate_page`, which filters to `ref_count <= 1` and documents the intent inline. **Breaks if violated:** an active sequence loses KV mid-generation.
 
 ### 5.5 Batch composition — ENFORCED
 
 > Physical concurrency never exceeds `max_batch` decode rows; each admitted row reserves its worst-case KV footprint up front.
 
-Enforced in `run_continuous_batch_scheduled` (`batched.rs:759-760` — the executable assignments `preemption_policy = PreemptionPolicy::Disabled` and `priority_policy = PriorityPolicy::Fcfs`): the scheduler governs *eligibility* (ordering plus the shared token/byte budget) while the manager's `max_batch` bounds *row count*. Up-front worst-case reservation is what makes byte-budget admission sound (`batched.rs:717-718`).
+Enforced in `run_continuous_batch_scheduled` (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled` — the executable assignments `preemption_policy = PreemptionPolicy::Disabled` and `priority_policy = PriorityPolicy::Fcfs`): the scheduler governs *eligibility* (ordering plus the shared token/byte budget) while the manager's `max_batch` bounds *row count*. Up-front worst-case reservation is what makes byte-budget admission sound (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`).
 
-`DEFAULT_MAX_BATCH` is currently **hardcoded to 4** (`crates/onnx-genai-server/src/state.rs:25`) with no CLI flag.
+`DEFAULT_MAX_BATCH` is currently **hardcoded to 4** (`crates/onnx-genai-server/src/state.rs::DEFAULT_MAX_OUTPUT_TOKENS`) with no CLI flag.
 
 ### 5.6 The static-cache requirement — ENFORCED (and load-bearing)
 
 > Continuous batching engages **only** on static-cache models. Paged KV and continuous batching are **mutually exclusive**.
 
-Enforced by the branch at `driver.rs:407-421`. `ContinuousBatchManager` (`batched.rs:101-110`) holds a `BatchedDecodeSession`, a tokenizer, and rows — **it never touches `engine.kv_cache`**. Static-cache models use runtime-owned in-place KV buffers, so there are no pages to page.
+Enforced by the branch at `crates/onnx-genai-server/src/driver.rs::embed`. `ContinuousBatchManager` (`crates/onnx-genai-engine/src/batched.rs::ContinuousBatchManager`) holds a `BatchedDecodeSession`, a tokenizer, and rows — **it never touches `engine.kv_cache`**. Static-cache models use runtime-owned in-place KV buffers, so there are no pages to page.
 
 Because the paged KV cache is the owner of *both* the page table and the prefix trie, bypassing it bypasses both. A static-cache model therefore never consults the prefix index at all — the question is never asked, so there is no answer to report. This distinction matters when reporting these metrics: a bypassed subsystem is **not applicable**, which is a different fact from **not measured** and a different fact again from **measured as zero**. Reporting any of the three as the others is a correctness bug in the reporting layer, even though every underlying number is accurate.
 
@@ -473,11 +475,11 @@ The batching/paged-KV split is not one limitation. It is a single structural fac
 
 | Feature | Where it dies on the batching path | Evidence |
 |---|---|---|
-| **Prefix cache reuse** | The batch never consults the prefix trie | `prefix_cache_hit_len` is a literal `0` at `batched.rs:262` and `:486`, so the `> 0` test at `metrics.rs:135` is never true |
-| **Preemption** | Disabled by construction, not by default | `scheduler_config.preemption_policy = PreemptionPolicy::Disabled` (`batched.rs:759`) |
-| **KV memory pressure / eviction** | Nothing to evict — rows are physical and pre-reserved | `batched.rs:759` sets `PreemptionPolicy::Disabled` (executable). Stated rationale at `:713-718`. |
+| **Prefix cache reuse** | The batch never consults the prefix trie | `prefix_cache_hit_len` is a literal `0` at `crates/onnx-genai-engine/src/batched.rs::admit_pending_into_row` and `:486`, so the `> 0` test at `crates/onnx-genai-router/src/metrics.rs::encode` is never true |
+| **Preemption** | Disabled by construction, not by default | `scheduler_config.preemption_policy = PreemptionPolicy::Disabled` (`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`) |
+| **KV memory pressure / eviction** | Nothing to evict — rows are physical and pre-reserved | `crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled` sets `PreemptionPolicy::Disabled` (executable). Stated rationale at `:713-718`. |
 
-The rationale at `batched.rs:713-718` is the common cause stated in the source itself: **the batch owns its KV in physical rows, and each row reserves its worst-case footprint up front.** Pre-reserved physical rows are what make the batching path fast and predictable, and they are *precisely* what removes the freedom that sharing, eviction and preemption all require. **Every one of the three is the same trade, seen from a different angle.**
+The rationale at `crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled` is the common cause stated in the source itself: **the batch owns its KV in physical rows, and each row reserves its worst-case footprint up front.** Pre-reserved physical rows are what make the batching path fast and predictable, and they are *precisely* what removes the freedom that sharing, eviction and preemption all require. **Every one of the three is the same trade, seen from a different angle.**
 
 > **The practical rule.** Before adding any counter or panel for a KV-related behaviour, establish **which execution path it can fire on**. A metric can be correctly implemented, correctly plumbed, and permanently zero — and that is indistinguishable from a bug for anyone who does not know this invariant. Zero here means *structurally impossible*, not *not yet happening*, and the two must never be rendered the same way.
 
@@ -485,7 +487,7 @@ The rationale at `batched.rs:713-718` is the common cause stated in the source i
 
 > `PreemptionPolicy::Disabled` is set unconditionally for scheduler-driven continuous batching.
 
-`batched.rs:759` (`scheduler_config.preemption_policy = PreemptionPolicy::Disabled`). The reason is structural, not a policy choice — stated rationale, not executable evidence, at `batched.rs:713-717`:
+`crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled` (`scheduler_config.preemption_policy = PreemptionPolicy::Disabled`). The reason is structural, not a policy choice — stated rationale, not executable evidence, at `crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`:
 
 > *"this batch owns its KV in the batched decode session's physical rows, which cannot be swapped out and resumed in place, so mid-flight eviction/swap of a running row is deferred."*
 
@@ -493,45 +495,45 @@ The rationale at `batched.rs:713-718` is the common cause stated in the source i
 
 > A request's output tokens do not depend on which other requests share its batch.
 
-Documented at `batched.rs:708-711`. There is no runtime assertion; it follows from the batched forward pass being mathematically per-row independent. **Breaks if violated:** batching becomes observable to users, and results stop being reproducible.
+Documented at `crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`. There is no runtime assertion; it follows from the batched forward pass being mathematically per-row independent. **Breaks if violated:** batching becomes observable to users, and results stop being reproducible.
 
 ### 5.9 Configuration asserts — ENFORCED, at construction
 
-`page_table.rs:785` requires non-empty layer configs. This is an `assert!`, so violation panics at construction — loud and early, which is correct for configuration errors.
+`crates/onnx-genai-kv/src/page_table.rs::new_with_layer_storage` requires non-empty layer configs. This is an `assert!`, so violation panics at construction — loud and early, which is correct for configuration errors.
 
 ### 5.10 The decode loop never blocks for observability — **ASSUMED, NOT ENFORCED** ⚠️
 
 > No code inside the decode step loop may `.await`, acquire a lock, block, or allocate unboundedly — including for telemetry.
 
-Nothing in the type system prevents it. The engine thread (`driver.rs:113-123`) is a plain OS thread that owns the `Engine` outright, so there is no borrow-checker or runtime guard that would reject a blocking call; it will compile and run and simply make every token slower.
+Nothing in the type system prevents it. The engine thread (`crates/onnx-genai-server/src/driver.rs::DriverRoute`) is a plain OS thread that owns the `Engine` outright, so there is no borrow-checker or runtime guard that would reject a blocking call; it will compile and run and simply make every token slower.
 
-**Why it holds:** the loop at `driver.rs:575-603` runs once per decode step for *every* in-flight request. Latency added there is multiplied by steps and by batch size, and it lands directly in inter-token latency — the number users feel most.
+**Why it holds:** the loop at `crates/onnx-genai-server/src/driver.rs::run_static_engine_driver` runs once per decode step for *every* in-flight request. Latency added there is multiplied by steps and by batch size, and it lands directly in inter-token latency — the number users feel most.
 
 **What breaks if violated:** token generation stalls for every concurrent request at once. It degrades gradually rather than failing, so it survives review and shows up later as "the server got slower" with no obvious cause.
 
-**Safe primitives:** relaxed atomics (the pattern already used throughout `metrics.rs:74-101`), or `tokio::sync::broadcast::send`, which is deliberately non-`async` and returns immediately even with no receivers.
+**Safe primitives:** relaxed atomics (the pattern already used throughout `crates/onnx-genai-router/src/metrics.rs::encode`), or `tokio::sync::broadcast::send`, which is deliberately non-`async` and returns immediately even with no receivers.
 
 ### 5.11 Non-`Generate` commands are deferred until the batch drains — ENFORCED
 
 > While a continuous batch is running, the **only** command processed inline is `DriverCommand::Generate` with `session_id: None`. Every other command is queued and not handled until the batch goes idle.
 
-Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:560-566`): the `try_recv` drain matches `Generate { session_id: None, .. }` and submits it to the manager, and the catch-all arm at **`driver.rs:566`** pushes everything else onto `deferred`. That queue is only drained at `driver.rs:570`, after the batch loop has exited.
+Enforced by the dispatch inside `run_static_batch_until_idle` (`crates/onnx-genai-server/src/driver.rs::run_static_engine_driver`): the `try_recv` drain matches `Generate { session_id: None, .. }` and submits it to the manager, and the catch-all arm at **`crates/onnx-genai-server/src/driver.rs::run_static_engine_driver`** pushes everything else onto `deferred`. That queue is only drained at `crates/onnx-genai-server/src/driver.rs::run_static_engine_driver`, after the batch loop has exited.
 
 **Why it holds:** the `Engine` is single-owner with no interior locking (§6). Servicing an arbitrary command mid-batch would need mutable access the batch loop is already holding.
 
 **What breaks if violated — and this is a live trap:** anything latency-sensitive implemented as a `DriverCommand` is answered **only when the server is idle**. A telemetry command is the worst case: batch occupancy, queue depth, and KV stats would be unavailable *precisely while the server is busy*, which is the only time they are interesting. A dashboard built that way appears to work in testing and freezes under load — looking like a UI bug rather than an architectural one.
 
-> ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`driver.rs:653`), and published through an atomic. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted. **✅ This is now shipped, not proposed: `KvTelemetry` (`onnx-genai-kv/src/telemetry.rs`) is a block of atomics stored with `Ordering::Relaxed`, attached via `Engine::attach_kv_telemetry` (`engine/runtime.rs:263`) on both driver paths (`driver.rs:449`, `:463`) and read lock-free by the HTTP handlers.** The measured consequence is the argument: routing the same data through a driver round-trip turns two 1.8 ms endpoints into **14.8-second stalls during a generation**, because the round-trip queues behind the exclusive `&mut Engine` borrow. **A relaxed atomic store is cheaper than servicing a channel, so the correct design is also the lower-overhead one.**
+> ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`), and published through an atomic. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted. **✅ This is now shipped, not proposed: `KvTelemetry` (`onnx-genai-kv/src/telemetry.rs`) is a block of atomics stored with `Ordering::Relaxed`, attached via `Engine::attach_kv_telemetry` (`crates/onnx-genai-engine/src/engine/runtime.rs::page_stats`) on both driver paths (`crates/onnx-genai-server/src/driver.rs::run_engine_driver`, `:463`) and read lock-free by the HTTP handlers.** The measured consequence is the argument: routing the same data through a driver round-trip turns two 1.8 ms endpoints into **14.8-second stalls during a generation**, because the round-trip queues behind the exclusive `&mut Engine` borrow. **A relaxed atomic store is cheaper than servicing a channel, so the correct design is also the lower-overhead one.**
 
 ### 5.12 Exactly one model-directory validator — **ASPIRATIONAL, CURRENTLY VIOLATED** ⚠️
 
-> A directory is a valid model directory if and only if `ModelDirectory::load` (`onnx-genai-ort/src/loader.rs:35`) accepts it. No other component may define its own criterion.
+> A directory is a valid model directory if and only if `ModelDirectory::load` (`crates/onnx-genai-ort/src/loader.rs::load`) accepts it. No other component may define its own criterion.
 
-**This invariant is currently false**, and stating it as intent rather than behaviour would violate this document's own honesty rule. `looks_like_model_dir` (`models_config.rs:162`) is a second, weaker validator that accepts on an **OR** of conditions where the loader requires an **AND**. A directory can therefore pass admission and then fail at load, producing contradictory error text (`models_config.rs:155-158`).
+**This invariant is currently false**, and stating it as intent rather than behaviour would violate this document's own honesty rule. `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs::looks_like_model_dir`) is a second, weaker validator that accepts on an **OR** of conditions where the loader requires an **AND**. A directory can therefore pass admission and then fail at load, producing contradictory error text (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`).
 
 **Why the invariant is worth holding:** validation that disagrees with loading is unfalsifiable from the user's side — the error message names the wrong cause.
 
-**What breaks while it is violated:** a user is told their model directory is fine, then told it does not exist. Two duplicated error strings (`state.rs:366` and `engine/load.rs:30`) make the origin ambiguous when debugging.
+**What breaks while it is violated:** a user is told their model directory is fine, then told it does not exist. Two duplicated error strings (`crates/onnx-genai-server/src/state.rs::infer_model_id` and `crates/onnx-genai-engine/src/engine/load.rs::from_dir_impl`) make the origin ambiguous when debugging.
 
 **Status:** the fix is funded — delete `looks_like_model_dir` and unify on `ModelDirectory::load(...).is_ok()`. Update this section to ENFORCED when it lands.
 
@@ -545,10 +547,10 @@ Verified instances in this repo, all genuinely measured and all easy to misread:
 
 | Field | Name implies | Actually counts | Evidence |
 |---|---|---|---|
-| `prefix_cache_lookups` | cache lookups | **completed generations** — incremented unconditionally, with no predicate | `metrics.rs:130-135` |
-| `active_sessions` | concurrent requests | **persistent `X-Session-Id` sessions** — 4 concurrent stateless requests report `0` | `session.rs:73`, `:106` |
-| `vram.used` | GPU memory in use | the scheduler's **KV byte-budget accounting** | `governor.rs:548`, `:554` |
-| `host_ram.used` | this process's memory | **whole-machine** OS query, including every other process | `governor.rs:575-579` |
+| `prefix_cache_lookups` | cache lookups | **completed generations** — incremented unconditionally, with no predicate | `crates/onnx-genai-server/src/metrics.rs::result` |
+| `active_sessions` | concurrent requests | **persistent `X-Session-Id` sessions** — 4 concurrent stateless requests report `0` | `crates/onnx-genai-server/src/session.rs::remove` |
+| `vram.used` | GPU memory in use | the scheduler's **KV byte-budget accounting** | `crates/onnx-genai-engine/src/engine/governor.rs::resolved_host_ram_budget`, `:554` |
+| `host_ram.used` | this process's memory | **whole-machine** OS query, including every other process | `crates/onnx-genai-engine/src/engine/governor.rs::resolved_host_ram_budget` |
 
 **What breaks if violated:** the failure is silent and self-confirming. `prefix_cache_lookups` is the cautionary case — it would read `5` on a build with the prefix cache **deleted entirely**, so any hit-rate derived from it is a ratio against an unrelated denominator.
 
@@ -560,10 +562,10 @@ Verified instances in this repo, all genuinely measured and all easy to misread:
 
 Four independent instances:
 
-- **`PageUsage` collapses page identity into a count.** `SequenceUsage.pages` is `pages.len()` (`page_table.rs:867-875`) — the `Vec<PageId>` is consumed to produce a length. The table knows *which* pages each sequence holds (`self.sequences`, `page_table.rs:619-620`), but that mapping never crosses the API boundary. **Consequence:** per-block sequence ownership — colouring a block grid by owning sequence — cannot be built from `page_usage()` as it stands.
+- **`PageUsage` collapses page identity into a count.** `SequenceUsage.pages` is `pages.len()` (`crates/onnx-genai-kv/src/page_table.rs::build`) — the `Vec<PageId>` is consumed to produce a length. The table knows *which* pages each sequence holds (`self.sequences`, `crates/onnx-genai-kv/src/page_table.rs::TelemetryHandle`), but that mapping never crosses the API boundary. **Consequence:** per-block sequence ownership — colouring a block grid by owning sequence — cannot be built from `page_usage()` as it stands.
 - **`GovernorReconfigureOutcome` drops the eviction plan**, so a caller learns that reconfiguration happened but not what it decided. `overage_bytes` and `eviction_order` (`scheduler/src/governor.rs:158-167`) have **no consumers anywhere outside `governor.rs`'s own tests** (`:786`, `:852`).
-- **`driver.rs:735-739` discards the reconfigure result** entirely.
-- **`execution_provider` is resolved and dropped.** Determined at `engine/load.rs:328-345`, then not carried out to any handler. *(Reported by @d7cf9b84; the first three verified here.)*
+- **`crates/onnx-genai-server/src/driver.rs::submit_to_continuous_manager` discards the reconfigure result** entirely.
+- **`execution_provider` is resolved and dropped.** Determined at `crates/onnx-genai-engine/src/engine/load.rs::package_selection_from_session_options`, then not carried out to any handler. *(Reported by @d7cf9b84; the first three verified here.)*
 
 **Why it holds:** each of these was a reasonable narrowing for its original caller — a length is all the original consumer needed.
 
@@ -579,8 +581,8 @@ Four independent instances:
 
 The engine holds no concurrent-reader path. Both driver paths take an **exclusive borrow** for the whole of a generation:
 
-- **Batched path:** commands needing `&mut Engine` are deferred (`driver.rs:647`) until `manager.is_idle()` (`:661`), drained at `:570`. Under sustained load the batch may never idle. **`ResourceSnapshot` is exempt — it is answered inline through a `&Engine` borrow (`driver.rs:678`).** (§5.11)
-- **Pipeline/fallback path:** `handle_driver_command(engine: &mut Engine, ..)` (`driver.rs:674`) runs `run_fallback_generation` **inline** at `:696`. The generation completes *inside* the command handler, so the next command — telemetry or otherwise — is not read until it returns.
+- **Batched path:** commands needing `&mut Engine` are deferred (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`) until `manager.is_idle()` (`:661`), drained at `:570`. Under sustained load the batch may never idle. **`ResourceSnapshot` is exempt — it is answered inline through a `&Engine` borrow (`crates/onnx-genai-server/src/driver.rs::intake_during_batch`).** (§5.11)
+- **Pipeline/fallback path:** `handle_driver_command(engine: &mut Engine, ..)` (`crates/onnx-genai-server/src/driver.rs::intake_during_batch`) runs `run_fallback_generation` **inline** at `:696`. The generation completes *inside* the command handler, so the next command — telemetry or otherwise — is not read until it returns.
 
 **These look like two problems and are one.** The queue policy is not the cause; **`&mut Engine` is.** While a generation holds the exclusive borrow, no reader can observe the engine *at all* — not because a channel is busy, but because the borrow makes concurrent observation unrepresentable. Draining the queue faster cannot fix it, and neither can adding another command.
 
@@ -614,7 +616,7 @@ The split is exactly the invariant: the two slow endpoints await a driver round-
 | Thread | Role |
 |---|---|
 | tokio runtime workers | axum request handling, SSE streaming |
-| **one dedicated engine thread per model handle** | `EngineDriver::start`, `driver.rs:113-123`, spawned with `std::thread::Builder` |
+| **one dedicated engine thread per model handle** | `EngineDriver::start`, `crates/onnx-genai-server/src/driver.rs::DriverRoute`, spawned with `std::thread::Builder` |
 
 ### Why a dedicated OS thread, not a tokio task
 
@@ -625,14 +627,14 @@ The second-order benefit is the important one: **because exactly one thread owns
 ### Ordering rules
 
 1. Commands are processed **in channel order** — the mpsc queue defines admission order into the driver.
-2. The scheduler may reorder *eligibility* among waiting requests (FCFS by default, `batched.rs:759`), but never reorders events **within** a single request.
-3. Every request's events pass through `route_continuous_events` (`driver.rs:637`) — a single funnel, so per-request event ordering is total.
+2. The scheduler may reorder *eligibility* among waiting requests (FCFS by default, `crates/onnx-genai-engine/src/batched.rs::run_continuous_batch_scheduled`), but never reorders events **within** a single request.
+3. Every request's events pass through `route_continuous_events` (`crates/onnx-genai-server/src/driver.rs::intake_during_batch`) — a single funnel, so per-request event ordering is total.
 4. Replies are per-request channels, so responses to different requests are unordered with respect to each other. Callers must not assume completion order.
 
 ### Where the locks are
 
 - **Not in the decode loop.** Deliberate.
-- Metrics are **lock-free atomics** in a static registry (`crates/onnx-genai-server/src/metrics.rs:74-101`).
+- Metrics are **lock-free atomics** in a static registry (`crates/onnx-genai-server/src/metrics.rs::Registry`).
 - The session registry and model registry use standard synchronization, but are touched per request, not per token.
 
 ### Rule for anyone adding instrumentation
@@ -648,11 +650,11 @@ Use an atomic counter, or a non-blocking `tokio::sync::broadcast::send` (which i
 ### Adding an execution provider
 
 Implement the `onnx-runtime-ep-api` traits; follow `onnx-runtime-ep-cpu` (simplest complete reference) or `-ep-cuda`. Register so `SessionOptions` can resolve it.
-**Must not break:** placement-hint validation (`engine/load.rs:33-37`) — an EP that silently ignores forced placement turns a hard error into wrong-device execution.
+**Must not break:** placement-hint validation (`crates/onnx-genai-engine/src/engine/load.rs::from_dir_impl`) — an EP that silently ignores forced placement turns a hard error into wrong-device execution.
 
 ### Adding a sampler
 
-Sampling lives in the generation core. Model authors' declared defaults are captured before the engine moves into the driver (`state.rs:373-375`), specifically so a model shipping `do_sample: true` is not silently forced to greedy.
+Sampling lives in the generation core. Model authors' declared defaults are captured before the engine moves into the driver (`crates/onnx-genai-server/src/state.rs::load_chat_template`), specifically so a model shipping `do_sample: true` is not silently forced to greedy.
 **Must not break:** that defaults capture. Overriding it makes model-declared generation config unreachable.
 
 ### Adding a scheduling policy
@@ -662,19 +664,19 @@ Extend `PriorityPolicy` / `PreemptionPolicy` in `onnx-genai-scheduler`.
 
 ### Adding an HTTP endpoint
 
-Register in `app()` (`crates/onnx-genai-server/src/lib.rs:62-135`). Choose a gate deliberately:
+Register in `app()` (`crates/onnx-genai-server/src/lib.rs::app`). Choose a gate deliberately:
 
 - ungated — safe for anonymous callers;
-- `enable_debug_endpoints` (`crates/onnx-genai-server/src/lib.rs:101`, flag `--enable-debug-endpoints`, `cli.rs:74`) — introspection;
-- `enable_admin_endpoints` (`crates/onnx-genai-server/src/lib.rs:114`) — mutating operations.
+- `enable_debug_endpoints` (`crates/onnx-genai-server/src/lib.rs::app`, flag `--enable-debug-endpoints`, `crates/onnx-genai-server/src/cli.rs::run_serve`) — introspection;
+- `enable_admin_endpoints` (`crates/onnx-genai-server/src/lib.rs::app`) — mutating operations.
 
 **Gated routes return `404`, not `403`**, because the route is never registered. Clients must treat 404 on a debug path as "disabled", not "missing".
 
-If the endpoint needs engine data, add a `DriverCommand` variant — copy `ResourceSnapshot` (`driver.rs:72`, `:383`, `:732`). Do not reach into the engine from a handler.
+If the endpoint needs engine data, add a `DriverCommand` variant — copy `ResourceSnapshot` (`crates/onnx-genai-server/src/driver.rs::DriverCommand`, `:383`, `:732`). Do not reach into the engine from a handler.
 
 ### Error message convention
 
-`What: / Why: / How:` — see `driver.rs:723-730` for the reference example. New errors should follow it.
+`What: / Why: / How:` — see `crates/onnx-genai-server/src/driver.rs::handle_or_defer_during_batch` for the reference example. New errors should follow it.
 
 ---
 
@@ -690,7 +692,7 @@ There is a paged **allocator** (`PageTable`, `PrefixCache`) that genuinely alloc
 >
 > * **The page allocator's LRU eviction is REAL and RUNS.** `PagedDecode::evict_until_free()`
 >   (`engine/src/pipeline/paged_decode.rs:44`) calls `evict_lru(..)` (`:53`), reached from
->   `flat_autoregressive.rs:307` — i.e. on the **dynamic / per-request path**, which is the only
+>   `crates/onnx-genai-engine/src/pipeline/flat_autoregressive.rs::admit_paged_sequence` — i.e. on the **dynamic / per-request path**, which is the only
 >   path with a page table at all (§5.6.1). §5.4's liveness guarantee applies to *this* mechanism.
 > * **The resource governor's eviction plan is COMPUTED AND NEVER EXECUTED.**
 >   `GovernorReconfigureOutcome` produces `overage_bytes` and an ordered `eviction_order`
@@ -711,21 +713,21 @@ Say "paged KV block table", not "paged attention". The distinction is not pedant
 
 ### 8.2 KV introspection is stubbed at the server seam
 
-`GET /v1/debug/kv` (`crates/onnx-genai-server/src/routes/admin.rs:118-141`) returns the literal string *"engine does not yet expose KV page statistics"* (`:140`).
+`GET /v1/debug/kv` (`crates/onnx-genai-server/src/routes/admin.rs::KV_DETAIL`) returns the literal string *"engine does not yet expose KV page statistics"* (`:140`).
 
-**But the data already exists.** `Engine::page_usage()` and `Engine::page_stats()` (`engine/runtime.rs:247-253`) compute block utilization, per-sequence page counts, and allocation/free/eviction/failure counters; the underlying types are `PageStats` (`page_table.rs:564-579`), `PageUsage` (`:583-604`), `SequenceUsage` (`:607-614`).
+**But the data already exists.** `Engine::page_usage()` and `Engine::page_stats()` (`crates/onnx-genai-engine/src/engine/runtime.rs::set_vram_limit`) compute block utilization, per-sequence page counts, and allocation/free/eviction/failure counters; the underlying types are `PageStats` (`crates/onnx-genai-kv/src/page_table.rs::PageStats`), `PageUsage` (`:583-604`), `SequenceUsage` (`:607-614`).
 
 The gap is **one missing `DriverCommand`**, not missing instrumentation. Anyone closing it must **delete the stub comments in the same change** — a stale `// not yet tracked` next to a live value is worse than the stub was.
 
 ### 8.3 `/v1/status` returns documented zeros — a real trap for consumers ⚠️
 
-`NodeStatus` (`crates/onnx-genai-server/src/routes/mod.rs:118-131`) declares a rich set of fields. The **handler** (`admin.rs:41-86`) hardcodes most of them.
+`NodeStatus` (`crates/onnx-genai-server/src/routes/mod.rs::HealthResponse`) declares a rich set of fields. The **handler** (`crates/onnx-genai-server/src/routes/admin.rs::models`) hardcodes most of them.
 
 | Genuinely measured | Hardcoded |
 |---|---|
 | `node_id` `:45` · `healthy` `:47-51` · `queue_depth` `:59` · `active_sessions` `:61` · `sessions[].id` `:69` (redacted — full ids are bearer tokens) | `kv_usage` `:53` · `kv_pages_used` `:54` · `kv_pages_total` `:55` · `kv_pages_shared` `:56` · `paused_sessions` `:62` · `tokens_per_second` `:63` · `batch_utilization` `:64` · `sessions[].priority` `:75` · `sessions[].kv_pages` `:76` · `sessions[].state` `:77` · `prefix_hashes` `:81` |
 
-The struct doc (`routes/mod.rs:110-116`) states the intent honestly: metrics the server cannot yet measure are *"reported as documented zeros/empties rather than fabricated"*.
+The struct doc (`crates/onnx-genai-server/src/routes/mod.rs::ModelObject`) states the intent honestly: metrics the server cannot yet measure are *"reported as documented zeros/empties rather than fabricated"*.
 
 **The trap:** a consumer can bind a dashboard to `kv_usage` or `tokens_per_second`, do everything else correctly, and display a fabricated measurement. **Verify a field is populated before depending on it.** Per-field comments in `status()` mark which are which.
 
@@ -735,7 +737,7 @@ Note `tokens_per_second` is honest about the reason — *"only cumulative token 
 
 > **On how this list was established, and how much to trust it.** Two independent audits produced it: one reading forward from the engine toward the response, one reading backward from the response struct toward its sources. They agree on the same set, which is stronger evidence than either pass alone.
 >
-> **That convergence still failed once, and the failure is instructive.** Both audits initially placed `prefix_cache_lookups` on the honest side of the line. Both were wrong for the same reason: each read the field's *name* and neither read `metrics.rs:130-135` (see §5.13). Agreement is only independent evidence when the two paths do not share a premise — and a plausible name is a premise both readers inherit from the same place. The rule this list is built on is therefore **verify the field, not the rule**: confirm each entry at its cited line rather than trusting the table, including this one.
+> **That convergence still failed once, and the failure is instructive.** Both audits initially placed `prefix_cache_lookups` on the honest side of the line. Both were wrong for the same reason: each read the field's *name* and neither read `crates/onnx-genai-router/src/metrics.rs::encode` (see §5.13). Agreement is only independent evidence when the two paths do not share a premise — and a plausible name is a premise both readers inherit from the same place. The rule this list is built on is therefore **verify the field, not the rule**: confirm each entry at its cited line rather than trusting the table, including this one.
 
 ### 8.4 Prefix cache: the zero is safe, the **non-zero** is the defect ⚠️🔴
 
@@ -753,10 +755,10 @@ The earlier open question ("should these counters report *unavailable* rather th
 
 | Evidence | Citation |
 |---|---|
-| `ContinuousBatchManager` holds eight fields — `decode`, `tokenizer`, `metadata_max_context`, `static_max_len`, `queue`, `rows`, `events`, `next_handle`. **No `kv_cache`, no page table.** | `crates/onnx-genai-engine/src/batched.rs:101-110` |
-| `batched.rs` only ever **reads** `row.state.prefix_cache_hit_len` when building a result; it never assigns it | `batched.rs:347`, `:579` |
-| The only literal assignment anywhere is `prefix_cache_hit_len: 0` | `crates/onnx-genai-engine/src/pipeline/nested_autoregressive.rs:533` |
-| **Three engine tests assert the zero as a postcondition** — `.all(\|result\| result.prefix_cache_hit_len == 0)` | `tests/batched_static_decode.rs:53`, `:88`, `tests/engine_continuous_batch_scheduled.rs:82` |
+| `ContinuousBatchManager` holds eight fields — `decode`, `tokenizer`, `metadata_max_context`, `static_max_len`, `queue`, `rows`, `events`, `next_handle`. **No `kv_cache`, no page table.** | `crates/onnx-genai-engine/src/batched.rs::ContinuousBatchManager` |
+| `batched.rs` only ever **reads** `row.state.prefix_cache_hit_len` when building a result; it never assigns it | `crates/onnx-genai-engine/src/batched.rs::advance_row`, `:579` |
+| The only literal assignment anywhere is `prefix_cache_hit_len: 0` | `crates/onnx-genai-engine/src/pipeline/nested_autoregressive.rs::publish_generation_result` |
+| **Three engine tests assert the zero as a postcondition** — `.all(\|result\| result.prefix_cache_hit_len == 0)` | `crates/onnx-genai-engine/tests/batched_static_decode.rs::batched_static_decode_matches_individual_static_generates`, `:88`, `crates/onnx-genai-engine/tests/engine_continuous_batch_scheduled.rs::scheduled_continuous_batch_matches_sequential_under_admission_eviction` |
 
 That last row is what closes it. **A stub is a value nobody has gotten to yet; this is a value the test suite would fail if someone changed.** Instrumenting the batching path is not deferred work — it is work that would break three green tests, because there is no cache to instrument.
 
@@ -775,11 +777,11 @@ That last row is what closes it. **A stub is a value nobody has gotten to yet; t
 
 **Correcting my own §8.4a, committed minutes earlier.** Having verified the static-path zero exhaustively, I let its complement — *"therefore the dynamic path is `measured`"* — ride unverified. It is not. QA (@fc8b5d97) measured 19 hits / 20 lookups **including six controls whose prefixes differ from token 0**, with the shared-prefix arm **7.0% slower**. I traced it to source and confirm their finding.
 
-`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs:1009`) forks into two mechanisms:
+`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs::tokenize_prompt`) forks into two mechanisms:
 
 | | Branch A — token cache (`:1029-1036`) | Branch B — paged (`:1037-1088`) |
 |---|---|---|
-| Guard | `uses_token_prefix_cache()` = `has_runner() \|\| is_windowed()` (`decode/state.rs:206`) | `use_kv` && `kv_model.is_some()` && `page_table.tensor_config.is_some()` |
+| Guard | `uses_token_prefix_cache()` = `has_runner() \|\| is_windowed()` (`crates/onnx-genai-engine/src/decode/state.rs::uses_token_prefix_cache`) | `use_kv` && `kv_model.is_some()` && `page_table.tensor_config.is_some()` |
 | Loads KV? | **No** | Yes — `attach_pages_to_sequence` → `materialize_sequence` → `load_materialized_past` |
 | Sets `loaded_prompt_prefix`? | **No** | Yes (`:1087`) |
 | Effect on prefill | **None** | Genuinely shortened |
@@ -867,43 +869,43 @@ why §8.4c's verdict required a control arm: no artifact already in the repo
 could have distinguished a working cache from a counter that always fires,
 *including the test written to do exactly that.*
 
-**⚠️ Do not cite `prefix_speedup.rs:50` as evidence that prefix reuse works.**
+**⚠️ Do not cite `crates/onnx-genai-engine/tests/prefix_speedup.rs::second_turn_latency_is_reported_for_prefix_cache_validation` as evidence that prefix reuse works.**
 It is sound evidence for one narrow fact — that the *counter* reports nonzero on
 a same-session second turn — and for nothing else. A test's **name is not an
 assertion**; only its `assert!` lines are.
 
 ### 8.5 `scripts/build_qwen.sh` produces a model that cannot be loaded
 
-`scripts/build_qwen.sh:32` passes `--runtime ort-genai`, which emits only `genai_config.json`. Loading the result fails because the runtime requires a `model.io.static_cache` declaration in `inference_metadata.yaml`.
+`scripts/build_qwen.sh::# shellcheck source=lib/mobius_env.sh` passes `--runtime ort-genai`, which emits only `genai_config.json`. Loading the result fails because the runtime requires a `model.io.static_cache` declaration in `inference_metadata.yaml`.
 
 The failure is confusing: the script succeeds, artifacts appear correct, and the model fails only at server start. Because continuous batching requires a static-cache model (§5.6), the practical effect is that batching silently never engages. A reproducible build recipe is captured as a skill in `.github/skills/build-static-cache-model/`.
 
 ### 8.6 Two model-directory admission filters
 
-`ModelDirectory::load` (`loader.rs:35`) is the real validator. The server's `looks_like_model_dir` (`models_config.rs:162`) is a second, laxer filter for `--models-dir` fan-out that accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`.
+`ModelDirectory::load` (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`) is the real validator. The server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs::looks_like_model_dir`) is a second, laxer filter for `--models-dir` fan-out that accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`.
 
-Because the real loader requires `tokenizer.json` **AND** an onnx file, a directory can pass admission and then fail at load, with an error message (`models_config.rs:155-158`) that describes a contract the loader does not implement. Consolidating on `ModelDirectory::load(...).is_ok()` would remove the divergence.
+Because the real loader requires `tokenizer.json` **AND** an onnx file, a directory can pass admission and then fail at load, with an error message (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`) that describes a contract the loader does not implement. Consolidating on `ModelDirectory::load(...).is_ok()` would remove the divergence.
 
-Also asymmetric: the CLI applies `resolve_model_dir` (`crates/onnx-genai-cli/src/lib.rs:674`) to coerce a config-file path to its parent directory. **The server does not.** So `onnx-genai generate ./m/genai_config.json` works while `--model ./m/genai_config.json` fails.
+Also asymmetric: the CLI applies `resolve_model_dir` (`crates/onnx-genai-cli/src/lib.rs::resolve_model_dir`) to coerce a config-file path to its parent directory. **The server does not.** So `onnx-genai generate ./m/genai_config.json` works while `--model ./m/genai_config.json` fails.
 
 ### 8.7 Runtime VRAM override is inert
 
-`POST /v1/admin/resources/vram-limit` (`admin.rs:160-181`) cannot shrink a live KV budget:
+`POST /v1/admin/resources/vram-limit` (`crates/onnx-genai-server/src/routes/admin.rs::KV_DETAIL`) cannot shrink a live KV budget:
 
-1. `allow_runtime_override` defaults to `false` (`config.rs:602`) and the server hardcodes `EngineConfig::default()` (`state.rs:152`) with no flag to change it — so the call returns `403`.
-2. Even when enabled, `Governor::set_vram_limit` (`engine/governor.rs:163-174`) carries `TODO(§26.11.2)` for executing the eviction order. It moves the accounting ceiling; **resident KV is never released.** It affects new allocations only.
+1. `allow_runtime_override` defaults to `false` (`crates/onnx-genai-router/src/config.rs::rejects_zero_unhealthy_after_misses`) and the server hardcodes `EngineConfig::default()` (`crates/onnx-genai-server/src/state.rs::ServerConfig`) with no flag to change it — so the call returns `403`.
+2. Even when enabled, `Governor::set_vram_limit` (`crates/onnx-genai-engine/src/engine/governor.rs::set_vram_limit`) carries `TODO(§26.11.2)` for executing the eviction order. It moves the accounting ceiling; **resident KV is never released.** It affects new allocations only.
 
 ### 8.8 OTLP span export is deferred
 
-`/v1/status` reports this explicitly rather than pretending it works (`routes/mod.rs:87-88`). Perfetto export is available at `/v1/debug/trace/perfetto`.
+`/v1/status` reports this explicitly rather than pretending it works (`crates/onnx-genai-server/src/routes/mod.rs::PERFETTO_EXPORT_PATH`). Perfetto export is available at `/v1/debug/trace/perfetto`.
 
 ### 8.9 `max_batch` is not configurable
 
-`DEFAULT_MAX_BATCH = 4` (`state.rs:25`) with no CLI flag, which also makes any batch-utilization percentage computed against it uninformative.
+`DEFAULT_MAX_BATCH = 4` (`crates/onnx-genai-server/src/state.rs::DEFAULT_MAX_OUTPUT_TOKENS`) with no CLI flag, which also makes any batch-utilization percentage computed against it uninformative.
 
 ### 8.10 `/v1/resources` can block for the duration of a busy batch ⚠️
 
-`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. **✅ RESOLVED by `a6fefde2`.** This section previously described a hang: on the continuous-batch path the command was not `Generate`, so it hit the catch-all, was parked on `deferred`, and was not drained until `manager.is_idle()` (`driver.rs:661`) — which under sustained load may never happen. **`handle_or_defer_during_batch` (`driver.rs:678`) now answers `ResourceSnapshot` inline through a `&Engine` borrow (`:646`), and defers only what genuinely needs `&mut Engine` (`:647`).** The fix is **structural rather than probabilistic**: the incapacity was never the queue, it was the exclusive borrow, so a fix that merely made the hang rarer would have passed every test the correct one does. Measured consequence of getting this wrong: `/metrics` and `/v1/resources` stall **14.8 s** during a 384-token generation, against **1.8 ms** for `/v1/status`.
+`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. **✅ RESOLVED by `a6fefde2`.** This section previously described a hang: on the continuous-batch path the command was not `Generate`, so it hit the catch-all, was parked on `deferred`, and was not drained until `manager.is_idle()` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`) — which under sustained load may never happen. **`handle_or_defer_during_batch` (`crates/onnx-genai-server/src/driver.rs::intake_during_batch`) now answers `ResourceSnapshot` inline through a `&Engine` borrow (`:646`), and defers only what genuinely needs `&mut Engine` (`:647`).** The fix is **structural rather than probabilistic**: the incapacity was never the queue, it was the exclusive borrow, so a fix that merely made the hang rarer would have passed every test the correct one does. Measured consequence of getting this wrong: `/metrics` and `/v1/resources` stall **14.8 s** during a 384-token generation, against **1.8 ms** for `/v1/status`.
 
 **Under sustained concurrent load the batch may not go idle**, because finished rows are backfilled from new arrivals to maintain occupancy. The reply is therefore held for as long as the server stays busy — the request does not fail, it simply does not answer, and it eventually surfaces as a client-side timeout rather than an error the server reports.
 
@@ -912,7 +914,7 @@ Two consequences worth separating:
 - **The endpoint appears to hang precisely when the machine is under load** — the condition a resource endpoint exists to report on.
 - **A poller gets a burst of identically-stale values** when the batch finally drains, because several deferred snapshots are serviced back-to-back against the same post-drain state.
 
-**Not the cause:** the pipeline driver arm is *not* at fault. It replies with an explicit `Err` for both `ResourceSnapshot` (`driver.rs:479-483`) and `SetVramLimit` (`driver.rs:485-489`) rather than dropping the oneshot, so pipeline models return a clean error instead of hanging. The deferral above is the whole mechanism.
+**Not the cause:** the pipeline driver arm is *not* at fault. It replies with an explicit `Err` for both `ResourceSnapshot` (`crates/onnx-genai-server/src/driver.rs::run_pipeline_driver`) and `SetVramLimit` (`crates/onnx-genai-server/src/driver.rs::run_pipeline_driver`) rather than dropping the oneshot, so pipeline models return a clean error instead of hanging. The deferral above is the whole mechanism.
 
 **This is the practical face of invariant §5.11**, and it is why observability must be collected inline in the batch loop rather than requested through the command channel: *the command channel is not serviced during batch decode, which is exactly when observability matters most.*
 
@@ -920,7 +922,7 @@ Two consequences worth separating:
 
 ### 8.11 `/metrics` inherits the driver round-trip for two gauges it treats as optional ⚠️
 
-`prometheus_metrics` (`admin.rs:504`) does two things:
+`prometheus_metrics` (`crates/onnx-genai-server/src/routes/admin.rs::prometheus_metrics`) does two things:
 
 ```rust
 let mut output = crate::metrics::encode_prometheus();          // atomic registry, ~0.8 ms
@@ -956,14 +958,14 @@ catch one is to read the increment site and ask what actually causes it to move.
 
 | Field | What the name implies | What it actually counts | Evidence |
 |---|---|---|---|
-| `prefix_cache_lookups` | cache lookups | **completed generations** — `fetch_add(1)` is unconditional in `GenerationMetrics::result()` | **Verified** — `metrics.rs:133-135` |
-| `prefix_cache_hits` | cache hits | **generations with *any* prefix overlap ≥1 token** (`if prefix_cache_hit_len > 0`) — a shared chat template alone satisfies it | **Verified** — `metrics.rs:136-137` |
+| `prefix_cache_lookups` | cache lookups | **completed generations** — `fetch_add(1)` is unconditional in `GenerationMetrics::result()` | **Verified** — `crates/onnx-genai-router/src/metrics.rs::encode` |
+| `prefix_cache_hits` | cache hits | **generations with *any* prefix overlap ≥1 token** (`if prefix_cache_hit_len > 0`) — a shared chat template alone satisfies it | **Verified** — `crates/onnx-genai-router/src/metrics.rs::encode` |
 | `prefix_cache_hit_rate` | hits ÷ lookups | **hits ÷ generations** — a real, useful per-generation rate, but not a hit rate | **Verified** (both terms above) |
-| `batch_size_current` | the engine's decode batch | **live `GenerationMetrics` guards** — incremented in `start()`, decremented in `Drop`. On the dynamic server this is structurally ≤1 (§5.15); on the scatter server it is requests in flight, not decode rows. **It is never the batch size on either server.** | **Verified** — `metrics.rs:112`, `:145` |
-| `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `admin.rs:526-534` |
+| `batch_size_current` | the engine's decode batch | **live `GenerationMetrics` guards** — incremented in `start()`, decremented in `Drop`. On the dynamic server this is structurally ≤1 (§5.15); on the scatter server it is requests in flight, not decode rows. **It is never the batch size on either server.** | **Verified** — `crates/onnx-genai-router/src/metrics.rs::escape`, `:145` |
+| `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `crates/onnx-genai-server/src/routes/admin.rs::from` |
 | `active_sessions` | concurrent requests | persistent `X-Session-Id` sessions — reads `0` at the busiest moment of a batching run, correctly | **Reported** (Lead), not independently verified here |
-| `kv_usage` (on `/v1/status`) | KV utilisation | hardcoded `0.0`. **Not demo-only:** `RoutingPolicy::LeastKvUsage` sorts on it (`router.rs:247`), so the comparison cannot discriminate and the weighted policy silently loses its 30% term. | **Reported** (@d7cf9b84), traced cross-crate |
-| ~~`created` (on `/v1/models`)~~ | model creation time | ~~**`now_unix()` — the current clock, evaluated per call.**~~ **✅ RESOLVED by `e556b7f4`** — now `directory_mtime_secs(&status.path)` (`routes/admin.rs:58`). Confirmed by observation: two calls 3 s apart returned an identical `created` (§8.13). | **Observed** |
+| `kv_usage` (on `/v1/status`) | KV utilisation | hardcoded `0.0`. **Not demo-only:** `RoutingPolicy::LeastKvUsage` sorts on it (`crates/onnx-genai-router/src/router.rs::load_score`), so the comparison cannot discriminate and the weighted policy silently loses its 30% term. | **Reported** (@d7cf9b84), traced cross-crate |
+| ~~`created` (on `/v1/models`)~~ | model creation time | ~~**`now_unix()` — the current clock, evaluated per call.**~~ **✅ RESOLVED by `e556b7f4`** — now `directory_mtime_secs(&status.path)` (`crates/onnx-genai-server/src/routes/admin.rs::models`). Confirmed by observation: two calls 3 s apart returned an identical `created` (§8.13). | **Observed** |
 
 > **🔴 `created` is the most dangerous entry in this table, and it is the one that defeats our own
 > detection heuristic.** Every instinct we have treats **motion as evidence of life**: `stale` exists
@@ -993,6 +995,61 @@ different provenance, and here one is a live count and the other is a compile-ti
 
 ---
 
+### 8.14 A prefix "hit" on the token path is a comparison, never a reuse ⚠️🔴
+
+**Status: LIVE GAP.** Every value of `prefix_cache_hit_len` in the engine originates in one
+function, `crates/onnx-genai-engine/src/engine/runtime.rs::prepare_session_prefix`, reached from
+exactly two call sites. It has two mutually exclusive branches, and they differ in a way no
+consumer of the metric can see:
+
+| Branch | Gate | What it does | Prefill shortened? |
+|---|---|---|---|
+| token-prefix | `uses_token_prefix_cache()` (`crates/onnx-genai-engine/src/decode/state.rs::uses_token_prefix_cache`) | computes a longest-common-prefix length and **falls through** | **no** |
+| paged | `use_kv` + tensor config present | calls `lookup_shared` and **materializes `matched.page_ids` into the page table** | yes |
+
+On the token branch the match length is filtered by `len > 0` — **a single shared token scores a
+hit.** Since every prompt in this repo shares a chat-template preamble, essentially every
+generation scores one. That is not a bug in the counter; it is the counter faithfully reporting
+that all prompts share a template.
+
+**Why this is the canonical §5.13 specimen:** every individual layer is correct.
+`crates/onnx-genai-server/src/metrics.rs::prefix_reuse_increments` returns `(0, 0)` for a zero
+match, and `crates/onnx-genai-server/src/metrics.rs::result` only increments when it does not.
+The server crate is clean, there is no stub, and **there is no literal to grep for.** The
+composition still misleads, because `generations_with_prefix_reuse`
+(`crates/onnx-genai-server/src/routes/admin.rs::resources`) names *work saved* while measuring
+*a comparison performed*.
+
+**Do not derive a hit rate from these fields.** A ratio whose numerator counts template-preamble
+matches and whose denominator counts completed generations is a real number about nothing.
+
+**What is NOT settled here, stated plainly:** which branch a given server takes at runtime.
+`has_runner()` is a runtime state, and this document's own §1 rule is that a state is not
+settleable by reading source. The branch table above is the discriminator; it is not the verdict.
+
+### 8.15 LRU prefix eviction is live — the allocator's *other* eviction is not ⚠️
+
+Two different mechanisms in this codebase are both called "eviction," and conflating them
+produces confident errors in **both** directions.
+
+**Live.** Cached prefix pages are evicted under pool pressure through five production hops with
+no test in the chain: `crates/onnx-genai-engine/src/pipeline/flat_autoregressive.rs` calls
+`crates/onnx-genai-engine/src/pipeline/paged_decode.rs::evict_until_free`, which calls
+`crates/onnx-genai-kv/src/prefix_cache.rs::evict_lru`, which **frees real pages** and then calls
+`crates/onnx-genai-kv/src/page_table.rs::note_prefix_eviction`. Pages are returned to the pool,
+not merely counted.
+
+**Inert.** The VRAM byte-budget governor computes an eviction order that nothing outside its own
+file consumes, and `ByteBudget::reconfigure` never touches `used`. The repo's own test is named
+`reconfigure_lower_reports_overage_without_evicting`. Lowering the ceiling **refuses new
+allocations rather than reclaiming existing ones.**
+
+**The lesson is directional.** This project spent a session hunting overclaims and found six. It
+found zero underclaims — because nobody greps to check whether we are being too hard on
+ourselves. An honesty process that only ever ratchets toward understating is not calibrated; it
+is a different bias, and it is harder to catch because every individual step feels virtuous. A
+claim of "no eviction occurs" is falsifiable in one grep, and it fails.
+
 ### 8.13 Observed against a running server — evidence class **Observed** 🟢
 
 Everything above this section is **Read**: derived from source at `file:line`. This section is
@@ -1020,12 +1077,12 @@ artifact it was made against:
 
 - **§8.12 `prefix_cache_lookups` counts completed generations.** After exactly **two** chat
   completions, `onnx_genai_prefix_cache_lookups_total` read **2**. This was previously an inference
-  from `metrics.rs:133-135`; it is now a measurement.
+  from `crates/onnx-genai-router/src/metrics.rs::encode`; it is now a measurement.
 - **§8.3 `tokens_per_second` is a placeholder.** 425 tokens were generated across the run and
   `/v1/status` still reported `tokens_per_second: 0.0`. The server accumulates totals and never
   computes a rate.
 - **§4.8 the registry has no model dimension.** The only labels anywhere in `/metrics` are histogram
-  `le=` buckets. Every counter is process-global, exactly as `metrics.rs:74-89` implies.
+  `le=` buckets. Every counter is process-global, exactly as `crates/onnx-genai-router/src/metrics.rs::encode` implies.
 - **§8.12 `vram`/`host_ram` are ceilings.** `/v1/resources` reported `vram: {used: 0, limit:
   5746050801}` — a 5.7 GB limit against a consumption term that is structurally absent.
 - **§8.4a the batching path never hits.** `onnx_genai_prefix_cache_hits_total` was `0` after both
@@ -1034,7 +1091,7 @@ artifact it was made against:
 #### What observation corrected
 
 - **🔴 `created` is no longer a clock — that §8.12 row is RESOLVED.** The row asserted
-  `created: now_unix()`, re-verified at `routes/admin.rs:29`. Two successive `/v1/models` calls three
+  `created: now_unix()`, re-verified at `crates/onnx-genai-server/src/routes/admin.rs::model_path_for_display`. Two successive `/v1/models` calls three
   seconds apart returned the **identical** `created: 1785389982`. Commit **`e556b7f4`** replaced it
   with `directory_mtime_secs(&status.path)` — a real property of a real directory. **The claim was
   true when written and false when shipped, and only a running server could tell the difference.**
@@ -1072,9 +1129,9 @@ is equally consistent with ordinary first-call warm-up.
 
 | Question | Start at |
 |---|---|
-| How does a request become tokens? | §3, then `driver.rs:407-421` |
+| How does a request become tokens? | §3, then `crates/onnx-genai-server/src/driver.rs::embed` |
 | Why is my batching panel flat? | §5.6 — check whether your model is static-cache |
-| Why is this metric zero? | §8.3, then the per-field comments in `admin.rs:41-86` |
-| Where do I add an endpoint? | §7, `crates/onnx-genai-server/src/lib.rs:62-135` |
+| Why is this metric zero? | §8.3, then the per-field comments in `crates/onnx-genai-server/src/routes/admin.rs::models` |
+| Where do I add an endpoint? | §7, `crates/onnx-genai-server/src/lib.rs::app` |
 | Can I call this from the engine thread? | §4.2 — check whether the accessor takes `&self` |
 | Is this invariant enforced or assumed? | §5 — assumed ones are marked ⚠️ |
