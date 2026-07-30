@@ -1161,3 +1161,84 @@ exercised surface on the branch. Not blocking; worth stating beside the
 `-p onnx-genai-server` only. I did NOT run the workspace: item 1 on the gate
 is a known `cargo check` exit 101 from vendored x86 AVX2 on arm64 in other
 crates, and I did not re-measure it. **264/0 is a claim about one package.**
+
+## 18. C17 — a faithful pipe carrying a misattributed message
+
+Filed at @d7cf9b84's prompt. They observed that the shared-buffer route
+fails silently where the static-cache route fails loudly. They are right,
+and the cause is one line further up than the silence.
+
+### 18.1 The plumbing is excellent. I checked it first, expecting to find the defect there.
+
+`batch_driver.rs:69 explain()` propagates the engine's own words verbatim:
+*"continuous batching is INACTIVE ... The engine refused it: {reason}"*, and
+its doc comment is the best sentence in the subsystem -- **"A reason shown
+only on failure teaches a reader that silence means success, and silence is
+also what a field that was never wired up looks like."** The enabled case
+explains itself too. `driver.rs:694` logs it at `warn`, and it reaches
+`/v1/status` as `batch_driver_detail`. **Nothing is lost in transit.**
+
+### 18.2 The reason is wrong where it is BORN, not where it is carried
+
+`decode/metadata.rs:160`:
+
+    let shared_buffer = supports_present_binding
+        && session.past_present_share_buffer_supported()
+        && metadata_max_context.is_some();
+
+**THREE INDEPENDENT CONDITIONS COLLAPSE INTO ONE BOOLEAN, AND THE BOOLEAN
+KEEPS NO RECORD OF WHICH ONE FAILED.** Two are facts about the environment
+(the EP declined; the session declined). Only the third is a fact about the
+model.
+
+Downstream, `batched.rs:653` composes the refusal:
+
+    "continuous batching requires a STATIC-CACHE or shared-buffer
+     past/present model"
+
+That sentence blames **the model**. It is reached whenever ANY of the three
+failed. So an operator whose *execution provider* declined is told to fix
+their *model file* -- and the message is now warn-level, on the wire, and on
+the page. **Every improvement to the honesty layer makes the wrong
+attribution more visible and more authoritative.**
+
+This is the branch's own `MISATTRIBUTED` classification occurring one floor
+BELOW the layer that has a word for it. The honesty layer can only be as
+honest as the reason handed to it, and it has no way to know this one is
+mis-signed.
+
+### 18.3 The asymmetry, which is the structural half
+
+    static-cache route   reject_undeclared_static_cache (ort/decode/io.rs:194)
+                         REFUSES TO BOOT, naming every missing key.
+                         @d7cf9b84 proved this by execution: delete the
+                         metadata and the server will not start.
+    shared-buffer route  degrades to `false` and blames the model.
+
+**TWO ROUTES TO ONE CAPABILITY, OPPOSITE FAILURE POSTURES, AND NOTHING IN
+THE TYPE SYSTEM OR THE PROSE MARKS THEM AS DIFFERENT.** A reader who learns
+the static-cache route's behaviour will generalise it, and be wrong.
+
+### 18.4 Why this is worse than an ordinary bad error string
+
+`supports_fixed_capacity_present_binding()` is negotiated with the EP at load
+time. **The same model bytes batch on one machine and refuse on another, and
+the refusal names the bytes.** The one artefact the operator can inspect,
+diff and re-download is the one the message accuses, and it is identical on
+both machines. That is unfalsifiable from the operator's side.
+
+No test pins the attribution: zero test references to either capability
+predicate. Control: `reject_undeclared_static_cache` is real, present code.
+
+### 18.5 Fix, and it is small
+
+Return a reason from the decision, not a boolean -- `Result<(), NoSharedBuffer>`
+with three variants (`EpDeclined`, `SessionDeclined`, `NoMaxContext`), and let
+`batched.rs` render the one it got. The plumbing to carry it **already exists
+and is good**; it is being handed a string that averaged three causes into one.
+`explain()` would then say which subsystem refused, which is the only thing
+the reader actually needs.
+
+**I am not asking for the boolean to become a config knob.** The decision is
+correct; only its *explanation* is lossy. A capability that turns on the host
+should be reported as a fact about the host.
