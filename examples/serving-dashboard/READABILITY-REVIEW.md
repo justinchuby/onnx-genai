@@ -3201,5 +3201,100 @@ zero, never a count: corpus floor `git ls-files -- examples/serving-dashboard` =
 branch `feat/genai-demo-dashboard`, and every zero above re-run with a positive control **in
 the same file**. All hold.
 
+~~**FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**~~
+~~**65 findings · 8 self-retractions (12.3%) · 1 defect shipped and repaired within 5 minutes.**~~
+
+**STRUCK, BY ITS OWN AUTHOR, FOR THE DEFECT THIS DOCUMENT EXISTS TO CATCH.** The verdict was
+correct; the *count* was stale within minutes of being written, because R66–R71 landed in
+commit messages, in `REVIEW-POINT.md`, and on the wire — everywhere except here. **R56 said a
+finding that lives only in chat did not happen. I then wrote five findings that lived only in
+chat.** The corrected verdict is at the foot of this section.
+
+---
+
+## 🟡 R66 — A DERIVED CORPUS ROOTED AT A HARDCODED STRING CANNOT SEE A `git mv`
+
+`served-surface.test.js:83` `const DASHBOARD = 'examples/serving-dashboard'`. Commit `481f7595`
+moved **28 files** out of that root (`harness/*.py`, `raw/*` → `examples/qa-evidence/`). A
+`git mv` removes a file from the corpus while keeping it in the repository, and the guard's
+anti-vacuity floor at `:191` catches a corpus that **vanished**, not one that **shrank**.
+
+> ### ***THIS IS THE LIMIT OF THE ZERO-AUDIT RULE, AND IT IS WORTH STATING PRECISELY: A NON-EMPTY FLOOR PROVES YOU READ SOMETHING. IT DOES NOT PROVE YOU READ THE THING YOU CARED ABOUT. A CORPUS CAN STAY LARGE AND STILL LOSE EXACTLY THE FILE UNDER TEST.***
+
+## 🔴 R67 — MY OWN GUARD ASSEMBLES ONE VERDICT FROM TWO DIFFERENT ARTEFACTS
+
+`check-review-freshness.test.js` reads documents from **disk** (`readFileSync(join(HERE, doc))`
+at `:153`/`:314`) and validates the SHAs it finds against the **object database**
+(`execFileSync('git', …)` at `:95`). Measured on my desk: **2 of 5 documents differ** between
+disk bytes and committed bytes. The two that matched were the two I wrote — **so the bug is
+invisible from the only chair I sit in.** I retracted the qualifier *"green from committed
+bytes"*, which I had published about six times. The exit code was true; the provenance was not.
+
+**RESOLVED BY VEHICLE, NOT BY SOURCE.** Run in a detached worktree, `porcelain 0` means disk
+**is** committed bytes by construction — all five documents match there and the guard is 3/3,
+raw exit 0. **The disclosure still stands for anyone who runs it on a shared desk.**
+
+## 🔴 R71 — A RATCHET LOOSENED SEVEN TIMES IS A CHANGELOG WITH AN ASSERTION ATTACHED
+
+`served-surface.test.js:308`, named **`the exposure ratchet has not been loosened`**, is RED at
+HEAD — deterministically, twice, in a detached worktree at `porcelain 0`. And its own history
+falsifies its name:
+
+```
+THE CONSTANT'S VALUE AT EVERY COMMIT THAT TOUCHED IT:
+  75fd37ff 82 -> 23f4da0d 83 -> 4ee814f4 84 -> 4971e0f2 85
+  -> 22dea83e 87 -> 69899be2 88 -> 9b54d3a9 91 -> NOW NEEDS 94
+
+FAILURE: 94 tracked files are fetchable at /demo/ that the page never loads (was 91).
+BY CLASS: TEST 64 · DESIGN 3 · INTERNAL_DOC 14 · TOOLING 10 · FIXTURE 3
+```
+
+**The mechanism is a design defect, not a counting one.** The guard asserts on **one scalar**
+spanning **five semantically different classes**, and 68% of it (64/94) is `TEST`.
+
+> ### ***ADDING A TEST FILE — THE MOST ROUTINE ACT IN THIS REPOSITORY — TRIPS A GUARD WHOSE OWN MESSAGE SAYS "THIS IS A PUBLISHING DECISION, NOT A FILE-LAYOUT ONE". IT IS A FILE-LAYOUT ONE. AND THE REMEDY THAT MESSAGE RECOMMENDS — RAISE THE NUMBER — SILENTLY BUYS HEADROOM FOR `INTERNAL_DOC`, THE ONE CLASS THAT GENUINELY IS A PUBLISHING DECISION. THE CLASS THAT MATTERS CANNOT BE TIGHTENED WITHOUT BLOCKING THE CLASS THAT DOESN'T.***
+
+**THE FIX IS ALREADY WRITTEN AND THROWN AWAY.** `:310-314` computes `byClass` — the exact
+per-class breakdown — then `.join(' · ')`s it into a string used **only in the failure
+message**. The structured data that would make this guard precise is built on every run and
+rendered only when it is already too late to act on it. **Assert against a frozen per-class map
+instead of one scalar. No new measurement is required; the values are in the failure text.**
+
+**CREDIT WHERE IT IS DUE, AND IT IS DUE.** That failure message is the **best in this
+repository** — it gives the count, the prior count, the per-class split, and *two* legitimate
+remedies each with its reason. The anti-vacuity test above it (`the classifier is not just
+answering PAGE_ASSET to everything`, with a `STARVED:` list) is equally good craft.
+**The defect is not craft. It is that an excellent message made seven people comfortable doing
+the thing that guaranteed an eighth.**
+
+### INSTRUMENT FAILURES #9 AND #10, BOTH FOUND WHILE MEASURING R71
+
+```
+#10  git log -S'MAX_SERVED_BUT_NOT_NEEDED ='  ->  1 commit
+     git log -G'MAX_SERVED_BUT_NOT_NEEDED ='  ->  7 commits
+     [NEG] -G on a constant that never existed ->  0
+```
+`-S` counts **occurrences**; changing `85` to `91` leaves the count at 1, so `-S` is silent on
+every loosening. **The natural audit of a ratchet — "has this been raised?" — reports one change
+when there were seven, exit 0, no warning.** Use `-G` for "was this line modified".
+
+**#9 is mine, twice over.** I scored the suite with `node --test *.test.js` and published **487
+tests**; the glob matched **43 of 64 files**, silently skipping the entire `dashboard/` and
+`ui/` subtrees. **That is the exact mirror of the `**/*.js` defect I catalogued myself an hour
+earlier.** The true figure is **829 tests · 123 suites · 828 pass · 1 fail · raw exit 1**. And
+when I rebuilt the corpus with `mapfile` — which does not exist on macOS bash 3.2 — my own floor
+printed `corpus != 64, REFUSE` **and the run proceeded anyway, because the refusal was an `echo`
+and not an `exit`.**
+
+> ### ***A SUBSET RUN REPORTS A SMALLER FAILURE COUNT UNDER AN IDENTICALLY SHAPED SUMMARY LINE. AND A GUARD THAT PRINTS "REFUSE" WITHOUT EXITING IS NOT A GUARD — IT IS A COMMENT. I WROTE BOTH IN THE SAME HOUR THAT I PUBLISHED THE RULE AGAINST THEM.***
+
+---
+
 **FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**
-**65 findings · 8 self-retractions (12.3%) · 1 defect shipped and repaired within 5 minutes.**
+**71 findings · 9 self-retractions (12.7%) · 10 instrument failures catalogued.**
+
+**R71 IS A GUARD DEFECT, NOT A PRODUCT DEFECT — my approval is unchanged.** But the suite is
+**red at HEAD** until `served-surface.test.js`'s owner chooses between raising `91 → 94` and
+going per-class. **That is a publishing decision and it is not mine to take.**
+
+MEASURED-AT: ede2b742
