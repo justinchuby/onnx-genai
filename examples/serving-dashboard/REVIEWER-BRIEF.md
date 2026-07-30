@@ -3698,3 +3698,94 @@ and every condition on the board is a `merge-base` away from being checked by an
 `no_configuration_can_re_enable_full_path_disclosure` is the best security control on the branch
 and that every reviewer has read it and none has executed it. **A green board here is not a green
 product, and I will not let the gate's 10/10 travel to a sha where two of its rows are unmeasured.**
+
+---
+
+## §8.42 — The DAG cannot spell "superseded", so every finished task that somebody else fixed still reads as live work
+
+**This is my lane, it is the last thing I own that nobody else can measure, and the defect is the
+same one the crew has now found in three languages.**
+
+### The census
+
+```
+DAG at 05:12   completed 46 · in_progress 64 · blocked 0 · total 119
+
+OPEN TASKS CLUSTERED BY SUBJECT:
+  fetch-timeout / AbortSignal   4 OPEN   (+ 4 already marked complete = EIGHT for one item)
+  catalogue                     5 OPEN
+  render-state                  2 OPEN
+  batching / baseline           2 OPEN
+  provenance                    2 OPEN
+```
+
+**Eight DAG tasks exist for C2.** C2 is closed, and the refuting command runs green:
+
+```
+git merge-base --is-ancestor f3b45f8d <branch>  ->  YES
+git merge-base --is-ancestor 6ecd9183 <branch>  ->  YES
+bare fetch( in app.js at the branch tip         ->  0
+CONTROL fetchWithDeadline in app.js             ->  2   (instrument is not vacuous)
+```
+
+The Lead has countermanded C2 three times and written *if a fourth arrives, refuse it*. **The DAG
+is holding four more.** Every one of them is a loaded re-dispatch that will fire the moment
+somebody looks for unfinished work — which is what a task board is *for*.
+
+### `blocked: 0` is the tell, and it is the whole finding
+
+A task in this DAG can be **complete** or **in_progress**. There is no state meaning *this work
+was done by somebody else's commit and is no longer needed*. So a task whose subject was closed
+an hour ago by another agent stays `in_progress` **forever**, and `in_progress` is the same
+notation as *an agent is working on this right now*.
+
+> **RULE 23. The DAG records "being worked on" and "superseded by another agent's commit" in
+> identical notation, and the second is far more common on a 14-agent branch.**
+
+**This is @bb2ee824's finding about `MISATTRIBUTED`, one level up and in the tracking layer:**
+*a missing word in a vocabulary does not read as a gap — it reads as agreement.* They had
+`DOCUMENTED_ZERO`, `NOT_PLUMBED`, `STRUCTURALLY_BYPASSED` and nothing for *asked, answered,
+answering something else*, so three fields became `MEASURED` because it was the only option left.
+**We have `complete` and `in_progress` and nothing for *obsolete*, so fifteen-plus dead tasks are
+`in_progress` because it is the only option left.** It is also @376a0297's law arriving a third
+time: **the board records decisions and non-decisions in the same notation, so no reader can see
+there is anything to audit.**
+
+**And it explains the mechanism the Lead published without naming its source.** They called the
+re-dispatch storm the obituary pattern and blamed a grep. The grep was the evidence; **the DAG
+row was the thing that kept re-arming.** A label outlived its fix by two generations because
+nothing in the board can express that a fix arrived from outside the task.
+
+### My own two false-opens, closed with evidence rather than assertion
+
+I audited my rows before anyone else's, because a tracker carrying a false open is worse than a
+developer carrying one:
+
+```
+auto-secretary-tag-review-0-now-w3di    IN_PROGRESS  ->  DONE.
+   review-0 and gate-scored-0aac6bb1 both resolve to 0aac6bb1; the annotated tag
+   carries the scorecard and its own object in its name.
+auto-secretary-stand-ready-score-km1y   IN_PROGRESS  ->  DONE.
+   Gate scored 10/10 at 0aac6bb1 (§8.32-§8.37), every row with a command.
+auto-secretary-add-the-what-jjoa        IN_PROGRESS  ->  GENUINELY OPEN. Not mine.
+   @c0de4c2e holds it, has zero commits by design, and correctly refuses to close
+   a task whose bytes were never written. That refusal is the correct behaviour
+   and it is the only reason this row is honest.
+```
+
+**Nine of the 119 are unaccounted for in the dump I was given** (46 + 64 + 0 = 110). I am not
+claiming they are missing — I am recording that I could not see them, because an unexplained gap
+of nine in a total of 119 is exactly the size of the thing everybody has been mis-reading tonight.
+
+### What I am asking for, which is one word
+
+**Not a re-plan. One additional state — `superseded`, carrying the sha that closed it.** Then the
+refuting command the Lead already mandated becomes a property of the row instead of a thing a
+human must remember to run:
+
+```
+task.superseded_by = <sha>    ->    git merge-base --is-ancestor <sha> HEAD
+```
+
+**Every rule we wrote tonight asks a person to remember something. @73e77d95's `run-tests.sh` and
+this are the only two that ask a machine.**
