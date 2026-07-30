@@ -726,11 +726,15 @@ Note `tokens_per_second` is honest about the reason — *"only cumulative token 
 >
 > **That convergence still failed once, and the failure is instructive.** Both audits initially placed `prefix_cache_lookups` on the honest side of the line. Both were wrong for the same reason: each read the field's *name* and neither read `metrics.rs:130-135` (see §5.13). Agreement is only independent evidence when the two paths do not share a premise — and a plausible name is a premise both readers inherit from the same place. The rule this list is built on is therefore **verify the field, not the rule**: confirm each entry at its cited line rather than trusting the table, including this one.
 
-### 8.4 Prefix cache reports zero hits on the static-cache path
+### 8.4 Prefix cache: the zero is safe, the **non-zero** is the defect ⚠️🔴
+
+**Read this section in full before binding any prefix-cache field. It has two halves and they point in opposite directions. The zero on the static path is honest. The non-zero on the dynamic path is not.**
 
 Observed: identical prompts yield `prefix_cache_hits: 0` with non-zero lookups when continuous batching is active.
 
 Per §5.6 this is **expected**: prefix caching lives in the paged KV manager, which is inactive for static-cache models. Recorded here because it looks exactly like a bug.
+
+#### 8.4a The static-path zero
 
 **RESOLVED — the zero is `not-applicable`, not `unavailable`, and the distinction is enforced by tests that already exist.**
 
@@ -746,6 +750,34 @@ The earlier open question ("should these counters report *unavailable* rather th
 That last row is what closes it. **A stub is a value nobody has gotten to yet; this is a value the test suite would fail if someone changed.** Instrumenting the batching path is not deferred work — it is work that would break three green tests, because there is no cache to instrument.
 
 **Consequence for consumers:** the batching path must report this field as `not-applicable`, never `unavailable`. `unavailable` is a *promise* that someone will supply the number later; here nobody can, ever. Labelling it `unavailable` would also err in the flattering direction — it implies the project is behind on measurement rather than that static-cache and paged-KV are mutually exclusive by design (§5.6). The zero must never render at full contrast either way; see §8.12 for why the counters' *names* are separately wrong.
+
+---
+
+#### 8.4b The dynamic path reports hits it never serves — `MISLEADING`, not `measured` 🔴
+
+**Correcting my own §8.4a, committed minutes earlier.** Having verified the static-path zero exhaustively, I let its complement — *"therefore the dynamic path is `measured`"* — ride unverified. It is not. QA (@fc8b5d97) measured 19 hits / 20 lookups **including six controls whose prefixes differ from token 0**, with the shared-prefix arm **7.0% slower**. I traced it to source and confirm their finding.
+
+`prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs:997`) forks into two mechanisms:
+
+| | Branch A — token cache (`:1017-1024`) | Branch B — paged (`:1025-1076`) |
+|---|---|---|
+| Guard | `uses_token_prefix_cache()` = `has_runner() \|\| is_windowed()` (`decode/state.rs:206`) | `use_kv` && `kv_model.is_some()` && `page_table.tensor_config.is_some()` |
+| Loads KV? | **No** | Yes — `attach_pages_to_sequence` → `materialize_sequence` → `load_materialized_past` |
+| Sets `loaded_prompt_prefix`? | **No** | Yes (`:1075`) |
+| Effect on prefill | **None** | Genuinely shortened |
+
+Because `loaded_prompt_prefix` stays `0` under Branch A, the very next statement — `state.tokens.extend_from_slice(&prompt_tokens[loaded_prompt_prefix..])` (`:1080-1083`) — queues the **entire** prompt and prefill recomputes every token. The returned `in_process_hit` (`:1086`) has **no compute saving behind it**, and it is this value that becomes `prefix_cache_hit_len`.
+
+**Two structural facts beyond the measurement, both readable from the control flow:**
+
+1. **Any single shared leading token scores a hit.** The scoring expression is `common_prefix_len(..).filter(|&len| len > 0).max()`. Every `/v1/chat/completions` request shares the chat-template preamble, so **every request reports a hit, permanently.**
+2. **Branch A pre-empts Branch B — they are `if` / `else if`, and A is tested first.** So whenever a model has a runner or a sliding window, the genuine paged reuse path is **unreachable**, whatever the page-table configuration. This answers as a matter of static precedence what would otherwise need a debug log: a server that satisfies Branch A's guard *cannot* be getting Branch B's real reuse. Branch B requires **four** simultaneous conditions including `!has_runner() && !is_windowed()`.
+
+**The codebase states the correct rule 30 lines below, and applies it to a different path.** The connector fallback is commented *"never claiming a hit we can't serve"* (`:1097-1099`). Branch A violates the rule its own neighbour states.
+
+> **🔒 Binding: `prefix_cache_hits` / `prefix_cache_hit_rate` MUST NOT be bound to any panel.** The honest signal is `loaded_prompt_prefix` (prefill *actually* skipped), not `prefix_cache_hit_len` (tokens that merely *matched*).
+
+**Why this is more dangerous than every stub in §8.3, and why it inverts the section's own premise:** a zero looks broken and invites scrutiny. **95% looks like success.** This field is not a zero to be fixed — it is a **non-zero to be distrusted**, and it defeats every detector this document recommends: it is genuinely computed (so §8.12's name-tracing passes), it moves when you exercise the cache (so §5.14's motion test passes), and it carries a plausible magnitude. It is also **not** fixable by wiring up telemetry: this is a functional gap in prefix reuse, not a reporting gap, so no telemetry change will incidentally close it.
 
 ### 8.5 `scripts/build_qwen.sh` produces a model that cannot be loaded
 
