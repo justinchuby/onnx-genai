@@ -376,7 +376,14 @@ fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_
         }
     };
     let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
-    if continuous_batch_supported {
+    #[cfg(feature = "native-backend")]
+    let native_continuous_batch = engine.supports_native_continuous_batch();
+    #[cfg(not(feature = "native-backend"))]
+    let native_continuous_batch = false;
+    if native_continuous_batch {
+        tracing::info!(max_batch, "native continuous batch driver enabled");
+        run_static_engine_driver(&mut engine, rx, max_batch);
+    } else if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");
         run_static_engine_driver(&mut engine, rx, max_batch);
     } else {
@@ -507,7 +514,7 @@ fn run_static_engine_driver(
 }
 
 fn run_static_batch_until_idle(
-    engine: &Engine,
+    engine: &mut Engine,
     rx: &mut mpsc::Receiver<DriverCommand>,
     deferred: &mut std::collections::VecDeque<DriverCommand>,
     max_batch: usize,
@@ -515,7 +522,15 @@ fn run_static_batch_until_idle(
     first_events: mpsc::Sender<DriverEvent>,
     first_permit: OwnedSemaphorePermit,
 ) {
-    let mut manager = match engine.continuous_batch_manager(max_batch) {
+    #[cfg(feature = "native-backend")]
+    let manager = if engine.supports_native_continuous_batch() {
+        engine.native_continuous_batch_manager(max_batch)
+    } else {
+        engine.continuous_batch_manager(max_batch)
+    };
+    #[cfg(not(feature = "native-backend"))]
+    let manager = engine.continuous_batch_manager(max_batch);
+    let mut manager = match manager {
         Ok(manager) => manager,
         Err(err) => {
             crate::metrics::generation_queue_cancelled();

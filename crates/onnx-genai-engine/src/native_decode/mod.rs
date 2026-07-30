@@ -28,6 +28,7 @@ mod cuda;
 mod io;
 mod load;
 mod proposer;
+mod static_cache_batched;
 mod tensor;
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,7 @@ use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
 use io::*;
 pub(crate) use proposer::NativeProposerSession;
+pub use static_cache_batched::NativeStaticCacheBatchedDecodeSession;
 use tensor::*;
 
 /// Device requested for a native decode session.

@@ -188,18 +188,19 @@ impl<'session> NativeBatchedDecodeSession<'session> {
         let Some(_) = self.lora_segments_input.as_ref() else {
             return Ok(None);
         };
-        let routes = self.pending_routes.take();
-        let routes = match routes {
-            Some(routes) => routes,
+        let mut routes = self.pending_routes.take().unwrap_or_default();
+        if routes.is_empty() {
             // No routes fed since the last step: every row is base-only. This
             // keeps a grouped-capable graph correct when the manager runs a
             // base-only batch (all rows route to the null adapter).
-            None => vec![BASE_LORA_ROUTE; rows],
-        };
+            routes.resize(rows, BASE_LORA_ROUTE);
+        }
         if routes.len() != rows {
+            let observed = routes.len();
+            routes.clear();
+            self.pending_routes = Some(routes);
             return Err(OrtError::InvalidArgument(format!(
-                "native batched grouped-LoRA routes ({}) do not match the {rows} activation rows this step runs",
-                routes.len()
+                "native batched grouped-LoRA routes ({observed}) do not match the {rows} activation rows this step runs"
             )));
         }
         self.segments_scratch.clear();
@@ -210,8 +211,12 @@ impl<'session> NativeBatchedDecodeSession<'session> {
         let tensor = Tensor::from_raw(DataType::Int32, vec![rows], &self.segments_scratch)
             .map_err(|e| {
                 OrtError::InvalidArgument(format!("build native lora.segments tensor: {e}"))
-            })?;
-        Ok(Some(tensor))
+            });
+        // Reuse the emptied Vec on the next step rather than dropping it, so the
+        // route buffer is not reallocated per step (Runciter follow-up).
+        routes.clear();
+        self.pending_routes = Some(routes);
+        tensor.map(Some)
     }
 
     /// Run the model over `physical_rows` (each an owning physical slot index),
