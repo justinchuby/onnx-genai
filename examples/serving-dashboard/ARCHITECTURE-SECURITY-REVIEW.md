@@ -2021,3 +2021,202 @@ and it becomes the assertion above.
 > NEVER THE SIZE OF THE CORPUS — IT WAS THAT THE GUARD TESTED FOR *NAMES* WHEN
 > THE PROPERTY IT CARED ABOUT WAS *BEHAVIOUR*. WIDENING A NAME-BASED GUARD
 > SCALES ITS BLIND SPOT LINEARLY WITH ITS APPARENT THOROUGHNESS.**
+
+## §30 — C23: TWO TOMBSTONES FOR ONE FIELD, IN TWO LANGUAGES, GIVING OPPOSITE ORDERS — AND THE STALE ONE IS ARMED
+
+MEASURED-AT: `8a309ce0`. Predicates and denominators inline. This section also
+closes C20 and C22 by showing all three are one defect.
+
+### 1. The Lead's count is stale, and the correction matters
+
+Broadcast claim: *"`NEVER_BIND` HAS EXACTLY ONE ENTRY AND `server.model_path` IS
+NOT IN IT."*
+
+Measured at HEAD, `telemetry-provenance.js`:
+
+```
+NEVER_BIND entries                     : 2   (`created`, `path`)
+entries naming the string `server.model_path` : 0
+[CONTROL] the block was found, lines    : 67
+```
+
+Both halves of the Lead's sentence are literally true and the conclusion drawn
+from them is wrong. The second entry **is** the model-path ban. It does not say
+`server.model_path` because it is keyed on `{ endpoint: ENDPOINTS.MODELS, field:
+'path' }` — **the wire field, not the dashboard binding key.** That is the more
+defensible design: it bans the value at the boundary it enters through, so it
+survives any renaming of the store key. Credit where it is due — this is better
+than the thing the Lead expected to find.
+
+> **A search for the consumer's name for a thing cannot find a ban expressed in
+> the producer's name for it. Both are correct; only one is greppable.**
+
+My own count predicate failed in the same command: I grepped `key:` and got
+**0** against a block with **2** entries, because the schema field is `field:`.
+Had I published that, I would have reported the ban as absent. Same class,
+mine, in the same minute.
+
+### 2. C23 — the Rust tombstone and the JS tombstone give opposite instructions
+
+Both are excellent. Both are well-argued. They disagree.
+
+`crates/onnx-genai-server/src/routes/mod.rs`, at the deleted field:
+
+> `NO PATH FIELD, AND NOTHING DERIVED FROM ONE.` … *"This carried the configured
+> directory, then its basename, and the basename was still wrong: a basename is
+> the last segment of an OPERATOR-CHOSEN path, so its contents are unbounded …
+> safe on this machine by luck, not by construction."* → **bind `id`.**
+
+`examples/serving-dashboard/telemetry-provenance.js`, `NEVER_BIND[1].why`:
+
+> *"the day that branch is removed server-side, the predicate above goes to 0,
+> **this ban should be deleted**, and the basename — NOT the id — is the field
+> to bind."*
+
+**The Rust side permanently refuses the basename. The JS side records the
+basename as the plan of record, and names me as the author of that argument.**
+I was wrong, the Rust author's reasoning beat mine, and *the refutation never
+propagated to the document that carries my position.*
+
+### 3. The stale one is not merely stale — its trigger is already satisfied
+
+The JS entry states its own retirement condition as a wire predicate:
+
+```
+curl -s localhost:PORT/v1/models | grep -c '"path":"/'   ->   0     ⇒ delete the ban
+```
+
+At HEAD that predicate returns **0** — because `b7f83e72` deleted the `path`
+field outright. So the recorded instruction to **delete the ban** is live *now*,
+and it was written to fire on a different event entirely:
+
+```
+INTENDED TRIGGER : the disclosure was FIXED (absolute -> basename on the wire)
+ACTUAL STATE     : the field was REMOVED
+SAME PREDICATE. OPPOSITE IMPLICATIONS FOR WHETHER THE BAN IS STILL NEEDED.
+```
+
+> **A self-retiring guard whose retirement condition is "my subject is no longer
+> observable" cannot distinguish *the hazard was fixed* from *the hazard is
+> temporarily out of view*. Absence satisfies it either way — and absence is
+> exactly the state a guard exists to survive.**
+
+This is the Lead's immutability ruling inverted. They found an artifact that
+could not receive fixes. This is an artifact that **receives its own deletion
+order from a condition its subject's removal fulfils.** A maintainer who obeys
+it deletes the ban, looks for the basename to bind, finds no field — and the
+recorded plan explicitly authorises putting one back.
+
+### 4. Why no instrument caught the contradiction: the guard checks the FORM of evidence, never its TRUTH
+
+`never-bind.test.js:45` is the entire evidence check:
+
+```js
+assert.match(entry.why, /crates\/[^\s]+:\d+/, `${entry.field} must cite evidence`);
+```
+
+It requires a `crates/…:NNN` coordinate to exist **as a shape**. It never opens
+the file, never resolves the line, never compares the quoted text. Proof, at
+HEAD:
+
+```
+the `why` quotes verbatim: "Absolute on loopback; the basename otherwise"
+occurrences of that sentence in crates/    : 0        ⬅ I DELETED IT AT fa1fd425
+model_path_for_display live in crates/     : 1  (tests.rs only — the C22 denylist)
+[CONTROL] ModelObject in crates/           : 2 files  ⬅ the instrument reaches
+```
+
+**The ban's stated justification quotes a doc comment that exists nowhere in the
+repository, and the guard is green.** The citation passes because it has a colon
+and digits in it.
+
+And the coordinate it cites — `mod.rs:116-120` — *still lands on the right
+thing*, but only because the author happened to leave a tombstone at exactly
+those lines. That is survival by luck, and it is the same luck the Rust
+tombstone refuses to accept for the basename, one file away.
+
+> **A guard that demands a coordinate as the price of admission will be paid in
+> well-formed ones. Shape is free to satisfy; truth is not.**
+
+@e00032a4 built the fix for precisely this tonight — content-carrying cite
+markers that make drift decidable and the repair *computable*, with the target
+line printed. It was applied to prose documents. **The highest-stakes citations
+in this repository — the ones gating a disclosure ban — are checked by a regex
+for colon-digits.** That is the Lead's own ruling landing on the Lead's own
+flagged line: *the mechanism is the easy part; the sweep is the work.*
+
+### 5. C20, C22 and C23 are one defect, and one assertion closes all three
+
+| | what it says | why it fails |
+|---|---|---|
+| **C20** | the deletion of `path` is unlocked | 0 tests assert the field is absent |
+| **C22** | the source guard bans 3 dead identifiers | catches an undo, never a re-invention |
+| **C23** | the ban carries an armed self-deletion order | its trigger is met by absence |
+
+All three are the same gap: **every guard we have reads the tree, and the
+property we care about is a property of the wire.** The ban even *writes the
+wire predicate down* — and nobody executes it:
+
+```
+test files asserting '"path":"/'   : 0
+test files asserting MAIN_SEPARATOR: 0
+[CONTROL] test files naming NEVER_BIND : 2   ⬅ the corpus is reachable
+```
+
+**The fix is the one assertion I proposed in §29, and C23 is the third
+independent finding to land on it:**
+
+```
+assert the /v1/models body contains NO value containing MAIN_SEPARATOR
+  — having first asserted the body is NON-EMPTY, so an empty response
+    fails LOUDLY instead of vacuously (the CANNOT_RUN third state)
+```
+
+It closes C20 (the field cannot return). It closes C22 (any re-invention under
+any name fails, because it tests behaviour not identifiers). It closes C23 (the
+ban becomes safe to delete, because deleting it no longer removes the only
+control — and re-adding the basename fails immediately, which is the outcome
+*both* tombstones actually want).
+
+**Neither tombstone has to be rewritten. One assertion makes the disagreement
+harmless, which is better than adjudicating it.**
+
+### 6. STRUCTURAL, URGENT: the git index is shared mutable state and nobody pinned it
+
+Found while committing this section. My index has been **0 all session** and I
+have never run `git add`. It is not 0 now:
+
+```
+git diff --cached --name-only   ->  2 paths, neither mine
+  examples/serving-dashboard/asset-graph.test.js
+  examples/serving-dashboard/design/demo-ux.md
+git diff --cached --stat        ->  2 files changed, 69 DELETIONS, 0 insertions
+
+staged blob  ec1fd8fc  == the version at the 11 PREVIOUS commits
+HEAD   blob  7b39f312  != staged        ⬅ HEAD moved past the index seconds ago
+[CONTROL] test( arms: staged 11 / HEAD 11 / worktree 11 — no arms lost YET
+```
+
+Nobody staged a deletion. **Somebody ran `git add` at an earlier HEAD, the
+branch advanced past it, and a stale index silently became a revert.** Any agent
+who now runs a bare `git commit -m "…"` ships a commit that reverts 69 lines of
+two other agents' just-landed work under their own message, and their diffstat
+looks *larger*, not wrong.
+
+This is @732c7548's sweep hazard with the sign flipped — not a half-finished
+edit promoted to shipped, but a **finished edit demoted to reverted.**
+
+> **We pinned SHAs, detached worktrees, hashed bodies and stamped build IDs. The
+> index is the one piece of git state we left as a global mutable variable that
+> every agent's default commit reads — and unlike a tag, it has no name, no
+> owner and no history.**
+
+**The crew already carries the immunity and adopted it for an unrelated reason.**
+`git commit --only -m "msg" -- <path>` commits the named paths *from the
+worktree* and ignores the index entirely. It was adopted so nobody would sweep a
+colleague's files. It **also** makes the stale-index revert structurally
+impossible. Everyone using it has been safe by construction rather than by
+vigilance — which is the only kind of safe that survives a night this long.
+
+**Verification that it holds: after committing this section, the two foreign
+paths must still be staged and still unshipped.** Asserted below, not assumed.
