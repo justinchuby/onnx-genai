@@ -122,9 +122,6 @@ static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 const MAX_TOPOLOGY_DECODE_THREADS: usize = 8;
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
-#[cfg(feature = "mlas")]
-static MLAS_QNBIT_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
-    OnceLock::new();
 
 /// Upper bound on the bounded pool used for the **dense-f32** decode path (see
 /// [`configured_dense_decode_threads`]). Unlike the quantized `MatMulNBits`
@@ -1262,10 +1259,7 @@ impl MatMulNBitsKernel {
             return Ok(Some(()));
         }
 
-        if can_prepack
-            && !mlas_no_shard()
-            && let Some(shards) = self.mlas_shards.get()
-        {
+        if can_prepack && !mlas_no_shard() && let Some(shards) = self.mlas_shards.get() {
             let Some(shards) = shards.as_ref() else {
                 return Ok(None);
             };
@@ -1275,7 +1269,7 @@ impl MatMulNBitsKernel {
             return Ok(Some(()));
         }
 
-        if can_prepack && let Some(cached) = self.mlas_packed.get() {
+        if can_prepack && mlas_no_shard() && let Some(cached) = self.mlas_packed.get() {
             let Some(packed_weight) = cached.as_ref() else {
                 return Ok(None);
             };
@@ -1341,23 +1335,14 @@ impl MatMulNBitsKernel {
             return Ok(None);
         }
 
-        // Constant weights (the decode hot path) are packed once into per-N-shard
-        // MLAS weights and cached. This lets each M=1 decode projection fan its
-        // output columns across the *persistent SPMD decode workers* (each worker
-        // runs its shard's GEMV serially), instead of one `multithread=true` call
-        // that asks MLAS to fork a Rayon parallel-for for every projection.
-        // That removes both known decode failure modes: x86 f16 decode's
-        // historical oversubscription against resident SPMD workers, and ARM64
-        // Qwen3's per-projection Rayon/MLAS dispatch overhead (197 QNBit nodes
-        // per token) while still executing the same KleidiAI SQNBit ukernel.
-        // Non-constant weights keep the single owned `multithread=true` path
-        // (they are never the decode hot path and re-sharding per call is not
-        // worth it). The `NO_SHARD` escape hatch forces that single full-width
-        // call too: MLAS's SIMD column-tiling is not bit-stable across
-        // N-partition boundaries (it can differ by ~1 ULP), so this hatch
-        // restores byte-for-byte the pre-sharding output for A/B parity checks
-        // or a host where the reordering ever matters.
-        if can_prepack && !mlas_no_shard() {
+        // Constant weights (the decode hot path) normally use the historical
+        // static-SPMD shards. `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` opts into
+        // ORT's full-width `MlasQNBitGemmBatch(..., multithread=true)` design,
+        // where MLAS dynamically partitions N tiles across its persistent
+        // work-stealing intra-op pool, for A/B profiling without changing the
+        // default until correctness and throughput are proven.
+        let use_static_shards = can_prepack && !mlas_no_shard();
+        if use_static_shards {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
@@ -1666,26 +1651,19 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
         multithread: bool,
     ) -> Result<()> {
-        let mut run = || {
-            let mut workspace = prepared
-                .workspace
-                .lock()
-                .expect("MLAS SQNBit workspace lock poisoned");
-            mlas_sys::sqnbit_gemm_with_workspace(
-                &prepared.packed,
-                m,
-                activations,
-                bias,
-                result,
-                &mut workspace,
-                multithread,
-            );
-        };
-        if multithread {
-            with_mlas_qnbit_pool(run)?;
-        } else {
-            run();
-        }
+        let mut workspace = prepared
+            .workspace
+            .lock()
+            .expect("MLAS SQNBit workspace lock poisoned");
+        mlas_sys::sqnbit_gemm_with_workspace(
+            &prepared.packed,
+            m,
+            activations,
+            bias,
+            result,
+            &mut workspace,
+            multithread,
+        );
         Ok(())
     }
 
@@ -2602,15 +2580,6 @@ fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> 
         return Ok(operation());
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
-        Ok(Some(pool)) => Ok(pool.install(operation)),
-        Ok(None) => Ok(operation()),
-        Err(message) => Err(error(message.clone())),
-    }
-}
-
-#[cfg(feature = "mlas")]
-fn with_mlas_qnbit_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
-    match MLAS_QNBIT_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => Ok(pool.install(operation)),
         Ok(None) => Ok(operation()),
         Err(message) => Err(error(message.clone())),
@@ -7356,11 +7325,11 @@ mod tests {
                 );
                 assert!(
                     kernel.mlas_shards.get().and_then(Option::as_ref).is_some(),
-                    "{label}: bits={bits} block{block_size} must prepack MLAS QNBit shards for SPMD decode",
+                    "{label}: bits={bits} block{block_size} must prepack MLAS QNBit shards for decode by default",
                 );
                 assert!(
                     kernel.mlas_packed.get().is_none(),
-                    "{label}: bits={bits} block{block_size} decode must avoid the full-width Rayon MLAS path",
+                    "{label}: bits={bits} block{block_size} should only use full-width MLAS when ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1",
                 );
                 assert!(
                     kernel.packed_kai_qsi4_weight.get().is_none()
