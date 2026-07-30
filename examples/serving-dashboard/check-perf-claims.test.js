@@ -226,9 +226,35 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // figure, this test fails and tells me to delete the entry. An exemption that
   // cannot expire is a suppression, and the direction that never gets reported
   // is the one where the gap has quietly closed.
+  //
+  // ONE HONEST LIMIT ON THAT PROMISE, MEASURED 07:57 AND NOT THEORISED. The
+  // expiry fires on the figure being ABSENT. A document that fixes itself
+  // WELL -- striking the old value in place and saying what it used to read --
+  // ends up containing MORE occurrences than before, not fewer: demo-ux.md went
+  // 14 -> 31 while the defect was being repaired. So this deferral CANNOT
+  // expire on a well-documented fix, only on a silent one. That is the exact
+  // inversion of what we want to reward, and it is the same blind spot named in
+  // the demo-spec.md row: a strike record quotes the thing it strikes, so
+  // presence stops tracking currency the moment anyone writes a good obituary.
+  // The count RISING is therefore a prompt to READ, never evidence of a
+  // regression -- and the row above records what reading it found.
   const DEFERRED = Object.freeze({
     'REVIEWER-BRIEF.md': 'owned by the secretary; edited 02:49, live at the time of the freeze',
-    'design/demo-ux.md': 'owned by the designer; edited 02:45, live at the time of the freeze',
+    'design/demo-ux.md':
+      'The designer STRUCK the withdrawn hero (verified in HEAD 07:57: the '
+      + '`AC50/D85 compliant` badge is gone, 1 -> 0; the sketch reads '
+      + '`2.46-2.72x`, the sanctioned interval; the two residual bare hits are '
+      + 'past-tense strike records reading "PREVIOUSLY READ ... WERE STRUCK"). '
+      + 'SO THE ORIGINAL REASON -- "owned by the designer; live at the time of '
+      + 'the freeze" -- IS SPENT, AND THIS ENTRY IS NO LONGER HELD BY IT. It is '
+      + 'held by the same content property as demo-spec.md above: the file '
+      + 'states the figure as the SUBJECT of a retraction, which no pattern '
+      + 'here can tell from an assertion. I MEASURED THIS RATHER THAN ASSUMING '
+      + 'IT -- deleting this line yields 18/19 exit 1, "states the withdrawn '
+      + 'throughput ratio as a live claim: design/demo-ux.md", against a '
+      + 'document that is correctly fixed. THAT WOULD BE A FALSE RED ON A '
+      + 'REPAIRED FILE. Do not drop it on the strike condition; the strikes '
+      + 'have ALREADY landed and it is not what holds this row.',
     // Moved here from EXEMPT by @376a0297, who audited MY exemption list against
     // their own file -- the check nobody runs on their own work. It sat in the
     // permanent bucket on the reason "not mine to edit", which is a fact about
