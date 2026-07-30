@@ -1675,3 +1675,62 @@ closed *before* the latency panel is wired to the histogram, not after. With `_c
 mean is `0/0`, so wiring first renders "unavailable" in every cell — the same thing the panel
 already shows — while spending a multi-file, multi-owner edit to get there. Warm the demo, then
 wire the panel. Two filed items, and the order between them is not optional.
+
+## Both gates in the launcher test presence. Neither tests the property the user cares about.
+
+The readiness section above found one defect in `run-demo.sh`. Re-reading the same file at the
+review point for a different reason turned up its twin, and the pair is the finding:
+
+```
+run-demo.sh @ 37d0d72e — 336 lines
+  :257  if [[ ! -x "${SERVER_BIN}" ]]; then        <- BUILD GATE
+  :259    cargo build --release -p onnx-genai-server
+  :261  [[ -x "${SERVER_BIN}" ]] || fail "the server binary is missing after the build"
+
+STALENESS CHECKS ON THAT BINARY:
+  'newer' 0 · '-nt' 0 · 'mtime' 0 · 'stale' 0
+  [POS CTL] 'SERVER_BIN' 5   [NEG CTL] 0
+  (the two 'rebuild' hits are a local variable at :193 and its use in a message at
+   :233 — they describe the dashboard assets, not the server binary)
+```
+
+**The build gate rebuilds a binary that is *missing*. It never rebuilds one that is merely
+*wrong*.** If a binary exists at that path from any earlier build of any tree, the launcher
+accepts it, skips `cargo build`, and launches it.
+
+Put the two gates side by side and they are the same defect twice:
+
+| gate | what it tests | what the operator assumes it tests |
+|---|---|---|
+| `:257` build | a file exists at a path | the binary matches this source tree |
+| `:141` ready | the port answers `/health` | the demo has something to show |
+
+> **Both gates test *presence*. The operator reads both as *correctness*. And a path is the one
+> identifier in this entire system that is mutable, unversioned, and silently reused — which is
+> the same lesson the review documents learned about branch names and tag names, arrived at
+> independently, in a shell script nobody was reviewing.**
+
+### This corrects my own prescription, and in the more dangerous direction
+
+The section above prescribed: after `wait_until_ready` succeeds, issue one generation request so
+the panels have something to show. **That prescription is incomplete and, on its own, makes things
+worse.** Warming a binary the launcher never verified produces a dashboard full of confident,
+well-labelled, *live* telemetry measured from code that may not be the tree in this PR. Today the
+panels are empty, and empty is at least honest about knowing nothing. A warm-up without a build
+check converts a visible absence of evidence into an invisible piece of wrong evidence.
+
+**So the ordering has a third term, and it comes first:**
+
+1. **Verify the binary is this tree** — build gate on currency, not existence.
+2. **Warm the demo** — one generation request, so the panels have real data.
+3. **Wire the latency panel** — only then, since a mean over `_count` 0 is `0/0`.
+
+All three are filed, none are fixed, and the freeze is the right call for all three: this is the
+launch path, and the last hour of a session is the worst possible time to edit it. But the
+sequence matters more than any one item, because **doing 2 without 1 is the only combination that
+is worse than doing nothing.**
+
+**Credit where the evidence came from:** the binary-identity problem was measured on the wire by
+other agents — three artefacts with the same filename, different inodes, different build times,
+one of them from a tree that lacks a fix this PR ships. I verified the launcher half at the pin
+and take responsibility only for that half, and for the prescription it corrects, which was mine.
