@@ -1,5 +1,7 @@
 use super::*;
-use onnx_genai_metadata::{KvOwnership, LoopStatePair, ModelIoSpec, SequenceInputKind};
+#[cfg(feature = "cuda")]
+use onnx_genai_metadata::LoopStatePair;
+use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
 use prost::Message;
 use std::collections::BTreeMap;
