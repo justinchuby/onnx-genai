@@ -1089,6 +1089,140 @@ test('fast completion cannot erase a newer slow value or observation time', asyn
   }
 });
 
+test('a superseded slow response cannot publish or poison cadence reuse after stop', async () => {
+  let clock = 1_000;
+  let configRequests = 0;
+  let releaseOldConfig;
+  let markOldConfigStarted;
+  const oldConfigStarted = new Promise((resolve) => {
+    markOldConfigStarted = resolve;
+  });
+  const oldConfigResponse = new Promise((resolve) => {
+    releaseOldConfig = resolve;
+  });
+  const routes = healthyRoutes();
+  const configBody = (modelMaxContext) => ({
+    node_id: 'node-0',
+    pipeline: false,
+    max_batch_size: 8,
+    max_output_tokens: 512,
+    max_sessions: 256,
+    max_queue_depth: 64,
+    model_max_context: modelMaxContext,
+  });
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname;
+      if (path !== ENDPOINTS.DEBUG_CONFIG) {
+        return fakeFetch(routes)(url);
+      }
+      configRequests += 1;
+      if (configRequests === 1) {
+        markOldConfigStarted();
+        return oldConfigResponse;
+      }
+      return jsonResponse(200, configBody(222));
+    },
+  });
+
+  try {
+    store.start();
+    await oldConfigStarted;
+    store.stop();
+
+    clock = 2_000;
+    await store.pollOnce();
+    const afterNew = store.field('server.context_length').value;
+
+    clock = 3_000;
+    releaseOldConfig(jsonResponse(200, configBody(111)));
+    await new Promise((resolve) => setImmediate(resolve));
+    const afterOld = store.field('server.context_length').value;
+
+    clock = 3_001;
+    await store.pollOnce();
+    const afterCadenceReuse = store.field('server.context_length').value;
+
+    assert.deepEqual(
+      { afterNew, afterOld, afterCadenceReuse, configRequests },
+      {
+        afterNew: 222,
+        afterOld: 222,
+        afterCadenceReuse: 222,
+        configRequests: 2,
+      },
+      'superseded DEBUG_CONFIG content published or replaced the newer cadence cache',
+    );
+  } finally {
+    store.stop();
+  }
+});
+
+test('fast endpoint requests do not overlap across stop and pollOnce', async () => {
+  let statusRequests = 0;
+  let statusInFlight = 0;
+  let maxStatusInFlight = 0;
+  let releaseFirstStatus;
+  let markFirstStatusStarted;
+  const firstStatusStarted = new Promise((resolve) => {
+    markFirstStatusStarted = resolve;
+  });
+  const firstStatusResponse = new Promise((resolve) => {
+    releaseFirstStatus = resolve;
+  });
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname;
+      if (path !== ENDPOINTS.STATUS) {
+        return fakeFetch(routes)(url);
+      }
+      statusRequests += 1;
+      statusInFlight += 1;
+      maxStatusInFlight = Math.max(maxStatusInFlight, statusInFlight);
+      try {
+        if (statusRequests === 1) {
+          markFirstStatusStarted();
+          return await firstStatusResponse;
+        }
+        return jsonResponse(200, statusBody({ queue_depth: 222 }));
+      } finally {
+        statusInFlight -= 1;
+      }
+    },
+  });
+  const firstFastPublish = new Promise((resolve) => {
+    const unsubscribe = store.subscribe((candidate) => {
+      if (candidate.fields['queue.depth'].value !== 111) return;
+      unsubscribe();
+      resolve();
+    });
+  });
+
+  try {
+    store.start();
+    await firstStatusStarted;
+    store.stop();
+
+    await store.pollOnce();
+    assert.equal(statusRequests, 1, 'pollOnce issued a second STATUS request while start() was pending');
+
+    releaseFirstStatus(jsonResponse(200, statusBody({ queue_depth: 111 })));
+    await firstFastPublish;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await store.pollOnce();
+    assert.equal(store.field('queue.depth').value, 222);
+    assert.equal(statusRequests, 2);
+    assert.equal(maxStatusInFlight, 1, 'public scheduling overlapped STATUS requests');
+  } finally {
+    store.stop();
+  }
+});
+
 test('an HTML error page served at /metrics does not crash the store', async () => {
   // A proxy or a wrong port realistically returns HTML with a 200.
   const store = createTelemetryStore({

@@ -266,6 +266,8 @@ export function createTelemetryStore({
   // window and its own explanation for the visitor.
   /** @type {Map<string, SourceResult>} */
   const lastSuccessfulFetch = new Map();
+  /** @type {Map<string, number>} */
+  const latestRequestGeneration = new Map();
 
   /**
    * WHICH ENGINE PRODUCED THIS NUMBER, as asserted by the server itself.
@@ -436,6 +438,7 @@ export function createTelemetryStore({
     slowPollInFlight = true;
     try {
       const slowResults = await fetchSources(BACKGROUND_SLOW_ENDPOINTS);
+      if (Object.keys(slowResults).length === 0) return;
       applySourceResults(slowResults);
       publish(buildSnapshot(latestSourceResults));
     } finally {
@@ -467,7 +470,8 @@ export function createTelemetryStore({
     /** @type {Record<string, SourceResult>} */
     const byPath = {};
     paths.forEach((path, index) => {
-      byPath[path] = settled[index];
+      const result = settled[index];
+      if (result !== null) byPath[path] = result;
     });
     return byPath;
   }
@@ -487,7 +491,7 @@ export function createTelemetryStore({
    * so downstream code reads them via `metric` rather than `path`.
    *
    * @param {string} path
-   * @returns {Promise<SourceResult>}
+   * @returns {Promise<SourceResult|null>}
    */
   async function fetchSource(path) {
     const isText = TEXT_ENDPOINTS.includes(path);
@@ -509,6 +513,9 @@ export function createTelemetryStore({
       return suppressed.result;
     }
 
+    const generation = (latestRequestGeneration.get(path) ?? 0) + 1;
+    latestRequestGeneration.set(path, generation);
+
     // A stalled server is indistinguishable from a working one until you give
     // up on it, so every request carries its own deadline. The idiom lives in
     // request-deadline.js because it previously lived here ONLY, and the boot
@@ -528,13 +535,8 @@ export function createTelemetryStore({
           serverMessage: await readServerMessage(response),
           transportError: null,
         };
-        suppressedEndpoints.set(path, {
-          retryAtMs: now() + ENDPOINT_ERROR_RETRY_MS,
-          result,
-        });
-        return result;
+        return commitSourceResult(path, generation, result);
       }
-      suppressedEndpoints.delete(path);
       const result = {
         ok: true,
         body: isText ? parsePrometheusText(await response.text()) : await response.json(),
@@ -543,14 +545,12 @@ export function createTelemetryStore({
         transportError: null,
         fetchedAtMs: now(),
       };
-      lastSuccessfulFetch.set(path, result);
-      return result;
+      return commitSourceResult(path, generation, result);
     } catch (error) {
       // Transport failures are handled by the whole-cycle backoff, not here:
       // suppressing them per-endpoint would delay recovery when the server
       // comes back.
-      suppressedEndpoints.delete(path);
-      return {
+      const result = {
         ok: false,
         body: null,
         status: null,
@@ -568,7 +568,26 @@ export function createTelemetryStore({
               ? error.message
               : String(error),
       };
+      return commitSourceResult(path, generation, result);
     }
+  }
+
+  /** Superseded responses cannot reach either publication or endpoint caches. */
+  function commitSourceResult(path, generation, result) {
+    if (latestRequestGeneration.get(path) !== generation) return null;
+
+    if (result.ok) {
+      suppressedEndpoints.delete(path);
+      lastSuccessfulFetch.set(path, result);
+    } else if (result.status !== null) {
+      suppressedEndpoints.set(path, {
+        retryAtMs: now() + ENDPOINT_ERROR_RETRY_MS,
+        result,
+      });
+    } else {
+      suppressedEndpoints.delete(path);
+    }
+    return result;
   }
 
   /**
