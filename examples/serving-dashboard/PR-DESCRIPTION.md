@@ -464,6 +464,107 @@ strike been executed, three documents would have deleted true statements about a
 live security control, and the deletion would have looked like diligence in every
 one of them.
 
+### The bypass does not reach this document, and here is why it cannot
+
+**The percent-encoding bypass above is real and it is unfixed. It is also
+narrower than the section preceding this one might leave a reader believing**, and
+the reviewer who found it published that bound against their own finding rather
+than letting it stand at its most impressive width.
+
+**The reach:** dotfiles and dot-directories whose contents carry a *servable*
+extension — `.vscode/settings.json`, `.secret.json`. That is genuine, and the
+wire proof used `.json` for exactly that reason.
+
+**What it does not reach: the extension allowlist, and therefore not one of the
+14 markdown documents on this branch — including this one.** Verified against the
+source rather than relayed:
+
+```
+demo_assets.rs:188   let Some((_, extension)) = name.rsplit_once('.') else {
+demo_assets.rs:189       return false;                      <- FAILS CLOSED
+demo_assets.rs:191   SERVABLE_EXTENSIONS.contains(extension.to_ascii_lowercase())
+
+"md" in SERVABLE_EXTENSIONS   -> 0
+"html" in SERVABLE_EXTENSIONS -> 1     [positive control: the probe reaches]
+```
+
+Every raw spelling that decodes to this file's name is refused, and the two
+refusal paths are exhaustive:
+
+```
+PR-DESCRIPTION.md        ext = md      not in allowlist         REFUSED
+PR-DESCRIPTION%2Emd      no literal dot -> rsplit_once -> None   REFUSED
+PR-DESCRIPTION.m%64      ext = m%64    not in allowlist         REFUSED
+PR-DESCRIPTION.%6Dd      ext = %6Dd    not in allowlist         REFUSED
+%50R-DESCRIPTION.md      ext = md      not in allowlist         REFUSED
+```
+
+> **Encoding can only ever make a raw extension *more* mangled. It can never turn
+> `md` into `js`. Either it destroys the literal dot and the `else` denies, or it
+> corrupts the extension characters and the allowlist denies.**
+
+**So an allowlist that fails closed turned out to be immune to a class of attack
+its author never considered, and a denylist in the same position would have
+fallen to the first `%2E`.** That is the whole argument for allowlists, and this
+branch earned it empirically instead of asserting it.
+
+**The structural finding is sharper than either the bypass or the bound.** Both
+guards are `let-else`, in one function, 27 lines apart, written by one author:
+
+```
+:161  let Some(rest) = path.strip_prefix("/demo/") else {
+:162      return true;      <- FAIL-OPEN.   cannot parse -> SERVE IT.   the bypass
+:188  let Some((_, extension)) = name.rsplit_once('.') else {
+:189      return false;     <- FAIL-CLOSED. cannot parse -> REFUSE IT.  holds
+```
+
+**Same idiom, same function, same author, opposite safety — and the author
+demonstrably knew the fail-closed form, because they wrote it 27 lines later.**
+The correct framing of the bypass is therefore not *add a percent check*. It is
+**the default is allow and it should be deny**, and the file already contains its
+own counter-example.
+
+### A guard whose every failure mode is green
+
+**The freshness guard that polices the review documents on this branch passes,
+and its passing is close to uninformative.** Its corpus is discovered by filename
+pattern on a non-recursive directory read, so it covers **4 of 8** citation-bearing
+documents and **21 %** of the citations — an upper bound, since the denominator was
+itself counted with a hand-written extension list. Its staleness boundary is a
+SHA stored in a file, **210 commits behind the shipping pin**.
+
+**It has three degradation paths — a document renamed out of the corpus, a
+document moved into a subdirectory, and a boundary left behind. Every one of them
+makes it greener. Not one of them can make it red.**
+
+> **A guard whose every failure mode is green is not a guard. It is a logging
+> statement with a checkmark.**
+
+**And the boundary is the worse half, because it does not decay gradually.** The
+assertion is *no document was measured before the boundary*. A boundary that ages
+backwards becomes **more permissive with every commit**, blesses more stale
+documents the older it gets, and never once turns red while doing it.
+
+**This is not a coding error, and the author refuted the obvious fix in a comment
+before anyone raised it:** a derived boundary would re-score every document on
+every commit and enforce a line nobody chose. They were right; a declared
+boundary is the better design. **But a declared value is a value with an owner,
+and this one has none. We shipped the stored form without shipping the obligation
+that makes it safe.**
+
+> **Staleness is not an accident that befalls a correct value. It is the
+> guaranteed end state of every value we store instead of derive.**
+
+**That sentence indicts this document more than it indicts the guard.** The
+acceptance-criteria count in it moved 208 → 213 → 218 while the specification sat
+frozen — the artefact did not change, the number I had stored beside it was
+simply never derived again. **The measurement marker at line 3 is a stored value.
+So is the pin. So is every count in the table above.** Each is correct at the
+moment it was written and each is on the same trajectory. **Eleven controls were
+built on this branch against falsehood and none against staleness**, and the
+distinction we kept failing to make is that a false value has an adversary while a
+stale one merely has an author who has moved on.
+
 ### Corroboration must be verified at the source, not at the number
 
 **An agent was credited with a test run they never performed.** Two independent
