@@ -365,10 +365,10 @@ is the sharpest example of it anyone has produced tonight: same commit, 18 failu
 | Finding | Evidence as first observed at `d6e57c63` | Status re-derived at `b54437df` |
 | --- | --- | --- |
 | **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **STRUCK @ `459c40c2`** — replaced by `classify_kv_applicability()`. The one surviving textual hit is `tests.rs`, in the doc comment on `fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts` — a comment *describing* the dead bug. **A grep cannot see tense: the hit and the proof-of-fix are byte-identical.** |
-| **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE — VERIFIED-AT `b54437df`** (both paths present in `git ls-tree`) |
-| **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **LIVE (as F4-REVISED) — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: the declaration is now `prefix-cache.js:88`, not `:77`. |
+| **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE — RE-VERIFIED AT `0bc86726`, UPGRADED: THREE implementations, disagreeing on 7 of 7 inputs — see PASS 2** (was: both paths present in `git ls-tree`) |
+| **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **CLOSED at `0bc86726`** — `resolveStaleCeilingMs` replaces both inline `??` sites; regression caught by 3 tests. Was: LIVE (as F4-REVISED) at `b54437df`. ⚠️ Citation drifted: the declaration is now `prefix-cache.js:88`, not `:77`. |
 | **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **STRUCK @ `1b4d76c6`** — `ROOT` now derives from `tree_context.repo_root()`; exits `CANNOT_RUN` with no worktree and exits 1 conditionally. Zero hits for the hardcoded path; positive control `repo_root` fires in 7 files. |
-| **F11** MAJOR | `index.js:179` `createRovingGroup(root, { label: panel.title })`; `panel.title` is not a key of the frozen registry entry. | **LIVE — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: now `dashboard/index.js:143`, not `:179`. See also the F11 count retraction below (five panels, not six) — that retraction is about the COUNT, not the defect. |
+| **F11** MAJOR | `index.js:179` `createRovingGroup(root, { label: panel.title })`; `panel.title` is not a key of the frozen registry entry. | **CLOSED at `0bc86726`** — `title` is now lifted into the frozen registry entry (`dashboard/index.js:93`). Was: LIVE at `b54437df`. ⚠️ Citation drifted: now `dashboard/index.js:143`, not `:179`. See also the F11 count retraction below (five panels, not six) — that retraction is about the COUNT, not the defect. |
 | F2 | retracted — see #2 above. | **FIXED, and so is its guard — I withdraw the claim that stood here.** I wrote that `check-field-states.test.js:69`'s `FIELD_STATES.MEASURED ?? FIELD_STATES.OK` made the guard unfailable. **Mutation-proven false at `1bca52a8`, against the real module and the real README, no file written:** point the README sentence at the retired spelling `'ok'` → **fires**; delete the sentence entirely → **fires**; unmutated control → **silent**. It is a working, non-vacuous drift guard that reads the wire value from the constant instead of hardcoding a spelling. **The only true residue is cosmetic and I should have filed it as such: `FIELD_STATES.OK` is `undefined`, so the `??` arm is dead code and `:73`'s failure message names a key the enum no longer defines.** Not a defect in the guard — a retired spelling surviving in the guard's own prose. |
 
 **Reader instruction, applying to this whole document:** every `file:NNN` here is a
@@ -2697,3 +2697,198 @@ number behind that: 118 cited paths, 117 correct, one typo, zero phantoms.** ➡
 document with 2 — it is 118 opportunities to be caught and one that was.** The
 rot surface and the verification surface are **the same surface**, and tonight it
 paid out in the right direction.
+
+---
+
+## TRIPLE REVIEW — PASS 2, code-reviewer arm, at `review-2` = `0bc86726`
+
+**Verdict: APPROVE WITH COMMENTS. Blocking set: empty. Two findings raised, one upgraded and quantified.**
+
+Every number below was produced by **execution in a clean detached worktree** at `0bc86726`
+(`/tmp/rv2-code`, `porcelain 0`, sha asserted before and after). Every mutation is accompanied by
+the `git diff --numstat` that proves it reached disk, because **an unapplied mutation and a blind
+guard produce the same green.**
+
+### Suite at `review-2`
+
+```
+tests 646 · suites 98 · pass 646 · fail 0 · RAW UNPIPED EXIT 0
+49 files discovered by run-tests.sh · reconciliation 0 untracked / 0 missing / 0 uncommitted
+porcelain 0 before, and 0 again after every mutation was restored
+```
+
+### Ordered task 1 — F2's guard. **My retraction HOLDS. Re-derived, not cited.**
+
+Four arms, each gated on a numstat proof:
+
+| Arm | Mutation | numstat | Result |
+|---|---|---|---|
+| 0 | none (control) | — | 5/5, raw exit 0 |
+| 1 | README sentence → retired spelling `'ok'` | `1 1` | **RED, exit 1**, message names *both* sides |
+| 2 | delete the `?? FIELD_STATES.OK` arm entirely | `1 1` | **5/5 green — identical**. The arm is provably dead |
+| 3 | enum key `MEASURED` → `OK`, value unchanged | `1 1` | guard **stays 5/5 green** |
+
+`FIELD_STATES` keys at `0bc86726` are `MEASURED,PENDING,STALE,UNAVAILABLE,NOT_APPLICABLE`;
+`FIELD_STATES.OK` is `undefined`. So the `??` fallback is **dead code with a cosmetic residue** —
+the failure message names a key that cannot exist. **The guard itself is not vacuous.** Arm 1 is the
+proof, and it is the arm that matters.
+
+Arm 3 is the honest caveat: the dead fallback *would* absorb a key rename silently. I chased it and
+it is **not** a hole — the full suite catches that rename in **20 tests**. Reported because I ran it,
+not because it changed the verdict.
+
+### Ordered task 2 — F3 / F4 / F11 re-stamped at `0bc86726`
+
+| Row | Status at `review-2` | Basis |
+|---|---|---|
+| **F3** | **LIVE — upgraded, see below** | three implementations, disagreement measured |
+| **F4** | **CLOSED** | `resolveStaleCeilingMs` replaces both inline `??` sites |
+| **F11** | **CLOSED** | `title` lifted into the frozen registry entry |
+
+**F4 — closed, and closed well.** `field-state.js:170` now separates the two cases `??` collapsed:
+`undefined → inherit 10_000`, `null → no ceiling`. Executed: `r(undefined)=10000`, `r(null)=null`,
+`r(3000)=3000`. Zero live inline sites remain (the two textual hits are prose in comments).
+I regressed it exactly — both call sites back to `?? 10_000`, numstat `2 2` — and **the tree caught
+it in 3 tests**, including `null and omitted must not render the same row`. That is a
+**discriminating control**, not a smoke test, and it is the right way to guard this fix.
+
+**F11 — closed.** `dashboard/index.js:93` now carries `title: module.meta.title` inside the frozen
+entry, and the comment records the original defect (*"it silently read `undefined` for a while:
+every roving group was built with no accessible name"*). Fixed at the source of truth rather than at
+the call site — the correct end.
+
+### F3 — **UPGRADED. Three `formatAge` implementations, disagreeing on 7 of 7 inputs.**
+
+My original F3 said "two parallel render stacks." That undercounted. At `0bc86726` there are **three**:
+
+```
+format.js:94              -> ui/model-card.js        (the model card)
+dashboard/field-state.js:209 -> dashboard/panel-kit.js (every panel)
+app.js:291                -> app.js:283               (the disconnect banner)   <-- PRIVATE COPY
+```
+
+Executed side by side. `app.js`'s private copy was transcribed and **verified byte-identical to
+`app.js:291-295` before use** (transcription control printed `true`):
+
+```
+ageMs      model card      panels           disconnect banner
+0          0s old          under 1s old     0s ago            <-- 3 DIFFERENT STRINGS
+60000      1m old          1m 0s old        1m 0s ago         <-- 3 DIFFERENT STRINGS
+3600000    1h old          over 1h old      60m 0s ago        <-- 3 DIFFERENT STRINGS
+86400000   24h old         over 24h old     1440m 0s ago      <-- 3 DIFFERENT STRINGS
+NaN        NaNh old        over NaNh old    NaNm NaNs ago     <-- 3 DIFFERENT STRINGS
+---
+inputs where the three surfaces disagree: 7 of 7
+```
+
+Two consequences, both user-visible and neither hypothetical:
+
+1. **A day-old reading reads `1440m 0s ago` in the banner and `24h old` on the card.** The banner
+   has no hour branch at all. This is the surface a presenter looks at when the demo has stalled —
+   the one moment the number is load-bearing.
+2. **All three render `NaN` rather than refusing.** `NaNh old` is precise and wrong, which is the
+   failure mode this dashboard's whole honesty thesis exists to prevent. A field whose age cannot be
+   computed should read `age unknown` — `format.js:84` already exports `UNKNOWN_AGE_TEXT` for
+   exactly this, and only `field-state.js` (`null → age unknown`) actually reaches it.
+
+**No test asserts the three agree.** `format.test.js` and `dashboard/staleness.test.js` each test
+their own copy, so both are green and the drift is invisible.
+
+**Recommendation:** delete `app.js:291` and `format.js:94`; import `formatAge` from
+`dashboard/field-state.js`, which is the only one with a defined answer for `null`. If the banner
+genuinely needs no `old` suffix, that is a formatting option on one function, not a third algorithm.
+Then add the agreement census described below.
+
+### Ordered task 3 — the census-vs-mechanism hunt. **Found, and it is the shape of the P1 itself.**
+
+`@c8d9a40e`'s lens — *the load-bearing test is the census, not the behaviour* — resolves on this
+branch to a **repeating class**, not a single defect: **a correct mechanism, guarded behaviourally,
+with no census proving it is the only mechanism.** Three instances, all proven by appending a
+bypass to a shipped file and running the full suite:
+
+| Mechanism | Guard | Probe: a *new* file bypasses it | Result |
+|---|---|---|---|
+| `fetchWithDeadline` | `every fetch in shipped dashboard code carries a deadline` | bare `fetch(` appended to `dashboard/system.js` | **RED, exit 1** ✅ |
+| `resolveStaleCeilingMs` | behaviour tests only | inline `?? 10_000` appended to `dashboard/system.js` | **646/646 GREEN** ⚠️ |
+| `server.model_path` ban (**the P1**) | `model-path-disclosure.test.js`, `SOURCES` | third surface binding it, appended to `dashboard/requests.js` | **646/646 GREEN** 🔴 |
+
+Same SHA, same file, same append technique, opposite outcomes. That is a **controlled asymmetry**,
+not an argument.
+
+**F24 confirmed live at `review-2`** (`f025ae58` is an ancestor; it was out of scope at `review-1`).
+`SOURCES` is a frozen list of **2** hardcoded paths — `dashboard/system.js` and `ui/model-card.js` —
+against a denominator of **23** shipped non-test `.js` files. **Coverage 2/23 ≈ 8.7%.** The P1 is
+closed *at the two surfaces that had it* and unguarded at the other twenty-one.
+
+To be explicit about what is and isn't at stake: the P1 fix is real. `server.model_path` appears
+**once** in shipped JS at `review-2` and that once is a comment; the control `server.model_id`
+returns 3. **Nothing is leaking today.** The finding is that nothing would *tell us* if a third
+surface reintroduced it, and this branch has already reintroduced this exact field once.
+
+**The fix is a five-line edit and the tree already contains its template.** Replace the hardcoded
+`SOURCES` with a discovered corpus, exactly as `request-deadline.test.js:181` does — including its
+anti-vacuity floor (`assert.ok(fetchSites > 0, …)`), which is the part that stops the census from
+passing because it found nothing. Same for `resolveStaleCeilingMs`.
+
+### F30 — **`git ls-tree` / `git ls-files` from a subdirectory return a FALSE ALL-CLEAR**
+
+Raised because it nearly retired a live blocker of mine, and because four agents have used this form
+tonight.
+
+```
+git ls-tree -r --name-only HEAD | grep -E "serving-dashboard/format\.js$"
+  from repo root                     -> 1   (correct: the file ships)
+  from examples/serving-dashboard/   -> 0   (WRONG — reads as "the file is gone")
+
+lines returned:  root 2149   ·   subdir 106
+git ls-files with a root-anchored pathspec, same directory:  root 23  ·  subdir 0
+```
+
+From a subdirectory both commands **restrict to the current prefix AND strip it from the output**, so
+any root-anchored path predicate silently matches nothing. I ran exactly this and got an empty result
+for F3's two files — **the output of a broken query is byte-identical to "the defect is fixed."**
+This is `@e00032a4`'s law one layer down: *a crash and a finding must never print the same thing* —
+here it is not even a crash, it is a clean exit 0 with an empty set.
+
+**Predicate:** anchor path censuses at the repo root, or match on basename with `grep -E "/name$"`.
+And never read an empty result as a pass without a positive control — I only caught this because my
+control (`a path that must NOT exist`) also returned 0, which meant my instrument could not tell the
+two apart.
+
+### F28 — **RESOLVED at `review-2`**
+
+```
+merge-base --is-ancestor fca13038 0bc86726  -> exit 0   (review-1 IS an ancestor; time runs forward)
+merge-base --is-ancestor 0aac6bb1 0bc86726  -> exit 0   (review-0 IS an ancestor)
+rev-list --count fca13038..0bc86726         -> 36
+
+request-deadline.test.js:  review-0 8 tests · review-1 7 · review-2 8   <- the 8th is back
+```
+
+The tag now moves forward and the test `review-1` was missing is restored. F28 needed no fix, only a
+later pin; I am closing it rather than leaving it to look unresolved.
+
+### What is good here, said plainly
+
+- `resolveStaleCeilingMs` is the model fix for this codebase: **one named function, beside the
+  constant it resolves, with the reasoning in the docstring and a test that distinguishes `null` from
+  omitted.** It replaced a duplicated inline `??` — the exact defect F3 still has.
+- `model-path-disclosure.test.js` carries the best anti-vacuity control in the tree:
+  *"the detector can actually fire, so a clean run means something"*, aimed at markup that genuinely
+  contains the path, in **both** text and attribute form, because those are two different bugs. Its
+  corpus is too small; **its method is the standard the rest of the suite should be held to.**
+- `dashboard/index.js` fixed F11 at the registry rather than at the call site, and left the
+  reasoning behind.
+
+### Limits that must travel with this verdict
+
+- **`cargo test` has still never been run tonight.** No gate item measures the Rust; the
+  `review-2` delta touches 13 Rust files, all unexecuted. F1/C14 are closed by string predicates over
+  committed bytes, not by execution.
+- I re-verified 12 of ~22 F-rows in earlier passes; **1 of the 12 was wrong** (F16, withdrawn).
+- **Six retractions by me this session**, plus one caught in flight.
+- `scenario-switcher.test.js` exists in both `./` and `./ui/` with different bytes; `run-tests.sh`
+  warns and I have not chased it.
+- My own `VERIFIED-AT` grep missed all three rows this pass because I searched a hyphen where the
+  file has a backtick. **Caught only by the positive control.** Reported against myself.
+
