@@ -500,17 +500,26 @@ describe('the check- test-file prefix', () => {
     // proves discrimination — that the extractor finds a read when one is
     // present and stays silent when none is — independently of whether the
     // corpus currently contains one.
-    const positive = byNameTestReads("const x = readFileSync(join(H, 'dashboard/field-keys.test.js'), 'utf8');");
+    // The fixtures build their filenames by concatenation, deliberately. This
+    // file is itself part of the corpus scanned above. A fixture containing a
+    // literal test-file name on the same line as a read call matches that scan,
+    // and the guard then reports its OWN sample data as a real dependency on a
+    // file that was never meant to exist. It did exactly that on first write.
+    // A test's sample data must not be indistinguishable from the thing it
+    // samples.
+    const T = '.test' + '.js';
+
+    const positive = byNameTestReads(`const x = readFileSync(join(H, 'dashboard/field-keys${T}'), 'utf8');`);
     assert.deepEqual(
       positive,
-      ['dashboard/field-keys.test.js'],
+      [`dashboard/field-keys${T}`],
       'The extractor failed to find a by-name test read in a fixture that ' +
         `plainly contains one. It returned ${JSON.stringify(positive)}. An empty ` +
         'result over the real corpus therefore means nothing.',
     );
 
     const negative = byNameTestReads(
-      ["// readFileSync('dashboard/field-keys.test.js') in a comment", "import { X } from './a.test.js';"].join('\n'),
+      [`// readFileSync('dashboard/field-keys${T}') in a comment`, `import { X } from './a${T}';`].join('\n'),
     );
     assert.deepEqual(
       negative,
