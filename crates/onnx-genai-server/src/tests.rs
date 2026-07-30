@@ -1193,6 +1193,69 @@ async fn vision_request_against_non_pipeline_model_returns_400() {
     );
 }
 
+/// The running process is the only artefact in this project that cannot be
+/// asked which source produced it, and that gap cost this project hours: four
+/// servers were demonstrated for most of a session on a binary nobody could tie
+/// to a commit. `ps` reports a path, and the path is set by `CARGO_TARGET_DIR`,
+/// which is shared across worktrees -- so it names a directory, not a history.
+///
+/// These assertions are about honesty rather than formatting: the field must be
+/// present unconditionally, and it must be permitted to say `unknown` rather
+/// than invent a plausible commit.
+#[tokio::test]
+async fn status_stamps_the_commit_the_binary_was_built_from() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    // Present unconditionally. Every other unmeasurable field here is omitted so
+    // a client can render "not applicable", but an absent provenance stamp is
+    // indistinguishable from a binary too old to carry one -- and telling those
+    // apart is the entire purpose of the field.
+    let sha = body["build_sha"]
+        .as_str()
+        .expect("build_sha must always be present, never omitted");
+    assert!(!sha.is_empty(), "build_sha must not be empty");
+
+    // Either a real short hash or the honest admission. Anything else means the
+    // stamp fabricated a value.
+    let plausible =
+        sha == "unknown" || (sha.len() == 8 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        plausible,
+        "build_sha must be an 8-char hex commit or the literal `unknown`, got {sha:?}"
+    );
+
+    // Three states, not two. "We could not tell" is a different claim from "the
+    // tree was clean", and collapsing them asserts a cleanliness never observed.
+    let dirty = body["build_dirty"]
+        .as_str()
+        .expect("build_dirty must always be present");
+    assert!(
+        matches!(dirty, "true" | "false" | "unknown"),
+        "build_dirty must be one of true/false/unknown, got {dirty:?}"
+    );
+
+    // The stamp describes the build, so it must not appear in `unavailable`:
+    // that map explains omissions, and this field is never omitted.
+    if let Some(unavailable) = body["unavailable"].as_object() {
+        assert!(
+            !unavailable.contains_key("build_sha"),
+            "build_sha is unconditional and must never be explained as unavailable"
+        );
+    }
+}
+
 #[tokio::test]
 async fn status_reports_node_status_contract() {
     let response = app(tiny_state())

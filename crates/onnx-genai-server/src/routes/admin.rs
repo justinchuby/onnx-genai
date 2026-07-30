@@ -191,6 +191,11 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
     Ok(Json(NodeStatus {
         // Node-level id from server config; independent of any loaded model.
         node_id: state.config.node_id.clone(),
+        // Which commit compiled this binary. Read from the environment that
+        // `build.rs` stamped at compile time, so it describes the running
+        // executable rather than the checkout the process happens to sit in.
+        build_sha: env!("ONNX_GENAI_BUILD_SHA"),
+        build_dirty: env!("ONNX_GENAI_BUILD_DIRTY"),
         // Echoed so a captured payload is self-describing. Under the two-server
         // demo topology attribution is by origin, but a saved response should
         // not depend on remembering which port produced it.

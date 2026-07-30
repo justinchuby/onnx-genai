@@ -319,6 +319,28 @@ pub(crate) struct NodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_driver_detail: Option<String>,
     sessions: Vec<SessionStatus>,
+    /// The commit this binary was compiled from, stamped by `build.rs`.
+    ///
+    /// Always present, never omitted, and never optional. Every other
+    /// unmeasurable field on this struct is omitted so a client can say "not
+    /// applicable" -- but this one answers *which code is speaking*, and a
+    /// client cannot interpret any other field without it. Omission would also
+    /// be ambiguous in the one direction that matters: a binary predating this
+    /// field omits it too, so "absent" must mean "too old to say", which is
+    /// itself the answer the operator needs.
+    ///
+    /// `unknown` when git could not be consulted at build time. That is a real
+    /// state and it is reported rather than guessed.
+    build_sha: &'static str,
+    /// Whether tracked files were modified when this binary was built:
+    /// `"true"`, `"false"` or `"unknown"`.
+    ///
+    /// A string rather than a bool because "we could not tell" is a third
+    /// answer, and collapsing it into `false` would assert a clean tree we
+    /// never observed. See `build.rs` for why this is a hint rather than a
+    /// guarantee: cargo decides when to re-stamp, so a stale `false` is
+    /// possible. `build_sha` is the load-bearing half.
+    build_dirty: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_hashes: Option<Vec<String>>,
     /// Explanations for every field omitted above, keyed by field name.
