@@ -2177,3 +2177,44 @@ CONTROL  (key: |field\()['"]server\.model_id     →  3   ✅ instrument reaches
 **The rule this adds to AC202, and it is the one that generalises:** a predicate must key on **what the defect DOES**, never on **what the defect is CALLED**. A name survives its own deletion — in prose, in an obituary, in a test title, in a changelog. **Only the mechanism disappears when the mechanism is removed.**
 
 **And the reason this correction belongs in the document rather than in chat:** AC202 requires every completion to carry a re-runnable predicate. Shipping that rule with a broken exemplar would have propagated the defect into every completion written against it. *A rule is only as good as the example attached to it, and the example is the part people copy.*
+
+### AC204 — a disclosure defect has two surfaces; scoring the named one closes nothing
+
+Gate item 10 is named **"one browser load."** So it was scored by what the browser renders. **The defect is not a rendering defect — it is a disclosure defect, and disclosure has two surfaces: the page and the wire.**
+
+Measured at 04:46, all origins, with both control arms:
+
+```
+:8123 :8124 :8133 :8134   "path":"/Users/<user>/…/onnx-genai/models/qwen2.5-0.5b…"
+                          4 answered · 4 leaked · 0 clean
+CONTROL  synthetic leaky body → detected 1 ✅   synthetic clean body → 0 ✅
+```
+
+**Severity splits, and the halves must not share a colour:**
+
+- ✅ **Render half — closed, and closed better than specified.** Zero bindings; control 3. `projectServedModel()` deleted, so the value is not merely unrendered but **unaddressable**. `NEVER_BIND` makes re-exposure a loud edit rather than a one-word one.
+- 🟡 **Wire half — live, unowned, not a demo-day blocker.** The endpoint is loopback-bound and the projector renders nothing. Nobody in the room sees it unless someone opens a terminal on purpose. **It is not inflated to a blocker and it is not called closed.**
+
+**The rule:** an item's *title* names a surface; a defect inhabits a *mechanism*. **Score the mechanism, or you will retire the defect on the one surface you happened to name.** This is the same failure as keying a predicate on a defect's name — one level up, in the gate itself, where it is copied most.
+
+**And the second half is an ordering constraint, not a preference.** Ban-first leaves the unauthenticated leak standing; server-first leaves a safe basename permanently unshowable. **Neither fix is safe alone, so the guard must carry the condition that retires it** — a guard that states what it forbids but not what would lift it becomes permanent by default, and a permanent guard on a fixed defect is indistinguishable from a live defect to every future reader.
+
+### AC205 — guard coverage follows convenience unless someone measures the corpus
+
+Measured at `94799c04`:
+
+```
+IN THE CITATION GUARD'S CORPUS
+  README.md                  1  ✅  the only one
+  design/demo-ux.md          0  ⛔  rank-1, 30 inbound citations
+  demo-spec.md               0  ⛔  rank-2, this file, 115 cited paths
+  IMPLEMENTATION-REVIEW.md   0  ⛔  82 file:NNN coordinates
+CONTROL  the guard's own readFileSync → 3 ✅      NEG CONTROL → 0 ✅
+this file IS in 4 other test corpora ✅ — so this is one specific guard, not "markdown is untested"
+```
+
+This answers why the 9 unresolvable citations in this document survived unnoticed: **the only guard that could see them has a corpus of one, and it is not this file.**
+
+**The rule:** **we guard the artifact that is easiest to guard, not the one whose rot costs most.** That is the default outcome every time, because a corpus is chosen once, silently, by whoever wrote the guard — and nothing afterwards ever asks what it excluded.
+
+**Acceptance:** the citation guard's corpus must be widened to every rank-1 and rank-2 document. **Expect it to go red on this file.** A guard that goes red on the spec is the guard working, and an exemption granted to the document that defines the quality bar is the worst possible place to grant one.
