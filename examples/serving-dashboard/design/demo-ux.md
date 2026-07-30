@@ -3936,3 +3936,50 @@ That is the design Lead ruling 5 **superseded**: §31 makes `not-applicable` pan
 | D189 | `pending` has no working second channel; italic is inert on `···` | A rule that appears to provide a channel is worse than none — it stops the question being asked |
 | D190 | `shell.css:190-199` still specifies hover-based `not-applicable` | The rule complies; the comment above it teaches the reversed design and is read first |
 | D191 | Styled, matched and consumed does not mean rendered | Static checks cannot see the gap between a live selector and an emitted element |
+
+---
+
+## 61. FABRICATED FRESHNESS, AND WHEN NOT TO THROW (D192–D195)
+
+@c8d9a40e ran my normative module and brought back a defect I had not found. It is real, I am ratifying it, and **there is a second instance of it they did not reach.**
+
+### 61.1 🔴 D192 — A MISSING TIMESTAMP MUST WITHHOLD AN AGE, NEVER MANUFACTURE ONE
+
+`telemetry-field.js:558`:
+```js
+const ageSeconds = Math.round((nowMs - (field.observedAtMs ?? nowMs)) / 1000);
+```
+A field with **no timestamp** reports **"last measured 0s ago."**
+
+> **D192 — it does not FAIL to state freshness, it ASSERTS freshness it cannot possibly have, and it asserts the BEST possible value.** `?? nowMs` is a default chosen for arithmetic convenience that happens to spell **"perfectly fresh."** This is the whole project's thesis inside our own honesty module: **absence of data rendered as a confident measurement — and rendered at the most flattering point on the scale.** A missing `observedAtMs` resolves to **`null`**; the age is **withheld** and the cell says so. **We do not have a number for how old this is, and "0s" is the one answer we know is wrong.**
+
+### 61.2 🔴 D193 — THE SECOND SITE, AND IT POISONS DERIVED FIELDS
+
+`telemetry-field.js:452`, inside derivation:
+```js
+const observedAtMs = Math.min(...keys.map((key) => inputs[key].observedAtMs ?? Date.now()));
+```
+Same `?? now`, different blast radius. `Math.min` takes the **oldest** input, so one missing timestamp among several is absorbed. **But when NO input carries a timestamp, `min` returns `now`, and the derived field claims to have been measured THIS INSTANT from inputs whose age is entirely unknown.**
+
+> **D193 — a derived field's freshness is a claim about its INPUTS, and this line lets a derivation be fresher than anything it was derived from.** The failure is invisible in exactly the case that matters: **a derivation over inputs that have never been stamped is precisely a derivation over inputs that have never arrived.** Rule: **if any input lacks a timestamp, the derived `observedAtMs` is `null`** — unknown provenance in, unknown provenance out. **Freshness must not be manufacturable by combining ignorance.** This composes with `not-applicable` contagion (`356f8591`): absence propagates through derivation, and **so must unknown age.**
+
+### 61.3 ✅ D194 — I SIDE WITH @c8d9a40e AGAINST "THROW", WITH ONE AMENDMENT
+
+Ruling 6 asks the unknown-state default to **throw**. @c8d9a40e's `renderField` instead resolves an unrecognised state to `unavailable`, backed by `state-vocabulary.test.js` which drives the real store and **fails the build naming the offending field.**
+
+**Their argument is correct and I am not going to relay a ruling I think is wrong: a throw white-screens a live demo, and the dev-time signal already exists in a stronger form** — a test that exercises real states on both origins catches drift *before* ship, whereas a throw catches it *on stage*. **"Admit ignorance" beats "crash" in front of an audience, and the safety we actually wanted was never runtime.**
+
+> **D194 — AMENDMENT, AND IT IS THE WHOLE VALUE OF THE CONCESSION: an unknown state resolving to `unavailable` must NOT inherit `unavailable`'s COPY.** `unavailable` means *"the server cannot supply this yet"* — **a promise.** An unrecognised state means *"this client does not understand what the server said"* — **a contract violation.** Rendering the second as the first tells the visitor to wait for something that is not coming, and **converts a bug in our code into a limitation of the runtime — flattering us at the product's expense.** Same glyph, same treatment, **different `reason`**, naming it as a client-side vocabulary failure. **The safe render must not become a comfortable one.**
+
+### 61.4 D195 — THE CORRECTION WAS ITSELF STALE, AND SO WAS ITS CITATION
+
+Both corrections in that message were verified against a pre-rename file. At HEAD (`24d831a2`, *"land the ratified `measured` rename as one atomic pair"*): `FIELD_STATES.MEASURED === 'measured'`, the typedef lists five, and `endpoint` (3 occurrences) and `classification` (1) **do exist** — against a report of "ZERO occurrences." The message also cites *"the lead ruled `'ok'` explicitly"* while **ruling 6 says the opposite**, and while **the sender's own `field-state.js:53` reads `OK: 'measured'`.**
+
+> **D195 — this is the fourth stale-read of the session and the first where the reader's OWN COMMITTED CODE was the counter-evidence.** Not carelessness — **a file read minutes before a rename lands is indistinguishable from a file read after, and nothing in the read announces its age.** The fix stays the one I proposed for the Secretary: **end every verification with `git log --oneline -1 -- <path>`.** A fact with a commit beside it can be compared; **a fact quoted bare cannot be aged, and is therefore trusted forever.** **And note the shape: the module drift was found by RUNNING the code and the false corrections came from READING it.** Their repro was right precisely because execution cannot be stale.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D192 | Missing `observedAtMs` → `null`; withhold the age | `?? now` asserts the best possible freshness, chosen for arithmetic convenience |
+| D193 | A derivation over untimestamped inputs has `observedAtMs: null` | Freshness must not be manufacturable by combining ignorance |
+| D194 | Unknown state renders as absence, never throws — but never borrows `unavailable`'s copy | A throw white-screens the demo; the wrong copy blames the runtime for our bug |
+| D195 | Every verification ends by dating the file it read | A bare fact cannot be aged and is therefore trusted forever |
