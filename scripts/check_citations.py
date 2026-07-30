@@ -568,7 +568,11 @@ def main() -> int:
     if not args.doc:
         ap.error("a document is required (or --self-test)")
 
-    repo = tree_context.repo_root()
+    try:
+        repo = tree_context.repo_root()
+    except tree_context.NoWorktree as exc:
+        print(f"CANNOT RUN: {exc}", file=sys.stderr)
+        sys.exit(tree_context.CANNOT_RUN)
     ctx = tree_context.tree_context(repo)
     print(tree_context.banner(ctx), file=sys.stderr)
     if args.require_branch:

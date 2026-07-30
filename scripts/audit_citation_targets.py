@@ -39,7 +39,11 @@ from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tree_context  # noqa: E402
 
-ROOT = str(tree_context.repo_root())
+try:
+    ROOT = str(tree_context.repo_root())
+except tree_context.NoWorktree as exc:
+    print(f"CANNOT RUN: {exc}", file=sys.stderr)
+    sys.exit(tree_context.CANNOT_RUN)
 # argv[1] lets the mutation test run against a COPY. Never mutate the live
 # tree to test a checker -- another agent is almost certainly editing it.
 DOC=sys.argv[1] if len(sys.argv)>1 else os.path.join(ROOT,"docs/ARCHITECTURE.md")

@@ -36,17 +36,47 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+# Exit code for "this check could not run", kept distinct from 1, which every
+# checker here uses for "this check ran and found a defect". A tool that cannot
+# start and a tool that found a real problem must be separable by a caller --
+# a CI job, a hook, or an agent -- without reading prose.
+CANNOT_RUN = 2
+
+
+class NoWorktree(Exception):
+    """Raised when there is no git worktree to resolve tracked paths against."""
+
 
 def repo_root() -> Path:
-    """The worktree containing THIS FILE, never the caller's CWD."""
+    """The worktree containing THIS FILE, never the caller's CWD.
+
+    Fails with a NAMED diagnostic rather than a traceback when there is no
+    worktree at all. That case is not hypothetical: the ratified way to review
+    this branch is to extract a commit and measure the extract, and an archive
+    extract is not a git repository. Every checker here needs `git ls-files` to
+    know which paths are real, so refusing is correct -- but a raw
+    CalledProcessError reads as "the tooling is broken" rather than "you are
+    outside a repository", and it exits 1, which is byte-identical to a checker
+    that ran and found a genuine defect. A crash and a finding must never print
+    the same thing.
+    """
     here = Path(__file__).resolve().parent
     out = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=here,
         capture_output=True,
         text=True,
-        check=True,
     )
+    if out.returncode != 0:
+        raise NoWorktree(
+            f"{Path(__file__).name} is at {here}, which is not inside a git "
+            f"worktree, so tracked-path resolution is impossible and every "
+            f"result would be vacuous.\n"
+            f"If this is an archive extract (`git archive`/`tar`), clone or "
+            f"`git worktree add --detach <sha>` instead -- that preserves the "
+            f"index these checks resolve against.\n"
+            f"git said: {out.stderr.strip() or '(no stderr)'}"
+        )
     return Path(out.stdout.strip())
 
 

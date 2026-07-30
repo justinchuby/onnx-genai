@@ -262,7 +262,11 @@ def check(repo: Path) -> tuple[list[str], dict]:
 
 
 def main() -> int:
-    repo = repo_root()
+    try:
+        repo = repo_root()
+    except tree_context.NoWorktree as exc:
+        print(f"CANNOT RUN: {exc}", file=sys.stderr)
+        sys.exit(tree_context.CANNOT_RUN)
     print(tree_context.banner(tree_context.tree_context(repo)), file=sys.stderr)
     failures, stats = check(repo)
     print(
