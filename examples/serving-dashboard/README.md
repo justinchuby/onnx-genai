@@ -278,7 +278,7 @@ that scenario's configured origin, **as a real page navigation**, carrying the
 scenario in the URL:
 
 ```
-http://127.0.0.1:8124/demo/?scenario=prefix-cache
+http://127.0.0.1:8124/demo/?scenario=paged-kv
 ```
 
 Both servers serve the same static demo, so each page is always **same-origin
@@ -385,16 +385,27 @@ measured the spread. It is also why the demo re-measures rather than shipping a
 recorded baseline: **a stored number is a claim about a machine that no longer
 exists.**
 
-### Scenario B — prefix caching *(dynamic profile, `:8124`)*
+### Scenario B — paged KV page allocation *(dynamic profile, `:8124`)*
 
-Reuse across a shared prompt prefix. The cache is a token radix trie, so reuse
-happens over the common *prefix*, not merely by appending to a previous
-conversation.
+Pages being allocated, shared and freed as sequences run: the block allocator
+doing its actual job. This is a **paged-KV** story, not a prefix-reuse one, and
+it is fed by `/v1/debug/kv` rather than `/v1/status` — the `kv_*` fields on
+`/v1/status` are placeholders (see [`QA-PLAN.md`](QA-PLAN.md) §7.1, which lists
+which four of the thirteen are real).
 
-🔴 **This scenario is currently unconfirmed, and the honest reading is that
-prefix reuse does not measurably happen.** It is documented here rather than
-quietly removed, because how it failed is more instructive than the feature
-would have been.
+The allocator is genuinely observable: page allocation and release were verified
+directly against a running dynamic server, against a pool of ~14,600 pages. That
+is the payoff this scenario shows.
+
+> **This scenario used to be "prefix caching", and it was re-scoped after the
+> feature failed verification.** The material below is kept because how it
+> failed is considerably more instructive than the feature would have been, and
+> because a re-scope that leaves no trace is indistinguishable from a feature
+> that never existed.
+
+#### Why this is no longer a prefix-caching scenario
+
+🔴 **Prefix reuse does not measurably happen.**
 
 An early check fired one identical long prefix twice, saw
 `prefix_cache_hits_total` move 0 → 1 and latency fall 1.53 s → 1.22 s, and
@@ -536,33 +547,56 @@ field arrives as:
 { value, state, source, reason, unit, observedAtMs }
 ```
 
-where `state` is `measured`, `pending`, `stale` or `unavailable`. Panels branch
-on `state` before reading `value`. `telemetry-provenance.js` holds the
-classification of every field and emits documented zeros as `unavailable` **even
-when the response carried a parseable number**, so a panel cannot accidentally
-bind to a placeholder.
+where `state` is `measured`, `pending`, `stale`, `unavailable` or
+`not-applicable`. Panels branch on `state` before reading `value`.
+`telemetry-provenance.js` holds the classification of every field and emits
+documented zeros as `unavailable` **even when the response carried a parseable
+number**, so a panel cannot accidentally bind to a placeholder.
 
 ### A measured zero and a fabricated zero are opposite things
 
-This is the distinction the whole design exists to protect, and it is worth
-being concrete about.
+This is the distinction the whole design exists to protect. **The example this
+section used to give was itself wrong, and correcting it in place is more
+useful than replacing it quietly.**
 
-- **`prefix_cache_hits: 0` on the batching server is a real measurement.** The
-  cache genuinely did not hit, because on the static-cache path there is no
-  prefix trie to hit. That zero is *information*. The repository asserts it in
-  both directions:
-  `crates/onnx-genai-engine/tests/batched_static_decode.rs:53,88` asserts
-  `prefix_cache_hit_len == 0` on the batched static path, and
-  `crates/onnx-genai-engine/tests/prefix_speedup.rs:50,84` asserts
-  `warm.prefix_cache_hit_len > 0` on the dynamic path. Two tests, opposite
-  assertions, both passing — that is what makes this a finding rather than a bug.
-- **`tokens_per_second: 0.0` is a placeholder.** Nobody measured anything. The
+We originally offered `prefix_cache_hits: 0` on the batching server as the
+canonical *genuine* zero — the cache truly did not hit, because that path has no
+prefix trie. **That reading was wrong.** The batching path does not measure a
+miss: it passes a literal `0` as the `prefix_cache_hit_len` argument of
+`DecodeLoopState::with_rng` (`crates/onnx-genai-engine/src/batched.rs:262,486`;
+the parameter is first in the signature at `decode_loop.rs:39-42`, and at the
+call site it reads `with_rng(0, rng, …)`, which is easy to mistake for a seed).
+So the zero is not the answer to a question nobody could answer differently —
+**it is a constant that was never a measurement at all.** It is also not
+`unavailable`, because nobody will ever instrument it: `ContinuousBatchManager`
+(`batched.rs:101-110`) has no prefix-cache field at all, so a lookup there is
+not merely absent but *impossible*. That is what `not-applicable` is for.
+
+**So our flagship example of a real measurement was a fabricated number, sitting
+inside the section that argues this demo does not fabricate numbers.** It is
+worth stating plainly, because it is the most instructive thing in this file:
+the safeguard is exactly where a defect hides best, since nobody audits the
+audit.
+
+- **A genuine measured zero:** `queue_depth: 0`. Something computed it, the
+  answer is zero, and it would have been a different number under load. It
+  renders at full contrast, because a real zero is *information*.
+- **A placeholder:** `tokens_per_second: 0.0`. Nobody measured anything. The
   server records cumulative token totals and never computes a rate, and the
-  source says so in a comment beside the literal.
+  source says so in a comment beside the literal. It renders `—`.
+- **A structural non-answer:** prefix reuse on the batching path. The subsystem
+  is never consulted, so there is nothing to measure and never will be. It
+  renders `n/a`, which teaches rather than apologises.
 
-Both are the character `0` in an HTTP 200 response. The page renders the first
-as a number at full contrast and the second as `—`, because presenting them the
-same way would be the single most misleading thing this demo could do.
+All three are the character `0` in an HTTP 200 response. Rendering them the same
+way would be the single most misleading thing this demo could do.
+
+> **The naming traps behind these distinctions are maintained in
+> [`QA-PLAN.md`](QA-PLAN.md) §7 (displayed name → what the code actually counts
+> → required action, with `file:line`) and the known-absent register in §11.**
+> Those sections are normative. This file deliberately does not restate the
+> table: two copies of a trap list drift, and the stale copy is the one that
+> gets believed, because it reads exactly as authoritatively as the live one.
 
 ### What the model card can and cannot tell you
 

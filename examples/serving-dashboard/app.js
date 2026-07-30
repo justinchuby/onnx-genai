@@ -25,6 +25,7 @@ import {
 } from './scenario-origins.js';
 import { mountFailureStates } from './ui/failure-state.js';
 import { mountModelCard } from './ui/model-card.js';
+import { mountScenarioSwitcher } from './ui/scenario-switcher.js';
 import { PROVENANCE, allFieldKeys } from './telemetry-provenance.js';
 import { FIELD_STATES } from './telemetry-field.js';
 
@@ -79,6 +80,15 @@ async function main() {
 
   mountFailureStates(requireElement('failure-state'), telemetryStore);
   mountModelCard(requireElement('model-card'), telemetryStore);
+  // The switcher is the ONLY route to the other server's scenarios. Without it
+  // planScenario's work reached nothing: `plan` was computed, stashed on
+  // globalThis and never rendered, so a visitor on the scatter server had no
+  // way to reach paged KV or prefix caching at all.
+  const scenarioSwitcher = mountScenarioSwitcher(requireElement('scenario-switcher'), {
+    origins,
+    currentScenarioId: scenarioId,
+    currentOrigin: location.origin,
+  });
   mountConnectionIndicator(requireElement('connection-indicator'), telemetryStore);
   renderProvenanceFooter(requireElement('provenance-table'));
 
@@ -88,7 +98,14 @@ async function main() {
 
   // Exposed for the dashboard developer's modules and for manual poking in
   // DevTools. One store for the page -- panels must never create their own.
-  globalThis.onnxGenAiDemo = { telemetryStore, origins, plan, serverClass, dashboard };
+  globalThis.onnxGenAiDemo = {
+    telemetryStore,
+    origins,
+    plan,
+    serverClass,
+    dashboard,
+    scenarioSwitcher,
+  };
 }
 
 /**

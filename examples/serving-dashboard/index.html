@@ -87,13 +87,14 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
         <section class="scenario" aria-labelledby="scenario-heading">
           <h2 id="scenario-heading" class="scenario__heading">Scenarios</h2>
           <!--
-            Scenario mounts. Each is independent and removable: the prefix-cache
-            scenario is at risk pending confirmation that the counter moves on
-            this decode path, and the grid must not leave a hole if it is cut.
+            One mount point, filled from the SCENARIOS registry in
+            scenario-origins.js. Listing the scenarios here as well is how the
+            shell and the registry drift apart: this markup previously named
+            "paged-kv-block-table" and "prefix-caching", neither of which is a
+            registry id, so a switcher reading it would have offered two
+            scenarios that do not exist.
           -->
-          <div id="scenario-batching" data-scenario="continuous-batching"></div>
-          <div id="scenario-paged-kv" data-scenario="paged-kv-block-table"></div>
-          <div id="scenario-prefix-cache" data-scenario="prefix-caching" hidden></div>
+          <div id="scenario-switcher"></div>
         </section>
 
         <section class="dashboard" aria-labelledby="dashboard-heading">

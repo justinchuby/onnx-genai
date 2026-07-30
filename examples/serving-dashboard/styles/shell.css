@@ -516,3 +516,101 @@ body[data-blocked] .app {
     gap: var(--og-space-5);
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Scenario switcher.
+
+   Every value here is a token. The one rule doing real work is the gap on
+   .scenario-switcher__tab: the label and the "on the dynamic server" hint are
+   separate inline spans, and without an explicit gap they render glued
+   together as "Paged KV block tableon the dynamic server". Eight passing unit
+   tests did not see it, because textContent has no concept of whitespace.
+   --------------------------------------------------------------------------- */
+
+.scenario-switcher__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--og-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scenario-switcher__tab {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+  padding: var(--og-space-2) var(--og-space-4);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-pill);
+  background: var(--og-bg-raised);
+  color: var(--og-fg);
+  font: var(--og-weight-medium) var(--og-type-sm) / var(--og-leading-tight) var(--og-font-ui);
+  text-decoration: none;
+}
+
+.scenario-switcher__tab:hover {
+  background: var(--og-bg-hover);
+  border-color: var(--og-border-strong);
+}
+
+.scenario-switcher__tab:focus-visible {
+  outline: var(--og-focus-ring);
+  outline-offset: var(--og-focus-offset);
+}
+
+/* Current scenario carries a filled background AND aria-current, so the state
+   survives grayscale and is announced rather than only seen. */
+.scenario-switcher__tab[aria-current='page'] {
+  background: var(--og-accent);
+  border-color: var(--og-accent);
+  color: var(--og-accent-fg);
+}
+
+/* The scenario name stays on one line so it cannot break mid-phrase while the
+   hint wraps beneath it, which reads as two unrelated labels. */
+.scenario-switcher__label {
+  white-space: nowrap;
+}
+
+/* "on the dynamic server" -- the visitor is about to leave this origin. Said
+   in words, never colour alone. */
+.scenario-switcher__hint {
+  color: var(--og-fg-muted);
+  font-size: var(--og-type-xs);
+  font-weight: var(--og-weight-normal);
+}
+
+.scenario-switcher__tab[aria-current='page'] .scenario-switcher__hint {
+  color: var(--og-accent-fg);
+}
+
+/* The unreachable-scenario note. Styled as an architectural fact, not a
+   failure: nothing is broken, the other server is simply not running. */
+.scenario-switcher__note {
+  margin-top: var(--og-space-4);
+  padding: var(--og-space-4);
+  border-left: 3px solid var(--og-na-rule);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-na-bg);
+  color: var(--og-na-fg);
+  font: var(--og-type-sm) / var(--og-leading-body) var(--og-font-ui);
+}
+
+.scenario-switcher__note-heading {
+  margin: 0 0 var(--og-space-2);
+  font-size: var(--og-type-sm);
+  font-weight: var(--og-weight-bold);
+  letter-spacing: var(--og-tracking-caps);
+  text-transform: uppercase;
+}
+
+.scenario-switcher__note-list {
+  margin: 0;
+  padding-left: var(--og-space-5);
+}
+
+.scenario-switcher__note-fix {
+  margin: var(--og-space-3) 0 0;
+  color: var(--og-na-note);
+}
