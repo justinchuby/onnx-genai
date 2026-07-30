@@ -13,3 +13,7 @@
 
 - Approved Kuato's PR #423 after QLinearMatMul and Resize GPU parity evidence.
 - Requested changes on PR #424, locking Kuato out of the revision; then approved Mary's shape-aware claim-gate fix after independent on-device re-run covering 308 GPU parity cases plus claim-gate probe evidence.
+
+## 2026-07-30T09:16:00Z — 27B blocker-chain reviews
+
+- Approved Mary’s rank-3 Conv1D PR #438, now merged; continuing review of Silu inference PR #440.

@@ -14,3 +14,8 @@
 ## 2026-07-30T07:20:00Z — Qwen3.6-27B persistent recurrent-state bindings
 
 - Confirmed the Qwen 27B Unsqueeze blocker was already resolved, then generalized native CUDA persistent state allocation so metadata-declared fixed rank-3 `conv_state`/recurrent state uses static replace semantics instead of rank-4 KV capacity growth. The graph now reaches the next blocker: unsupported rank-3/1-D CUDA Conv.
+
+## 2026-07-30T09:16:00Z — 27B Conv and Silu blocker chain
+
+- PR #438 merged native CUDA rank-3 Conv1D support, advancing the Qwen3.6-27B probe past `__fn0_Conv_node_12`.
+- PR #440 supplies `com.microsoft::Silu` unary shape inference and is in review; the next observed blocker is `value#1414 not produced`.
