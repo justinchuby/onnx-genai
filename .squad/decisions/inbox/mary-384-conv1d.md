@@ -1,0 +1,4 @@
+### 2026-07-30: Add native CUDA rank-3 Conv1D
+**By:** Mary
+**What:** CUDA `Conv` now handles rank-3 NCL tensors with an output-owned NVRTC kernel while preserving the existing rank-4 cuDNN path. The rank-3 path supports f32/f16/bf16, optional bias, groups/depthwise convolution, stride, dilation, explicit asymmetric/causal padding, and ONNX `VALID`/`SAME_UPPER`/`SAME_LOWER` geometry. GPU parity against the CPU EP covers basic, depthwise causal FP16, and grouped strided/dilated cases. The Qwen3.6-27B INT4 native CUDA probe clears `__fn0_Conv_node_12` and proceeds to the next blocker: missing inferred shape for the layer-0 linear-attention `Silu` output.
+**Why:** Hybrid/recurrent LLM blocks use depthwise causal Conv1D over their fixed convolution state. The CUDA kernel previously accepted only rank-4 NCHW tensors and failed the real 27B graph after recurrent-state allocation was fixed.
