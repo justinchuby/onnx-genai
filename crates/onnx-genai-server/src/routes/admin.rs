@@ -65,11 +65,6 @@ pub(crate) async fn models(
     }))
 }
 
-/// `GET /v1/status` — node-status contract for the cluster router (§34.8).
-///
-/// Real values: `queue_depth` (admission queue), `active_sessions` (session
-/// registry), `healthy`, `node_id`. Everything else is a documented placeholder
-/// because the underlying getter does not exist yet — see per-field comments.
 /// Fraction of the assemblable batch that is currently generating.
 ///
 /// Clamped to 1.0 rather than allowed to exceed it. The numerator counts
@@ -175,6 +170,9 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
             snapshot.current_batch_size,
             state.config.effective_batch_capacity(),
         ),
+        // The denominator itself, so the client never hardcodes a capacity no
+        // endpoint confirms. Same source as the ratio above, read once.
+        batch_capacity: u32::try_from(state.config.effective_batch_capacity()).unwrap_or(u32::MAX),
         // Session ids are real, and redacted because full ids are bearer
         // tokens (see session.rs). The per-session detail fields are omitted
         // rather than filled with "unknown".

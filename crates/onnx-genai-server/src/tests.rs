@@ -3635,6 +3635,36 @@ fn effective_batch_capacity_is_the_batch_ceiling_when_admission_is_generous() {
     assert_eq!(config.effective_batch_capacity(), 4);
 }
 
+/// The published denominator must be the one the ratio was divided by.
+///
+/// A client renders "N of M" from `batch_capacity`. If that key ever carries
+/// `max_batch` while `batch_utilization` divides by the effective capacity,
+/// the two disagree and BOTH still look plausible: with `max_batch = 8` and
+/// admission capped at 1, a fully saturated server would publish
+/// `batch_utilization: 1.0` beside `batch_capacity: 8` -- "1 of 8" at 100%.
+/// Neither number is out of range, so nothing detects it.
+#[tokio::test]
+async fn status_publishes_the_denominator_it_actually_divided_by() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            max_batch: 8,
+            max_queue_depth: 1,
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with a tighter admission cap than batch cap");
+
+    let body = get_json(app(state), "/v1/status").await;
+
+    assert_eq!(
+        body["batch_capacity"], 1,
+        "capacity must be min(max_batch, max_queue_depth), never max_batch alone"
+    );
+}
+
 #[test]
 fn batch_utilization_is_in_flight_over_capacity() {
     assert_eq!(crate::routes::admin::batch_utilization(0, 4), 0.0);
@@ -3973,6 +4003,7 @@ async fn status_still_reports_the_fields_it_genuinely_measures() {
         "queue_depth",
         "active_sessions",
         "batch_utilization",
+        "batch_capacity",
         "sessions",
     ] {
         assert!(

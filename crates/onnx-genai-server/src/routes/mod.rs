@@ -201,6 +201,16 @@ pub(crate) struct NodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens_per_second: Option<f64>,
     batch_utilization: f32,
+    /// The denominator of [`Self::batch_utilization`], published so a client
+    /// can render "3 of 4" rather than a bare percentage it must trust.
+    ///
+    /// Deliberately NOT named `max_batch`. It is
+    /// `min(max_batch, max_queue_depth)` — see
+    /// `AppConfig::effective_batch_capacity` — because admission is often the
+    /// tighter constraint, and `max_batch` alone overstates the ceiling. A
+    /// client that received this as `max_batch` would re-derive the wrong
+    /// quantity from an honest one.
+    batch_capacity: u32,
     sessions: Vec<SessionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_hashes: Option<Vec<String>>,
