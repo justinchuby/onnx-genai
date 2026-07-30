@@ -1345,3 +1345,83 @@ The fail-closed matcher for F17 is eight lines and is ready. It is not being
 landed, because it would turn a green tree red at demo time over 13 keys in a file
 this reviewer does not own, and the triage of those 13 belongs to that owner. A
 reviewer who reddens a shared tree to prove a point has stopped reviewing.
+
+---
+
+## F19 (MINOR, new) — the in-flight fixture repair left its affordance armed
+
+The last suite failure (`telemetry-store.test.js`, `the in-flight gauge is NEVER
+exposed as the engine batch size`, `2 !== 8`) is fixed at `712cc39b`: 60 pass /
+0 fail in a clean detached worktree, `--porcelain` 0.
+
+The fix is good. `batch.in_flight` migrated from `/metrics` to `/v1/status`; the
+test now injects through `statusBody({ batch_in_flight: 8 })`, all four assertions
+survive verbatim including `assert.match(reason, /does not report/i)`, and the
+comment was updated to describe the new path *and* to record the trap for the next
+reader.
+
+**The residue:** `telemetry-store.test.js:121` still declares
+`metricsBody({ inFlight = 3, ... })` and `:127` still emits
+`onnx_genai_batch_size_current ${inFlight}`. Measured at `712cc39b`:
+
+| | count |
+| --- | --- |
+| callers passing `inFlight` | 0 |
+| catalogue entries reading that metric | 0 |
+| prometheus names injected / consumed | 8 / 7 |
+| orphaned | 1 |
+
+So the next person who needs to set in-flight will find `metricsBody({ inFlight })`
+— the discoverable, natural-looking door — and it will silently inject nothing,
+and their assertion will read the `/v1/status` fixture's value instead. That is
+the identical bug that just held the gate, still loaded, with zero callers.
+
+**Fix:** delete the `inFlight` parameter and the two lines it feeds. Zero callers,
+zero risk. `statusBody({ batch_in_flight: N })` becomes the only door.
+
+A comment warning about a trap is strictly weaker than not having the trap. The
+comment only reaches someone reading the *repaired* test; the next person will be
+writing a *new* one and meets the parameter first. When a function accepts an
+argument that can only produce a wrong result, the fix is to stop accepting it.
+
+### Governance ruling: a third permitted category
+
+This edit was challenged against the rule recorded earlier in this review —
+*editing a test because it is inconvenient is banned; editing it because the
+requirement it encodes was superseded is required.* Neither clause fits. Here
+**neither the requirement nor the evidence changed — only the wire address did.**
+The edit changed the input path and touched no assertion. That is a third,
+clearly permitted category, and it leaves the test's meaning entirely intact.
+
+### A retraction against myself, and a broken instrument
+
+Suspicion that the comment's mechanism clause (`incremented per HTTP generation
+and decremented on drop`) had been carried across the migration and become false:
+**wrong.** `metrics.rs:211` reads `current_batch_size` from `REGISTRY.batch_size`,
+the same process-global static backing `onnx_genai_batch_size_current`, and
+`admin.rs:167` documents it. One counter, two endpoints. The clause is true of
+both.
+
+The first blast-radius probe reported **8 of 8 prometheus names orphaned**. It was
+entirely false: it matched `path: '<name>'`, but METRICS entries use
+`metric: '<name>'`, so the extractor matched nothing and every name fell through
+as an orphan. The corrected answer is 1. A finding that indicts everything is
+usually indicting the instrument — 8-of-8 is the signature of a broken matcher,
+not of a defect.
+
+### Measured scope for the citation conversion
+
+`telemetry-provenance.js` carries **38** `file.rs:NNN` line-anchored citations,
+including `metrics.ttft` (`metrics.rs:119-123`) and `metrics.e2e_latency`
+(`metrics.rs:141-144`). The `batch.capacity` entry is already symbol-anchored and
+is the template.
+
+### Well done, and worth naming
+
+`crates/onnx-genai-server/src/tests.rs:3959-3975` documents what the test *cannot*
+prove and why it stopped trying: `REGISTRY.batch_size` is process-global, `cargo
+test` runs concurrently, the old absolute assertion passed alone and failed
+roughly one full-suite run in three, and a lock could not fix it because the other
+mutators would have to volunteer to take it. It then names the deterministic test
+that proves the property at the arithmetic seam instead. A flaky assertion
+correctly retired, with its replacement cited. That is the standard.
