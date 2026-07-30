@@ -446,25 +446,32 @@ describe('the check- test-file prefix', () => {
     const dangling = [];
     const seen = [];
 
-    for (const path of shippedPaths()) {
-      if (!/\.(?:js|mjs)$/.test(path)) continue;
-      const source = shipped(path);
-
+    // The extractor, factored out so the anti-vacuity control below can drive
+    // it with a synthetic fixture instead of depending on the corpus happening
+    // to contain a real by-name read.
+    const byNameTestReads = (source) => {
+      const found = [];
       for (const line of source.split('\n')) {
         // Only lines that actually READ a file by name. A prose cross-reference
         // in a comment is not a functional dependency and must not be policed
         // here — comments are how this codebase explains itself.
         if (!/readFileSync|readFile\(|createReadStream/.test(line)) continue;
         if (/^\s*(?:\/\/|\*)/.test(line)) continue;
+        for (const [, name] of line.matchAll(/'([^']*\.test\.js)'/g)) found.push(name);
+      }
+      return found;
+    };
 
-        for (const [, name] of line.matchAll(/'([^']*\.test\.js)'/g)) {
-          seen.push(`${path} -> ${name}`);
-          const base = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
-          const exists = shippedPaths().some(
-            (p) => p === name || p.endsWith(`/${base}`) || p === base,
-          );
-          if (!exists) dangling.push(`${path} reads '${name}', which is not shipped`);
-        }
+    for (const path of shippedPaths()) {
+      if (!/\.(?:js|mjs)$/.test(path)) continue;
+
+      for (const name of byNameTestReads(shipped(path))) {
+        seen.push(`${path} -> ${name}`);
+        const base = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
+        const exists = shippedPaths().some(
+          (p) => p === name || p.endsWith(`/${base}`) || p === base,
+        );
+        if (!exists) dangling.push(`${path} reads '${name}', which is not shipped`);
       }
     }
 
@@ -480,14 +487,37 @@ describe('the check- test-file prefix', () => {
     );
 
     // ANTI-VACUITY. If the line filter stopped matching, `dangling` is empty and
-    // this test passes while policing nothing. The known dependency must be seen.
-    assert.ok(
-      seen.some((s) => s.includes('field-keys.test.js')),
-      'The scan did not observe check-binding-liveness.test.js reading ' +
-        "dashboard/field-keys.test.js, which it does at line 531. The extractor " +
-        'is not reading the corpus it claims to read, so an empty result means ' +
-        'nothing.\n' +
-        `OBSERVED: ${seen.join(', ') || 'nothing at all'}`,
+    // this test passes while policing nothing.
+    //
+    // This USED to pin the one real dependency in the tree —
+    // check-binding-liveness reading dashboard/field-keys.test.js. That was a
+    // mistake, and it went red the moment the registry refactor DELETED that
+    // read. An anti-vacuity control anchored on a real defect fails when the
+    // defect is legitimately repaired, which punishes exactly the change you
+    // want people to make. Zero by-name reads is the goal state, not a fault.
+    //
+    // So the control now drives the extractor with a synthetic fixture. It
+    // proves discrimination — that the extractor finds a read when one is
+    // present and stays silent when none is — independently of whether the
+    // corpus currently contains one.
+    const positive = byNameTestReads("const x = readFileSync(join(H, 'dashboard/field-keys.test.js'), 'utf8');");
+    assert.deepEqual(
+      positive,
+      ['dashboard/field-keys.test.js'],
+      'The extractor failed to find a by-name test read in a fixture that ' +
+        `plainly contains one. It returned ${JSON.stringify(positive)}. An empty ` +
+        'result over the real corpus therefore means nothing.',
+    );
+
+    const negative = byNameTestReads(
+      ["// readFileSync('dashboard/field-keys.test.js') in a comment", "import { X } from './a.test.js';"].join('\n'),
+    );
+    assert.deepEqual(
+      negative,
+      [],
+      'The extractor reported a dependency for a commented-out read and a plain ' +
+        `import, returning ${JSON.stringify(negative)}. It is matching too much, ` +
+        'so its findings cannot be trusted either.',
     );
   });
 
