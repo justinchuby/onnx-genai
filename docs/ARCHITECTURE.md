@@ -829,6 +829,41 @@ impossible for a brand-new prefix. The control arm was built on the strength of 
 > false greens caught tonight (this and the self-built model reference, §8.5) were caught by someone
 > re-examining their own *success*. Nothing in a green result asks to be checked.
 
+#### 8.4d The regression test named `prefix_speedup` never asserts a speedup 🔴
+
+**Evidence class: Read (executable lines).**
+
+`crates/onnx-genai-engine/tests/prefix_speedup.rs` is the repo's own guard on
+prefix reuse. It:
+
+- times both turns — `cold_start`/`cold_duration` (`:27`, `:29`) and
+  `warm_start`/`warm_duration` (`:32`, `:34`);
+- **spends both durations on an `eprintln!`** (`:36-39`);
+- then asserts 13 times, **not one of them on a duration**. `grep -n
+  "assert.*duration"` returns nothing.
+
+The only prefix assertion is `warm.prefix_cache_hit_len > 0` (`:50`), and §8.4c
+establishes that `hit_len` is nonzero for *every* request because
+`.filter(|len| len > 0).max()` scores the shared chat-template preamble. So the
+test passes when the warm turn is faster, when it is identical, and when it is
+**7.0% slower** — which is what QA measured at n=20.
+
+> **The test computes the exact quantity that would have exposed the defect, and
+> discards it into a log line.** It has been green for the entire life of the
+> feature it is named after, and its name is the only place the word *speedup*
+> appears.
+
+**This is the §1 shape at its purest — the instrument is healthy, the output is
+accurate, and the reading does not mean what it appears to mean.** It is also
+why §8.4c's verdict required a control arm: no artifact already in the repo
+could have distinguished a working cache from a counter that always fires,
+*including the test written to do exactly that.*
+
+**⚠️ Do not cite `prefix_speedup.rs:50` as evidence that prefix reuse works.**
+It is sound evidence for one narrow fact — that the *counter* reports nonzero on
+a same-session second turn — and for nothing else. A test's **name is not an
+assertion**; only its `assert!` lines are.
+
 ### 8.5 `scripts/build_qwen.sh` produces a model that cannot be loaded
 
 `scripts/build_qwen.sh:32` passes `--runtime ort-genai`, which emits only `genai_config.json`. Loading the result fails because the runtime requires a `model.io.static_cache` declaration in `inference_metadata.yaml`.
