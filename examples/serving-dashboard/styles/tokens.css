@@ -67,12 +67,27 @@
      Rendering one as a measurement is a silent, plausible lie. These tokens
      give "not measurable yet" a consistent, dignified treatment that is
      instantly distinguishable from a real measured zero.                  */
-  --og-unavail-fg: #5a6673;
+  --og-unavail-fg: #758493;  /* AA 4.52:1 on --og-bg-raised */
   --og-unavail-rule: #3d4855;
   --og-unavail-hatch: #212932;
   --og-unavail-bg: #131920;
   --og-unavail-label: #6e7d8c;
-  --og-pending-fg: #4a5560;
+  --og-pending-fg: #748494;  /* AA 4.51:1 on --og-bg-raised */
+  /* `not-applicable` — DELIBERATELY BRIGHTER THAN `unavailable`, and this is
+     the one place where "more visible" is the honest choice rather than the
+     flattering one. `unavailable` is our gap and is apologetic. THIS is an
+     architectural fact the demo exists to teach: continuous batching bypasses
+     the paged KV allocator, so the number is not missing — it is meaningless
+     on this execution path.
+     It shares the em-dash glyph with `unavailable` (one glance-level fact:
+     "no number here, nothing hidden"), but it is the ONLY state whose
+     explanation renders ON SCREEN rather than in a hover, because a fact
+     nobody hovers over is a fact nobody learns. `-fg` is the em-dash,
+     `-note` the always-visible caption, `-rule` its left border. */
+  --og-na-fg: #7e8fa0;
+  --og-na-note: #93a3b4;
+  --og-na-rule: #53687e;     /* 3.01:1 — WCAG 1.4.11 non-text */
+  --og-na-bg: #161d26;
   /* `stale` — a value that WAS genuinely measured but which the latest poll
      did not refresh. It is not fabricated and not absent, so it gets neither
      the em-dash nor full contrast. It must always render with a visible AGE
