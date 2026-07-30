@@ -287,10 +287,10 @@ flowchart TD
 
 - `run_static_batch_until_idle` (`driver.rs:546`) is the outer loop.
 - Each iteration first drains newly arrived commands with `rx.try_recv()` (`driver.rs:577`), then calls `manager.step()` (`driver.rs:596`) — **one shared batched forward pass across all active rows**.
-- **Only `Generate { session_id: None, .. }` is handled inline.** Every other command hits the catch-all at `driver.rs:592` and is pushed onto `deferred`, which is not drained until `driver.rs:520` — after the batch goes idle. This is invariant §5.11 and it is the reason telemetry must be collected inline rather than requested via a command.
+- **Only `Generate { session_id: None, .. }` is submitted to the running batch inline.** Every other command reaches `handle_or_defer_during_batch` (`driver.rs:678`), which answers `ResourceSnapshot` immediately through a `&Engine` borrow and pushes the rest onto `deferred` (`driver.rs:647`), drained only at `driver.rs:570` after the batch goes idle. **✅ RESOLVED (`a6fefde2`) — this section previously stated that *every* non-`Generate` command was deferred, which was true when written.** The mid-batch `&Engine` reader closed the `/v1/resources` hang structurally: state written inside the exclusive borrow is now readable without any borrow at all. **The invariant that remains is narrower and still load-bearing: anything needing `&mut Engine` cannot be served during a batch, which is why telemetry must be *published* from the decode loop rather than *requested* from it.**
 - New arrivals are admitted at `driver.rs:610`; finished rows are backfilled so occupancy is maintained.
 - Admission eligibility, when scheduler-driven, is `run_continuous_batch_scheduled` (`batched.rs:719`): FCFS order (`batched.rs:760`, `priority_policy = PriorityPolicy::Fcfs`) gated by the shared KV byte budget and total-token ceiling (`batched.rs:750-760`).
-- Per-request events are funnelled through `route_continuous_events` (`driver.rs:637`) — **the single place where every request's lifecycle events pass**. TTFT is recorded at `driver.rs:650`.
+- Per-request events are funnelled through `route_continuous_events` (`driver.rs:718`, called at `:660`) — **the single place where every request's lifecycle events pass**. TTFT is **not** recorded there: it is observed at `metrics.rs:124`, guarded by `first_token_seen` (`:123`), inside `GenerationMetrics`. An earlier draft of this section cited a line in `driver.rs`, which was wrong about the **file**, not merely the line.
 
 **Output equivalence guarantee** (`batched.rs:708-711`): a request's tokens never depend on which rows share its batch. Batched output is byte-identical to running the request alone. Batching is a throughput optimization, not a semantic change.
 
@@ -414,7 +414,7 @@ Each states the rule, **where it is enforced**, and what breaks. Critically: whe
 
 Enforced in `PageTable::free` (`page_table.rs:947-951`): decrement, and return to the pool only on reaching zero. `allocate` (`:836`) draws only from the free pool.
 
-Corollary: `free_count(device)` (`page_table.rs:1150`) plus the count of pages with `ref_count > 0` equals capacity. **Breaks if violated:** double-free returns a live page to the pool, and two sequences then write the same physical KV.
+Corollary: `free_count(device)` (`page_table.rs:1338`) plus the count of pages with `ref_count > 0` equals capacity. **Breaks if violated:** double-free returns a live page to the pool, and two sequences then write the same physical KV.
 
 *Note:* `free` uses `saturating_sub` (`:950`), which makes an extra free **silent** rather than a panic. Safe against underflow, but it means a refcount bug degrades quietly instead of failing loudly.
 
@@ -497,7 +497,7 @@ Documented at `batched.rs:708-711`. There is no runtime assertion; it follows fr
 
 ### 5.9 Configuration asserts — ENFORCED, at construction
 
-`page_table.rs:740-741` requires non-empty layer configs; `:776` requires every page tensor config to validate. These are `assert!`, so violation panics at construction — loud and early, which is correct for configuration errors.
+`page_table.rs:785` requires non-empty layer configs. This is an `assert!`, so violation panics at construction — loud and early, which is correct for configuration errors.
 
 ### 5.10 The decode loop never blocks for observability — **ASSUMED, NOT ENFORCED** ⚠️
 
@@ -515,13 +515,13 @@ Nothing in the type system prevents it. The engine thread (`driver.rs:113-123`) 
 
 > While a continuous batch is running, the **only** command processed inline is `DriverCommand::Generate` with `session_id: None`. Every other command is queued and not handled until the batch goes idle.
 
-Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:575-594`): the `try_recv` drain matches `Generate { session_id: None, .. }` and submits it to the manager, and the catch-all arm at **`driver.rs:592`** pushes everything else onto `deferred`. That queue is only drained at `driver.rs:520`, after the batch loop has exited.
+Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:560-566`): the `try_recv` drain matches `Generate { session_id: None, .. }` and submits it to the manager, and the catch-all arm at **`driver.rs:566`** pushes everything else onto `deferred`. That queue is only drained at `driver.rs:570`, after the batch loop has exited.
 
 **Why it holds:** the `Engine` is single-owner with no interior locking (§6). Servicing an arbitrary command mid-batch would need mutable access the batch loop is already holding.
 
 **What breaks if violated — and this is a live trap:** anything latency-sensitive implemented as a `DriverCommand` is answered **only when the server is idle**. A telemetry command is the worst case: batch occupancy, queue depth, and KV stats would be unavailable *precisely while the server is busy*, which is the only time they are interesting. A dashboard built that way appears to work in testing and freezes under load — looking like a UI bug rather than an architectural one.
 
-> ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`driver.rs:595-603`), and published through an atomic or a broadcast channel. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted.
+> ⚠️ **Correction to earlier guidance in this project.** An earlier draft of the telemetry plan proposed adding a `DriverCommand` to fetch a `ResourceSnapshot`. That is correct for the per-request path but **wrong for the batched path**, for the reason above. Instrumentation for batching must be gathered **inline**, right after `manager.step()` (`driver.rs:653`), and published through an atomic. `Engine::continuous_batch_manager`, `page_usage`, and `page_stats` all take `&self`, so reading them inline is permitted. **✅ This is now shipped, not proposed: `KvTelemetry` (`onnx-genai-kv/src/telemetry.rs`) is a block of atomics stored with `Ordering::Relaxed`, attached via `Engine::attach_kv_telemetry` (`engine/runtime.rs:263`) on both driver paths (`driver.rs:449`, `:463`) and read lock-free by the HTTP handlers.** The measured consequence is the argument: routing the same data through a driver round-trip turns two 1.8 ms endpoints into **14.8-second stalls during a generation**, because the round-trip queues behind the exclusive `&mut Engine` borrow. **A relaxed atomic store is cheaper than servicing a channel, so the correct design is also the lower-overhead one.**
 
 ### 5.12 Exactly one model-directory validator — **ASPIRATIONAL, CURRENTLY VIOLATED** ⚠️
 
@@ -579,7 +579,7 @@ Four independent instances:
 
 The engine holds no concurrent-reader path. Both driver paths take an **exclusive borrow** for the whole of a generation:
 
-- **Batched path:** non-`Generate` commands are deferred (`driver.rs:592`) until `manager.is_idle()` (`:604`), drained at `:520`. Under sustained load the batch may never idle. (§5.11)
+- **Batched path:** commands needing `&mut Engine` are deferred (`driver.rs:647`) until `manager.is_idle()` (`:661`), drained at `:570`. Under sustained load the batch may never idle. **`ResourceSnapshot` is exempt — it is answered inline through a `&Engine` borrow (`driver.rs:678`).** (§5.11)
 - **Pipeline/fallback path:** `handle_driver_command(engine: &mut Engine, ..)` (`driver.rs:674`) runs `run_fallback_generation` **inline** at `:696`. The generation completes *inside* the command handler, so the next command — telemetry or otherwise — is not read until it returns.
 
 **These look like two problems and are one.** The queue policy is not the cause; **`&mut Engine` is.** While a generation holds the exclusive borrow, no reader can observe the engine *at all* — not because a channel is busy, but because the borrow makes concurrent observation unrepresentable. Draining the queue faster cannot fix it, and neither can adding another command.
@@ -666,7 +666,7 @@ Register in `app()` (`crates/onnx-genai-server/src/lib.rs:62-135`). Choose a gat
 
 - ungated — safe for anonymous callers;
 - `enable_debug_endpoints` (`crates/onnx-genai-server/src/lib.rs:101`, flag `--enable-debug-endpoints`, `cli.rs:74`) — introspection;
-- `enable_admin_endpoints` (`crates/onnx-genai-server/src/lib.rs:113`) — mutating operations.
+- `enable_admin_endpoints` (`crates/onnx-genai-server/src/lib.rs:114`) — mutating operations.
 
 **Gated routes return `404`, not `403`**, because the route is never registered. Clients must treat 404 on a debug path as "disabled", not "missing".
 
@@ -903,7 +903,7 @@ Also asymmetric: the CLI applies `resolve_model_dir` (`crates/onnx-genai-cli/src
 
 ### 8.10 `/v1/resources` can block for the duration of a busy batch ⚠️
 
-`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. On the **continuous-batch path** that command is not `Generate`, so it hits the catch-all at `driver.rs:592` and is parked on `deferred`. The deferred queue is not drained until the batch loop exits, which happens only when `manager.is_idle()` (`driver.rs:604`).
+`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. **✅ RESOLVED by `a6fefde2`.** This section previously described a hang: on the continuous-batch path the command was not `Generate`, so it hit the catch-all, was parked on `deferred`, and was not drained until `manager.is_idle()` (`driver.rs:661`) — which under sustained load may never happen. **`handle_or_defer_during_batch` (`driver.rs:678`) now answers `ResourceSnapshot` inline through a `&Engine` borrow (`:646`), and defers only what genuinely needs `&mut Engine` (`:647`).** The fix is **structural rather than probabilistic**: the incapacity was never the queue, it was the exclusive borrow, so a fix that merely made the hang rarer would have passed every test the correct one does. Measured consequence of getting this wrong: `/metrics` and `/v1/resources` stall **14.8 s** during a 384-token generation, against **1.8 ms** for `/v1/status`.
 
 **Under sustained concurrent load the batch may not go idle**, because finished rows are backfilled from new arrivals to maintain occupancy. The reply is therefore held for as long as the server stays busy — the request does not fail, it simply does not answer, and it eventually surfaces as a client-side timeout rather than an error the server reports.
 
@@ -920,7 +920,7 @@ Two consequences worth separating:
 
 ### 8.11 `/metrics` inherits the driver round-trip for two gauges it treats as optional ⚠️
 
-`prometheus_metrics` (`admin.rs:391-408`) does two things:
+`prometheus_metrics` (`admin.rs:504`) does two things:
 
 ```rust
 let mut output = crate::metrics::encode_prometheus();          // atomic registry, ~0.8 ms
@@ -960,7 +960,7 @@ catch one is to read the increment site and ask what actually causes it to move.
 | `prefix_cache_hits` | cache hits | **generations with *any* prefix overlap ≥1 token** (`if prefix_cache_hit_len > 0`) — a shared chat template alone satisfies it | **Verified** — `metrics.rs:136-137` |
 | `prefix_cache_hit_rate` | hits ÷ lookups | **hits ÷ generations** — a real, useful per-generation rate, but not a hit rate | **Verified** (both terms above) |
 | `batch_size_current` | the engine's decode batch | **live `GenerationMetrics` guards** — incremented in `start()`, decremented in `Drop`. On the dynamic server this is structurally ≤1 (§5.15); on the scatter server it is requests in flight, not decode rows. **It is never the batch size on either server.** | **Verified** — `metrics.rs:112`, `:145` |
-| `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `admin.rs:434-443` |
+| `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `admin.rs:526-534` |
 | `active_sessions` | concurrent requests | persistent `X-Session-Id` sessions — reads `0` at the busiest moment of a batching run, correctly | **Reported** (Lead), not independently verified here |
 | `kv_usage` (on `/v1/status`) | KV utilisation | hardcoded `0.0`. **Not demo-only:** `RoutingPolicy::LeastKvUsage` sorts on it (`router.rs:247`), so the comparison cannot discriminate and the weighted policy silently loses its 30% term. | **Reported** (@d7cf9b84), traced cross-crate |
 | ~~`created` (on `/v1/models`)~~ | model creation time | ~~**`now_unix()` — the current clock, evaluated per call.**~~ **✅ RESOLVED by `e556b7f4`** — now `directory_mtime_secs(&status.path)` (`routes/admin.rs:58`). Confirmed by observation: two calls 3 s apart returned an identical `created` (§8.13). | **Observed** |
