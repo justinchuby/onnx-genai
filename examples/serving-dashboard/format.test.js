@@ -44,6 +44,13 @@ test('a measured zero renders as a stark 0, never as absence', () => {
   assert.notEqual(out.text, ABSENT_TEXT);
 });
 
+test('a measured false renders as literal false, never as absence', () => {
+  const out = formatField(measuredField(false, { source: '/v1/status' }));
+  assert.equal(out.text, 'false');
+  assert.notEqual(out.text, ABSENT_TEXT);
+  assert.doesNotMatch(out.text, /—/);
+});
+
 test('unavailable and not-applicable differ on the surface, not just in the hover', () => {
   const unavailable = formatField(unavailableField('The server hardcodes 0.0.'), { nowMs: NOW });
   const notApplicable = formatField(notApplicableField('This path never consults the cache.'), {

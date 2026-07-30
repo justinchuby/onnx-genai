@@ -72,6 +72,20 @@ describe('renderField — a measured zero and an unmeasurable value must look di
     assert.equal(node.findByClass('value__num--unavailable'), null);
   });
 
+  it('renders a real false as literal false, never as an em-dash', () => {
+    const node = renderField({
+      value: false,
+      state: 'measured',
+      source: 'server',
+      label: 'Feature enabled',
+    });
+
+    assert.equal(node.getAttribute('data-state'), 'measured');
+    assert.equal(node.findByClass('value__num').textContent, 'false');
+    assert.equal(node.findByClass('value__num--unavailable'), null);
+    assert.doesNotMatch(node.textContent, /—/);
+  });
+
   it('renders an unavailable value as an em-dash and never as a number', () => {
     const node = renderField({
       value: null,
