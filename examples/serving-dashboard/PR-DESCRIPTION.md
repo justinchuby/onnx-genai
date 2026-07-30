@@ -1161,7 +1161,13 @@ BY CLASS: TEST 61 · INTERNAL_DOC 14 · TOOLING 10 · DESIGN 3 · FIXTURE 3
 **`INTERNAL_DOC` is `/\.md$/`, and the server refuses `.md`.** Those fourteen
 files are counted as fetchable by a guard that sits four directories from a
 guard proving they are not. Both are committed, both run in the same suite, and
-the suite is green on the pair.
+the **JavaScript** suite is green on the pair — `node --test` under
+`run-tests.sh`, which is the only suite either of these guards belongs to.
+Naming it is not pedantry: this repository has **two** suites and one word for
+them, and a `cargo` number quoted without `--no-fail-fast` is a lower bound
+rather than a total, because cargo stops at the first failing test *binary*.
+Nothing in this paragraph was measured by cargo, and it makes no claim about
+the Rust tree.
 
 The ratchet is not stale by accident — it records its own provenance, and the
 record is what dates it: *111 of 111 served, 0 refused … there is no allowlist,
