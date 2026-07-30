@@ -163,12 +163,14 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   const RATIO = /\b2\.4[5-9]\s*×|\b2\.5\s*×|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
   const ARMS = /\b0\.62\s*×|\b82\.\d{3}\s*tok|\b33\.\d{3}\s*tok|\+147\s*%/;
 
+  // PERMANENT exclusions. The bar is a reason that is true of the FILE'S
+  // CONTENT and can never stop being true. "Somebody else owns it" does not
+  // clear that bar: ownership is fixed, content is not, so an ownership reason
+  // produces an entry that outlives the condition it was written for.
   const EXEMPT = new Set([
     // The lab notebook. It records what was run and must keep its raw samples,
     // or we destroy the evidence that the claim was unsafe.
     'perf-baseline.md',
-    // Not mine to edit; owned separately and read as a contract snapshot.
-    'demo-spec.md',
   ]);
 
   // Documents that still carry the figure and belong to someone else. The tree
@@ -183,6 +185,17 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   const DEFERRED = Object.freeze({
     'REVIEWER-BRIEF.md': 'owned by the secretary; edited 02:49, live at the time of the freeze',
     'design/demo-ux.md': 'owned by the designer; edited 02:45, live at the time of the freeze',
+    // Moved here from EXEMPT by @376a0297, who audited MY exemption list against
+    // their own file -- the check nobody runs on their own work. It sat in the
+    // permanent bucket on the reason "not mine to edit", which is a fact about
+    // AUTHORSHIP, while the two entries above are in the expiring bucket on the
+    // identical situation. Same condition, two notations, and the notation was
+    // chosen by which day I wrote the line.
+    //
+    // The cost was not a false pass. It is that a permanent entry naming the
+    // SPEC reads, to every later maintainer, as "the spec is allowed to state
+    // the ratio" -- and a spec is where people go to learn what is permitted.
+    'demo-spec.md': 'owned by the product manager; states the figure as the SUBJECT of a retraction, which no pattern here can tell from an assertion',
   });
 
   const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
