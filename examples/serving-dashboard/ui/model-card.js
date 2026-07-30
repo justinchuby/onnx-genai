@@ -14,7 +14,7 @@
 // mount(rootElement, telemetryStore) contract so there is one shape to learn.
 
 import { FIELD_STATES } from '../telemetry-field.js';
-import { displaySafeField, formatField } from '../format.js';
+import { formatField } from '../format.js';
 
 /**
  * Fields shown on the card, in reading order: identity first, then the two
@@ -74,8 +74,7 @@ export function mountModelCard(rootElement, telemetryStore) {
     for (const { key, format } of CARD_FIELDS) {
       const cell = cells.get(key);
       if (!cell) continue;
-      const field = telemetryStore.field(key);
-      renderCardField(cell.value, displaySafeField(field), format);
+      renderCardField(cell.value, telemetryStore.field(key), format);
     }
   });
 

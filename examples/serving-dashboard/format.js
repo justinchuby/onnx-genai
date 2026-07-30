@@ -149,6 +149,7 @@ export function formatAge(ageMs) {
  * }}
  */
 export function formatField(field, { format, withUnit, nowMs = Date.now() } = {}) {
+  field = displaySafeField(field);
   // A caller who supplies its own formatter owns the ENTIRE display string,
   // unit included -- `formatTokenCount` returns "32,768 tokens", and appending
   // field.unit on top of that produced "32,768 tokens tokens" on the live page

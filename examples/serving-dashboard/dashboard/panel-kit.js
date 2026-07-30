@@ -37,6 +37,7 @@ import {
   planSparkline,
   tabulateSparkline,
 } from './sparkline.js';
+import { displaySafeField } from '../format.js';
 import { DEBUG_GATED_ENDPOINTS, DEBUG_ENDPOINTS_FLAG } from '../telemetry-provenance.js';
 
 /**
@@ -295,6 +296,7 @@ function headlineSentence(reason) {
  * @returns {HTMLElement}
  */
 export function renderField(field, options = {}) {
+  field = displaySafeField(field);
   const state = renderStateOf(field, { strict: options.strict });
   const label = options.label ?? field?.label ?? 'value';
   const unit = field?.unit ?? '';
@@ -1279,6 +1281,7 @@ export function createRovingGroup(container, options = {}) {
  * @returns {string}
  */
 export function describeFieldText(label, field, format) {
+  field = displaySafeField(field);
   if (!isRenderable(field)) {
     const state = renderStateOf(field);
     if (state === RENDER_STATES.PENDING) return `${label} has no samples yet`;
