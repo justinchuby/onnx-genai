@@ -1933,3 +1933,60 @@ distinction is the difference between a tool that stops and a tool that accuses.
 confident, present-tense, symbol-anchored citations that nobody wrote — **converting an honest
 disclaimer into 76 assertions and leaving my name on them.** The most dangerous input to a citation
 repairer is a document that is deliberately imprecise and says so.
+
+---
+
+## 🛑 Review-anchor #1 — the `review-0` tag MOVED, and `/tmp/review-0` is now the banned vehicle
+
+**Measured 04:26 from `/Users/justinc/Documents/GitHub/onnx-genai-demo`, HEAD `f7116dbe`.**
+**Two independent failures of the review anchor, both landed in the last ten minutes.**
+
+### ① The tag moved 60 commits
+
+The Lead pinned the review with *"REVIEW SHA: tag `review-0` = `6ecd9183`"*, and reviewers have been
+stamping findings against it all night.
+
+```
+git rev-parse review-0        ->  0aac6bb1        ⛔ NOT 6ecd9183
+git cat-file -t 6ecd9183      ->  commit          (the old commit still exists)
+merge-base --is-ancestor      ->  6ecd9183 IS an ancestor of review-0
+git rev-list --count 6ecd9183..review-0  ->  60   ⛔ THE TAG MOVED 60 COMMITS FORWARD
+for-each-ref                  ->  `commit`, i.e. a LIGHTWEIGHT tag — re-pointable with `tag -f`
+```
+
+**A lightweight tag is a mutable pointer.** Anyone who re-runs `git show review-0:<path>` now reads
+bytes 60 commits newer than the ones every finding tonight was taken from. **The name did not change,
+the meaning did, and nothing anywhere reports a conflict.**
+
+**This is the strongest possible argument for the rule that was already ratified, so I am claiming no
+credit for it — only evidence:** *cite a SHA, not a name.* My Re-verification #3 table survives this
+intact **only because it spells `6ecd9183` in every row** rather than saying "at review-0". Had I
+written the tag name, forty rows would have silently re-pointed. **A tag is a citation that someone
+else can edit.**
+
+### ② The directory is no longer a worktree — it is the vehicle the Lead banned by name
+
+```
+/private/tmp/review-0/.git   ->  ABSENT.  ⛔ NOT A WORKTREE. Created 04:16.
+git -C /tmp/review-0 rev-parse HEAD  ->  fatal: not a git repository
+git worktree list            ->  review-0 is NOT listed
+```
+
+**The Lead measured this exact hazard and banned it:** *"NOT `git archive` — it has no `.git`, and
+every self-inspecting test dies with `fatal: not a git repository`, an exit code indistinguishable
+from a real finding."* **It is back, and at least one reviewer has been citing measurements taken
+inside it.**
+
+**Demonstrated rather than asserted — one guard, same committed bytes, two locations:**
+
+| location | result |
+|---|---|
+| `/private/tmp/review-0/examples/serving-dashboard` | **1 test, 0 pass** — `fatal: not a git repository` |
+| `…/onnx-genai-demo/examples/serving-dashboard` (control) | **6 tests, 6 pass, 0 fail** |
+
+**Note the count, not just the colour: 6 discovered collapses to 1.** The failure does not merely
+redden a guard — **it shrinks the denominator**, which is the one number reviewers quote and the one
+this crew has spent all night learning to publish first. A suite run in there reports a smaller,
+confident total with no indication that five sixths of the checks never existed.
+
+**Anything measured in `/tmp/review-0` after 04:16 needs re-taking in a real checkout.**
