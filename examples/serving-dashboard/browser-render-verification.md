@@ -354,3 +354,93 @@ costs one line.
 **@086345a5 withdrew D232 citing my pixels before this correction landed.
 That withdrawal was made on my error and should be reversed — the colour half
 of their finding was correct all along.**
+
+---
+
+## §7. AC189 — the scheduling panel, measured against HEAD. **P1, intermittent, reproduced 5 of 6.**
+
+**Asked by @376a0297:** *"load `/demo/`, fire four concurrent requests, and the scheduling
+panel must read `n of 4` — not `n in flight`, not an em-dash. If it reads wrong I would
+rather hear it from you than from a reviewer."* They asked to be falsified. They are.
+
+### §7.1 The result
+
+```
+server   :9351  binary ada195f5  governor=3 (post-fix)  --demo-assets-dir = CLEAN HEAD TREE
+assets   /tmp/qa-head-assets @ 5893ce3c   porcelain 0
+identity served telemetry-store.js == git show HEAD:  ✅ and != worktree ✅ (discriminating)
+
+WIRE, sampled in the SAME evaluate call as the panel text:
+    batch_in_flight = 4      batch_capacity = 4      active_batch_size = 4
+    sustained 21 s, 4/4 completions, every sample
+
+PANEL, same instant:
+    "··· requests  sequences  —
+     The count is real; the limit isn't reported, so there is no
+     percentage to show. Without a limit you are watching a queue
+     length, not batch occupancy."
+
+RUNS ON HEAD ASSETS:  STUCK 5  /  RESOLVED 1
+```
+
+**The failure is not an em-dash. It is a fabricated explanation.** The panel states
+*"the limit isn't reported"* while `batch_capacity: 4` is in the very response the page
+fetched, 4 times a second, 117 times in 30 s, with zero failures and zero console errors.
+
+> **This is the honesty layer's own defect class, committed by the honesty layer, in its own
+> voice. An em-dash says "I don't know." This says "the server didn't tell me" — a specific,
+> confident, checkable claim ABOUT THE SERVER, and it is false. A wrong number invites doubt;
+> a wrong *reason* closes the question, because it already explains itself.**
+
+### §7.2 What is NOT the cause — each excluded by measurement, not by argument
+
+| candidate | measurement | verdict |
+|---|---|---|
+| server doesn't serve it | `batch_capacity` 4, `batch_in_flight` 4, `active_batch_size` 4 | ❌ excluded |
+| page polls the wrong origin | 117/117 requests to the page's own origin, hosts preserved | ❌ excluded |
+| poller dies or backs off | 4.0 req/s flat across six 5 s windows, 30 s, no decay | ❌ excluded |
+| fetch failures / JS errors | `Network.loadingFailed` 0, console errors 0 | ❌ excluded |
+| catalogue mis-binding | executed: `batch.capacity`→`/v1/status`,`batch_capacity`,MEASURED | ❌ excluded |
+| duplicate `batch.capacity` key | now **1** occurrence in HEAD; symbol-anchored entry survived | ❌ fixed |
+| my under-priming | reproduced at 6 s **and** 20 s priming | ❌ excluded |
+
+**It is a race.** Two byte-identical runs — same binary, same HEAD assets, same URL, same
+timing — gave `measured 3 / pending 11` and `measured 16 / pending 1`. When it loses,
+~13 fields never leave `pending` and the panel prints the false reason.
+
+### §7.3 🔻 A retraction of my own, and it invalidates browser evidence taken by anyone tonight
+
+I have stated, and broadcast, that **"assets are read from disk per request, so CSS/JS are
+always at HEAD even under a stale binary."** **That is false and I am withdrawing it.**
+
+```
+served by :8133   48,529 B   ==  WORKING TREE   (byte-identical)
+git show HEAD:                45,832 B          (53 uncommitted lines behind)
+```
+
+`--demo-assets-dir` points at the **working tree**. The demo server therefore executes
+**whatever is on the author's disk at the instant of the request**, including files another
+agent is mid-edit. `telemetry-store.js` was dirty throughout my first six runs, which is
+precisely why they contradicted each other — I was measuring a file being written while I read it.
+
+> **A DEMO SERVER SERVES THE DESK, NOT THE BRANCH. Every browser verification tonight —
+> mine, and everyone's — certifies an uncommitted tree. The reviewer clones and gets HEAD.**
+> This is @1cb42f0e's `readFileSync` finding and @c7a654ed's clean-vs-dirty ruling arriving on
+> the one surface we all agreed was the acceptance standard. **The fix is construction, not
+> discipline: point `--demo-assets-dir` at a detached worktree pinned to a SHA, and check the
+> served bytes against `git show HEAD:` in the same invocation — an asset identity check,
+> exactly parallel to @1cb42f0e's binary identity check, and it must be DISCRIMINATING (differ
+> from the worktree) or it proves nothing.** Every §7 number above was taken that way.
+
+### §7.4 Two smaller findings from the same session
+
+- **`batch.in_flight` has ZERO consumers in shipped dashboard code.** The raw uncllamped
+  in-flight count was ordered, served, and registered in the catalogue — and no panel reads it.
+  The fix landed at three layers of four. `scheduling.js` still takes its numerator from
+  `batch.active_size` (`/v1/debug/kv`).
+- **`.value__num--not-applicable` is never emitted.** Zero instances across 3 origins × 3
+  scenarios (`:8133`, `:8134`, `:9242` × continuous-batching, paged-kv, memory-pressure).
+  **@376a0297's D266 test cannot be run as specified, and its unrunnability is the answer:**
+  neither they nor @0837fdf9 is right, because the rule is live in CSS and nothing renders an
+  element matching it. That is @12e42da8's *styled-but-never-emitted* gap, second instance,
+  measured. The only `not-applicable` element on the page is a `scenario-switcher__note`.
