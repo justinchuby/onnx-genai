@@ -4183,3 +4183,44 @@ Three stale reports from one author on one subject inside ninety minutes is not 
 | D212 | Agreement between copies is propagation, not corroboration | The more widely a wrong value spread, the more corroborated it looks — so the corrected file is nominated as the outlier |
 | D213 | The CSS↔JS seam test makes the atomic pair atomic by construction | The bug lived only in the gap; both sides were internally consistent and nothing owned the seam |
 | D214 | Quote the SHA with any claim about a file | Nothing in a message carries its own age, so a bare fact is trusted indefinitely — first of all by its author |
+
+---
+
+## 67. THE 250 ms CADENCE IS AN ASPIRATION — GLOBAL STALENESS, AND THE FINDING CARD (D215–D218)
+
+Two assignments: @376a0297's **AC84** (global staleness detection, ruled for option (a)) and @12e42da8's *"design it as a finding card, not an empty panel."*
+
+### 67.1 D215 — ONE POLL LOOP, SO ONE PAGE-LEVEL STATE
+
+Verified: `app.js:32` and `telemetry-store.js:84` both hold `250`, **one loop, six-to-seven endpoints, every panel.** @fc8b5d97 measured `/metrics` and `/v1/resources` blocking **14,784 ms** during generation. So on the dynamic server **~59 consecutive polls return the same snapshot and then everything jumps at once.**
+
+> **D215 — STALENESS IS A PROPERTY OF THE POLL LOOP, NOT OF A PANEL, SO IT IS ANNOUNCED ONCE IN THE HEADER AND NEVER REPEATED PER PANEL.** Six identical captions is not six disclosures — **it is noise that trains the reader to skip the one place it will eventually matter.** The header carries `sampled between requests`, and every time-series switches from a connected line to **discrete points with visible gaps.** The panels do not each decide; **they read one page-level fact**, which is also what keeps it out of the mode→field table AC64 forbids.
+
+### 67.2 🔴 D216 — THE DETECTOR HAS THE EXACT AMBIGUITY IT WAS BUILT TO RESOLVE, AND THE CLIENT ALREADY HOLDS THE DISAMBIGUATOR
+
+AC84 detects *"identical payload for N consecutive polls."* **But a genuinely idle server also returns identical payloads, forever.** So the signal means **"unobserved OR nothing is happening"** — which is **precisely the pair D78 says are pixel-identical.** A detector whose output is ambiguous in the same way as its input has moved the problem, not solved it.
+
+> **D216 — THE DISAMBIGUATOR IS THE ONE FACT THE CLIENT MEASURES RATHER THAN READS: DID *I* ISSUE A GENERATION THAT HAS NOT YET COMPLETED?** Frozen payloads **with** a request in flight ⇒ **unobserved** — the server is busy and cannot answer, so render gaps and say so. Frozen payloads **with no request in flight** ⇒ **genuinely idle** — a flat line is TRUE and must be drawn as a normal connected line, because **treating a real idle period as a measurement gap is the underclaim of D204, and would make our own server look broken while it is working correctly.** **The client is not guessing about the runtime's threading here; it is reporting its own outbound state, which is the single thing on this page it knows with certainty.** That keeps AC84 observation-driven and self-correcting: **if @d7cf9b84's atomics land and polls stop freezing, the condition simply stops firing — nothing to un-hardcode.**
+
+### 67.3 🔴 D217 — A CONNECTING LINE IS AN ASSERTION ABOUT THE INTERVAL, NOT THE ENDPOINTS
+
+> **D217 — NEVER INTERPOLATE ACROSS AN UNOBSERVED GAP. A line segment between two samples asserts that the quantity passed through every value in between, and across a 14.8-SECOND HOLE THAT IS A CLAIM ABOUT ~59 MEASUREMENTS WE DO NOT HAVE** — drawn in the smoothest, most confident form the chart language offers. Points we measured render as points; the interval renders as **nothing**, because nothing is what we know about it. **This is D210's twin: there I banned motion we cannot attribute, here I ban CONTINUITY we cannot attribute. A chart makes two claims — the values AND the shape between them — and we have only ever audited the first.**
+
+### 67.4 D218 — THE FINDING CARD: A NULL RESULT IS A RESULT, SO IT GETS A RESULT'S LAYOUT
+
+The prefix-cache non-result must **not** be an empty panel or a `not-applicable` body. Those say *"nothing here."* This is the opposite: **the most evidenced claim on the page.**
+
+> **D218 — THE FINDING CARD USES THE SAME TYPE SCALE, FRAME AND BADGE WEIGHT AS A LIVE PANEL, BECAUSE DEMOTING ITS TYPOGRAPHY WOULD RE-INTRODUCE THE LIE ABOVE THE VALUE LAYER — AC88 EXACTLY: type size is a claim about which number matters.** A finding rendered in caption grey next to full-size panels reads as a footnote **whatever the words say.** Structure, in this order:
+> 1. **The prediction**, stated as we held it: *"we expected shared prefixes to cut TTFT."*
+> 2. **The two arms at IDENTICAL size** — shared **1341 ms** · zero-sharing control **1254 ms**. Per D85 neither may be the hero; **the control is the load-bearing half and must not be the small one.**
+> 3. **The sensitivity check**, which is what converts this from *unobserved* to *absent*: prefill is 1241 ms of a 1380 ms TTFT, so a working cache would show **~140 ms** — **a ~90% drop we could not have missed.**
+> 4. **The conclusion**, and it must be stated in the DIRECTION THE EVIDENCE SUPPORTS: *"no prefix reuse on either execution path."* **Never "prefix caching is broken"** — that is an overclaim about a subsystem we did not audit — and **never "we could not measure it,"** which is the D204 underclaim and throws away the entire result.
+
+**AND THE CAPTION THAT MAKES IT PERSUASIVE RATHER THAN APOLOGETIC:** *"This is the only claim on this page backed by evidence that it could have detected the opposite."* **A negative result with a control arm outranks a positive result without one, and no competing dashboard shows either.** Per @376a0297's AC83 — **which is my own scenario-provenance finding, and it applies here as the card's own justification: the sensitivity check IS the driving-action provenance, proving the action could have moved the number.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D215 | Staleness is announced once at page level, never per panel | Six identical captions train the reader to skip the one that matters |
+| D216 | Disambiguate frozen payloads by the client's own in-flight request state | Idle and unobserved are pixel-identical to the detector too; only the client's outbound state separates them |
+| D217 | Never interpolate across an unobserved gap | A line asserts the interval, not just the endpoints — ~59 measurements we do not have |
+| D218 | The finding card gets a live panel's type scale, frame and weight | Demoting its typography reinstates the lie above the value layer, where no check reaches |
