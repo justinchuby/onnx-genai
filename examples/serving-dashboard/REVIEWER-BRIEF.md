@@ -213,6 +213,93 @@ rest.
 I caught this only by discarding my own result. I had `584/584 fail 0`, from the
 real suite, at the real sha, and threw it away because `porcelain` said 7.
 
+### 12. A stale reading and a narrow instrument look identical, and the flattering diagnosis is the wrong one
+
+I was told a key was declared twice in `telemetry-provenance.js`. I searched for
+duplicates with `^  '[a-z_.]+':` and found none — 36 declared, 36 distinct. I
+nearly published *cannot reproduce*, and the reason I did not is that I had
+misdiagnosed my own result once already that hour.
+
+Both explanations fit a clean zero equally well:
+
+```
+(a) MY INSTRUMENT WAS TOO NARROW  -> widen it
+(b) I MEASURED AFTER THE FIX      -> timestamp it
+```
+
+I assumed (a), widened the search, and immediately found evidence for it: one
+entry, `metrics.e2e_latency`, is declared **unquoted**, so my pattern really was
+blind to 1 of 37 keys. That felt like the answer. **It was not the answer.** The
+actual duplicate was `'batch.capacity'`, declared at two-space indent, quoted, at
+lines `:497` and `:637` — **a shape my original narrow pattern would have matched
+perfectly.** It was live for exactly two commits and was fixed one commit before
+the sha I measured at, which `git merge-base --is-ancestor` settles in one
+command.
+
+> **The report was right and I was late. Nothing was wrong with the instrument
+> that had anything to do with this defect.** The Lead's own distinction is the
+> remedy and I failed to apply it to myself: *wrong needs a correction, stale
+> needs a timestamp.* Ask which one you have **before** you reach for the fix.
+
+Prefer (a) and you will feel diligent while missing it, because widening an
+instrument is real work that produces real findings — I did find a genuine
+inconsistency — and none of it touches the reason you got a zero. **The
+flattering diagnosis is that your tool failed. The useful one is usually that the
+world moved.** At one commit every 45 seconds, (b) is the prior.
+
+And widening has a cost nobody bills. My widened pattern reported three further
+duplicates: `byOrigin`, `dynamic`, `scatter`. All three are **false** — nested
+keys under different parents, at `:435`, `:463` and `:688`. Had I published, I
+would have filed a duplicate-key alarm against a file that is correct, on a
+branch under freeze, in the same message as a retraction.
+
+> **Trading a false negative for three false positives is not an improvement,
+> and a flat pattern cannot see structure. If you must widen, widen against a
+> parser or against the runtime — the only check that actually decides this is
+> `declared` versus `surviving`, and it needs no regex at all.**
+
+Count the entries the source declares, count the keys the object has after it
+loads, and compare. A collision is exactly `declared > surviving`. It cannot hide
+from that pair and it is invisible to either number alone: **36 alone looks
+perfect; 37 alone looks perfect.**
+
+### 13. A withdrawal must state the question it answered, not just its verdict
+
+A reviewer filed a finding, re-checked it, and withdrew it correctly. The
+withdrawal read, in substance, *withdrawn — `dataset.state` is a real
+vocabulary.* That is true. Ninety minutes later a second reviewer examined the
+same six lines and found a live defect in them.
+
+The two are not in conflict, and they read as though they are:
+
+```
+QUESTION ONE   is 'stale' a raw enum leaking to a user-facing surface?
+               ANSWER: no — it is a member of the ruled vocabulary.   WITHDRAWN, correctly.
+
+QUESTION TWO   do these writes go through the chokepoint that THROWS on an
+               unknown state?
+               ANSWER: no — all three assign the attribute directly.  LIVE.
+```
+
+A correct value written through an unchecked path is the one configuration in
+which this class survives review, **because every reader who spot-checks the
+value finds it correct and stops.** The first reviewer *was* that reader, and
+their stopping is now a committed document that reads like a clearance.
+
+> **Nobody re-derives the scope of a withdrawal.** *Already fixed* is the one
+> disposal nobody re-checks; *already withdrawn* is the one finding nobody
+> re-scopes. A retracted finding gets cited as proof the area is clean, and the
+> retraction is more authoritative than the original claim ever was — because
+> retracting costs the author something, and readers price that in.
+
+The fix costs one clause. Not *R9 withdrawn*, but **R9 withdrawn as a leak; the
+write path is unexamined.** The second version hands the next reviewer the live
+finding instead of nearly burying it.
+
+This document contains withdrawals. Read every one of them as scoped to the
+question in it, and if the question is not stated, treat the area as unexamined
+rather than as cleared.
+
 ### And one about this document
 
 `grep` cannot see negation. The string `'Batch limit'` appears in
@@ -237,6 +324,32 @@ registered git worktrees on unrelated branches, each with its own
 `crates/onnx-genai-server/src/lib.rs` at different contents. One of them is
 parked on an older commit and does not contain `examples/serving-dashboard`
 at all.
+
+Measured, rather than assumed — `git worktree list` reports **six checkouts on
+five branches**, and `git rev-parse --git-common-dir` from this directory points
+at *another checkout's* `.git`:
+
+```
+/Users/justinc/…/onnx-genai                justinchu/demo              <- the primary
+/Users/justinc/…/onnx-genai-demo           feat/genai-demo-dashboard   <- YOU ARE HERE
+/Users/justinc/…/onnx-genai-pris-multiturn squad/multiturn-session-api
+/Users/justinc/…/onnx-genai-spec-capture   feat/speculative-conformance-capture
+/Users/justinc/…/onnx-genai-unify-session  squad/unify-session-api
+/private/tmp/…                             (detached, transient)
+```
+
+They are **one repository with one object store**, not sibling clones — a
+distinction I got wrong in conversation before measuring it, and it has a
+consequence worth more than the correction:
+
+> **Every commit is resolvable from every checkout.** `git show <SHA>:<path>`
+> gives identical bytes no matter which of the six directories you stand in, so a
+> citation carrying a sha is portable across all of them. `HEAD` is the only
+> ambiguous word, and it is the one every command uses by default.
+
+So the failure mode is narrower and more treatable than *you might be in the
+wrong repository*: you are in the right repository and on the wrong branch, and
+the fix is to name the sha rather than to hunt for the correct directory.
 
 This matters more than it sounds. A command run in the wrong checkout does not
 error — it answers, confidently, in the correct format, about a different
