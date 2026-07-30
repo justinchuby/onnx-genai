@@ -917,11 +917,44 @@ Also asymmetric: the CLI applies `resolve_model_dir` (`crates/onnx-genai-cli/src
 
 **And the numerator is process-global** (`crates/onnx-genai-server/src/metrics.rs::current_batch_size`) while the denominator belongs to one configuration, so the numerator can legitimately exceed it. The reported value is clamped, which hides a **scope mismatch** rather than a bug.
 
-### 8.10 `/v1/resources` can block for the duration of a busy batch ⚠️
+### 8.10 `/v1/resources` queued behind the work it reports on — RESOLVED, and mis-attributed first
 
-`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. **✅ RESOLVED by `a6fefde2`.** This section previously described a hang: on the continuous-batch path the command was not `Generate`, so it hit the catch-all, was parked on `deferred`, and was not drained until `manager.is_idle()` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`) — which under sustained load may never happen. **`handle_or_defer_during_batch` (`crates/onnx-genai-server/src/driver.rs::intake_during_batch`) now answers `ResourceSnapshot` inline through a `&Engine` borrow (`:646`), and defers only what genuinely needs `&mut Engine` (`:647`).** The fix is **structural rather than probabilistic**: the incapacity was never the queue, it was the exclusive borrow, so a fix that merely made the hang rarer would have passed every test the correct one does. Measured consequence of getting this wrong: `/metrics` and `/v1/resources` stall **14.8 s** during a 384-token generation, against **1.8 ms** for `/v1/status`.
+`GET /v1/resources` sends `DriverCommand::ResourceSnapshot(reply)` and awaits a oneshot. **✅ RESOLVED — but by the second of two fixes, and this document credited the first one for two hours.** Two distinct defects blocked this endpoint, on two different drivers, and **the one that was measured is not the one that was first fixed.**
 
-**Under sustained concurrent load the batch may not go idle**, because finished rows are backfilled from new arrivals to maintain occupancy. The reply is therefore held for as long as the server stays busy — the request does not fail, it simply does not answer, and it eventually surfaces as a client-side timeout rather than an error the server reports.
+**Defect A — deferral on the continuous-batch path.** The command was not `Generate`, so it hit the catch-all, was parked on `deferred`, and was not drained until `manager.is_idle()` (`crates/onnx-genai-server/src/driver.rs::run_static_batch_until_idle`) — which under sustained load may never happen. Fixed by `a6fefde2` (23:58): `handle_or_defer_during_batch` (`crates/onnx-genai-server/src/driver.rs::handle_or_defer_during_batch`) answers `ResourceSnapshot` inline through a `&Engine` borrow and defers only what genuinely needs `&mut Engine`.
+
+**Defect B — head-of-line blocking on the fallback driver, which is the one that was benchmarked.** `run_fallback_engine_driver` (`crates/onnx-genai-server/src/driver.rs::run_fallback_engine_driver`) runs generations **inline, one at a time** — its own comment states the capacity "is not `max_batch` — no batch exists — it is one." It is a strictly serial `blocking_recv` loop, so *no* command of any kind is serviced until the in-flight generation returns. **No change inside a command loop could ever have fixed this**, which is why Defect A's fix left the measured symptom untouched.
+
+Fixed by `bd2197a4` (01:51, ancestor of HEAD) — **not** by `a6fefde2`. `EngineDriver::resource_snapshot` (`crates/onnx-genai-server/src/driver.rs::resource_snapshot`) now returns `governor.snapshot()` directly when a governor handle is present, **bypassing the driver channel entirely on every real-engine driver**. Pipeline engines hold no governor and keep the command path with its honest "not available" error rather than inventing a snapshot.
+
+> ⚠️ **Name the type, not just the method.** An earlier draft of this very paragraph read `Engine::resource_snapshot`. A distinct `Engine::resource_snapshot` genuinely exists (`crates/onnx-genai-engine/src/engine/runtime.rs::resource_snapshot`) — it is the one `handle_or_defer_during_batch` calls — so the sentence named a real symbol in the wrong crate while citing the right file. **The citation resolved. The prose was still wrong**, and no citation checker can catch that, because a checker verifies that a target exists, never that it is the target the sentence is about.
+
+⚠️ **The mis-attribution is the durable lesson here, and it is worth more than either bug.** Defect A explains the symptom perfectly: a snapshot request parked behind a batch is exactly what a hanging `/v1/resources` looks like. It was a real defect, correctly found and correctly fixed. **It was also not running.** The benchmarked server never entered that loop. **A mechanism that explains your symptom perfectly is not evidence that it was involved — before blaming a code path, prove it ran.** The identical error, in the identical file, is recorded in §8.9's post-mortem: a citation that resolves onto a plausible neighbour is more convincing than one that resolves onto nonsense.
+
+**Why a shared read and not a published mirror.** A mirror was considered and rejected, and the reasoning is the part that generalises: **a mirror refreshed between generations is stalest exactly when the server is busiest — which is the one condition this endpoint exists for.** The governor's accessors take `&self`, so a shared handle is both always-available and always-live. No copy means no field can go stale. The fix is **structural rather than probabilistic**: the incapacity was never the queue depth, it was the exclusive borrow, so a fix that merely made the hang rarer would have passed every test the correct one does.
+
+**Under sustained concurrent load the batch may not go idle**, because finished rows are backfilled from new arrivals to maintain occupancy. The reply was therefore held for as long as the server stayed busy — the request did not fail, it simply did not answer, and it surfaced as a client-side timeout rather than an error the server reported.
+
+**Measured, worst case and error count — never the mean**, because a mean over a bimodal latency hides exactly the failure being described:
+
+| | Worst case | Errors |
+|---|---|---|
+| Before | **7910 ms** | **5 of 6 polls timed out** |
+| After | **86.6 ms** | **0 across 1055 polls** |
+
+Taken on a box at load average 13 (measured by @d7cf9b84; not independently reproduced by this document's author). The load figure is part of the result, not context: an improvement measured on an idle box would not speak to the condition the endpoint exists for.
+
+#### 8.10a A second, separate intake defect — fixed in the same commit, and *not* the cause of the above
+
+`bd2197a4` also repaired the static driver's intake: the outer loop drained commands into a holding queue that the inner batch loop never read, degrading continuous batching toward serialisation. It ships with a regression test (`crates/onnx-genai-server/src/tests.rs::commands_parked_before_a_batch_starts_are_drained_into_it`).
+
+**This is recorded here specifically to keep it separated from §8.10's measurement.** Two defects fixed in one commit, in one file, both touching command intake, both plausibly explaining a stalled endpoint — and only one of them was on the measured path. **The commit boundary is not an attribution boundary.** Reading a diff tells you what changed together; it does not tell you which change moved the number.
+
+#### 8.10b Open question — measured and unexplained
+
+The benchmarked server logged the **continuous batch driver as disabled**, while a freshly built model logs it **enabled at two widths**. Something about the older model or its configuration selects the fallback path.
+
+**This is deliberately left unresolved rather than answered from source.** Which branch a server takes is a property of a *running process* — its model, its flags, and its build — and §7's capability table is the discriminator that makes the boot log interpretable, not a substitute for reading it. Section 7 already documents *why* the branch exists (continuous batching and paged KV are mutually exclusive); it cannot tell you which side a given process landed on. **An open question stated as open is a smaller error than a confident answer derived from the wrong artefact** — and per §8.10 above, a compiled binary carries no record of the commit it was built from, so the source cannot settle this even in principle.
 
 Two consequences worth separating:
 
