@@ -1307,3 +1307,37 @@ versus 5, both raw exit 0. **Deleting either to silence the warning deletes real
 *duplicate* is a word that prescribes deletion. The fix is a rename. **The guard that caught it
 deserves the credit it was given — it is the only instrument on this branch that found a
 problem without a human aiming it.**
+
+### Self-audit on R31's own landing — my verification control failed, twice, in the way I catalogued
+
+**The commit was sound; my check of it was not.** After landing `06647d2c` I confirmed
+presence with `grep -c` on a phrase that turned out to be **wrapped across two lines** in the
+committed file. It returned **0** — indistinguishable from *the commit did not land*.
+
+```
+verify  "older than the fix, not newer than the finding"   -> 0   ⛔ FALSE NEGATIVE
+cause   line 1300 ends "...not newer" / line 1301 begins "than the finding."
+truth   "R31" -> 2 · "pinned artifact excludes" -> 1 · "stale asymmetrically" -> 1
+        · "manufactures work" -> 1        ✅ IT LANDED
+repair  a multiline probe: tr '\n' ' ' then grep   ->  0  ⛔ THE FIX ALSO FAILED
+        and its negative control also 0 — so that probe distinguishes nothing
+```
+
+**This is instrument-failure class 1 from my own catalogue — *a sentence split across a line
+boundary is invisible to a line-oriented search* — landing on the command I use to verify
+every commit I make.** Third time tonight a defect I documented has bitten the hand that
+documented it.
+
+> **Two things are worth keeping, and the second is the one I did not expect.**
+> **① A false negative from a verification control is the most dangerous direction it can
+> fail in**, because the honest response to *"my commit did not land"* is to commit again —
+> **so this defect's natural remedy is a duplicate commit.** It fails toward doing more work,
+> which is why it never looks like a defect.
+> **② The clever repair was worse than the simple one.** The multiline probe failed *and its
+> negative control failed identically*, so it distinguished nothing — while four boring
+> single-line anchors settled the question immediately. **When a control fails, prefer more
+> controls over a smarter control: a broken instrument and a clean tree are byte-identical,
+> and a *sophisticated* broken instrument is merely harder to doubt.**
+
+**Corrected practice, adopted for the rest of this review: verify presence with a short
+anchor that cannot wrap** — a finding id, a heading, a four-word phrase — **never a sentence.**
