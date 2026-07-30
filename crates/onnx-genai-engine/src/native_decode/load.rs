@@ -330,6 +330,10 @@ impl NativeDecodeSession {
                 state_pairs.push((pair.output.clone(), pair.input.clone()));
             }
         }
+        let fixed_state_inputs = state_pairs
+            .iter()
+            .map(|(_, input)| input.clone())
+            .collect::<HashSet<_>>();
 
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
@@ -424,7 +428,11 @@ impl NativeDecodeSession {
             let attention_mask = attention_mask
                 .as_deref()
                 .context("native CUDA target decode requires a declared attention-mask input")?;
-            let bytes_per_token = DecodeCudaState::kv_bytes_per_token(&session, &present_to_past)?;
+            let bytes_per_token = DecodeCudaState::kv_bytes_per_token(
+                &session,
+                &present_to_past,
+                &fixed_state_inputs,
+            )?;
             let device_memory = cuda_device_memory_snapshot(session.device_id().index as i32).ok();
             let max_len = match cuda_options.kv_max_len {
                 Some(0) => bail!("CUDA KV max length must be greater than zero"),
@@ -466,6 +474,7 @@ impl NativeDecodeSession {
                     logits: &logits,
                 },
                 &present_to_past,
+                &fixed_state_inputs,
                 capacity,
                 graph_enabled,
             )?)
