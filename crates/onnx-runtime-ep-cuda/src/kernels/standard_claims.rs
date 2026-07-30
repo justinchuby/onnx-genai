@@ -523,7 +523,7 @@ fn rotary_embedding(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
 
 fn topk(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 2, 2)?;
-    require_dtype(input_dtypes, 0, DataType::Float32, "X")?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
     require_dtype(input_dtypes, 1, DataType::Int64, "K")?;
     bool_attribute(node, "largest")?;
     bool_attribute(node, "sorted")
