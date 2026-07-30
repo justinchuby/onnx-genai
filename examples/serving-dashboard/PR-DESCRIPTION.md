@@ -561,8 +561,46 @@ run-demo.sh:29   BIND_HOST="${BIND_HOST:-127.0.0.1}"
   lines validating its value ............ 0
   '0.0.0.0' in any tracked .sh .......... 0    [POS CTL] '127.0.0.1' in 5 files
                                                [NEG CTL] fabricated token in 0
-  guards asserting the bind is loopback . 0
+  guards asserting the bind is loopback . ~~0~~  **FALSE — SEE BELOW. THE REAL
+                                          ANSWER IS 1, AND IT MAKES THE POINT
+                                          BETTER THAN MY ZERO DID.**
 ```
+
+**I published that zero and it was wrong.** `check-launch-command.test.js:425`
+does assert it:
+
+```js
+test('both servers bind loopback by default', () => {
+  assert.match(runDemoCode, /BIND_HOST:-127\.0\.0\.1/,
+    'run-demo.sh must bind loopback by default');
+});
+```
+
+**How I got it wrong is the part worth keeping.** I ran a search for test files
+mentioning `BIND_HOST` or `--addr`. It returned four files. **I then reported how
+many of them *assert* the property without opening any of them.** The search
+answered *which files mention the token*; I published an answer to *which files
+assert the bound*. **Same instrument, adjacent question, and the arithmetic in
+between was flawless.** That is the third time tonight I have caught this exact
+substitution in my own work, and it has never once looked like a mistake while I
+was making it.
+
+**And the guard I missed is better evidence for my finding than the absence I
+claimed.** It reads `runDemoCode` — the *source text* of the shell script — and
+asserts the literal string `BIND_HOST:-127.0.0.1`. An environment override
+changes the value at runtime and leaves that text untouched. **So the guard is
+green in every world where the demo is serving on `0.0.0.0`.** It is not weak;
+it is measuring the only thing a source-level test can measure.
+
+**Its own title carries the limitation: `bind loopback by default`.** The author
+named the gap precisely and put it in the test description. **What decays is the
+reading**: a green scrolls past as *binds loopback*, and the two words doing all
+the work are the ones a passing test stops showing you. **An honest test name is
+not a guard — nobody reads the name of a test that passes.**
+
+So the corrected finding is narrower and firmer than the one I published: **the
+default is asserted, the override is unconstrained, and no guard can see the
+difference from the source alone.**
 
 **`:-` is a default, not a constraint.** `BIND_HOST=0.0.0.0` reaches the blocking
 condition without editing one tracked byte, without a code review, and without a
