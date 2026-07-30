@@ -20,7 +20,16 @@
 // contract, not a competing design: when format.js lands, the bodies below are
 // replaced by re-exports and no panel changes.
 
-import { RENDER_STATES, isRenderable, isStale, renderStateOf } from './field-state.js';
+import {
+  DEFAULT_STALE_CEILING_MS,
+  RENDER_STATES,
+  ageMsOf,
+  formatAge,
+  isPastStaleCeiling,
+  isRenderable,
+  isStale,
+  renderStateOf,
+} from './field-state.js';
 import {
   describeSparkline,
   paintSparkline,
@@ -212,10 +221,60 @@ export function renderField(field, options = {}) {
   const sourceClass = normaliseSourceClass(options.sourceClass ?? field?.source);
   const showUnit = options.showUnit !== false && Boolean(unit) && unit !== '%';
 
+  const ceilingMs = options.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS;
+  const nowMs = options.nowMs ?? Date.now();
+
   const wrapper = element('span', {
     className: 'value',
     attrs: { 'data-state': state, 'data-source': sourceClass },
   });
+
+  if (state === RENDER_STATES.NOT_APPLICABLE) {
+    // Deliberately not the same treatment as `unavailable`. Nothing is missing
+    // here and nothing is coming: this code path structurally cannot reach the
+    // subsystem. Saying "not measurable yet" would promise a value that will
+    // never arrive.
+    const reason = field?.reason ?? 'This server cannot produce this measurement.';
+    wrapper.setAttribute(ROVING_ITEM_ATTR, '');
+    wrapper.setAttribute('tabindex', '-1');
+    wrapper.setAttribute('role', 'note');
+    wrapper.setAttribute('aria-label', `${label}: not applicable here. ${reason}`);
+    wrapper.setAttribute('title', reason);
+    wrapper.append(
+      element('span', {
+        className: ['value__num', 'value__num--not-applicable'],
+        text: 'n/a',
+        attrs: { 'aria-hidden': 'true' },
+      }),
+    );
+    return wrapper;
+  }
+
+  if (isPastStaleCeiling(field, ceilingMs, nowMs)) {
+    // AC45(b). An unbounded age suffix is still a number on screen, and past
+    // some point "last known" is indistinguishable from fiction. The number
+    // goes away; the age stays, because WHY it went away is the useful part.
+    const age = formatAge(ageMsOf(field, nowMs));
+    const reason = `Last measured ${age}, which is past this panel's ${Math.round(
+      ceilingMs / 1000,
+    )}s limit for showing a number.`;
+    wrapper.setAttribute('data-state', RENDER_STATES.UNAVAILABLE);
+    wrapper.setAttribute('data-stale', 'expired');
+    wrapper.setAttribute(ROVING_ITEM_ATTR, '');
+    wrapper.setAttribute('tabindex', '-1');
+    wrapper.setAttribute('role', 'note');
+    wrapper.setAttribute('aria-label', `${label}: too old to show. ${reason}`);
+    wrapper.setAttribute('title', reason);
+    wrapper.append(
+      element('span', {
+        className: ['value__num', 'value__num--unavailable'],
+        text: '—',
+        attrs: { 'aria-hidden': 'true' },
+      }),
+      element('span', { className: 'value__stale', text: age }),
+    );
+    return wrapper;
+  }
 
   if (state === RENDER_STATES.UNAVAILABLE) {
     const reason = field?.reason ?? 'This value is not measured by the server.';
@@ -271,13 +330,14 @@ export function renderField(field, options = {}) {
   }
   wrapper.append(sourceBadge(sourceClass, describeProvenance(field)));
 
-  if (isStale(field)) {
-    const ageSeconds = Math.max(0, Math.round((Date.now() - (field.at ?? Date.now())) / 1000));
+  const staleAge = isStale(field) ? formatAge(ageMsOf(field, nowMs)) : null;
+
+  if (staleAge !== null) {
     wrapper.setAttribute('data-stale', 'true');
     wrapper.append(
       element('span', {
         className: 'value__stale',
-        text: `${ageSeconds}s ago`,
+        text: staleAge,
         attrs: {
           title:
             field.reason ??
@@ -287,7 +347,14 @@ export function renderField(field, options = {}) {
     );
   }
 
-  wrapper.setAttribute('aria-label', `${label}: ${prefix}${rendered}${unit ? ` ${unit}` : ''}`);
+  // The age has to be in the ACCESSIBLE name, not only in the visual suffix.
+  // Announcing "queue depth 41" while the screen says "41 · 12s old" hands the
+  // number to a screen-reader user stripped of the one qualifier that makes it
+  // honest — AC6 failing for exactly the visitors AC45 was written to protect.
+  wrapper.setAttribute(
+    'aria-label',
+    `${label}: ${prefix}${rendered}${unit ? ` ${unit}` : ''}${staleAge ? `, stale, ${staleAge}` : ''}`,
+  );
   return wrapper;
 }
 
@@ -307,6 +374,23 @@ export function metricRow(label, field, options = {}) {
       renderField(field, { label, ...options }),
     ],
   });
+}
+
+/**
+ * Bind a panel's stale ceiling (AC45(c)) to the two render helpers, so the
+ * ceiling is declared once in `meta` rather than repeated at every call site
+ * — where one omission silently reverts that metric to the global default.
+ *
+ * @param {{staleCeilingMs?: number}} panelMeta
+ * @returns {{metricRow: typeof metricRow, renderField: typeof renderField}}
+ */
+export function bindPanel(panelMeta) {
+  const staleCeilingMs = panelMeta?.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS;
+  return {
+    metricRow: (label, field, options = {}) =>
+      metricRow(label, field, { staleCeilingMs, ...options }),
+    renderField: (field, options = {}) => renderField(field, { staleCeilingMs, ...options }),
+  };
 }
 
 /**

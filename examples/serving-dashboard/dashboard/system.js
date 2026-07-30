@@ -30,11 +30,10 @@ import { isRenderable, numericValueOf } from './field-state.js';
 import {
   createRepaintScheduler,
   describeFieldText,
+  bindPanel,
   element,
   formatDuration,
-  metricRow,
   observeVisibility,
-  renderField,
   replaceChildren,
   sectionLabel,
 } from './panel-kit.js';
@@ -48,6 +47,8 @@ export const meta = Object.freeze({
   group: 'system',
   span: 1,
   cadence: 1000,
+  // Model identity and configured ceilings are resolved at startup and do not drift.
+  staleCeilingMs: 30000,
   defaultOpen: false,
   acronyms: {
     EP: 'Execution provider — the backend ONNX Runtime dispatches operators to',
@@ -56,6 +57,9 @@ export const meta = Object.freeze({
     RSS: 'Resident set size — physical memory held by a process',
   },
 });
+
+/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
+const { metricRow, renderField } = bindPanel(meta);
 
 /**
  * @param {HTMLElement} rootElement
@@ -190,7 +194,6 @@ function renderBudgetRow(label, budget, caveat) {
     ],
   });
 }
-
 
 /**
  * Disk spill is an `Option` server-side: absent means "not configured", which

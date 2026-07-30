@@ -162,7 +162,7 @@ export function adaptStore(telemetryStore, options = {}) {
   return {
     /** @param {string} key */
     field(key) {
-      return telemetryStore.field(key);
+      return markStalledOrigin(telemetryStore.field(key), telemetryStore.getSnapshot().connection);
     },
 
     getSnapshot() {
@@ -373,3 +373,44 @@ const CAPABILITY_KEYS = Object.freeze({
   'batch-occupancy': ['batch.utilization', 'batch.active_size'],
   throughput: ['throughput.tokens_per_second', 'metrics.tokens_generated_total'],
 });
+
+/**
+ * AC45(d) — a whole-origin stall marks EVERY field from that origin.
+ *
+ * The store marks a field stale when ITS poll fails. But a field whose endpoint
+ * was not polled this cycle keeps its `ok` state and goes on looking live, so
+ * every field can be individually honest while the page as a whole lies. This
+ * is AC6 arriving through the transport layer rather than through a panel:
+ * honesty was enforced per-field, and the failure is per-connection.
+ *
+ * It matters most with two origins. One server can die while the other stays
+ * live, and without this the dead half keeps presenting its last good frame
+ * indefinitely, right next to a half that is genuinely updating.
+ *
+ * Applied in the adapter rather than in each panel because a panel that forgot
+ * would look completely normal — the values would simply be wrong.
+ *
+ * @param {any} field
+ * @param {{state?: string, serverMessage?: string|null}|null|undefined} connection
+ * @returns {any}
+ */
+function markStalledOrigin(field, connection) {
+  const state = connection?.state;
+  if (!state || state === 'connected' || state === 'connecting') {
+    return field;
+  }
+  // Only a currently-live value can be downgraded. Anything already stale keeps
+  // its ORIGINAL observation time, and unavailable/pending/not-applicable are
+  // saying something truer than "stale" already.
+  if (field?.state !== 'ok' && field?.state !== 'measured') {
+    return field;
+  }
+  return {
+    ...field,
+    state: 'stale',
+    reason:
+      state === 'no-model'
+        ? 'The server is running but has no model loaded, so nothing is refreshing this value.'
+        : 'The server stopped answering, so this is the last value we received rather than a current one.',
+  };
+}

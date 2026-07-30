@@ -873,3 +873,37 @@
   outline: var(--og-focus-ring);
   outline-offset: var(--og-focus-offset);
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   NOT APPLICABLE vs UNAVAILABLE (AC43)
+   Two different absences that must not look alike. "Unavailable" invites the
+   reader to wait for a value; "n/a" says this server structurally cannot
+   produce one — continuous batching and paged KV are mutually exclusive, so
+   half these metrics can never fill on a given origin. Reading "n/a" as
+   "still loading" is exactly the misunderstanding the demo exists to correct.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+.value__num--not-applicable {
+  color: var(--og-unavail-fg);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-2xs);
+  letter-spacing: var(--og-tracking-caps);
+  text-transform: uppercase;
+  /* No dashed rule: unlike the em-dash, "n/a" is already legible as a
+     deliberate statement rather than a missing glyph. */
+  border-bottom: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   EXPIRED (AC45b)
+   A value that aged past its panel's ceiling. The age stays and the number
+   goes — an unbounded age suffix is still a number on screen, and past some
+   point "last known" is indistinguishable from fiction. Weight and case carry
+   the meaning as well as colour, for the grayscale gate.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+.value[data-stale='expired'] .value__stale {
+  color: var(--og-unavail-fg);
+  font-weight: var(--og-weight-medium);
+  text-transform: uppercase;
+}

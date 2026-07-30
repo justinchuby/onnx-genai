@@ -103,11 +103,36 @@ describe('renderField — a measured zero and an unmeasurable value must look di
       source: 'server',
       unit: 'count',
       label: 'Queue depth',
-      at: Date.now() - 8000,
+      observedAtMs: Date.now() - 8000,
     });
 
     assert.equal(node.getAttribute('data-stale'), 'true');
-    assert.match(node.findByClass('value__stale').textContent, /^\d+s ago$/);
+    assert.match(node.findByClass('value__stale').textContent, /^8s old$/);
+    // The age must reach a screen reader too, not just the pixels.
+    assert.match(node.getAttribute('aria-label'), /stale, 8s old/);
+  });
+
+  it('will not date a value from any property but observedAtMs', () => {
+    // This test exists because the original one did not. It asserted the age
+    // suffix appeared, using a fixture that carried `at` — the same wrong
+    // property name the renderer read. Both sides agreed and both were wrong,
+    // so every stale value in the real app would have rendered "0s ago":
+    // an actively false claim of freshness on the exact values AC45 protects.
+    const node = renderField({
+      value: 42,
+      state: 'stale',
+      source: 'server',
+      label: 'Queue depth',
+      at: Date.now() - 8000,
+    });
+
+    assert.equal(
+      node.getAttribute('data-stale'),
+      'expired',
+      'an undateable stale value must not be shown as a number',
+    );
+    assert.match(node.getAttribute('aria-label'), /age unknown/);
+    assert.doesNotMatch(node.textContent, /42/, 'the number survived without a trustworthy age');
   });
 });
 

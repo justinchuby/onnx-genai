@@ -21,13 +21,12 @@
 import { isRenderable, numericValueOf } from './field-state.js';
 import {
   createRepaintScheduler,
+  bindPanel,
   createSparklineSlot,
   describeFieldText,
   element,
   formatDuration,
-  metricRow,
   observeVisibility,
-  renderField,
   replaceChildren,
   sectionLabel,
   readRequests,
@@ -46,6 +45,8 @@ export const meta = Object.freeze({
   group: 'throughput',
   span: 2,
   cadence: 250,
+  // A tokens/sec figure three seconds old is describing a different moment of the run.
+  staleCeilingMs: 3000,
   defaultOpen: true,
   acronyms: {
     TTFT: 'Time to first token — how long until the first token of a response arrives',
@@ -55,6 +56,9 @@ export const meta = Object.freeze({
     makespan: 'The wall-clock span from the first request being sent to the last one completing',
   },
 });
+
+/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
+const { metricRow, renderField } = bindPanel(meta);
 
 /**
  * @param {HTMLElement} rootElement

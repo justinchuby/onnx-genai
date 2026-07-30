@@ -47,6 +47,7 @@ export const RENDER_STATES = Object.freeze({
   PENDING: 'pending',
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',
+  NOT_APPLICABLE: 'not-applicable',
 });
 
 /**
@@ -61,7 +62,79 @@ const STATE_ALIASES = Object.freeze({
   awaiting: RENDER_STATES.PENDING,
   stale: RENDER_STATES.STALE,
   unavailable: RENDER_STATES.UNAVAILABLE,
+  // Distinct from `unavailable` on purpose. "Unavailable" invites the reader to
+  // expect it later; "not applicable" says plumbing would not produce a value
+  // because this code path cannot reach that subsystem at all. Collapsing them
+  // would flatten AC43 — the mutual-exclusivity story is the most interesting
+  // thing the demo has to say, and it is told through this distinction.
+  'not-applicable': RENDER_STATES.NOT_APPLICABLE,
+  not_applicable: RENDER_STATES.NOT_APPLICABLE,
+  notApplicable: RENDER_STATES.NOT_APPLICABLE,
 });
+
+/**
+ * Default ceiling past which a stale value stops being shown as a number.
+ *
+ * AC45(c) makes the real ceiling per-panel; this is only the fallback for a
+ * caller that expresses no opinion. It is deliberately short — showing a
+ * number for too long is the failure mode being guarded against, so the
+ * default errs toward withholding.
+ */
+export const DEFAULT_STALE_CEILING_MS = 10_000;
+
+/**
+ * Age of a field's observation in milliseconds, or null when it never carried
+ * one.
+ *
+ * Returns null rather than 0 for a missing timestamp. Zero would read as
+ * "observed just now", which is the single most dangerous thing this module
+ * could say about a value it cannot date.
+ *
+ * @param {{observedAtMs?: number|null}|null|undefined} field
+ * @param {number} [nowMs]
+ * @returns {number|null}
+ */
+export function ageMsOf(field, nowMs = Date.now()) {
+  const observedAtMs = field?.observedAtMs;
+  if (typeof observedAtMs !== 'number' || !Number.isFinite(observedAtMs)) {
+    return null;
+  }
+  return Math.max(0, nowMs - observedAtMs);
+}
+
+/**
+ * Whether a stale field has aged past the point where its number should still
+ * be shown (AC45(b)).
+ *
+ * An undateable stale field counts as past the ceiling: if we cannot say how
+ * old it is, we cannot claim it is recent enough to show.
+ *
+ * @param {{state?: string, observedAtMs?: number|null}|null|undefined} field
+ * @param {number} [ceilingMs]
+ * @param {number} [nowMs]
+ * @returns {boolean}
+ */
+export function isPastStaleCeiling(field, ceilingMs = DEFAULT_STALE_CEILING_MS, nowMs = Date.now()) {
+  if (renderStateOf(field) !== RENDER_STATES.STALE) return false;
+  const ageMs = ageMsOf(field, nowMs);
+  return ageMs === null || ageMs > ceilingMs;
+}
+
+/**
+ * Age rendered in words, never colour alone (AC45(a)).
+ *
+ * @param {number|null} ageMs
+ * @returns {string}
+ */
+export function formatAge(ageMs) {
+  if (ageMs === null) return 'age unknown';
+  const seconds = Math.round(ageMs / 1000);
+  if (seconds < 1) return 'under 1s old';
+  if (seconds < 60) return `${seconds}s old`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s old`;
+  return `over ${Math.floor(minutes / 60)}h old`;
+}
 
 /**
  * Normalise any field-like object to a render state.

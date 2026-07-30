@@ -25,12 +25,11 @@ import { isRenderable, numericValueOf, ratioField } from './field-state.js';
 import {
   REASONS,
   createRepaintScheduler,
+  bindPanel,
   createSparklineSlot,
   describeFieldText,
   element,
-  metricRow,
   observeVisibility,
-  renderField,
   replaceChildren,
   sectionLabel,
   renderSparkline,
@@ -45,6 +44,8 @@ export const meta = Object.freeze({
   group: 'scheduling',
   span: 2,
   cadence: 250,
+  // Occupancy and queue depth at 4 Hz are worthless once seconds old — they are the fastest-moving numbers on the page.
+  staleCeilingMs: 3000,
   defaultOpen: true,
   acronyms: {
     batch: 'A group of sequences decoded together in one forward pass',
@@ -53,6 +54,9 @@ export const meta = Object.freeze({
     preemption: 'Evicting a running sequence to free capacity for another',
   },
 });
+
+/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
+const { metricRow, renderField } = bindPanel(meta);
 
 /**
  * Mount the scheduling panel.

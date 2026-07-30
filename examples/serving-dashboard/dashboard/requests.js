@@ -22,11 +22,11 @@
 import { isRenderable, numericValueOf } from './field-state.js';
 import {
   createRepaintScheduler,
+  bindPanel,
   element,
   formatDuration,
   formatNumber,
   observeVisibility,
-  renderField,
   replaceChildren,
   readRequests,
   REQUEST_TABLE_EMPTY,
@@ -55,12 +55,17 @@ export const meta = Object.freeze({
   group: 'scheduling',
   span: 2,
   cadence: 0,
+  // The request table is client-observed and refreshes with the scenario runner.
+  staleCeilingMs: 10000,
   defaultOpen: true,
   acronyms: {
     TTFT: 'Time to first token — how long until the first token of a response arrives',
     KV: 'Key/Value attention cache — the per-token state attention reads on every step',
   },
 });
+
+/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
+const { renderField } = bindPanel(meta);
 
 /**
  * @param {HTMLElement} rootElement

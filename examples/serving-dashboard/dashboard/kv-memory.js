@@ -21,11 +21,10 @@ import {
   capabilityNotice,
   createRepaintScheduler,
   describeFieldText,
+  bindPanel,
   element,
   formatNumber,
-  metricRow,
   observeVisibility,
-  renderField,
   replaceChildren,
   sectionLabel,
 } from './panel-kit.js';
@@ -36,6 +35,8 @@ export const meta = Object.freeze({
   group: 'memory',
   span: 2,
   cadence: 250,
+  // Block accounting moves with allocation, not with every decode step, so it stays meaningful longer.
+  staleCeilingMs: 15000,
   defaultOpen: true,
   acronyms: {
     KV: 'Key/Value attention cache — the per-token state attention reads on every step',
@@ -44,6 +45,9 @@ export const meta = Object.freeze({
     eviction: 'Reclaiming a block so its memory can serve another sequence',
   },
 });
+
+/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
+const { metricRow, renderField } = bindPanel(meta);
 
 /**
  * @param {HTMLElement} rootElement

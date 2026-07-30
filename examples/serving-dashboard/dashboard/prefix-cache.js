@@ -38,14 +38,13 @@
 import { isRenderable, numericValueOf } from './field-state.js';
 import {
   createRepaintScheduler,
+  bindPanel,
   createSparklineSlot,
   renderSparkline,
   describeFieldText,
   element,
   formatDuration,
-  metricRow,
   observeVisibility,
-  renderField,
   replaceChildren,
   sectionLabel,
 } from './panel-kit.js';
@@ -73,6 +72,8 @@ export const meta = Object.freeze({
   group: 'cache',
   span: 1,
   cadence: 250,
+  // Cache counters are cumulative; a slightly old count still describes the same run.
+  staleCeilingMs: 15000,
   defaultOpen: true,
   acronyms: {
     prefix: 'A leading run of tokens shared by several prompts, whose KV state can be reused',
@@ -80,6 +81,9 @@ export const meta = Object.freeze({
     eviction: 'Reclaiming cached prefix state so its memory can serve another sequence',
   },
 });
+
+/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
+const { metricRow, renderField } = bindPanel(meta);
 
 /**
  * @param {HTMLElement} rootElement
