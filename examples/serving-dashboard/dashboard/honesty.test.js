@@ -366,3 +366,91 @@ describe('honesty lint — the measured state is never compared as a literal', (
     }
   });
 });
+
+describe('honesty lint — poisoned server fields must never be bound', () => {
+  // Some fields on the wire are not merely unmeasured — they are ACTIVELY
+  // MISLEADING, because they carry a plausible number computed from the wrong
+  // thing. Those are more dangerous than a missing field: a missing field
+  // renders an em-dash and asks a question, while a wrong-denominator rate
+  // renders a confident percentage that survives into a screenshot.
+  //
+  // Each entry names the field, the file:line that makes it wrong, and what to
+  // show instead. Nothing here is a style preference; every one has been
+  // measured or read out of the server source.
+  const FORBIDDEN = [
+    {
+      pattern: /\.(?:field|series|rate)\(\s*['"`](?:prefix_cache[._]hit_rate)['"`]/,
+      what: 'prefix_cache.hit_rate',
+      why:
+        'its denominator counts COMPLETED GENERATIONS, not cache lookups ' +
+        '(metrics.rs:130-132), and QA disproved the numerator too — hits rise on requests ' +
+        'that share no prefix. Both terms measure the wrong thing, so the ratio is not a ' +
+        'hit rate at all.',
+      instead: 'show hits_total, plus the client-side TTFT delta, and name the defect.',
+    },
+    {
+      pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*tokens_per_second['"`]/,
+      what: 'status.tokens_per_second',
+      why: 'the server hardcodes it to a literal 0.0 (routes/admin.rs:63) — it is a stub, not a measurement.',
+      instead: 'differentiate metrics.tokens_generated_total client-side, badged `derived`.',
+    },
+  ];
+
+  it('binds no field whose published value is known to be wrong', () => {
+    /** @type {string[]} */
+    const offenders = [];
+
+    for (const name of sourceFiles()) {
+      // Comments MUST be stripped: every one of these fields is discussed by
+      // name in a comment explaining why it is not bound. A lint that fires on
+      // its own documentation trains people to delete the documentation.
+      //
+      // The patterns match a VALUE READ specifically — `.field(...)`,
+      // `.series(...)`, `.rate(...)` — not any mention of the key. That
+      // distinction is load-bearing: `capability()` legitimately names
+      // throughput.tokens_per_second in CAPABILITY_KEYS to read its STATE and
+      // decide whether a panel can populate at all, and it never touches the
+      // value. Forbidding the mention rather than the read flagged that
+      // correct code on the first run of this lint.
+      const source = stripComments(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8'));
+      source.split('\n').forEach((line, index) => {
+        for (const entry of FORBIDDEN) {
+          if (entry.pattern.test(line)) {
+            offenders.push(
+              `${name}:${index + 1} binds ${entry.what} — ${entry.why} Instead: ${entry.instead}`,
+            );
+          }
+        }
+      });
+    }
+
+    assert.deepEqual(offenders, [], `poisoned field bound:\n${offenders.join('\n')}`);
+  });
+
+  it('MUTATION TEST — the tripwire fires on a real binding', () => {
+    const wouldBind = [
+      "const rate = telemetryStore.field('prefix_cache.hit_rate');",
+      'const rate = store.field(`prefix_cache_hit_rate`);',
+      "const tps = telemetryStore.field('status.tokens_per_second');",
+    ];
+    for (const line of wouldBind) {
+      assert.ok(
+        FORBIDDEN.some((entry) => entry.pattern.test(line)),
+        `tripwire missed a poisoned binding: ${line}`,
+      );
+    }
+
+    // Must NOT fire on the counters that ARE real and SHOULD be bound.
+    const legitimate = [
+      "telemetryStore.field('prefix_cache.hits')",
+      "telemetryStore.rate('metrics.tokens_generated_total')",
+      "const label = 'Prefix cache hit rate';",
+    ];
+    for (const line of legitimate) {
+      assert.ok(
+        !FORBIDDEN.some((entry) => entry.pattern.test(line)),
+        `tripwire fired on a legitimate binding: ${line}`,
+      );
+    }
+  });
+});
