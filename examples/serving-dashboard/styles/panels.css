@@ -1027,3 +1027,54 @@
   user-select: all;
   white-space: pre;
 }
+
+/* ── Panel: prefix cache ────────────────────────────────────────────────── */
+
+/* This panel renders a FINDING, not a metric. There is no hero number because
+   there is no number at all: prefix reuse is absent on both execution paths,
+   and the timing figure that once argued the point was withdrawn. The type here
+   is set for READING rather than glancing, which is the honest treatment for a
+   panel whose entire content is an explanation. */
+
+.panel-prefix-cache__finding {
+  margin-bottom: var(--og-space-4);
+}
+
+.panel-prefix-cache__headline {
+  font-size: var(--og-type-md);
+  line-height: var(--og-leading-body);
+  color: var(--og-fg);
+  margin: 0 0 var(--og-space-3);
+}
+
+.panel-prefix-cache__body {
+  font-size: var(--og-type-sm);
+  line-height: var(--og-leading-body);
+  color: var(--og-fg-muted);
+  margin: 0 0 var(--og-space-3);
+}
+
+.panel-prefix-cache__body:last-child {
+  margin-bottom: 0;
+}
+
+.panel-prefix-cache__citations {
+  list-style: none;
+  margin: 0 0 var(--og-space-3);
+  padding: 0;
+}
+
+.panel-prefix-cache__citation {
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-xs);
+  line-height: var(--og-leading-body);
+  color: var(--og-fg-muted);
+  padding: var(--og-space-1) 0;
+}
+
+.panel-prefix-cache__provenance {
+  font-size: var(--og-type-xs);
+  line-height: var(--og-leading-body);
+  color: var(--og-fg-subtle);
+  margin: 0;
+}

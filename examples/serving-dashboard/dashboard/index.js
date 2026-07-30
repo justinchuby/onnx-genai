@@ -47,6 +47,7 @@ import { createRovingGroup, setPanelView } from './panel-kit.js';
 import { adaptStore } from './store-adapter.js';
 
 import * as kvMemory from './kv-memory.js';
+import * as prefixCache from './prefix-cache.js';
 import * as requests from './requests.js';
 import * as scheduling from './scheduling.js';
 import * as system from './system.js';
@@ -74,7 +75,13 @@ import * as throughput from './throughput.js';
  * @type {ReadonlyArray<RegisteredPanel>}
  */
 export const PANELS = Object.freeze(
-  [throughput, scheduling, kvMemory, requests, system].map((module) =>
+  // `prefix-cache` sits immediately after `kv-memory` because it is the same
+  // subject read one level deeper: KV memory shows the state that exists, and
+  // this panel explains why none of it is ever reused. It is a finding rather
+  // than a reading, and it binds no telemetry at all — see the header of
+  // `prefix-cache.js`. It is registered like any other panel because it is one:
+  // the shell should not need to know that a panel's content is prose.
+  [throughput, scheduling, kvMemory, prefixCache, requests, system].map((module) =>
     // `title` is lifted out of `meta` deliberately. The shell naturally
     // reaches for `panel.title`, and it silently read `undefined` for a while:
     // every roving group was built with no accessible name, which is invisible

@@ -15,14 +15,11 @@ import { PANELS, panelById } from './index.js';
 
 describe('panel registry', () => {
   it('registers every panel module with a complete meta block', () => {
-    // Five since the prefix-cache panel was cut. The counters were ruled
-    // unshippable because the hit counter is disqualified by its own
-    // arithmetic: twelve requests -- six repeated, six deliberately unique --
-    // produced +12 hits, one per completed generation, and the rate never
-    // left ~0.94.
+    // Six. The prefix-cache panel is the sixth and binds no telemetry at all --
+    // it renders the null result rather than a counter, per demo-ux.md D279.
     // Pinned deliberately -- adding or removing a panel should require saying
     // so here, because that is a decision about what the demo claims.
-    assert.equal(PANELS.length, 5);
+    assert.equal(PANELS.length, 6);
     for (const panel of PANELS) {
       assert.equal(typeof panel.module.mount, 'function', `${panel.id} has no mount()`);
       assert.equal(panel.id, panel.module.meta.id, `${panel.id} id disagrees with its meta`);
@@ -31,25 +28,72 @@ describe('panel registry', () => {
     }
   });
 
-  it('keeps the prefix-cache panel CUT, and not merely unregistered', async () => {
-    // Deleting the module is the ratchet; unregistering it is not. A module
-    // left on disk gets re-imported by the next person who greps for "prefix"
-    // and finds a working panel with a mount() -- which is how the counters
-    // would come back, and they are not merely unproven: twelve requests --
-    // six repeated, six deliberately unique -- produced +12 hits, one per
-    // completed generation, so the counter cannot tell reuse from no-reuse.
-    const { existsSync } = await import('node:fs');
+  it('ships the prefix-cache panel, bound to zero telemetry fields', async () => {
+    // THIS ASSERTION USED TO RUN THE OTHER WAY, and inverting it is the
+    // required move rather than a loosening. It asserted the module must not
+    // exist on disk, citing a ruling -- and it said in as many words that
+    // re-adding the panel "needs a new ruling, not a merge". That ruling
+    // arrived: demo-ux.md D279 ratifies the panel as SHIPPING, bound to zero
+    // fields, on the reasoning that deleting it is the one option that is
+    // definitely dishonest -- a visitor who sees no prefix panel concludes
+    // prefix caching works, because nothing on the page says otherwise.
+    //
+    // The old test was not wrong when written. It went stale, silently and
+    // greenly, the moment the ruling it encoded was overturned, and a green
+    // test enforcing a dead requirement is indistinguishable from a green test
+    // enforcing a live one. That is why the citation is in the comment.
+    //
+    // WHAT THE RATCHET GUARDS NOW IS THE THING THE RULING ACTUALLY FORBADE.
+    // Every denial in the design record is scoped to a prefix COUNTER FIELD --
+    // `prefix_cache.hits`, `_lookups`, `hit_rate` -- and never to the panel.
+    // FIELD and PANEL are different nouns. The counter is what cannot come
+    // back, so the counter is what this pins.
+    const { existsSync, readFileSync } = await import('node:fs');
     const { fileURLToPath } = await import('node:url');
-    assert.equal(
-      existsSync(fileURLToPath(new URL('./prefix-cache.js', import.meta.url))),
-      false,
-      'prefix-cache.js is back on disk. The panel was cut by ruling; re-adding it ' +
-        'needs a new ruling, not a merge.',
-    );
+    const modulePath = fileURLToPath(new URL('./prefix-cache.js', import.meta.url));
+
+    assert.equal(existsSync(modulePath), true, 'prefix-cache.js is missing from disk');
     assert.equal(
       PANELS.some((panel) => panel.id === 'prefix-cache'),
-      false,
-      'a prefix-cache panel is registered again',
+      true,
+      'the prefix-cache panel is not registered, so no visitor can ever reach the finding',
+    );
+
+    // Read the SOURCE, not the module object. A binding added later would be a
+    // string in this file long before it were observable through any export.
+    const source = readFileSync(modulePath, 'utf8');
+    for (const banned of ['prefix_cache.hits', 'prefix_cache.lookups', 'prefix.hit_rate']) {
+      assert.equal(
+        source.includes(`'${banned}'`),
+        false,
+        `prefix-cache.js binds ${banned}. The panel ships precisely because it binds nothing.`,
+      );
+    }
+  });
+
+  it('renders the prefix finding without any withdrawn timing figure', async () => {
+    // The panel's original argument rested on a latency A/B that was later
+    // withdrawn by the engineer who ran it. The conclusion survived because it
+    // never rested on the timing -- counter arithmetic and the engine source
+    // are both timing-free -- but the prose had to be rebuilt, and prose drifts
+    // back. These are the exact figures that were retracted.
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const source = readFileSync(fileURLToPath(new URL('./prefix-cache.js', import.meta.url)), 'utf8');
+
+    for (const figure of ['1341', '1254', '7.0%', '7% slower', '1380 ms', '140 ms']) {
+      assert.equal(
+        source.includes(figure),
+        false,
+        `prefix-cache.js quotes the withdrawn figure ${figure}. No prefix timing number ships.`,
+      );
+    }
+
+    // Positive control: the surviving argument must actually be present, or
+    // this test would pass just as happily against an empty file.
+    assert.ok(
+      source.includes('control request'),
+      'the counter-behaviour argument is missing, so the checks above are vacuous',
     );
   });
 
@@ -76,7 +120,7 @@ describe('panel registry', () => {
     // silent membership change.
     assert.deepEqual(
       PANELS.map((panel) => panel.id),
-      ['throughput', 'scheduling', 'kv-memory', 'requests', 'system'],
+      ['throughput', 'scheduling', 'kv-memory', 'prefix-cache', 'requests', 'system'],
     );
   });
 
@@ -207,6 +251,7 @@ describe('mountDashboard', () => {
         'throughput',
         'scheduling',
         'kv-memory',
+        'prefix-cache',
         'requests',
         'system',
       ]);
