@@ -302,7 +302,8 @@ test('the catalogue keeps the server vocabulary for paged KV', () => {
 //
 //   A CAPTION THAT NAMES A FIELD IS NOT A PROMISE. A CAPTION BOUND TO A FIELD
 //   IS. The binding is what makes it a claim, so the binding is what to parse.
-const ACCESSIBLE_CAPTION = /describeFieldText\(\s*'([^']*)'\s*,\s*[A-Za-z_$][\w$]*\.field\(\s*'([^']*)'/g;
+const ACCESSIBLE_CAPTION =
+  /describeFieldText\(\s*'([^']*)'\s*,\s*(?:displaySafeField\(\s*)?[A-Za-z_$][\w$]*\.field\(\s*'([^']*)'/g;
 
 /**
  * Every accessible-description caption bound to a telemetry key, at HEAD.
@@ -371,6 +372,13 @@ test('the accessible-caption detector fires, and does not claim an unbound one',
   const bound = `parts.push(\`\${describeFieldText('Execution provider', store.field('server.execution_provider'))}.\`);`;
   assert.deepEqual(findAccessibleCaptions(bound), [
     { prose: 'Execution provider', key: 'server.execution_provider' },
+  ]);
+
+  const safelyBound =
+    `parts.push(\`\${describeFieldText('Model', ` +
+    `displaySafeField(store.field('server.model_id')))}.\`);`;
+  assert.deepEqual(findAccessibleCaptions(safelyBound), [
+    { prose: 'Model', key: 'server.model_id' },
   ]);
 
   // A caption naming a field WITHOUT binding it is prose, not a promise. The
