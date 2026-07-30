@@ -521,3 +521,53 @@ it right; on a hand-started server it is the worst-looking thing in the demo.**
   silent — it appears on the landing page — so it is the less dangerous direction.
 - Arm A proves the tabs work between **two origins that both have assets**. It says nothing
   about whether the two panes should differ in batching behaviour (see `perf-baseline.md` §11).
+
+---
+
+## §9 — The batch caption, read off the screen
+
+@086345a5 reported that `telemetry-provenance.js` was fixed to `'Effective batch capacity'`
+while `scheduling.js` hardcoded a `'Batch limit'` override at the render site, with
+`honesty.test.js` pinning the wrong string. Three agents had verified the label by importing
+the module; all three readings were correct and none of them was about the screen.
+
+**Nobody had looked at the pixel. This is that measurement.**
+
+Method: fresh detached worktree pinned to `664b3721` at `porcelain 0`, a server launched with
+`--demo-assets-dir` pointed at it (so the bytes served are the committed bytes, not a working
+tree eleven agents are writing to), Chrome 150 over CDP, `continuous batch driver enabled
+max_batch=4`.
+
+```
+RENDERED document.body.innerText — 12,400 chars
+  "Batch limit"                 ->  0 occurrences
+  "Effective batch capacity"    ->  1 occurrence
+  CONTROL "requests"            ->  6 occurrences   <- the search works, the page is populated
+  wire /v1/status               ->  batch_capacity=4  batch_in_flight=0
+```
+
+**The caption defect is closed at the layer that ships.** `Batch limit` is painted nowhere.
+
+The control is not decoration: a zero from a string search on a page that failed to render is
+byte-identical to a zero from a page that rendered correctly. Six hits on a word I did not
+care about is what separates *the defect is gone* from *nothing loaded*.
+
+### 9.1 A detail worth keeping — the panel does not use a caption here at all
+
+The scheduling panel renders capacity as a **denominator in a phrase** — `… of 4 requests` —
+not as a labelled field. `Effective batch capacity` renders once, on the provenance surface
+(`/v1/status` · *Measured by the server* · `crates/onnx-genai-server/src/…`).
+
+That is stronger than the fix that was asked for. @0837fdf9's D275 hazard was that a caption
+naming the *raw ceiling* sits beside a value that is `min(max_batch, max_queue_depth)`, so a
+saturated server reads as 25% busy under a caption asserting it is at its limit. **A
+denominator cannot make that claim.** `X of 4 requests` states a ratio and names no ceiling.
+
+### 9.2 What is NOT claimed
+
+- `max_queue_depth >= max_batch` on this server (`batch_capacity=4` = `max_batch=4`), so I did
+  **not** exercise the clamped case where the two values diverge. I verified the caption, not
+  the arithmetic under a low queue depth.
+- One rendered occurrence of the string is consistent with the catalogue being read; I did not
+  prove the panel *sources* its caption from the catalogue rather than coinciding with it.
+- Measured at `664b3721`. The tree moves at roughly a commit a minute; this is a snapshot.
