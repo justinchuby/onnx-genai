@@ -3405,3 +3405,73 @@ AC59 says **never the words "batch size" in UI copy.** The page now renders `eng
 |---|---|---|
 | D148 | `reason` copy is an unverified claim and must be cited like a value | The struck line invented a scheduler that preempts silently; a wrong number gets challenged, a wrong explanation gets sympathy |
 | D149 | "batch size" banned beside a number, REQUIRED beside an em-dash; greppable via `data-state="unavailable"` | Enforced literally, AC59 would forbid the page from naming the honest quantity it exists to distinguish |
+
+---
+
+## 51. 🔬 THE NULL RESULT PANEL — SHIPPING THE EXPERIMENT THAT DIDN'T WORK (D150–D155)
+
+@12e42da8 re-scoped Scenario B to **(a)** paged-KV page allocation and **(b)** *the measured non-result, shipped and explained*, and assigned me the treatment. **(b) is the hardest thing on this page and the most valuable**, because it is the only panel whose entire persuasive force comes from us reporting something we would rather not.
+
+### 51.1 🔴 D150 — THE HEADLINE IS NOT "7% SLOWER". OUR OWN NOISE IS BIGGER THAN THAT.
+
+The measured numbers: ARM A (one shared ~900-token prefix ×6) **1341 ms**; ARM B control (six prefixes differing from token 0) **1254 ms**. Shared is **6.9% slower**.
+
+**Before designing anything I checked that number against the only noise measurement we have.** @fc8b5d97 re-ran a **byte-identical binary on the same machine 75 minutes later**: 33.415 → 30.151 tok/s, **9.8% drift from background load alone.**
+
+> **OUR MEASUREMENT NOISE (9.8%) IS LARGER THAN OUR MEASURED EFFECT (6.9%). SO "PREFIX CACHING MAKES IT SLOWER" IS NOT A CLAIM WE ARE ENTITLED TO MAKE.**
+
+- **D150:** the panel reports **"no effect detected"**, never "slower". **Rendering the 6.9% as a finding would be the exact error we spent the night catching — a real number, correctly computed, meaning something it does not mean.** It would also be *more* interesting than the truth, which is precisely why it must be resisted (D107). The 6.9% appears only inside the noise band, where its being smaller than the band is the point.
+
+### 51.2 🔒 D151 — THE DETECTION FLOOR IS THE HERO, NOT THE RESULT
+
+A null result is worthless without evidence the test could have found the effect. Prefill is ~90% of long-prompt TTFT, so a working cache collapses **1380 ms → ~140 ms: an 89.9% drop.**
+
+**That is the number that gets the largest type on the card.** It converts *"we didn't see it"* into *"it is not there"* — the difference between an absence of evidence and evidence of absence, and the only honest basis for the claim.
+
+```
+┌─ EXPERIMENT · recorded, not live ────────────────────────────┐
+│                                                              │
+│  Does prefix caching reduce time-to-first-token?             │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │              NO EFFECT DETECTED                        │  │
+│  │  This test could detect a 90% improvement.             │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│   shared prefix ×6   ████████████████████████ 1341 ms        │
+│   control, no sharing████████████████████████ 1254 ms        │
+│   ░░░░░░░ measurement noise on this machine: ±9.8% ░░░░░░░   │
+│                                                              │
+│   ▚▚▚▚▚▚▚▚▚▚ where a working cache would land ▚▚▚▚▚▚▚▚▚▚     │
+│   ~140 ms  ▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚     │
+│                                                              │
+│   Recorded 2026-07-30 00:12 · n=20 · reproduce:              │
+│   $ ./scripts/prefix-control.sh --arms both --n 20           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- **D151:** **the two observed bars must be drawn on the same axis as the hatched target region, and must conspicuously fail to reach it.** A visitor should see the gap before reading a word. **Two bars alone say "these are about the same" — which is *un*convincing, because that is also what a broken test looks like.** The target region is what makes the flatness meaningful.
+
+### 51.3 🔒 D152 — THIS IS THE ONLY RECORDED PANEL ON A PAGE THAT OTHERWISE RE-MEASURES, AND THAT MUST BE UNMISSABLE
+
+Every other panel polls. **This one cannot** — it needs a controlled 20-request protocol that would take a minute and perturb everything else. So it ships **recorded**, and the honesty footer's own argument (*a stored baseline is a claim about a machine that no longer exists*) applies to us.
+
+- **D152:** the card carries a **different chrome from every live panel**: no connection dot, no cadence chip, no `ˢ`/`ᴰ` badge, and a persistent **`recorded · <timestamp>`** in the header. **Per D142 this distinction cannot be colour** — it is the *presence of a timestamp* and the *absence of the live dot*, both structural.
+- **Its `source` is `simulated`? No — `measured`, with `observedAtMs` far in the past.** The field envelope already carries exactly the right vocabulary for this and it should be used rather than invented: **a recorded measurement is a `stale` measurement with an honest age**, which is the case §21's `stale` treatment exists for. **The most rigorous panel on the page renders in the state we built for staleness, and that is correct, not a demotion.**
+
+### 51.4 D153–D154 — TWO THINGS THE PANEL MUST NOT DO
+
+- **D153: it must not name a single banned field.** No `prefix_cache_hits`, `_lookups`, `_hit_rate`, `prefix_hashes` — the tripwire (`prefix-counters-forbidden.test.js`) covers modules, and this panel's copy is where the names would most naturally creep back, because the panel is *about* prefix caching. **The panel discusses the mechanism and reports TTFT; it never reports a counter.** The counter is the thing that lied.
+- **D154: it must not editorialise about the runtime.** *"onnxruntime-genai can't do this either"* is not on the page. **We measured our own engine and found a gap in our own engine.** A null result about ourselves is credible precisely because it costs us something; the moment it is turned into a competitive claim it becomes marketing and the credibility is spent.
+
+### 51.5 🔒 D155 — WHY THIS PANEL IS THE THESIS, STATED FOR THE README
+
+- **D155:** **anyone can ship a number going up. Almost nobody ships the experiment that didn't work, next to the control proving the test could have detected it.** Every other panel asks the visitor to trust that we would have told them if something were wrong. **This one is the proof that we would** — and it costs us a headline feature to make. **It should be the panel we point at first, not the one we bury at the bottom.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D150 | Headline is "no effect detected", never "7% slower" | Machine noise (9.8%) exceeds the effect (6.9%); the interesting reading is the unearned one |
+| D151 | The 90% detection floor gets the largest type; bars share an axis with the hatched target | Two flat bars are also what a broken test looks like; the target makes flatness mean something |
+| D152 | Recorded chrome: no live dot, persistent timestamp, renders via `stale` with honest age | It is the one panel that cannot re-measure, on a page whose thesis is re-measuring |
+| D153 | Discusses the mechanism, reports TTFT, names no counter | The counter is the artifact that lied; this is where the names would creep back |
+| D154 | No competitive claim about other runtimes | A null result is credible because it costs us something; a competitive one costs nothing |
+| D155 | Lead with this panel, don't bury it | It is the only evidence on the page that we report what we'd rather not |
