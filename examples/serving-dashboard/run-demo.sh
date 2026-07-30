@@ -196,7 +196,7 @@ command -v curl >/dev/null 2>&1 || fail "curl is required to check server readin
 require_model "${SCATTER_MODEL}" "static-cache (scatter)" \
   "Continuous batching engages ONLY on static-cache models, so this one drives the batching scenario."
 require_model "${DYNAMIC_MODEL}" "dynamic" \
-  "The paged KV allocator and the prefix cache live on the dynamic path, so this one drives those scenarios."
+  "The paged KV allocator lives on the dynamic path, so this one drives those scenarios."
 require_static_cache "${SCATTER_MODEL}"
 
 # Check the ports BEFORE starting anything, for the same reason the models are
@@ -239,7 +239,7 @@ ONNX_GENAI_EP="${ONNX_GENAI_EP:-cpu}" "${SERVER_BIN}" \
   --enable-debug-endpoints &
 scatter_pid=$!
 
-printf 'starting the dynamic server on :%s (paged KV, prefix caching)\n' "${DYNAMIC_PORT}"
+printf 'starting the dynamic server on :%s (paged KV)\n' "${DYNAMIC_PORT}"
 ONNX_GENAI_EP="${ONNX_GENAI_EP:-cpu}" "${SERVER_BIN}" \
   --model "${DYNAMIC_MODEL}" \
   --model-id qwen-dynamic \

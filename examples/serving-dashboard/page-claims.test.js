@@ -426,3 +426,81 @@ describe('the scenario switcher advertises no cut capability', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// THE LAUNCHER IS THE FIRST PROSE AN OPERATOR EVER READS, AND NOTHING SCANNED
+// IT.
+//
+// `run-demo.sh` is one of the most-tested files in this repository. SIX suites
+// read it -- check-launcher, check-cli-flags, check-endpoint-registration,
+// check-launch-command, scenario-origins, scenario-switcher -- and every one
+// of them tests MECHANISM: that it launches the servers the README promises,
+// that every launch passes --demo-assets-dir, that the value is absolute.
+//
+// NOT ONE TESTED PROSE. And the three claim-scanners above read index.html,
+// scenario-origins.js and demo-ux.md -- run-demo.sh was not among them. So the
+// most-tested file in the repository had its entire operator-facing surface
+// unexamined, because COVERAGE IS COUNTED PER FILE AND CLAIMS LIVE PER
+// SENTENCE. A file can be exhaustively tested and still make an unchecked
+// promise.
+//
+// That gap let the launcher advertise `?scenario=prefix-cache` as one of three
+// co-equal headline URLs while scenario-origins.js went to deliberate lengths
+// to make that id unaddressable -- keyed with no `id:` field, with a comment
+// saying it MUST NOT BE ADDRESSABLE. THE CUT WAS ENFORCED IN JAVASCRIPT AND
+// UNDONE IN BASH. A decision is only as enforced as its least-audited
+// language, and every instrument we own is single-language.
+//
+// SCOPE: OPERATOR-VISIBLE LINES ONLY -- comments are stripped first. That
+// restriction is the whole design, and it is the same claim-versus-explanation
+// split used for demo-ux.md above. The launcher MUST keep discussing prefix
+// reuse: its banner carries the null result, which is the strongest thing we
+// can say on the subject. Banning the words would forbid the honest treatment
+// along with the dishonest one, and would delete the disclosure that replaced
+// the bad link. So a mention is allowed EXACTLY WHEN it carries its own
+// withdrawal.
+const LAUNCHER = fileURLToPath(new URL('./run-demo.sh', import.meta.url));
+const launcher = readFileSync(LAUNCHER, 'utf8');
+
+// A capability claim: prefix caching named as a thing this server DOES.
+const PREFIX_CLAIM = /prefix[-\s]?cach|prefix reuse/i;
+// Language that withdraws the claim in the same breath.
+const WITHDRAWAL = /\bno\b|deliberately|measured|absent|cut\b|not\b|never\b/i;
+
+describe('the launcher does not advertise what the page refuses to serve', () => {
+  const operatorLines = launcher
+    .split('\n')
+    .map((text, i) => ({ text, line: i + 1 }))
+    .filter(({ text }) => !/^\s*#/.test(text));
+
+  it('actually read the launcher', () => {
+    // Guards the guard. A wrong path or a renamed file would yield zero lines,
+    // zero offenders and a confident PASS -- a scan that cannot fail. This is
+    // the vacuity failure that has bitten this branch repeatedly: a check that
+    // stopped looking and a check that found nothing print the same green.
+    assert.ok(
+      operatorLines.length > 50,
+      `Expected to read run-demo.sh; got ${operatorLines.length} non-comment ` +
+        'lines. The file was renamed, moved, or this path is wrong -- and a ' +
+        'zero-line scan would otherwise PASS while checking nothing.',
+    );
+  });
+
+  it('never presents prefix caching as a live capability', () => {
+    const offenders = operatorLines
+      .filter(({ text }) => PREFIX_CLAIM.test(text) && !WITHDRAWAL.test(text))
+      .map(({ text, line }) => `run-demo.sh:${line} -> ${text.trim()}`);
+
+    assert.deepEqual(
+      offenders,
+      [],
+      'The launcher tells an operator this build does prefix caching. It does ' +
+        'not: the counter fires on every request including controls that share ' +
+        'no prefix, so the scenario was cut.\n' +
+        'THE FIX IS NOT TO DELETE THE SUBJECT. The banner\'s null-result ' +
+        'paragraph is the honest treatment and passes this check, because it ' +
+        'carries its own withdrawal. Say what was measured, or say nothing.\n' +
+        `FOUND:\n  ${offenders.join('\n  ')}`,
+    );
+  });
+});
