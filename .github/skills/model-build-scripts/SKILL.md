@@ -100,7 +100,10 @@ shellcheck -x scripts/build_qwen.sh scripts/lib/mobius_env.sh
 ## Which model does the demo need?
 
 `STATIC_CACHE=1` produces `models/qwen2.5-0.5b-scatter`, whose graph contains
-`TensorScatter` and pre-allocated `key_cache.N`/`value_cache.N` inputs. Only
-these `-scatter` static-cache models engage continuous batching; a plain
-dynamic-cache model silently falls back to the per-request path. If a batching
-panel reads flat, check the model before debugging anything else.
+`TensorScatter` and pre-allocated `key_cache.N`/`value_cache.N` inputs. These
+`-scatter` static-cache models are the route this repo uses to engage continuous
+batching; a plain dynamic-cache model falls back to the per-request path. If a
+batching panel reads flat, check the model before debugging anything else — but
+read the driver's logged reason rather than concluding the model is dynamic-cache,
+since a shared-buffer model missing `max_len`, a zero `max_batch`, or an absent ORT
+decoder session all fall back too. See `.github/skills/build-static-cache-model`.

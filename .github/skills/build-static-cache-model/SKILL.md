@@ -7,9 +7,41 @@ description: Build a loadable static-cache (TensorScatter) ONNX model for onnx-g
 
 ## Why this exists
 
-Continuous batching in `onnx-genai` engages **only for static-cache models**. The gate is in `crates/onnx-genai-server/src/driver.rs:407-421` — `continuous_batch_manager(max_batch).is_ok()` succeeds only when the model exposes a static KV cache. Dynamic-cache models silently fall back to the per-request path.
+Continuous batching in `onnx-genai` is decided by `Engine::continuous_batch_manager`
+in `crates/onnx-genai-engine/src/batched.rs`. It succeeds for **two** kinds of
+model, and the shipped refusal message names both:
 
-So if you are benchmarking or demonstrating batching, you need a static-cache model — and the obvious ways to produce one currently give you a model that will not load.
+```
+continuous batching requires a STATIC-CACHE or shared-buffer past/present model
+```
+
+1. A **static-cache** model (`ModelDecodePath::StaticCache`) — what this skill builds.
+2. A **shared-buffer past/present** model (`shared_buffer: true`) with a known `max_len`.
+
+**Batch capability is a property of (model, execution provider, launch), not of a
+model directory.** The `shared_buffer` flag is resolved by
+`supports_fixed_capacity_present_binding()` — an execution-provider capability plus
+an explicit opt-in — so *the same model on the same disk* can batch or not depending
+on how the server was launched. You cannot predict batching by reading
+`inference_metadata.yaml`.
+
+Two corollaries worth holding onto, because getting them backwards has cost real
+debugging time here:
+
+- **Batching not engaging does not mean the model is dynamic-cache.** A
+  `shared_buffer: true` model with `max_len: None` reaches the *capable* arm and
+  then fails on missing metadata — it was never judged unqualified. It is one of
+  several non-capability failures (zero `max_batch`, absent ORT decoder session,
+  session construction failure) that land in the same place. `driver.rs` states the
+  rule directly: *"Neither implies the other, in either direction."*
+- **Read the reason, do not infer it.** The driver keeps the error in
+  `BatchDriver::PerRequest { reason }` precisely so the log tells you which of these
+  happened. An earlier version discarded it with `.is_ok()`; do not reintroduce that
+  and do not document it.
+
+Building a static-cache model is a *sufficient* way to get batching, not the only
+one — and it is the route this skill covers, because the obvious ways to produce one
+currently give you a model that will not load.
 
 ## Symptom → diagnosis
 

@@ -1291,8 +1291,135 @@ test('shared-buffer batching is still gated on an execution-provider capability,
   );
 });
 
-// This guard exists because of a specific, embarrassing failure: a server-side
-// fix (`1e1b2a82`) landed ONE COMMIT before documentation describing the
+// WHY THIS GUARD EXISTS, AND WHY IT IS A *CORPUS* WIDENING RATHER THAN A NEW
+// MECHANISM.
+//
+// Everything above pins the two-qualifying-classes claim in `README.md`, and it
+// pins it well -- including the sentence that batch capability is a property of
+// (model, EP, launch) and NOT of a model directory. All of it was green while
+// `.github/skills/build-static-cache-model/SKILL.md` said the opposite in its
+// first paragraph: that batching engages "only for static-cache models", gated
+// by a `.is_ok()` call that `1e1b2a82` had already removed, cited to a line
+// range holding an unrelated function.
+//
+// The assertions were never wrong. The FILE SET was. This checker had never
+// opened `.github/skills`, so the claim was pinned in the document humans read
+// and unpinned in the documents AGENTS read -- which are instructions, acted on
+// without a second reader. A skill file is the highest-leverage place in the
+// repo to be wrong.
+//
+// Scope is deliberately narrow: this asserts only the mutual-exclusivity claim,
+// because that is the one the Rust source contradicts outright. It is not a
+// general prose linter.
+function shippedSkillDocs() {
+  // `:(top)` and `--full-name` are both load-bearing, and their absence is why
+  // the anti-vacuity floor below exists -- each was wrong on a separate run of
+  // this guard. `git ls-tree <ref> -- <path>` resolves the pathspec relative to
+  // CWD and prints names relative to CWD, and this file runs from
+  // examples/serving-dashboard: without `:(top)` the pathspec silently matched
+  // `examples/serving-dashboard/.github/skills` and returned NOTHING, so every
+  // check below would have passed over an empty corpus. This is the same
+  // root-vs-cwd trap `shippedFromRoot` documents for `git show`.
+  const paths = execFileSync(
+    'git',
+    [
+      'ls-tree',
+      '-r',
+      '--full-name',
+      '--name-only',
+      SHIPPING_REF,
+      '--',
+      ':(top).github/skills',
+      ':(top).agents/skills',
+    ],
+    { cwd: HERE, maxBuffer: 16 * 1024 * 1024 },
+  )
+    .toString()
+    .split('\n')
+    .filter((p) => p.endsWith('SKILL.md'));
+  return paths.map((path) => ({ path, body: shippedFromRoot(path) }));
+}
+
+test('no agent-facing skill doc claims static-cache is the ONLY way to get batching', () => {
+  const docs = shippedSkillDocs();
+
+  // ANTI-VACUITY FLOOR. Without this, a rename of the skill trees -- or the
+  // `ls-tree` pathspec silently matching nothing, which is EXACTLY what it did
+  // on the first run of this guard -- turns every assertion below into a loop
+  // over an empty array and reports GREEN. An empty corpus satisfies a
+  // universal claim about its members, and that is the defect this guard was
+  // written in response to.
+  assert.ok(
+    docs.length >= 10,
+    `expected at least 10 SKILL.md files under the skill trees at ${SHIPPING_REF}, ` +
+      `found ${docs.length}. A short corpus makes the checks below vacuously ` +
+      'true, which is how the original defect survived.',
+  );
+
+  // Not an inventory of expected files -- a requirement that the corpus contain
+  // the ONE doc whose entire subject is this claim. A guard about static-cache
+  // claims that does not read the static-cache skill is decorative.
+  const SUBJECT_DOC = '.github/skills/build-static-cache-model/SKILL.md';
+  assert.ok(
+    docs.some((d) => d.path === SUBJECT_DOC),
+    `${SUBJECT_DOC} is not in this guard's corpus. That is the document whose ` +
+      'subject IS the batching gate, and it is where the false claim was found.',
+  );
+
+  // The claim is false because of THIS arm, so anchor to it rather than to
+  // prose: if `shared_buffer: true` ever stops qualifying, static-cache really
+  // does become the only route and these docs become correct again.
+  const managerBody = continuousBatchManagerBody();
+  assert.ok(
+    /shared_buffer:\s*true/.test(managerBody),
+    '`continuous_batch_manager` no longer has a qualifying `shared_buffer: true` ' +
+      'arm. If static-cache is now genuinely the ONLY path to continuous ' +
+      'batching, this guard is obsolete and the skill docs it polices were ' +
+      'right all along -- delete it deliberately rather than loosening it.',
+  );
+
+  // Each pattern states what is wrong with it, because a skill doc is read by
+  // someone who is already lost.
+  const FALSE_EXCLUSIVITY = [
+    {
+      re: /engages\s+\*\*only for static-cache models\*\*|only for static-cache models/i,
+      why: 'a shared-buffer past/present model with a known max_len also qualifies',
+    },
+    {
+      re: /\bOnly\s+these\s+`?-scatter`?\s+static-cache models engage continuous batching/i,
+      why: 'a shared-buffer past/present model also engages it',
+    },
+    {
+      re: /continuous_batch_manager\([^)]*\)\.is_ok\(\)/,
+      why: '`1e1b2a82` replaced `.is_ok()` with a match that keeps the reason in ' +
+        '`BatchDriver::PerRequest { reason }`; documenting `.is_ok()` describes a ' +
+        'mechanism that no longer exists and implies the reason is unavailable',
+    },
+  ];
+
+  const offenders = [];
+  for (const { path, body } of docs) {
+    for (const { re, why } of FALSE_EXCLUSIVITY) {
+      const hit = body.match(re);
+      if (hit) offenders.push(`  ${path}: ${JSON.stringify(hit[0])}\n      -> ${why}`);
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'an agent-facing skill doc states that continuous batching requires a ' +
+      'static-cache model, or describes a gate that was removed:\n' +
+      `${offenders.join('\n')}\n` +
+      'batched.rs refuses with "continuous batching requires a STATIC-CACHE or ' +
+      'shared-buffer past/present model" -- TWO classes qualify, and which one ' +
+      'applies depends on the execution provider and launch flags, not on the ' +
+      'model directory. A skill doc is executed as instruction, so this sends an ' +
+      'agent to rebuild a model when the real fix may be an environment variable.',
+  );
+});
+
+
 // behaviour it removed. The prose was false the moment it was committed, the
 // suite was green throughout, and the existing checker -- which pins the
 // quoted log MESSAGE -- stayed green, because the message did not change. Only
