@@ -2481,3 +2481,42 @@ This also **removes the failure mode the fifth state was created to prevent**, r
 |---|---|---|
 | D89 | `not-applicable` is primarily a PANEL-level state: header retained, body replaced by the explanation, no em-dash | Its cause is structural, so it's never mixed within a panel. At field level it could only differ from `unavailable` by decoration — which is why they kept nearly collapsing. Different scopes cannot be confused |
 | D90 | Choose a treatment's SCOPE before its appearance | Second time today the same error (D83's lane). Layout answers questions decoration cannot |
+
+---
+
+## 32. 🔴 D65 REVERSED — `measured` IS RESTORED. AND MY CONCESSION WAS ITSELF AN ERROR.
+
+@12e42da8's final ruling reinstates `measured`, `observedAtMs`, and the three attribution keys. **§21.1 and D65 — where I conceded `ok` — are WRONG and superseded by this section.** Anyone reading §21 in isolation would build the wrong enum.
+
+**FINAL: `state: 'measured' | 'pending' | 'stale' | 'unavailable' | 'not-applicable'`.**
+
+### 32.1 Why the reversal is right, and why my concession wasn't
+
+I conceded because the orthogonality argument is clean: `state: 'measured'` beside `source: 'estimated'` looks like a field contradicting itself. **The counter-argument is better and I did not find it:**
+
+> **A reviewer seeing `state: 'ok', value: 0` reads "ok" as "fine" and is tempted to hide it. `measured` makes a genuine zero obviously load-bearing.**
+
+**That is a safety property, not a naming preference** — and it defends the single hardest case in this design, the honest zero we have fought for all day. `ok` is a *verdict*; `measured` is a *provenance claim*, and provenance claims are what this envelope exists to carry.
+
+And the contradiction I capitulated to dissolves under the Lead's definition: **`state` means "do we have a real value from its stated source." It does not claim the source was an instrument.** `source` remains the sole answer to where it came from. `{ state: 'measured', source: 'estimated' }` reads correctly — *we really do have the estimate*.
+
+### 32.2 The error worth recording: I conceded gracefully but not correctly
+
+I have spent this session telling other people to check the specific thing rather than trusting the rule. **Then I accepted a well-formed argument against my own position without looking for its counter — precisely because it was well-formed, and because conceding felt like good practice.**
+
+> **DEFERENCE IS A FAILURE MODE TOO. Conceding gracefully is not the same as conceding correctly.**
+
+Three people who disagreed with the ruling — @376a0297, @bb2ee824, and by implication @c8d9a40e's committed code — found the counter I didn't. **The person best placed to defend a design is its author, and I stopped defending mine one exchange too early.** Worth remembering next time I'm complimented on changing my mind: a reversal is only valuable if it's *correct*, and "I reversed myself" is not by itself evidence of rigour. It's the same trap as the safeguard being where the bug hides — **I audited everyone's reasoning except the reasoning that made me feel reasonable.**
+
+### 32.3 ⚠️ §31 SUPERSEDES §21 FOR `not-applicable` — the Lead is citing the older section
+
+@12e42da8's ruling describes `not-applicable` as *"em-dash + a VISIBLE CAPTION, not a hover."* That was §21, and **§31 (published minutes later, after @c0de4c2e's push) revises it: `not-applicable` is a PANEL-LEVEL state with NO EM-DASH AT ALL.** The panel keeps its header and frame, and its body is replaced by the explanation.
+
+**The Lead's stated rule is preserved exactly and served better** — *"a fact nobody hovers over is a fact nobody learns, and this is the one we most want read"* is the reason the explanation moves out of the value slot entirely rather than sitting beside an em-dash. **An em-dash still leads with "nothing here."** Under §31 there is no absence glyph to scan past.
+
+The field-level em-dash-plus-caption survives only for the rare mixed case (a single structurally-pinned field inside a live panel, e.g. `preemptions_total`, D83). **@bb2ee824, @c8d9a40e: build §31, not §21.** If the Lead prefers §21, say so and I'll revert — but §31 is what the collapse-test answer was built on.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D91 | `measured` restored; **D65 reversed** | `ok` is a verdict, `measured` is a provenance claim. `state:'ok', value:0` invites hiding the zero — a safety property, not naming taste |
+| D92 | Deference is a failure mode; a concession needs the same audit as an assertion | I accepted a clean argument without seeking its counter, because conceding felt like good practice. The people who disagreed found it |
