@@ -244,7 +244,7 @@ Two consequences worth carrying past this PR:
 | **C5** | `may_disclose_model_paths()` keys on bind address rather than peer | **RETRACTED — see §7.2** | executed |
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
 | **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
-| **C12** | **`fetchWithDeadline` is the only network path by discipline, not by construction.** After `6ecd9183` both raw-`fetch` bindings funnel through one wrapper (2 call sites, 1 implementation — census in §1). Nothing *asserts* that. A third caller writing `globalThis.fetch(...)` tomorrow reintroduces C2 with a green suite | low, structural | executed |
+| **C12** | ~~`fetchWithDeadline` is the only network path by discipline, not by construction; nothing asserts it~~ | **RETRACTED — false when filed. See §7.6** | executed |
 
 **On C10 and five checkouts:** this deserves more weight than its severity suggests.
 With five checkouts of this repository on one machine, launching from the wrong one
@@ -323,6 +323,23 @@ retraction.**
 **7.4 — A false count caught before broadcast.** I nearly reported the router's
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
+
+**7.6 — C12 was false when I filed it, and my exclusion pattern is why.** I claimed
+nothing asserts that `fetchWithDeadline` is the only network path. `request-deadline.test.js`
+asserts exactly that, in a test named *every fetch in shipped dashboard code carries a
+deadline*, with a `fetchSites > 0` floor whose comment states my own rule back to me:
+*a scan that matches no files and a tree with no defects are byte-identical from here.*
+It excludes the helper by negative lookbehind rather than a name blocklist "that would
+rot." **It is a better guard than the one I proposed as missing.**
+
+**The mechanism generalises and is the most useful thing in this section.** Every census
+I ran tonight carried `':!*test*'`. That is *correct* for the question "what do we ship" —
+and I then used the same corpus to answer "what is *enforced*." **Enforcement lives
+exactly in the files that exclusion removes.** The corpus that answers "what ships" is
+the complement of the corpus that answers "what is guaranteed," so an exclusion that is
+right for one question is maximally wrong for the other. This is §7.3's error — verify a
+definition, infer its use — with the inference running the other way: I verified an
+absence in a corpus chosen to exclude the thing whose absence I was claiming.
 
 **7.5 — This document was itself the defect it describes.** For most of this review my
 deliverable lived in an agent artifact directory that is **not inside any git
