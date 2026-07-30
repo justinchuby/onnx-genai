@@ -647,11 +647,14 @@ pub(crate) async fn debug_kv_blocks(
     // dangerous. A client cannot be expected to know that.
     match telemetry.applicability() {
         onnx_genai_engine::Applicability::NotApplicable => {
-            return Ok(Json(BlockTableResponse::not_applicable(
-                model_id,
-                "this model uses continuous batching, which is mutually exclusive \
-                 with paged KV; the page pool exists but the decoder never uses it",
-            )));
+            // The wording comes from the reason the driver recorded, not from a
+            // constant here. More than one fact reaches this state, and a
+            // hardcoded sentence would name continuous batching even on a model
+            // whose KV cache simply cannot page.
+            let detail = telemetry
+                .not_applicable_reason()
+                .map_or("this model does not use paged KV", |reason| reason.detail());
+            return Ok(Json(BlockTableResponse::not_applicable(model_id, detail)));
         }
         // The driver picks the decode path asynchronously at startup, so a poll
         // can genuinely arrive before the answer exists. Saying "pending" costs

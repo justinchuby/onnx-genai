@@ -83,6 +83,48 @@ pub struct KvTelemetry {
     /// batching model every counter here is a truthful reading of a pool that
     /// is never consulted.
     applicability: AtomicU8,
+    /// Why `applicability` is `NotApplicable`. Meaningless in any other state.
+    ///
+    /// Separate from `applicability` because that is stored as a plain `as u8`
+    /// discriminant and so cannot carry a payload. Kept in lockstep by the fact
+    /// that the only way to reach `NotApplicable` is
+    /// [`set_not_applicable`](KvTelemetry::set_not_applicable), which demands a
+    /// reason.
+    not_applicable_reason: AtomicU8,
+}
+
+/// Why a paged pool is not the mechanism in play.
+///
+/// Two genuinely different facts reach the same `NotApplicable` state, and they
+/// have different explanations. Reporting one wording for both would state the
+/// wrong mechanism with full confidence -- the failure this module's
+/// [`Applicability`] tri-state was introduced to stop, one level down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KvNotApplicable {
+    /// The decoder batches continuously, which is mutually exclusive with
+    /// paged KV. The pool is fully allocated and simply never consulted.
+    ContinuousBatching = 0,
+    /// This engine's KV cache owns no paged tensor storage, so its page table
+    /// keeps bookkeeping the decoder can never use.
+    CacheCannotPage = 1,
+}
+
+impl KvNotApplicable {
+    /// The client-facing explanation. Owned here, beside the variant, so a new
+    /// cause cannot be added without its wording.
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::ContinuousBatching => {
+                "this model uses continuous batching, which is mutually exclusive \
+                 with paged KV; the page pool exists but the decoder never uses it"
+            }
+            Self::CacheCannotPage => {
+                "this model's KV cache holds no paged tensor storage, so the page \
+                 table is bookkeeping the decoder never consults"
+            }
+        }
+    }
 }
 
 /// Packs a page's mutable state into one atomic word so a reader gets a
@@ -141,18 +183,43 @@ impl KvTelemetry {
         self.page_size.store(page_size, Ordering::Relaxed);
     }
 
-    /// Declares whether this pool is the one the decoder actually uses.
+    /// Declares that this pool *is* the one the decoder uses.
     ///
     /// Must be set by whoever knows the decode path -- which is only knowable
     /// once the driver has chosen one, so this is set asynchronously at
     /// startup.
-    pub fn set_applicable(&self, applicable: bool) {
-        let state = if applicable {
-            Applicability::Applicable
-        } else {
-            Applicability::NotApplicable
-        };
-        self.applicability.store(state as u8, Ordering::Relaxed);
+    pub fn set_applicable(&self) {
+        self.applicability
+            .store(Applicability::Applicable as u8, Ordering::Relaxed);
+    }
+
+    /// Declares that this pool is *not* the mechanism in play, and why.
+    ///
+    /// The reason is required rather than optional on purpose. There is more
+    /// than one way to reach this state and they have different explanations,
+    /// so a caller that could omit the reason would be choosing, silently,
+    /// whichever wording happened to be hardcoded downstream.
+    pub fn set_not_applicable(&self, reason: KvNotApplicable) {
+        self.not_applicable_reason
+            .store(reason as u8, Ordering::Relaxed);
+        // Release, paired with the Acquire in `not_applicable_reason()`: a
+        // reader that observes `NotApplicable` must also observe the reason
+        // stored just above it. Under Relaxed it could see the new state with
+        // the default reason and report the wrong mechanism -- which is the
+        // precise bug this enum exists to prevent, reintroduced as a data race.
+        self.applicability
+            .store(Applicability::NotApplicable as u8, Ordering::Release);
+    }
+
+    /// Why this pool is not in play, or `None` unless it is `NotApplicable`.
+    pub fn not_applicable_reason(&self) -> Option<KvNotApplicable> {
+        if self.applicability.load(Ordering::Acquire) != Applicability::NotApplicable as u8 {
+            return None;
+        }
+        match self.not_applicable_reason.load(Ordering::Relaxed) {
+            1 => Some(KvNotApplicable::CacheCannotPage),
+            _ => Some(KvNotApplicable::ContinuousBatching),
+        }
     }
 
     /// Whether these counters describe a mechanism that is actually in play.
@@ -953,13 +1020,70 @@ mod tests {
     #[test]
     fn classifying_a_pool_moves_it_off_unknown_in_both_directions() {
         let paged = KvTelemetry::default();
-        paged.set_applicable(true);
+        paged.set_applicable();
         assert_eq!(paged.applicability(), Applicability::Applicable);
         assert!(paged.is_applicable());
+        assert_eq!(
+            paged.not_applicable_reason(),
+            None,
+            "an applicable pool has no reason for not applying"
+        );
 
         let batching = KvTelemetry::default();
-        batching.set_applicable(false);
+        batching.set_not_applicable(KvNotApplicable::ContinuousBatching);
         assert_eq!(batching.applicability(), Applicability::NotApplicable);
         assert!(!batching.is_applicable());
+    }
+
+    /// The two causes of `NotApplicable` must not share one explanation.
+    ///
+    /// Before this, the block-table route hardcoded the continuous-batching
+    /// sentence for every `NotApplicable` pool. A model whose KV cache simply
+    /// holds no paged tensors would have been told, with total confidence, that
+    /// it was using a batching mechanism it may not have. A wrong mechanism
+    /// stated fluently is worse than no explanation: it terminates the reader's
+    /// inquiry.
+    #[test]
+    fn each_cause_of_not_applicable_explains_itself_differently() {
+        let batching = KvTelemetry::default();
+        batching.set_not_applicable(KvNotApplicable::ContinuousBatching);
+        let unpaged = KvTelemetry::default();
+        unpaged.set_not_applicable(KvNotApplicable::CacheCannotPage);
+
+        assert_eq!(
+            batching.not_applicable_reason(),
+            Some(KvNotApplicable::ContinuousBatching)
+        );
+        assert_eq!(
+            unpaged.not_applicable_reason(),
+            Some(KvNotApplicable::CacheCannotPage)
+        );
+
+        let batching_detail = KvNotApplicable::ContinuousBatching.detail();
+        let unpaged_detail = KvNotApplicable::CacheCannotPage.detail();
+        assert_ne!(
+            batching_detail, unpaged_detail,
+            "two different facts must not be reported with one sentence"
+        );
+        assert!(
+            !unpaged_detail.contains("continuous batching"),
+            "a cache that cannot page must not be explained as batching: {unpaged_detail}"
+        );
+        assert!(
+            batching_detail.contains("continuous batching"),
+            "the batching cause must still name batching: {batching_detail}"
+        );
+    }
+
+    /// `Unknown` carries no reason, so a reader cannot render an explanation
+    /// for a state that has not been decided yet.
+    #[test]
+    fn an_undecided_pool_offers_no_explanation_to_render() {
+        let telemetry = KvTelemetry::default();
+        assert_eq!(
+            telemetry.not_applicable_reason(),
+            None,
+            "a pending pool must not hand out the default reason"
+        );
     }
 }

@@ -8,8 +8,8 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError,
-    EngineResourceGovernor, FimConfig, GovernorSnapshot, KvTelemetry, PipelineEngine,
-    PipelineGenerateRequest, ResourceLimit,
+    EngineResourceGovernor, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
+    PipelineEngine, PipelineGenerateRequest, ResourceLimit,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -520,6 +520,66 @@ impl EngineDriver {
     }
 }
 
+/// What to publish about a paged pool once the decode path is known.
+///
+/// Extracted so the rule has exactly one home. Both driver arms route through
+/// it, and it is total over its two inputs, so there is no combination that
+/// falls through to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvApplicabilityDecision {
+    Applicable,
+    NotApplicable(KvNotApplicable),
+}
+
+impl KvApplicabilityDecision {
+    fn apply(self, telemetry: &KvTelemetry) {
+        match self {
+            Self::Applicable => telemetry.set_applicable(),
+            Self::NotApplicable(reason) => telemetry.set_not_applicable(reason),
+        }
+    }
+}
+
+/// Decide whether a paged pool is the mechanism actually in play.
+///
+/// Applicability is a CONJUNCTION of two independent facts, and the bug this
+/// replaces used the second alone as a proxy for both:
+///
+///   1. `paged` -- the pool can hold KV tensors at all. Reported by the attach,
+///      never inferred.
+///   2. `!continuous_batch_supported` -- the paged path is the one that will
+///      run. Continuous batching and paged KV are mutually exclusive.
+///
+/// **Neither implies the other, in either direction.**
+///
+/// Fact 2 alone was the shipped bug. `continuous_batch_manager` also fails when
+/// `max_batch` is zero, when the ORT decoder session is absent, and when the
+/// batched session cannot be constructed -- none of which say anything about
+/// KV -- so `!continuous_batch_supported` converts any of those into a positive
+/// claim that paged KV is in play. That is a capability derived from the
+/// absence of a different capability, which is never sound.
+///
+/// Fact 1 alone is just as wrong the other way: on the batching path the pool
+/// is fully tensor-backed, so `paged` is `true` while the decoder never
+/// consults it. Reporting that pool as applicable would render a structure that
+/// can never move as one that is merely idle.
+///
+/// `paged` is checked first because it is the stronger claim: a cache that
+/// cannot page is not paging *regardless* of which decode path runs, so
+/// naming the decode path in that case would explain the wrong mechanism.
+pub(crate) fn classify_kv_applicability(
+    paged: bool,
+    continuous_batch_supported: bool,
+) -> KvApplicabilityDecision {
+    if !paged {
+        KvApplicabilityDecision::NotApplicable(KvNotApplicable::CacheCannotPage)
+    } else if continuous_batch_supported {
+        KvApplicabilityDecision::NotApplicable(KvNotApplicable::ContinuousBatching)
+    } else {
+        KvApplicabilityDecision::Applicable
+    }
+}
+
 fn run_engine_driver(
     owner: EngineOwner,
     rx: mpsc::Receiver<DriverCommand>,
@@ -532,23 +592,20 @@ fn run_engine_driver(
         EngineBackend::Pipeline(mut pipeline) => {
             // A pipeline decoder pages only when its KV can be paged; the
             // accessor reports which, so we never claim applicability we
-            // haven't checked.
+            // haven't checked. A pipeline never batches continuously, so the
+            // second fact is a constant here rather than an inference.
             let paged = pipeline.attach_kv_telemetry(Arc::clone(&kv_telemetry));
-            kv_telemetry.set_applicable(paged);
+            classify_kv_applicability(paged, false).apply(&kv_telemetry);
             run_pipeline_driver(&mut pipeline, rx);
             return;
         }
     };
     let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
 
-    // Continuous batching and paged KV are mutually exclusive. On the batching
-    // path the paged pool still exists and still reports a real capacity -- it
-    // is simply never used, so every reading from it would describe a mechanism
-    // that is not in play. Attach either way so the numbers stay truthful, but
-    // mark applicability so a client renders "not applicable" instead of an
-    // idle pool that looks merely quiet.
-    engine.attach_kv_telemetry(Arc::clone(&kv_telemetry));
-    kv_telemetry.set_applicable(!continuous_batch_supported);
+    // Attach either way. The pool's capacity is a real number even when the
+    // mechanism is inactive; what must not be guessed is whether it will move.
+    let paged = engine.attach_kv_telemetry(Arc::clone(&kv_telemetry));
+    classify_kv_applicability(paged, continuous_batch_supported).apply(&kv_telemetry);
 
     if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");

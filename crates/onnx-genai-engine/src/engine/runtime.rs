@@ -271,8 +271,34 @@ impl Engine {
     /// updated incrementally at the pool's mutation sites and read from any
     /// thread, so a KV panel can move *during* generation, which is the only
     /// time paged-KV behaviour is worth watching.
-    pub fn attach_kv_telemetry(&mut self, telemetry: std::sync::Arc<onnx_genai_kv::KvTelemetry>) {
+    ///
+    /// Returns `false` when this engine's KV cannot page, mirroring
+    /// [`Pipeline::attach_kv_telemetry`](crate::Pipeline::attach_kv_telemetry),
+    /// so a caller can report the panel as not-applicable rather than rendering
+    /// a pool that will never move as one that is merely idle. The pool is
+    /// attached either way: its capacity is a real number, and a client that
+    /// knows the mechanism is inactive can still show it truthfully.
+    ///
+    /// A caller must not infer this from the *absence* of some other
+    /// capability. See [`pages_kv`](Self::pages_kv) for why.
+    pub fn attach_kv_telemetry(
+        &mut self,
+        telemetry: std::sync::Arc<onnx_genai_kv::KvTelemetry>,
+    ) -> bool {
         self.kv_cache.page_table.attach_telemetry(telemetry);
+        self.pages_kv()
+    }
+
+    /// Whether this engine's KV cache can actually hold paged tensors.
+    ///
+    /// This is the same conjunction the paged prefix path itself tests before
+    /// it will touch the page table, and it is deliberately expressed here once
+    /// so a caller cannot drift from it: a `PagedKvCache` built without a KV
+    /// model (see `allocate_kv_cache`) has a page table that does bookkeeping
+    /// but owns no KV storage, so it reports a real capacity that no generation
+    /// will ever consume.
+    pub fn pages_kv(&self) -> bool {
+        self.kv_model.is_some() && self.kv_cache.page_table.tensor_config.is_some()
     }
 
     /// External KV connector activity from the most recent generation.
@@ -1045,11 +1071,7 @@ impl Engine {
                 .filter(|&len| len > 0)
                 .max()
                 .unwrap_or(0);
-        } else if started_empty
-            && state.decode_state.use_kv
-            && self.kv_model.is_some()
-            && self.kv_cache.page_table.tensor_config.is_some()
-        {
+        } else if started_empty && state.decode_state.use_kv && self.pages_kv() {
             let matched = self
                 .prefix_cache
                 .lookup_shared(prompt_tokens, &mut self.kv_cache.page_table);

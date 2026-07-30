@@ -4974,3 +4974,97 @@ fn the_batch_numerator_is_never_read_from_the_http_generation_gauge() {
          denominator it does not belong to"
     );
 }
+
+/// Paged-KV applicability is a conjunction, and the table is total.
+///
+/// The shipped bug read `set_applicable(!continuous_batch_supported)`: a
+/// capability derived from the *absence* of a different capability. Two of the
+/// four rows below distinguish that rule from the correct one, and each fails
+/// it in a different direction, so no single-row test could have caught both.
+#[test]
+fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts() {
+    use crate::driver::{KvApplicabilityDecision, classify_kv_applicability};
+    use onnx_genai_engine::KvNotApplicable;
+
+    // (paged, continuous_batch_supported, expected)
+    let table = [
+        (
+            true,
+            false,
+            KvApplicabilityDecision::Applicable,
+            "a tensor-backed pool on the per-request path is genuinely in play",
+        ),
+        (
+            true,
+            true,
+            KvApplicabilityDecision::NotApplicable(KvNotApplicable::ContinuousBatching),
+            "the pool is real and fully allocated, and the decoder never consults it",
+        ),
+        (
+            false,
+            true,
+            KvApplicabilityDecision::NotApplicable(KvNotApplicable::CacheCannotPage),
+            "a cache that cannot page is not paging, whatever the decode path",
+        ),
+        // THE ROW THE OLD INFERENCE GOT WRONG. `continuous_batch_manager` fails
+        // for reasons that say nothing about KV -- max_batch of zero, an absent
+        // ORT decoder session, a batched session that will not construct -- and
+        // the old rule turned every one of them into a positive claim that
+        // paged KV was in play, on a cache with no paged storage at all.
+        (
+            false,
+            false,
+            KvApplicabilityDecision::NotApplicable(KvNotApplicable::CacheCannotPage),
+            "batching being unavailable is not evidence that paging is available",
+        ),
+    ];
+
+    for (paged, batching, expected, why) in table {
+        assert_eq!(
+            classify_kv_applicability(paged, batching),
+            expected,
+            "paged={paged} continuous_batch_supported={batching}: {why}"
+        );
+    }
+}
+
+/// The decision above must be the only decision.
+///
+/// A test that calls `classify_kv_applicability` directly proves the *rule* and
+/// cannot see whether the driver reaches it -- the same hole that let the AC31
+/// snapshot drain be reordered under a green suite. This reads the driver's own
+/// source and asserts the retired inference is absent from every call site, so
+/// restoring it reddens the build even though the rule itself stays correct.
+#[test]
+fn the_driver_never_derives_kv_applicability_from_the_batch_path() {
+    let source = include_str!("driver.rs");
+
+    // Comment lines are excluded: this file's own doc comment explains the
+    // retired form by quoting it, and a checker that cannot tell a claim from a
+    // quotation fails on its own prose.
+    let offending: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| line.contains("set_applicable") || line.contains("set_not_applicable"))
+        .filter(|line| line.contains("continuous_batch_supported") || line.contains('!'))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "KV applicability is being computed at the call site rather than by \
+         `classify_kv_applicability`; a capability must never be derived from \
+         the absence of another capability: {offending:?}"
+    );
+
+    // Positive control: the assertion above passes trivially if the driver
+    // stopped classifying altogether, which is exactly the silent failure this
+    // guards. Both arms -- pipeline and single-engine -- must route through the
+    // classifier.
+    let routed = source.matches("classify_kv_applicability(").count();
+    assert!(
+        routed >= 3,
+        "expected the classifier's definition plus both driver arms to \
+         reference it, found {routed}; a guard that passes because the code it \
+         guards is gone is worse than no guard"
+    );
+}
