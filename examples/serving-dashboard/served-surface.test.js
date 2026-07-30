@@ -126,18 +126,23 @@ const servedButNotNeeded = classified.filter(
   (entry) => entry.className !== null && entry.className !== 'PAGE_ASSET',
 );
 
-// The ratchet. MEASURED, not chosen: 112 tracked files, 30 of them assets the
-// page loads, 82 served for no reason a visitor benefits from. It may fall. It
+// The ratchet. MEASURED, not chosen: 113 tracked files, 30 of them assets the
+// page loads, 83 served for no reason a visitor benefits from. It may fall. It
 // may never rise. A rise means somebody put another file inside the origin's
 // reach, which is exactly the event nothing else here would report.
 //
-// 82 and not 81 BECAUSE THIS FILE COUNTS ITSELF. Test files are served -- I
+// THIS NUMBER COUNTS THE FILES THAT MEASURE IT. Test files are served -- I
 // checked, `/demo/asset-graph.test.js` returns 44356 bytes -- so adding a suite
-// that measures the exposure also enlarges it by one. Recording that rather
-// than quietly pinning the pre-existing number: a ratchet whose author exempts
-// their own contribution is not a ratchet, and the first exemption is the one
-// that teaches everyone else the number is negotiable.
-const MAX_SERVED_BUT_NOT_NEEDED = 82;
+// that measures the exposure also enlarges it by one. It was 82 when this file
+// was the only such suite; `fetch-chokepoint.test.js` made it 83. Recording
+// that rather than quietly pinning the pre-existing number: a ratchet whose
+// author exempts their own contribution is not a ratchet, and the first
+// exemption is the one that teaches everyone else the number is negotiable.
+//
+// Raising it is therefore a NORMAL and expected part of adding a guard, and it
+// is not the same act as raising it to accommodate a new document or fixture.
+// The diff shows which one you did.
+const MAX_SERVED_BUT_NOT_NEEDED = 83;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
