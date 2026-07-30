@@ -513,3 +513,44 @@ test('the scatter launch command is still the one the README and index.html quot
   assert.equal(DEFAULT_SERVER_ADDRESS, SERVERS.scatter.address);
   assert.equal(RECOMMENDED_MODEL_DIR, SERVERS.scatter.modelDir);
 });
+
+test('no placeholder path is presented as the command to paste', () => {
+  // AC38: the command a visitor is told to paste must work VERBATIM. The
+  // explanatory "under the hood" block legitimately carries a
+  // `/path/to/onnx-genai/models` placeholder, because models are gitignored and
+  // their location genuinely varies per machine -- but the CANONICAL command
+  // must never contain one, or the rule that makes AC38 checkable dissolves.
+  //
+  // MUTATION: put `/path/to/...` into LAUNCH_COMMAND -> red.
+  assert.ok(
+    !/\/path\/to\//.test(LAUNCH_COMMAND),
+    `The canonical launch command contains a placeholder path and therefore ` +
+      `cannot be pasted as-is: ${LAUNCH_COMMAND}`,
+  );
+
+  // Every placeholder that DOES appear must be accompanied, within the five
+  // lines above it, by an instruction to substitute something real. An
+  // unexplained placeholder reads as a literal path.
+  const lines = readme.split('\n');
+  const unexplained = [];
+  lines.forEach((line, i) => {
+    if (!line.includes('/path/to/')) return;
+    // Five lines, because the explaining prose usually sits above the ``` fence
+    // and a blank line, not immediately above the command itself.
+    const context = lines.slice(Math.max(0, i - 5), i).join(' ');
+    if (
+      !/point (this|the script|it) at|whichever|replace|substitute|your own|actually hold/i.test(
+        context,
+      )
+    ) {
+      unexplained.push(`README.md:${i + 1}  ${line.trim()}`);
+    }
+  });
+
+  assert.deepEqual(
+    unexplained,
+    [],
+    `These placeholder paths are not explained in the three lines above them, ` +
+      `so a reader may paste them literally:\n  ${unexplained.join('\n  ')}`,
+  );
+});

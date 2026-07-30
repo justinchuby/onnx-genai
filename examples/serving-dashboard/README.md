@@ -206,16 +206,37 @@ The dashboard polls **`/v1/status`, `/v1/debug/kv` and `/health`**, and
 deliberately **not `/metrics` or `/v1/resources`**, even though both expose
 genuinely measured data. Those two answer in under a millisecond when the server
 is idle and **block for the entire duration of a generation** when it is not —
-around 15 seconds on the reference machine — because each one round-trips a
-command to the driver thread that is busy decoding (`/v1/resources` awaits
-`resource_snapshot()` at `crates/onnx-genai-server/src/routes/admin.rs:263-266`).
-Measured during a single 384-token generation: `/v1/status`, `/v1/debug/kv` and
-`/health` completed **61 polls at a clean 4 Hz, ~1.8 ms each**, while
-`/v1/resources` and `/metrics` completed **5, blocking 14,784 ms**.
-Polling them would freeze the dashboard during exactly the activity it exists to
-show, and it would look perfect in every idle test. If you add a panel, check
-what your endpoint costs *under load*; the fast path and the slow path are
-indistinguishable at rest.
+because each one round-trips a command to the driver thread (`/v1/resources`
+awaits `resource_snapshot()` at
+`crates/onnx-genai-server/src/routes/admin.rs:265`; `/metrics` does the same at
+`:503-508`). Measured during a single 384-token generation: `/v1/status`,
+`/v1/debug/kv` and `/health` completed **61 polls at a clean 4 Hz, ~1.8 ms
+each**, while `/v1/resources` and `/metrics` completed **5, blocking
+14,784 ms**.
+
+**That stall is now fixed on one server and not the other, and the split is the
+opposite of convenient.** `ResourceSnapshot` is answered in two different
+places:
+
+| path | handler | borrow | behaviour |
+|---|---|---|---|
+| batching (`:8123`) | `driver.rs:683` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
+| dynamic (`:8124`) | `driver.rs:813` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
+
+The shared-vs-exclusive borrow *is* the fix — nothing else differs.
+
+> **The server that still stalls is the only one where the interesting
+> telemetry lives.** Paged KV, block tables, page allocation — everything
+> Scenarios B and C exist to show — runs on the dynamic origin. So "the hang is
+> fixed" is true, and acting on it unqualified would put the demo's most
+> important panels on the one path that still freezes. **A partial fix measured
+> on the healthy half certifies the broken half.** If you re-measure this,
+> measure it *per server*.
+
+Polling either endpoint would freeze the dashboard during exactly the activity
+it exists to show, and it would look perfect in every idle test. If you add a
+panel, check what your endpoint costs *under load*; the fast path and the slow
+path are indistinguishable at rest.
 | `--addr` | Defaults to `127.0.0.1:8080`. The demo uses `:8123` and `:8124` so it does not collide with a server you already have running. |
 
 Overridable via environment: `MODELS_DIR`, `SCATTER_MODEL`, `DYNAMIC_MODEL`,
@@ -528,15 +549,45 @@ control arm rules out warm-up; it does not rule out noise larger than the signal
 > because understating a capability feels like the safe direction. It is not:
 > **an honesty process that only ever ratchets toward understating is not
 > calibrated, it is just a differently-biased claim**, and "proven absent" is a
-> strong claim that this evidence does not support.
+> strong claim that this evidence did not support.
+>
+> **We left it inconclusive rather than resolving it in the flattering
+> direction or the modest one — and that turned out to be what made the real
+> answer findable.** The next section is the answer, and it came from reading
+> the code rather than from taking more samples.
 
-What *would* settle it is stated here so it can be run and the section closed:
-prefill is ~90 % of TTFT (~10-token prompt → 140 ms; ~900-token prompt →
-1380 ms), so a genuine full-prefix hit should collapse TTFT toward ~140 ms.
-That is far too large to hide in noise **on a quiet machine**. The open
-measurement is an interleaved TTFT comparison, n ≥ 15 per arm, medians with
-confidence intervals, taken while the machine is idle. Overlapping intervals
-would settle it as absent.
+**The timing question is now settled by mechanism rather than by measurement,
+and that is a much stronger result than another round of benchmarking.** There
+are two prefix branches in `prepare_session_prefix`
+(`crates/onnx-genai-engine/src/engine/runtime.rs:1009`), and **only one of them
+restores anything**:
+
+| | branch | what it does |
+|---|---|---|
+| **1** | `runtime.rs:1029` — taken when `uses_token_prefix_cache()` | Scans cached token sequences with `common_prefix_len` and keeps the longest overlap. **It never touches the page table and materialises no KV.** No prefill is skipped. |
+| **2** | `runtime.rs:1037` — the `else if` | `prefix_cache.lookup_shared(…, &mut page_table)` — the real one. Matches pages and materialises them, so prefill genuinely shrinks. |
+
+**Branch 1 wins first, and it wins for our models.**
+`uses_token_prefix_cache()` is `has_runner() || is_windowed()`
+(`crates/onnx-genai-engine/src/decode/state.rs:206-208`), so a model with a
+decode runner takes branch 1 and **the `else if` is never evaluated at all**.
+
+This predicts every number we measured, which is why it settles the question:
+
+| Observation | Mechanism |
+|---|---|
+| ~95 % hit rate from the very first request | *any* nonzero overlap counts, and the chat template shares its opening tokens |
+| control prompts that differ from token 0 still scored hits | they still share that template prefix |
+| **TTFT unchanged (+7 %)** | **branch 1 skips no prefill — there is nothing to speed up** |
+| the predicted ~90 % collapse never appeared | branch 2, the only branch that materialises pages, is unreachable |
+
+> **This is a finding about our configuration, not a verdict on the feature.**
+> Branch 2 is real, wired and covered by its own tests (`prefix_speedup.rs`). It
+> is simply not reachable from either server path as we run them. So the honest
+> claim is *"on this path, the code that runs computes a textual overlap and
+> restores nothing"* — **not** *"prefix caching does not work"*, which is a
+> product-correctness claim that a configuration finding cannot support.
+> Cutting the result loses something real; leading with it overclaims.
 
 **And both hit-rate counters are unusable, in opposite directions.** On the
 scatter profile the counter records nothing — `prefix_cache_hit_len` is a
@@ -550,10 +601,21 @@ token 0. One counter is pinned low, the other pinned high, and **neither is
 measuring prefix reuse.**
 
 The denominator is independently broken, and that is the part worth
-generalising. `prefix_cache_lookups` (`metrics.rs:130-132`) increments
+generalising. `prefix_cache_lookups` (`crates/onnx-genai-server/src/metrics.rs:136-138`) increments
 **unconditionally on every completed generation**, outside any predicate — it
 counts generations, not lookups. **It would read 135 with the prefix cache
 deleted from the codebase.**
+
+> **The wire has since been made honest and the internal counters have not, so
+> what you grep for depends on where you look.** `/v1/debug/kv` now returns
+> `generations_completed`, `generations_with_prefix_reuse` and
+> `generation_prefix_reuse_rate` — names that say what the numbers actually
+> count. The registry behind them is still `prefix_cache_lookups` /
+> `prefix_cache_hits` (`metrics.rs:83-86`). **That is the right order to fix it
+> in** — the name a visitor can see was wrong in a way the internal one is not,
+> because nobody reads an atomic and concludes anything about a cache. It does
+> mean a search for "the hit rate field" finds an honest name at the boundary
+> and a misleading one two files in.
 
 > **A ratio has two halves and they usually have different provenance. Audit
 > them separately.** Ours was a real count over a compile-time constant. The
@@ -570,9 +632,22 @@ deleted from the codebase.**
 
 What remains real and reportable here is the **counter's behaviour**, which is
 what the panel shows: a hit scored for prompts that share nothing. That is a
-finding about the instrument, and it stands regardless of how the timing
-question resolves. The timing result itself is reported as **unverified**, with
-the measurement that would close it named above.
+finding about the instrument, and it never depended on timing at all.
+
+**The timing result is no longer unverified — it is explained.** The two
+measurements that looked like contradictory noise (+7 % on one run, −17 % on a
+warm interleaved run, on a machine at load average 22) are both consistent with
+branch 1, which cannot produce a speedup in either direction. **We did not need
+a quieter machine; we needed to read the branch.** The wider lesson is worth
+more than the result:
+
+> **When a measurement is inconclusive, the next move is not always more
+> measurement.** We had specified an n ≥ 15 interleaved re-run on an idle
+> box — real work, and it would have produced a tighter confidence interval
+> around a number that was never going to move. **Reading the code that
+> produces the effect settled in minutes what more samples could not have
+> settled at all**, because the samples were all drawn from a path with no
+> effect in it. Noise made it *look* like a statistics problem.
 
 > **This scenario cannot be driven by concurrency.** The dynamic server
 > serialises generations — one engine, one driver thread — so concurrent
