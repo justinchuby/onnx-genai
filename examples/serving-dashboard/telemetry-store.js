@@ -1045,7 +1045,12 @@ export function createTelemetryStore({
       // Resolve per-server overrides first: the same field can be a genuine
       // measurement on one server and structurally meaningless on the other.
       const entry = resolveForOrigin(PROVENANCE[key], origin);
-      fields[key] = unavailableField(reason, { source: entry.source, unit: entry.unit });
+      // catalogueMeta, not a hand-rolled `{source, unit}`: this frame dropped
+      // `label` (so every field rendered as the literal word "value"), and it
+      // defaulted `sourceClass` to SERVER, which made a DERIVED field claim the
+      // server reported it. The second one is a provenance lie, not a caption
+      // bug, and it is the reason this is the same helper the other frames use.
+      fields[key] = unavailableField(reason, catalogueMeta(entry, origin));
     }
     return Object.freeze(fields);
   }
@@ -1131,10 +1136,17 @@ export function createTelemetryStore({
  * The catalogue metadata every field carries on a frame with no server answer.
  *
  * The store has a `fieldMeta` for the healthy path, but it is a closure over
- * `attribution`, so the three frames that exist BEFORE or WITHOUT a response --
- * the first frame, the offline frame, and the never-measurable fields on both
- * -- each hand-rolled `{source, unit}` instead. All three therefore dropped
+ * `attribution`, so the frames that exist BEFORE or WITHOUT a response each
+ * hand-rolled `{source, unit}` instead: the first frame, the offline frame,
+ * the never-measurable fields on both, and -- found last, a fix that did not
+ * travel -- the NO_MODEL frame in `allUnavailable`. All of them dropped
  * `label`, and `renderField` falls back to the literal word "value".
+ *
+ * The count is deliberately not written here. Three sites were fixed and a
+ * fourth survived for hours because the sentence said "three" and reviewers
+ * read the sentence instead of the callers. `frame-metadata.test.js` censuses
+ * every frame the store can build, so the number lives in a test that fails
+ * rather than in prose that ages.
  *
  * That is the frame a visitor always sees and the one no test covered. Worse
  * for the never-measurable fields: they have no second frame to correct it, so
