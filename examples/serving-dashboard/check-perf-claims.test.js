@@ -1107,3 +1107,67 @@ test('shared-buffer batching is still gated on an execution-provider capability,
       'point at.',
   );
 });
+
+// This guard exists because of a specific, embarrassing failure: a server-side
+// fix (`1e1b2a82`) landed ONE COMMIT before documentation describing the
+// behaviour it removed. The prose was false the moment it was committed, the
+// suite was green throughout, and the existing checker -- which pins the
+// quoted log MESSAGE -- stayed green, because the message did not change. Only
+// the LEVEL changed, and a field appeared.
+//
+// PINNING A QUOTED STRING DOES NOT PIN THE SENTENCE YOU WRAPPED AROUND IT.
+test('the README describes the CURRENT batch-decision mechanism, not the one it replaced', () => {
+  const driver = shippedFromRoot('crates/onnx-genai-server/src/driver.rs');
+  const readme = shipped('README.md');
+
+  // 1. The decision must still keep the reason. If anyone regresses to
+  //    `.is_ok()`, the README's "the log tells you why" becomes false.
+  //    Anchored to the CONSTRUCTION that retains the error, not to the word
+  //    `match`. `match engine.continuous_batch_manager(max_batch)` appears
+  //    TWICE in driver.rs, so a regression at the startup site is fully
+  //    concealed by the surviving second call -- a mutation of the real site
+  //    left a `match`-shaped assertion GREEN. Pin the semantics: the Err arm
+  //    must still carry the reason into the driver.
+  assert.ok(
+    /Err\(err\)\s*=>\s*BatchDriver::PerRequest\s*\{\s*\n?\s*reason:/.test(driver),
+    'the batch decision no longer carries the error into ' +
+      '`BatchDriver::PerRequest { reason }`. If it has regressed to ' +
+      '`.is_ok()`, the reason is discarded again and the README now ' +
+      'OVERSTATES what the log can tell an operator.',
+  );
+  assert.ok(
+    !/continuous_batch_manager\(max_batch\)\.is_ok\(\)/.test(driver),
+    'driver.rs is back to `.is_ok()`. The README says the fallback is logged ' +
+      'WITH a reason; it would no longer be.',
+  );
+
+  // 2. The fallback must still be a WARN carrying a `reason` field -- the two
+  //    details the README now prints in its sample output.
+  assert.ok(
+    /tracing::warn!\(\s*\n?\s*reason = %/.test(driver),
+    'the fallback is no longer logged at WARN with a `reason =` field. The ' +
+      'README prints a sample line reading `WARN ... reason=<why>`; an ' +
+      'operator greps for exactly that.',
+  );
+  assert.ok(
+    readme.includes('WARN onnx_genai_server::driver: continuous batch driver disabled'),
+    'the README no longer shows the fallback line at WARN. It was shipped as ' +
+      'INFO for one commit after the server started emitting WARN -- a reader ' +
+      'filtering their logs at INFO would have seen it, then not found it.',
+  );
+
+  // 3. The vacuity floor for THIS test: both refused arms must still share one
+  //    `bail!`, because that shared message is precisely why the README says
+  //    the remaining ambiguity is two-way and unclosable by better logging.
+  const bailCount = (
+    shippedFromRoot(BATCHED_RS)
+      .slice(shippedFromRoot(BATCHED_RS).indexOf('pub fn continuous_batch_manager('))
+      .match(/anyhow::bail!/g) || []
+  ).length;
+  assert.ok(
+    bailCount >= 1,
+    'no `bail!` remains in `continuous_batch_manager`; the README\'s account ' +
+      'of WHY the refusal reason cannot discriminate the two refused decode ' +
+      'paths no longer has a mechanism behind it.',
+  );
+});

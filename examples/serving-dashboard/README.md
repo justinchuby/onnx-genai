@@ -613,7 +613,7 @@ branches:
 
 ```
 INFO onnx_genai_server::driver: continuous batch driver enabled max_batch=4
-INFO onnx_genai_server::driver: continuous batch driver disabled; using per-request engine path
+WARN onnx_genai_server::driver: continuous batch driver disabled; using per-request engine path reason=<why>
 ```
 
 - The **scatter server (`:8123`, `qwen2.5-0.5b-scatter-v2`)** takes the first
@@ -700,14 +700,29 @@ expected to be running.
 > older build, the capacity field is not a witness; it is the thing being
 > witnessed.
 
-> **The limit of that evidence, stated because it bounds every claim above.**
-> The decision is `engine.continuous_batch_manager(max_batch).is_ok()` — the
-> reason is discarded one line before it could be logged. So the log and the
-> capacity field tell you **which** path ran; **neither can tell you why**, and
-> the enumeration above is something you read out of the source rather than
-> anything the running server hands you. A run that unexpectedly reports
-> capacity 1 is a fact you can act on, and the diagnosis costs you a source
-> dive that one `match` arm would have saved.
+> **This paragraph used to state a limit that no longer exists, and the
+> correction is worth more than the fact.** Until `1e1b2a82` the decision was
+> `engine.continuous_batch_manager(max_batch).is_ok()`, which discarded the
+> only description of *why* the headline capability was off. It is now a
+> `match` that keeps the error, and the fallback is logged at **WARN with a
+> `reason=` field**. **The log now tells you which path ran AND why.**
+>
+> **What it still cannot tell you is which refused decode path you are on —
+> and that is not an oversight, it is arithmetic.** Both refused arms
+> (`PastPresent { .. }` and `Legacy`) are a **single match arm with a single
+> `bail!`**, so they emit the **same** `reason=` string. **Adding the reason
+> narrowed the question from "why is batching off?" to "which of two shapes is
+> this model?", and no amount of log-level detail closes the remaining gap,
+> because the two cases are indistinguishable at the point the message is
+> written.** That is the whole of the two-way ambiguity noted above.
+>
+> ⚠️ **And note how this section decayed: a server-side fix landed one commit
+> before the documentation that described the old behaviour, so the prose was
+> false the moment it was committed and the tree was green throughout.** No
+> guard caught it; the log *message* is unchanged, so a checker pinning the
+> quoted string stayed green across a change of log LEVEL and the arrival of a
+> new field. **Pinning a quoted string does not pin the sentence you wrapped
+> around it.**
 
 **Continuous batching** (`crates/onnx-genai-engine/src/batched.rs`) keeps one
 decode batch running and edits its membership *between steps* rather than
