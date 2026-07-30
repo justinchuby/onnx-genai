@@ -1,5 +1,15 @@
 # Examples
 
+## Serving dashboard
+
+[`serving-dashboard/`](serving-dashboard/) is a live browser demonstration of
+continuous batching, paged KV block allocation, and prefix caching, served by
+the onnx-genai server itself at `GET /demo`. Every figure is measured on your
+machine while you watch; fields the runtime cannot measure say so rather than
+showing a zero. Run it with
+[`serving-dashboard/run-demo.sh`](serving-dashboard/run-demo.sh) and see
+[`serving-dashboard/README.md`](serving-dashboard/README.md).
+
 ## Real multimodal model contract
 
 [`smolvlm-256m/`](smolvlm-256m/) validates the inference-metadata contract
