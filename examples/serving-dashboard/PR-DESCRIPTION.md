@@ -606,9 +606,10 @@ test files importing fake-store:  **8**
 [POSITIVE CONTROL] test files importing panel-kit: 6   [NEG] fake-zqq-store: 0
 ```
 
-**@12e42da8 reports ~112 fixture fields rendering as em-dashes while their tests
-believe they are measured. I have not reproduced that count and I am not
-publishing it as mine — what I measured is the default, the retirement, and the
+**The `~112 fixture fields` figure reached me relayed, inside a checklist, and
+I could not establish who took it — so under AC218 this document names no one
+for it.** *(It also cited `fake-store.js:26`; the default I measured is at
+`:65`.)* **I have not reproduced the count and I am not publishing it as mine — what I measured is the default, the retirement, and the
 blast radius of eight files.** *The direction is not in doubt; the magnitude is
 somebody else's number and it is labelled as such.*
 
