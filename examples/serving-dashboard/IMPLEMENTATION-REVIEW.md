@@ -1283,3 +1283,65 @@ That is the right mechanism, and it is an improvement on a silent blank. The
 residual concern is governance, not code: the register holds 26 entries, carries
 no owner and no expiry, and nothing re-asks whether an entry is still true. It
 converts an unresolved red into a permanent green. That is a gate question.
+
+---
+
+## F18 (MAJOR, new) — a duplicate catalogue key is undetectable by any runtime test
+
+`telemetry-provenance.js` briefly carried two definitions of `'batch.capacity'`
+(found by another reviewer at `bc8ef473`; already repaired by `185d6720`, and the
+survivor is the symbol-anchored entry, which is the right outcome).
+
+The finding is not the duplicate. It is that **no test could have caught it, and
+none ever can.** Established by mutation in a clean worktree at `185d6720`,
+`--porcelain` 0, by re-introducing the defect:
+
+| | catalogue entries | suite |
+| --- | --- | --- |
+| baseline | 37 | 520 pass / 0 fail |
+| duplicate re-introduced | 37 | 520 pass / 0 fail |
+
+A duplicate key in an object literal produces one key. `Object.keys().length` is
+invariant, so no counting assertion can observe it, and no property of the parsed
+object differs in any way. A guard written against the runtime object would be
+green against the defect as readily as against the fix — its green would carry no
+information.
+
+The corollary is the uncomfortable half: **the repair is equally unverifiable.**
+Nobody can demonstrate the duplicate is gone by executing anything. Defect and
+repair have identical runtime signatures — the same shape as a commit that
+silently fails and a grep that matches nothing.
+
+**Fix:** a source-level check. Parse the object literal (or scan textually for
+repeated `'key':` at the catalogue's top level) and assert each key appears once.
+This must be a text check, deliberately, and the reason should be written into the
+assertion message so the next reader does not "improve" it into a runtime check
+and silently disarm it.
+
+The cost of the live defect was never runtime behaviour — both entries agreed on
+`source`, `path` and `classification`. The cost was that the file stated one
+field's provenance twice and the reader could not tell which the program believed.
+That is the exact defect class this product exists to refuse, located in the
+provenance table itself.
+
+## F15 — CLOSED
+
+Both halves resolved. The denominator binds `batch.capacity`, registered against
+`/v1/status` with `path: 'batch_capacity'`, carrying a symbol-anchored citation to
+`AppConfig::effective_batch_capacity()` and a comment preserving the reason
+`max_batch` alone is wrong. Verified at `185d6720`: `scheduler.running`,
+`scheduler.waiting` and `kv.allocation_failures` are all declared in
+`NOT_YET_PUBLISHED`.
+
+Four of `scheduling.js`'s nine fields and ten of `kv-memory.js`'s thirteen are
+permanently em-dashed **by declaration**. That is an honest state, not a defect,
+and F15 is closed. The residual is governance, not code: the register holds 26
+entries with no owner and no expiry, and nothing re-asks whether an entry is still
+true — it converts an unresolved red into a permanent green.
+
+## Note on F17's fix, deliberately not landed
+
+The fail-closed matcher for F17 is eight lines and is ready. It is not being
+landed, because it would turn a green tree red at demo time over 13 keys in a file
+this reviewer does not own, and the triage of those 13 belongs to that owner. A
+reviewer who reddens a shared tree to prove a point has stopped reviewing.
