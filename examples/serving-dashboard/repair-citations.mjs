@@ -37,7 +37,7 @@
 // It is not wired into the test suite and must not be: a check that repairs
 // its own subject can never fail.
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -54,14 +54,63 @@ const CITATION = /`([A-Za-z0-9_./-]+\.(?:rs|js|css|html|sh|toml|md)):(\d+)`/g;
 // A backticked identifier, optionally with (), near the citation.
 const SYMBOL = /`([A-Za-z_][A-Za-z0-9_]{2,})(?:\(\))?`/g;
 
+/**
+ * A CITATION IS A PROMISE TO A READER WHO HAS THE SHIPPED TREE, NOT MY DESK.
+ *
+ * Every read below resolves against `HEAD` rather than the working copy. Under
+ * `--write` this tool BAKES A LINE NUMBER INTO A COMMITTED DOCUMENT, so if it
+ * counts lines in an uncommitted edit it emits a citation that is correct on
+ * exactly one machine in the world and wrong for every reviewer. That is the
+ * same defect already fixed in `check-perf-claims.test.js` ("Nobody clones my
+ * working tree") and in `scenario-routes.test.js`; this is its third site, and
+ * the only one where the wrong answer gets WRITTEN DOWN rather than merely
+ * mis-reported.
+ *
+ * Returns null when the path is not in HEAD, which is the honest answer for a
+ * citation target: a reviewer cannot follow a link to a file they do not have.
+ */
+function shipped(rel) {
+  try {
+    return execFileSync('git', ['show', `HEAD:./${rel}`], {
+      cwd: REPO,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Paths tracked in HEAD. `ls-files` would also report staged-but-uncommitted. */
+let headFilesCache = null;
+function headFiles() {
+  if (headFilesCache === null) {
+    headFilesCache = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only'], {
+      cwd: REPO,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    })
+      .split('\n')
+      .filter(Boolean);
+  }
+  return headFilesCache;
+}
+
+function isDirty(rel) {
+  return (
+    execFileSync('git', ['status', '--porcelain', '--', rel], { cwd: REPO, encoding: 'utf8' })
+      .trim().length > 0
+  );
+}
+
 function resolveFile(cited) {
-  const direct = join(REPO, cited);
-  if (existsSync(direct)) return cited;
+  // NOT `existsSync`. An untracked file exists on disk and is invisible to a
+  // reviewer, so resolving to it would anchor a citation to a file nobody else
+  // has -- the failure this tool is supposed to repair, committed by the tool.
+  if (shipped(cited) !== null) return cited;
   const base = cited.split('/').pop();
-  const hits = execFileSync('git', ['ls-files', '*/' + base, base], { cwd: REPO })
-    .toString()
-    .split('\n')
-    .filter(Boolean);
+  const hits = headFiles().filter((f) => f === base || f.endsWith('/' + base));
   return hits.length === 1 ? hits[0] : null;
 }
 
@@ -108,7 +157,20 @@ for (const m of readme.matchAll(CITATION)) {
   const window = readme.slice(Math.max(0, m.index - 240), m.index + 240);
   const named = [...new Set([...window.matchAll(SYMBOL)].map((s) => s[1]))];
 
-  const lines = readFileSync(join(REPO, file), 'utf8').split('\n');
+  // A file with uncommitted changes has TWO line numberings and neither is the
+  // one the reviewer will read: HEAD's is about to change, the desk's will
+  // never be published. Refusing is the same judgement the tool already makes
+  // for ambiguous symbols -- it declines rather than guesses.
+  if (isDirty(file)) {
+    declines.push(
+      `${full} — ${file} has uncommitted changes, so a line number counted ` +
+        `from it describes neither HEAD nor what the reviewer will clone. ` +
+        `Commit it and re-run; this tool will not guess.`,
+    );
+    continue;
+  }
+
+  const lines = shipped(file).split('\n');
   const anchored = named.filter((s) => definitionsOf(s, lines).length > 0);
 
   if (anchored.length === 0) continue; // nothing to anchor to; checker ignores it too
