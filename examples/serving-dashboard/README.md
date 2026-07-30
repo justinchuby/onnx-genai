@@ -335,6 +335,16 @@ enough to manufacture a false result). They are **not** a performance claim abou
 onnx-genai, and yours will differ. The page measures your machine; that is the
 only number that should persuade you.
 
+**How much they differ is itself worth knowing.** The *byte-identical* binary,
+re-run on the *same* machine 75 minutes later, produced **30.151 tok/s instead
+of 33.415 — a 9.8 % drop caused entirely by background load** (a backup running,
+an indexer at 91 % CPU). That is nearly five times the margin anyone would treat
+as a meaningful regression. So a number from this table is not a target to hit,
+and a lower number on your machine is not evidence of anything until you have
+measured the spread. It is also why the demo re-measures rather than shipping a
+recorded baseline: **a stored number is a claim about a machine that no longer
+exists.**
+
 ### Scenario B — prefix caching *(dynamic profile, `:8124`)*
 
 Reuse across a shared prompt prefix. The cache is a token radix trie, so reuse
