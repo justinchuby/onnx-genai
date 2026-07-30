@@ -80,11 +80,21 @@ export const SCENARIOS = Object.freeze({
  * A tab is not a panel. A panel displays a value and can honestly say "n/a"; a
  * TAB ADVERTISES A CAPABILITY — a labelled, clickable promise that the product
  * does this, made before the visitor has seen a single number. Prefix reuse was
- * measured and found ABSENT on both execution paths (QA, n=6 per arm with a
- * sensitivity control: shared-prefix requests ran 7% SLOWER than a zero-sharing
- * control, while the engine's hit counter fired on every request including all
- * six controls). So a reachable `?scenario=prefix-cache` route is a navigable
- * link to a feature we proved is not there.
+ * measured and found ABSENT on both execution paths, and the surviving evidence
+ * needs no stopwatch: the engine's hit counter fired on every request,
+ * INCLUDING six prompts made deliberately unique, scoring twelve hits from
+ * twelve requests. A counter that reads the same whether prefixes are reused or
+ * not cannot distinguish the two cases, so it is not measuring reuse. So a
+ * reachable `?scenario=prefix-cache` route is a navigable link to a feature we
+ * proved is not there.
+ *
+ * ⚠️ THIS PARAGRAPH USED TO CITE A TIMING ARM — shared-prefix requests "7%
+ * SLOWER" than a zero-sharing control. ITS OWN AUTHOR WITHDREW IT: the
+ * interleaved warm re-run came back with the OPPOSITE SIGN, on a machine where
+ * a byte-identical binary swung 9.8% from ambient load alone, so the effect was
+ * smaller than the noise floor. We ship no prefix timing number. Do not
+ * reintroduce one. The conclusion is unchanged because it never rested on the
+ * stopwatch — which is why the counter argument is the one worth keeping.
  *
  * The finding itself still ships — it is the most credible thing the demo has
  * to say — but it ships as evidence inside a panel, not as a capability tab.
