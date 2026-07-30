@@ -226,11 +226,20 @@ body[data-blocked] .app {
  * and renders like a measurement, which is the exact failure this file guards.
  */
 [data-state='not-applicable'] {
-  color: var(--og-unavail-fg);
+  /* --og-na-*, NOT --og-unavail-*. tokens.css declares this state "DELIBERATELY
+     BRIGHTER THAN `unavailable`" and gives it a whole family to say so, and
+     this rule spent the neighbouring family instead -- so the distinction was
+     specified, measured, annotated, and then rendered as an exact colour match
+     for the state it was defined to differ from. The palette was never wrong;
+     the page asked it the wrong question. */
+  color: var(--og-na-fg);
   /* DOUBLE, not dashed: `stale` already owns the dashed underline, and those
      two colours sit within a few RGB values of each other. Distinguishing them
-     by colour alone would fail in greyscale and for colourblind viewers. */
-  border-bottom: 3px double var(--og-unavail-rule);
+     by colour alone would fail in greyscale and for colourblind viewers. That
+     is still true with the correct token (stale/na measure 1.041:1 apart), so
+     the border grammar remains the entire signal -- this fix restores the depth
+     behind it, it does not replace it. */
+  border-bottom: 3px double var(--og-na-rule);
   cursor: help;
   min-width: var(--og-value-slot);
   display: inline-block;

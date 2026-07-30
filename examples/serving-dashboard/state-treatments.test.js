@@ -358,3 +358,158 @@ test('the two absence texts are actually different strings', () => {
   // spec requires quietly disappears.
   assert.notEqual(ABSENT_TEXT, NOT_APPLICABLE_TEXT);
 });
+
+// ---------------------------------------------------------------------------
+// WIRING, NOT VALUES.
+//
+// Every assertion above this line reads shell.css for STRUCTURE -- does the
+// state have a rule, does it have a border, is its line style unique. Every
+// assertion in @0837fdf9's eight token suites reads tokens.css for VALUES --
+// is the contrast ratio legal, is the ramp monotonic. Both were green all
+// session while `[data-state='not-applicable']` painted itself in
+// `--og-unavail-fg`.
+//
+// Neither could see it, and not by oversight: the defect is not in the palette
+// and not in the structure, it is in the WIRE BETWEEN THEM. The palette can be
+// flawless and the selector can still spend the wrong entry. A guard has to
+// read the token NAME inside the state's own rule to see it, which is a third
+// question neither file was asking.
+//
+// Guard by @0837fdf9, who measured it, built it, and proved the fix sufficient
+// before asking for it. Ported here because it lived in /tmp: uncommitted
+// coverage is not coverage, and it belongs next to the other reader of these
+// same blocks rather than in a ninth parser.
+
+/**
+ * The token family a state is allowed to spend, keyed by state.
+ *
+ * Trailing `-` means prefix; otherwise exact. Derived-not-hardcoded is enforced
+ * below: this map must cover FIELD_STATES exactly, so a sixth state fails here
+ * until somebody decides which family it draws from -- rather than silently
+ * sitting outside the loop, which is the failure the pending case above records.
+ */
+const STATE_TOKEN_FAMILY = {
+  [FIELD_STATES.MEASURED]: ['--og-fg'],
+  [FIELD_STATES.PENDING]: ['--og-pending-'],
+  [FIELD_STATES.STALE]: ['--og-stale-'],
+  [FIELD_STATES.UNAVAILABLE]: ['--og-unavail-'],
+  [FIELD_STATES.NOT_APPLICABLE]: ['--og-na-'],
+};
+
+const allows = (family, token) =>
+  family.some((p) => (p.endsWith('-') ? token.startsWith(p) : token === p));
+
+/**
+ * Colour/border token usages inside BARE `[data-state='…']` rules.
+ *
+ * Bare only. `.connection-indicator[data-state='connected']` is a different
+ * state vocabulary -- connection health -- and correctly spends semantic
+ * --og-ok/--og-warn/--og-bad. Flagging correct code is how a guard earns its
+ * deletion, so the leading-anchor is load-bearing rather than incidental.
+ */
+function auditStateWiring(css) {
+  const lines = withoutNotGroups(css).split('\n');
+  const blocks = [];
+  let cur = null;
+  lines.forEach((line, i) => {
+    const opened = line.match(/^\s*\[data-state='([^']+)'\]/);
+    if (opened) cur = { state: opened[1], line: i + 1, uses: [] };
+    if (cur && /(^|\s)(color|border[a-z-]*)\s*:/.test(line)) {
+      for (const t of line.matchAll(/var\((--og-[a-z0-9-]+)\)/g)) {
+        cur.uses.push({ token: t[1], line: i + 1 });
+      }
+    }
+    if (cur && !opened && /^\s*}/.test(line)) {
+      blocks.push(cur);
+      cur = null;
+    }
+  });
+  if (cur) blocks.push(cur);
+  return blocks;
+}
+
+/**
+ * @e00032a4's rule, applied to a runner with no exit codes: a check that CANNOT
+ * RUN must not be confusable with one that ran and found nothing. There is no
+ * exit 2 here, so the distinction is carried by the message -- `CANNOT RUN` vs
+ * `FAIL` -- and by the floors below firing before any verdict is reached.
+ */
+function assertCanRun(blocks) {
+  const states = Object.keys(STATE_TOKEN_FAMILY);
+  assert.ok(
+    blocks.length >= states.length,
+    `CANNOT RUN: parsed ${blocks.length} bare [data-state] blocks, expected >= ${states.length}. ` +
+      'The parser broke or the file moved; a pass here would be vacuous.',
+  );
+  const uses = blocks.reduce((n, b) => n + b.uses.length, 0);
+  assert.ok(
+    uses >= 8,
+    `CANNOT RUN: inspected ${uses} token usages, expected >= 8. ` +
+      'The declaration matcher stopped matching, so every block looks clean.',
+  );
+}
+
+test('the family map covers exactly the ruled state vocabulary', () => {
+  assert.deepEqual(
+    Object.keys(STATE_TOKEN_FAMILY).sort(),
+    Object.values(FIELD_STATES).sort(),
+    'a state has no declared token family, so nothing checks which colours it spends',
+  );
+});
+
+test('every state selector spends the token family named for that state', () => {
+  const blocks = auditStateWiring(shellCss);
+  assertCanRun(blocks);
+
+  const findings = [];
+  for (const b of blocks) {
+    const family = STATE_TOKEN_FAMILY[b.state];
+    assert.ok(family, `FAIL: [data-state='${b.state}'] (shell.css:${b.line}) has no family`);
+    for (const u of b.uses) {
+      if (!allows(family, u.token)) {
+        findings.push(
+          `shell.css:${u.line}  [data-state='${b.state}'] consumes ${u.token} ` +
+            `(expected ${family.join(', ')})`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(findings, [], `FAIL: a state renders in another state's colours:\n${findings.join('\n')}`);
+});
+
+// The detector's own positive controls. @0837fdf9 ran these as manual edits to
+// a real file; as synthetic input they ship, so the guard keeps proving it can
+// still fail long after the defect that motivated it is gone.
+test('the wiring audit detects a DIFFERENT state borrowing tokens', () => {
+  const blocks = auditStateWiring(
+    `[data-state='stale'] {\n  color: var(--og-pending-rule);\n}\n`,
+  );
+  assert.equal(blocks.length, 1);
+  assert.ok(
+    !allows(STATE_TOKEN_FAMILY[FIELD_STATES.STALE], blocks[0].uses[0].token),
+    'the audit is hardcoded at one state and cannot see a borrow elsewhere',
+  );
+});
+
+test('the wiring audit refuses to vouch for an unmapped state', () => {
+  const blocks = auditStateWiring(`[data-state='estimated'] {\n  color: var(--og-fg);\n}\n`);
+  assert.equal(STATE_TOKEN_FAMILY[blocks[0].state], undefined,
+    'an unknown state must be a finding, not a silent pass through a stale coverage list');
+});
+
+test('the wiring audit cannot pass on input it never read', () => {
+  assert.throws(
+    () => assertCanRun(auditStateWiring('')),
+    /CANNOT RUN: parsed 0 bare/,
+    'an empty stylesheet produced a clean bill of health',
+  );
+});
+
+test('a nested state selector is not audited as a bare one', () => {
+  // The false-positive guard, pinned. --og-ok is correct for connection health
+  // and must never be reported against the field-state families.
+  const blocks = auditStateWiring(
+    `.connection-indicator[data-state='connected'] {\n  color: var(--og-ok);\n}\n`,
+  );
+  assert.deepEqual(blocks, [], 'a different state vocabulary was audited against field-state families');
+});
