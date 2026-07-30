@@ -381,6 +381,24 @@ how it behaves here more than on the happy path.
       real effect is far too large to hide in noise on a quiet machine — if it is not obvious,
       it is not there.
 
+      🔒 **THE DECISION THIS PROTOCOL WAS WRITTEN TO MAKE HAS ALREADY BEEN MADE, AND IT SHIPPED.**
+      `scenario-origins.js` now carries `'prefix-cache'` in `CUT_SCENARIOS`, keyed with **no
+      `id:` field so it cannot be addressed**, giving the reason *"Prefix reuse was measured and
+      found absent on both execution paths, so a tab advertising it would promise a capability
+      the engine does not have."* That is a **stronger and later finding than the "UNVERIFIED"
+      verdict above** — "absent on both paths" is a conclusion, "neither confirmed nor refuted"
+      is a pending question. **Do not run the n ≥ 15/arm protocol to decide whether the scenario
+      ships. It does not ship, and no result you obtain can change that today.**
+      The protocol is retained for exactly one purpose: **falsifying the cut.** If you do observe
+      a clean, replicated, non-overlapping TTFT collapse, that contradicts shipping code and is a
+      finding worth filing loudly — but it is a *reversal*, not a *gate*.
+      ⚠️ Note the shape of this staleness, because it is the failure §11 opens by warning
+      against: **this section did not become wrong, it became ANSWERED, and an answered question
+      reads exactly like an open one.** Nothing here was ever false. A tester who works top-down
+      would have spent an hour on thirty timed requests to re-derive a verdict already frozen in
+      an `Object.freeze` — which is the precise cost §11 exists to prevent, reproduced by the
+      document that contains §11.
+
 ## 6. Scenario C — dynamic origin (paged-KV pressure)
 
 - [ ] **6.1** Executes per spec; all §7 honesty checks apply.
@@ -696,8 +714,12 @@ histogram and token counters all live), unlike `/v1/status`.
    demos. The panel still **ships** (§9.3) — it renders `not-applicable` on batching and
    `unavailable` on dynamic, which is the honest reading of a counter that scores a hit for
    every generation.
-7. **§5.5 settled — Scenario B either has a replicated TTFT effect under the §5.5 protocol
-   (quiet machine, warm server, interleaved, n ≥ 15/arm, non-overlapping 95% CIs) or the
-   scenario is cut.** The ~20% e2e figure did not replicate and must not ship as a claim.
-   Per the 🔒 ruling, cutting the SCENARIO is permitted; cutting the PANEL is not.
+7. **§5.5 settled — and it settled by CUTTING.** The criterion was "a replicated TTFT effect
+   under the §5.5 protocol (quiet machine, warm server, interleaved, n ≥ 15/arm, non-overlapping
+   95% CIs) **or** the scenario is cut." The ~20% e2e figure did not replicate and must not ship
+   as a claim, and **the cut has landed in shipping code** — `'prefix-cache'` sits in
+   `CUT_SCENARIOS` (`scenario-origins.js`) with no `id:`, so it is not addressable.
+   **Discharge this criterion by confirming the cut is present and the panel still degrades
+   honestly — NOT by re-running the protocol.** Per the 🔒 ruling, cutting the SCENARIO is
+   permitted; cutting the PANEL is not, and the panel does still ship.
 8. Every item in §11 confirmed to **degrade honestly**, rather than confirmed absent.

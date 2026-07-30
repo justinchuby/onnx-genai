@@ -685,3 +685,49 @@ test('the KV redefinition caveat matches whether its fields are published', () =
     );
   }
 });
+
+// A cut that ships in code, and a QA plan that still asks a tester to decide it.
+//
+// §5.5 of QA-PLAN.md specifies a 30-request protocol (n >= 15/arm, interleaved,
+// 95% CIs) to determine whether the prefix-reuse scenario ships. That question
+// was answered and FROZEN IN SHIPPING CODE: 'prefix-cache' sits in
+// CUT_SCENARIOS with the reason "measured and found absent on both execution
+// paths". The section did not become WRONG, it became ANSWERED -- and an
+// answered question reads exactly like an open one, so a tester working
+// top-down pays the full hour to re-derive a settled verdict. That is the exact
+// cost §11 of the same document opens by warning against.
+//
+// Bidirectional on purpose. If someone ever un-cuts the scenario, the note
+// telling testers not to run the protocol becomes the lie, and this fails the
+// other way.
+test('the QA plan matches whether the prefix scenario is actually cut', () => {
+  const origins = shipped('scenario-origins.js');
+  const qa = shipped('QA-PLAN.md');
+
+  // Match the key only inside the CUT_SCENARIOS literal, not anywhere the
+  // string 'prefix-cache' happens to appear in prose or a comment.
+  const block = origins.slice(origins.indexOf('CUT_SCENARIOS'));
+  const isCut = /^\s*'prefix-cache':/m.test(block.slice(0, block.indexOf('});') + 3));
+
+  const note = qa.includes('THE DECISION THIS PROTOCOL WAS WRITTEN TO MAKE HAS ALREADY BEEN MADE');
+
+  if (isCut) {
+    assert.ok(
+      note,
+      "scenario-origins.js still lists 'prefix-cache' in CUT_SCENARIOS, so the "
+        + 'scenario does not ship. QA-PLAN.md §5.5 must keep the note beginning '
+        + '"THE DECISION THIS PROTOCOL WAS WRITTEN TO MAKE HAS ALREADY BEEN '
+        + 'MADE". Without it the plan reads as an open question and costs a '
+        + 'tester an hour of timed requests to re-derive a frozen verdict.',
+    );
+  } else {
+    assert.ok(
+      !note,
+      "'prefix-cache' is NO LONGER in CUT_SCENARIOS -- the scenario was "
+        + 'reinstated. Delete the §5.5 note that tells testers the decision is '
+        + 'already made and not to run the protocol, and revisit exit criterion '
+        + '7. That note is now the stale claim, and it suppresses exactly the '
+        + 'measurement that would confirm the reinstatement.',
+    );
+  }
+});
