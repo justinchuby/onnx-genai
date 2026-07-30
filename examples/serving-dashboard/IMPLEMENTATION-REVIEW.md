@@ -1990,3 +1990,83 @@ this crew has spent all night learning to publish first. A suite run in there re
 confident total with no indication that five sixths of the checks never existed.
 
 **Anything measured in `/tmp/review-0` after 04:16 needs re-taking in a real checkout.**
+
+---
+
+## F24 — the P1 path guard has a false positive and a false negative
+
+**Status:** 🟡 open · not a blocker · the guard is correct for the shipped launcher
+**Subject:** `telemetry-store.test.js`, test `the absolute model directory is not
+addressable through the store at all`
+**Measured at** `1384f7aa`, clean detached worktree, `porcelain 0`, node v25.6.1,
+raw unpiped exit codes, 65 tests / 65 pass / 0 fail on the unmutated control.
+
+This test replaced the two assertions I flagged as a landmine (`:1299` and
+`:1352`, the second found by `@c0de4c2e` widening my census from 1 to 2). The
+replacement is better than the repair either of us proposed and I want that on
+the record before the criticism: it asserts on the **value**, not the key name,
+so renaming the row is not a way to satisfy it; it puts a **positive control
+first**, deliberately, because the test it replaces *went green while its subject
+was being deleted*; and its comment says so in those words. That is the
+vacuous-pass class this crew has chased all night, caught and documented by the
+author against their own work.
+
+**Mutation-proved, not read.** Injecting a path into a *differently named* field
+(`server.execution_provider`) fails the test naming that field — so the
+"whatever it is called" claim is real:
+
+```
+mutated   -> raw exit 1, fail 1/65, leaking == ['server.execution_provider']
+unmutated -> raw exit 0, pass 65/65
+```
+
+**The defect is the predicate.** It bans any string value containing `/`:
+
+| value | source | current | should be |
+|---|---|---|---|
+| `/Users/someone/.../models/qwen2.5-0.5b` | the threat | BAN ✅ | BAN |
+| `Qwen/Qwen2.5-0.5B-Instruct` | `scripts/build_qwen.sh:25` | **BAN ⛔ false positive** | pass |
+| `roneneldan/TinyStories-33M` | `scripts/bench_speculative.sh:6` | **BAN ⛔ false positive** | pass |
+| `C:\Users\someone\models` | a Windows operator | **pass ⛔ false negative** | BAN |
+| `qwen-scatter` | `run-demo.sh:236` | pass ✅ | pass |
+
+`server.model_id` is `/health`.`model` (`routes/admin.rs:6-12`) = the registry's
+`default_id`, which is the operator-supplied `--model-id` (`cli.rs:37`,
+`Option<String>`). **There is no character validation on it.** The guard is green
+today only because the shipped launcher happens to pass slash-free ids; this
+repository's own scripts default to slash-bearing ones. `--model-id
+Qwen/Qwen2.5-0.5B-Instruct` is a legitimate invocation that turns the suite red
+with a message accusing the operator of leaking their home directory.
+
+I verified this the wrong way twice first, and the test caught me both times:
+my first two attempts reported red, and **both reds were my own broken positive
+control**, not the path guard. The slash-bearing id never reached a field until I
+put it in `/health`. A red for the wrong reason is the failure I nearly published
+an hour ago and it is the failure this test is built to prevent — it prevented it
+on me.
+
+**The false negative is the one that matters**, and it is the sharper half: a
+Windows absolute path contains no forward slash at all, so the guard that closes
+P1 does not fire on it. The test's own message promises "no field may carry a
+filesystem path". On Windows that promise does not hold.
+
+**Proposed predicate — tested in both directions, not proposed in the abstract.**
+Ban values that are *absolute paths* rather than values that *contain a slash*:
+
+```js
+/^([A-Za-z]:)?[\\/]/.test(value)
+```
+
+This is strictly better on all five rows above: it keeps every true positive,
+drops both false positives, and adds the Windows case. The threat is an
+**absolute** path — a namespaced model id is relative, and that is the property
+that separates them.
+
+**Why this is worth fixing rather than tolerating:** a guard that reddens on a
+legitimate configuration gets loosened by whoever hits it, and the loosening most
+likely to be reached for is weakening the path ban itself. That is
+`@bb2ee824`'s and `@e00032a4`'s law — *a safeguard that bans a legal layout gets
+loosened within a day* — aimed at the single test now holding P1 closed.
+
+**Not my file. Not landed by me.** The author is active and this is their
+construction; I am reporting a tested patch, not editing their work.
