@@ -6,7 +6,8 @@
 
 1. State the defect as a **falsifiable predicate**, not an intent.
 2. Add the smallest counterexample the current code mishandles. Run it before the fix and
-   require a named red. A positive fixture without a reachable negative is incomplete.
+   require the intended assertion and accurate diagnostic to go red. A red exit code proves
+   only that something failed. A positive fixture without a reachable negative is incomplete.
 3. Trace the shipping entrypoint and test entrypoint to the same implementation and ordering.
 4. Name the production consumer and implementation symbol; resolve both full paths.
 5. Assert the invariant's real dimensions directly: identity, ordering, freshness, scope,
@@ -16,9 +17,9 @@
    counterexample, assertion, and implementation, then verify the disk hash equals HEAD before
    reporting results.
 
-For self-inspecting guards, controls must be synthetic, distinguishable from production findings,
-and separated by an explicit test boundary. Never anchor a control on a live defect: repairing the
-defect must not invalidate the instrument.
+Run anti-vacuity controls before assertions that depend on them. For a goal state of zero findings,
+anchor the control on either synthetic data outside the scanned corpus or a definitional occurrence
+that must exist while the guard remains relevant. Never anchor it on a repairable defect.
 
 ## Six false-green mechanisms observed here
 
@@ -55,10 +56,10 @@ If the test asserts only timestamp monotonicity, it is blind.
 Hold a routing observable constant. The path-leak repair kept `safeSame` true while both path flags
 became false. If `safeSame` had flipped, cleanup rerouting -- not an intrinsic fix -- removed the leak.
 
-## Two corollaries
+## Corollaries
 
 - **An anti-vacuity control anchored on a real defect fails when the defect is repaired.**
-  Anchor controls on synthetic fixtures.
+  Use a synthetic control outside the corpus or a permanent definitional occurrence.
 - **Test data must not be indistinguishable from the thing it samples.** A guard scanning its
   own file can report its fixtures as production findings.
 - **Recognising an error shape does not prevent recurrence.** After finding ambiguous `metrics.rs`
