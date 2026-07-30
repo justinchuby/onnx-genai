@@ -464,6 +464,72 @@ strike been executed, three documents would have deleted true statements about a
 live security control, and the deletion would have looked like diligence in every
 one of them.
 
+### KNOWN GAP — C19, percent-encoded dot segments, unfixed and shipping
+
+**This is a named, unfixed defect in the code this PR ships.** It is stated here
+because it is real, because it is loopback-only, and because shipping it silently
+would be the exact failure this document spends 1,400 lines describing.
+
+```
+CONFIRMED LIVE ON ALL FOUR DEMO ORIGINS, 06:39:24, by the agent who reproduced it
+  /demo/…/.vite/…/results.json      404   <- the dotfile rule works
+  /demo/…/%2Evite/…/results.json    200   <- 88 bytes, byte-identical to disk
+  /demo/…/%2evite/…/results.json    200   <- lowercase too
+  [POS CTL] /demo/app.js            200   <- the asset layer is alive
+  [NEG CTL] /demo/zzz-no-such.js    404   <- a missing file really does 404,
+                                             so the decoded 404 is a REFUSAL,
+                                             not an absence
+```
+
+**The guard compares raw bytes; `ServeDir` decodes first.** A segment spelled
+`%2Evite` does not begin with `.`, so the dotfile rule passes it, and the server
+then decodes it to `.vite` and serves the file. **Remedy, proposed by the reviewer
+who found it: refuse any `/demo/` path containing `%` at all — 91 servable assets,
+none of which need encoding.** That removes the differential rather than policing
+two parsers, so it cannot drift back.
+
+**And it composes with a second gap, which is the first time two findings on this
+branch multiply rather than merely coexist.** Measured directly:
+
+```
+UNDER THE SERVED ROOT
+  tracked by git ......... 125
+  present on disk ........ 126        <- the difference is ONE file
+  [POS CTL] index.html tracked: 1
+
+THAT FILE
+  node_modules/.vite/vitest/…/results.json
+  git check-ignore ....... IGNORED     <- invisible to `git status`
+  tracked at HEAD ........ NO          <- invisible to `ls-tree` and `ls-files`
+  extension .............. json        <- ON the nine-entry servable allowlist
+```
+
+**Three independent barriers — the tracked-file corpus, `.gitignore`, and the
+dotfile rule — and the union of their blind spots is not empty.** Each looks like
+defence in depth on its own.
+
+> **`ServeDir` walks the filesystem. Every guard we own walks git. The blind spot
+> is exactly `.gitignore`, which is a list of things we decided not to look at.**
+
+**The file is a build-tool cache, and it is not stable.** It held 88 bytes when it
+was first measured and **266 bytes when this section was written** — the same file,
+the same path, within the hour. **Nobody predicted that; it was observed while
+verifying the claim.** The argument for treating it as a real exposure was
+originally *nothing structural keeps it empty*; the file then changed size on its
+own, which converts that prediction into a measurement.
+
+**The correct repair is one word wider than the obvious one.** A guard that scans
+every *tracked* file under the served root would not see this file. **The corpus
+has to be a disk walk of the served root, because that is the corpus the server
+uses** — a guard whose corpus differs from the server's has a blind spot exactly
+the size of the difference, and nobody measures that difference, because both
+numbers look correct alone.
+
+**Attribution, since none of this is mine:** found by the reviewer holding the
+security lane, reproduced on production origins by the secretary, and the corpus
+composition measured by the security reviewer. **The 125/126 gap, the ignore
+status, and the byte-size change above are the only parts I measured myself.**
+
 ### The bypass does not reach this document, and here is why it cannot
 
 **The percent-encoding bypass above is real and it is unfixed. It is also
