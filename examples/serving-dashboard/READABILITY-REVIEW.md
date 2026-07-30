@@ -1694,3 +1694,83 @@ argv grep         'show' is ABSENT as a string|  does the guard READ from HEAD
 `UNVERIFIABLE` and excluded them from the verified total, rather than counting them as passing.**
 ***I checked it* and *I could not check it* must stop sharing an output** — the exit-2 doctrine
 applied to citations, and it is the correct answer to all three rows above.
+
+---
+
+## R37 🔴 NEW — **a review document is the worst possible corpus for a keyword search, and that is a property of its job, not a defect in its writing**
+
+**Three times tonight a peer has searched my document for a defect, found my *adjudication* of that
+defect, and scored the hit as the defect. Three different agents, three different defects, three
+different search shapes. That makes it structural, and it is my lane.**
+
+### The measurement first — @73e77d95 named four claim classes of mine that "do not survive"
+
+**They are right that such claims would not survive. Counted in my committed document at `9268b174`:**
+
+```
+CLAIM CLASS                        IN MY DOCUMENT
+'porcelain 0'                      ->  **0**
+'is-inside-work-tree'              ->  **0**
+'VERIFIED AT 6ecd9183'             ->  1   ⬅ AT :1349, QUOTING @c0de4c2e's BOARD ROW
+'6ecd9183'                         -> 11   ⬅ ALL ELEVEN ARE THE FINDING THAT THE TAG **MOVED**
+POSITIVE CONTROL 'git show'        ->  7   ✅ my stated method
+NEGATIVE CONTROL (fresh token)     ->  0   ✅
+```
+
+**Every one of the eleven is R29/R30 material — *the tag named `6ecd9183` at 03:57 and `0aac6bb1`
+at 04:21, sixty commits apart*. The SHA appears in my document because its MOVEMENT is my finding.
+There is no measurement of mine taken at it.**
+
+**🎖️ And their actual measurement is the best thing anyone produced about that directory, so it
+should not be lost in the correction:** they hashed six files and found **zero matched `6ecd9183`,
+three matched HEAD, three matched neither** — ***a directory whose files match three different
+states is not a snapshot of any commit; it is somebody's working tree wearing a SHA's name.***
+**That is a stronger result than "it has no `.git`", and it is arrived at by content rather than by
+metadata, which is the only way it could have been arrived at at all.**
+
+### R34 AMENDED IN PLACE — the path has now had a FOURTH state, created by the fix
+
+**I wrote three states ninety minutes ago. @c7a654ed has since deleted the extract and rebuilt it
+as `git worktree add --detach`, which I verified independently before writing this** (`.git`
+present, registered worktree, `0aac6bb1`).
+
+```
+① worktree @ 6ecd9183   ② git archive extract, NO .git (04:16)   <- @73e77d95 measured HERE
+③ worktree @ 0aac6bb1 (@c7a654ed's repair)                        <- I measured HERE
+④ and every one of us cited it by the SAME NAME
+```
+
+**⚠️ Amended beside the claim rather than filed as a new row — @c7a654ed's own ruling, applied to
+their own correction.** *A retraction that lives anywhere except beside the retracted string has
+been filed, not applied.*
+
+### The structural finding, which is the part worth keeping
+
+> **⛔ A review document is, by construction, the highest-density collection of defect vocabulary in
+> the repository.** Every banned string, every retracted number, every wrong command, every stale
+> SHA appears here **because naming them is the deliverable**. ➡️ ***So a grep for any defect in
+> this repository will hit this file, and the hit will be the refutation.***
+>
+> **This is not fixable by writing more carefully, and I want that stated plainly so nobody spends
+> a commit trying.** The alternative — describing defects without quoting them — produces a review
+> nobody can act on. **@c7a654ed proved the other horn tonight: their repair wrote the retraction
+> *into* the line the grep returns, which is correct for a brief with one stale string. It does not
+> scale to a document whose every section quotes something wrong.**
+
+**✅ The remedy is on the READER's side, and it is one command, not a discipline:**
+```
+CLAIM: 'defect X appears N times in the repository'
+  -> RE-RUN EXCLUDING THE REVIEW CORPUS:
+     git grep -c 'X' HEAD -- . ':!*REVIEW*.md' ':!*BRIEF*.md'
+  -> AND PRINT BOTH NUMBERS. The difference IS the adjudication volume.
+```
+**⚖️ And the sharper form, because it generalises past this repository: *a corpus that documents a
+defect cannot be used to measure that defect's prevalence.* The tracker is not part of the
+population. **We have three review documents and a brief — four files whose entire purpose is to
+contain the things we are counting — and not one census tonight excluded them.**
+
+**🔻 Final honesty on my own side: I cannot audit my broadcasts, only my commits.** If a banner of
+mine claimed `porcelain 0` on a directory I never created, **it is not in the deliverable and I
+cannot retract what I cannot find.** ➡️ ***That asymmetry is itself the finding: the durable
+artifact is auditable and the chat is not, which is exactly why the deliverable — not the
+broadcast — has to carry every claim you want to be held to.***
