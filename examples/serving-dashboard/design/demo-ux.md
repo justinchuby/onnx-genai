@@ -7310,3 +7310,94 @@ The same paragraph reads: *"If `n` and `CV` aren't available for a number, it is
 | D342 | A `CV`/`n` beside a figure is a claim about THAT figure's dispersion | `CV 1.98%` is within-run for one arm; the ratio's reproducibility is 9.77% between occasions. A correct statistic on the wrong quantity manufactures false support |
 | D343 | A rule set is a conjunction — check every clause against its neighbours, not only against the example | My own third clause forbade what my first clause mandated, and both shipped |
 | D344 | A deferral expires on its REASON, not only on its subject | `'edited 02:45, live at the time of the freeze'` was discharged hours ago; an entry that only watches its subject is blind to its excuse dissolving |
+
+---
+
+## §102 — Every guard we built asks whether a value is TRUE. None asked how much SPACE it takes (D345–D348)
+
+@376a0297 measured AC199 in a browser, which is the only place it is visible:
+
+```
+At 320px, the leaked path rendered   4 WRAPPED LINES / 81px
+the model name it sat beneath        1 LINE / 20px
+```
+
+**Nobody chose to emphasise the presenter's home directory. String length chose it.**
+
+⛔ And the CSS is *correct*. `overflow-wrap: anywhere` refuses to hide data the server authored — exactly right for an honest value. **A layout rule adopted to protect honesty became a megaphone the instant the content was something we should never have shown.**
+
+### 102.1 The distinction the whole rule turns on: two regions, not one
+
+Length means opposite things in two places, and every previous discussion of this collapsed them:
+
+| | **PROSE REGION** | **VALUE SLOT** |
+|---|---|---|
+| Examples | verbatim server error, footer evidence column, bypass reason | a `dd` in the model card, a panel's headline number |
+| Reader's posture | reading a quotation | **comparing peers** |
+| What length is | **content** | **emphasis** |
+| Long text is | correct, and truncating it destroys the one string a visitor can grep | **a claim nobody authored** |
+| Correct treatment | `overflow-wrap: anywhere`, unbounded | one line, overflow to `title` |
+
+🔑 **D345 — In a grid of peer cells, vertical extent IS emphasis.** The model card is a two-column `dl` whose cells are read against each other. The moment one cell is four lines and its neighbours are one, the grid stops being a grid and the longest string wins the page. **That is emphasis allocated by `strlen`, and no author was involved.**
+
+➡️ It does not die with the deleted path — **every unbounded-length field inherits it**: an error `reason`, a `provenanceWarning`, a stale-field explanation. ⚡ ***Left alone, the most emphatic thing on the panel is the honesty layer's apology for not having a number.*** A dashboard whose visual hierarchy is decided by string length is not an honest dashboard, it is an accidental one — **and it shouts loudest exactly when it has least to say.**
+
+### 102.2 The census — published as a LIST, not a count
+
+29 `textContent` write sites across 6 modules. Most are authored literals (`'Copy'`, `'Copied'`, `'···'`) and are bounded by construction. **The sites whose length is chosen by something other than us:**
+
+| Site | Text | Region | Bounded? |
+|---|---|---|---|
+| `model-card.js:102` → `.model-card__value` | `server.model_id`, **server-chosen** | **VALUE SLOT** | ⛔ **no** |
+| `panel-kit.js:330` → `.value__na-caption` | `headlineSentence(reason)` | **VALUE SLOT** | ⚠️ partial — see 102.3 |
+| `failure-state.js:272` → `.failure-state__verbatim-text` | server/browser message | prose | ✅ correct unbounded |
+| `app.js:351` → `.provenance-table td:last-child` | 34 evidence strings, **max 300 chars**, median 124, 8 over 200 | prose | ✅ correct unbounded |
+| `panel-kit.js:309/349/372` | `reason`, full text | **`title` attribute** | ✅ **costs no layout** |
+
+✅ **The single best pattern already in this codebase is the last row**: `panel-kit` puts the *headline sentence* in the flow and the *full reason* in `title`/`aria-label`. **An attribute is unbounded and costs zero layout — nothing is hidden, it is relocated to a surface that does not compete for emphasis.** That is the answer, and it was already here.
+
+⚠️ **The measurement that matters most, and it is a warning not a clearance:** `server.model_id` is unbounded and **server-chosen**. Our captures read `qwen-scatter` — 12 characters — so nothing overflows today. **That is the name we happened to pick, not a property anyone enforces.** A real ONNX id is `microsoft/Phi-3-mini-4k-instruct-onnx-cpu-int4-rtn-block-32-acc-level-4`: **71 characters, and it reproduces AC199 on the first honest deploy.** ➡️ ***The reachable set is empty by luck, which is not the same as bounded.***
+
+### 102.3 D346 — The one length bound we own degrades to identity on exactly the content that causes the defect
+
+`panel-kit.js:239` `headlineSentence()` keeps only the first sentence, and its comment is *right*: it exists because stacked prose "buries the very sentence it exists to communicate." **Somebody already solved AC199. Once. Locally. For one call site. And never turned it into a rule.** Measured:
+
+```
+authored prose, 2 sentences      50 ->  22   BOUNDED
+authored prose, 1 sentence       36 ->  36   ** IDENTITY **
+a leaked absolute path           82 ->  82   ** IDENTITY **
+a URL                            72 ->  72   ** IDENTITY **
+a real ONNX model id             71 ->  71   ** IDENTITY **
+a bare file:line citation        27 ->  27   ** IDENTITY **
+```
+
+🔑 **D346 — A sentence-shaped bound silently becomes a no-op on machine-shaped strings.** It splits on `[.!?]` + space. A path, a URL, an id and a hash contain none of those, **so the bound vanishes precisely on the class of content that overflows.** ⛔ And it fails *toward* the defect while still reading, at the call site, as though a bound is in force. **A bound that cannot fail loudly is a comment.**
+
+### 102.4 D347 — The guard, and the honest limit on it
+
+`asset-graph.test.js` → **`unbounded text is classified where it is written`** (4 tests). Since `overflow-wrap: anywhere` is *correct* in a prose region and *wrong* in a value slot, **no grep for the declaration can decide** — only the author knows which region they are in. So the trust default is inverted: **an unconditional breaker must be classified where it is written, and an unclassified one fails.**
+
+- Both arms mutation-proven against the real `shell.css` with the byte delta printed: marker stripped → **RED**, naming `.model-card__value` (−11 bytes); restored → **GREEN, byte-identical, sha `39e9298d`**.
+- Anti-vacuity floor (≥2 breakers), stale-marker arm, closed-set arm (`FINE-ACTUALLY` is rejected), and scanner controls for nesting and braces-in-comments.
+- **Declared limit:** scope is the *unconditional* breakers. `overflow-wrap: break-word` is out of scope; its one instance, `panels.css` `.panel-bypass__reason`, is a prose region that already justifies itself in file, and widening needs a marker from that file's owner. **A selector with no wrapping property at all is also unbounded and this guard cannot see it.**
+
+### 102.5 D348 — The guard reproduced tonight's signature defect, and its own mutation caught it
+
+⛔ On the first run of the anti-vacuity mutation I deleted **both** `overflow-wrap: anywhere` declarations from `shell.css` and the floor reported **`found 1`, not `found 0`**.
+
+**The classifying comment I had just written NAMES the property it classifies. The predicate matched the epitaph, not the defect.**
+
+🔑 **D348 — Look for a declaration in the declaration stream, never in the prose.** The two halves need opposite treatment: the breaker is a declaration, so comments are noise; the marker is a comment, so declarations are noise. ⚖️ **The repair is always the predicate and never the comment** — the sentence explaining the choice is the most valuable line in the block, and deleting it to satisfy a matcher trades a reader for a regex. Kept as a permanent arm (`.h`, "we deliberately avoid…").
+
+➡️ **This is the fifth form of my own guard-scoping defect and the most humbling: I wrote it one hour after reading @c0de4c2e's `telemetry-store.js:684` finding, which is the identical mechanism.** ***A false floor propped up by a comment is not a floor*** — and only a mutation could tell me, because a `1` and a `0` render identically in a column of numbers until you predict which one you expect.
+
+### 102.6 What is NOT built, and why I am not building it tonight
+
+⛔ **`.model-card__value` is still an unbounded VALUE SLOT. It ships DISCLOSED, named in the stylesheet, not repaired.** The repair is a layout change — one line plus overflow to `title` — and **no source read can verify a layout.** Every browser-only defect this session (AC199 included) was invisible to every static instrument we own; shipping an unverified layout change onto a tagged review at 07:00 would be that exact error, committed in the name of fixing it.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D345 | In a grid of peer cells, vertical extent is EMPHASIS; unbounded text belongs in a prose region or an attribute, never a value slot | 4 lines/81px beside 1 line/20px. `strlen` allocated the loudest slot on the card and no author was involved |
+| D346 | A sentence-shaped bound is a no-op on machine-shaped strings | `headlineSentence` is identity on a path, a URL, an id and a citation — it vanishes on exactly the content that overflows, while still reading as a bound |
+| D347 | A declaration that is right in one region and wrong in another must be CLASSIFIED where written, not grepped for | `overflow-wrap: anywhere` is correct on quoted server text and a defect on a value slot; only the author knows which |
+| D348 | Look for a declaration in the declaration stream, never in the prose | My own classifying comment named its property and propped the anti-vacuity floor at 1 with both declarations deleted |

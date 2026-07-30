@@ -1905,3 +1905,238 @@ describe('every stylesheet is structurally well-formed', () => {
     );
   });
 });
+
+/*
+ * ---------------------------------------------------------------------------
+ * THE EMPHASIS BUDGET (demo-ux.md §102, D345-D348)
+ *
+ * Every other guard in this suite asks whether a value is TRUE. This one asks
+ * how much SPACE it takes, which is a question none of our thirteen
+ * instruments could previously ask.
+ *
+ * THE DEFECT IT EXISTS FOR. At 320px a leaked absolute path rendered 4 wrapped
+ * lines / 81px directly beneath a model name that rendered 1 line / 20px.
+ * Nobody chose to emphasise the presenter's home directory; STRING LENGTH
+ * CHOSE IT. In a grid of peer cells, vertical extent IS emphasis -- so an
+ * unbounded value awards itself the loudest slot on the card with no author
+ * involved, and it shouts loudest exactly when it has least to say.
+ *
+ * WHY A REGISTRY AND NOT A BAN. `overflow-wrap: anywhere` is CORRECT in a
+ * prose region: it refuses to hide data the server authored. The property is
+ * not the defect. Putting it on a VALUE SLOT is. Since the same declaration is
+ * right in one place and wrong in another, no grep for the declaration can
+ * decide -- only the author knows which region they are in. So this inverts
+ * the trust default: an unconditional breaker must be CLASSIFIED where it is
+ * written, and an unclassified one fails. That converts "somebody asked this
+ * question once, locally, about one rule" into a swept rule.
+ *
+ * DECLARED LIMIT, so nobody reads a green here as wider than it is:
+ *   - Scope is the UNCONDITIONAL breakers, `overflow-wrap: anywhere` and
+ *     `word-break: break-all`, which split inside a token even when a soft
+ *     wrap opportunity exists. `overflow-wrap: break-word` is OUT OF SCOPE.
+ *     The one instance -- `panels.css` `.panel-bypass__reason` -- is a prose
+ *     region that already justifies itself in file, and widening this guard to
+ *     reach it needs a marker added by that file's owner, not by me.
+ *   - A selector with NO wrapping property at all is also unbounded. This
+ *     guard cannot see that. It detects an undeclared BREAKER, not every route
+ *     to an unbounded line box.
+ * ---------------------------------------------------------------------------
+ */
+describe('unbounded text is classified where it is written', () => {
+  // The two words a breaker may be classified as. A CLOSED SET on purpose: an
+  // unrecognised class must fail rather than be waved through, because the
+  // failure mode being guarded is somebody inventing a soothing word for
+  // "this one is fine actually".
+  const CLASSES = ['PROSE-REGION', 'VALUE-SLOT'];
+  const BREAKER = /overflow-wrap:\s*anywhere|word-break:\s*break-all/;
+  const MARKER = /UNBOUNDED-TEXT:\s*([A-Z-]+)/;
+
+  /**
+   * Innermost rule blocks with their selector and body.
+   *
+   * Brace counting must know about comments or a `{` inside prose corrupts the
+   * depth for the rest of the file -- the same class of defect as counting
+   * comment openers with grep, which reads `tokens.css` as 54/53 when a state
+   * machine reads 53/53. And the body must KEEP its comments, because the
+   * marker this guard looks for lives in one.
+   */
+  const blocks = (src) => {
+    const out = [];
+    let depth = 0;
+    let inComment = false;
+    let segStart = 0;
+    const stack = [];
+    for (let i = 0; i < src.length; i += 1) {
+      if (inComment) {
+        if (src[i] === '*' && src[i + 1] === '/') { inComment = false; i += 1; }
+        continue;
+      }
+      if (src[i] === '/' && src[i + 1] === '*') { inComment = true; i += 1; continue; }
+      if (src[i] === '{') {
+        stack.push({ selector: src.slice(segStart, i), bodyStart: i + 1 });
+        depth += 1;
+        segStart = i + 1;
+      } else if (src[i] === '}') {
+        const open = stack.pop();
+        if (open) {
+          const body = src.slice(open.bodyStart, i);
+          // Innermost only: a media/container query's body contains `{`, and
+          // its declarations belong to the rules nested inside it, not to it.
+          if (!body.includes('{')) {
+            out.push({
+              selector: open.selector.replace(/\/\*[\s\S]*?\*\//g, '').trim().split('\n').pop().trim(),
+              body,
+            });
+          }
+        }
+        depth = Math.max(0, depth - 1);
+        segStart = i + 1;
+      }
+    }
+    return out;
+  };
+
+  /**
+   * A rule body with its comments removed.
+   *
+   * ⛔ THE BREAKER MUST BE LOOKED FOR IN THE DECLARATION STREAM, NEVER IN THE
+   * PROSE. This guard failed its own anti-vacuity mutation on the first run: I
+   * deleted BOTH `overflow-wrap: anywhere` declarations from `shell.css` and
+   * the floor reported `found 1` instead of `found 0`, because the classifying
+   * comment I had just written NAMES the property it is classifying. The
+   * epitaph matched the predicate for the defect.
+   *
+   * That is the session's own signature landing on the instrument written to
+   * end it: a rule that documents itself is LOUD to a grep for the thing it
+   * documents, so a well-commented fix reads as an outstanding defect. The
+   * repair is always the predicate and never the comment -- the sentence
+   * explaining the choice is the most valuable line in the block and deleting
+   * it to satisfy a matcher would be trading a reader for a regex.
+   *
+   * The two halves need OPPOSITE treatment and that is the whole trick here:
+   * the BREAKER is a declaration, so comments are noise; the MARKER is a
+   * comment, so declarations are noise.
+   */
+  const declarationsOf = (body) => body.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  /** Every block carrying an unconditional breaker, with its declared class. */
+  const breakers = (src) =>
+    blocks(src)
+      .filter((b) => BREAKER.test(declarationsOf(b.body)))
+      .map((b) => ({ selector: b.selector, declared: MARKER.exec(b.body)?.[1] ?? null }));
+
+  const defects = (src) =>
+    breakers(src).flatMap(({ selector, declared }) => {
+      if (declared === null) {
+        return [`\`${selector}\` breaks text unconditionally and is not classified`];
+      }
+      if (!CLASSES.includes(declared)) {
+        return [`\`${selector}\` is classified \`${declared}\`, which is not one of ${CLASSES.join('/')}`];
+      }
+      return [];
+    });
+
+  it('every unconditional breaker declares which kind of region it is', () => {
+    for (const file of styleFiles) {
+      assert.deepEqual(
+        defects(css[file]),
+        [],
+        `\`styles/${file}\` breaks text inside words without saying whether that is a ` +
+          `PROSE-REGION (length is content -- correct) or a VALUE-SLOT (length is ` +
+          `EMPHASIS -- a defect). Add an \`UNBOUNDED-TEXT: <class>\` comment inside ` +
+          `the rule saying which, and why. See demo-ux.md §102.`,
+      );
+    }
+  });
+
+  // ANTI-VACUITY, and it is the arm that matters most here: this whole guard
+  // goes silently green the day somebody deletes both breakers, or renames the
+  // property, or the scanner stops finding blocks. A registry check with an
+  // empty registry reports a perfect score for inspecting nothing -- the exact
+  // absent-versus-zero failure this project exists to refuse.
+  it('found breakers to classify, so a clean run is not an empty one', () => {
+    const found = styleFiles.flatMap((f) => breakers(css[f]).map((b) => `${f} ${b.selector}`));
+    assert.ok(
+      found.length >= 2,
+      `expected at least the 2 known unconditional breakers, found ${found.length}. ` +
+        `Either they were removed -- in which case DELETE THIS FLOOR DELIBERATELY and ` +
+        `say so -- or the scanner stopped seeing them, which would make every green ` +
+        `above meaningless. Found: ${JSON.stringify(found)}`,
+    );
+  });
+
+  // A marker on a rule with no breaker is a TOMBSTONE READING AS LANDED: it
+  // says somebody considered the question here, when the declaration it was
+  // written about has since moved or gone. Cheap to check, and it is how a
+  // registry rots without anything going red.
+  it('no rule is classified for a breaker it no longer has', () => {
+    const stale = [];
+    for (const file of styleFiles) {
+      for (const b of blocks(css[file])) {
+        if (MARKER.test(b.body) && !BREAKER.test(declarationsOf(b.body))) {
+          stale.push(`styles/${file}: \`${b.selector}\` is classified but breaks nothing`);
+        }
+      }
+    }
+    assert.deepEqual(stale, [], 'a classification outlived the declaration it describes');
+  });
+
+  it('can actually detect each defect, so a clean run means something', () => {
+    const unclassified = '.a {\n  overflow-wrap: anywhere;\n}\n';
+    assert.equal(defects(unclassified).length, 1, 'the detector cannot see an unclassified breaker');
+    assert.match(defects(unclassified)[0], /not classified/);
+
+    const breakAll = '.b {\n  word-break: break-all;\n}\n';
+    assert.equal(defects(breakAll).length, 1, 'the detector only looks at `overflow-wrap`');
+
+    // The closed set must actually be closed. A soothing invented word is the
+    // realistic way this guard gets defeated -- not by deleting it.
+    const invented = '.c {\n  /* UNBOUNDED-TEXT: FINE-ACTUALLY */\n  overflow-wrap: anywhere;\n}\n';
+    assert.equal(defects(invented).length, 1, 'an unrecognised class was accepted');
+    assert.match(defects(invented)[0], /not one of/);
+
+    // NEGATIVE CONTROLS. Without these the detector could pass all three above
+    // by flagging every block it sees.
+    const classified = '.d {\n  /* UNBOUNDED-TEXT: PROSE-REGION -- quoted server text */\n  overflow-wrap: anywhere;\n}\n';
+    assert.deepEqual(defects(classified), [], 'the detector fires on a correctly classified breaker');
+
+    const noBreaker = '.e {\n  color: red;\n}\n';
+    assert.deepEqual(defects(noBreaker), [], 'the detector fires on a rule that breaks nothing');
+
+    // And the control for the scanner itself, which is the half that would
+    // fail SILENTLY: a breaker nested inside a media query must still be
+    // found. A naive innermost-block scan that mishandles nesting reports zero
+    // here, and zero reads exactly like clean.
+    const nested = '@media (max-width: 400px) {\n  .f {\n    overflow-wrap: anywhere;\n  }\n}\n';
+    assert.equal(defects(nested).length, 1, 'the scanner loses blocks nested in a query');
+    assert.match(defects(nested)[0], /\.f/);
+
+    // A `{` inside a COMMENT must not corrupt brace depth for the rest of the
+    // file. This is the defect that would make the guard go quiet from the
+    // point of the comment onward while still reporting a confident pass.
+    const braceInComment = '/* a comment with { an unbalanced brace */\n.g {\n  overflow-wrap: anywhere;\n}\n';
+    assert.equal(defects(braceInComment).length, 1, 'a brace inside a comment blinded the scanner');
+    assert.match(defects(braceInComment)[0], /\.g/);
+
+    // ⛔ THE ARM THIS GUARD FAILED ITS OWN MUTATION ON, kept permanently. A
+    // rule that merely TALKS about `overflow-wrap: anywhere` in a comment,
+    // while declaring nothing of the kind, must NOT count as a breaker. Before
+    // `declarationsOf` this returned 1 -- the guard read its own explanatory
+    // prose as the thing it was hunting, which would have held the anti-vacuity
+    // floor up at 1 forever after both real declarations were deleted. A floor
+    // propped up by a comment is not a floor.
+    const talksAboutIt =
+      '.h {\n  /* we deliberately avoid overflow-wrap: anywhere here */\n  color: red;\n}\n';
+    assert.deepEqual(
+      defects(talksAboutIt),
+      [],
+      'the guard counts a mention of the property as a use of it -- look for the ' +
+        'declaration in the declaration stream, never in the prose',
+    );
+    assert.equal(
+      breakers(talksAboutIt).length,
+      0,
+      'the anti-vacuity floor can be propped up by comment prose alone',
+    );
+  });
+});

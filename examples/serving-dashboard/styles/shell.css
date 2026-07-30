@@ -136,6 +136,29 @@ body[data-blocked] .app {
 .model-card__value {
   margin: 0;
   font-family: var(--og-font-mono);
+  /*
+   * UNBOUNDED-TEXT: VALUE-SLOT -- DISCLOSED DEFECT, NOT AN ENDORSEMENT.
+   * See demo-ux.md §102 (D345-D348). This is the only VALUE-SLOT in the
+   * stylesheet that wraps without a bound, and it is recorded here rather
+   * than repaired because the repair is a layout change no source read can
+   * verify. It ships named.
+   *
+   * WHY IT IS A DEFECT. This is a `dd` in a two-column grid whose other
+   * cells are one line each. `overflow-wrap: anywhere` refuses to hide data
+   * -- exactly right for an honest value -- but vertical extent in a grid of
+   * peer cells IS emphasis, so a long string awards itself the loudest slot
+   * on the card without anybody choosing that. Measured at 320px: a leaked
+   * absolute path rendered 4 lines / 81px beside a 1-line / 20px model name.
+   * The path has since been deleted; THE SLOT HAS NOT CHANGED.
+   *
+   * WHY IT IS STILL LIVE. `server.model_id` renders here and its length is
+   * chosen by the SERVER, not by us. Our captures read `qwen-scatter` (12
+   * chars) so nothing overflows today -- that is the naming we happened to
+   * pick, not a property anyone enforces. A real ONNX id such as
+   * `microsoft/Phi-3-mini-4k-instruct-onnx-cpu-int4-rtn-block-32-acc-level-4`
+   * is 71 characters and reproduces the defect on the first honest deploy.
+   * THE REACHABLE SET IS EMPTY BY LUCK, WHICH IS NOT THE SAME AS BOUNDED.
+   */
   overflow-wrap: anywhere;
 }
 
@@ -472,6 +495,17 @@ body[data-blocked] .app {
   font-family: var(--og-font-mono);
   font-size: var(--og-type-sm);
   white-space: pre-wrap;
+  /*
+   * UNBOUNDED-TEXT: PROSE-REGION -- CORRECT HERE, AND DELIBERATE.
+   * This element renders text the SERVER or the BROWSER authored, verbatim
+   * and visibly quoted (`labelledVerbatim`, ui/failure-state.js). Length is
+   * CONTENT here, not emphasis: the reader has been told they are reading a
+   * quotation, there are no peer cells to compare it against, and truncating
+   * a diagnostic to keep a box tidy would destroy the one string the visitor
+   * can actually grep for. A prose region is where unbounded text BELONGS --
+   * the rule in demo-ux.md §102 exists to keep it out of value slots, not to
+   * shorten it everywhere.
+   */
   overflow-wrap: anywhere;
 }
 
