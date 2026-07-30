@@ -33,8 +33,57 @@ import { assertShippingTree } from './shipping-tree.mjs';
 assertShippingTree();
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const README = readFileSync(join(HERE, 'README.md'), 'utf8');
-const BASELINE = readFileSync(join(HERE, 'perf-baseline.md'), 'utf8');
+
+// Every claim below is a claim about WHAT SHIPS, so every byte below comes from
+// `git show HEAD:`, never from the disk.
+//
+// This guard used to readFileSync the working tree. That reads correctly and
+// means the wrong thing, and the two are indistinguishable whenever the tree is
+// clean -- which is precisely when you are most likely to trust the result. The
+// failure it permits is one-directional and it is the bad direction: a defect
+// still present in HEAD but repaired only on disk scores GREEN, and the repair
+// then evaporates on the next checkout. A reviewer clones HEAD. So does CI. So
+// does the demo. Nobody clones my working tree.
+//
+// The inverse failure -- a fix on disk that is not yet committed reads RED --
+// is the safe one, and its remedy is the thing you were going to do anyway.
+function shipped(rel) {
+  // The `./` is load-bearing: `git show HEAD:<path>` resolves from the repo
+  // root, not the cwd, so bare relative paths silently resolve to nothing.
+  return execFileSync('git', ['show', `HEAD:./${rel}`], {
+    cwd: HERE,
+    maxBuffer: 64 * 1024 * 1024,
+  }).toString();
+}
+
+// A clean tree makes "reads HEAD" and "reads disk" byte-identical, so state the
+// difference out loud rather than letting silence stand in for equality.
+function divergentFromHead(rels) {
+  const out = [];
+  for (const rel of rels) {
+    let onDisk;
+    try {
+      onDisk = readFileSync(join(HERE, rel), 'utf8');
+    } catch {
+      continue; // deleted on disk; HEAD is still what ships.
+    }
+    if (onDisk !== shipped(rel)) out.push(rel);
+  }
+  return out;
+}
+
+// A note for whoever reads a RED from this file with a fix already in hand:
+// if the offending path is listed as divergent, your fix exists only on disk.
+function divergenceNote(rels) {
+  const d = divergentFromHead(rels);
+  return d.length
+    ? `\n\nNOTE: these scanned files differ between HEAD and your working tree, `
+      + `so a fix you have made on disk is NOT yet part of what ships: ${d.join(', ')}`
+    : '';
+}
+
+const README = shipped('README.md');
+const BASELINE = shipped('perf-baseline.md');
 
 function median(xs) {
   const s = [...xs].sort((a, b) => a - b);
@@ -218,17 +267,17 @@ test('the README does not restate an absolute figure the baseline calls irreprod
 // did not exist when the rule was ratified, and adding a file to a list is a
 // step someone has to remember, which is the failure being guarded.
 test('no document states the speedup without the per-stream tradeoff', () => {
-  const docs = execFileSync('git', ['ls-files', '*.md'], { cwd: HERE })
+  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
     .toString()
     .split('\n')
-    .filter(Boolean)
+    .filter((f) => f.endsWith('.md'))
     // perf-baseline.md is the raw record and demo-spec.md is the contract;
     // both discuss the figures analytically rather than presenting them.
     .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f));
 
   const offenders = [];
   for (const doc of docs) {
-    const text = readFileSync(join(HERE, doc), 'utf8');
+    const text = shipped(doc);
     // A PRESENTATION of the speedup: "2.5x"/"2.46x" tied to throughput prose.
     const presents = /\b2\.[45]\d?\s*×[\s\S]{0,200}?(?:aggregate|throughput|decode)/i.test(text)
       || /(?:aggregate|throughput)[\s\S]{0,200}?\b2\.[45]\d?\s*×/i.test(text);
@@ -274,10 +323,10 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
   // and a percentage delta actually co-occur. A bare "7 %" anywhere in the
   // repo is not evidence of anything -- a checker that fired on that would be
   // reworded away within a day and would teach everyone to ignore it.
-  const docs = execFileSync('git', ['ls-files', '*.md'], { cwd: HERE })
+  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
     .toString()
     .split('\n')
-    .filter(Boolean)
+    .filter((f) => f.endsWith('.md'))
     .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f))
     // EXEMPTION, DOCUMENTED SO IT CANNOT BECOME AN OVERSIGHT: design/demo-ux.md
     // is @0837fdf9's design record and currently has THREE unqualified
@@ -320,7 +369,7 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
     // LINE NUMBER: matching characters is not matching meaning, and a checker
     // that cannot tell a claim from a search for that claim will be trained
     // away by its own false positives.
-    const text = readFileSync(join(HERE, doc), 'utf8')
+    const text = shipped(doc)
       .replace(/```[\s\S]*?```/g, '\n')
       .replace(/`[^`\n]*`/g, ' ');
     for (const para of text.split(/\n\s*\n/)) {
@@ -414,13 +463,13 @@ function statementUnits(source) {
 test('no source file states the withdrawn prefix timing result as a live finding', () => {
   assertShippingTree();
 
-  const sources = execFileSync('git', ['ls-files', '*.js', '*.mjs'], { cwd: HERE })
+  const sources = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
     .toString()
     .split('\n')
-    .filter(Boolean);
+    .filter((f) => /\.(js|mjs)$/.test(f));
   assert.ok(
     sources.length > 0,
-    'no tracked .js/.mjs files found — this check would pass vacuously',
+    'no .js/.mjs files found in HEAD — this check would pass vacuously',
   );
 
   // The withdrawn artefacts, by content rather than by digits alone: the
@@ -473,7 +522,7 @@ test('no source file states the withdrawn prefix timing result as a live finding
   let withdrawnMentions = 0;
 
   for (const rel of sources) {
-    const units = statementUnits(readFileSync(join(HERE, rel), 'utf8'));
+    const units = statementUnits(shipped(rel));
     if (rel !== SELF) unitsInspected += units.length;
     for (const unit of units) {
       if (!WITHDRAWN.test(unit.text)) continue;
