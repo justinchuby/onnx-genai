@@ -432,24 +432,63 @@ impl NativeDecodeSession {
         drop(io_span);
 
         let cuda = if session.device_id().device_type == DeviceType::Cuda {
-            if sequence_source != SequenceInputKind::TokenIds
-                || step_inputs.iter().any(|binding| {
-                    matches!(
-                        binding.source,
-                        NativeStepInputSource::InputsEmbeds | NativeStepInputSource::Routed
-                    )
-                })
+            // Inc3a: the CUDA native decoder now accepts a metadata-declared
+            // `inputs_embeds` sequence source (a fused VLM decoder). Generic
+            // arbitrary `Routed` ports are still unsupported on CUDA and remain
+            // refused here until per-port device bindings are implemented.
+            if step_inputs
+                .iter()
+                .any(|binding| binding.source == NativeStepInputSource::Routed)
             {
                 bail!(
-                    "native CUDA target decode does not yet support metadata-declared embedding or routed step inputs; use the CPU native device for this contract until generic device bindings are implemented"
+                    "native CUDA target decode does not yet support arbitrary routed step inputs; use the CPU native device for this contract until generic device bindings are implemented"
                 );
             }
-            let token_input = token_input
-                .as_deref()
-                .context("native CUDA target decode is missing its token input binding")?;
             let attention_mask = attention_mask
                 .as_deref()
                 .context("native CUDA target decode requires a declared attention-mask input")?;
+            // Resolve the sequence input: token ids (Int64 `[1, 1]`) by default,
+            // or a float `inputs_embeds` `[1, 1, hidden]` for a fused decoder.
+            let inputs_embeds = if sequence_source == SequenceInputKind::InputsEmbeds {
+                let name = inputs_embeds_input.as_deref().context(
+                    "native CUDA target decode declares inputs_embeds but is missing its embedding input binding",
+                )?;
+                let meta = session
+                    .inputs()
+                    .iter()
+                    .find(|meta| meta.name == name)
+                    .with_context(|| {
+                        format!("missing CUDA inputs_embeds input metadata for '{name}'")
+                    })?;
+                if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) {
+                    bail!(
+                        "native CUDA inputs_embeds input '{name}' must be f32 or f16, got {:?} {:?}",
+                        meta.dtype,
+                        meta.shape
+                    );
+                }
+                let hidden = match meta.shape.iter().copied().next_back() {
+                    Some(Dim::Static(value)) => value,
+                    _ => bail!(
+                        "native CUDA inputs_embeds input '{name}' needs a static hidden dimension, got shape {:?}",
+                        meta.shape
+                    ),
+                };
+                Some(CudaEmbedsBinding {
+                    name,
+                    dtype: meta.dtype,
+                    hidden,
+                })
+            } else {
+                None
+            };
+            let token_input = if inputs_embeds.is_some() {
+                ""
+            } else {
+                token_input
+                    .as_deref()
+                    .context("native CUDA target decode is missing its token input binding")?
+            };
             let bytes_per_token = DecodeCudaState::kv_bytes_per_token(
                 &session,
                 &present_to_past,
@@ -500,6 +539,7 @@ impl NativeDecodeSession {
                 &mut session,
                 DecodeCudaIo {
                     input_ids: token_input,
+                    inputs_embeds,
                     attention_mask,
                     position_ids: position_ids.as_deref(),
                     logits: &logits,

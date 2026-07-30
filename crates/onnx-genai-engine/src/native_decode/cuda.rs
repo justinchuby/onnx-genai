@@ -173,9 +173,24 @@ pub(crate) struct DecodeCudaState {
 
 pub(crate) struct DecodeCudaIo<'a> {
     pub(crate) input_ids: &'a str,
+    /// Present only when the decoder's sequence source is `inputs_embeds` (a
+    /// fused VLM decoder) rather than raw token ids. Carries the embed port
+    /// name plus its element dtype and hidden width so the sequence device
+    /// binding is allocated as a float `[1, 1, hidden]` embedding instead of an
+    /// `Int64 [1, 1]` token id. `None` keeps the token-id path byte-identical.
+    pub(crate) inputs_embeds: Option<CudaEmbedsBinding<'a>>,
     pub(crate) attention_mask: &'a str,
     pub(crate) position_ids: Option<&'a str>,
     pub(crate) logits: &'a str,
+}
+
+/// Metadata for a CUDA `inputs_embeds` sequence input (Inc3a). The native CUDA
+/// decoder receives one token's embedding per step as a routed host tensor and
+/// binds it on-device, keeping the KV cache device-resident.
+pub(crate) struct CudaEmbedsBinding<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) dtype: DataType,
+    pub(crate) hidden: usize,
 }
 
 pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
@@ -217,11 +232,6 @@ impl NativeDecodeSession {
         position_input: Option<&str>,
         error_context: &str,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let state = self
-            .cuda
-            .as_mut()
-            .context("CUDA decode state is not initialized")?;
-        state.invalidate_graph(&mut self.session)?;
         let ids = token_ids
             .iter()
             .map(|&id| i64::from(id))
@@ -238,6 +248,28 @@ impl NativeDecodeSession {
                 Tensor::from_i64(&[1, token_ids.len()], &positions)?,
             ));
         }
+        self.run_cuda_eager_rows_owned(owned, total_len, error_context)
+    }
+
+    /// Shared eager (uncaptured) device forward body: bind the caller-provided
+    /// non-KV inputs (`owned` — a token or `inputs_embeds` sequence tensor plus
+    /// optional position ids) against the persistent device KV/mask bindings,
+    /// run, collect host `[K, vocab]` logits, and advance the KV logical length.
+    ///
+    /// Both the token path (via [`Self::run_cuda_eager_rows`]) and the
+    /// `inputs_embeds` path (Inc3a) share this body; only the construction of
+    /// `owned` differs, so the KV device-residency guarantee is identical.
+    fn run_cuda_eager_rows_owned(
+        &mut self,
+        owned: Vec<(String, Tensor)>,
+        total_len: usize,
+        error_context: &str,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.invalidate_graph(&mut self.session)?;
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
@@ -285,10 +317,34 @@ impl NativeDecodeSession {
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
+        step_inputs: &[(String, Tensor)],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let total_len = past_len
             .checked_add(token_ids.len())
             .context("native decode context length overflow")?;
+        // A fused VLM decoder is driven by `inputs_embeds` (Inc3a): there is no
+        // token-id sequence input, so its per-step embedding arrives as a routed
+        // host tensor. Route it through the eager device path — the KV/mask
+        // bindings stay device-resident exactly as in the token path; only the
+        // sequence tensor bound each step differs. Generic (non-embeds) routed
+        // ports on CUDA are still unsupported and are refused below.
+        if let Some(embeds_input) = self
+            .step_input_name(NativeStepInputSource::InputsEmbeds)
+            .map(str::to_owned)
+        {
+            return self.decode_cuda_inputs_embeds(
+                &embeds_input,
+                token_ids,
+                past_len,
+                total_len,
+                step_inputs,
+            );
+        }
+        if let Some((name, _)) = step_inputs.first() {
+            bail!(
+                "native CUDA target decode does not yet accept generic routed host step input '{name}'; only inputs_embeds and generated roles are supported on CUDA (use the CPU native device for arbitrary routed ports)"
+            );
+        }
         let token_input = self
             .step_input_name(NativeStepInputSource::TokenIds)
             .context("native CUDA decoder has no token input binding")?
@@ -354,6 +410,67 @@ impl NativeDecodeSession {
             position_input.as_deref(),
             "decoder",
         )
+    }
+
+    /// CUDA `inputs_embeds` decode step (Inc3a). The routed one-token embedding
+    /// (`[1, K, hidden]`, produced host-side by the every_step embedding
+    /// component) is bound as the sequence input for an eager device forward,
+    /// while the attention mask and KV cache stay resident in the persistent
+    /// device bindings — so only the small embedding crosses host→device each
+    /// step and the KV never round-trips. Generated position ids (when the
+    /// decoder declares them) are supplied alongside, mirroring the CPU path.
+    fn decode_cuda_inputs_embeds(
+        &mut self,
+        embeds_input: &str,
+        token_ids: &[TokenId],
+        past_len: usize,
+        total_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+        let embeds = step_inputs
+            .iter()
+            .find(|(name, _)| name == embeds_input)
+            .map(|(_, tensor)| tensor.clone())
+            .with_context(|| {
+                format!(
+                    "declared inputs_embeds input '{embeds_input}' was not supplied to the native CUDA decode step; route the current embedding component output to this exact decoder port"
+                )
+            })?;
+        for (name, _) in step_inputs {
+            if name != embeds_input {
+                bail!(
+                    "native CUDA target decode does not yet accept generic routed host step input '{name}'; only inputs_embeds and generated roles are supported on CUDA (use the CPU native device for arbitrary routed ports)"
+                );
+            }
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        // The embedding is a fresh device upload every step, so this path is not
+        // CUDA-graph captured; expose the growing logical mask width (matching the
+        // eager token forward) rather than freezing to physical capacity.
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+
+        let mut owned = Vec::with_capacity(2);
+        owned.push((embeds_input.to_owned(), embeds));
+        if let Some(position_ids_name) = position_input {
+            let positions = (past_len..total_len)
+                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            owned.push((
+                position_ids_name,
+                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
+            ));
+        }
+        self.run_cuda_eager_rows_owned(owned, total_len, "decoder")
     }
 
     /// Speculative **verify** primitive (option (b): the safe eager M=K path).
@@ -847,10 +964,15 @@ impl DecodeCudaState {
         // data-dependent and must not be collapsed. See RULES.md §2 — this is a
         // purely structural signal, never a model-name gate.
         let mut unit_symbols: HashSet<SymbolId> = HashSet::new();
+        let sequence_input_name = io
+            .inputs_embeds
+            .as_ref()
+            .map(|embeds| embeds.name)
+            .unwrap_or(io.input_ids);
         if let Some(meta) = session
             .inputs()
             .iter()
-            .find(|meta| meta.name == io.input_ids)
+            .find(|meta| meta.name == sequence_input_name)
         {
             Self::collect_unit_symbols(&meta.shape, false, &mut unit_symbols);
         }
@@ -942,13 +1064,29 @@ impl DecodeCudaState {
         };
 
         let input_ids_binding = bindings.len();
-        bindings.push(session.allocate_device_binding(
-            io.input_ids,
-            None::<String>,
-            DataType::Int64,
-            vec![1, 1],
-            vec![1, 1],
-        )?);
+        if let Some(embeds) = &io.inputs_embeds {
+            // Fused VLM decoder (Inc3a): the sequence input is a float
+            // `[1, 1, hidden]` embedding, not an `Int64 [1, 1]` token id. This
+            // persistent binding keeps the sequence-binding index valid; the
+            // eager inputs_embeds decode path binds the per-step embedding as an
+            // owned input rather than through this slot, so it is never the
+            // captured token-write target.
+            bindings.push(session.allocate_device_binding(
+                embeds.name,
+                None::<String>,
+                embeds.dtype,
+                vec![1, 1, embeds.hidden],
+                vec![1, 1, embeds.hidden],
+            )?);
+        } else {
+            bindings.push(session.allocate_device_binding(
+                io.input_ids,
+                None::<String>,
+                DataType::Int64,
+                vec![1, 1],
+                vec![1, 1],
+            )?);
+        }
         let position_ids_binding = if let Some(position_ids) = io.position_ids {
             let index = bindings.len();
             bindings.push(session.allocate_device_binding(

@@ -273,12 +273,7 @@ impl NativeDecodeSession {
             );
         }
         if self.cuda.is_some() {
-            if !step_inputs.is_empty() {
-                bail!(
-                    "native CUDA target decode does not yet accept routed host step inputs; use the CPU native device until generic device bindings are implemented"
-                );
-            }
-            return self.decode_cuda(token_ids, past_len);
+            return self.decode_cuda(token_ids, past_len, step_inputs);
         }
         if self.cpu_kv.is_some() {
             return match self.decode_cpu_inplace(token_ids, past_len, false, step_inputs)? {

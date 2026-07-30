@@ -487,15 +487,12 @@ fn build_native_pipeline_decoder(
             .models
             .get(decoder)
             .and_then(|component| component.io.as_ref());
-        // The deterministic parity fixture runs on CPU; CUDA target decode with
-        // routed host step inputs is refused today (see native_decode), so CPU is
-        // the correct native target for this text-decoder slice. Device placement
-        // onto GPU is later (inc3) work.
-        let native = crate::pipeline::NativePipelineDecoder::load(
-            path,
-            crate::native_decode::NativeDecodeDevice::Cpu,
-            io,
-        )?;
+        // The decoder runs on CPU by default (the deterministic parity fixture);
+        // set ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE=cuda[:index] to keep the
+        // device-resident KV cache on the CUDA EP (Inc3a). One token's embedding
+        // uploads host->device per step; the KV never round-trips.
+        let native =
+            crate::pipeline::NativePipelineDecoder::load(path, native_decoder_device(), io)?;
         Ok(Box::new(native))
     }
     #[cfg(not(feature = "native-backend"))]
@@ -506,6 +503,31 @@ fn build_native_pipeline_decoder(
              ONNX_GENAI_PIPELINE_NATIVE_DECODER, but this build was compiled without the \
              'native-backend' feature. Rebuild with `--features native-backend`."
         )
+    }
+}
+
+/// Resolve the native pipeline decoder's device from
+/// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE`: `cpu` (default), `cuda`, or
+/// `cuda:<index>` / `cuda=<index>` to pin a GPU. Any unrecognized value falls
+/// back to CPU so a stray setting never silently changes the device.
+#[cfg(feature = "native-backend")]
+fn native_decoder_device() -> crate::native_decode::NativeDecodeDevice {
+    use crate::native_decode::NativeDecodeDevice;
+    let Ok(value) = std::env::var("ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE") else {
+        return NativeDecodeDevice::Cpu;
+    };
+    let value = value.trim().to_ascii_lowercase();
+    match value.strip_prefix("cuda") {
+        Some(rest) => {
+            let index = rest.trim_start_matches([':', '=']).trim();
+            let index = if index.is_empty() {
+                None
+            } else {
+                index.parse::<u32>().ok()
+            };
+            NativeDecodeDevice::Cuda { index }
+        }
+        None => NativeDecodeDevice::Cpu,
     }
 }
 
