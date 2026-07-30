@@ -4,8 +4,22 @@ Reviewers extract exactly one tree. This file records which one. **This file is 
 authority.** Broadcasts, chat messages, DAG task text and tag names do not outrank it, by
 explicit ruling of the project lead.
 
-REVIEW-POINT-SHA: 1944a5e9a7d79c5f0936f488c0c60b6c7f9b7ff8
-MEASURED-AT: 1944a5e9a7d79c5f0936f488c0c60b6c7f9b7ff8
+REVIEW-POINT-SHA: d5da0061232248f5b08e115c0269249ccdad6fdb
+MEASURED-AT: d5da0061232248f5b08e115c0269249ccdad6fdb
+
+**READ THIS FILE AT THE BRANCH TIP, NOT AT THE PIN.** A declaration cannot live inside the
+tree it declares. `1944a5e9` was scored first and its own copy of this file still names
+`217ae170`, so a reviewer who extracted it would have been handed a stale boundary by the very
+document whose job is to prevent that. The fix is not a cleverer commit order — it is a rule:
+**this file is authoritative at the tip, and the hex it names is the tree to extract.** The
+pin above was then re-scored directly, so the SHA that carries the declaration is also the SHA
+that was measured, and the two are the same tree.
+
+`d5da0061` differs from `1944a5e9` by documentation only. Proved, not asserted:
+
+    crates/ tree object ......... identical at both (560f0a7e…)
+    all 64 *.test.js blobs ...... identical at both (corpus hash 601f45bf…)
+    [NEG CONTROL] same corpus hash at 37d0d72e ... 97e4b301…  DIFFERS
 
 **MOVED FORWARD FROM `217ae170`, AND THE REASON IS A SECURITY FIX, NOT A GREENER NUMBER.**
 `217ae170` and every earlier candidate — `37d0d72e`, `3b701494`, `d1c8fff0` — **do not contain
@@ -20,15 +34,22 @@ count at the earlier candidates is lower and that is exactly the trap: `d1c8fff0
 787/786 because it is **69 test arms smaller** than the tree above it (61 test files against
 64; control — files present at the candidate and absent above: 0, a pure superset).
 
-### The score at this pin, taken in a clean detached worktree
+### The score at this pin, taken in a clean detached worktree — twice
 
-    git worktree add --detach <dir> 1944a5e9a7d79c5f0936f488c0c60b6c7f9b7ff8
-    requested SHA == actual SHA .... ASSERTED
-    porcelain 0 · untracked 0 · tracked-but-missing 0
-    [POS CONTROL] test files enumerated by git ls-files: 64
+    git worktree add --detach <dir> <RAW HEX>
+    requested SHA == actual SHA .... ASSERTED, both runs
+    porcelain 0 · untracked 0 · tracked-but-missing 0 ... both runs
+    [POS CONTROL] test files enumerated by git ls-files: 64 ... both runs
 
     node --test $(git ls-files '*.test.js')      RAW UNPIPED EXIT: 1
-      tests 868 · suites 126 · pass 860 · fail 8 · cancelled 0 · skipped 0 · todo 0
+
+      @ 1944a5e9  tests 868 · suites 126 · pass 860 · fail 8 · cancelled 0 · skipped 0
+      @ d5da0061  tests 868 · suites 126 · pass 860 · fail 8 · cancelled 0 · skipped 0
+
+**Two runs, two trees, same eight failures by name.** That is deliberate. A test result is a
+sample and not a property of a commit — the Rust package produced exit 101 once and exit 0
+twice at a single SHA earlier tonight — so a number quoted from one run should say `once`.
+This one does not have to.
 
 **Eight failures, and the split is five false to three true.** The five are one defect:
 `run-demo.sh:329` is English prose inside a quoted `fail "..."` string, and the line-based
