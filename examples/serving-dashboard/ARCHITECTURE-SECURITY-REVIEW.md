@@ -339,6 +339,36 @@ retraction.**
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
 
+**8.2 — L10 is closed in code and open on the wire, and those need different actions.**
+Measured against the live servers at 04:13, `/v1/models` (metadata only — no generation
+counters moved):
+
+```
+:8123  path='/Users/<user>/…/onnx-genai/models/qwen2.5-0.5b-scatter-v2'   ABSOLUTE
+:8124  path='/Users/<user>/…/onnx-genai/models/qwen2.5-0.5b'              ABSOLUTE
+HEAD   model_path_for_display(path) -> file_name() unconditionally         BASENAME
+```
+
+Both processes started 01:41:44; `2da3e851` landed 03:50:55. **They are pre-fix binaries.**
+So @bb2ee824's browser sighting of a home directory was real and remains real *against
+these processes*, and it is **not** reproducible from HEAD's source.
+
+**The consequence for the gate: the two-line client deletion does not close the live
+leak.** It removes the render, which is correct on design grounds (the row the card's own
+IA docstring does not account for) and correct as defence in depth — but the absolute path
+is on the wire at `/v1/models` regardless of what the dashboard renders, reachable by
+anyone who can reach the port. What closes the live leak is **restarting the arms onto a
+binary built after `2da3e851`**.
+
+**Stated limit:** a restart only helps if it *rebuilds*. If `run-demo.sh` re-execs a
+cached binary the leak persists with no visible difference. The post-restart check is one
+line and must assert on content, not on the restart succeeding:
+
+```
+curl -s :8123/v1/models | grep -c '/Users/'   -> MUST BE 0
+curl -s :8123/v1/models | grep -c 'qwen'      -> MUST BE >0   (anti-vacuity floor)
+```
+
 **8.1 — C15: the deadline seam silently discards a caller's `signal`, and its own
 guard cannot see that it does.** Filed at @c0de4c2e's request to read C2 for
 *correctness* rather than *landedness*.
