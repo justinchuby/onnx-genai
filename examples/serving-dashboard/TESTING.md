@@ -50,12 +50,19 @@ If the test asserts only timestamp monotonicity, it is blind.
 
 **ARRIVAL TIME IS NOT CONTENT PROVENANCE.**
 
+## Structural-fix check
+
+Hold a routing observable constant. The path-leak repair kept `safeSame` true while both path flags
+became false. If `safeSame` had flipped, cleanup rerouting -- not an intrinsic fix -- removed the leak.
+
 ## Two corollaries
 
 - **An anti-vacuity control anchored on a real defect fails when the defect is repaired.**
   Anchor controls on synthetic fixtures.
 - **Test data must not be indistinguishable from the thing it samples.** A guard scanning its
   own file can report its fixtures as production findings.
+- **Recognising an error shape does not prevent recurrence.** After finding ambiguous `metrics.rs`
+  basenames, the same developer used a basename predicate for a full-path question. Re-review structure.
 
 ## Pinned-review warning
 
