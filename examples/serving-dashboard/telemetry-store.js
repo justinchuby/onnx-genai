@@ -38,6 +38,11 @@ import {
   allFieldKeys,
 } from './telemetry-provenance.js';
 import { parsePrometheusText, scalarOf, histogramMean } from './prometheus-parse.js';
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  RequestTimeoutError,
+  fetchWithDeadline,
+} from './request-deadline.js';
 import { selfClassesFromModelId } from './scenario-origins.js';
 
 /**
@@ -100,8 +105,12 @@ export const DEFAULT_POLL_INTERVAL_MS = 250;
  * The timeout does not invent a new failure mode; it converts an unhandled one
  * into the handled one. Two seconds is deliberately many multiples of the
  * poll interval: this exists to break a hang, not to police a slow server.
+ *
+ * Re-exported, not redeclared. Two constants of the same name in two modules is
+ * how a duplicate `batch.capacity` key silently picked a misnomer tonight: JS
+ * gives no error, it just picks one. There is one deadline in this product.
  */
-export const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
+export { DEFAULT_REQUEST_TIMEOUT_MS };
 
 /** Backoff for reconnection attempts while unreachable, in milliseconds. */
 const RECONNECT_BACKOFF_MS = Object.freeze([500, 1000, 2000, 4000, 4000, 8000]);
@@ -432,22 +441,15 @@ export function createTelemetryStore({
     }
 
     // A stalled server is indistinguishable from a working one until you give
-    // up on it, so every request carries its own deadline. `timedOut` is
-    // tracked explicitly rather than read back off the abort reason, because
-    // the reason is a moving target across runtimes and this message is
-    // visitor-facing.
-    const controller = new AbortController();
-    let timedOut = false;
-    const deadline = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, requestTimeoutMs);
-
+    // up on it, so every request carries its own deadline. The idiom lives in
+    // request-deadline.js because it previously lived here ONLY, and the boot
+    // probe in app.js never received it.
     try {
-      const response = await fetchImpl(`${baseUrl}${path}`, {
+      const response = await fetchWithDeadline(`${baseUrl}${path}`, {
+        fetchImpl,
+        timeoutMs: requestTimeoutMs,
         headers: { accept: isText ? 'text/plain' : 'application/json' },
         cache: 'no-store',
-        signal: controller.signal,
       });
       if (!response.ok) {
         const result = {
@@ -488,27 +490,15 @@ export function createTelemetryStore({
         // "This operation was aborted" reads like the dashboard did something
         // wrong; the visitor needs to know the SERVER went quiet, and for how
         // long, because that distinguishes a hung generation from a dead port.
-        transportError: timedOut
-          ? `no response within ${requestTimeoutMs} ms — the server accepted the ` +
-            'connection but never replied'
-          : error instanceof Error
+        // The distinction is carried by the error TYPE, so nothing here has to
+        // string-match a runtime's wording.
+        transportError:
+          error instanceof RequestTimeoutError
             ? error.message
-            : String(error),
+            : error instanceof Error
+              ? error.message
+              : String(error),
       };
-    } finally {
-      // Cleared on every path, including the successful ones that return from
-      // inside the try.
-      //
-      // HONEST SCOPE OF THIS LINE, because it looks like it prevents more than
-      // it does: a leaked timer would NOT abort a later request. Each call gets
-      // its own controller, and by the time the timer fired its signal would
-      // already be detached from a settled fetch, so the abort is inert. What
-      // this prevents is one live timer per request accumulating for as long as
-      // the page is open — a resource leak on a page designed to be left open
-      // on a screen all day. Deleting this line reddens NO test, which is why
-      // the limit is written here rather than asserted somewhere it would pass
-      // vacuously.
-      clearTimeout(deadline);
     }
   }
 

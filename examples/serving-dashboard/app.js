@@ -15,6 +15,7 @@
 
 import { createTelemetryStore } from './telemetry-store.js';
 import { CONNECTION_STATES } from './telemetry-store.js';
+import { fetchWithDeadline } from './request-deadline.js';
 import { mountDashboard } from './dashboard/index.js';
 import {
   SERVER_MODE_BY_CLASS,
@@ -177,7 +178,15 @@ async function determineSelfClasses() {
   let observedModelId = null;
   try {
     // /health is never gated and is the only ungated identity endpoint.
-    const response = await fetch(new URL('/health', location.origin), {
+    //
+    // This carries a deadline for a reason worth stating at the line: this is
+    // the FIRST request the page makes, and it is awaited before any panel
+    // mounts. A bare fetch here against a server that accepts the socket and
+    // never answers does not reject — it pends, `main()` never returns, and
+    // the page sits on the loading state permanently. The catch below is
+    // correct about what it describes and was unreachable for the failure it
+    // was written for.
+    const response = await fetchWithDeadline(new URL('/health', location.origin), {
       headers: { accept: 'application/json' },
     });
     if (response.ok) {
@@ -186,8 +195,11 @@ async function determineSelfClasses() {
       observed = selfClassesFromModelId(observedModelId).classes;
     }
   } catch {
-    // Unreachable server. The failure states own this case and render the
-    // launch command; mounting no panels is correct until it comes back.
+    // Unreachable OR unresponsive server. The failure states own this case and
+    // render the launch command; mounting no panels is correct until it comes
+    // back. Reachable for both failures now that the request above has a
+    // deadline — it previously handled only the server that refuses us, never
+    // the one that goes quiet.
   }
 
   return reconcileSelfClasses({
