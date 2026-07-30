@@ -900,3 +900,68 @@ suites 103 · pass 660 · fail 3`, from
 stashed (control run), `dashboard/index.js` appears **0** times in the failure output, and the
 failing assertion is `no [data-state] rule is unqualified` — a CSS rule test. Five other
 agents' files were dirty in the shared tree at the time.
+
+---
+
+## R14 disclosure case — 🟢 CLOSED by execution, and the reason it survived is a new defect
+
+**Retired at `ee8542d2`.** R14's type-level half was already recorded fixed. Its *live*
+remainder — does the UI actually **tell the visitor** it substituted a scenario? — is now
+closed. @1cb42f0e found the proof; `ui/scenario-switcher.test.js` landed at `f7b884b0`
+(`git merge-base --is-ancestor f7b884b0 HEAD` → ancestor). Executed at HEAD, **raw exit 0,
+5 tests / 5 pass / 0 fail**:
+
+```
+:46  renders a notice naming the rejected id and what is shown instead
+:59  announces it, because the visitor is looking at the panels and not at this
+:71  renders NOTHING when we showed what was asked for          <- the control
+:85  keeps the substitution notice separate from the contradiction notice
+:108 escapes nothing into markup, because the id comes off the query string
+```
+
+`:71` is the arm that makes the other four mean anything — a notice that always renders
+discloses nothing. **The author shipped the negative control inside the suite.**
+
+### R27 🔴 NEW — two unrelated suites share a basename, and "duplicate" is the wrong word for it
+
+This finding was invisible for hours because it lives in `ui/`, a **third** test directory
+that the two-glob command four reviewers independently converged on cannot reach. It has
+been described on the channel as a *duplicate file* that the runner merely warns about.
+**It is not a duplicate.** At HEAD the two blobs differ (`db7b3b06` vs `93bd9a47`) and they
+test entirely disjoint things:
+
+| file | tests | subject |
+|---|---|---|
+| `scenario-switcher.test.js` | 10 | reachability, peer servers, `describe()`, CSS-class coverage |
+| `ui/scenario-switcher.test.js` | 5 | the substitution **disclosure** — R14's open half |
+
+Both raw exit 0. **Neither is redundant, and deleting either to silence the warning would
+delete real coverage** — which is what "duplicate" invites a reader to do.
+
+> **A colliding basename is not a duplicate; it is two things wearing one name.** The word
+> chosen for a defect decides what the next reader does about it, and *duplicate* prescribes
+> deletion. The fix is a rename that says what each covers — `scenario-reachability.test.js`
+> and `scenario-substitution-notice.test.js` — after which no warning exists to suppress.
+
+**And the mechanism that hid the cure is the sharpest instance of my own doctrine yet.** I
+have been writing that a completeness over-call stops the next reader looking. Here the
+over-call was **the instrument's, not any reviewer's**: a two-glob runner reported a large
+green number and exit 0 while never reaching `ui/`. Nobody misread it. **It was a true
+report from an incomplete instrument — and a true report is the one artefact no honesty
+check can catch.**
+
+The cure is already shipped and must not be restated: `run-tests.sh` **discovers** rather
+than enumerates. Cite the script, do not copy its internals.
+
+> **⚠️ Cite it by name, not by line.** The order that sent me here placed the discovery call
+> at line 56; at HEAD line 56 is `echo "pwd:    $(pwd)"` and the call is at **66**. Ten lines
+> of drift inside one night. This is the fourth line-citation in this review that moved
+> between the read and the check. **A line number is a guess about a moving file; a symbol,
+> or a quoted string, is an address.**
+
+**Runner state at this measurement:** `discovered: 52 test files`, raw exit **1**, with the
+first failure being its own tracking check — `1 test file(s) ran here but are not committed:
+shipping-tree.test.js`. Not mine, and not a test failure at all: the runner is refusing to
+report a number that describes this desk rather than the branch. **That refusal is the
+single most valuable line it prints**, and it is the same discipline as declining to invent
+a denominator.
