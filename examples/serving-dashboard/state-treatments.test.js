@@ -20,6 +20,7 @@ import { FIELD_STATES, SOURCE_CLASSES } from './telemetry-field.js';
 import { ABSENT_TEXT, NOT_APPLICABLE_TEXT } from './format.js';
 
 const shellCss = readFileSync(new URL('./styles/shell.css', import.meta.url), 'utf8');
+const tokensCss = readFileSync(new URL('./styles/tokens.css', import.meta.url), 'utf8');
 
 /**
  * `:not(...)` groups removed.
@@ -140,7 +141,13 @@ test('every non-measured state is distinguishable without colour', () => {
  * state at all.
  */
 function backstopRule(css) {
-  const match = /(\.value:not\(\[data-state\]\)[^{]*)\{([^}]*)\}/.exec(css);
+  const match = /(\.value:not\(\[data-state\]\),[^{]*)\{([^}]*)\}/.exec(css);
+  return match ? { selector: match[1], body: match[2] } : null;
+}
+
+/** The `NO STATE` chip rule: `{selector, body}`, or null. */
+function chipRule(css) {
+  const match = /(\.value:not\(\[data-state\]\)::after,[^{]*)\{([^}]*)\}/.exec(css);
   return match ? { selector: match[1], body: match[2] } : null;
 }
 
@@ -220,6 +227,82 @@ test('the backstop is legible without colour, and its channel is unused', () => 
     'wavy',
     `the backstop reuses '${style}', which a ruled absence state already owns`,
   );
+});
+
+/** WCAG relative luminance of a #rrggbb string. */
+function luminance(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const lin = (c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+/** WCAG contrast ratio between two #rrggbb strings. */
+function contrast(a, b) {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** Resolve a `var(--og-x)` reference against tokens.css. */
+function token(name) {
+  const match = new RegExp(`${name}:\\s*(#[0-9a-fA-F]{6})`).exec(tokensCss);
+  return match ? match[1] : null;
+}
+
+test('the NO STATE chip is CLOSED — it inherits no colour from the page', () => {
+  // @0837fdf9 retracted their own inversion proposal after measuring it: it
+  // would have put #e6edf3 text on an #e6edf3 background at 1.00:1, DELETING
+  // the value it was meant to qualify, because `.value__num` sets its own
+  // colour directly and a direct rule beats inheritance from the parent.
+  //
+  // The chip is the answer to that class, not a patch for that instance. It
+  // declares BOTH background and foreground, so none of the unconditional
+  // `color` rules on `.value` descendants can reach inside it — including ones
+  // nobody has written yet. THAT is the property under test here: not the
+  // colours it picked, but that it picks both of them.
+  const rule = chipRule(shellCss);
+  assert.ok(rule, 'shell.css has no `NO STATE` chip rule');
+  assert.match(rule.body, /background:\s*var\(--og-[a-z-]+\)/, 'the chip sets no background');
+  assert.match(rule.body, /(^|[^-])color:\s*var\(--og-[a-z-]+\)/, 'the chip sets no colour');
+});
+
+test('the chip carries a WORD, and it is legible against its own background', () => {
+  const rule = chipRule(shellCss);
+  assert.ok(rule, 'no chip rule');
+  const content = /content:\s*'([^']*)'/.exec(rule.body);
+  assert.ok(content && content[1].trim(), 'the chip renders no text, so it encodes by hue alone');
+
+  const fg = token(/color:\s*var\((--og-[a-z-]+)\)/.exec(rule.body.replace(/background:[^;]*;/, ''))[1]);
+  const bg = token(/background:\s*var\((--og-[a-z-]+)\)/.exec(rule.body)[1]);
+  assert.ok(fg && bg, `chip colours did not resolve in tokens.css: fg=${fg} bg=${bg}`);
+  const ratio = contrast(fg, bg);
+  assert.ok(ratio >= 4.5, `the chip reads at ${ratio.toFixed(2)}:1 against its own background`);
+
+  // KNOWN-FAILING CONTROL, @0837fdf9's requirement: the ratio function must be
+  // able to return a SMALL number, or "every ratio is large" proves nothing.
+  // Their measured case: --og-simulated-fg on the inverted background they
+  // withdrew. If this stops being ~1.91 the instrument has drifted.
+  const control = contrast(token('--og-simulated-fg'), token('--og-fg'));
+  assert.ok(
+    control < 2.5,
+    `the contrast function cannot produce a failing value (control ${control.toFixed(2)}:1), ` +
+      'so the assertion above is unfalsifiable',
+  );
+});
+
+test('the chip and the backstop exclude the SAME ruled vocabulary', () => {
+  // Two hand-written `:not()` chains naming the same five states is exactly the
+  // duplication that produced tonight's duplicate-provenance-key defect. They
+  // cannot be aliased in CSS, so they are pinned to the enum instead — and to
+  // each other, because a chain that drifts gives a state a chip while styling
+  // it correctly, or the reverse.
+  const backstop = backstopRule(shellCss);
+  const chip = chipRule(shellCss);
+  assert.ok(backstop && chip, 'both rules must exist to compare them');
+  const excluded = (sel) =>
+    [...new Set([...sel.matchAll(/:not\(\[data-state='([^']+)'\]\)/g)].map((m) => m[1]))].sort();
+  const ruled = [...new Set(Object.values(FIELD_STATES))].sort();
+  assert.deepEqual(excluded(chip.selector), ruled, "the chip's exclusions have drifted from FIELD_STATES");
+  assert.deepEqual(excluded(chip.selector), excluded(backstop.selector), 'the two chains disagree');
 });
 
 test('every source class has a CSS hook for its badge', () => {

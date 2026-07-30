@@ -152,6 +152,12 @@ body[data-blocked] .app {
  * and unrecognised cases. That used to be guaranteed only by the store's
  * discipline, one call site away in another language.
  *
+ * THE FIVE SELECTORS BELOW ARE THEREFORE AN EXHAUSTIVE LIST. Adding a sixth
+ * wire state without adding it here makes every field of that state grow a
+ * 'NO STATE' chip -- which is the failure mode announcing itself, and is why
+ * `state-treatments.test.js` derives both backstop chains from FIELD_STATES
+ * rather than trusting this comment.
+ *
  * THE SELECTOR VALUES ARE THE FIELD_STATES WIRE VALUES, NOT THEIR CONSTANT
  * NAMES. They happen to read alike now — the constant is FIELD_STATES.MEASURED
  * and the value is 'measured' — and that agreement is the point. They drifted
@@ -264,6 +270,48 @@ body[data-blocked] .app {
   text-decoration: underline wavy var(--og-warn);
   text-underline-offset: 2px;
   cursor: help;
+}
+
+/*
+ * THE CHIP — @0837fdf9's §B2, and the channel that actually carries this state.
+ *
+ * The `color` above is WEAKER THAN IT LOOKS and the honest reason is worth the
+ * lines. `panels.css:40` sets `.value__num { color: var(--og-fg) }` DIRECTLY on
+ * the child, and a direct rule beats inheritance from the parent, so the
+ * wrapper's colour never reaches the number -- the one glyph a reader actually
+ * looks at. It still covers bare text nodes, and `text-decoration` propagates
+ * to in-flow descendants and cannot be cancelled by a child, so the wavy rule
+ * does draw. But colour alone was never going to carry this.
+ *
+ * @0837fdf9 found that cascade fact while measuring a DIFFERENT proposal --
+ * inverting the wrapper background -- which `getComputedStyle` showed would
+ * have rendered #e6edf3 text on an #e6edf3 background at 1.00:1, deleting the
+ * value it was meant to qualify, and would have broken six more tokens tuned
+ * against a dark background. This is the version that survived that measurement.
+ *
+ * IT IS CLOSED. The chip declares BOTH its background and its foreground and
+ * inherits nothing, so none of the eighteen unconditional `color` rules on
+ * `.value` descendants can reach inside it -- nor can the nineteenth that does
+ * not exist yet. A treatment every future child must know about is a debt, not
+ * a design.
+ *
+ * AND IT CARRIES A WORD, NOT A HUE. `NO STATE` survives a projector, greyscale
+ * and colour-blindness with no encoding at all, and it tells the reader WHAT is
+ * wrong rather than only that something is.
+ */
+.value:not([data-state])::after,
+.value[data-state]:not([data-state='measured']):not([data-state='pending']):not([data-state='stale']):not([data-state='unavailable']):not([data-state='not-applicable'])::after {
+  content: 'NO STATE';
+  background: var(--og-fg);
+  color: var(--og-bg-raised);
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.05em 0.4em;
+  margin-inline-start: 0.4em;
+  border-radius: 2px;
+  /* The chip is the signal, not decoration on the value it follows. */
+  text-decoration: none;
 }
 
 /* ---------------------------------------------------- connection indicator */
