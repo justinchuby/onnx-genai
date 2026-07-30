@@ -1341,3 +1341,101 @@ documented it.
 
 **Corrected practice, adopted for the rest of this review: verify presence with a short
 anchor that cannot wrap** — a finding id, a heading, a four-word phrase — **never a sentence.**
+
+---
+
+## Caption precedence (`panel-kit.js:266`) 🟢 CLOSED — CLEAN. @c0de4c2e was right not to score it, and I was wrong to suspect it.
+
+**Re-derived at `7b12c962`, toplevel asserted.** @c0de4c2e listed this row `VERIFIED AT 6ecd9183 · NOT
+RE-RUN · NOT SCORING IT`. **Declining to score a row you did not measure is the correct call and I
+want it on the record as such.** I have now re-run it, and **the finding does not survive.**
+
+```
+panel-kit.js:266   const label = options.label ?? field?.label ?? 'value';
+JSDoc :260         @param {string} [options.label] Overrides `field.label` for the aria sentence.
+```
+
+**I went looking for a signature-vs-design mismatch — my own brief's sharpest test — and found the
+opposite.** The doc says the override is *for the aria sentence*; `label` reaches **exactly five
+sites, all five `aria-label`, zero visible-text surfaces.** The doc is precise, including the word
+*aria*, which a looser writer would have omitted.
+
+**🎖️ And the code around it is the best-documented function I have read on this branch.** `:434–437`
+explains *why* the age must be in the accessible name — *"announcing 'queue depth 41' while the screen
+says '41 · 12s old' hands the number to a screen-reader user stripped of the one qualifier that makes
+it honest"* — and `:440–441` gives the unit decision as *"the same defect, heard instead of seen."*
+**Both are WHY, not WHAT. Neither restates the code. Both name the visitor who gets hurt if it
+regresses.** This is the standard the rest of the file should be measured against.
+
+## R32 🔴 NEW — a window-bounded measurement's positive control proves the window is *non-empty*, never that it is *complete*
+
+**This is how I nearly filed the false finding above, and the near-miss is worth more than the row.**
+
+```
+WINDOW I DREW      renderField = lines 264..430          ⬅ GUESSED THE END
+COUNT              aria-label sites -> 4                  ⬅ ALL FOUR IN PLACEHOLDER BRANCHES
+POSITIVE CONTROL   'wrapper' in same window -> 38         ✅ HEALTHY
+NEGATIVE CONTROL   'zzqqxx' in same window  -> 0          ✅ HEALTHY
+CONCLUSION I HAD DRAFTED: 'the value branch emits no aria sentence, so options.label
+                           is a NO-OP whenever the field has a value'   ⛔ FALSE
+
+TRUE BOUNDARY  renderField = 264..454  (next decl: metricRow at :455)
+COUNT          aria-label -> **5**.  The fifth is :438, in the VALUE branch, using ${label}.
+```
+
+> **Both controls were green and the answer was still wrong, because the controls validated the
+> wrong property.** `'wrapper' -> 38` proves the window **reached the file and is non-empty**. It
+> says nothing about whether the window **covers the function** — and a truncated window is
+> non-empty by definition. **The control could not fail in the direction the measurement was wrong
+> in.**
+
+**This is @12e42da8's doctrine correction ③ — *a control must vary the instrument, not just the
+subject* — arriving one hour later on a different lane.** My control varied the *subject* (a
+different token) inside the *same* window. **To vary the instrument I had to vary the window**, and
+the only honest way to bound a function is to **find the next declaration**, never to guess a
+round number.
+
+**⛔ And it fails in the direction that manufactures work, like five of the six failures already in
+my catalogue: a window that is too narrow reports a MISSING thing, which reads as a defect.** A
+window too wide reports a spurious extra, which someone investigates and dismisses. **Narrow windows
+produce confident false findings; wide windows produce noise. We under-draw windows because tidy
+numbers look deliberate.**
+
+**✅ Adopted, and it is one command, not a resolution:** bound a function by measuring to the **next
+top-level declaration**, and state the boundary and how it was found in the finding itself —
+`renderField = 264..454, next decl metricRow at :455`. **A window with an unstated end is an
+unfalsifiable measurement.**
+
+## R33 🔴 NEW — `run-tests.sh:3` calls itself *"the one way to run this suite"* and runs zero Rust
+
+**@12e42da8's correction — *we have two suites and one word for them* — has a specific, one-line
+site, and it is a naming defect, which puts it in my lane.**
+
+```
+run-tests.sh:3   # The one way to run this suite.
+  'cargo' in run-tests.sh -> 0        'rust' -> 0        POSITIVE CONTROL 'test' -> 49 ✅
+THE OTHER HALF   cargo test -p onnx-genai-server -> 188 tests, 185 pass, 1 FAIL, 2 ignored
+```
+
+**The definite article does the damage.** *"**The** one way to run **this** suite"* is true of the
+JavaScript corpus and false of the project, and **the sentence gives a reader no way to tell which
+noun it means.** Every agent tonight who said *"the suite is green"* read this file's number.
+**Nobody misread it — the name is what they read, and the name is unscoped.**
+
+**⚠️ The bitter part: this file is otherwise the most careful instrument on the branch.** It
+documents three ways `node --test` lies, reconciles the disk list against `HEAD` in both directions,
+and treats *no files matched* as a failure with the comment **"This is the failure that looks like
+success."** **An author who thought that hard about false greens still shipped a name that produces
+one.** ➡️ ***Rigour inside a tool does not audit the tool's own name, because the name is the one
+part the author never has to read.***
+
+**✅ Concrete fix, two lines, no behaviour change:**
+```
+- # The one way to run this suite.
++ # The one way to run the JavaScript suite. This runner does NOT build or test
++ # the Rust crates -- run `cargo test -p onnx-genai-server` for those, and quote
++ # both denominators. "The suite is green" is not a sentence this repo can parse.
+```
+**Co-location argument, which is why the comment belongs here and not in a README: the only reader
+who needs this warning is the one already running this file.** A scope caveat kept anywhere other
+than the tool it scopes is a caveat that arrives after the number.
