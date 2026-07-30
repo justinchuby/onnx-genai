@@ -1,0 +1,4 @@
+### 2026-07-30: Generalize native CUDA persistent recurrent-state bindings
+**By:** Mary
+**What:** Native CUDA now distinguishes metadata-declared fixed `state_pairs` from growable KV pairs. Growable rank-4 KV retains its existing capacity-bucket and logical sequence-axis behavior. Fixed recurrent state is allocated at its declared rank and static geometry, batch is bound to one, storage is zero-initialized, and the state is excluded from KV bytes-per-token accounting and capacity growth. The Qwen3.6-27B INT4 graph now clears the former rank-3 FP16 `conv_state` allocation failure and reaches its next blocker: unsupported rank-3/1-D CUDA Conv.
+**Why:** Hybrid attention/recurrent decoders carry fixed convolution and recurrent tensors that use replace semantics rather than sequence growth. Treating every past/present pair as rank-4 KV incorrectly applied axis-2 capacity growth to arbitrary declared state.
