@@ -18,13 +18,16 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
+import { createFakeStore, unavailable } from './testing/fake-store.js';
 import {
   collapseNotApplicableBody,
   createRepaintScheduler,
   element,
   renderField,
+  renderGatedEndpointNotice,
   replaceChildren,
 } from './panel-kit.js';
+import { PANELS } from './index.js';
 
 let uninstallDom;
 before(() => {
@@ -191,7 +194,10 @@ describe('panel-level not-applicable (§31/D89)', () => {
           fields.map((field) => renderField(field)),
         );
 
-      const scheduler = createRepaintScheduler(root, paint, { minIntervalMs: 0 });
+      const scheduler = createRepaintScheduler(root, paint, {
+        minIntervalMs: 0,
+        telemetryStore: { getSnapshot: () => ({ endpointErrors: {} }) },
+      });
       scheduler.request();
       flushAnimationFrames();
       assert.equal(countClass(root, 'panel-bypass'), 1, 'collapsed on first paint');
@@ -270,5 +276,136 @@ describe('panel-level not-applicable (§31/D89)', () => {
         handle.unmount();
       }
     });
+  });
+});
+
+// AC62 — A MISSING FLAG MUST NOT PRESENT AS A BROKEN SERVER.
+//
+// The debug-gated endpoints answer 404 when the server was launched without
+// --enable-debug-endpoints. 404 is the cruellest status available here: a 403
+// would say "you need permission" and diagnose itself, but 404 says "this
+// endpoint does not exist", which a visitor reads as a wrong URL, a stale
+// build, or a broken demo — anything except "add a flag".
+//
+// Measured before this existed: with /v1/debug/kv 404ing, the KV panel showed
+// em-dashes carrying the FIELD's reason — "not exposed to the HTTP layer" —
+// which is true of the default build and is the WRONG EXPLANATION here. It
+// describes an unfixable limitation when the fix is one restart.
+describe('AC62 — a gated 404 names the flag and the whole command', () => {
+  const gatedStore = (endpointErrors) => ({
+    getSnapshot: () => ({ endpointErrors }),
+  });
+
+  const panelWithUnavailableField = () => {
+    const root = document.createElement('div');
+    root.append(
+      element('div', {
+        className: 'metric',
+        attrs: { 'data-state': 'unavailable', title: 'Not exposed to the HTTP layer.' },
+        children: [element('span', { className: 'value__num--unavailable', text: '—' })],
+      }),
+    );
+    return root;
+  };
+
+  it('names the flag AND the full command, not just the flag', () => {
+    const root = panelWithUnavailableField();
+    const rendered = renderGatedEndpointNotice(root, {
+      '/v1/debug/kv': '/v1/debug/kv is disabled. Restart with --enable-debug-endpoints.',
+    });
+
+    assert.equal(rendered, true);
+    const text = root.textContent;
+    assert.match(text, /--enable-debug-endpoints/, 'must name the flag');
+    assert.match(text, /onnx-genai-server/, 'must show the executable');
+    assert.match(text, /--model/, 'a flag with no command is a puzzle, not a fix');
+    assert.match(text, /--addr/, '--addr is the flag people get wrong (--port is rejected)');
+  });
+
+  it('says nothing when no gated endpoint failed', () => {
+    const root = panelWithUnavailableField();
+    assert.equal(renderGatedEndpointNotice(root, {}), false);
+    assert.equal(renderGatedEndpointNotice(root, undefined), false);
+    assert.ok(!root.textContent.includes('--enable-debug-endpoints'));
+  });
+
+  it('stays silent on a panel that lost nothing', () => {
+    // The endpoint is down, but this panel reads none of it. Repeating the
+    // notice on all five panels would train the eye to skip it.
+    const root = document.createElement('div');
+    root.append(
+      element('div', {
+        className: 'metric',
+        attrs: { 'data-state': 'measured' },
+        children: [element('span', { className: 'value__num', text: '7' })],
+      }),
+    );
+    assert.equal(renderGatedEndpointNotice(root, { '/v1/debug/kv': 'disabled' }), false);
+  });
+
+  it('is idempotent across repaints, not appended once per frame', () => {
+    const root = panelWithUnavailableField();
+    const errors = { '/v1/debug/kv': 'disabled' };
+    renderGatedEndpointNotice(root, errors);
+    renderGatedEndpointNotice(root, errors);
+    renderGatedEndpointNotice(root, errors);
+
+    const notices = root.children.filter((child) =>
+      child.classList.contains('panel-gated-notice'),
+    );
+    assert.equal(notices.length, 1, 'three repaints must leave exactly one notice');
+  });
+
+  it('disappears once the server is restarted with the flag', () => {
+    const root = panelWithUnavailableField();
+    renderGatedEndpointNotice(root, { '/v1/debug/kv': 'disabled' });
+    assert.ok(root.textContent.includes('--enable-debug-endpoints'));
+
+    // Next poll succeeds: the notice must clear itself rather than linger as a
+    // stale instruction to fix something that is no longer broken.
+    renderGatedEndpointNotice(root, {});
+    assert.ok(!root.textContent.includes('--enable-debug-endpoints'));
+  });
+
+  it('REFUSES to build a scheduler with no store, so a panel cannot lose the notice silently', () => {
+    // A panel that forgets the store paints perfectly and drops AC62 without a
+    // symptom — invisible in exactly the situation the notice exists for.
+    assert.throws(
+      () => createRepaintScheduler(document.createElement('div'), () => {}),
+      /requires \{ telemetryStore \}/,
+    );
+  });
+
+  it('MOUNTS a real panel and finds the notice, proving the repaint path is wired', () => {
+    // The unit tests above call renderGatedEndpointNotice directly, so they all
+    // still pass if it is never CALLED by the scheduler. Deleting the call from
+    // run() was green across every one of them. This is the only test that
+    // fails when the mechanism is disconnected, which is the failure most
+    // likely to happen during a refactor.
+    const store = createFakeStore({
+      fields: {
+        'kv.pages_used': unavailable('Not exposed to the HTTP layer.'),
+        'kv.pages_total': unavailable('Not exposed to the HTTP layer.'),
+      },
+    });
+    const withGate = {
+      ...store,
+      // The fake store models fields, not connection state; the notice reads
+      // only endpointErrors, so that is all this needs to supply.
+      getSnapshot: () => ({ endpointErrors: { '/v1/debug/kv': '/v1/debug/kv is disabled.' } }),
+    };
+
+    const kvPanel = PANELS.find((panel) => panel.id === 'kv-memory');
+    const root = document.createElement('div');
+    const handle = kvPanel.module.mount(root, withGate);
+    flushAnimationFrames();
+
+    assert.match(
+      root.textContent,
+      /--enable-debug-endpoints/,
+      'a mounted panel must surface the flag without the panel knowing about AC62',
+    );
+    assert.match(root.textContent, /onnx-genai-server --model/, 'and the whole command');
+    handle.unmount();
   });
 });

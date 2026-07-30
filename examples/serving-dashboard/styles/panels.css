@@ -994,3 +994,36 @@
   padding-top: var(--og-space-3);
   border-top: 1px solid var(--og-border-subtle);
 }
+
+/* AC62 — a missing launch flag is ACTIONABLE, so it must not wear the
+   unavailable treatment. The em-dash palette says "this cannot be known"; this
+   notice says "you can have this in one restart". Styling it like an absence
+   would tell the visitor to give up on data that is one flag away, so it takes
+   --og-info rather than any --og-unavail-* or --og-na-* token. */
+.panel-gated-notice {
+  margin-top: var(--og-space-4);
+  padding: var(--og-space-3) var(--og-space-4);
+  border-left: 3px solid var(--og-info);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-bg-raised);
+}
+
+.panel-gated-notice__lead {
+  margin: 0;
+  color: var(--og-fg);
+  font-size: var(--og-type-xs);
+  line-height: var(--og-leading-body);
+}
+
+/* The command is the payload of this notice: it must be selectable, copyable
+   and unmistakably a shell command, so it renders monospaced at full contrast
+   rather than as muted supporting prose. */
+.panel-gated-notice__command {
+  margin: var(--og-space-2) 0 0;
+  overflow-x: auto;
+  color: var(--og-fg);
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-2xs);
+  user-select: all;
+  white-space: pre;
+}

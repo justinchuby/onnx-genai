@@ -15,6 +15,12 @@ import { after, before, describe, it } from 'node:test';
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
 import { createFakeStore, measured, series } from './testing/fake-store.js';
 
+// These exercise scheduler MECHANICS, not AC62. A store publishing no endpoint
+// errors keeps the gated-endpoint notice inert so it cannot perturb the counts.
+const noGateStoreOptions = {
+  telemetryStore: { getSnapshot: () => ({ endpointErrors: {} }) },
+};
+
 let uninstallDom;
 before(() => {
   uninstallDom = installFakeDom();
@@ -131,7 +137,7 @@ describe('AC30 — reduced motion moves less, never knows less', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
 
     scheduler.request();
     flushAnimationFrames();
@@ -152,7 +158,7 @@ describe('AC30 — reduced motion moves less, never knows less', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
     for (let index = 0; index < 3; index += 1) {
       scheduler.request();
       flushAnimationFrames();
@@ -185,7 +191,7 @@ describe('AC30 — reduced motion moves less, never knows less', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    }, { minIntervalMs: 20 });
+    }, { minIntervalMs: 20, ...noGateStoreOptions });
 
     scheduler.request();
     flushAnimationFrames();
@@ -210,7 +216,7 @@ describe('AC30 — reduced motion moves less, never knows less', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
     scheduler.request();
     flushAnimationFrames();
     scheduler.request();

@@ -37,6 +37,7 @@ import {
   planSparkline,
   tabulateSparkline,
 } from './sparkline.js';
+import { DEBUG_GATED_ENDPOINTS, DEBUG_ENDPOINTS_FLAG } from '../telemetry-provenance.js';
 
 /**
  * Source classes, as rendered by the AC7 provenance badge (demo-ux.md §4.5).
@@ -674,7 +675,101 @@ export function withAcronyms(text, acronyms) {
  * @param {() => void} paint
  * @returns {{request(): void, cancel(): void, setVisible(visible: boolean): void}}
  */
+/**
+ * AC62. A debug-gated endpoint answers 404 when the server was launched without
+ * `--enable-debug-endpoints`, and 404 is the cruellest status we could have been
+ * given: 403 would say "you need permission" and diagnose itself, but 404 says
+ * "this endpoint does not exist". A visitor reads that as a wrong URL, a stale
+ * build, or a broken demo -- anything except "add a flag" -- and they will go
+ * re-read the README, which will look correct, because it is.
+ *
+ * Without this, the panel renders em-dashes carrying the FIELD's reason, which
+ * explains that the value is not exposed to the HTTP layer. That sentence is
+ * true of the default build and it is the WRONG EXPLANATION here: it describes
+ * an unfixable limitation when the actual fix is one flag. An honest absence
+ * that misattributes its own cause is worse than a blank, because it forecloses
+ * the fix.
+ *
+ * Shown only on panels that are actually degraded -- a panel with nothing
+ * missing has nothing to explain, and repeating the notice on all five would
+ * train the eye to skip it.
+ *
+ * @param {HTMLElement} rootElement
+ * @param {Readonly<Record<string, string|null>>} [endpointErrors]
+ * @returns {boolean} True if a notice was rendered.
+ */
+export function renderGatedEndpointNotice(rootElement, endpointErrors) {
+  // Idempotent: the repaint scheduler calls this on every frame, so without
+  // this the page would accumulate one notice per frame — four a second.
+  // Membership is tested through classList, which both the browser and the
+  // test DOM implement; `className` is a string in one and absent in the other,
+  // and reading it is how this silently matched nothing the first time.
+  for (const child of [...(rootElement.children ?? [])]) {
+    if (child.classList?.contains('panel-gated-notice')) child.remove();
+  }
+  if (!endpointErrors) return false;
+
+  const gated = DEBUG_GATED_ENDPOINTS.filter((path) => Boolean(endpointErrors[path]));
+  if (gated.length === 0) return false;
+
+  // Only speak up if this panel actually lost something. A panel with nothing
+  // missing has nothing to explain, and repeating the notice on all five would
+  // train the eye to skip it.
+  const degraded = collectFieldWrappers(rootElement).some((node) =>
+    [RENDER_STATES.UNAVAILABLE, RENDER_STATES.PENDING].includes(node.getAttribute('data-state')),
+  );
+  if (!degraded) return false;
+
+  rootElement.append(
+    element('div', {
+      className: 'panel-gated-notice',
+      attrs: { role: 'note' },
+      children: [
+        element('p', {
+          className: 'panel-gated-notice__lead',
+          text:
+            `${gated.join(' and ')} returned 404 because this server was started without ` +
+            `${DEBUG_ENDPOINTS_FLAG}. The endpoint is missing, not the data.`,
+        }),
+        element('p', {
+          className: 'panel-gated-notice__command',
+          text: gatedRestartCommand(),
+        }),
+      ],
+    }),
+  );
+  return true;
+}
+
+/**
+ * The full command, not just the flag name. A visitor who has to work out where
+ * the flag goes has been handed a puzzle instead of a fix, and `--addr` is
+ * already the flag people get wrong (`--port` is rejected outright).
+ *
+ * The address is read from the page's own origin rather than hardcoded: this
+ * page is served BY the server it is describing, so that is the one part of the
+ * command we can state as fact instead of guessing.
+ *
+ * @returns {string}
+ */
+export function gatedRestartCommand() {
+  const host =
+    typeof location === 'object' && location?.host ? location.host : '127.0.0.1:8123';
+  return `onnx-genai-server --model <MODEL_DIR> --addr ${host} ${DEBUG_ENDPOINTS_FLAG}`;
+}
+
 export function createRepaintScheduler(rootElement, paint, options = {}) {
+  // A panel that forgets the store still paints perfectly and silently loses
+  // its AC62 notice -- the failure would be invisible in exactly the situation
+  // the notice exists for. Refusing here makes the omission impossible to ship
+  // rather than merely discouraged, the same rule createRovingGroup applies to
+  // an unnamed group.
+  if (!options.telemetryStore && IS_DEVELOPMENT) {
+    throw new Error(
+      'createRepaintScheduler requires { telemetryStore } so the panel can render the ' +
+        'AC62 gated-endpoint notice. Pass the same store the panel reads fields from.',
+    );
+  }
   let frameHandle = 0;
   let visible = true;
   let dirtyWhileHidden = false;
@@ -713,6 +808,9 @@ export function createRepaintScheduler(rootElement, paint, options = {}) {
     // become bypassed (or stop being bypassed) at runtime — when the visitor
     // switches servers — with no panel-specific code on either transition.
     collapseNotApplicableBody(rootElement);
+    // AC62, after the collapse: if a panel is wholly not-applicable it has a
+    // better explanation than a missing flag, and two notices would compete.
+    renderGatedEndpointNotice(rootElement, options.telemetryStore?.getSnapshot?.()?.endpointErrors);
   };
 
   return {

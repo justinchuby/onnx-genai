@@ -136,7 +136,7 @@ export default function mount(rootElement, telemetryStore) {
     description = buildDescription(telemetryStore, aggregate);
   };
 
-  const scheduler = createRepaintScheduler(rootElement, paint);
+  const scheduler = createRepaintScheduler(rootElement, paint, { telemetryStore });
   const stopObserving = observeVisibility(rootElement, (visible) => scheduler.setVisible(visible));
   const unsubscribe = telemetryStore.subscribe(() => scheduler.request());
   const unsubscribeRequests = telemetryStore.subscribeRequests?.(() => scheduler.request()) ?? (() => {});

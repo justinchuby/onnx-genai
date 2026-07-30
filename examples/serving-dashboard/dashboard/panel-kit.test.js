@@ -12,6 +12,12 @@ import { after, before, describe, it } from 'node:test';
 
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
 
+// These exercise scheduler MECHANICS, not AC62. A store publishing no endpoint
+// errors keeps the gated-endpoint notice inert so it cannot perturb the counts.
+const noGateStoreOptions = {
+  telemetryStore: { getSnapshot: () => ({ endpointErrors: {} }) },
+};
+
 let uninstallDom;
 before(() => {
   uninstallDom = installFakeDom();
@@ -279,7 +285,7 @@ describe('createRepaintScheduler — AC23', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
 
     scheduler.request();
     scheduler.request();
@@ -294,7 +300,7 @@ describe('createRepaintScheduler — AC23', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
 
     scheduler.setVisible(false);
     scheduler.request();
@@ -312,7 +318,7 @@ describe('createRepaintScheduler — AC23', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
 
     scheduler.request();
     flushAnimationFrames();
@@ -325,7 +331,7 @@ describe('createRepaintScheduler — AC23', () => {
     let paints = 0;
     const scheduler = createRepaintScheduler(root, () => {
       paints += 1;
-    });
+    }, noGateStoreOptions);
 
     scheduler.request();
     scheduler.cancel();

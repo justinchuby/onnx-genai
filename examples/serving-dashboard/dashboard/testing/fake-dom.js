@@ -169,6 +169,19 @@ class FakeElement extends FakeNode {
     }
   }
 
+  /**
+   * Detach this node from its parent, mirroring Element.remove(). Modelled
+   * because panel code legitimately calls it: without it the fake DOM silently
+   * no-ops where the browser detaches, so a test can pass while the real page
+   * accumulates duplicate nodes on every repaint.
+   */
+  remove() {
+    if (!this.parent) return;
+    const index = this.parent.children.indexOf(this);
+    if (index >= 0) this.parent.children.splice(index, 1);
+    this.parent = null;
+  }
+
   /** @param {...FakeNode} nodes */
   replaceChildren(...nodes) {
     this.children = [];
