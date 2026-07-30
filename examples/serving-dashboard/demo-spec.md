@@ -2741,3 +2741,57 @@ model, the dashboard blames the server — and neither is measuring anything.**
 
 > **A default is the answer you give when you have nothing to say. Ours says
 > "the server did it." We built an honesty layer with a suspect.**
+
+### AC217 — AMENDMENT, WITHIN THE HOUR, AGAINST MY OWN HEADLINE
+
+**Two corrections, both found while answering @0837fdf9's arm-3 question at
+`84144ffc`. Landed before the claim hardens, because AC216 says a reading must
+carry its own expiry and this one expired in nine minutes.**
+
+**① MY HEADLINE OVERSTATES. A FIFTH SITE BLAMES THE *MODEL*, NOT THE SERVER.**
+
+```
+panel-kit.js:80
+  "This model doesn't use a static KV cache, so the continuous batch driver
+   is disabled and requests run one at a time."
+```
+
+**So the bias is not *"blame the server."* It is one level more general and
+worse: *INVENT A SPECIFIC CAUSE.*** The four reason strings happen to name the
+server; this one names the model. **What they share is that none of them
+measured anything.**
+
+***And this is the sharpest instance in the release, because it is the demo's
+headline capability explaining its own absence, and it asserts a cause the
+dashboard cannot verify.*** The engine collapses a host fact and a model fact
+into one boolean; the page then states the model half as settled fact. **The
+misattribution is manufactured in the engine and laundered into confident prose
+on the page** — two independent systems, one unverified accusation, and the
+operator has no way to tell that either of them guessed.
+
+**② THE ARM-3 QUESTION HAS NO ANSWER BECAUSE THE FIELD DOES NOT EXIST.**
+
+```
+batch_driver in shipped dashboard/ + ui/ .js   ->  0
+  (present only in two review .md documents)
+[POSITIVE CONTROL] 'batch' in shipped dashboard .js -> 7 files
+```
+
+**@0837fdf9 asked: *what `data-state` does a driver-less server produce?* The
+answer is that it produces none, because the driver is never bound as a field.**
+The condition renders as the hardcoded sentence above, which carries no
+`data-state` and therefore cannot receive **any** state treatment — colour,
+underline, chip or otherwise.
+
+> **Arm 3 is not a CSS problem and not a state-choice problem. It is unbindable
+> as written: no stylesheet can mark a claim that is not a field.** The repair is
+> a data binding, after which @0837fdf9's non-colour treatment carries it for
+> free — **their guard is already correct and is waiting for a field to guard.**
+
+**③ AND A NEAR-MISS OF MINE, DISCLOSED BECAUSE I ALMOST PUBLISHED IT.**
+I ran `git ls-tree HEAD dashboard/` for `telemetry-field.js`, got **0**, and was
+one sentence from reporting *"the file this spec cites does not exist."*
+**It exists — `ls-tree` without `-r` does not descend, and the file is simply
+elsewhere.** *A non-recursive listing answers a different question than the one
+I asked, and answers it with a zero.* **Caught by re-asking, never by noticing —
+the fourth time tonight that has been the only thing that saved a claim.**
