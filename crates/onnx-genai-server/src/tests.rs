@@ -5161,3 +5161,90 @@ async fn parked_commands_are_drained_before_the_batch_takes_its_first_step() {
          batch and /v1/resources stalls"
     );
 }
+
+/// Generations parked before a batch starts must JOIN it, not queue behind it.
+///
+/// This is the capability half of AC31, and no existing test asserted it. The
+/// sibling tests prove a parked *read-only* command gets answered (availability)
+/// and that the published pair is commensurable (arithmetic). Neither would
+/// fail if every parked generation ran as its own one-row batch -- which is
+/// continuous batching degrading to strict serialisation under exactly the
+/// concurrency it exists to overlap, with a green suite and a demo that shows
+/// nothing.
+///
+/// Driven through the REAL loop with the arrivals parked where the outer drain
+/// actually puts them, because that is the route production takes: a test that
+/// submits through `rx` proves a path the outer loop has already emptied.
+///
+/// Asserted on the high-water mark rather than a sampled reading. The loop
+/// publishes `(0, 0, capacity)` when the batch drains, so an instantaneous
+/// read after the fact always sees zero and would make this test pass or fail
+/// on timing.
+#[tokio::test]
+async fn generations_parked_before_a_batch_starts_share_its_rows() {
+    use std::collections::VecDeque;
+
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+
+    let (_tx, mut rx) = tokio::sync::mpsc::channel::<crate::driver::DriverCommand>(16);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+
+    // Three more generations sitting exactly where `run_static_engine_driver`'s
+    // outer loop parks concurrent arrivals before dispatching the first one.
+    let mut deferred = VecDeque::new();
+    let mut event_rxs = Vec::new();
+    for i in 0..3 {
+        let (events, events_rx) = tokio::sync::mpsc::channel(64);
+        event_rxs.push(events_rx);
+        let mut request = onnx_genai::GenerateRequest::new(format!("count to twenty, request {i}"));
+        request.options.max_new_tokens = 24;
+        deferred.push_back(crate::driver::DriverCommand::Generate {
+            session_id: None,
+            request: Box::new(request),
+            events,
+            permit: std::sync::Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+        });
+    }
+
+    let (first_events, _first_rx) = tokio::sync::mpsc::channel(64);
+    let mut first = onnx_genai::GenerateRequest::new("count to twenty, request first");
+    first.options.max_new_tokens = 24;
+
+    let batch_telemetry = crate::batch_telemetry::BatchTelemetry::default();
+    crate::driver::run_static_batch_until_idle(
+        &engine,
+        &mut rx,
+        &mut deferred,
+        4,
+        first,
+        first_events,
+        std::sync::Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("permit"),
+        &batch_telemetry,
+    );
+
+    let peak = batch_telemetry
+        .peak_active()
+        .expect("the batch loop ran, so it must have published an occupancy");
+
+    // THE ACCEPTANCE CRITERION, AS A NUMBER: four concurrent generations must
+    // occupy more than one row. One means each ran alone.
+    assert!(
+        peak > 1,
+        "four concurrent generations produced a peak batch of {peak} row(s): \
+         the parked arrivals never joined the running batch, so continuous \
+         batching is serialising"
+    );
+    assert!(
+        deferred.is_empty(),
+        "generations were left parked after the batch finished: {} remain",
+        deferred.len()
+    );
+}

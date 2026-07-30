@@ -53,6 +53,18 @@ pub(crate) struct BatchTelemetry {
     active: AtomicU64,
     queued: AtomicU64,
     capacity: AtomicU64,
+    /// Widest batch this driver has ever assembled.
+    ///
+    /// The instantaneous `active` reading cannot answer "did continuous
+    /// batching actually overlap anything?": the loop publishes `(0, 0,
+    /// capacity)` when the batch drains, so by the time anyone reads it the
+    /// evidence is gone. A poller can miss the overlap entirely by sampling
+    /// between batches, which makes a working server indistinguishable from a
+    /// serialising one at exactly the moment the distinction matters.
+    ///
+    /// Monotonic and never reset: this is a claim about what the process has
+    /// demonstrated, not about what it is doing now.
+    peak_active: AtomicU64,
     /// False until a driver loop publishes. Distinguishes "this build never
     /// reached a batching path" from "the batch is empty", which are the same
     /// zeroes and very different facts.
@@ -71,7 +83,16 @@ impl BatchTelemetry {
         self.active.store(active as u64, Ordering::Relaxed);
         self.queued.store(queued as u64, Ordering::Relaxed);
         self.capacity.store(capacity as u64, Ordering::Relaxed);
+        self.peak_active.fetch_max(active as u64, Ordering::Relaxed);
         self.observed.store(true, Ordering::Release);
+    }
+
+    /// The widest batch assembled so far, or `None` if no loop has published.
+    pub(crate) fn peak_active(&self) -> Option<u64> {
+        if !self.observed.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.peak_active.load(Ordering::Relaxed))
     }
 
     /// Returns `None` until a driver loop has published, so the route omits
