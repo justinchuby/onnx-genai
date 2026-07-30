@@ -45,9 +45,19 @@ allow_untracked=0
 
 # Every measurement prints the container it was taken in. A relative path is a
 # stale citation in space, exactly as a line number is a stale citation in time.
-echo "pwd:  $(pwd)"
-echo "head: $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
-echo "node: $(node --version)"
+#
+# PORCELAIN IS ON THIS BANNER DELIBERATELY AND IT IS NOT DECORATION. The same
+# SHA, the same Node and the same minute produced 567 tests / 3 failures in the
+# shared tree and 566 / 0 in a clean detached worktree -- the ONLY variable was
+# whether the working tree was dirty. A count without its tree state is not a
+# measurement, it is an anecdote. The untracked-file check below covers dirty
+# TEST files; a modified tracked SOURCE file changes results and that check
+# cannot see it. This line can.
+echo "pwd:    $(pwd)"
+echo "branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'not a git tree')"
+echo "head:   $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
+echo "dirty:  $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted file(s) in this tree"
+echo "node:   $(node --version)"
 
 # Discover, never enumerate.
 test_files=()
@@ -104,6 +114,8 @@ suites=$(field suites)
 
 echo ""
 echo "── reconciliation ─────────────────────────────"
+echo "  tree             : $(pwd)"
+echo "  head / dirty     : $(git rev-parse --short HEAD 2>/dev/null || echo 'no-git') / $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted"
 echo "  discovered files : ${discovered}"
 echo "  suites executed  : ${suites:-<unparsed>}"
 echo "  tests            : ${tests:-<unparsed>}"
