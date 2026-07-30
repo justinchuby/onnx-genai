@@ -473,9 +473,12 @@ the card says so with an em-dash rather than guessing from the `ONNX_GENAI_EP`
 you happened to set — the server never confirms it acted on that variable, and
 printing it back to you would be a fabricated measurement dressed as identity.
 
-### Three kinds of empty
+### Four kinds of empty
 
-An empty field is not one situation, and your next action differs in each:
+Every number on the page carries its own provenance, in one of **five states** —
+`measured`, `pending`, `stale`, `unavailable`, `not-applicable`. Only the first
+is a plain number; the other four are the kinds of empty, and your next action
+differs in each:
 
 | You see | Meaning | What it tells you |
 |---|---|---|
