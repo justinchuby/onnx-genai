@@ -30,6 +30,7 @@ pub mod block_quant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
 pub mod cast;
+pub mod causal_conv_with_state;
 pub mod compressed_sparse_attention;
 pub mod constant;
 pub mod constant_of_shape;
@@ -326,6 +327,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Resize",
     "ConvTranspose",
     "GridSample",
+    "GatherBlockQuantized",
+    "CausalConvWithState",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -715,6 +718,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
         Box::new(gather_block_quantized::GatherBlockQuantizedFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("CausalConvWithState", "com.microsoft", 1),
+        Box::new(causal_conv_with_state::CausalConvWithStateFactory {
             runtime: runtime.clone(),
         }),
     );

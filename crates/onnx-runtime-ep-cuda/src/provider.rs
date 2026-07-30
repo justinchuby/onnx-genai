@@ -312,6 +312,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "CausalConvWithState"
+            && op.domain == "com.microsoft"
+            && let Some(reason) =
+                crate::kernels::causal_conv_with_state::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "Attention"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
