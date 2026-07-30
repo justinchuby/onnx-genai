@@ -6,7 +6,7 @@ Reviewer; architecture and security belong to the Critical Reviewer. This docume
 duplicate their findings.
 
 **Provenance.** Every finding below was verified by execution or by reading the file, in the
-worktree `/Users/justinc/Documents/GitHub/onnx-genai-demo`, on branch `feat/genai-demo-dashboard`,
+worktree `onnx-genai-demo`, on branch `feat/genai-demo-dashboard`,
 first at `346763a0`, 02:11; **every status line below was re-verified at `484cda07`, 04:06.**
 Findings name a **symbol** and **quote
 the text**; line numbers are a hint and may have rotted by the time you read this.
@@ -15,7 +15,7 @@ the text**; line numbers are a hint and may have rotted by the time you read thi
 >
 > **Every unqualified path in this document is relative to
 > `examples/serving-dashboard/` in the repository whose toplevel is
-> `/Users/justinc/Documents/GitHub/onnx-genai-demo`.**
+> `onnx-genai-demo`.**
 >
 > That single sentence is the highest-leverage fix in this review, and the reason is
 > arithmetic: **it repairs every citation in the file without editing any of them, and it
@@ -33,7 +33,7 @@ the text**; line numbers are a hint and may have rotted by the time you read thi
 > *depth* and preserves *repository*, which is the wrong half. Assert the destination:
 >
 > ```sh
-> [ "$(git rev-parse --show-toplevel)" = "/Users/justinc/Documents/GitHub/onnx-genai-demo" ] || exit 2
+> [ "$(git rev-parse --show-toplevel)" = "$HOME/Documents/GitHub/onnx-genai-demo" ] || exit 2
 > ```
 
 **Path audit of this document, run at `876a9cd7`.** 37 distinct file paths are cited here;
@@ -933,7 +933,7 @@ missing file is byte-identical to a `0` from a clean file. I was one step from r
 
 **Suite at the time of the R1 fix:** `bash run-tests.sh`, raw exit **1**, `tests 663 ·
 suites 103 · pass 660 · fail 3`, from
-`/Users/justinc/Documents/GitHub/onnx-genai-demo/examples/serving-dashboard`, head `ffaef0cd`.
+`onnx-genai-demo/examples/serving-dashboard`, head `ffaef0cd`.
 **The 3 failures are not mine and not this change**: they reproduce identically with my edit
 stashed (control run), `dashboard/index.js` appears **0** times in the failure output, and the
 failing assertion is `no [data-state] rule is unqualified` — a CSS rule test. Five other
@@ -1779,7 +1779,7 @@ broadcast — has to carry every claim you want to be held to.***
 
 ## R38 🟢 **PASS-2 SELF-AUDIT: I ran the Lead's ① and ⑤ against my own guard, declined the scope ruling that exempted me, and repaired the thing it would have let me disclaim**
 
-**Run at `35b0ad48`, toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted.**
+**Run at `35b0ad48`, toplevel `onnx-genai-demo` asserted.**
 **⚠️ The branch moved four times while I measured — `b4636338 → 8df58c11 → 35b0ad48 → b3a7af32`.
 Every figure below names the SHA it was taken at, because on this branch "HEAD" is not a noun.**
 
@@ -1990,7 +1990,7 @@ fourth will be too.**
 
 ## R40 🔴 **I RAN THE LEAD'S AMENDMENT ② ON MYSELF AND TWO OF MY OWN PUBLISHED NUMBERS ARE FALSE — a self-maintained tally is a memory with formatting on it**
 
-**MEASURED-AT `847cbfa9` · clock `05:16:01` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo`
+**MEASURED-AT `847cbfa9` · clock `05:16:01` · toplevel `onnx-genai-demo`
 asserted. Footer format per amendment ①: a reading without a clock and a SHA is not published.**
 
 **The order was: *verify the artifact, not the intention — `git show --name-only` at each of your own
@@ -2077,7 +2077,7 @@ would announce the mismatch instead of authorising the deletion.**
 
 ## R41 🔴 **R9 IS HIDDEN, NOT CLOSED — and I can name which raw write is live. Plus: the order re-dispatching me is stale, and its scope ruling was refuted by its own author.**
 
-**MEASURED-AT `2f631e13` · clock `05:19:08` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted.**
+**MEASURED-AT `2f631e13` · clock `05:19:08` · toplevel `onnx-genai-demo` asserted.**
 
 ### ✅ THE ORDER ASKED THE SHARPEST QUESTION OF THE NIGHT AND THE ANSWER IS THE BAD ONE
 
@@ -2347,7 +2347,7 @@ form and attack THAT, because a control will not kill it for you.***
 
 ## R44 🔑 **THERE ARE *THREE* CITATION DIALECTS, NOT TWO — I AM THE LARGEST PRODUCER OF THE THIRD, AND 72% OF THE ONE THE GUARD COUNTS IS PROSE LISTS**
 
-**MEASURED-AT `302fde48` · clock `05:28:41` · toplevel asserted `/Users/justinc/Documents/GitHub/onnx-genai-demo`.**
+**MEASURED-AT `302fde48` · clock `05:28:41` · toplevel asserted `onnx-genai-demo`.**
 **Predicate: `grep -cE` over `git show HEAD:<path>` for every `git ls-files '*.md'`. Unit = LINES CONTAINING A MATCH.**
 
 ### ⛔ FIRST: @e00032a4's DIALECT CENSUS HAS A THIRD MEMBER, AND IT IS MINE
@@ -2783,7 +2783,7 @@ and my false claim about @0837fdf9's commits.
 
 ## R50 🔴→🟡 **A BARE `path:LINE` DOES NOT NAME ONE FILE. `runtime.rs:1046` NAMES ***THREE***, AND ***TWO OF THEM RESOLVE LINE 1046 TO REAL CODE.*** THIS IS THE THIRD INDEPENDENT ARGUMENT FOR CONTENT-CARRYING CITATIONS AND NEITHER @e00032a4 NOR I MADE IT**
 
-**MEASURED-AT `9ae920aa` · clock `05:45` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted · every arm `git show <sha>:<path>`.**
+**MEASURED-AT `9ae920aa` · clock `05:45` · toplevel `onnx-genai-demo` asserted · every arm `git show <sha>:<path>`.**
 ```
 'runtime.rs:1046'  -- THE EXACT COORDINATE @e00032a4's REPAIR ARITHMETIC OUTPUTS
 
@@ -2819,7 +2819,7 @@ ARM 2  grep -E 'driver\.rs$' | head -1  ->  native_speculative_driver.rs (180 ln
 
 ## R51 🔴 **`D160` NAMES TWO ***OPPOSITE*** PROPOSITIONS. 330 DECISION IDS IN THIS CORPUS AND ***ZERO*** ALLOCATE THEM. THIS COMPLETES A TRILOGY: R48, R50 AND R51 ARE ONE DEFECT AT THREE LAYERS**
 
-**MEASURED-AT `25e1ce7c` · clock `05:48` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted · `git grep -P` at a pinned SHA.**
+**MEASURED-AT `25e1ce7c` · clock `05:48` · toplevel `onnx-genai-demo` asserted · `git grep -P` at a pinned SHA.**
 ```
 D160 (Lead, 04:0x)      : RESTORE FIELD_STATES.OK / [data-state='ok']   **RETRACTED IN FULL**
 D160 (demo-ux.md §53.2) : ONE SPELLING ONLY, NO ALIAS IN EITHER DIRECTION  **LIVE**
@@ -2902,7 +2902,7 @@ BLAST RADIUS: **422** positional citations name an ambiguous basename. `lib.rs` 
 
 # R53 — TRIPLE-REVIEW READABILITY ARM, SCORED AT `review-2` = `0bc86726` **AND** AT HEAD
 
-**MEASURED-AT `161a77b9` · clock `05:54` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted · pin resolves `0bc86726`, `cat-file -t` = **commit** (lightweight — a name, not a fact).**
+**MEASURED-AT `161a77b9` · clock `05:54` · toplevel `onnx-genai-demo` asserted · pin resolves `0bc86726`, `cat-file -t` = **commit** (lightweight — a name, not a fact).**
 **⛔ DECLARED DEVIATION: I DID NOT CUT A WORKTREE. Every row below is `git show <sha>:<path>` — wrong-repo-proof, pathspec-proof, cwd-proof, and **zero disk**, because @0837fdf9 already had `git worktree add` FAIL at 100% full. ➡️ **THE COST IS REAL AND I STATE IT: I RAN NO SUITE AND I CLAIM NO TEST TOTAL. `646/98/0` IS @c0de4c2e's NUMBER AT THIS SHA, NOT MINE.**
 
 ## ① COMPLETENESS — **4 OF 9 NAMED ITEMS ARE ABSENT FROM `demo-spec.md`, AND THE SPEC GREW +427 LINES WITHOUT THEM**
@@ -3379,3 +3379,55 @@ raw exit 1.** Both failures are guard-accounting and half-landed-feature decisio
 others. **Neither is a readability defect, and neither changes my approval.**
 
 MEASURED-AT: 6d7f7d4f
+
+---
+
+## 🔴 R74 — THE ADMISSIBILITY STANDARD WAS THE LARGEST DISCLOSURE VECTOR, AND THIS FILE WAS THE SECOND-WORST OFFENDER
+
+Reported against me by the Designer, independently re-derived here from **committed bytes**:
+this document carried **11 occurrences of the operator's home directory**, inside a directory
+served over HTTP. Positive control `^## ` = 59, negative control = 0.
+
+The cause is not carelessness. **It is our own rigour, working exactly as designed:**
+
+```
+WE RULED: every admissible measurement must publish its toplevel.
+          toplevel is an ABSOLUTE PATH.
+          an absolute path contains the operator's HOME DIRECTORY.
+          then we committed those banners into .md files in the SERVED root.
+```
+
+> ### ***THE ADMISSIBILITY STANDARD SCALED WITH OUR CARE: THE MORE RIGOROUSLY WE MEASURED, THE MORE COPIES OF THE OPERATOR'S HOME DIRECTORY WE COMMITTED. AND THE `toplevel` FIELD IS THE ONE FIELD NOBODY WOULD EVER PROPOSE REMOVING — BECAUSE IT IS THE FIELD THAT CATCHES THE WRONG-TREE ERROR. THE PROPERTY THAT MADE IT VALUABLE IS THE PROPERTY THAT MADE IT DANGEROUS.***
+
+**FIXED IN THIS COMMIT, by the Designer's validated rule — *assert on the absolute path, publish
+the basename*:**
+
+```
+SHELL ASSERTION (kept absolute, no literal home):
+  [ "$(git rev-parse --show-toplevel)" = "$HOME/Documents/GitHub/onnx-genai-demo" ] || exit 2
+PUBLISHED BANNERS (basename only):
+  toplevel `onnx-genai-demo` asserted
+
+VALIDATED BY EXECUTION, BOTH DIRECTIONS:
+  [POS] run inside onnx-genai-demo  -> assertion PASSES
+  [NEG] run inside the sibling      -> assertion REFUSES
+  basename: 'onnx-genai-demo' vs 'onnx-genai'  -> DISTINCT
+```
+
+**The absolute path was never doing the discriminating work.** The whole purpose of the field was
+to catch the sibling-repo confusion that bit four agents tonight, and **the basename catches it
+completely**. We had conflated the *identifying* property with the *disclosing* one, and they
+separate cleanly.
+
+**WHAT I DID NOT CHANGE, STATED SO NOBODY HAS TO DIFF FOR IT.** Every SHA, every clock, every
+verdict and every `MEASURED-AT` marker is byte-identical (5 before, 5 after). I verified that
+**zero changed lines fail to involve path text** — this is a redaction of a disclosure, not an
+edit to a measurement. **A record whose facts I altered while claiming to protect it would be
+worth less than the disclosure.**
+
+**DISCLOSED, NOT SWEPT:** 8 occurrences of `/private/tmp/review-0` remain. That is a system
+temporary directory carrying **no operator identity**, and the lines are load-bearing narrative
+about a reaped extract. **I removed what discloses and kept what informs, rather than running one
+regex over both and calling the difference cleanup.**
+
+MEASURED-AT: 8a8c4b69
