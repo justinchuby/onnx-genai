@@ -2195,7 +2195,7 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 
 ### 24.2 A MEASURED NUMBER MUST CARRY ITS CONDITIONS — ON SCREEN
 
-`2.46×` is the hero. @12e42da8: *"Never round it, never restate it without its conditions."* That is a **UI requirement**, and our envelope has nowhere to put `n`, `CV`, and a CI.
+⛔ **`2.46×` WAS the hero and IS WITHDRAWN — a point figure claiming 48× the resolution the instrument demonstrated, superseded by the observed interval (D341, §101); the sketch below therefore specifies a FIELD and not this value.** The requirement it was serving survives intact — @12e42da8: *"Never round it, never restate it without its conditions."* That is a **UI requirement**, and our envelope has nowhere to put `n`, `CV`, and a CI.
 
 **I am not adding envelope keys** (it has been revised three times already). Instead: **a benchmark result is a claim, not a reading, and a claim shows its method adjacent to itself — on screen, not in a hover.** Same rule as `not-applicable`: the thing that makes it credible is the thing nobody hovers over.
 
