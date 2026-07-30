@@ -62,6 +62,9 @@ export function adaptStore(telemetryStore, options = {}) {
   const capacity = options.capacity ?? DEFAULT_CAPACITY;
   /** @type {Map<string, {t: number[], v: number[], gaps: Array<[number, number]>, lastAt: number|null}>} */
   const histories = new Map();
+  /** Observed gaps between snapshots, so the poll interval is measured rather than declared. */
+  const observedIntervalsMs = [];
+  let lastSnapshotAtMs = null;
   /** @type {Set<(snapshot: object) => void>} */
   const listeners = new Set();
 
@@ -81,6 +84,15 @@ export function adaptStore(telemetryStore, options = {}) {
   /** @param {object} snapshot */
   function record(snapshot) {
     const at = snapshot?.timestampMs ?? Date.now();
+
+    if (lastSnapshotAtMs !== null && at > lastSnapshotAtMs) {
+      // The OBSERVED gap, not the configured one. The configured interval is a
+      // statement of intent; under load the two diverge, and the whole point of
+      // showing this number is to reveal that divergence.
+      observedIntervalsMs.push(at - lastSnapshotAtMs);
+      if (observedIntervalsMs.length > 32) observedIntervalsMs.shift();
+    }
+    lastSnapshotAtMs = at;
     for (const [key, field] of Object.entries(snapshot?.fields ?? {})) {
       const numeric = numericValueOf(field);
       if (numeric === null || !hasValue(field)) {
@@ -163,6 +175,15 @@ export function adaptStore(telemetryStore, options = {}) {
   return {
     /** @param {string} key */
     field(key) {
+      // client.* never reaches the store. The store answers an unknown key with
+      // 'No field named "x" is published by this server build', which for a
+      // CLIENT-measured value is a false accusation: it blames the server for a
+      // number the browser owns and the server has never heard of. Same failure
+      // as coalescing a missing scenario runner to an empty list — the dashboard
+      // reporting its own gap as someone else's.
+      if (key.startsWith('client.')) {
+        return clientField(key, observedIntervalsMs);
+      }
       return markStalledOrigin(telemetryStore.field(key), telemetryStore.getSnapshot().connection);
     },
 
@@ -451,5 +472,59 @@ function markStalledOrigin(field, connection) {
       state === CONNECTION_STATES.NO_MODEL
         ? 'The server is running but has no model loaded, so nothing is refreshing this value.'
         : 'The server stopped answering, so this is the last value we received rather than a current one.',
+  };
+}
+
+/**
+ * Values the BROWSER measures about itself. The server has no opinion on any of
+ * these and must never be blamed for their absence.
+ *
+ * @param {string} key
+ * @param {number[]} observedIntervalsMs
+ * @returns {object}
+ */
+function clientField(key, observedIntervalsMs) {
+  if (key === 'client.poll_interval_ms') {
+    if (observedIntervalsMs.length === 0) {
+      return {
+        value: null,
+        state: 'pending',
+        source: 'client',
+        unit: 'ms',
+        label: 'Poll interval',
+        reason: 'Two polls are needed before an interval can be observed.',
+        observedAtMs: null,
+      };
+    }
+    // Median, not mean: one long stall would drag an average and misreport the
+    // typical cadence as worse than it is.
+    const sorted = [...observedIntervalsMs].sort((a, b) => a - b);
+    return {
+      value: sorted[Math.floor(sorted.length / 2)],
+      state: 'ok',
+      source: 'client',
+      unit: 'ms',
+      label: 'Poll interval',
+      reason: 'Measured in the browser as the median gap between polls.',
+      observedAtMs: Date.now(),
+    };
+  }
+
+  // Honestly unavailable, and the reason names the DASHBOARD as the gap. An
+  // em-dash here is correct; blaming "this server build" for it was not.
+  const reasons = {
+    'client.poll_rtt_ms':
+      'The dashboard does not yet time individual requests — the store does not expose per-request duration.',
+    'client.dropped_frames':
+      'The dashboard does not yet instrument repaint drops.',
+  };
+  return {
+    value: null,
+    state: 'unavailable',
+    source: 'client',
+    unit: null,
+    label: key,
+    reason: reasons[key] ?? 'This is a client-side value the dashboard does not measure yet.',
+    observedAtMs: null,
   };
 }
