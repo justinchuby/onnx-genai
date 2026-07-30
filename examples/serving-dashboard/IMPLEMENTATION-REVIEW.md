@@ -3411,3 +3411,61 @@ record since I audited that guard hard earlier: `server.execution_provider` real
 not-plumbed, surface-bound field, and the fixture proves the promotion path it names is live rather
 than theoretical. **The exemption describes a real hole and expires itself when the hole closes.**
 
+
+---
+
+## F36 — **F2 upgraded from "cosmetic residue" to a named standard, because the tree already meets it 30 lines away**
+
+Verifying `@c8d9a40e`'s rehousing claim independently sent me past a pattern that settles F2. **Their
+read is correct and the rehousing is *stronger* than what it replaced**, which I want on the record
+because "two red tests disappeared and the suite went green" is the single most suspicious shape on any
+board and it deserves an explicit exoneration:
+
+```
+telemetry-store.test.js:949  'the hit rate is suppressed whatever the denominator does'
+    for (const lookups of [0, 11])  -> asserts UNAVAILABLE at BOTH denominators
+    "Both arms are asserted together so nobody restores one half and concludes
+     the field is healthy."
+```
+
+**The old pair could be half-restored; this one cannot.** That is a direct defence against the Lead's
+signature defect — *a single-site repair leaves the other*. The invariant did not shrink; it stopped
+being *correct arithmetic on a wrong numerator*.
+
+### The pattern that settles F2
+
+`telemetry-store.js:901 suppressUndefinedHitRate()` is **unreachable at HEAD** — it returns early
+unless `prefix_cache.hit_rate` is `MEASURED`, and the field is `MISATTRIBUTED` on every origin. It was
+**kept on purpose**, and the keeping is done properly:
+
+| | dormant `suppressUndefinedHitRate()` | **F2's `?? FIELD_STATES.OK` arm** |
+|---|---|---|
+| Reachable? | No | No |
+| Reason recorded at the site? | **Yes** — *"the only thing standing between a 0/0 and a rendered 0%"* | **No** |
+| Guarded by a test? | **Yes** — `:977`, *"asserted rather than commented: THIS test is what goes red"* | **No** — I deleted the arm and got an identical 5/5 |
+| Deleting it is caught? | **Yes, red** | **No, silent** |
+
+**So the tree already knows how to keep dead code honestly, and F2 is the same tree not doing it.**
+This retires my own "cosmetic residue" grading, which was too soft. The correct disposition is not a
+matter of taste — **it is the standard set by a sibling file in the same suite.**
+
+And the two options are not equal here. `suppressUndefinedHitRate()` is dormant against a **future
+state that can return** (someone re-plumbs the numerator). `FIELD_STATES.OK` is `undefined`
+**permanently** — the alias was deleted at `f19fdb63` (D160) and the ruling to restore it has been
+retracted. **There is no future in which that fallback fires, so the dormant-retention argument does
+not reach it.** `check-field-states.test.js:69` reads:
+
+```js
+const wire = FIELD_STATES.MEASURED ?? FIELD_STATES.OK;
+```
+
+`MEASURED` is `'measured'` — non-nullish, always — so the right operand is unreachable, and the
+assertion at `:73` (*"Neither FIELD_STATES.MEASURED nor FIELD_STATES.OK exists"*) can only fire on a
+condition half of which is a constant `undefined`. **The guard reads as though it tolerates two
+spellings while testing exactly one.** Either drop the arm, or assert the absence deliberately
+(`assert.equal(FIELD_STATES.OK, undefined, 'the alias stays deleted — D160 retracted')`), which would
+convert a silent dead branch into the *only* thing that goes red if someone restores the alias.
+
+**Non-blocking, follow-up branch. Graded by the tree's own standard rather than my taste** — which is
+the better form of every review comment I have written tonight.
+
