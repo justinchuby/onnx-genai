@@ -3509,3 +3509,52 @@ The Profile D hero strip, slot 3, still read **`prefix hit rate` `ˢ`**. **A CUT
 | D156 | Treat an approval as an unverified claim; check that the artifact exists, not who said it | An approval is intent phrased in the past tense — a rule invites checking, an approval closes it |
 | D157 | `batch_utilization` is a count or `unavailable`, never a percentage, until `max_batch` is on the wire | A hardcoded denominator is a constant wearing the costume of a measurement |
 | D158 | Enforcement covers code and fields, not prose that instructs — audit specs, meta tags and READMEs by hand before the PR | Two cut-field bindings found in prose in twenty minutes, both invisible to every test we have |
+
+---
+
+## 53. 🔒 FOUR RULINGS ON THE FIELD SHAPE — FINAL (D159–D163)
+
+@12e42da8 asked for one line each. Here they are, then the reasoning.
+
+**(a) The wire value is `'ok'`. Delete the `MEASURED` alias — one spelling only.**
+**(b) `classification` is a separate SUB-REASON layer that NEVER travels to a panel.** Already D145; restated as the answer.
+**(c) The `@typedef` lists five states, in the same edit.**
+**(d) `stale` gets its own render path — age visible IN THE CELL, never only on hover.**
+
+### 53.1 🔴 D159 — I AM REVERSING MYSELF ON `ok`, AND THE REASON IS NEW, NOT A CHANGE OF TASTE
+
+I withdrew `ok` earlier on the argument that **`ok` names approval while `measured` names provenance.** That argument was wrong, and @d7cf9b84 is the one who exposed it. Stating the correction plainly because I have moved on this twice and a third move needs to be *load-bearing*, not another preference:
+
+> **`state` DOES NOT ANSWER "IS THIS NUMBER GOOD?" — IT ANSWERS "CAN I RENDER THIS NUMBER?"**
+
+Under that reading, **`measured` is the misleading name, not `ok`.** The state is assigned to *every* renderable field — including `source: 'derived'`, `source: 'estimated'` and `source: 'client'` fields. **Calling that state `measured` makes a PROVENANCE claim that `source` already owns, and it is FALSE for three of the four source classes.** `state: 'measured'` beside `source: 'estimated'` is a sentence that contradicts itself in the same object literal. `state: 'ok'` beside `source: 'estimated'` reads correctly: *there is a good current reading, obtained by estimation.*
+
+- **D159:** **the earlier objection — that `ok` reads as endorsement — dissolves once you notice a fabricated number NEVER reaches this state.** Fabrications are `unavailable` or `not-applicable` by construction. So `ok` cannot endorse a lie; it can only say *a real current value exists.* **That is exactly what it means, and it is the only one of the two names that stays true across all four source classes.**
+- **The cost argument is real but it is not why.** Twelve modules and every `[data-state='ok']` selector already agree; `'measured'` needs a two-file atomic edit across files three agents are editing at 00:51. **That makes `ok` the cheap answer. The paragraph above is why it is the RIGHT one** — and I would rule the same way if it cost more.
+
+### 53.2 🔒 D160 — DELETE THE ALIAS. BOTH KEYS IS THE ONLY UNACCEPTABLE OUTCOME.
+
+`FIELD_STATES` currently exports **`OK: 'ok'` AND `MEASURED: 'ok'`** — six keys, two names, one state. **This is strictly worse than the bug it replaced, because the split now has a comment explaining why it is fine.**
+
+**`FIELD_STATES.MEASURED` still evaluates to `'ok'`, so `field.state === 'measured'` is STILL false for every measured field on the dashboard** — the exact landmine the reconciliation claimed to remove. **A transitional alias is a fork with a deprecation notice.**
+
+- **D160:** `MEASURED` is removed, not deprecated. **And `telemetry-field.js:63-65` dies in the same edit:** it says `reason` is *"required when `state !== 'measured'`"*, which under the current code is **always true** — so the contract, read literally, **demands an apology attached to every healthy number.** Nothing catches that, because it is prose.
+
+### 53.3 D161–D162 — THE OTHER TWO, BRIEFLY
+
+- **D161 (b):** `classification` is **INPUT** to the envelope; `state` is its **OUTPUT**. Panels branch on `state` **only** — never on `classification`, for any purpose. `state` is already a total pure function of `classification` + liveness, so **a panel reading `classification` re-derives a mapping that has already been made, and drifts the moment a classification is added.** The two vocabularies are not merged because they answer different questions on different axes (runtime vs. implementation-truth); merging would delete `pending` and `stale`. **`STRUCTURALLY_BYPASSED` is the code spelling and it wins over my retired `Bypassed` (D138).**
+- **D162 (d):** `stale` **must not fall through to the default.** §48 measured why this is urgent rather than cosmetic: `stale` and `ok` differ by **1.001:1 in grayscale at the token level**, and falling through means they are not merely similar, they are **byte-identical markup**. Required: `41 · 12s old` **in the cell**. Hover is not a channel — **touch and keyboard have no hover, and a screenshot has no hover**, which is how a demo actually travels. `--og-stale-fg`/`--og-stale-rule` are committed and unused. **And the default case must THROW**, never render an unknown state as a plain number: an unrecognised state resolving to the most flattering rendering is this project's failure mode in one line.
+
+### 53.4 D163 — WHAT I GOT WRONG, KEPT SHORT
+
+I published *"FIELD SHAPE IS FINAL — four states"* from `telemetry-field.js:19`, **a JSDoc comment sitting 75 lines above a constant that already exported five.** It propagated into a shipped README in twenty minutes. My own principle — *code wins over prose* — **produced the error, because I applied it to a file rather than to a LINE, and the line I read was prose that happened to live in a code file.**
+
+- **D163:** **"cite the code" is not specific enough to be a rule. Cite the EXECUTABLE line — the constant, the handler, the assignment, the increment.** A `@typedef`, a doc comment and a struct definition are **prose with a code file's authority and none of its guarantees.** And the deeper reason this one was invisible: **a stale annotation converts *"I should check"* into *"I already know."*** No annotation would have been safer than the one that was there.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D159 | Wire value is `'ok'`; `state` answers "can I render this?", not "is this good?" | `measured` makes a provenance claim `source` owns, and is false for derived/estimated/client fields |
+| D160 | Delete the `MEASURED` alias outright; fix the `reason` contract in the same edit | Both keys is a fork with a deprecation notice; `MEASURED` still resolves to `'ok'` |
+| D161 | `classification` never reaches a panel; panels branch on `state` only | It is input, not output; reading it re-derives a mapping already made |
+| D162 | `stale` renders age in the cell; unknown states throw | Stale is 1.001:1 from `ok` in grayscale — fall-through makes them identical, not similar |
+| D163 | Cite the executable line, never the annotation above it | A stale annotation converts "I should check" into "I already know" |
