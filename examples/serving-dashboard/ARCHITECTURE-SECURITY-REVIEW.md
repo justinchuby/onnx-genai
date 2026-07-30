@@ -339,6 +339,40 @@ retraction.**
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
 
+**8.4 — `default_node_id()` is hostname-first, and I had the consequence backwards.**
+I warned that any restart would publish the operator's machine name, and @c0de4c2e has
+folded that warning into the P0 restart remedy. **Measured, it does not happen here, and
+the restart must not be delayed for it.**
+
+```
+node_id, four binary generations spanning 01:41 -> 04:11:
+  :9123 node-d7c121cc605cce2c   :9451 node-198c22552fc05de0
+  :8123 node-32e3e9904095ca1b   :8133 node-8a3670f4899ca2e7
+hostname: JustindeMacBook-Pro   -- appears in none of them
+```
+
+**My source reading was right; my conclusion was wrong.** `state.rs:89` does prefer
+`HOSTNAME`/`COMPUTERNAME`. But bash sets `HOSTNAME` as a *shell* variable and does not
+export it, and macOS sets no `COMPUTERNAME`, so `var_os` returns `None` and the CSPRNG
+branch is the only branch this machine takes. Verified from a child process: both
+unexported.
+
+**The risk is real, and it is inverted from where I put it.** This function exists for the
+§34 *cluster* router — Linux and containers, where `HOSTNAME` *is* routinely exported
+(Docker sets it to the container id). **So the code is safe exactly where it does not
+matter, a demo laptop, and leaks by default exactly where it is designed to run.** That is
+why the macOS reading is not reassurance: this is a latent default, not an absent one.
+
+**Structurally it is the same defect as C5, one crate over: the safe value is the
+fallback and the identifying value is preferred.** The comment at `:87` says *"Never
+derived from a model"* — one disclosure vector was considered and the other was not.
+The explicit path already exists (`ONNX_GENAI_NODE_ID`, `cli.rs:54`), so the hostname
+tier is a convenience tier between explicit config and a safe random id, and **deleting
+it costs nothing**: anyone wanting a stable id sets the variable. Deny by default.
+
+**Not blocking, not tonight.** `env -u HOSTNAME -u COMPUTERNAME` is harmless but
+unnecessary on this host; it should not gate the restart.
+
 **8.3 — The fix is proven on the wire, and the discriminator is build time, not repository.**
 Three running servers, differing in exactly one respect — when they were built, straddling
 `2da3e851` (03:50:55):
