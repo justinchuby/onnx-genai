@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import { PROVENANCE, TEXT_ENDPOINTS, resolveForOrigin } from './telemetry-provenance.js';
+import { createTelemetryStore } from './telemetry-store.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CAPTURE_DIR = join(HERE, 'fixtures', 'captures');
@@ -296,3 +297,220 @@ describe('binding liveness', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// THE ROUTING HALF.
+//
+// Everything above answers "does the producer emit this field at all". That
+// catches a DEAD binding and is blind to its twin, which @f6527cc9 named: a key
+// that is correctly registered, correctly spelled, and genuinely published by
+// the server -- but routed by OUR catalogue to an endpoint we banned for
+// stalling. It passes every existence check ever written and still freezes a
+// panel. A dead key and a live key on a forbidden endpoint are ONE defect
+// class -- a binding nobody checked against the wire -- and only one of them is
+// a missing name.
+
+/**
+ * Endpoints D88 excludes from the 4 Hz loop. Not "polled slowly" -- EXCLUDED.
+ *
+ * design/demo-ux.md D88: "the 4 Hz loop polls /v1/status, /v1/debug/kv and
+ * /health ONLY ... a single in-flight request against them holds a connection
+ * for 15 s and AC24's at-most-one-cycle-in-flight rule would stall the whole
+ * loop behind it." demo-spec.md:1874 is blunter: "/metrics is not involved and
+ * must not be polled." Measured cost: 14,784 ms under load vs ~1.8 ms for the
+ * three permitted endpoints DURING THE SAME GENERATION.
+ *
+ * This list is duplicated from prose because the ruling exists only as prose --
+ * which is the root cause the lead named: our output contract is not an
+ * artifact anywhere, so every party hand-maintains a private model of it. This
+ * constant is the first executable form of D88 in the repository.
+ */
+const EXCLUDED_FROM_POLL_LOOP = Object.freeze(['/metrics', '/v1/resources']);
+
+/**
+ * `telemetry-store.js` binds fields as the module that SERVES them, not as a
+ * panel that renders them. Counting it as a consumer reports the store's own
+ * plumbing as four dashboard defects and buries the one real panel binding in
+ * them -- the same blind-instrument error that made `derived: true` fields look
+ * dead in the first version of this guard. The store's use of a stalling
+ * endpoint is a POLL-LOOP defect, asserted separately below.
+ */
+const NOT_A_PANEL = 'telemetry-store.js';
+
+/**
+ * Routing violations that exist at HEAD, declared so a NEW one cannot hide
+ * among them. Same expensive escape hatch as `DECLARED_ABSENT`: reason and
+ * evidence required, and the ceiling makes an addition a visible diff.
+ *
+ * These are NOT closed. They are open and reported; the entry exists so the
+ * suite stays green for a frozen branch while the defect stays executable and
+ * un-loseable, rather than living in a broadcast nobody re-reads.
+ */
+const DECLARED_ROUTING_VIOLATIONS = Object.freeze({
+  'resources.vram_limit_bytes': {
+    reason:
+      'dashboard/system.js renders VRAM limit from /v1/resources, which D88 excludes from ' +
+      'the loop. It only appears to work because the store polls the excluded endpoint ' +
+      'anyway -- so the binding and the poll loop are ONE defect, not two.',
+    evidence:
+      'design/demo-ux.md D88 (excluded, not slowed); demo-spec.md:805 and :830 ' +
+      '(stay excluded until a load run posts a measured latency -- no such ' +
+      'measurement exists in the tree at HEAD); telemetry-store.js poll set.',
+  },
+  'resources.kv_budget_bytes': {
+    reason:
+      'Second binding in dashboard/system.js on the same excluded endpoint. Recorded ' +
+      'separately because two sites IS the finding: one exemption covering both would ' +
+      'have made the second invisible while looking handled.',
+    evidence: 'design/demo-ux.md D88; dashboard/system.js renders it from /v1/resources.',
+  },
+});
+
+describe('no binding routes a panel to an endpoint D88 excluded', () => {
+  it('binds no panel field to a stalling endpoint', () => {
+    const offenders = [];
+    for (const [key, panels] of consumersByKey()) {
+      if (!Object.hasOwn(PROVENANCE, key)) continue;
+      const rendering = [...panels].filter((p) => !p.endsWith(NOT_A_PANEL));
+      if (rendering.length === 0) continue;
+      if (Object.hasOwn(DECLARED_ROUTING_VIOLATIONS, key)) continue;
+      // Per ORIGIN, not once: resolveForOrigin can override `source`, so a key
+      // that is fast on the base entry can still be routed to a stalling
+      // endpoint on one arm. Checking the base entry alone would be a guard
+      // blind to the exact asymmetry it exists to find.
+      for (const origin of [null, 'scatter', 'dynamic']) {
+        const { source } = resolveForOrigin(PROVENANCE[key], origin);
+        if (!EXCLUDED_FROM_POLL_LOOP.includes(source)) continue;
+        offenders.push(`${key} [${origin ?? 'base'}] -> ${source} <- ${rendering.join(', ')}`);
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      `These panel bindings resolve to an endpoint D88 excluded from the poll ` +
+        `loop:\n  ${offenders.join('\n  ')}\n\nThe field may well be real and ` +
+        'correctly named -- that is what makes this invisible to every ' +
+        'existence check. Move the binding to a field served on /v1/status, ' +
+        '/v1/debug/kv or /health, or render it unavailable with a reason.',
+    );
+  });
+
+  it('is measuring real bindings, not an empty set', () => {
+    // Non-vacuity. A drifted consumer scan would report a spotless dashboard
+    // in bytes identical to a genuinely clean one.
+    const registered = [...consumersByKey().keys()].filter((k) => Object.hasOwn(PROVENANCE, k));
+    assert.ok(
+      registered.length > 10,
+      `Only ${registered.length} registered bindings found; the consumer scan has drifted.`,
+    );
+    const reachable = new Set(
+      registered.map((k) => resolveForOrigin(PROVENANCE[k], 'dynamic').source),
+    );
+    assert.ok(
+      reachable.size > 1,
+      'Every binding resolved to one endpoint, which means resolution is not running.',
+    );
+  });
+});
+
+describe('the poll loop is held to D88 by execution, not by reading it', () => {
+  it('requests only endpoints D88 permits, and declares the ones it does not', async () => {
+    // EXECUTED. Reading the array literal in telemetry-store.js would audit the
+    // source; running the store audits the behaviour. Our fake servers answer
+    // /metrics instantly, which is precisely why a 15-second stall has been
+    // invisible to 600 tests: THE TEST DOUBLE CANNOT EXHIBIT THE DEFECT.
+    const asked = [];
+    const fetchImpl = async (url) => {
+      asked.push(new URL(url).pathname);
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const store = createTelemetryStore({ origin: 'scatter', fetchImpl });
+    await store.pollOnce();
+    store.stop();
+
+    assert.ok(asked.length > 2, `The loop requested ${asked.length} paths; the recorder is blind.`);
+
+    const declared = new Set(
+      Object.values(DECLARED_ROUTING_VIOLATIONS).length ? EXCLUDED_FROM_POLL_LOOP : [],
+    );
+    const undeclared = asked.filter(
+      (p) => EXCLUDED_FROM_POLL_LOOP.includes(p) && !declared.has(p),
+    );
+    assert.deepEqual(
+      undeclared,
+      [],
+      `The 4 Hz loop requests ${undeclared.join(', ')}, which D88 excludes ENTIRELY ` +
+        '-- "not polled slowly, excluded" -- because one in-flight request holds a ' +
+        'connection for 15 s and AC24 allows at most one cycle in flight, so the ' +
+        'whole loop stalls behind it.',
+    );
+  });
+});
+
+describe('a declared-unplumbed key expires against the wire, not against us', () => {
+  it('has no declared-unplumbed key that the server has started emitting', () => {
+    // field-keys.test.js promises to remove a key from NOT_YET_PUBLISHED once
+    // the data arrives. That promise CANNOT BE KEPT by the check that makes it:
+    // it asks whether the key is in `publishedKeys()`, which polls a FAKE and
+    // reads `Object.keys(PROVENANCE)`. A key absent from PROVENANCE can never
+    // appear there, so for exactly the keys it covers the check is structurally
+    // incapable of firing. The server could emit queue_depth_peak tomorrow and
+    // nothing would notice, forever. This is the same expiry, anchored to a
+    // recorded live capture instead -- the only artefact here that is not us.
+    const declared = unplumbedKeys();
+    assert.ok(declared.length > 2, `Only ${declared.length} declared keys read; the lift drifted.`);
+
+    const bodies = readCaptureBodies();
+    assert.ok(bodies.length > 0, 'No capture bodies read; this check would pass vacuously.');
+
+    const arrived = declared.filter((key) => {
+      const wire = key.slice(key.indexOf('.') + 1);
+      // PRESENCE IS NOT A ROLE, and this guard caught its own author making
+      // that mistake on the first run: `resources.disk_spill_bytes` IS a key in
+      // the /v1/resources body on both origins -- with the value `null`. The
+      // server emits the field NAME while declaring it unmeasured, so a
+      // `hasOwn` test reports a correct declaration as a stale one and sends
+      // somebody to "fix" a panel that is already honest. A field has arrived
+      // when it carries a VALUE, not when it appears in the response shape.
+      return bodies.some((body) => body[wire] !== null && body[wire] !== undefined);
+    });
+    assert.deepEqual(
+      arrived,
+      [],
+      `${arrived.join(', ')} is declared unplumbed but the server is now emitting it. ` +
+        'The panel is rendering an em-dash over real data -- the direction nobody ' +
+        'reports, because it looks correct. Register it and drop the declaration.',
+    );
+  });
+});
+
+/**
+ * The declared-unplumbed keys, LIFTED from field-keys.test.js rather than
+ * copied. A copy would be a second inventory that drifts from the first, and
+ * this crew has paid full price twice tonight for two copies of one fact.
+ */
+function unplumbedKeys() {
+  const src = readFileSync(join(HERE, 'dashboard', 'field-keys.test.js'), 'utf8');
+  const block = src.match(/NOT_YET_PUBLISHED = Object\.freeze\(\{([\s\S]*?)\n\}\);/);
+  assert.ok(block, 'Could not lift NOT_YET_PUBLISHED from field-keys.test.js.');
+  return [...block[1].matchAll(/^\s*'([^']+)':/gm)].map((m) => m[1]);
+}
+
+/** Every JSON object body in the captures, flattened one level. */
+function readCaptureBodies() {
+  const bodies = [];
+  for (const file of readdirSync(CAPTURE_DIR)) {
+    if (file === 'manifest.json') continue;
+    const capture = JSON.parse(readFileSync(join(CAPTURE_DIR, file), 'utf8'));
+    for (const entry of Object.values(capture.endpoints ?? capture)) {
+      const body = entry?.body;
+      if (body && typeof body === 'object') {
+        bodies.push(body);
+        for (const nested of Object.values(body)) {
+          if (nested && typeof nested === 'object' && !Array.isArray(nested)) bodies.push(nested);
+        }
+      }
+    }
+  }
+  return bodies;
+}
