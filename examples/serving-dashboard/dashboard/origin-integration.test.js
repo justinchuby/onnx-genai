@@ -231,10 +231,40 @@ describe('KV block-window aggregation', () => {
       total: 300,
       poolTotal: 300,
     });
-    assert.equal(
-      blockTable.blocks.ref_counts.filter((refCount) => refCount > 1).length,
-      0,
-      'fixture must make scanned shared pages disagree with the whole-pool scalar',
+    const windowDerivedPagesUsed = blockTable.blocks.ref_counts.filter(
+      (refCount) => typeof refCount === 'number' && refCount > 0,
+    ).length;
+    const windowDerivedPagesTotal = blockTable.window.scanned;
+    const windowDerivedPagesShared = blockTable.blocks.ref_counts.filter(
+      (refCount) => typeof refCount === 'number' && refCount > 1,
+    ).length;
+    const windowDerivedPagesFree = windowDerivedPagesTotal - windowDerivedPagesUsed;
+    const windowDerivedUtilization = windowDerivedPagesUsed / windowDerivedPagesTotal;
+
+    assert.notEqual(
+      blockTable.pages_in_use,
+      windowDerivedPagesUsed,
+      'cross-scope fixture is meaningless unless whole-pool used differs from window-derived used',
+    );
+    assert.notEqual(
+      blockTable.window.pool_total,
+      windowDerivedPagesTotal,
+      'cross-scope fixture is meaningless unless whole-pool total differs from window-derived total',
+    );
+    assert.notEqual(
+      blockTable.pages_in_use / blockTable.window.pool_total,
+      windowDerivedUtilization,
+      'cross-scope fixture is meaningless unless whole-pool utilization differs from window-derived utilization',
+    );
+    assert.notEqual(
+      blockTable.window.pool_total - blockTable.pages_in_use,
+      windowDerivedPagesFree,
+      'cross-scope fixture is meaningless unless whole-pool free differs from window-derived free',
+    );
+    assert.notEqual(
+      blockTable.pages_shared,
+      windowDerivedPagesShared,
+      'cross-scope fixture is meaningless unless whole-pool shared differs from window-derived shared',
     );
     const { store } = await pollBlockTable(blockTable);
 
