@@ -94,17 +94,25 @@ A skip here is expected, not a regression.
 ## 2. `/v1/resources`: fixed on one path only
 
 The command-hang fix landed on the static/scatter path and **not** on the paged
-path (`d6e57c63`). Cite the routing by symbol; the line numbers below have
-already moved once during this session.
+path (`d6e57c63`, symbols re-resolved at `2582f5fb`).
+
+> **Do not trust the line numbers below, including these.** Every driver.rs
+> citation in the first version of this file went stale within thirty minutes —
+> the file shifted about a hundred lines while this brief sat in the tree.
+> Resolve them yourself; the command is the citation:
+>
+> ```
+> grep -n 'continuous_batch_supported\|fn run_pipeline_driver\|fn run_fallback_engine_driver\|fn run_static_engine_driver' crates/onnx-genai-server/src/driver.rs
+> ```
 
 ```
-driver.rs:455  let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
-driver.rs:464  kv_telemetry.set_applicable(!continuous_batch_supported);
-driver.rs:466  if continuous_batch_supported { ... }
+driver.rs:491  let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+driver.rs:500  kv_telemetry.set_applicable(!continuous_batch_supported);
+driver.rs:502  if continuous_batch_supported { ... }
 
-run_pipeline_driver          driver.rs:475
-run_fallback_engine_driver   driver.rs:544   <- still stalls behind &mut Engine
-run_static_engine_driver     driver.rs:550   <- fixed
+run_pipeline_driver          driver.rs:511
+run_fallback_engine_driver   driver.rs:580   <- still stalls behind &mut Engine
+run_static_engine_driver     driver.rs:586   <- fixed
 ```
 
 > **The origin that now responds fast is the one whose prefix numbers are
@@ -251,17 +259,42 @@ it. Two notes for anyone re-running:
   `http://127.0.0.1:8123`. `telemetry-store.test.js:74` injects a `fakeFetch`
   at six call sites. Those alarming lines are tests **passing**.
 
-**Two gaps that are open and are ours:**
+**Two gaps that were open when this was first committed. One has since closed:**
 
-- `perf-baseline.md` does not exist in any branch (control: an equivalent
-  `*README*` pathspec query returns 36 add-commits, so the query form
-  resolves). The 2.46× measurement is sound; its receipt was never written.
+- ~~`perf-baseline.md` does not exist in any branch.~~ **CORRECTED — it landed
+  in `87a80c0c` and is tracked** (`7d528de7`). This claim was true when written
+  and expired about ten minutes later. The file carries what the measurement
+  needed: `n=15`, `CV 1.98%`, per-repetition tables with stdev, and the
+  derivation `82.13 / 33.41 = 2.46×` at `perf-baseline.md:93`. `demo-spec.md`
+  landed in the same commit and is also tracked.
 - The dashboard has been verified served (`/demo/` and all eight JS modules
   return 200 over HTTP) only **at rest**, with no generation in flight. Three
   known defects — the occupancy gauge, `ttft`, and the block grid — are all
   invisible in that state by construction. A page checked at rest is checked
   in the one state that hides them. Treat the served-page evidence as
   incomplete until the panels have been watched during an active generation.
+
+### A caution about `demo-spec.md`, now that it is in the tree
+
+`demo-spec.md` is normative and it currently contains a false claim about this
+codebase, stated three times in escalating emphasis (`7d528de7`):
+
+```
+demo-spec.md:1245  styles/shell.css:163   [data-state='ok']  { … }
+demo-spec.md:1254  the [data-state='ok'] selector change in one commit
+demo-spec.md:1303  "AND FOR THE THIRD TIME: ... styles/shell.css:163 is [data-state='ok']"
+```
+
+The actual line (`sed -n '163p' styles/shell.css`, `7d528de7`) is:
+
+```css
+[data-state='measured'] {
+```
+
+The migration completed; the spec indicts a defect that was repaired. Do not
+act on those three passages, and do not treat the repetition as corroboration —
+all three are one unrefreshed observation. **Where the spec and the source
+disagree about the source, the source wins.**
 
 **Request the URL with the trailing slash: `/demo/`.** Without it the module
 imports resolve against `/`, every `<script type="module">` 404s, and the page
