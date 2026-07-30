@@ -253,7 +253,11 @@ quieter machine can overturn:**
    a literal 0.0 when `lookups == 0`, so an undefined rate and a genuine 0% are
    the same bytes."* A defect visible in source, with no stopwatch.
 2. **The counter cannot distinguish reuse from no-reuse**: twelve requests with
-   six deliberately unique prompts produced twelve hits and a 0.9375 rate.
+   six deliberately unique prompts produced **+12 hits — one per completed
+   generation**, whether or not the prompt shared any prefix. The delta is the
+   evidence; no rate is quoted here, because `prefix_cache_hits` and
+   `prefix_cache_lookups` are cumulative since boot, so their ratio is a
+   property of the process rather than of this experiment.
 3. **The mechanism, traced in source**: the hit path returns a length without
    setting the loaded prefix, so prefill recomputes everything regardless.
 
