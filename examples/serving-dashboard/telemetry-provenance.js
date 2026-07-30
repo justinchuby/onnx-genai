@@ -103,6 +103,7 @@ export const ENDPOINTS = Object.freeze({
   MODELS: '/v1/models',
   STATUS: '/v1/status',
   DEBUG_KV: '/v1/debug/kv',
+  DEBUG_KV_BLOCKS: '/v1/debug/kv/blocks',
   DEBUG_CONFIG: '/v1/debug/config',
   RESOURCES: '/v1/resources',
   METRICS: '/metrics',
@@ -125,6 +126,7 @@ export const FEATURE_GATED_ENDPOINTS = Object.freeze({
 /** Endpoints behind `--enable-debug-endpoints`. A 404 here is configuration, not breakage. */
 export const DEBUG_GATED_ENDPOINTS = Object.freeze([
   ENDPOINTS.DEBUG_KV,
+  ENDPOINTS.DEBUG_KV_BLOCKS,
   ENDPOINTS.DEBUG_CONFIG,
 ]);
 
@@ -219,6 +221,39 @@ export const PROVENANCE = Object.freeze({
   },
 
   // ---------------------------------------------------------------- scheduling (real)
+  //
+  // 🔴 `scheduler.running` AND `scheduler.waiting` WERE ALLOWLISTED AS
+  // "scheduler introspection not yet plumbed". Both are served by
+  // `/v1/debug/kv`, WHICH THIS STORE HAS BEEN POLLING ALL ALONG, and both are
+  // in our own recorded captures. The claim was never false about a missing
+  // endpoint -- it was false about an endpoint we already read.
+  'scheduler.running': {
+    source: ENDPOINTS.DEBUG_KV,
+    path: 'active_batch_size',
+    classification: 'MEASURED',
+    unit: 'requests',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs — `active_batch_size` on /v1/debug/kv, ' +
+      'from the same live scheduler snapshot that feeds queue_depth. Present in ' +
+      'fixtures/captures/dynamic.json and scatter.json.',
+    label: 'Running now',
+    caveat:
+      'Generations the driver is stepping. This is the ADMITTED count, which is what the ' +
+      'scheduler panel is about; it is not the number of sequences the engine fused into one ' +
+      'batch — nothing reports that, and batch.effective_size says so rather than guessing.',
+  },
+  'scheduler.waiting': {
+    source: ENDPOINTS.DEBUG_KV,
+    path: 'pending_queue_depth',
+    classification: 'MEASURED',
+    unit: 'requests',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs — `pending_queue_depth` on /v1/debug/kv. ' +
+      'The same quantity is exported as `onnx_genai_requests_waiting` (metrics.rs) and as ' +
+      '`queue_depth` on /v1/status; /v1/debug/kv is chosen because it is polled at every ' +
+      'tick while /metrics is rate-limited to 500 ms.',
+    label: 'Waiting',
+  },
   'queue.depth': {
     source: ENDPOINTS.STATUS,
     path: 'queue_depth',
@@ -319,71 +354,182 @@ export const PROVENANCE = Object.freeze({
       'labels it as client-measured.',
   },
 
-  // ---------------------------------------------------------------- paged KV (omitted today, not zeroed)
+  // ---------------------------------------------------------------- paged KV
+  //
+  // 🔴 THESE ROWS USED TO SAY "the status handler holds no engine reference".
+  // THAT WAS TRUE OF /v1/status AND IRRELEVANT, BECAUSE THE SERVER GREW A
+  // SECOND ENDPOINT AND NOTHING HERE NOTICED.
+  //
+  // `/v1/debug/kv/blocks` is a registered route (routes/mod.rs, admin.rs), it
+  // serves the whole paged-KV mirror, and the already-polled `/v1/debug/kv`
+  // ADVERTISES ITS OWN URL as `block_table_endpoint` -- so the fact was on the
+  // wire, in our own recorded captures, the entire time. Ten keys sat in
+  // field-keys.test.js's NOT_YET_PUBLISHED reading "block-table endpoint, not
+  // yet landed" while the panel rendered an em-dash over live data. That is
+  // the failure field-keys.test.js itself names as the worst available here:
+  // it looks correct, reports nothing, and understates a server that got
+  // better. Every test in the package was green throughout.
+  //
+  // WHY NOTHING CAUGHT IT, AND WHAT NOW DOES. The stale-entry check could only
+  // fire once a key became published BY OUR STORE, which happens when somebody
+  // adds a row HERE. So the trigger for noticing the server had grown a
+  // feature was us noticing the server had grown a feature -- a loop closed
+  // entirely on our own artefacts, with nothing reading the Rust.
+  // `check-unplumbed-claims.test.js` now reads it: every remaining claim of
+  // absence must name the wire names it is absent under, and the server
+  // sources are scanned for them on every run.
+  //
+  // THE RESPONSE CARRIES ITS OWN STATE, AND WE HONOUR IT RATHER THAN GUESS.
+  // BlockTableResponse has `applicable: bool` plus an optional
+  // `FieldUnavailable { code, detail }` whose codes are EXACTLY this project's
+  // vocabulary -- `unavailable`, `not-applicable`, `pending`
+  // (routes/mod.rs:155-173). On a server whose model does not page KV, the
+  // endpoint answers `applicable: false` with a reason written by the people
+  // who know why. So "this server cannot do paged KV" and "this number has not
+  // been plumbed" stop being the same em-dash, and the sentence a visitor
+  // reads is the server's own.
   'kv.usage': {
-    source: ENDPOINTS.STATUS,
-    path: 'kv_usage',
-    classification: 'NOT_PLUMBED',
-    // OLDER BINARIES SEND A LITERAL 0.0 HERE. The current server omits the
-    // field, so absence is the normal case and is handled by the caller's
-    // presence check. But several builds in circulation tonight predate that
-    // change, and without this declaration a 0 from one of them reads as a
-    // value CONTRADICTING the table -- which makes the store display it as a
-    // live measurement. The fabricated zero would arrive wearing the one badge
-    // this project exists to withhold. A non-zero value still raises the
-    // staleness warning, so the branch keeps its purpose.
-    stubValue: 0,
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    derived: true,
+    derivedFrom: ['pages_in_use', 'window.pool_total'],
+    classification: 'MEASURED',
     unit: 'ratio',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs — `kv_usage: None`. The four KV fields ' +
-      'travel together and are omitted from the payload, not sent as zeros.',
+      'Derived as pages_in_use / window.pool_total, both served by ' +
+      'crates/onnx-genai-server/src/routes/mod.rs (BlockTableResponse.pages_in_use, ' +
+      'BlockWindow.pool_total). pool_total is the POOL size, not the capped mirror `total`: ' +
+      'mod.rs:889-897 publishes it precisely because pages_in_use is measured against the ' +
+      'pool while `total` is the mirror, so dividing by `total` would report utilization ' +
+      'above 100% whenever the 1024-page cap bites.',
     label: 'KV utilization',
-    reason:
-      'The status handler holds no engine reference, so it cannot see the paged-KV pool and ' +
-      'omits the field rather than sending 0. An absent value renders as "not measured here", ' +
-      'which is a different and stronger claim than a zero. Live paged-KV data comes from the ' +
-      'KV block-table endpoint instead.',
   },
   'kv.pages_used': {
-    source: ENDPOINTS.STATUS,
-    path: 'kv_pages_used',
-    classification: 'NOT_PLUMBED',
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    path: 'pages_in_use',
+    classification: 'MEASURED',
     unit: 'pages',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs — `kv_pages_used: None`, omitted from the ' +
-      'payload rather than sent as a zero.',
+      'crates/onnx-genai-server/src/routes/mod.rs — BlockTableResponse.pages_in_use, omitted ' +
+      'entirely (serde skip_serializing_if) when the model does not page KV rather than sent ' +
+      'as a zero.',
     label: 'KV pages in use',
-    reason:
-      'Not exposed to the HTTP layer; the field is omitted, not zeroed. Absent says "not ' +
-      'measured here"; a zero would say "measured, and the pool is empty".',
   },
   'kv.pages_total': {
-    source: ENDPOINTS.STATUS,
-    path: 'kv_pages_total',
-    classification: 'NOT_PLUMBED',
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    path: 'window.pool_total',
+    classification: 'MEASURED',
     unit: 'pages',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs — `kv_pages_total: None`, omitted from the ' +
-      'payload rather than sent as a zero.',
+      'crates/onnx-genai-server/src/routes/mod.rs — BlockWindow.pool_total, the pages the POOL ' +
+      'holds. Deliberately NOT `window.total`, which is the mirror\'s reach and is capped at ' +
+      'MAX_WINDOW; the server publishes both and a `truncated` flag precisely so a client ' +
+      'cannot render pages_in_use against the wrong denominator.',
     label: 'KV pages total',
-    reason:
-      'Not exposed to the HTTP layer; the field is omitted, not zeroed. This is the trap of ' +
-      'the group: it reads a real structure, so a non-zero value would survive any ' +
-      '"is this hardcoded?" audit while describing a pool the decoder never uses. A non-zero ' +
-      'value is not evidence that a mechanism is in play.',
   },
   'kv.pages_shared': {
-    source: ENDPOINTS.STATUS,
-    path: 'kv_pages_shared',
-    classification: 'NOT_PLUMBED',
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    path: 'pages_shared',
+    classification: 'MEASURED',
     unit: 'pages',
     evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs — `kv_pages_shared: None`, omitted from ' +
-      'the payload rather than sent as a zero.',
+      'crates/onnx-genai-server/src/routes/mod.rs — BlockTableResponse.pages_shared.',
     label: 'KV pages shared',
-    reason:
-      'Not exposed to the HTTP layer; the field is omitted, not zeroed. Sharing is ' +
-      'page-granular, so even when this is plumbed a zero will not mean "no reuse happened".',
+    caveat:
+      'Sharing is page-granular, so a zero does not mean "no reuse happened" — it means no ' +
+      'whole page is currently referenced by more than one sequence.',
+  },
+  'kv.block_size': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    path: 'page_size',
+    classification: 'MEASURED',
+    unit: 'tokens',
+    evidence:
+      'crates/onnx-genai-server/src/routes/mod.rs — BlockTableResponse.page_size, the token ' +
+      'slots per page.',
+    label: 'KV block size',
+  },
+  'kv.hot_evictions': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    path: 'hot_evictions',
+    classification: 'MEASURED',
+    unit: 'count',
+    evidence:
+      'crates/onnx-genai-server/src/routes/mod.rs — BlockTableResponse.hot_evictions, ' +
+      'documented there as "the real \'pool is full\' indicator".',
+    label: 'Hot-tier evictions',
+  },
+  'kv.allocation_failures': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    path: 'allocation_failures',
+    classification: 'MEASURED',
+    unit: 'count',
+    evidence:
+      'crates/onnx-genai-server/src/routes/mod.rs — BlockTableResponse.allocation_failures.',
+    label: 'Allocation failures',
+    // A zero here is a MEASURED zero and means something specific, which is
+    // why it is stated rather than left to be read as "nothing happened".
+    caveat:
+      'Expected to stay at zero: the server\'s own note records that the pool grows by ' +
+      'demoting pages to the cold tier rather than failing, so hot_evictions — not this — is ' +
+      'the pressure signal to watch.',
+  },
+  'kv.slots_filled': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    derived: true,
+    derivedFrom: ['blocks.filled_slots'],
+    classification: 'MEASURED',
+    unit: 'tokens',
+    evidence:
+      'Summed client-side over BlockTable.filled_slots (routes/mod.rs), skipping nulls. A null ' +
+      'means the page has NEVER BEEN WRITTEN — the server documents that explicitly, and that ' +
+      'it does NOT mean free, because a released page reports ref_count 0. Counting nulls as ' +
+      'zeros would be correct here by accident and wrong the moment the field is reused, so ' +
+      'they are skipped rather than coerced.',
+    label: 'Token slots holding data',
+  },
+  'kv.slot_capacity': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    derived: true,
+    derivedFrom: ['page_size', 'pages_in_use'],
+    classification: 'MEASURED',
+    unit: 'tokens',
+    evidence:
+      'Derived as page_size × pages_in_use (both BlockTableResponse fields, routes/mod.rs). ' +
+      'The denominator is the pages ACTUALLY ALLOCATED, not the pool: the quantity the panel ' +
+      'reports is paging waste — how much of what we took is in use — and dividing by the ' +
+      'whole pool would answer a different question with the same two numbers.',
+    label: 'Token slots allocated',
+  },
+  'kv.refcount_histogram': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    derived: true,
+    derivedFrom: ['blocks.ref_counts'],
+    classification: 'MEASURED',
+    unit: null,
+    evidence:
+      'Aggregated client-side from BlockTable.ref_counts (routes/mod.rs) into ' +
+      '[{refcount, blocks}]. Nulls are skipped for the same reason as filled_slots: they are ' +
+      'an absence of observation, not a refcount of zero, and a released page genuinely ' +
+      'reporting 0 must not be merged with a page nobody has ever written.',
+    label: 'Refcount distribution',
+    caveat:
+      'Covers only the pages in the served window (window.scanned), which is capped at ' +
+      'MAX_WINDOW. When window.truncated is true this describes a prefix of the pool.',
+  },
+  'kv.tiers': {
+    source: ENDPOINTS.DEBUG_KV_BLOCKS,
+    derived: true,
+    derivedFrom: ['blocks.tiers', 'tiers'],
+    classification: 'MEASURED',
+    unit: null,
+    evidence:
+      'Aggregated from BlockTable.tiers, LABELLED FROM THE WIRE using the response\'s own ' +
+      '`tiers` vocabulary map (Rust `tier_names`, serde-renamed; routes/mod.rs). The server ' +
+      'serves the vocabulary on purpose: its comment states that a bare tier integer whose ' +
+      'meaning lives only in the Rust source is a citation rather than data, and that adding ' +
+      'a tier would leave a client rendering confidently with the wrong label. So an ' +
+      'unrecognised tier id is rendered as unknown here rather than guessed.',
+    label: 'Pages by tier',
   },
 
   // ---------------------------------------------------------------- prefix cache
@@ -847,6 +993,221 @@ export const PROVENANCE = Object.freeze({
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs — resolved from configured vram limit.',
     label: 'VRAM limit',
   },
+  // 🔴 ALLOWLISTED AS "spill accounting not yet plumbed". THE SERVER SERVES IT,
+  // ON AN ENDPOINT THIS STORE ALREADY POLLS, AND IT IS IN OUR OWN CAPTURES.
+  // Found by check-unplumbed-claims.test.js reading the Rust, not by anyone
+  // re-reading this table -- which is the point of that guard.
+  //
+  // WHAT IT IS, STATED SO NOBODY RE-MISCLASSIFIES IT: a configured CEILING,
+  // exactly like its two neighbours above. system.js renders all three
+  // together under captions that already say "a limit, not a reading", so the
+  // budget semantics are what the panel asked for. It is NOT a count of bytes
+  // spilled; no counter records that, and none is claimed here.
+  'resources.disk_spill_bytes': {
+    source: ENDPOINTS.RESOURCES,
+    path: 'resolved_limits.disk_spill_bytes',
+    classification: 'MEASURED',
+    unit: 'bytes',
+    evidence:
+      'crates/onnx-genai-server/src/routes/mod.rs:454 declares ' +
+      '`disk_spill_bytes: Option<u64>` on ResolvedResourceLimits; ' +
+      'crates/onnx-genai-server/src/routes/admin.rs:610 populates it from ' +
+      'snapshot.resolved_limits. Serialised as `null` when no spill tier is configured, ' +
+      'which is the honest wire and renders unavailable on its own.',
+    label: 'Disk spill limit',
+    caveat:
+      'A configured ceiling, not a measurement of bytes actually spilled — the server records ' +
+      'no spill volume. `null` means no spill tier is configured at all, which is the default.',
+  },
+
+  // ---------------------------------------------------------------- latency percentiles
+  //
+  // ⚖️ TWO DIFFERENT EMPTINESSES, PREVIOUSLY RENDERED AS ONE EM-DASH.
+  //
+  // All fifteen latency keys were allowlisted together as "percentile
+  // aggregation not yet plumbed". That single sentence covered two situations
+  // that are not alike and must not look alike on the page:
+  //
+  //   SERVER ROWS (ttft_server_*, e2e_server_*) are a genuine GAP. The server
+  //   really does measure these latencies -- it just publishes them as a
+  //   BUCKETED HISTOGRAM (`_bucket{le=}`, `_sum`, `_count` over 14 fixed
+  //   bounds; metrics.rs) and never as a percentile. There is no `quantile`
+  //   label anywhere in the crate. The mean IS recoverable from _sum/_count
+  //   and is bound, as `metrics.ttft` and `metrics.e2e_latency`. A p95
+  //   interpolated from 14 coarse buckets is an estimate whose error bar is a
+  //   whole bucket wide, so rendering one under the label "p95" would be a
+  //   fabricated measurement wearing a plausible name -- the precise defect
+  //   this table exists to prevent. These stay `unavailable`: a server change
+  //   (a summary, or finer buckets) would fix them, so the promise is real.
+  //
+  //   CLIENT ROWS (below) are NOT a gap at all. No server will ever supply
+  //   them, because they are measured in the browser, from a stream this page
+  //   would have to issue itself. There is no scenario runner in this demo, so
+  //   the measurement is never taken. Telling a visitor "not yet plumbed"
+  //   about these would promise a server change that could not possibly
+  //   deliver them.
+  //
+  // WHY `STRUCTURALLY_BYPASSED` AND NOT A NEW WORD. Its operative test is
+  // "no amount of plumbing would fix it; it is a true statement about the
+  // architecture, not a gap in it", and it renders `not-applicable`. Both hold
+  // exactly. Its NARRATIVE was written about a server bypassing its own
+  // subsystem, so it is widened here rather than duplicated: the question is
+  // not the server's to answer. A sixth classification for the same verdict
+  // and the same rendering would be vocabulary growth with no new distinction
+  // in it, and the five states already say everything a visitor needs.
+  'latency.ttft_client_p50': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: the browser must issue a streaming request and time the first chunk itself. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Time to first token p50 (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.ttft_client_p95': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: the browser must issue a streaming request and time the first chunk itself. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Time to first token p95 (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.ttft_client_max': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: the browser must issue a streaming request and time the first chunk itself. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Time to first token max (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.itl_client_p50': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: it is the gap between consecutive streamed chunks, which only the receiver sees. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Inter-token latency p50 (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.itl_client_p95': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: it is the gap between consecutive streamed chunks, which only the receiver sees. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Inter-token latency p95 (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.itl_client_max': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: it is the gap between consecutive streamed chunks, which only the receiver sees. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Inter-token latency max (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.tpot_client_p50': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: it divides a client-observed generation duration by the tokens that arrived. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Time per output token p50 (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.tpot_client_p95': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: it divides a client-observed generation duration by the tokens that arrived. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Time per output token p95 (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
+  'latency.tpot_client_max': {
+    source: null,
+    classification: 'STRUCTURALLY_BYPASSED',
+    unit: 'ms',
+    evidence:
+      'Client-measured by definition: it divides a client-observed generation duration by the tokens that arrived. ' +
+      'No route in crates/onnx-genai-server/src/routes/ serves it and none could -- the ' +
+      'quantity does not exist server-side. Measuring it requires a scenario runner that ' +
+      'issues generations from this page, which this demo does not ship.',
+    label: 'Time per output token max (client-measured)',
+    reason:
+      'Measured in the browser, not on the server -- it includes network and streaming ' +
+      'framing that no server can see. It needs a scenario runner to issue requests from ' +
+      'this page, and this demo does not ship one, so the measurement is never taken. This ' +
+      'is not a missing server feature: no server change would supply it. The ' +
+      'server-measured rows above are the comparable numbers.',
+  },
 
   // ── Derived in the browser ──────────────────────────────────────────────
   // Computed by telemetry-store.js rather than read from a response, so
@@ -856,6 +1217,7 @@ export const PROVENANCE = Object.freeze({
   'throughput.observed': {
     source: ENDPOINTS.METRICS,
     derived: true,
+    derivedFrom: ['onnx_genai_tokens_generated_total'],
     classification: 'MEASURED',
     unit: 'tokens/s',
     evidence:

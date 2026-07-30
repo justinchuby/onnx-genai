@@ -204,8 +204,34 @@ function renderBudgetRow(label, budget, caveat) {
  * @returns {HTMLElement}
  */
 function renderDiskSpill(diskSpill) {
-  if (isRenderable(diskSpill)) {
+  // NUMERIC OR NOTHING. The wire type is Option<u64> (ResolvedResourceLimits,
+  // routes/mod.rs:454), so a string here is never a legitimate reading -- and
+  // the store cannot filter it for us, because it promotes any unexpected value
+  // to state="measured". Without this, a server that put a spill DIRECTORY in
+  // the field would have this row paint an absolute filesystem path, which is
+  // the model_path disclosure again under a different key.
+  if (isRenderable(diskSpill) && typeof diskSpill.value === 'number') {
     return metricRow('disk spill', diskSpill, { format: formatBytes });
+  }
+  if (isRenderable(diskSpill)) {
+    return element('div', {
+      className: 'resource-row resource-row--absent',
+      children: [
+        element('span', { className: 'resource-row__label', text: 'disk spill' }),
+        element('span', {
+          className: 'resource-row__absent',
+          text: 'unreadable',
+          attrs: {
+            tabindex: '-1',
+            'data-roving-item': '',
+            title:
+              'The server sent a disk-spill value that is not a byte count. It is not shown ' +
+              'because it cannot be read as one, and showing it verbatim could disclose a ' +
+              'filesystem path.',
+          },
+        }),
+      ],
+    });
   }
   return element('div', {
     className: 'resource-row resource-row--absent',

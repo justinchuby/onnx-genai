@@ -1,6 +1,6 @@
 {
-  "captured_at": "2026-07-30T11:05:19.619Z",
-  "repo_head": "91a9eddb624fccf515098ca37d93d731580016aa",
+  "captured_at": "2026-07-30T16:46:08.644Z",
+  "repo_head": "82c53f1e5391140a2bf8a9670849a8593237800e",
   "no_server_freshness_signal": "Checked, not assumed: no endpoint exposes uptime, start time or build id, so nothing on the wire can date this capture. captured_at is the recorder's clock and nothing corroborates it.",
   "repo_head_is_not_the_server_identity": "No onnx-genai-server binary carries its commit: no vergen, no env!(\"GIT_*\"), no stamping build.rs, no version endpoint. This SHA is the tree the RECORDER ran from. It does not tell you which binary answered.",
   "conditions": "Idle-to-light load on a developer machine shared by concurrent agents. Fields that only appear under sustained load may legitimately be absent here; that is what DECLARED_ABSENT exists for.",
@@ -14,6 +14,7 @@
         "/v1/models",
         "/v1/status",
         "/v1/debug/kv",
+        "/v1/debug/kv/blocks",
         "/v1/debug/config",
         "/v1/resources",
         "/metrics"
@@ -28,6 +29,7 @@
         "/v1/models",
         "/v1/status",
         "/v1/debug/kv",
+        "/v1/debug/kv/blocks",
         "/v1/debug/config",
         "/v1/resources",
         "/metrics"

@@ -201,7 +201,15 @@ const servedButNotNeeded = classified.filter(
 // excludes `*.test.js` and test-only modules, which is a `run-demo.sh` change
 // and belongs to whoever owns the launcher. Until then this number is the
 // disclosure, not the solution.
-const MAX_SERVED_BUT_NOT_NEEDED = 91;
+// 91 -> 92: +1, and exactly +1, for ONE file I added --
+// `check-unplumbed-claims.test.js`, which holds every claim of absence in the
+// catalogue against the actual Rust sources. Same rule the previous author
+// applied to themselves: you may buy a green for the file YOU added, with a
+// sentence, and you may not buy one for anybody else's. The residual red is
+// therefore unchanged in size -- it was 94 against 91 and it is 95 against 92 --
+// so raising this did not shrink the disclosure by a single file, which is the
+// only way a raise is honest. The three files that are not mine stay red.
+const MAX_SERVED_BUT_NOT_NEEDED = 92;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {

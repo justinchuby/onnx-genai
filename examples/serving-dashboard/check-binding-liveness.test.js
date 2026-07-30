@@ -150,18 +150,39 @@ function supportedBy(entry, capture) {
     return { ok: false, why: `${entry.source} answered ${recorded.status}` };
   }
 
+  // THE SERVER MAY DECLARE THE WHOLE ENDPOINT INAPPLICABLE, AND THAT IS AN
+  // ANSWER, NOT A GAP. /v1/debug/kv/blocks replies `applicable: false` with a
+  // FieldUnavailable reason on a model whose KV cache holds no paged storage
+  // (routes/mod.rs). The row is not unsupported there -- it was asked and the
+  // server said the question does not apply, which is exactly what the panel
+  // then renders. Reporting that as an unsupported MEASURED claim would push
+  // authors to delete a binding that works everywhere it can.
+  if (recorded.body.applicable === false && recorded.body.unavailable) {
+    const declared = recorded.body.unavailable;
+    return { ok: true, why: `${entry.source} declares ${declared.code} for this origin` };
+  }
+
   // A derived field has no wire path of its own -- it is computed client-side
   // from another series. Treating that as absent would be a blind instrument
   // reporting a false red, so the claim we CAN check is that its named input is
   // really on the wire. A derivation whose input is missing is just as dead.
   if (entry.derived) {
-    const inputs = [...String(entry.evidence ?? '').matchAll(/\b([a-z][a-z0-9_]*_total)\b/g)].map(
-      (m) => m[1],
-    );
+    // Inputs are DECLARED (`derivedFrom`), not scraped out of the prose. The
+    // scrape this replaces matched only /\w+_total/, which was every input the
+    // catalogue had while the only derived rows read /metrics counters; the
+    // first derivation off a JSON endpoint named `page_size` and `ref_counts`
+    // and the regex found nothing to check, so the guard would have gone red
+    // on a live binding while calling the reason "names no *_total input".
+    const inputs = entry.derivedFrom ?? [];
     if (inputs.length === 0) {
-      return { ok: false, why: 'derived, but its evidence names no *_total input to verify' };
+      return { ok: false, why: 'derived, but declares no `derivedFrom` inputs to verify' };
     }
-    const missing = inputs.filter((name) => !String(recorded.body).includes(name));
+    // `body` is a parsed object for JSON endpoints and a string for text ones.
+    // The former stringifies to "[object Object]", so a substring test against
+    // it can only ever fail -- silently, and identically for a real input and a
+    // typo. Serialise before searching.
+    const haystack = typeof recorded.body === 'string' ? recorded.body : JSON.stringify(recorded.body);
+    const missing = inputs.filter((name) => !haystack.includes(name.split('.').pop()));
     return missing.length === 0
       ? { ok: true, why: '' }
       : { ok: false, why: `derived from ${missing.join(', ')}, absent from ${entry.source}` };
@@ -363,6 +384,24 @@ const DECLARED_ROUTING_VIOLATIONS = Object.freeze({
       'separately because two sites IS the finding: one exemption covering both would ' +
       'have made the second invisible while looking handled.',
     evidence: 'design/demo-ux.md D88; dashboard/system.js renders it from /v1/resources.',
+  },
+  'resources.disk_spill_bytes': {
+    reason:
+      'THIRD instance of the SAME defect, not a new one: same panel (dashboard/system.js), ' +
+      'same renderBudgetRow group, same already-polled endpoint, and it will move with its ' +
+      'two siblings the day D88 closes. Declared rather than left unbound because the ' +
+      'alternative was worse — the key was previously carried as an unpublished field, i.e. ' +
+      'a written claim that the server does not serve it, and the server DOES: ' +
+      'ResolvedResourceLimits.disk_spill_bytes is declared at routes/mod.rs:454 and ' +
+      'populated at routes/admin.rs:610. Keeping a claim of absence that the source refutes ' +
+      'is the exact failure this suite exists to catch, so the honest routing violation was ' +
+      'preferred over the dishonest absence.',
+    evidence:
+      'design/demo-ux.md D88; crates/onnx-genai-server/src/routes/mod.rs:454 ' +
+      '(ResolvedResourceLimits.disk_spill_bytes: Option<u64>); routes/admin.rs:610 ' +
+      '(populated); adds ZERO polling cost — /v1/resources is already fetched and parsed ' +
+      'for the two siblings above, so this binding changes no request, only what is read ' +
+      'out of a response the page already has.',
   },
 });
 

@@ -214,12 +214,14 @@ test('documented zeros from /v1/status NEVER become measured values', async () =
 
   // NOT_PLUMBED: the server omits these entirely, so they are unavailable --
   // "we cannot measure this", with a fix that exists and is someone's job.
+  // The four kv.* keys that used to head this list are gone: they are now
+  // MEASURED off /v1/debug/kv/blocks, an endpoint that had shipped while this
+  // table still called them unplumbed. What remains is the set the server
+  // genuinely does not compute.
   for (const key of [
-    'kv.usage',
-    'kv.pages_used',
-    'kv.pages_total',
-    'kv.pages_shared',
     'throughput.tokens_per_second',
+    'batch.effective_size',
+    'server.execution_provider',
   ]) {
     const field = store.field(key);
     assert.equal(field.state, FIELD_STATES.UNAVAILABLE, `${key} must be unavailable`);
@@ -335,7 +337,7 @@ test('an unavailable field does not become stale — absence has no age', async 
   reachable = false;
   await store.pollOnce();
 
-  assert.equal(store.field('kv.usage').state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(store.field('throughput.tokens_per_second').state, FIELD_STATES.UNAVAILABLE);
 });
 
 test('a disabled debug endpoint degrades only its own fields, with the exact fix', async () => {
@@ -532,7 +534,7 @@ test('an unavailable field never inherits an explanation from an unrelated earli
   // The server stopped sending a hardcoded 0.0 and now omits the field, so the
   // reason names the OMISSION. Pinning the old prose would assert a server
   // behaviour that no longer exists.
-  assert.match(store.field('kv.usage').reason, /omits the field/);
+  assert.match(store.field('throughput.tokens_per_second').reason, /Omitted, not zeroed/);
 });
 
 test('the store is inert until start() is called', () => {
@@ -543,13 +545,13 @@ test('the store is inert until start() is called', () => {
 
 test('before the first poll, measurable fields are PENDING and documented zeros are UNAVAILABLE', () => {
   // The distinction matters to the visitor: pending resolves on its own,
-  // unavailable never will. Showing a spinner for `kv.usage` would promise a
-  // number that is never coming.
+  // unavailable never will. Showing a spinner for a field the server does not
+  // compute would promise a number that is never coming.
   const store = storeWith(healthyRoutes());
 
   assert.equal(store.field('queue.depth').state, FIELD_STATES.PENDING);
   assert.equal(store.field('queue.depth').value, null);
-  assert.equal(store.field('kv.usage').state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(store.field('batch.effective_size').state, FIELD_STATES.UNAVAILABLE);
   assert.equal(store.field('throughput.tokens_per_second').state, FIELD_STATES.UNAVAILABLE);
 });
 
@@ -889,7 +891,7 @@ test('an unavailable field still states which endpoint and server it would come 
   const store = createTelemetryStore({ baseUrl: BASE_URL, fetchImpl: fakeFetch(healthyRoutes()) });
   await store.pollOnce();
 
-  const field = store.getSnapshot().fields['kv.usage'];
+  const field = store.getSnapshot().fields['throughput.tokens_per_second'];
   assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
   assert.equal(field.source, ENDPOINTS.STATUS);
   assert.equal(field.sourceClass, 'server');
@@ -1124,10 +1126,26 @@ test('static endpoints are not re-fetched every poll (AC33 overhead budget)', as
   assert.equal(counts[ENDPOINTS.DEBUG_CONFIG], 1, 'model config cannot change');
   assert.equal(counts[ENDPOINTS.RESOURCES], 1, 'resource limits are configuration');
   assert.equal(counts[ENDPOINTS.MODELS], 1, 'the loaded model set changes rarely');
+  // The block table is the largest payload the page can ask for -- a window of
+  // up to 1024 pages across four parallel arrays -- and it describes a grid
+  // that does not turn over between frames. Pinned explicitly rather than
+  // absorbed into the total, so a future cadence change to it is a visible
+  // diff here instead of a number that quietly moved.
+  assert.equal(counts[ENDPOINTS.DEBUG_KV_BLOCKS], 1, 'the block table is the largest payload; 1 s');
 
-  // Uniform polling of seven endpoints at 250 ms would be 28 requests/second.
+  // Uniform polling of eight endpoints at 250 ms would be 32 requests/second.
+  //
+  // ⚠️ THIS CEILING WENT 17 -> 18 WHEN /v1/debug/kv/blocks WAS BOUND, AND THAT
+  // IS THE ONLY REASON IT MOVED. The budget is a real constraint (@d7cf9b84's
+  // <2% server overhead) and raising it must never be the reflex fix for a red
+  // here, so the trade is stated: the added request is ONE per second, against
+  // a live-gauge floor of 12 per second that is unchanged, and it lights up an
+  // entire panel that had been rendering em-dashes over data the server was
+  // already serving. A cadence change cannot buy it back -- at 4 polls per
+  // second the first fetch happens whatever the cadence -- so the choice was
+  // this number or leaving the panel dead.
   const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
-  assert.ok(total <= 17, `expected <= 17 requests in one second, got ${total}`);
+  assert.ok(total <= 18, `expected <= 18 requests in one second, got ${total}`);
 });
 
 test('a reused response never claims to be fresher than it is', async () => {
@@ -1236,10 +1254,11 @@ test('a stub that starts returning real data is shown, not hidden', async () => 
   console.warn = (...args) => warnings.push(args.join(' '));
   let store;
   try {
-    // kv_usage is DOCUMENTED_ZERO (admin.rs:54). Pretend the plumbing landed.
+    // tokens_per_second is NOT_PLUMBED with a declared stub of 0 (older
+    // binaries send a literal 0.0). Pretend the plumbing landed.
     store = storeWith(
       healthyRoutes({
-        [ENDPOINTS.STATUS]: { body: { ...statusBody(), kv_usage: 0.42 } },
+        [ENDPOINTS.STATUS]: { body: { ...statusBody(), tokens_per_second: 42.5 } },
       }),
     );
     await store.pollOnce();
@@ -1247,16 +1266,16 @@ test('a stub that starts returning real data is shown, not hidden', async () => 
     console.warn = originalWarn;
   }
 
-  const field = store.field('kv.usage');
+  const field = store.field('throughput.tokens_per_second');
   assert.equal(field.state, FIELD_STATES.MEASURED, 'a real measurement must not be suppressed');
-  assert.equal(field.value, 0.42);
+  assert.equal(field.value, 42.5);
 
   // ...but it must never pass as an ordinary measurement while the table
   // disagrees. The disagreement travels with the value.
   assert.ok(field.provenanceWarning, 'the value carries the contradiction');
   assert.match(field.provenanceWarning, /out of date/);
   assert.equal(warnings.length, 1, 'warns once per field, not once per poll');
-  assert.deepEqual(Object.keys(store.provenanceWarnings()), ['kv.usage']);
+  assert.deepEqual(Object.keys(store.provenanceWarnings()), ['throughput.tokens_per_second']);
 });
 
 test('a stub still returning its stub value stays suppressed and silent', async () => {
@@ -1270,7 +1289,7 @@ test('a stub still returning its stub value stays suppressed and silent', async 
   } finally {
     console.warn = originalWarn;
   }
-  assert.equal(store.field('kv.usage').state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(store.field('throughput.tokens_per_second').state, FIELD_STATES.UNAVAILABLE);
   assert.deepEqual(warnings, [], 'no false alarm at HEAD');
   assert.deepEqual(store.provenanceWarnings(), {});
 });
@@ -1313,8 +1332,21 @@ test('every suppressed field can be checked against the wire, or says why not', 
       // NOT_PLUMBED needs no declared stub: "the path carries nothing" is
       // already a checkable claim, and the day it carries something is exactly
       // the day the classification became false.
+      //
+      // A row with NO SOURCE is the one case this test cannot decide. It claims
+      // no endpoint serves the field and none could, so there is no path to
+      // read and no body that could ever contradict it -- `matchesStub()` has
+      // nothing to compare. The check does not vanish, it MOVES: every
+      // sourceless row is held against the Rust sources by
+      // check-unplumbed-claims.test.js ("a row that names no endpoint is still
+      // held against the server"), which fails the day the server grows a name
+      // that would serve it. Deleting that file does not silently widen this
+      // exemption -- the sourceless rows would then be checked by nothing, and
+      // that is a deletion a reviewer can see.
       const checkable =
         entry.classification === 'NOT_PLUMBED' ||
+        entry.source === null ||
+        entry.source === undefined ||
         'stubValue' in entry ||
         typeof entry.isStub === 'function' ||
         Boolean(entry.unfalsifiable);

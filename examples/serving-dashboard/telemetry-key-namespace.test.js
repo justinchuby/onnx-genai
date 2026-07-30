@@ -124,12 +124,25 @@ const DECLARED_DYNAMIC_KEYS = new Map([
 
 // THE OPEN DEFECT, PINNED AT ITS EXACT SIZE.
 //
-// These fifteen keys are unservable TODAY. This is a ratchet, not an
-// exemption: the assertion below requires the unservable set to equal this
-// list EXACTLY, so a sixteenth is a failure AND repairing one is also a
-// failure until it is removed from here. It cannot grow and it cannot drain
-// quietly, which is the property an allowlist normally lacks.
+// These six keys are unservable TODAY. This is a ratchet, not an exemption:
+// the assertion below requires the unservable set to equal this list EXACTLY,
+// so a seventh is a failure AND repairing one is also a failure until it is
+// removed from here. It cannot grow and it cannot drain quietly, which is the
+// property an allowlist normally lacks.
 //
+// WAS FIFTEEN. The nine latency.{ttft,itl,tpot}_client_* keys came off this
+// list when they got catalogue entries. They are CLIENT-measured -- no server
+// change would ever supply them -- so they are now STRUCTURALLY_BYPASSED rows
+// rendering the "not-applicable" state WITH THE REASON. That is the whole
+// point of the repair: while they were merely unservable they rendered the
+// SAME em-dash as a field the server was failing to send, so "nobody can ever
+// measure this here" and "this should be here and is missing" had one single
+// appearance. Now they have two. The ratchet did its job -- it refused to let
+// this list shrink silently and forced the count to be restated.
+//
+// The remaining six are a DIFFERENT and still-open defect: latency.ttft_server_*
+// and latency.e2e_server_* DO have a live producer (metrics.ttft and
+// metrics.e2e_latency, both MEASURED), under another name and as a MEAN.
 // Owner: dashboard lane. The fix is to rewire the latency table onto keys that
 // exist; it is blocked on a design ruling about the table's shape, because the
 // catalogue publishes a MEAN and this table has p50/p95/max cells, and
@@ -141,15 +154,6 @@ const KNOWN_UNSERVABLE_KEYS = [
   'latency.e2e_server_max',
   'latency.e2e_server_p50',
   'latency.e2e_server_p95',
-  'latency.itl_client_max',
-  'latency.itl_client_p50',
-  'latency.itl_client_p95',
-  'latency.tpot_client_max',
-  'latency.tpot_client_p50',
-  'latency.tpot_client_p95',
-  'latency.ttft_client_max',
-  'latency.ttft_client_p50',
-  'latency.ttft_client_p95',
   'latency.ttft_server_max',
   'latency.ttft_server_p50',
   'latency.ttft_server_p95',

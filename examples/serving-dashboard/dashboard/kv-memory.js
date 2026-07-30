@@ -285,7 +285,7 @@ function renderSlotFillNote(slotsFilled, slotCapacity) {
  */
 function renderRefcounts(histogram) {
   if (!isRenderable(histogram) || !Array.isArray(histogram.value)) {
-    return renderField(histogram, { label: 'Refcount distribution' });
+    return renderField(histogram);
   }
 
   const entries = histogram.value
@@ -340,7 +340,7 @@ function renderRefcounts(histogram) {
  */
 function renderTiers(tiers) {
   if (!isRenderable(tiers) || !Array.isArray(tiers.value)) {
-    return renderField(tiers, { label: 'KV tiers' });
+    return renderField(tiers);
   }
   const list = element('ul', { className: 'kv-tiers' });
   for (const tier of tiers.value) {

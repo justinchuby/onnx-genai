@@ -55,19 +55,27 @@ const SOURCE_DIRS = [
  * Keep this list SHRINKING. An entry that never shrinks is a panel promising a
  * metric nobody is building.
  */
-const NOT_YET_PUBLISHED = Object.freeze({
-  // Paged-KV block detail. Arrives on its own endpoint at a lower cadence than
-  // the 4Hz gauges, because a 4096-block grid at 4Hz is roughly 1MB/s.
-  'kv.allocation_failures': 'block-table endpoint, not yet landed',
-  'kv.allocations': 'block-table endpoint, not yet landed',
-  'kv.block_size': 'block-table endpoint, not yet landed',
-  'kv.frees': 'block-table endpoint, not yet landed',
-  'kv.hot_evictions': 'block-table endpoint, not yet landed',
-  'kv.prefix_evictions': 'block-table endpoint, not yet landed',
-  'kv.refcount_histogram': 'block-table endpoint, not yet landed',
-  'kv.slot_capacity': 'block-table endpoint, not yet landed',
-  'kv.slots_filled': 'block-table endpoint, not yet landed',
-  'kv.tiers': 'block-table endpoint, not yet landed',
+export const NOT_YET_PUBLISHED = Object.freeze({
+  // Paged-KV lifetime counters the block table does NOT carry.
+  //
+  // 🔴 TEN KEYS USED TO SIT HERE READING 'block-table endpoint, not yet
+  // landed'. THE BLOCK-TABLE ENDPOINT HAD LANDED. `/v1/debug/kv/blocks` is a
+  // registered route, and the already-polled `/v1/debug/kv` advertises its URL
+  // on the wire as `block_table_endpoint` -- so the refutation was in our own
+  // recorded captures while these lines claimed the opposite. Seven of the ten
+  // are now bound; these three survive because BlockTableResponse serves
+  // occupancy and pressure but keeps no cumulative alloc/free ledger and no
+  // eviction breakdown by cause.
+  //
+  // Nothing here could have caught that, and that is the structural point: the
+  // stale-entry check below only fires once a key is published BY OUR STORE,
+  // which happens when somebody edits telemetry-provenance.js. The trigger for
+  // noticing the server grew a feature was us noticing the server grew a
+  // feature. `check-unplumbed-claims.test.js` closes the loop by reading the
+  // Rust, and every key listed here must now carry a checkable claim there.
+  'kv.allocations': 'the pool keeps no cumulative allocation ledger',
+  'kv.frees': 'no free events are counted; a released page reports ref_count 0',
+  'kv.prefix_evictions': 'evictions are counted by tier, not by cause',
 
   // Prefix-cache savings. Namespaced prefix_cache.* to match the four prefix
   // metrics the store already publishes, so these bind on the day they ship
@@ -80,10 +88,22 @@ const NOT_YET_PUBLISHED = Object.freeze({
   // Scheduler detail beyond queue.depth.
   'queue.depth_peak': 'peak tracking not yet plumbed server-side',
   'scheduler.preemptions_total': 'scheduler introspection not yet plumbed',
-  'scheduler.running': 'scheduler introspection not yet plumbed',
-  'scheduler.waiting': 'scheduler introspection not yet plumbed',
 
-  // Latency percentiles. Client and server are deliberately separate keys: the
+  // Latency percentiles -- SERVER ROWS ONLY. The nine client-measured rows
+  // that used to sit here are gone: they were never a plumbing gap, so listing
+  // them beside the server rows promised a server change that could not
+  // possibly deliver them. They are now classified STRUCTURALLY_BYPASSED in
+  // telemetry-provenance.js and render `not-applicable` with the reason,
+  // rather than the same em-dash a typo produces.
+  //
+  // What is left IS a real gap, and a narrow one: the server measures these
+  // latencies and publishes them as a BUCKETED HISTOGRAM (_bucket/_sum/_count
+  // over 14 fixed bounds), never as a percentile -- there is no `quantile`
+  // label in the crate. The MEAN is recoverable and is bound as metrics.ttft
+  // and metrics.e2e_latency; interpolating a p95 from 14 coarse buckets and
+  // labelling it p95 would be a fabricated measurement in a plausible costume.
+  //
+  // Client and server are deliberately separate keys: the
   // difference between them IS the finding, so they must never be merged.
   //
   // ALL FIFTEEN ARE LISTED, AND THAT IS THE POINT. Until the extractor learned
@@ -96,24 +116,14 @@ const NOT_YET_PUBLISHED = Object.freeze({
   // Listing them by hand is deliberate: an exemption list generated from the
   // panel sources would exempt whatever the panels ask for, and could never go
   // red. Every line here has to be typed by someone.
-  'latency.ttft_client_p50': 'percentile aggregation not yet plumbed',
-  'latency.ttft_client_p95': 'percentile aggregation not yet plumbed',
-  'latency.ttft_client_max': 'percentile aggregation not yet plumbed',
   'latency.ttft_server_p50': 'percentile aggregation not yet plumbed',
   'latency.ttft_server_p95': 'percentile aggregation not yet plumbed',
   'latency.ttft_server_max': 'percentile aggregation not yet plumbed',
-  'latency.itl_client_p50': 'percentile aggregation not yet plumbed',
-  'latency.itl_client_p95': 'percentile aggregation not yet plumbed',
-  'latency.itl_client_max': 'percentile aggregation not yet plumbed',
-  'latency.tpot_client_p50': 'percentile aggregation not yet plumbed',
-  'latency.tpot_client_p95': 'percentile aggregation not yet plumbed',
-  'latency.tpot_client_max': 'percentile aggregation not yet plumbed',
   'latency.e2e_server_p50': 'percentile aggregation not yet plumbed',
   'latency.e2e_server_p95': 'percentile aggregation not yet plumbed',
   'latency.e2e_server_max': 'percentile aggregation not yet plumbed',
 
   // Build and host facts.
-  'resources.disk_spill_bytes': 'spill accounting not yet plumbed',
   'scenario.makespan_ms': 'supplied by the scenario runner, not the server',
   'server.decode_backend': 'build metadata not yet exposed',
   'server.quantization': 'build metadata not yet exposed',

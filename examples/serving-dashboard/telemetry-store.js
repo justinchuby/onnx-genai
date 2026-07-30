@@ -78,6 +78,13 @@ const ENDPOINT_CADENCE_MS = Object.freeze({
   [ENDPOINTS.HEALTH]: 0,      // liveness probe; must not lag a server going away
   [ENDPOINTS.STATUS]: 0,      // queue depth moves per request
   [ENDPOINTS.DEBUG_KV]: 0,    // batch and KV occupancy are the live signal
+  // The block table is DENSE: a default window is 256 pages × four parallel
+  // arrays, and the server will serve up to 1024. At the 250 ms gauge cadence
+  // that is the largest sustained payload on the page by a wide margin, and
+  // the pages it describes do not turn over per frame. Polled at 1 Hz for the
+  // same reason /metrics is capped at 500 ms — a panel that stalls the poll
+  // loop to draw a grid is worse than a grid that updates four times slower.
+  [ENDPOINTS.DEBUG_KV_BLOCKS]: 1000,
   [ENDPOINTS.METRICS]: 500,   // by far the largest payload; still within spec
   [ENDPOINTS.RESOURCES]: 1000,
   [ENDPOINTS.DEBUG_CONFIG]: 30000, // model_max_context/pipeline cannot change
@@ -388,6 +395,7 @@ export function createTelemetryStore({
             ENDPOINTS.HEALTH,
             ENDPOINTS.STATUS,
             ENDPOINTS.DEBUG_KV,
+            ENDPOINTS.DEBUG_KV_BLOCKS,
             ENDPOINTS.DEBUG_CONFIG,
             ENDPOINTS.METRICS,
             ENDPOINTS.RESOURCES,
@@ -858,6 +866,18 @@ export function createTelemetryStore({
         continue;
       }
 
+      // THE SOURCE MAY HAVE ANSWERED THE QUESTION ITSELF. An endpoint that
+      // declares `applicable: false` is not a build that predates a field, and
+      // must not be reported as one -- it is a server saying this mechanism is
+      // not what it uses. Checked before the value is read, because the value
+      // is legitimately absent in exactly this case and the generic
+      // "carried no value" message below would blame the wrong thing.
+      const verdict = sourceVerdict(source);
+      if (verdict) {
+        fields[key] = applyServerVerdict(verdict, fieldMeta(entry));
+        continue;
+      }
+
       if (!source.ok) {
         fields[key] = unavailableField(describeSourceFailure(entry.source, source), fieldMeta(entry));
         continue;
@@ -882,7 +902,117 @@ export function createTelemetryStore({
       });
     }
     addDerivedThroughput(fields, timestampMs);
+    addDerivedBlockTable(fields, sources, timestampMs);
     return Object.freeze(fields);
+  }
+
+  /**
+   * Fields aggregated from the paged-KV block table.
+   *
+   * `/v1/debug/kv/blocks` serves four parallel per-page arrays plus a handful
+   * of scalars. Four panel fields are sums or groupings over those arrays, so
+   * they are computed here rather than addressed by a dotted path.
+   *
+   * THE RESPONSE STATES ITS OWN AVAILABILITY AND WE OBEY IT RATHER THAN
+   * INFER. `applicable: false` means this model does not page KV at all, and
+   * the body carries a `FieldUnavailable { code, detail }` written by the
+   * people who know why. Its codes are already this project's vocabulary —
+   * `unavailable`, `not-applicable`, `pending` — so a static-cache server can
+   * SAY SO in its own words instead of showing the same bare em-dash a typo
+   * would produce. That distinction is the whole point of this endpoint's
+   * `applicable` flag, and ignoring it would collapse "this architecture does
+   * not have a block table" back into "we did not plumb this".
+   *
+   * @param {Record<string, import('./telemetry-field.js').TelemetryField>} fields
+   * @param {Record<string, SourceResult>} sources
+   * @param {number} timestampMs
+   */
+  function addDerivedBlockTable(fields, sources, timestampMs) {
+    const derivedKeys = [
+      'kv.usage',
+      'kv.slots_filled',
+      'kv.slot_capacity',
+      'kv.refcount_histogram',
+      'kv.tiers',
+    ];
+    const source = sources[ENDPOINTS.DEBUG_KV_BLOCKS];
+    const metaFor = (key) =>
+      catalogueMeta(resolveForOrigin(PROVENANCE[key], origin), origin);
+
+    /** Apply one treatment to every derived block field at once. */
+    const setAll = (make) => {
+      for (const key of derivedKeys) fields[key] = make(key);
+    };
+
+    if (!source?.ok) {
+      const reason = source
+        ? describeSourceFailure(ENDPOINTS.DEBUG_KV_BLOCKS, source)
+        : `This demo does not poll ${ENDPOINTS.DEBUG_KV_BLOCKS} yet.`;
+      setAll((key) => unavailableField(reason, metaFor(key)));
+      return;
+    }
+
+    const body = source.body ?? {};
+    // The server's own verdict, taken verbatim. `detail` is written to be
+    // shown to a person, so we show it rather than paraphrase it.
+    const verdict = sourceVerdict(source);
+    if (verdict) {
+      setAll((key) => applyServerVerdict(verdict, metaFor(key)));
+      return;
+    }
+
+    const observedAtMs = source.fetchedAtMs ?? timestampMs;
+    const blocks = body.blocks ?? {};
+    const pagesInUse = numberOrNull(body.pages_in_use);
+    const pageSize = numberOrNull(body.page_size);
+    const poolTotal = numberOrNull(body.window?.pool_total);
+
+    // A null in these arrays means the page has NEVER BEEN WRITTEN. The server
+    // documents that explicitly, and that it does NOT mean free -- a released
+    // page reports ref_count 0, which is a measurement. Coercing null to 0
+    // would merge an absence of observation with a real reading, which is the
+    // one conflation this whole layer exists to refuse.
+    const filledSlots = Array.isArray(blocks.filled_slots) ? blocks.filled_slots : null;
+    const refCounts = Array.isArray(blocks.ref_counts) ? blocks.ref_counts : null;
+    const tierValues = Array.isArray(blocks.tiers) ? blocks.tiers : null;
+
+    fields['kv.usage'] =
+      pagesInUse !== null && poolTotal !== null && poolTotal > 0
+        ? measuredField(pagesInUse / poolTotal, { ...metaFor('kv.usage'), observedAtMs })
+        : unavailableField(
+            'Utilization needs both pages in use and the pool size, and the block table did ' +
+              'not carry both.',
+            metaFor('kv.usage'),
+          );
+
+    fields['kv.slots_filled'] = filledSlots
+      ? measuredField(sumDefined(filledSlots), { ...metaFor('kv.slots_filled'), observedAtMs })
+      : unavailableField(
+          'The block table carried no per-page slot occupancy.',
+          metaFor('kv.slots_filled'),
+        );
+
+    fields['kv.slot_capacity'] =
+      pageSize !== null && pagesInUse !== null
+        ? measuredField(pageSize * pagesInUse, { ...metaFor('kv.slot_capacity'), observedAtMs })
+        : unavailableField(
+            'Slot capacity needs both the page size and the pages in use.',
+            metaFor('kv.slot_capacity'),
+          );
+
+    fields['kv.refcount_histogram'] = refCounts
+      ? measuredField(groupRefCounts(refCounts), {
+          ...metaFor('kv.refcount_histogram'),
+          observedAtMs,
+        })
+      : unavailableField(
+          'The block table carried no per-page reference counts.',
+          metaFor('kv.refcount_histogram'),
+        );
+
+    fields['kv.tiers'] = tierValues
+      ? measuredField(groupTiers(tierValues, body.tiers), { ...metaFor('kv.tiers'), observedAtMs })
+      : unavailableField('The block table carried no per-page tiers.', metaFor('kv.tiers'));
   }
 
   // TOMBSTONE -- `suppressUndefinedHitRate` lived here and is deliberately gone.
@@ -1214,6 +1344,140 @@ function readPath(body, path) {
     if (node === null || node === undefined) return undefined;
     return node[segment];
   }, body);
+}
+
+/**
+ * The server's own verdict about a response, or null if it made none.
+ *
+ * `/v1/debug/kv/blocks` answers `applicable: false` plus a
+ * `FieldUnavailable { code, detail }` when the model does not page KV. Its
+ * codes are already this project's vocabulary — `unavailable`,
+ * `not-applicable`, `pending` (crates/onnx-genai-server/src/routes/mod.rs) —
+ * and the `detail` is written to be shown to a person.
+ *
+ * WHY WE OBEY IT RATHER THAN INFER IT. Without this, a static-cache server
+ * produces a body with every KV field absent, and the generic branch reports
+ * "responded, but carried no value — this server build may predate it". That
+ * sentence is FALSE and specific: it blames an old binary for an architectural
+ * fact, sends the reader looking for an upgrade that does not exist, and
+ * renders identically to a genuine plumbing gap. Verified live on the demo's
+ * own scatter origin, which answers exactly this.
+ *
+ * @param {SourceResult} source
+ * @returns {{code: string, detail: string}|null}
+ */
+function sourceVerdict(source) {
+  const body = source?.body;
+  if (!body || typeof body !== 'object' || body.applicable !== false) return null;
+  return {
+    code: body.unavailable?.code ?? 'not-applicable',
+    detail:
+      body.unavailable?.detail ??
+      'The server reports that this mechanism does not apply to the loaded model.',
+  };
+}
+
+/**
+ * Turn a server verdict into a field, mapping its code onto our state.
+ *
+ * The three server codes and three of our five states are the same words, so
+ * this is a lookup rather than a translation. An UNRECOGNISED code falls back
+ * to `unavailable` — the weaker claim — because inventing a stronger one from
+ * a word we do not know is how a vocabulary drift becomes a false statement on
+ * screen.
+ *
+ * @param {{code: string, detail: string}} verdict
+ * @param {object} meta
+ */
+function applyServerVerdict(verdict, meta) {
+  if (verdict.code === 'not-applicable') return notApplicableField(verdict.detail, meta);
+  if (verdict.code === 'pending') return pendingField(verdict.detail, meta);
+  return unavailableField(verdict.detail, meta);
+}
+
+/**
+ * A finite number, or null. Never a coerced zero.
+ *
+ * `Number(null)` is 0 and `Number(undefined)` is NaN, so a bare `Number()` in
+ * this file would turn "the server omitted this" into "the server measured
+ * zero" for exactly the fields whose absence is the point.
+ *
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function numberOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+/**
+ * Sum the entries that are actually numbers, skipping nulls.
+ *
+ * Nulls are pages the pool has NEVER WRITTEN. They are an absence of
+ * observation, not a zero, and the difference is served on the wire as
+ * `window.scanned - window.observed`.
+ *
+ * @param {readonly unknown[]} values
+ * @returns {number}
+ */
+function sumDefined(values) {
+  let total = 0;
+  for (const value of values) {
+    const numeric = numberOrNull(value);
+    if (numeric !== null) total += numeric;
+  }
+  return total;
+}
+
+/**
+ * Group per-page reference counts into `[{refcount, blocks}]`, ascending.
+ *
+ * @param {readonly unknown[]} refCounts
+ * @returns {Array<{refcount: number, blocks: number}>}
+ */
+function groupRefCounts(refCounts) {
+  /** @type {Map<number, number>} */
+  const counts = new Map();
+  for (const value of refCounts) {
+    const refcount = numberOrNull(value);
+    if (refcount === null) continue;
+    counts.set(refcount, (counts.get(refcount) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([refcount, blocks]) => ({ refcount, blocks }))
+    .sort((a, b) => a.refcount - b.refcount);
+}
+
+/**
+ * Group per-page tier ids into `[{name, pages}]`, LABELLED FROM THE WIRE.
+ *
+ * `tierNames` is the vocabulary the response carries alongside the values. The
+ * server serves it deliberately: its own comment says a bare tier integer
+ * whose meaning lives only in the Rust source is a citation rather than data,
+ * and that adding a tier there would leave a client rendering confidently with
+ * the WRONG LABEL instead of failing. So an id the vocabulary does not cover
+ * is rendered as `tier N (unknown)` rather than guessed — visibly unlabelled
+ * beats invisibly mislabelled.
+ *
+ * @param {readonly unknown[]} tierValues
+ * @param {Record<string, string>|undefined} tierNames
+ * @returns {Array<{name: string, pages: number}>}
+ */
+function groupTiers(tierValues, tierNames) {
+  /** @type {Map<number, number>} */
+  const pagesByTier = new Map();
+  for (const value of tierValues) {
+    const tier = numberOrNull(value);
+    if (tier === null) continue;
+    pagesByTier.set(tier, (pagesByTier.get(tier) ?? 0) + 1);
+  }
+  return [...pagesByTier.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([tier, pages]) => ({
+      name: tierNames?.[String(tier)] ?? `tier ${tier} (unknown)`,
+      pages,
+    }));
 }
 
 /**

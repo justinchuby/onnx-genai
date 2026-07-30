@@ -130,11 +130,12 @@ export function findCaptionOverrides(text) {
 // defect, because then it is pure duplication and the catalogue can no longer
 // move it. Both directions are asserted below.
 const DECLARED_CAPTION_OVERRIDES = new Map([
-  [
-    'Refcount distribution',
-    'kv.refcount_histogram has no catalogue entry, so there is nothing to mask.',
-  ],
-  ['KV tiers', 'kv.tiers has no catalogue entry, so there is nothing to mask.'],
+  // 'Refcount distribution' and 'KV tiers' were declared here on the grounds
+  // that kv.refcount_histogram and kv.tiers "have no catalogue entry, so there
+  // is nothing to mask". Both now HAVE catalogue entries, so the stated reason
+  // became false and the overrides became exactly the duplication this list
+  // exists to forbid. Removed from the call sites in dashboard/kv-memory.js in
+  // the same change, rather than left here with a rewritten excuse.
   [
     'Aggregate output tokens per second',
     'A RATE derived from metrics.tokens_generated_total. The catalogue entry for ' +

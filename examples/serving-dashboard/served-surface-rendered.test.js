@@ -194,6 +194,22 @@ const KNOWN_UNRENDERED = [
   'headroom',
   // SessionStatus, reached through NodeStatus.sessions.
   'priority',
+
+  // -- /v1/status, build provenance ------------------------------------------
+  // THESE TWO APPEARED WHEN THE CAPTURES WERE RE-RECORDED, AND THAT IS THE
+  // FINDING. They are served by the binary this branch ships and were absent
+  // from the previous captures, so the committed fixtures had fallen behind the
+  // server: this guard was reasoning about a response shape the server had
+  // already stopped sending. Recorded here rather than rendered because build
+  // provenance is not a measurement any panel claims, and putting a commit SHA
+  // on screen is a product call, not a plumbing one.
+  //
+  // Worth a look by whoever owns /v1/status: `build_dirty` is serialised as the
+  // STRING "false", not the boolean false, so a client writing the obvious
+  // `if (build_dirty)` reads every clean build as dirty. Not changed here --
+  // it is a server-side serde question and outside this change.
+  'build_sha',
+  'build_dirty',
 ];
 
 /**
