@@ -438,11 +438,32 @@ mod tests {
             assert!(
                 crate::kernels::standard_claims::unsupported_reason(
                     &deferred,
+                    &[vec![1.into(), 1.into(), 2.into(), 2.into()]],
                     &[DataType::Float32, DataType::Float32],
                 )
                 .is_some()
             );
             assert!(reject_deferred(&deferred).is_err());
         }
+    }
+
+    #[test]
+    fn three_dimensional_input_is_rejected_by_claim_gate() {
+        let node = Node::new(
+            NodeId(0),
+            "ConvTranspose",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        let reason = crate::kernels::standard_claims::unsupported_reason(
+            &node,
+            &[
+                vec![1.into(), 1.into(), 2.into(), 2.into(), 2.into()],
+                vec![1.into(), 1.into(), 2.into(), 2.into(), 2.into()],
+            ],
+            &[DataType::Float32, DataType::Float32],
+        )
+        .expect("rank-5 ConvTranspose must be declined before CUDA placement");
+        assert!(reason.contains("rank 5 unsupported"), "{reason}");
     }
 }

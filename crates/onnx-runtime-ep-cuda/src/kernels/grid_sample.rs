@@ -326,12 +326,24 @@ mod tests {
             assert!(
                 crate::kernels::standard_claims::unsupported_reason(
                     &deferred,
+                    &[vec![1.into(), 1.into(), 2.into(), 2.into()]],
                     &[DataType::Float32, DataType::Float32],
                 )
                 .is_some()
             );
             assert!(reject_deferred(&deferred, &[vec![1, 1, 2, 2]]).is_err());
         }
-        assert!(reject_deferred(&node("linear"), &[vec![1, 1, 2, 2, 2]]).is_err());
+        let volumetric = node("linear");
+        let reason = crate::kernels::standard_claims::unsupported_reason(
+            &volumetric,
+            &[
+                vec![1.into(), 1.into(), 2.into(), 2.into(), 2.into()],
+                vec![1.into(), 2.into(), 2.into(), 2.into(), 3.into()],
+            ],
+            &[DataType::Float32, DataType::Float32],
+        )
+        .expect("rank-5 GridSample must be declined before CUDA placement");
+        assert!(reason.contains("rank 5 unsupported"), "{reason}");
+        assert!(reject_deferred(&volumetric, &[vec![1, 1, 2, 2, 2]]).is_err());
     }
 }

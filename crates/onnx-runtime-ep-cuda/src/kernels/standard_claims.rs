@@ -4,9 +4,13 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 
-pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<String> {
     let result = match node.op_type.as_str() {
         "RMSNormalization" => rms_normalization(node, input_dtypes),
         "RotaryEmbedding" => rotary_embedding(node, input_dtypes),
@@ -48,8 +52,8 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
-        "ConvTranspose" => conv_transpose(node, input_dtypes),
-        "GridSample" => grid_sample(node, input_dtypes),
+        "ConvTranspose" => conv_transpose(node, input_shapes, input_dtypes),
+        "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
     result
@@ -171,7 +175,11 @@ fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
     Ok(())
 }
 
-fn conv_transpose(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn conv_transpose(
+    node: &Node,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
     if !(2..=3).contains(&node.inputs.len()) || node.outputs.len() != 1 {
         return Err("requires X, W, optional B, and one output".into());
     }
@@ -194,10 +202,15 @@ fn conv_transpose(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
     if node.attr("output_shape").is_some() {
         return Err("output_shape-driven padding is deferred".into());
     }
+    require_input_rank(input_shapes, 0, &[3, 4], "X")?;
     Ok(())
 }
 
-fn grid_sample(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn grid_sample(
+    node: &Node,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
     require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
     if input_dtypes[1] != input_dtypes[0] {
@@ -220,8 +233,28 @@ fn grid_sample(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         value => return Err(format!("padding_mode {value:?} unsupported")),
     }
     match node.attr("align_corners").and_then(Attribute::as_int) {
-        None | Some(0 | 1) => Ok(()),
-        Some(_) => Err("align_corners must be 0 or 1".into()),
+        None | Some(0 | 1) => {}
+        Some(_) => return Err("align_corners must be 0 or 1".into()),
+    }
+    require_input_rank(input_shapes, 0, &[4], "X")
+}
+
+fn require_input_rank(
+    input_shapes: &[Shape],
+    index: usize,
+    supported_ranks: &[usize],
+    name: &str,
+) -> Result<(), String> {
+    let rank = input_shapes
+        .get(index)
+        .ok_or_else(|| format!("missing shape metadata for input {index} ('{name}')"))?
+        .len();
+    if supported_ranks.contains(&rank) {
+        Ok(())
+    } else {
+        Err(format!(
+            "input {index} ('{name}') rank {rank} unsupported; expected one of {supported_ranks:?}"
+        ))
     }
 }
 
