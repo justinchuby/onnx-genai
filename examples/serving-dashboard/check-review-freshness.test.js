@@ -143,7 +143,18 @@ test('every review document that declares a measurement SHA declares a real one'
   // adopting the marker makes this red until the name is removed, and a NEW
   // abstainer makes it red immediately. Green means the drain has not widened,
   // never that the corpus is complete.
-  const KNOWN_ABSTAINERS = ['REVIEWER-BRIEF.md'];
+  // EMPTY, AND THAT IS THE SUCCESS CONDITION, NOT A DISABLED CHECK.
+  //
+  // This list held two entries at 05:23. IMPLEMENTATION-REVIEW.md adopted the marker
+  // and the assertion below retired it at 05:34; REVIEWER-BRIEF.md adopted it and was
+  // retired at 05:43. Both times the guard went red naming the file and the remedy,
+  // and both times someone cleared it without discussion. An exemption list that
+  // empties itself is the only kind that cannot quietly become a suppression list.
+  //
+  // An empty list is NOT vacuous here: the `unexpected` assertion above still reddens
+  // the moment any review document appears without a MEASURED-AT marker, and the
+  // discovery floor still reddens if the corpus itself disappears.
+  const KNOWN_ABSTAINERS = [];
   const unexpected = abstainers.filter((d) => !KNOWN_ABSTAINERS.includes(d));
   assert.deepEqual(
     unexpected,

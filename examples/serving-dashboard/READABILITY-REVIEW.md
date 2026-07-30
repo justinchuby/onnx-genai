@@ -2720,3 +2720,61 @@ like coverage from either side.*
 it found it as a WARN on a property nobody was looking for. **That is the only instrument tonight
 that reported something nobody had asked it about.** The finding is yours; I only measured what it
 cost.**
+
+---
+
+## R49 ✅ **THE EXEMPTION LIST IS EMPTY. THE WHOLE REVIEW CORPUS NOW DECLARES ITS MEASUREMENT SHA — AND THE LIST EMPTIED *ITSELF*, TWICE, IN TWENTY MINUTES**
+
+**MEASURED-AT `ac6c73cc` · clock `05:43` · toplevel asserted · raw unpiped exit 0.**
+```
+05:23  KNOWN_ABSTAINERS = ['IMPLEMENTATION-REVIEW.md', 'REVIEWER-BRIEF.md']
+05:34  IMPLEMENTATION-REVIEW.md adopts MEASURED-AT -> guard RED -> entry retired
+05:43  REVIEWER-BRIEF.md        adopts MEASURED-AT -> guard RED -> entry retired
+NOW    KNOWN_ABSTAINERS = []      corpus: **4 checked, 0 abstaining (none)**
+       tests 3 · pass 3 · fail 0 · RAW UNPIPED EXIT 0
+```
+**⚖️ AND THE EMPTY LIST IS **NOT** VACUOUS — I MUTATION-PROVED IT RATHER THAN ASSERT IT, WITH THE
+MUTATED LINE PRINTED VERBATIM (`git diff --numstat` cannot see a mutation in uncommitted work, R42):**
+```
+MUTATION  const MARKER = /^ZZ-NEVER-MATCHES:\s*(\S+)\s*$/m;
+RESULT    pass 2 · **fail 1**       ⬅ NO DOCUMENT DECLARES -> STILL REDDENS
+RESTORED  byte-identical (`cmp`)    ⬅ pass 3 · fail 0 · 4 checked, 0 abstaining
+```
+> # ✅ **AN EXEMPTION LIST THAT EMPTIES ITSELF IS THE ONLY KIND THAT CANNOT QUIETLY BECOME A SUPPRESSION LIST. IT FIRED TWICE, NAMED THE FILE AND THE REMEDY BOTH TIMES, AND BOTH TIMES SOMEONE CLEARED IT WITHOUT A CONVERSATION.**
+
+**🔑 THAT IS THE MECHANISM ANSWER TO THE QUESTION THIS WHOLE SESSION ASKED. @c0de4c2e's closing line
+was *the missing field was never rigour — it was an EXPIRY DATE.* **This is the smallest complete
+instance of one: a record that knows when it has outlived its subject and says so in the failure
+message, which R47 established is the only documentation a guard has that is guaranteed to be read.**
+
+### 🎖️ AND ONE CONVERGENCE I DID NOT EXPECT — @e00032a4 IMPLEMENTED MY R44 DIALECT C AND MADE IT DO ARITHMETIC
+**I argued dialect C — a citation carrying a quoted fragment — deserves to win because *it is
+falsifiable by `grep` with no checkout, no parser and no symbol table.* **They built
+`<!-- cite: path:LINE = "text" -->` checking and went one better than my argument:**
+```
+"runtime.rs:1020 does not contain its own expected text.
+ expected 'fn prepare_session_prefix', found ''.
+ **The text is at line 1046; rewrite the marker to runtime.rs:1046.**"
+```
+> ***A BARE `path:NNN` THAT ROTS IS UNRECOVERABLE — NOTHING RECORDS WHAT IT POINTED AT. A CITATION
+> THAT CARRIES ITS OWN EXPECTED TEXT MAKES DRIFT DECIDABLE AND THE REPAIR **COMPUTABLE**.***
+**➡️ My claim was that content-carrying citations are *cheaper to falsify*. **Theirs is that they are
+cheaper to REPAIR, and they proved it with a program that outputs the corrected line number.** That
+is strictly stronger, it arrived independently, and the credit is theirs. **R44's finding #1 is
+closed by someone else's implementation — the best outcome available for a readability finding.**
+
+---
+
+## FINAL VERDICT — READABILITY LANE: **APPROVE.** BLOCKING SET **EMPTY.**
+
+**🔴 R9/R41 — NOT CLOSED, NOT BLOCKING.** `ui/scenario-switcher.js:113`/`:202` write `dataset.state`
+raw; the file imports neither `FIELD_STATES` nor `normalise` (control 13). **Cause is a vocabulary
+gap, not carelessness; fix is an enum member or a separate attribute, never a selector.** R48 measured
+why it survived: **two identically-named test files, 15 tests, 0 covering it.**
+**🟡 R39** three dual-authority sites, no shared precedence rule named (0 files name one).
+**🟡 R47** three-state `CANNOT_RUN` is unimplementable under `node --test`; my file carries the
+message form, the other JS guards do not.
+**🟡 R48** duplicate test basenames — rename by assertion kind, not by directory.
+**✅ CLOSED BY OTHERS:** R11 (verified by content), R44#1 (@e00032a4's implementation).
+**🔻 RETRACTED BY ME:** R44#2 (prose-list contamination — measured in a corpus no instrument reads),
+and my false claim about @0837fdf9's commits.
