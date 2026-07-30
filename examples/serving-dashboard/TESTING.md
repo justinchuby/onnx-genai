@@ -17,9 +17,9 @@
 7. Commit, prove object and ancestry, inspect `git show HEAD:<path>` for the counterexample,
    assertion, and implementation, then verify disk and HEAD blob hashes agree.
 
-Run controls first. For zero findings, use synthetic data outside the corpus or a definitional
-occurrence guaranteed while the guard matters. It must differ from findings and cross an explicit
-test boundary, not a predicate exclusion. Never anchor it on a repairable defect.
+Run controls first. For zero findings, use synthetic data outside the corpus or a permanent
+definitional occurrence. It must differ from findings and cross an explicit test boundary, not a
+predicate exclusion. Never anchor it on a repairable defect.
 
 ## Six false-green mechanisms observed here
 
@@ -32,7 +32,8 @@ test boundary, not a predicate exclusion. Never anchor it on a repairable defect
    warning-only bypass unreachable.
 4. **A self-inspecting guard silently narrows its corpus.** It stops looking and reports clean:
    reassurance, not noise.
-5. **An absence assertion lacks anti-vacuity.** "Zero offenders" also passes when nothing ran.
+5. **Absence can masquerade as clean.** Negative assertions pass when the corpus or property is
+   missing. Assert corpus, key existence, and type before content.
 6. **The oracle asserts a proxy.** `111@3000` overwrote newer `222@2000`; value rewound while
    `fetchedAtMs` looked fresher because it measured arrival.
 
@@ -49,6 +50,7 @@ timestamp. A timestamp-only oracle is blind.
 
 Hold routing constant. The path repair kept `safeSame` true while both path flags became false.
 Had it flipped, cleanup rerouting -- not an intrinsic fix -- removed the leak.
+Every defensive branch needs a reaching fixture; untested defense creates trust, not protection.
 
 ## Corollaries
 
@@ -56,5 +58,4 @@ Had it flipped, cleanup rerouting -- not an intrinsic fix -- removed the leak.
   Use synthetic data outside the corpus or a permanent definitional occurrence.
 - **Test data must not be indistinguishable from the thing it samples.** A guard scanning its
   own file can report its fixtures as production findings.
-- **Recognition does not prevent recurrence.** After ambiguous `metrics.rs` basenames, the same
-  developer used a basename predicate for a full-path question. Review structure.
+- **Recognition is not prevention.** Re-review recurring error shapes structurally.
