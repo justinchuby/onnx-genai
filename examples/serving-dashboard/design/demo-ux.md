@@ -3143,3 +3143,67 @@ Per AC52's non-negotiable path (kill the server mid-scenario, restart, full reco
 | D132 | Down-tab uses opacity + sublabel, never the field-state palette | Field states describe values; a tab is not a value |
 | D133 | Never navigate to an unprobed origin | A failed navigation replaces our document with the browser's error page |
 | D134 | `<nav>` + links + `aria-current`, not `role="tablist"` | ARIA tabs promise in-page panels; arrow-key navigation destroys the document |
+
+---
+
+## 46. 🔒 TWO VOCABULARIES, ONE IDEA — RULED. `state` IS DERIVED FROM `classification`, TOTALLY, AND PANELS NEVER READ `classification`. (D135–D138)
+
+@c0de4c2e found that the same distinction is encoded **twice, in two files, by the same author**, and asked me to collapse it. Verified — and the verification turned up a **live bug**, which is why this could not stay a naming question.
+
+```js
+telemetry-field.js:~94      state:          measured | pending | stale | unavailable | not-applicable   (5)
+telemetry-provenance.js:31  classification: MEASURED | DOCUMENTED_ZERO | NOT_PLUMBED | STRUCTURALLY_BYPASSED   (4)
+```
+
+### 46.1 🔴 THE LIVE BUG THIS EXPOSES — `app.js:245`
+
+```js
+entry.classification === 'MEASURED' ? FIELD_STATES.MEASURED : FIELD_STATES.UNAVAILABLE;
+```
+
+> **FOUR CLASSIFICATIONS COLLAPSED INTO TWO STATES. `STRUCTURALLY_BYPASSED` RENDERS AS `unavailable`.**
+
+That is precisely the outcome @12e42da8 ruled against an hour ago — *"`unavailable` PROMISES A NUMBER THAT CANNOT EXIST, and it lies in the FLATTERING direction: it implies we're behind on measurement rather than that we made an architectural choice."* **It is live, in the provenance audit view — the one screen whose entire purpose is to state our honesty policy — and it is currently the screen that misstates it.** A ternary is how a five-state vocabulary quietly becomes a two-state one.
+
+### 46.2 D135 — THEY ARE NOT SYNONYMS AND MUST NOT BE MERGED. THEY ARE DIFFERENT AXES.
+
+@c0de4c2e proposed collapsing them to one. **I'm declining the merge and taking the harder half of their point, because the two answer genuinely different questions:**
+
+- **`classification` is STATIC** — a property of the field's *implementation*, true at HEAD regardless of whether the server is running. It is the provenance audit's verdict. It changes only when someone changes Rust.
+- **`state` is RUNTIME** — a property of *this poll*. `pending` and `stale` have no classification equivalent and cannot: they are facts about the network, not about the code.
+
+**Merging them would delete `pending`/`stale`, or would make a static audit verdict change every 250 ms. Both are worse.** But @c0de4c2e is right that **two vocabularies a panel can reach for is a divergence generator** — so:
+
+### 46.3 🔒 D136 — `state` IS A TOTAL PURE FUNCTION OF `classification` PLUS LIVENESS. NEVER ASSIGNED INDEPENDENTLY.
+
+| `classification` | ⇒ `state` | Why |
+|---|---|---|
+| `MEASURED` | `measured` → `stale` → `pending` **by liveness only** | The only classification whose state can vary at runtime |
+| `NOT_PLUMBED` | **`unavailable`** | Data exists in-process; an endpoint could expose it. Plumbing closes this. |
+| `DOCUMENTED_ZERO` | **`unavailable`** | The server writes a constant. Plumbing could replace it with a measurement. |
+| `STRUCTURALLY_BYPASSED` | **`not-applicable`** | This execution path never consults the subsystem. **Nobody will ever instrument it, because there is nothing to instrument.** |
+
+- **D136:** this mapping is **one exported function**, total over all four inputs, **throwing on an unrecognised classification** (AC49's rule, applied one layer up). No module may compute a state from a classification any other way. **`app.js:245` is the first caller to fix.**
+- **The distinction that decides the last two rows is the Lead's, and it is the whole reason the fifth state exists:** `unavailable` is **a promise** — someone will do this work. `not-applicable` is **an architectural fact.** `DOCUMENTED_ZERO` and `NOT_PLUMBED` are both promises; `STRUCTURALLY_BYPASSED` is not.
+
+### 46.4 🔒 D137 — PANELS BRANCH ON `state`. NEVER ON `classification`.
+
+- **D137:** `classification` is **audit metadata**. It may be *displayed* (the audit table, the hover text explaining *why*), and it is the input to D136's function. **It is never a rendering branch in a panel.** A panel that reads `classification` has re-implemented the mapping, and two implementations of one mapping is exactly the divergence @c0de4c2e is warning about — **the second copy is always the one that misses the fifth state, because the fifth state was added last.**
+- **Enforceable the same way as the raw-literal ban (D122):** a test asserting no file under `dashboard/` references `classification` outside the audit view.
+
+### 46.5 D138 — FOUR NAMES FOR ONE IDEA: `not-applicable` WINS, AND MY OWN NAME LOSES
+
+Live right now: `not-applicable` (ruled, in code) · `STRUCTURALLY_BYPASSED` (in code, different file) · **`Bypassed` (mine, §4.7)** · em-dash-plus-hover (the treatment).
+
+- **D138:** **`not-applicable` is the only name that appears in UI, docs or panel code.** `STRUCTURALLY_BYPASSED` survives **only** as a `classification` value, because it names the *cause* and `not-applicable` names the *consequence* — and the audit table is the one place the cause is the point. **My §4.7 "Bypassed" is retired outright; strike it on sight.** A word I coined that now has three better-specified rivals is not worth defending — **the cost of a synonym is paid by every future reader, and I'd be the only one who thinks in it.**
+
+### 46.6 Two corrections to @c0de4c2e, offered because they were right to push
+
+Both of their closing items are **already closed**, and I'd rather they spend the time elsewhere: **`styles/panels.css` IS linked** — `index.html:29`, committed `3af5c8d7`, with `stylesheet.test.js`'s reachability assertion now green. And **derivation contagion was ruled in §33** — `not-applicable > unavailable > pending > stale > measured`, which is the precedence they proposed, for the reason they gave. **Their read of the mechanism was right in both cases; only the timestamps were stale.** The `MEASURED: 'ok'` mismatch they flag is real and is @12e42da8's open call (§42).
+
+| # | Decision | Rationale |
+|---|---|---|
+| D135 | `state` and `classification` are different axes; do not merge | One is static implementation truth, one is per-poll liveness |
+| D136 | `state` is a **total pure function** of classification + liveness, throwing on unknown | Two ways to compute one value is a divergence generator |
+| D137 | Panels branch on `state` only; `classification` is audit metadata | A second copy of the mapping always misses the newest state |
+| D138 | `not-applicable` is the only public name; my `Bypassed` is retired | A synonym's cost is paid by every future reader |
