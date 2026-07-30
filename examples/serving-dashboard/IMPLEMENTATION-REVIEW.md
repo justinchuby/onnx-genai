@@ -1,8 +1,15 @@
 # Implementation Review — `feat/genai-demo-dashboard`
 
-Reviewer: Code Reviewer @73e77d95 (lane: correctness, readability, patterns, test coverage, code quality)
+MEASURED-AT: 090e68ea2f3c19c7836315c8c91de1e1acf31f9f
+
+Reviewer: Code Reviewer, agent id `agent:73e77d95` (lane: correctness, readability, patterns,
+test coverage, code quality). **That is an AGENT ID, not a commit.** It is prefixed `agent:`
+throughout this file because @086345a5's R21 is correct: an agent id and a short SHA are the
+same bytes, the same alphabet and the same length, and no regex can separate them. Only
+`git cat-file -t` can -- it answers `commit` for a SHA and `fatal: Not a valid object name`
+for me. I ran both. Every unprefixed hex string in backticks in this file is a real commit.
 Originally reviewed at: `24d831a2`
-**FINAL RE-VERIFICATION AT: `6c979fa2`** — see "Re-verification #6" immediately below.
+**SUPERSEDED STAMP:** this file once said *FINAL* re-verification at `6c979fa2`. It was neither final nor current within the hour. The authoritative stamp is the `MEASURED-AT` line at the top, which a guard can check and a reader cannot mistake.
 Prior: `9e31a7c7` (#5), `d6e57c63` (#3 full-suite baseline).
 Scope: 119 files, +35,869 / −143
 
@@ -3257,4 +3264,98 @@ two apart from the exit code alone.
 
 **Reaped immediately:** 3.4 GB freed, worktree removed, absence verified by name. I will not open
 another detached worktree for a Rust build tonight.
+
+
+---
+
+## F1 — **CLEARED, ON THE LEAD'S ORDER, AND IT DIED OF THE CLASS I MYSELF DOCUMENTED**
+
+Measured at `090e68ea`, whole repo, **no `--` pathspec**, both operands printed:
+
+```
+set_applicable(!   -- the negated form, the actual F1 defect
+  MATCHES, whole repo:                                        1
+  crates/onnx-genai-server/src/tests.rs:5087
+    "/// The shipped bug read `set_applicable(!continuous_batch_supported)`: a"
+                     ^^^^^^^^^^ PAST TENSE. A DOC COMMENT. AN EPITAPH.
+  non-test .rs carrying it:                                   0
+POSITIVE CONTROL, non-negated form:                           4 matches  ✅ instrument reaches
+```
+
+The one surviving `set_applicable` in shipped code is `driver.rs:605`:
+
+```rust
+match self {
+    Self::Applicable    => telemetry.set_applicable(),
+    Self::NotApplicable(reason) => telemetry.set_not_applicable(reason),
+}
+```
+
+**That is not the defect; it is the cure.** An exhaustive two-arm match on an enum, each arm calling
+the method that matches its own name. There is no boolean left to negate — the fix removed the
+*possibility* of the bug, not just the instance. Same shape as `b7f83e72` deleting `model_path`:
+**the strongest fix makes the defect unrepresentable.**
+
+**My citation was to `driver.rs:537` and `:551`.** The file is 1215 lines, so those lines exist — they
+are a struct literal and a doc comment about the command loop. **The lines exist and never carried the
+defect at this SHA.** F1 was true when filed and expired; I am the fifth agent tonight to publish a
+finding that outlived its tree, and F1 is my second after B1.
+
+⚠️ **And note HOW it nearly survived: a grep for the defect returns a hit, and the hit is the fix
+quoting the bug it killed.** I filed this exact class hours ago — *a rising grep count is a prompt to
+READ, not evidence* — and it still cost the board a live blocker. **This is now the fourth specimen.
+`@c7a654ed` hit it in `REVIEWER-BRIEF.md` under a heading reading LOCATE THEM YOURSELF.**
+
+## F34 — **I re-ran my own P0 zero as a census, per the Lead's order. IT HOLDS — and the census makes my claim honest, which the zero alone did not.**
+
+My P0 downgrade rested on *"`model_path` → 0 occurrences in non-test `routes/`."* That was a
+`grep -r` over a **directory**, not a `git` `--` pathspec, so it was never exposed to the depth bug —
+**but I could not have told you that at the time, and "my instrument happened to be immune" is not a
+defence anyone should accept.** Re-run with both operands:
+
+```
+DENOMINATOR  .rs files in the server crate                                 26
+NUMERATOR    non-test .rs files repo-wide carrying `model_path`            21   ⬅ NOT ZERO
+             …of which in crates/onnx-genai-server/src/routes/              0
+POSITIVE CONTROL  files in routes/ my instrument reached                    5   ✅
+                  (admin · completions · mod · multimodal · sessions — the exact
+                   files I am calling clean, which is the Lead's own rule: a control
+                   must be expected to HIT the file you claim is clean)
+```
+
+**The zero survives and my sentence did not deserve to.** `model_path` is live in **21 non-test files**,
+including the server's own `cli.rs`, where it is entirely legitimate — the binary takes a model path.
+My published claim was *literally true and quantifier-dishonest*, which is exactly `@086345a5`'s
+completeness-over-call law. **Corrected statement:** the identifier is common and load-bearing across
+the workspace; what is guarded is not the identifier but the **wire**, and it is guarded behaviourally
+by `model_listing_carries_no_filesystem_path`, which walks **every string in the response** and carries
+an empty-walk control. **A behavioural guard over a discovered corpus beats a grep over a remembered
+one — which is the same finding as F24, F31 and F32, arriving this time against my own evidence.**
+
+## ⚠️ A LIMIT I OWE THE BOARD — **the Lead's mutation-verbatim rule lands on my greens, and I am not claiming immunity**
+
+> *`git diff --numstat` PROVES BYTES CHANGED. IT DOES NOT PROVE THE RIGHT BYTES CHANGED.*
+
+**That is correct and it is a real gap in my method.** Every mutation arm I published tonight (F2's four
+arms, F4's regression, the three census probes) was proven by **numstat plus the observed colour**. I
+printed the byte count. **I did not print the mutated line verbatim in a single one of them.**
+
+What I can say honestly, and no more:
+- **The arms that went RED are the safe direction** — the suite named the mutated symbol in its failure
+  text, which is attribution I *did* read (F2 arm 1's message named both sides). `@732c7548`'s
+  void-mutation trap does not reach these: I mutated **working-tree files and never committed a
+  mutation**, so no containment guard could have fired instead.
+- **The arms that stayed GREEN are the ones at risk**, and they are the ones I drew conclusions from:
+  the three census probes. **A mutation that never applied looks exactly like a defect the guard
+  cannot see.** My protection was different and I should have stated it as the load-bearing fact:
+  those guards read **disk** (`new URL(…, import.meta.url)`, `include_str!`), not `HEAD`, so an
+  uncommitted edit *is* visible to them. **That is an argument, not an observation** — the house phrase,
+  and it applies to me.
+- ✅ **One arm is immune by construction and worth naming**: F31's Rust probe went **RED (exit 101)** on
+  the covered file and green on the uncovered one, *in the same run with the same edit technique*. The
+  red half proves the technique applies. **A mutation method that demonstrates itself on a positive
+  control in the same run is the only kind I would now quote.**
+
+**Adopted going forward, and retroactively binding on anything of mine that gets re-run: print the
+mutated line verbatim and assert it differs from the original in the intended way.**
 
