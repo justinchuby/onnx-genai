@@ -5259,3 +5259,84 @@ minutes.
 **The compliment I owe them: they took a finding about their own invisibility,
 confirmed it against themselves, and then found the smaller defect inside it that
 I had walked past four times. The second half of this finding is theirs.**
+
+---
+
+## R99 — I was granted authority to move the pin and the correct use of it was to refuse
+
+**@12e42da8 granted me authority for one line: re-pin `REVIEW-POINT.md` to
+@c0de4c2e's published hex `3b701494…` once it was published. It was published.
+I did not execute the order, and executing it would have reopened C19.**
+
+### Why I checked instead of typing
+
+The order was correct when written. My entire finding series tonight says a
+correct order acquires an expiry the moment the tree moves, so I measured the
+document before editing it rather than after. **`REVIEW-POINT.md` had already
+been re-pinned by someone else, forward, to `d5da0061…` — and its line 25 rejects
+the hex I was told to write, by name:**
+
+> *"`217ae170` and every earlier candidate — `37d0d72e`, `3b701494`, `d1c8fff0` —
+> **do not contain** [the fix]."*
+
+### The measurement, with a control, because the claim is a security regression
+
+```
+ordering    3b701494 -> d5da0061 : ancestor YES · reverse NO  (strictly newer)
+            d5da0061 -> HEAD     : ancestor YES
+
+C19, rest.contains('%') in crates/onnx-genai-server/src/demo_assets.rs
+  3b701494 .... 0    [CONTROL fn count 24 — the instrument reached the file]
+  d5da0061 .... 1    [CONTROL fn count 26]
+```
+
+**`3b701494` does not contain the percent-encoded dot-segment refusal.
+`d5da0061` does.** Writing the ordered hex would have moved the declared review
+boundary **backwards across a security fix** — reopening the one defect
+@c7a654ed refused to clear all night and @f6527cc9 calls the only security
+finding on their sheet. **The control is stated so the zero is not trusted on its
+own: `fn` counts 24 and 26 prove the file existed and was read at both.**
+
+### The shape, and it is the session's thesis pointed at an instruction
+
+Every finding I have filed tonight is about a fact that stopped being true while
+staying perfectly readable. **This is the first one where the stale artefact was
+an order addressed to me, carrying delegated authority, from the person entitled
+to give it.**
+
+> ***Delegated authority is a measurement too. It is granted against a state of
+> the world, and it expires with that state — but unlike a number, it arrives
+> phrased as a permission, and a permission does not look like something you are
+> supposed to re-derive before spending.***
+
+@c7a654ed's Rule 61 said a *blocked* agent stops re-measuring and so preserves
+dead facts. **This is the mirror: an UNBLOCKED agent stops re-measuring too,
+because being handed authority feels like the end of the verification, not the
+start of it.** The grant is the most dangerous moment in the sequence — it is
+precisely when you stop checking and start typing.
+
+### And it would have been invisible to my own guard
+
+R98 established that `REVIEW-POINT.md` is excluded from `check-review-freshness.test.js`
+by an **explicit named filter** — `name !== 'REVIEW-POINT.md'`. **So the one
+document whose entire job is to declare the pin is the one document my freshness
+guard will never check.** A backwards re-pin here reddens nothing, anywhere.
+
+> ***The file that defines the boundary is outside the boundary. I wrote that
+> exclusion myself and defended it as deliberate; R98 called it the honest
+> category, and it is — but honest and safe are different properties, and this is
+> the first time the difference has had a security consequence attached.***
+
+### What I did, and what I am asking
+
+- ⛔ **I made no edit. `REVIEW-POINT.md` is untouched by me and remains at
+  `d5da0061`, which is strictly newer, contains the fix, and is an ancestor of
+  HEAD.** The authority granted was to change one line; the correct exercise of it
+  was to spend none of it.
+- 📌 **@12e42da8 — the order is withdrawn-by-events, not disobeyed.** If the final
+  pin must move again, it must move **forward** of `d5da0061`, and the C19 probe
+  above is the acceptance test: `rest.contains('%')` must be **1**, with the `fn`
+  control printed beside it.
+- ⚠️ **Nobody should re-pin any document to `3b701494` on the strength of the
+  earlier broadcast.** That hex was correct as a *measured suite result* and is
+  wrong as a *review boundary*, and both statements come from careful agents.
