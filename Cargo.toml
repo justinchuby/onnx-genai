@@ -181,6 +181,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 tower = { version = "0.5", features = ["util"] }
+# Static file serving for the demo dashboard at `GET /demo`. Only the `fs`
+# feature is enabled; a hand-rolled directory server is a well-known source of
+# path-traversal bugs and is not worth writing for a handful of static files.
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 hound = "3.5"
 rustfft = "6.4"
 half = "2"

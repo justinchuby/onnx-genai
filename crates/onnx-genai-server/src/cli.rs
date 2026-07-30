@@ -99,6 +99,22 @@ pub struct ServeArgs {
     )]
     pub kv_cache_dtype: KvDType,
 
+    /// Directory of static demo-dashboard assets served at GET /demo.
+    /// Defaults to ./examples/serving-dashboard when it exists.
+    /// Falls back to ONNX_GENAI_DEMO_ASSETS_DIR.
+    #[arg(long, env = "ONNX_GENAI_DEMO_ASSETS_DIR")]
+    pub demo_assets_dir: Option<PathBuf>,
+
+    /// Additional origin permitted to make cross-origin requests; repeatable.
+    /// Loopback origins are always permitted, so the two-server demo needs no
+    /// flag. Use this only when serving the dashboard from a non-loopback host.
+    #[arg(
+        long = "cors-allow-origin",
+        env = "ONNX_GENAI_CORS_ALLOW_ORIGIN",
+        value_delimiter = ','
+    )]
+    pub cors_allow_origins: Vec<String>,
+
     /// Device for native decoder execution: cpu, cuda, or cuda:<index>.
     /// Falls back to ONNX_GENAI_EP when omitted.
     #[cfg(feature = "native-backend")]
@@ -117,6 +133,8 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         enable_admin_endpoints: args.enable_admin_endpoints,
         max_loaded_models: args.max_loaded_models,
         eviction_policy: Default::default(),
+        demo_assets_dir: crate::demo_assets::resolve_demo_assets_dir(args.demo_assets_dir),
+        cors_allow_origins: args.cors_allow_origins,
         engine_config: onnx_genai_engine::EngineConfig {
             kv_cache_dtype: args.kv_cache_dtype,
             #[cfg(feature = "native-backend")]
@@ -128,6 +146,24 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Build the model spec list from whichever source flag was provided.
     // Exactly one of --model / --models-dir / --models-config is required (ArgGroup).
     let specs: Vec<ModelSpec> = if let Some(model_path) = args.model {
+        // The `onnx-genai generate` CLI coerces a config-file path to its parent
+        // directory; the server does not, so the same argument that works there
+        // otherwise fails deep inside the loader with a message that does not
+        // mention the actual mistake. Fail here, naming the fix.
+        if model_path.is_file() {
+            let parent = model_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            anyhow::bail!(
+                "--model expects a model DIRECTORY, but '{}' is a file.\n\
+                 Try: --model {}\n\
+                 (The `onnx-genai generate` CLI accepts a config-file path and uses \
+                 its parent directory; the server takes the directory itself.)",
+                model_path.display(),
+                parent.display(),
+            );
+        }
         let model_id = args.model_id.unwrap_or_else(|| {
             model_path
                 .file_name()

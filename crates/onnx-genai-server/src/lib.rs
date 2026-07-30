@@ -18,10 +18,13 @@ use axum::{
     response::Response,
     routing::{delete, get, post},
 };
+use tower_http::services::ServeDir;
 use tracing::Instrument;
 
 mod audio_input;
 mod cli;
+mod cors;
+mod demo_assets;
 mod driver;
 mod image_input;
 mod metrics;
@@ -74,6 +77,28 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/images/generations", post(routes::image_generations))
         .route("/v1/audio/speech", post(routes::audio_speech));
+    // The demo dashboard is served same-origin with the API so a visitor can
+    // open a running server and see it with no proxy and no build step.
+    // Ungated: requiring a flag to reach the demo would defeat the point.
+    //
+    // `ServeDir` owns path-traversal safety and content-type detection. When no
+    // asset directory was found the mount still exists, so `/demo` explains how
+    // to point the server at one instead of returning a bare 404.
+    //
+    // The missing-assets branch uses explicit routes rather than
+    // `nest(.., Router::new().fallback(..))`: a nested router's fallback is not
+    // invoked for unmatched paths under its prefix, so that form silently
+    // returned axum's default empty 404 and the actionable message was never
+    // sent. Covered by `demo_without_configured_assets_explains_how_to_fix_it`.
+    router = match state.config.demo_assets_dir.clone() {
+        Some(dir) => router.nest_service(
+            "/demo",
+            ServeDir::new(dir).append_index_html_on_directories(true),
+        ),
+        None => router
+            .route("/demo/", get(demo_assets::missing_assets))
+            .route("/demo/{*path}", get(demo_assets::missing_assets)),
+    };
     if state.config.enable_debug_endpoints {
         router = router
             .route("/v1/debug/config", get(routes::debug_config))
@@ -103,8 +128,16 @@ pub fn app(state: AppState) -> Router {
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
     router
-        .with_state(state)
+        .with_state(state.clone())
         .layer(middleware::from_fn(trace_request))
+        // Outside routing: `nest_service("/demo", ..)` already claims the bare
+        // `/demo` path, so the trailing-slash redirect cannot be a route.
+        .layer(middleware::from_fn(demo_assets::redirect_bare_demo))
+        // Outermost, deliberately: preflights must be answered before routing
+        // (an `OPTIONS` never matches a `get`/`post` route and would otherwise
+        // become a header-less 405), and they must not be counted as API
+        // requests by `trace_request`.
+        .layer(middleware::from_fn_with_state(state, cors::cors_middleware))
 }
 
 async fn trace_request(request: Request, next: Next) -> Response {
