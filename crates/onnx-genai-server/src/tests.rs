@@ -4076,3 +4076,45 @@ async fn debug_kv_reports_prefix_tokens_reused() {
         "tokens saved is the measure of what prefix caching bought"
     );
 }
+
+/// `/v1/debug/kv` points callers at the block table instead of apologising that
+/// the engine cannot expose page statistics. A pointer is only better than an
+/// apology if it resolves, so follow it.
+#[tokio::test]
+async fn debug_kv_points_at_a_block_table_route_that_exists() {
+    let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv").await;
+    let endpoint = body["block_table_endpoint"]
+        .as_str()
+        .expect("debug/kv must name where the page statistics live")
+        .to_string();
+
+    let response = app(tiny_state_with_debug())
+        .oneshot(
+            Request::builder()
+                .uri(&endpoint)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{endpoint} is advertised by /v1/debug/kv and must be reachable"
+    );
+}
+
+/// No field of /v1/debug/kv may still carry an "unavailable:" apology string.
+/// Those were placeholders for getters that now exist.
+#[tokio::test]
+async fn debug_kv_carries_no_unavailable_apology_strings() {
+    let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv").await;
+    for (key, value) in body.as_object().expect("object") {
+        if let Some(text) = value.as_str() {
+            assert!(
+                !text.starts_with("unavailable"),
+                "{key} still reports {text:?}; the underlying getter exists now"
+            );
+        }
+    }
+}

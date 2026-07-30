@@ -248,7 +248,7 @@ pub(crate) async fn debug_kv(
         pending_queue_depth: snapshot.pending_requests,
         available_admission_slots: handle.engine.generation_capacity.available_permits(),
         rejected_requests: snapshot.rejections,
-        engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics",
+        block_table_endpoint: "/v1/debug/kv/blocks",
     }))
 }
 

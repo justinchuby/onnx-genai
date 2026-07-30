@@ -270,7 +270,12 @@ pub(crate) struct DebugKvResponse {
     pending_queue_depth: u64,
     available_admission_slots: usize,
     rejected_requests: u64,
-    engine_kv_introspection: &'static str,
+    /// Where to find the paged-KV page statistics, which live on their own
+    /// endpoint because they are per-page and windowed rather than scalar.
+    ///
+    /// This field used to read "engine does not yet expose KV page statistics".
+    /// It does now, so the pointer replaces the apology.
+    block_table_endpoint: &'static str,
 }
 
 #[derive(Debug, Serialize)]
