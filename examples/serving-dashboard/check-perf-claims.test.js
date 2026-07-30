@@ -266,14 +266,24 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
 
 test('the README does not restate an absolute figure the baseline calls irreproducible', () => {
   // perf-baseline.md §1 explicitly warns its own absolute numbers are a sanity
-  // reference and not a gate, because the same binary drifted 9.8% in 75
-  // minutes. The README may quote them, but only next to that drift figure --
-  // otherwise a reader takes 33.415 tok/s as a target.
+  // reference and not a gate. The README may quote them, but only next to the
+  // measured instability -- otherwise a reader takes 33.415 tok/s as a target.
+  //
+  // This assertion used to REQUIRE the README to state "9.8 %". That figure was
+  // retracted as evidence by its own author (perf-baseline.md §6f -- the run
+  // window overlapped two CPU-heavy ONNX exports, so the swing has a cause and
+  // is not ambient noise), and the clean replacement (§8.1's null A/B, true
+  // delta zero by construction) is ~5x larger. A GUARD THAT REQUIRES A
+  // SUPERSEDED NUMBER DOES NOT MERELY PERMIT THE STALE TEXT -- IT MANDATES IT,
+  // and would have gone RED on the correction.
   assert.ok(
-    /9\.8 %/.test(README),
+    /\+?52\.30\s*%/.test(README),
     'README.md quotes absolute tok/s figures but no longer states the measured ' +
-      '9.8% same-binary drift. Without it, a reader reads those figures as ' +
-      'reproducible, which the baseline document itself denies.',
+      'noise floor from perf-baseline.md §8.1 (worst single-pair excursion ' +
+      '+52.30 % on a null A/B whose true delta is ZERO by construction). ' +
+      'Without it a reader takes those figures as reproducible, which the ' +
+      'baseline document itself denies. Do NOT satisfy this with the older ' +
+      '9.8 % figure: §6f retracted it as evidence.',
   );
   assert.ok(
     /perf-baseline\.md/.test(README),
@@ -566,7 +576,8 @@ test('no source file states the withdrawn prefix timing result as a live finding
     [],
     `${offenders.length} source site(s) state the WITHDRAWN prefix timing result as a live finding.\n` +
       `Its own author withdrew it: the interleaved warm re-run came back with the OPPOSITE sign, ` +
-      `on a box where a byte-identical binary swung 9.8% from ambient load alone.\n` +
+      `on a box where a null A/B -- same binary, same prompt, TRUE DELTA ZERO BY CONSTRUCTION -- ` +
+      `swung +52.30 % / -40.17 % across six pairs (perf-baseline.md §8.1).\n` +
       `Replacement (needs no stopwatch, so no re-run can withdraw it): "We could not measure a ` +
       `prefix effect above this machine's noise floor, so we ship no prefix number. The counter is ` +
       `disqualified on its own arithmetic instead: twelve requests with six deliberately unique ` +
@@ -1169,5 +1180,74 @@ test('the README describes the CURRENT batch-decision mechanism, not the one it 
     'no `bail!` remains in `continuous_batch_manager`; the README\'s account ' +
       'of WHY the refusal reason cannot discriminate the two refused decode ' +
       'paths no longer has a mechanism behind it.',
+  );
+});
+
+// The README's null result rests on a SENSITIVITY argument: the effect we
+// looked for (~90 %) is larger than the floor we could resolve, so failing to
+// see it is evidence of absence rather than absence of evidence. That argument
+// is a RATIO, and a ratio silently decays when either side is restated
+// somewhere else. It already did: the README carried "9x the floor" computed
+// against a floor its own source had retracted, and the true margin was 1.7x.
+//
+// Nothing caught that, because the existing checker asks whether a noise floor
+// is PRESENT, never whether it is the CURRENT one. Presence is not currency.
+test('the README noise floor is the one perf-baseline currently measures, and the margin arithmetic holds', () => {
+  const readme = shipped('README.md');
+  const baseline = shipped('perf-baseline.md');
+
+  // Anchor on §8.1's null A/B -- the only floor evidence on a KNOWN-ZERO truth.
+  // Read the extremes out of the source document rather than hardcoding them
+  // here, so this test cannot become the next stale publisher of a number.
+  const lo = /−?-?40\.17\s*%/;
+  const hi = /\+?52\.30\s*%/;
+  assert.ok(
+    hi.test(baseline) && lo.test(baseline),
+    'perf-baseline.md no longer reports the §8.1 null-A/B extremes ' +
+      '(+52.30 % / -40.17 %). The README cites them as the measured noise ' +
+      'floor; if they have been restated, the README is quoting a figure its ' +
+      'own source no longer carries.',
+  );
+  assert.ok(
+    hi.test(readme),
+    'README.md no longer states the measured noise floor (+52.30 %). Its null ' +
+      'prefix result is only admissible WITH a floor: "we did not observe it" ' +
+      'becomes "it is not there" only once the instrument is shown capable of ' +
+      'seeing the alternative.',
+  );
+
+  // The margin claim must be arithmetically consistent with the floor. 90/52.30
+  // = 1.72. Anything asserting a substantially larger multiple is the old,
+  // flattering number returning.
+  // `\*{0,2}` not `\*\*?`: the bold marker opens BEFORE "~90", so there is no
+  // asterisk between the arrow and the digits. `\*\*?` requires at least one
+  // and matched nothing -- a guard that would have thrown on the very text it
+  // was written to accept. Probed against the real string before trusting it.
+  const margin = readme.match(/~?90\s*%\s*→\s*\*{0,2}([\d.]+)×\s*the floor/);
+  assert.ok(
+    margin,
+    'the sensitivity table no longer states the margin as "<N>x the floor". ' +
+      'That multiple is the entire sensitivity argument; without it the table ' +
+      'lists two magnitudes and leaves the reader to divide.',
+  );
+  const stated = Number(margin[1]);
+  const truth = 90 / 52.3;
+  assert.ok(
+    Math.abs(stated - truth) < 0.25,
+    `the README claims the predicted effect is ${stated}x the noise floor, but ` +
+      `90 / 52.30 = ${truth.toFixed(2)}x. This is how the defect appeared the ` +
+      `first time: the floor was corrected upward ~5x somewhere else and the ` +
+      `ratio was left behind, overstating our own resolving power by 5x -- IN ` +
+      `THE FLATTERING DIRECTION, which is the one nobody re-derives.`,
+  );
+
+  // And the conclusion must still be stated as surviving. If the floor ever
+  // rises past the effect, this suite must not let the page keep claiming a
+  // sensitivity argument it no longer has.
+  assert.ok(
+    truth > 1,
+    'the measured noise floor now EXCEEDS the effect a working prefix cache ' +
+      'would produce. The README\'s null result is no longer supported by a ' +
+      'sensitivity argument and must be restated as simply unmeasured.',
   );
 });

@@ -813,7 +813,7 @@ arm, so warm-up and a cache hit were the same observation. A later controlled
 run put the shared-prefix arm **7 % slower** than a control sharing nothing. A
 third run, warm and interleaved, put it **17 % faster**. **Neither figure is a
 result: the author of the 7 % withdrew it when the interleaved re-run came back
-with the opposite sign, and both are smaller than this machine's measured 9.8 %
+with the opposite sign, and both are far smaller than this machine's measured
 noise floor.** Two numbers of opposite sign, both under the noise floor, is the
 textbook definition of inconclusive, and calling it anything stronger would be
 the exact move this page exists to refuse: turning *we could not measure this*
@@ -822,9 +822,26 @@ the *instrument*, not about the cache.
 
 **Those last two contradict each other, so the instrument cannot resolve a
 difference of that size.** The measurements were taken on a machine at load
-average 22 on ten cores, where a *byte-identical* binary has been observed to
-swing 9.8 %. A control arm rules out warm-up; it does not rule out noise larger
-than the signal.
+average 22 on ten cores. A control arm rules out warm-up; it does not rule out
+noise larger than the signal.
+
+**And the floor is measured on a known-zero truth, not assumed.**
+`perf-baseline.md` §8.1 ran a strictly interleaved A/B in which *both arms are
+the same server, the same binary, and the same prompt* — **the true delta is
+exactly zero by construction, so every delta it reports is noise.** Six pairs:
+
+| worst single-pair excursion (true delta **0**) | **+52.30 % / −40.17 %** |
+|---|---|
+| 95 % CI of the mean paired delta (n=6) | **−35.28 % … +34.73 %** |
+| per-arm coefficient of variation | **~28.9 %** |
+
+> **⚠️ This README previously put that floor at 9.8 %, and that was wrong in
+> the direction that flattered us.** The 9.8 % figure came from a run its own
+> author later **retracted as evidence** (`perf-baseline.md` §6f: the run
+> window overlapped two CPU-heavy ONNX exports, so the swing has a *cause* and
+> is not ambient noise). The clean replacement is **roughly five times larger**.
+> **Correcting it makes the withdrawal above stronger, not weaker** — 7 % and
+> 17 % are not near the floor, they are deep inside it.
 
 **But the effect we were looking for is not that size, and that is what closes
 the question.** A prefill/decode split on the same long prompt put prefill at
@@ -834,10 +851,18 @@ actually restored KV would therefore have collapsed TTFT to roughly **140 ms**.
 
 | | magnitude |
 |---|---|
-| noise floor on this machine | ~10 % |
-| smallest difference we can resolve | ~10 % |
-| observed shared-vs-control difference | 7 % → **below the floor, unresolvable** |
-| **effect a working prefix cache must produce** | **~90 % → 9× the floor** |
+| noise floor on this machine (worst excursion, true delta 0) | **~52 %** |
+| smallest difference we can resolve | **~52 %** |
+| observed shared-vs-control difference | 7 % → **deep below the floor, unresolvable** |
+| **effect a working prefix cache must produce** | **~90 % → 1.7× the floor** |
+
+> **🔻 That last row read "9× the floor" until this correction, and the margin
+> is really 1.7×.** `90 / 52.30 = 1.7`. **The conclusion survives — a ~90 %
+> collapse still cannot hide under a ~52 % floor — but the headroom is a fifth
+> of what this table claimed**, and a reader deciding how much to trust the
+> null result deserves the real number. What is excluded is a collapse *of the
+> predicted magnitude*; a **smaller** real prefix effect is **not** excluded by
+> anything on this page, and this table should not be read as excluding one.
 
 > **This is a sensitivity check, and it is the difference between "we did not
 > observe it" and "it is not there."** The same run that cannot tell 7 % from
