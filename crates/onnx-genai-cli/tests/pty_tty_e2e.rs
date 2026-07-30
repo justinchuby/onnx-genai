@@ -32,7 +32,7 @@
 #[cfg(unix)]
 mod pty_tty {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::OwnedFd;
     use std::os::unix::io::AsFd;
     use std::path::{Path, PathBuf};
@@ -48,6 +48,28 @@ mod pty_tty {
 
     fn text_model() -> PathBuf {
         repository_root().join("tests/fixtures/tiny-llm")
+    }
+
+    fn strip_terminal_controls(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                match chars.next() {
+                    Some('[') => {
+                        for next in chars.by_ref() {
+                            if next.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) | None => {}
+                }
+            } else if ch != '\r' {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     /// Open a fresh PTY pair.  The slave is the child-side terminal device;
@@ -321,5 +343,107 @@ mod pty_tty {
              the reply already ended with \\n and an extra newline was added. \
              got: {pty_out:?}"
         );
+    }
+
+    #[test]
+    fn run_repl_preserves_submitted_lines_across_two_tty_turns() {
+        let (master, slave) = open_pty();
+        let slave_stdin = dup(&slave).expect("dup stdin must succeed");
+        let slave_stdout = dup(&slave).expect("dup stdout must succeed");
+        let slave_stderr = slave;
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+            .arg("run")
+            .arg(text_model())
+            .arg("--raw")
+            .arg("--max-new-tokens")
+            .arg("2")
+            .env("ONNX_GENAI_EP", "cpu")
+            .stdin(Stdio::from(slave_stdin))
+            .stdout(Stdio::from(slave_stdout))
+            .stderr(Stdio::from(slave_stderr))
+            .spawn()
+            .expect("CLI binary must start");
+
+        let mut master: std::fs::File = master.into();
+        let mut bytes = Vec::new();
+        let mut first_sent = false;
+        let mut second_sent = false;
+        let mut exit_sent = false;
+        let mut buf = [0u8; 4096];
+        loop {
+            let ready = {
+                let borrowed = master.as_fd();
+                let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+                poll(
+                    &mut fds,
+                    PollTimeout::try_from(DRAIN_IDLE_TIMEOUT).unwrap_or(PollTimeout::MAX),
+                )
+                .unwrap_or(0)
+            };
+            assert!(
+                ready != 0,
+                "timed out waiting for two-turn REPL transcript; bytes so far: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+
+            let transcript = strip_terminal_controls(&String::from_utf8_lossy(&bytes));
+            let prompt_count = transcript.matches(">>>").count();
+            if !first_sent && prompt_count >= 1 {
+                master.write_all(b"first\r").expect("send first prompt");
+                first_sent = true;
+            }
+            if first_sent && !second_sent && prompt_count >= 2 {
+                master.write_all(b"second\r").expect("send second prompt");
+                second_sent = true;
+            }
+            if second_sent && !exit_sent && prompt_count >= 3 {
+                master.write_all(b"\r").expect("send empty exit line");
+                exit_sent = true;
+            }
+            if exit_sent && child.try_wait().expect("poll child").is_some() {
+                break;
+            }
+        }
+        let _ = child.wait();
+
+        let transcript = strip_terminal_controls(&String::from_utf8_lossy(&bytes));
+        let first_input = transcript
+            .find(">>> first")
+            .unwrap_or_else(|| panic!("first submitted line was not preserved: {transcript:?}"));
+        let second_input = transcript
+            .find(">>> second")
+            .unwrap_or_else(|| panic!("second submitted line was not preserved: {transcript:?}"));
+        let first_answer = transcript[first_input..second_input]
+            .find("tok")
+            .map(|offset| first_input + offset)
+            .unwrap_or_else(|| {
+                panic!("first reply text missing before second input: {transcript:?}")
+            });
+        let second_answer = transcript[second_input..]
+            .find("tok")
+            .map(|offset| second_input + offset)
+            .unwrap_or_else(|| {
+                panic!("second reply text missing after second input: {transcript:?}")
+            });
+
+        assert!(
+            first_input < first_answer
+                && first_answer < second_input
+                && second_input < second_answer,
+            "turn ordering must be input1 -> reply1 -> input2 -> reply2; transcript: {transcript:?}"
+        );
+        for line in transcript.lines() {
+            assert!(
+                !(line.trim().is_empty() && line.len() >= 8),
+                "renderer leaked a blank/whitespace viewport row into scrollback: {transcript:?}"
+            );
+        }
     }
 }
