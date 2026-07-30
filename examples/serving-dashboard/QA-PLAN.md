@@ -561,7 +561,35 @@ is worse than no reason, because the visitor believes it.
 
 ## 10. Regression and baseline
 
-- [ ] **10.1** AC33 perf baseline reproducible from `f55e459b`.
+- [ ] **10.1 🔴 AC33 PERF COMPARISON — READ `perf-baseline.md` §5, §6, AND §6c BEFORE RUNNING
+      ANYTHING. THE OBVIOUS PROTOCOL GIVES A FALSE VERDICT.**
+      Mandatory reading, not a pointer to the broadcast log: §5 acceptance spec, §6
+      threats-to-validity, **§6c protocol defect**.
+      - **The BEFORE arm is a preserved binary, not a rebuild.** `clean-binary/
+        onnx-genai-server-clean-d49d3c8` (SHA-256 `d49d3c8f…`, boot-tested). No code freeze is
+        needed and none should be requested. Rebuilding `f55e459b` to recreate the arm is the
+        wrong move — you would be comparing a different toolchain state.
+      - **512-token generations, 15 samples/arm, decode-only tok/s from SSE per-token
+        timestamps.** At 128 tokens CV is 4.95%; at 512 it is 1.98%. Do not shorten.
+      - 🔴 **ONE RUN PER ARM CANNOT SETTLE `<2%`, NO MATTER THE SAMPLE COUNT.** Two runs of the
+        **byte-identical** binary differ by **−2.07%** at the mean — the criterion fails against
+        itself. Within-run CV (1.98%) is the wrong variance component; the criterion depends on
+        **dispersion of run means**, which n-per-run does not touch.
+      - ✅ **Required: alternate binaries RUN BY RUN — A B A B A … ≥5 runs per arm.** Unit of
+        analysis is the **run mean** (5 numbers per arm), compared by permutation/Welch on run
+        labels. Report **n_runs**, the CI of the run-mean difference, and require non-overlap to
+        claim a regression *or* to claim `<2%`. ~80 min, unattended.
+      - ❌ **Do NOT gate on a "quiet machine" and do NOT interleave per-request.** Measured:
+        `loadavg` has **no** correlation with our throughput (ρ = +0.079, p = 0.785), so no
+        instrument certifies a window as quiet — gating on it converts an acknowledged threat
+        into an invisible assumption. And per-request pairing **doubles** delta variance (paired
+        stdev 7.01 pp) because per-request jitter is high-frequency. **Interleave at the
+        granularity that matches the noise you are fighting, and average below it.**
+      - Drift direction **flips** between runs (+2.24%, +3.07%, −5.05%), so it is autocorrelated
+        wander on the ~8-minute timescale of a run — not a correctable fixed bias.
+- [ ] **10.1a** Any tok/s displayed by the dashboard is **client-derived** from SSE token
+      timestamps. `/v1/status.tokens_per_second` is a hardcoded `0.0` (§7.1) and must never be
+      the source. Verify the number on screen moves when generation speed moves.
 - [ ] **10.2** `node --test` passes with zero dependencies; no Vite/TS/npm build step introduced.
 - [ ] **10.3** Full run from a clean clone by someone who has not read this thread — the real
       acceptance test.
