@@ -13,7 +13,8 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 | Evidence class | What it means | Examples |
 |---|---|---|
 | **Observed** | Confirmed against a *running server* — curled, streamed, or profiled | §5.6's mode matrix (both model types run and profiled); the endpoint behaviours in §8.3; debug endpoints returning **404**, not 403 |
-| **Read** | Established by reading the cited source | The dependency edges in §2; the command-deferral dispatch in §5.11; the `NodeStatus` scope comment in §4.7 |
+| **Read** | Established by reading the cited *executable* source — a constant, handler, assignment or signature | The dependency edges in §2; the command-deferral dispatch in §5.11 |
+| **Stated intent** | Established by reading a **comment or docstring**. Supports a claim about what the authors *meant*, **never** about what the code *does*. | The preemption rationale at `batched.rs:713-718` (the *behaviour* is cited separately at `:759`); the `NodeStatus` scope comment in §4.7 |
 | **Inferred** | A conclusion drawn from the above, not directly witnessed | §5.3's claim that a shared-page write *would* corrupt silently — no test provokes it, and nothing in the code prevents it |
 
 **Why the distinction is worth the overhead.** Verification tools share blind spots with the assumptions they are used to check. Several classes of defect in this codebase are **invisible to the instrument a reader would naturally reach for**:
@@ -27,6 +28,8 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 | A line citation | That the line moved. The claim stays true while the reference silently rots. |
 
 The common shape: **each tool inspects a *state*, while these defects live in a *transition* or a *relationship*.** None of them can express *"and then it changed"* or *"and it means something different over there."*
+
+> **Why `Stated intent` is a separate class and not a flavour of `Read`.** A doc comment is prose that lives in a code file: it inherits the authority of code while carrying none of the guarantees — nothing executes it, no test covers it, and it drifts silently when the code beneath it changes. This document cited *preemption is disabled* four separate times and every one of those citations landed on the docstring 40 lines above the assignment that actually disables it. **The comment happened to be accurate, which is precisely what makes the practice dangerous: it works until it doesn't, and no amount of careful reading can tell you which case you are in.** An audit of every citation here (`scripts/audit_citation_targets.py`) found 20 of 95 resolved citations anchored on prose. The behaviour claims among them have been re-anchored to executable lines; the rationale claims were relabelled to this class rather than deleted, because *why* the authors did something is genuinely useful and a comment is the correct source for it.
 
 The practical consequence for this document is that **a chain of individually-true statements can compose into a false one** — every step verifiable, the conclusion wrong. That is why claims here carry their evidence class rather than a uniform tone of authority: the reader needs to know which links were witnessed and which were reasoned, in order to check the composition rather than the steps.
 
@@ -278,7 +281,7 @@ flowchart TD
 - Each iteration first drains newly arrived commands with `rx.try_recv()` (`driver.rs:577`), then calls `manager.step()` (`driver.rs:596`) — **one shared batched forward pass across all active rows**.
 - **Only `Generate { session_id: None, .. }` is handled inline.** Every other command hits the catch-all at `driver.rs:592` and is pushed onto `deferred`, which is not drained until `driver.rs:520` — after the batch goes idle. This is invariant §5.11 and it is the reason telemetry must be collected inline rather than requested via a command.
 - New arrivals are admitted at `driver.rs:610`; finished rows are backfilled so occupancy is maintained.
-- Admission eligibility, when scheduler-driven, is `run_continuous_batch_scheduled` (`batched.rs:718`): FCFS order gated by the shared KV byte budget and total-token ceiling (`batched.rs:750-760`).
+- Admission eligibility, when scheduler-driven, is `run_continuous_batch_scheduled` (`batched.rs:719`): FCFS order (`batched.rs:760`, `priority_policy = PriorityPolicy::Fcfs`) gated by the shared KV byte budget and total-token ceiling (`batched.rs:750-760`).
 - Per-request events are funnelled through `route_continuous_events` (`driver.rs:637`) — **the single place where every request's lifecycle events pass**. TTFT is recorded at `driver.rs:650`.
 
 **Output equivalence guarantee** (`batched.rs:708-711`): a request's tokens never depend on which rows share its batch. Batched output is byte-identical to running the request alone. Batching is a throughput optimization, not a semantic change.
@@ -334,7 +337,7 @@ For each boundary: what the **caller** must guarantee, what the **callee** guara
 
 - **`ModelDirectory::load`** (`loader.rs:35`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
 - **Canonical errors:** `model directory does not exist: {}` (`loader.rs:39`), `tokenizer.json not found in {}` (`loader.rs:69`).
-- ⚠️ **Known duplication:** the server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs:161-165`) is a *second, laxer* filter used only for `--models-dir` fan-out. It accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory can pass admission and then fail at load. See §8.6.
+- ⚠️ **Known duplication:** the server's `looks_like_model_dir` (`crates/onnx-genai-server/src/models_config.rs:162`) is a *second, laxer* filter used only for `--models-dir` fan-out. It accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory can pass admission and then fail at load. See §8.6.
 
 ### 4.6 Tokenizer boundary
 
@@ -433,7 +436,7 @@ Enforced at `page_table.rs:1097-1110`, which filters to `ref_count <= 1` and doc
 
 > Physical concurrency never exceeds `max_batch` decode rows; each admitted row reserves its worst-case KV footprint up front.
 
-Enforced in `run_continuous_batch_scheduled` (`batched.rs:750-760`): the scheduler governs *eligibility* (ordering plus the shared token/byte budget) while the manager's `max_batch` bounds *row count*. Up-front worst-case reservation is what makes byte-budget admission sound (`batched.rs:717-718`).
+Enforced in `run_continuous_batch_scheduled` (`batched.rs:759-760` — the executable assignments `preemption_policy = PreemptionPolicy::Disabled` and `priority_policy = PriorityPolicy::Fcfs`): the scheduler governs *eligibility* (ordering plus the shared token/byte budget) while the manager's `max_batch` bounds *row count*. Up-front worst-case reservation is what makes byte-budget admission sound (`batched.rs:717-718`).
 
 `DEFAULT_MAX_BATCH` is currently **hardcoded to 4** (`crates/onnx-genai-server/src/state.rs:25`) with no CLI flag.
 
@@ -464,7 +467,7 @@ The batching/paged-KV split is not one limitation. It is a single structural fac
 |---|---|---|
 | **Prefix cache reuse** | The batch never consults the prefix trie | `prefix_cache_hit_len` is a literal `0` at `batched.rs:262` and `:486`, so the `> 0` test at `metrics.rs:135` is never true |
 | **Preemption** | Disabled by construction, not by default | `scheduler_config.preemption_policy = PreemptionPolicy::Disabled` (`batched.rs:759`) |
-| **KV memory pressure / eviction** | Nothing to evict — rows are physical and pre-reserved | `batched.rs:713-718`: rows "cannot be swapped out and resumed in place" |
+| **KV memory pressure / eviction** | Nothing to evict — rows are physical and pre-reserved | `batched.rs:759` sets `PreemptionPolicy::Disabled` (executable). Stated rationale at `:713-718`. |
 
 The rationale at `batched.rs:713-718` is the common cause stated in the source itself: **the batch owns its KV in physical rows, and each row reserves its worst-case footprint up front.** Pre-reserved physical rows are what make the batching path fast and predictable, and they are *precisely* what removes the freedom that sharing, eviction and preemption all require. **Every one of the three is the same trade, seen from a different angle.**
 
@@ -474,7 +477,7 @@ The rationale at `batched.rs:713-718` is the common cause stated in the source i
 
 > `PreemptionPolicy::Disabled` is set unconditionally for scheduler-driven continuous batching.
 
-`batched.rs:757`. The reason is structural, not a policy choice (`batched.rs:713-717`):
+`batched.rs:759` (`scheduler_config.preemption_policy = PreemptionPolicy::Disabled`). The reason is structural, not a policy choice — stated rationale, not executable evidence, at `batched.rs:713-717`:
 
 > *"this batch owns its KV in the batched decode session's physical rows, which cannot be swapped out and resumed in place, so mid-flight eviction/swap of a running row is deferred."*
 
@@ -516,7 +519,7 @@ Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:575-59
 
 > A directory is a valid model directory if and only if `ModelDirectory::load` (`onnx-genai-ort/src/loader.rs:35`) accepts it. No other component may define its own criterion.
 
-**This invariant is currently false**, and stating it as intent rather than behaviour would violate this document's own honesty rule. `looks_like_model_dir` (`models_config.rs:161-165`) is a second, weaker validator that accepts on an **OR** of conditions where the loader requires an **AND**. A directory can therefore pass admission and then fail at load, producing contradictory error text (`models_config.rs:155-158`).
+**This invariant is currently false**, and stating it as intent rather than behaviour would violate this document's own honesty rule. `looks_like_model_dir` (`models_config.rs:162`) is a second, weaker validator that accepts on an **OR** of conditions where the loader requires an **AND**. A directory can therefore pass admission and then fail at load, producing contradictory error text (`models_config.rs:155-158`).
 
 **Why the invariant is worth holding:** validation that disagrees with loading is unfalsifiable from the user's side — the error message names the wrong cause.
 
@@ -834,7 +837,7 @@ The failure is confusing: the script succeeds, artifacts appear correct, and the
 
 ### 8.6 Two model-directory admission filters
 
-`ModelDirectory::load` (`loader.rs:35`) is the real validator. The server's `looks_like_model_dir` (`models_config.rs:161-165`) is a second, laxer filter for `--models-dir` fan-out that accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`.
+`ModelDirectory::load` (`loader.rs:35`) is the real validator. The server's `looks_like_model_dir` (`models_config.rs:162`) is a second, laxer filter for `--models-dir` fan-out that accepts `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`.
 
 Because the real loader requires `tokenizer.json` **AND** an onnx file, a directory can pass admission and then fail at load, with an error message (`models_config.rs:155-158`) that describes a contract the loader does not implement. Consolidating on `ModelDirectory::load(...).is_ok()` would remove the divergence.
 
