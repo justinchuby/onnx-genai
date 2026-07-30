@@ -4921,7 +4921,10 @@ fn the_block_window_handler_sizes_its_window_through_the_clamp() {
         "the block handler must size its window through the published clamp"
     );
     assert!(
-        !source.contains(".unwrap_or(BlockTableResponse::DEFAULT_WINDOW)"),
+        !source.contains(concat!(
+            ".unwrap_or(BlockTableResponse",
+            "::DEFAULT_WINDOW)"
+        )),
         "the window policy was re-inlined at the call site; the clamp test now \
          describes code the handler no longer runs"
     );
@@ -5581,7 +5584,7 @@ async fn a_disabled_batcher_publishes_why_it_is_disabled() {
 fn the_continuous_batch_probe_never_discards_its_error() {
     let source = include_str!("driver.rs");
     assert!(
-        !source.contains("continuous_batch_manager(max_batch).is_ok()"),
+        !source.contains(concat!("continuous_batch_manager(max_batch)", ".is_ok()")),
         "the continuous-batch probe is collapsing its Err to a bool again; \
          the refusal reason exists nowhere else and cannot be recovered later"
     );
