@@ -50,6 +50,16 @@ function sourceFiles() {
     .filter((name) => !GUARD_MODULES.has(name));
 }
 
+/** The store layer sits one directory up from the panels. */
+const STORE_DIR = fileURLToPath(new URL('../', import.meta.url));
+
+/** @returns {string[]} */
+function storeLayerFiles() {
+  return readdirSync(STORE_DIR)
+    .filter((name) => name.endsWith('.js'))
+    .filter((name) => !name.endsWith('.test.js'));
+}
+
 describe('honesty lint — no unguarded value reads', () => {
   it('never reads .value without a guard nearby', () => {
     /** @type {string[]} */
@@ -558,6 +568,46 @@ describe('AC59 — "batch size" never appears in UI copy', () => {
       `AC59: "batch size" is ambiguous between the engine batch and the ` +
         `in-flight request gauge. Name what the number counts:\n${offenders.join('\n')}`,
     );
+  });
+
+  // The store layer (one directory UP from dashboard/) was never scanned by any
+  // honesty lint in this file — every check here reads `dashboard/`, i.e. the
+  // CONSUMERS. But `renderField` falls back to `field.label` when a panel does
+  // not pass one (panel-kit.js:265), so a label written in the provenance
+  // catalogue becomes the ACCESSIBLE NAME on screen. AC59 was therefore
+  // violable from a file this suite could not see. It found two on its first
+  // run: 'Active batch size' and 'Engine batch size'.
+  //
+  // The store form of the ban is deliberately NARROWER: only the spaced human
+  // phrase. Identifiers like `onnx_genai_batch_size_current` must stay quotable
+  // in `evidence:` strings, because naming the exact metric is how a reader
+  // checks our claim. Copy is banned; citations are not.
+  const STORE_BANNED = /batch\s+size/i;
+
+  it('no store-layer label or reason says "batch size"', () => {
+    const offenders = [];
+    for (const file of storeLayerFiles()) {
+      const source = readFileSync(`${STORE_DIR}${file}`, 'utf8');
+      for (const literal of stringLiteralsOf(source)) {
+        if (STORE_BANNED.test(literal)) offenders.push(`${file}: ${literal}`);
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      `AC59 reaches the screen through field.label too:\n${offenders.join('\n')}`,
+    );
+  });
+
+  it('MUTATION TEST — the store lint bans copy but never a metric identifier', () => {
+    assert.ok(STORE_BANNED.test("label: 'Active batch size'"), 'must catch the label form');
+    assert.ok(STORE_BANNED.test("'Engine batch size'"), 'must catch the second label');
+    assert.ok(
+      !STORE_BANNED.test("'onnx_genai_batch_size_current counts HTTP-layer generations'"),
+      'a metric identifier must stay citable in evidence strings',
+    );
+    assert.ok(!STORE_BANNED.test("'Sequences in the current batch'"), 'replacement must pass');
+    assert.ok(!STORE_BANNED.test("'Sequences stepped together'"), 'replacement must pass');
   });
 
   it('MUTATION TEST — the lint fires on every spelling it must catch', () => {

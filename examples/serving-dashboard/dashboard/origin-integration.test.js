@@ -161,3 +161,82 @@ describe('genuinely measured fields still render as numbers', () => {
   });
 });
 
+
+// A SERVER THAT NO LONGER EXISTS IS STILL RUNNING ON SOMEONE'S LAPTOP.
+//
+// The suite above correctly stopped sending zeros for fields the current
+// server omits. But "the current server" is not what the demo necessarily
+// runs against: builds in circulation tonight predate the telemetry work, and
+// those binaries send `tokens_per_second: 0.0` and `kv_usage: 0.0` as literal
+// values on the wire.
+//
+// That case is the dangerous one, and removing it from the fixture above left
+// it uncovered. When a NOT_PLUMBED field arrives carrying a value, the store
+// reads the disagreement as "the table is stale, this field became real" and
+// DISPLAYS the number — failing open, in the one direction this project
+// cannot afford. The provenance entries declare `stubValue: 0` so a zero is
+// recognised as the documented placeholder rather than as news.
+//
+// A non-zero value must still raise the staleness warning: that branch is how
+// we learn the server team shipped something, and this must not gut it.
+describe('an older binary that still sends the fabricated zeros', () => {
+  const legacyServer = () =>
+    respondingServer({
+      '/v1/status': {
+        healthy: true,
+        model_id: 'phi-3',
+        node_id: 'node-1',
+        context_length: 4096,
+        queue_depth: 3,
+        active_sessions: 2,
+        batch: { active_size: 4 },
+        // The literal zeros an older build puts on the wire.
+        tokens_per_second: 0.0,
+        kv_usage: 0.0,
+      },
+    });
+
+  for (const key of ['throughput.tokens_per_second', 'kv.usage']) {
+    it(`${key} sent as a literal 0.0 is not promoted to a measurement`, async () => {
+      const store = createTelemetryStore({ origin: 'scatter', fetchImpl: legacyServer() });
+      await store.pollOnce();
+
+      const field = store.field(key);
+      assert.notEqual(
+        field.state,
+        'measured',
+        `${key} arrived as a hardcoded 0.0 and was shown as a live reading`,
+      );
+      store.stop();
+    });
+  }
+
+  it('still flags a NON-zero value, so the staleness warning keeps its teeth', async () => {
+    const store = createTelemetryStore({
+      origin: 'scatter',
+      fetchImpl: respondingServer({
+        '/v1/status': {
+          healthy: true,
+          model_id: 'phi-3',
+          node_id: 'node-1',
+          context_length: 4096,
+          queue_depth: 3,
+          active_sessions: 2,
+          batch: { active_size: 4 },
+          // A real rate would mean the server started computing this.
+          tokens_per_second: 20.7,
+        },
+      }),
+    });
+    await store.pollOnce();
+
+    const field = store.field('throughput.tokens_per_second');
+    assert.equal(
+      field.state,
+      'measured',
+      'a genuine measurement must never be suppressed by the stub declaration',
+    );
+    assert.equal(field.value, 20.7);
+    store.stop();
+  });
+});

@@ -260,6 +260,15 @@ export const PROVENANCE = Object.freeze({
     source: ENDPOINTS.STATUS,
     path: 'tokens_per_second',
     classification: 'NOT_PLUMBED',
+    // OLDER BINARIES SEND A LITERAL 0.0 HERE. The current server omits the
+    // field, so absence is the normal case and is handled by the caller's
+    // presence check. But several builds in circulation tonight predate that
+    // change, and without this declaration a 0 from one of them reads as a
+    // value CONTRADICTING the table -- which makes the store display it as a
+    // live measurement. The fabricated zero would arrive wearing the one badge
+    // this project exists to withhold. A non-zero value still raises the
+    // staleness warning, so the branch keeps its purpose.
+    stubValue: 0,
     unit: 'tokens/s',
     evidence:
       'crates/onnx-genai-server/src/routes/admin.rs — `tokens_per_second: None`, registered ' +
@@ -279,6 +288,15 @@ export const PROVENANCE = Object.freeze({
     source: ENDPOINTS.STATUS,
     path: 'kv_usage',
     classification: 'NOT_PLUMBED',
+    // OLDER BINARIES SEND A LITERAL 0.0 HERE. The current server omits the
+    // field, so absence is the normal case and is handled by the caller's
+    // presence check. But several builds in circulation tonight predate that
+    // change, and without this declaration a 0 from one of them reads as a
+    // value CONTRADICTING the table -- which makes the store display it as a
+    // live measurement. The fabricated zero would arrive wearing the one badge
+    // this project exists to withhold. A non-zero value still raises the
+    // staleness warning, so the branch keeps its purpose.
+    stubValue: 0,
     unit: 'ratio',
     evidence:
       'crates/onnx-genai-server/src/routes/admin.rs — `kv_usage: None`. The four KV fields ' +
