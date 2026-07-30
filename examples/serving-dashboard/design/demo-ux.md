@@ -2970,7 +2970,7 @@ The mismatch is only dangerous if someone writes `field.state === 'measured'` (o
 - **D117:** every state comparison goes through `FIELD_STATES.*` or a helper (`hasValue`, `numericValueOf`). **A test asserts no module contains a raw state string.** Same tripwire pattern as `tokens_per_second`.
 - **D118:** `dashboard/field-state.js:28`'s `RenderState` typedef lists **four** states — **add `not-applicable`.** A stale typedef is the `:20` JSDoc failure again: **documentation with the authority of code and none of its guarantees.**
 
-**MY RECOMMENDATION TO @12e42da8, and it costs nothing to overrule: RATIFY `ok` AS THE WIRE VALUE.** Spec and code already agree; your safety property is delivered by the constant name; the migration risk lands in the scope least able to absorb it. **I argued for `measured` and I'm withdrawing that — the ambiguity window is now more expensive than either word, and this is the option that closes it in zero edits.**
+**MY RECOMMENDATION TO @12e42da8, and it costs nothing to overrule: RATIFY `ok` AS THE WIRE VALUE.** Spec and code agreed AS OF 00:51; your safety property is delivered by the constant name; the migration risk lands in the scope least able to absorb it. **I argued for `measured` and I'm withdrawing that — the ambiguity window is now more expensive than either word, and this is the option that closes it in zero edits.**
 
 ### 41.4 What I got wrong, plainly
 
@@ -3585,11 +3585,11 @@ I withdrew `ok` earlier on the argument that **`ok` names approval while `measur
 Under that reading, **`measured` is the misleading name, not `ok`.** The state is assigned to *every* renderable field — including `source: 'derived'`, `source: 'estimated'` and `source: 'client'` fields. **Calling that state `measured` makes a PROVENANCE claim that `source` already owns, and it is FALSE for three of the four source classes.** `state: 'measured'` beside `source: 'estimated'` is a sentence that contradicts itself in the same object literal. `state: 'ok'` beside `source: 'estimated'` reads correctly: *there is a good current reading, obtained by estimation.*
 
 - **D159:** **the earlier objection — that `ok` reads as endorsement — dissolves once you notice a fabricated number NEVER reaches this state.** Fabrications are `unavailable` or `not-applicable` by construction. So `ok` cannot endorse a lie; it can only say *a real current value exists.* **That is exactly what it means, and it is the only one of the two names that stays true across all four source classes.**
-- **The cost argument is real but it is not why.** Twelve modules and every `[data-state='ok']` selector already agree; `'measured'` needs a two-file atomic edit across files three agents are editing at 00:51. **That makes `ok` the cheap answer. The paragraph above is why it is the RIGHT one** — and I would rule the same way if it cost more.
+- **The cost argument is real but it is not why.** OBSERVED 00:51: twelve modules and every `[data-state='ok']` selector agreed THEN; `'measured'` needed a two-file atomic edit across files three agents are editing at 00:51. **That makes `ok` the cheap answer. The paragraph above is why it is the RIGHT one** — and I would rule the same way if it cost more.
 
 ### 53.2 🔒 D160 — DELETE THE ALIAS. BOTH KEYS IS THE ONLY UNACCEPTABLE OUTCOME.
 
-`FIELD_STATES` currently exports **`OK: 'ok'` AND `MEASURED: 'ok'`** — six keys, two names, one state. **This is strictly worse than the bug it replaced, because the split now has a comment explaining why it is fine.**
+OBSERVED 00:51 (SUPERSEDED at 01:17 by `24d831a2`; see §81/D276): `FIELD_STATES` exported **`OK: 'ok'` AND `MEASURED: 'ok'`** — six keys, two names, one state. **This is strictly worse than the bug it replaced, because the split now has a comment explaining why it is fine.**
 
 **`FIELD_STATES.MEASURED` still evaluates to `'ok'`, so `field.state === 'measured'` is STILL false for every measured field on the dashboard** — the exact landmine the reconciliation claimed to remove. **A transitional alias is a fork with a deprecation notice.**
 
@@ -5361,3 +5361,108 @@ permanent: **three unrelated vocabularies share `'ok'`, one of them the HTTP hea
 payload, where renaming it fakes an unreachable server.**
 
 **Suites: 10 + 7 + 7 + 3 + 3 + 3 = 33 green.**
+
+---
+
+## §82 — The provenance table says it twice and means one of them
+
+OBSERVED 02:19, HEAD `24012faf`. @c0de4c2e found `'batch.capacity'` declared twice in
+`telemetry-provenance.js` (`:497` and `:637`). I went to write a guard and found the
+duplicate was the smaller half of the finding.
+
+### D275 — The two entries are not copies. They disagree about what the panel says.
+
+Executed, not read:
+
+```
+OBSERVED 02:19 @ 24012faf   RESOLVED 02:21 @ 08633394 — the good entry was kept
+LIVE  (:637)  label: "Batch limit"                evidence: admin.rs:178, one line
+DEAD  (:497)  label: "Effective batch capacity"   evidence: symbol + 8 lines of reasoning
+```
+
+~~The wrong entry is live.~~ **RESOLVED while this section was being written**: `:637`
+was deleted and `:497` kept. Re-verified at 02:21 — live `label` is
+`"Effective batch capacity"`, evidence is symbol-anchored, reasoning intact. **Whoever
+made that call deleted the SECOND occurrence, which is the non-obvious direction.** The
+analysis below is retained because the guard now enforces it, not because it is open.
+
+`label` is not metadata. It is **the string the panel paints next to the number.**
+
+The served value is `effective_batch_capacity() = max_batch.min(max_queue_depth)`
+(`admin.rs:178`, verified — the line number is correct today). **"Batch limit" names
+`max_batch`.** It is the raw ceiling. With `max_batch 4` and `max_queue_depth 1`, the
+number is 1 and the label calls it the limit — so a saturated server reads as one
+quarter busy under a caption that says it is at its limit.
+
+The discarded entry's own comment predicted this in the file, at `:503-510`:
+
+> *a `max_batch` denominator would draw a saturated server as 25% busy … the one error
+> direction that makes our headline look WORSE than reality, which is why the server
+> clamps it and why the client must not "helpfully" un-clamp it.*
+
+**@1cb42f0e found that. @bb2ee824 wrote it into the catalogue explicitly so it could not
+be un-learned. It went into the half that JavaScript throws away.** The lesson of the
+entire `--max-batch` saga was recorded in this file and silently discarded in this file,
+and the entry that survived carries the one label the lesson forbids. **The client is
+un-clamping it in the caption instead of the value — which no arithmetic check can see,
+because the number is right.**
+
+### D276 — A duplicate key is absent-vs-zero, inside the honesty machinery
+
+A duplicate key in a JS object literal is **not an error**: no syntax error, no warning,
+no lint. Last definition wins, silently. So the file documents a provenance the program
+does not use, and **nothing anywhere tells you which one is live.**
+
+That is precisely the defect class this dashboard exists to refuse — a value whose origin
+cannot be recovered from the artifact — sitting in the table whose entire job is
+recording origins. **And note which survived: the SYMBOL-anchored citation died and the
+LINE-anchored one lives.** @73e77d95's law is *name the symbol; a line number may never
+substitute.* The catalogue now silently prefers the fragile form, and a reader who
+scrolls to `:497`, finds an exemplary symbol-anchored entry with its reasoning intact,
+and stops reading **will believe the good one is in force.** It is the best-written dead
+code in the repository.
+
+**The runtime object cannot show this.** By the time the module is imported the loser is
+already gone; `PROVENANCE['batch.capacity']` returns one clean entry and every runtime
+probe agrees. **Only the source text carries the evidence.** This is the inverse of the
+rule we have applied all night — *execute it, do not read it* — and it is the first case
+tonight where reading beats executing, because **the defect is destroyed by the act of
+running the file.**
+
+### D277 — Shipped as a guard; red on arrival, green ninety seconds later
+
+`provenance-expiry.test.js` now parses the register **source** and fails on any key
+declared twice, with an anti-vacuity control that asserts the parser found >20 keys and
+one known key by name (AC106: a regex matching nothing reports zero duplicates forever).
+
+**It was RED at `24012faf` and is GREEN at `08633394`** — red for roughly ninety
+seconds, during which the fix landed in a file I do not own, in the non-obvious
+direction I would have prescribed: delete `:637`, keep `:497`.
+
+> **AND I NEARLY SHIPPED THIS SECTION SAYING *"IT IS RED AT HEAD"* IN THE PRESENT
+> TENSE — IN THE SAME COMMIT AS D278, WHICH EXISTS BECAUSE I DID EXACTLY THAT IN
+> §53.** I wrote a live-defect report, the defect was fixed while I typed, and the only
+> reason I caught it is that I re-ran the suite before committing rather than after.
+> **A red I have personally observed is the single most convincing thing I can write
+> down, and it has the shortest shelf life of anything in this document.** §53 took two
+> hours to rot; this took ninety seconds.
+
+Per D271 I withdrew rather than redden a shared tree — **that was a new treatment I
+wanted. This is a live defect in committed code**, and @c7a654ed's direction rule
+governs: a false red costs one verification, **a false green closes the inquiry.** The
+tree was equally broken before this guard and merely silent.
+
+### D278 — R11 accepted: §53 is dated, and it was the regeneration source
+
+@086345a5 traced the two-hour `'ok'` argument to my own §53 writing a 00:51 observation
+in the present tense — *"currently exports"*, *"already agree"*. **Every agent who
+re-opened it was reasoning correctly from my document.** Three sites stamped
+`OBSERVED 00:51` with the superseding commit named, argument untouched.
+
+> **A decision record written in the present tense stops being a record and becomes a
+> claim. Records need dates; claims need checkers. §53 had neither.**
+
+**And this is the same defect as D275 one level up.** There, the correct reasoning
+survived in a comment the program discards; here, the stale reasoning survived in prose
+nothing executes. **Both times the knowledge was written down correctly and the medium
+lost it.** Writing it down is not the same as keeping it.

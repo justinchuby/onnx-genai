@@ -123,3 +123,69 @@ describe('the provenance register expires when the server catches up', () => {
     );
   });
 });
+
+/**
+ * D275 — A DUPLICATE KEY IN THE PROVENANCE TABLE IS THE DEFECT THIS PRODUCT REFUSES.
+ *
+ * @c0de4c2e found 'batch.capacity' defined TWICE in the catalogue. JS object
+ * literals permit that silently: no syntax error, no warning, no lint. The
+ * LAST definition wins and the first becomes dead code that still reads
+ * perfectly in the file.
+ *
+ * Which half survives is the part that makes this worth a guard rather than a
+ * fix. The dead entry at :497 is anchored to the SYMBOL `batch_capacity`. The
+ * live entry at :637 is anchored to `admin.rs:178` -- A LINE NUMBER, the exact
+ * citation form this crew ruled against tonight because it drifts. So the
+ * catalogue silently prefers the fragile citation, and a reader who scrolls to
+ * the first entry, finds an exemplary symbol-anchored one, and stops reading
+ * will believe the good one is in force.
+ *
+ * AND THE TWO ENTRIES ARE NOT COPIES. They differ in `label` -- the string the
+ * panel PAINTS. The discarded entry reads 'Effective batch capacity'; the
+ * surviving one reads 'Batch limit'. The served value is
+ * min(max_batch, max_queue_depth), so 'Batch limit' names max_batch: the RAW
+ * ceiling, which is exactly the overstatement the discarded entry's own
+ * comment was written to prevent. The whole --max-batch saga's lesson was
+ * recorded in this file and silently discarded in this file, and the survivor
+ * carries the one label the lesson forbids.
+ *
+ * The file states one field's provenance twice, the program believes one of
+ * them, and nothing anywhere tells you which. That is absent-vs-zero -- the
+ * defect class this dashboard exists to refuse -- sitting inside the
+ * provenance table itself. The runtime object CANNOT show it: by the time the
+ * module is imported, the loser is already gone. Only the source text can.
+ */
+describe('the provenance catalogue defines each field exactly once', () => {
+  const REGISTER_PATH = new URL('./telemetry-provenance.js', import.meta.url);
+
+  /** Keys at the register's own indent level; nested option keys are deeper. */
+  function declaredKeys(source) {
+    return [...source.matchAll(/^ {2}'([\w.]+)':\s*\{/gm)].map((m) => m[1]);
+  }
+
+  it('parses keys out of the register source at all', () => {
+    // ANTI-VACUITY. A regex that matched nothing would report zero duplicates
+    // forever -- an absence of search reported as an absence of evidence, which
+    // is the failure @376a0297 named as AC106.
+    const keys = declaredKeys(readFileSync(REGISTER_PATH, 'utf8'));
+    assert.ok(keys.length > 20, `expected many field keys; parsed ${keys.length}`);
+    assert.ok(keys.includes('batch.utilization'), 'a known key was not parsed');
+  });
+
+  it('declares no field twice', () => {
+    const keys = declaredKeys(readFileSync(REGISTER_PATH, 'utf8'));
+    const seen = new Set();
+    const duplicates = [...new Set(keys.filter((k) => seen.has(k) || (seen.add(k), false)))];
+
+    assert.deepEqual(
+      duplicates,
+      [],
+      'A field is declared more than once in the provenance catalogue. JS ' +
+        'keeps the LAST definition and discards the first silently -- no ' +
+        'error, no warning, no lint -- so the file documents a provenance the ' +
+        'program does not use, and a reader cannot tell which one is live. ' +
+        'The honesty layer must not itself be ambiguous about where a number ' +
+        `came from.\nDUPLICATED: ${duplicates.join(', ')}`,
+    );
+  });
+});
