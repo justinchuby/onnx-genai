@@ -499,3 +499,57 @@ describe('every state rule is drawn from a -rule token', () => {
     );
   });
 });
+
+// D298. THE EXPIRY GATE FOR A SPECIFIED-NOT-BUILT CAVEAT.
+//
+// The provenance badge has no `unknown` variant: `panel-kit.js` resolves an
+// absent or unrecognised source to `derived` via `?? SOURCE_BADGES.derived`,
+// so "we have no provenance for this" renders as a confident "derived by
+// arithmetic on measured inputs". It is SPECIFIED in demo-ux.md D298 and
+// deliberately NOT BUILT tonight -- the two developers who could build it hold
+// the security and poll-loop blockers.
+//
+// This test does NOT assert the defect is correct. Pinning a defect in place
+// is exactly the anti-pattern @73e77d95 found in telemetry-store.test.js:1348,
+// where an assertion required the very disclosure its comment diagnosed.
+//
+// It asserts something narrower and safe in both directions: THE DOCUMENT AND
+// THE STYLESHEET MUST NOT DISAGREE ABOUT WHETHER THE FIX EXISTS. @12e42da8's
+// ruling on caveats -- "the caveat must be present while the fields are
+// unpublished, and must be DELETED the day they land" -- has no mechanism
+// anywhere in this repository, and a caveat that outlives its defect trains
+// readers to skip caveats. Nobody ever files that bug.
+//
+// GREEN TODAY (not built, documented as not built). GREEN AFTER THE FIX, IF
+// AND ONLY IF the section is retired in the same change. RED for whoever
+// builds it and leaves the obituary armed.
+describe('a specified-not-built caveat expires with its defect', () => {
+  const panels = css['panels.css'] ?? '';
+  const spec = read('./design/demo-ux.md');
+
+  const variants = [...panels.matchAll(/\.value__src--([a-z-]+)/g)].map((m) => m[1]);
+  const built = variants.includes('unknown');
+  const caveatArmed = spec.includes('SPECIFIED, NOT BUILT');
+
+  it('actually finds the provenance vocabulary (anti-vacuity)', () => {
+    assert.ok(
+      variants.length >= 4,
+      `Expected the .value__src-- badge variants; found ${variants.length} ` +
+        `(${variants.join(', ') || 'none'}). Either the block was renamed or the ` +
+        'matcher has gone blind. A guard that finds nothing has not passed, it ' +
+        'has failed to run -- fix the matcher, do not relax the threshold.',
+    );
+  });
+
+  it('retires the caveat in the same change that builds the fix', () => {
+    assert.ok(
+      !(built && caveatArmed),
+      'RESOLVED: `.value__src--unknown` now exists in panels.css, so the D298 ' +
+        'provenance-unknown badge HAS been built -- but demo-ux.md still carries ' +
+        'the "SPECIFIED, NOT BUILT" section describing it as outstanding. Delete ' +
+        'that section (§87) and record the commit that built it. A caveat that ' +
+        'outlives its defect is worse than no caveat: it is committed, confident ' +
+        'and false, and it teaches the next reader to skip the real ones.',
+    );
+  });
+});

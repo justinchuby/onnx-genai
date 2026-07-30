@@ -1344,8 +1344,22 @@ The `?` overlay is a real dialog (`role="dialog"`, focus trapped, `Esc` closes, 
 2. **Nothing is modal** except the `?` overlay. No wizards, no dialogs, no blocking confirms.
 3. **Every number is hoverable** and reveals exact value, unit, source class, and cadence. This is the audit mechanism that lets an engineer verify us without reading docs (AC7).
 4. **Errors are UI, never console.** "Failed to fetch" is not an acceptable user-facing string. Every error names the thing, the cause, and the fix.
-5. **Deep links** (AC18): `#scenario=batching&n=16&stagger=200&mode=ab&panels=throughput,kv-memory`. Written on change, read on load. This is how the demo spreads — someone finds a striking configuration and pastes a URL into an issue thread.
+5. ~~**Deep links** (AC18): `#scenario=batching&n=16&stagger=200&mode=ab&panels=throughput,kv-memory`. Written on change, read on load. This is how the demo spreads — someone finds a striking configuration and pastes a URL into an issue thread.~~ 🔴 **NOT BUILT — STRUCK, SEE D296.** *If it is ever built*, the shape **would** be `#scenario=continuous-batching&n=16&stagger=200&mode=ab&panels=throughput,kv-memory`, written on change and read on load, so that someone who finds a striking configuration **could** paste a URL into an issue thread. **No such mechanism exists on this branch.**
 6. **Acronyms** (AC30): every one is an `<abbr>` with a dotted underline and a definition, declared in `meta.acronyms` and rendered on **first appearance per panel** — not once per page, because panels are read out of order.
+
+> 🔴 **D296 — ITEM 5 CARRIED THREE DEFECTS AND THE SMALLEST ONE WAS THE ONLY VISIBLE ONE. @1cb42f0e FOUND THE BAD SCENARIO ID; @376a0297 READ THE OTHER TWO OFF THE SAME LINE AND RULED. I VERIFIED ALL THREE INDEPENDENTLY BEFORE EDITING.**
+> ```
+> (1) 'batching' is not a scenario id.  SCENARIOS = continuous-batching · paged-kv · memory-pressure
+> (2) THE MECHANISM IS ABSENT.  location.search 0 · location.hash 0 · URLSearchParams 0
+>                               pushState 0 · replaceState 0 · hashchange 0
+>     POSITIVE CONTROLS, same corpus, same instrument: addEventListener 4 · fetch( 1 · location 28
+>     (`location` is used 28 times and NEVER for parameters — the instrument reaches.)
+> (3) AC18 IS NOT DEEP LINKS.  demo-spec.md:336 = "A/B comparison is stacked on one
+>                               locked X scale; static runs first."
+> ```
+> **⛔ FIXING ONLY THE ID WOULD HAVE BEEN THE MOST EXPENSIVE AVAILABLE OUTCOME: IT REMOVES THE ONE VISIBLE SYMPTOM AND LEAVES THE FEATURE MISSING, PRODUCING A LINE THAT IS *CORRECT AND STILL ENTIRELY NON-FUNCTIONAL*.** That is the third time tonight repairing the obvious defect would have concealed the real one.
+> **🔑 AND THE CLASS, WHICH IS WHY A DESIGN DOCUMENT NEEDS THE OBITUARY RULE: A DESIGN RECORD WRITTEN IN THE PRESENT TENSE STOPS BEING A RECORD AND BECOMES A CLAIM — and an AC citation upgrades a claim into an *accepted* claim, borrowing the authority of a real criterion. ⚖️ **THE CITATION GRAPH IS 100% HEALTHY — 194 ACs defined, 67 cited, ZERO dangling — AND `(AC18)` WAS STILL WRONG. A BROKEN CITATION ANNOUNCES ITSELF; A CITATION THAT RESOLVES TO THE WRONG TARGET IS INVISIBLE TO EVERY CHECK WE OWN AND IS *MORE* PERSUASIVE THAN NO CITATION AT ALL.** Existence is not identity, in a footnote.
+> **📌 EVERY UNBUILT FEATURE IN THIS DOCUMENT IS NOW REQUIRED TO BE IN THE FUTURE TENSE AND MARKED. Present tense is reserved for what a visitor can actually do.**
 
 ---
 
@@ -2791,7 +2805,9 @@ There is exactly one place this can be caught: **the words on screen.** So the r
 
 ## 38. 🔴 SCENARIO B — THE MECHANISM BEHIND QA'S RED RESULT. `prefix_cache_hit_len` ON DYNAMIC MEANS "TOKENS IN COMMON", NOT "PREFILL SKIPPED"
 
-@fc8b5d97 measured Scenario B red: shared-prefix warm requests **+7.0% SLOWER** than completely-unshared controls, with a sensitivity control proving a real effect would have been a ~90% TTFT collapse — **proven absent, not merely unobserved** — while the hit counter read **95%**. I traced the mechanism, because "cut it" and "re-scope it" are different decisions and only the mechanism distinguishes them.
+@fc8b5d97 measured Scenario B red: ~~shared-prefix warm requests **+7.0% SLOWER** than completely-unshared controls, with a sensitivity control proving a real effect would have been a ~90% TTFT collapse — **proven absent, not merely unobserved**~~ **[STRUCK — WITHDRAWN by its author; the noise floor is 9.8% and swallows it, see D293 below]** — while the hit counter read **95%**. I traced the mechanism, because "cut it" and "re-scope it" are different decisions and only the mechanism distinguishes them.
+
+> 🔴 **D293 — THE TIMING HALF OF THIS PARAGRAPH IS WITHDRAWN BY ITS OWN AUTHOR AND IS STRUCK ABOVE; THE MECHANISM HALF STANDS AND IS WHY THIS SECTION SURVIVES.** @fc8b5d97's interleaved warm re-run put the shared prefix **16.98% FASTER** — opposite sign — at `load average 22.56`, where a **byte-identical binary swung 9.8% from background load alone**. The effect and the **noise floor** are the same size, so there is no measured prefix timing result *in either direction*. ⚖️ **AND NOTE PRECISELY WHAT DIED: "proven absent" was a claim about the SENSITIVITY CONTROL, and a sensitivity control is only as good as the noise floor it assumes. When the floor moved, the control's conclusion moved with it — but the BRANCH MECHANISM at `engine/runtime.rs:1083` was never a timing claim and is untouched.** The decision to cut was correct on the mechanism alone. **Quote this paragraph's predicate, never its conclusion.**
 
 ### 38.1 There are TWO prefix branches and only one of them reuses anything
 
@@ -3116,8 +3132,9 @@ The tempting fix is a `misleading` state with its own treatment. **Reject it, on
 
 ### 44.3 🔴 D130 — TWO MEASUREMENTS OF THE SAME THING DISAGREE IN OPPOSITE DIRECTIONS. DO NOT RESOLVE THIS BY PICKING ONE.
 
-- **@376a0297:** dynamic path, e2e **1.53s → 1.22s** — a 20% *speed-up*, cited as the reason Scenario B ships.
-- **@fc8b5d97:** shared-prefix arm **+7.0% SLOWER**, n=20, with six controls, and a source mechanism explaining why a speed-up is impossible.
+- **@376a0297:** dynamic path, e2e ~~**1.53s → 1.22s** — a 20% *speed-up*, cited as the reason Scenario B ships.~~ **STRUCK — see D294.**
+- **@fc8b5d97:** shared-prefix arm ~~**+7.0% SLOWER**~~, n=20, with six controls, and a source mechanism explaining why a speed-up is impossible. **The timing is WITHDRAWN (D293); the mechanism is not.**
+- 🔴 **D294 — BOTH FIGURES IN THIS COMPARISON ARE NOW WITHDRAWN, AND THAT RESOLVES D130 IN THE ONLY WAY I SAID I WOULD NOT: NOT BY PICKING ONE, BUT BY LOSING BOTH.** @fc8b5d97 retracted the +7.0% after an interleaved re-run gave **16.98% FASTER**, opposite sign, on a box where a byte-identical binary swung **9.8%** from load alone. The 1.53s → 1.22s figure is n=1 with no stated control, which is **below that same noise floor** and was never separable from it. ⚖️ **TWO MEASUREMENTS DISAGREED IN OPPOSITE DIRECTIONS AND THE CORRECT ADJUDICATION WAS THAT NEITHER WAS A MEASUREMENT.** I wrote above that I was not qualified to adjudicate and would not — **that instinct was right for the wrong reason: the question was never which number to believe, it was whether either exceeded the noise. Neither did.**
 
 **These cannot both describe the same code path.** One is n=1 without a stated control; the other is n=20 with controls and a line-numbered mechanism. **I am not qualified to adjudicate the measurement and I am not going to — but the design consequence holds under BOTH: the panel cannot bind `hits` either way**, because under the PM's numbers the counter is still always-true, and under QA's it is also slower. **The scenario's fate is @12e42da8's call; the binding is mine, and it is closed.**
 
@@ -3458,7 +3475,7 @@ AC59 says **never the words "batch size" in UI copy.** The page now renders `eng
 
 ### 51.1 🔴 D150 — THE HEADLINE IS NOT "7% SLOWER". OUR OWN NOISE IS BIGGER THAN THAT.
 
-The measured numbers: ARM A (one shared ~900-token prefix ×6) **1341 ms**; ARM B control (six prefixes differing from token 0) **1254 ms**. Shared is **6.9% slower**.
+The measured numbers: ARM A (one shared ~900-token prefix ×6) ~~**1341 ms**~~; ARM B control (six prefixes differing from token 0) ~~**1254 ms**~~. ~~Shared is **6.9% slower**.~~ **🔴 STRUCK — WITHDRAWN, see D295. The noise floor that retracts these sits in the NEXT paragraph and in this section's own heading, and that is exactly why this sentence was still an offender: a quoted sentence travels alone.**
 
 **Before designing anything I checked that number against the only noise measurement we have.** @fc8b5d97 re-ran a **byte-identical binary on the same machine 75 minutes later**: 33.415 → 30.151 tok/s, **9.8% drift from background load alone.**
 
@@ -5851,3 +5868,84 @@ in-family test GREEN.**
 > RATIO AND ASSERT THAT. And a test never seen to fail is an untested test: all four
 > mutations here were proven red, and each was proven to have LANDED before its red was
 > believed.**
+
+## 87. The provenance badge cannot say "I don't know" — SPECIFIED, NOT BUILT
+
+**D298 — THE COMPONENT WHOSE ENTIRE JOB IS SAYING WHERE A NUMBER CAME FROM HAS NO WAY TO
+SAY IT DOES NOT KNOW.** Ruled into the record by @12e42da8 and deliberately **not built
+tonight**: the two developers who could build it hold the origin-validation blocker and the
+poll-loop blocker, and neither is worth trading for this. It is written down so it cannot
+be lost, and it ships unfixed and disclosed.
+
+### The proof is an asymmetry in our own stylesheet, not an opinion
+
+Measured from committed bytes at HEAD (`git show HEAD:styles/panels.css`), not read from a
+comment. My first attempt aimed at `shell.css` and returned **zero** — `shell.css` has **0**
+modifier selectors, the vocabularies live in `panels.css`. **That zero was a failed search,
+not evidence of absence, and only the modifier-count control distinguished the two.**
+
+```
+.connection--live  --offline  --retrying  --slow  --unknown     5 variants  ✅ has unknown
+.request-state--sent --streaming --done --cancelled --error
+                                                    --unknown   6 variants  ✅ has unknown
+.value__src--server --client --derived --estimated --simulated  5 variants  ⛔ NO unknown
+```
+
+**This page can admit it does not know whether it is connected, and can admit it does not
+know what a request is doing, and CANNOT admit it does not know where a number came from.**
+Two of our three state vocabularies shipped an unknown variant. The third — the one that
+carries the honesty claim itself — did not.
+
+### What actually happens today, from `panel-kit.js` at HEAD
+
+```js
+const badge = SOURCE_BADGES[sourceClass] ?? SOURCE_BADGES.derived;   // :191
+className: ['value__src', `value__src--${sourceClass}`],             // :194
+```
+
+`SOURCE_BADGES` is frozen with exactly five keys and no `unknown`. So an **absent** source,
+an **unrecognised** source, and a **genuinely derived** value all render the glyph `ᴰ` and
+the hover text *"Derived by arithmetic on measured inputs."* — **a positive, specific,
+checkable claim that the value was computed from other values.** We display *no provenance
+for this* as *derived*. **That is the exact defect this product exists to refuse, committed
+by the honesty layer, in the honesty layer's own voice.**
+
+**⚠️ AND A SECOND HALF THE RULING DID NOT NAME, WHICH CHANGES THE FIX:** the `??` resolves
+the **badge** but the className still interpolates the **raw** `sourceClass`. So an
+unrecognised source emits `value__src--<whatever>`, which matches no rule in `panels.css`,
+while the text confidently says *derived*. **The glyph and the class disagree — one has
+fallen back and the other has not.** A fix that only adds an `--unknown` variant to the
+stylesheet does not repair this, because nothing ever emits that class name. **Resolve once,
+and derive both the badge and the class from the same resolution.**
+
+### The specification
+
+1. Add `unknown` to `SOURCE_BADGES` — glyph `?`, title *"Provenance unknown — this value's
+   source was not recorded."* It is a **statement of ignorance**, not of derivation.
+2. Resolve **once**: `const key = SOURCE_BADGES[sourceClass] ? sourceClass : 'unknown'`,
+   then use `key` for **both** the badge lookup and the className. The two halves must never
+   again be able to disagree.
+3. Add `.value__src--unknown` to `panels.css` drawing from `--og-unavail-fg`, matching
+   `.request-state--unknown` at `:655`. **Do not invent a new colour**; the absence
+   vocabulary is already spent and D282 measured the four absence rules at **1.0014:1** in
+   greyscale — a sixth shade would carry nothing.
+4. The guard is the two-sided one: assert `sourceBadge(undefined)` produces the `unknown`
+   class **and** that a valid source still produces its own — without the second arm, an
+   implementation that marks everything unknown passes.
+
+### Why this is level two, and why nothing we own can see it
+
+@12e42da8's ruling was one level short and the correction is mine: the levels are
+**styled → constructible → reachable.** `asset-graph.test.js` measures the first. A
+template-aware scan would measure the second. **Neither can measure the third.** A scan
+proves a class *name can be built*; it cannot prove a *branch is ever taken*. `?? derived`
+is reachable only when a caller passes something absent or misspelled — **a branch no static
+instrument can prove is taken, and the browser only shows it if you happen to load a page
+where it fires.** This is the strongest argument on the branch for the browser-only rule,
+and it limits my own tool.
+
+**🔑 THIRD SURFACE, ONE SHAPE — and this is why it is a class and not an incident: empty
+string → a real scenario · never-written → zero · no-source → derived. Three defaults, three
+authors, three files, each silently converting *we do not know* into a confident specific
+answer.** Every one of them is individually reasonable defensive programming. **A default is
+a claim, and a default chosen for robustness is still a claim nobody checked.**
