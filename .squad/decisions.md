@@ -1,12 +1,19 @@
 # Decisions — live standing directives
 
-Last compacted: 2026-07-30T04:30:00Z (Scribe tidy round 2)
+Last compacted: 2026-07-30T04:30:00Z (Scribe tidy round 2, merged with #427 at 04:10:00Z)
+
+This file is the resolution of two concurrent Scribe compactions that rewrote it in the same
+minutes: #427 ("consolidate CUDA parity 161 state", 04:10:00Z) and this round-2 tidy
+(04:30:00Z). Both were merged; where the two sides disagreed on a single entry (one kept it
+live, one archived it) the entry was kept live, because a wrongly-archived rule silently stops
+governing while a wrongly-kept record only costs bytes.
 
 Full historical ledger archived to `.squad/decisions-archive/2026-07.md`:
 - "Full decisions snapshot archived by size gate — 2026-07-28T11:30:55Z"
 - "Post-rebase decisions archived by size gate — 2026-07-28T11:35:49Z"
 - "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" (first run)
 - "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z" (merge resolution)
+- "Post-rebase narrative tail compacted by size gate — 2026-07-30T04:10:00Z" (#427)
 - "Narrative entries compacted by size gate — 2026-07-30T04:30:00Z (Scribe tidy round 2)"
   — CUDA op-parity wave records (Kuato/Doug), native-KV benchmark record, PTY-harness
   technique notes, the reasoning-fixture review narrative, and the spent round-2 checklist.
@@ -177,6 +184,37 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   #377 verbose, Matthias static-cache implementation, Johnny PackedVarlenAttention,
   Pris multiturn corrected measurements.
 
+## CUDA standard-domain parity — current state (through 161 ops)
+
+Kept live from PR #427's `## Compacted active directives — 2026-07-30T04:10:00Z` section
+(merge round 2). PR #427 folded the CLI/CI/KV/verification/metadata/probe/PTY/inbox/worktree
+rules into one-line bullets and moved their full text to the archive; this merge instead keeps
+the fuller live sections below (a rule kept live governs at spawn; a wrongly-archived rule does
+not), and carries #427's CUDA records — the part it kept live — here. These are the current CUDA
+op-parity records; the earlier pre-161 wave narrative (SiLU/Instance/GroupNorm 152->154,
+LpPool/CenterCropPad/Col2Im 154->157, and Doug's ORT-1.28 27B INT4 benchmark) is archived
+under the 2026-07-30 compaction entries in `.squad/decisions-archive/2026-07.md`.
+
+### 2026-07-30: Add QLinearMatMul and common Resize CUDA parity
+**By:** Kuato
+**What:** CUDA now claims QLinearMatMul for Int8/Uint8 per-tensor and operand-axis quantization, plus Resize nearest/linear with half_pixel, align_corners, and asymmetric coordinates using scales or sizes. Cubic, pytorch_half_pixel, tf_crop_and_resize, half_pixel_symmetric, antialiasing, and non-stretch aspect policies remain fail-closed.
+**Why:** These implementations match the CPU EP's integer accumulation/requantization and interpolation formulas while raising standard-domain CUDA parity from 157 to 159 without claiming unsupported Resize semantics.
+
+### 2026-07-30: Add common ConvTranspose and GridSample CUDA geometry paths
+**By:** Kuato
+**What:** CUDA now covers 1-D/2-D ConvTranspose with explicit/VALID padding, strides, dilation, output padding, groups/depthwise, and optional bias, plus 4-D GridSample bilinear/nearest with zeros/border/reflection padding and both align_corners values. SAME auto-padding, output_shape-driven ConvTranspose geometry, cubic GridSample, and volumetric GridSample remain fail-closed.
+**Why:** Output-owned NVRTC kernels match the CPU EP formulas without atomic accumulation nondeterminism, raising advertised CUDA coverage from 159 to 161 while refusing geometry modes not validated in this wave.
+
+### 2026-07-30: Shape-aware CUDA claim gates for deferred ranks
+**By:** Mary (revision to Kuato PR #424); reviewed by Lori
+**What:** CUDA claim gates for rank-dependent operators must distinguish unsupported static shapes from deferred rank information. The #424 revision introduced a `require_input_rank` helper so ConvTranspose/GridSample claim only when rank is known and supported, while unknown/deferred rank preserves CPU fallback instead of falsely declining the graph.
+**Why:** Fail-closed CUDA claims are correct only when the shape fact is known. Treating deferred rank as unsupported breaks heterogeneous fallback and can turn safe CPU execution into an over-eager CUDA refusal. Future CUDA claim gates with rank/shape predicates must be shape-aware and preserve CPU fallback for deferred facts.
+
+### 2026-07-30: CUDA standard-domain parity reaches 161 covered ops
+**By:** Squad CUDA parity wave
+**What:** Merged #423 (`eed2fbf2`) for `QLinearMatMul` + common `Resize` and #424 (`1574e87a`, Mary revision `93d9e7b8`) for `ConvTranspose` + `GridSample`, raising advertised CUDA coverage from 157 to 161 ops. Lori approved #423 and, after requesting changes on #424, approved Mary's shape-aware correction with independent on-device evidence across 308 GPU parity cases.
+**Why:** The tractable CUDA parity wave is now landed through 161 ops while retaining fail-closed behavior for unsupported Resize cubic/coordinate modes, ConvTranspose output-shape/SAME modes, and GridSample cubic/volumetric modes. Remaining heavy gaps are NonMaxSuppression and Resize-cubic.
+
 ## CLI charter — standing directives
 
 These two govern all ongoing CLI work and outlive the PRs that produced them. They were
@@ -219,6 +257,15 @@ warm/cold) offers early feedback but never substitutes for the full gate. Window
 retains tests/clippy but not llvm-cov coverage (duplicates x64/macOS while owning the
 CI critical path — up to 26 min). Platform execution is the signal; instrumentation is
 the cost. Current critical path: `CLI ORT (Windows x86_64)` at ~18m50s.
+
+## 2026-07-29 — Native multi-turn performance claims must use the session-persistent KV API
+
+**By:** Pris (PR #408); kept live from PR #427's consolidation (merge round 2)
+
+Native multi-turn performance claims must use the session-persistent KV API, not the old
+stateless path, unless explicitly labeled `--native-stateless`. The full benchmark record
+(Qwen2.5-0.5B-f16 and TinyStories-33M, M1 Max) is archived under the 2026-07-30 compaction
+entries.
 
 ## 2026-07-29 — Verification steps that warn instead of fail are not verification
 
@@ -391,24 +438,31 @@ The full review narrative is archived (round-2 compaction). These are the bindin
 
 ## 2026-07-30 — Scribe tidy round 3: what to check next
 
-**By:** Scribe (tidy round 2)
+**By:** Scribe (tidy round 2, post-merge)
 
-Round 2 compacted `decisions.md` from 40,477 → ~24 KB by archiving the CUDA op-parity wave
-changelog, the native-KV benchmark record, PTY-harness notes, and the reasoning-fixture
-narrative; merged the tracked `kuato-cuda-parity-4.md` drop; and swept histories. For round 3:
+Round 2 compacted `decisions.md` from 40,477 → ~30 KB and then had to **merge a concurrent
+compaction**: PR #427 ("consolidate CUDA parity 161 state") rewrote the same file down to
+14,913 bytes in the same minutes, while I was pushing. Both were merged by property (union of
+standing rules live; disagreements resolved live). **The concurrent-Scribe collision is now
+observed, not predicted — the window was minutes, not days.** Two conflicting resolutions of a
+single hand-merged file is exactly the failure the tracked inbox was meant to remove but does
+not: the inbox stopped drop-loss, not the hand-merge rewrite. For round 3:
 
-- **`decisions.md` size.** Re-measure first. The dominant regrowth source is other teams'
-  dated `## 2026-07-…` / `### 2026-07-…` wave changelog entries (CUDA op-parity especially):
-  they are records of merges, not standing rules, so archive them by property and keep only
-  the standing constraints (dispatch-manifest inverse rule, BNNS/Conv/GEMM guidance) live.
-  Re-run compaction against tip immediately before merge — concurrent appends silently
-  reinflate without a conflict.
-- **Inbox.** Still tracked. Merge every `*.md` except `README.md`; dedupe against both the
-  live file and the archive (drops from other machines are visible here and another team's
-  Scribe may already have merged the same file — check the archive, not just the live file,
-  before re-adding). CUDA wave drops belong in the archive changelog, not the live file.
-- **Histories.** Sweep all `.squad/agents/*/history.md` against the chronicle gate (>8
-  dated entries, or oldest live entry predating the previous wave measured against that
-  file's newest entry — never against today). deckard/roy re-accumulate fastest.
+- **Adopt the round-2 Task-D recommendation.** The cheap fix is structural: keep the live file
+  for **standing rules only** (rarely edited, low collision) and route **all dated wave/
+  changelog records** through inbox drops that Scribe files **straight into the monthly
+  archive, never into the live file**. #427 kept four CUDA wave records live; round 2 archived
+  the equivalents — that divergence *is* the collision. If wave records never enter the live
+  file, two Scribes cannot disagree about them.
+- **`decisions.md` size / dedup.** Re-measure against tip first. When two compactions race,
+  reconcile by property, keep every rule either side kept live, and dedupe the archive —
+  build it as `base + one clean appendix`, never by concatenating two rewritten tails.
+- **Inbox.** Still tracked. Merge every `*.md` except `README.md`; dedupe against **both** the
+  live file and the archive — another team's Scribe may have merged the same drop on another
+  machine (this round #427 merged `kuato-cuda-parity-4.md` live while I archived it; I had to
+  match prose because drops carry no team/machine attribution). Add attribution to drops.
+- **Histories.** Sweep all `.squad/agents/*/history.md` against the chronicle gate (>8 dated
+  entries, or oldest live entry predating the previous wave measured against that file's newest
+  entry — never against today). deckard/roy re-accumulate fastest.
 - **Do not archive agent directories.** Fail-closed; with three teams active elsewhere,
   absence of local commits/drops/history proves nothing.
