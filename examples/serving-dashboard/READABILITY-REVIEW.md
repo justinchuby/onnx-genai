@@ -84,29 +84,48 @@ untested — no test asserts model-card's `data-state` at all. Independently fou
 Reviewer, who owns the severity call; listed here because it is the one place the two-vocabulary
 split is physically visible.
 
-### R10 — a withdrawn measurement survives at ten sites, three of them assertion strings
+### R10 — a withdrawn measurement propagated faster than its retraction
 
 The `7.0% slower` prefix result was withdrawn by its author (the re-run came back with the
 opposite sign, on a machine where a byte-identical binary swung 9.8% from ambient load). The
-retraction reached the discussion four times and the tree zero times.
+retraction reached the discussion four times before it reached the tree once.
+
+**This finding deliberately carries no count.** An earlier draft of it said "ten sites"; a sweep
+landed minutes later and the number was false while the defect it described was still real.
+Carry the predicate instead:
 
 ```
-scenario-origins.js · telemetry-provenance.js ×2 · registry.test.js ×2
-prefix-counters-forbidden.test.js ×3   (one is an assertion string)
-dashboard/honesty.test.js              (assertion string)
-check-readme-claims.test.js            (assertion string — EXEMPT, see next paragraph)
+grep -riE '7\.0%|7% slower|1341|1254|prefix reuse absent' $(git ls-files)
 ```
 
-Search `1341` and `1254`, not only `7.0%`, or a sweep misses two sites.
+Two flags that cost a measurement when omitted: `-i`, because the live text is `7% SLOWER` in
+caps, and the raw values `1341`/`1254`, because some sites quote the measurement without quoting
+the percentage. A search missing either returns a clean, confident, wrong zero.
 
-**Do not sweep `check-readme-claims.test.js`.** It asserts the *disagreement* — "one controlled
-run put the shared arm 7% slower, another put it 17% faster" — so its claim was never the effect
-size. It is still true, it is the ratified headline, and it is the template the other nine should
-become. A blind substitution breaks the only site that was already right.
+**At the time of writing the shipping test files have been swept, and the surviving carrier in
+shipping JS is `CUT_SCENARIOS` in `scenario-origins.js`.** Its fix is surgical rather than a
+substitution, because the paragraph holds both a withdrawn claim and the argument's real
+evidence:
 
-The replacement claim needs no timing at all and no machine can perturb it: twelve requests with
-six deliberately unique prompts produced twelve hits and a 0.9375 rate, so the counter cannot
-distinguish reuse from no-reuse.
+```
+"...measured and found ABSENT on both execution paths (QA, n=6 per arm with a
+ sensitivity control: shared-prefix requests ran 7% SLOWER than a zero-sharing   <- WITHDRAWN
+ control, while the engine's hit counter fired on every request including all
+ six controls)."                                                                 <- LOAD-BEARING
+```
+
+Delete the timing clause; keep the counter clause. Counter arithmetic cannot be overturned by a
+re-run on a quieter machine; a stopwatch can. **The argument gets stronger without it.**
+
+**Two sites must not be swept.** `check-readme-claims.test.js` asserts the *disagreement* — "one
+controlled run put the shared arm 7% SLOWER, another put it 17% faster" — so its claim was never
+the effect size; it is still true and it is the template the others should become.
+`check-perf-claims.test.js` is the guard that detects this entire class, and a guard necessarily
+quotes what it forbids. A blind substitution breaks the only two sites that were already right.
+
+*This document is itself a carrier, three times, and that is the correct state — a retraction has
+to name what it retracts. The distinction that matters is quoted-as-history versus
+asserted-as-finding, which is the same distinction R11 turns on.*
 
 ### R11 — the design record describes the enum in the present tense, and it is the regeneration source
 
@@ -151,6 +170,20 @@ prose site is the one people read before deciding.
 
 > A decision record written in the present tense stops being a record and becomes a claim.
 > Records need dates; claims need checkers. §53 has neither.
+
+**The same pattern, done right, landed while this review was being written** — worth naming
+because it is the counter-example rather than another complaint. `dashboard/scheduling.js`
+rebound away from a key with no producers, and its comment explains the *dead* binding in the
+past tense: *"`scheduler.max_batch` had ZERO producers … the suite was green because the tests
+handed the panel the value the server could not."* `scheduler.max_batch` now has **zero** code
+readers; both remaining occurrences are prose describing its own removal. That is exactly the
+tense discipline §53 is missing, from the same night and the same crew.
+
+*One consequence worth flagging for anyone auditing that fix:* `grep scheduler.max_batch` still
+returns hits, in the file most likely to be cited, and every hit is a comment about the repair.
+A reader who greps for the symptom finds the symptom and concludes it is unfixed. **The honest
+past-tense comment and the live defect are indistinguishable to a text search** — so verify this
+class by asking whether anything *reads* the key, not whether anything *mentions* it.
 
 **Related, smaller, same root:** 11 deictic references — *"see above"*, *"see below"*, *"the
 line above"* — across 7 tracked documents. A deictic is a citation with no resolvable target:
