@@ -18,9 +18,23 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/build_qwen.sh"
 
+# The model-fidelity checks need a real export, and models are gitignored, so
+# in a worktree they used to skip unconditionally -- meaning the branch that
+# gets reviewed was structurally incapable of running its own strongest
+# evidence. Resolve against a sibling checkout too. Every use below is
+# read-only (`--check` never writes), so pointing at a primary checkout cannot
+# disturb a perf baseline.
+# shellcheck source=scripts/lib/models_dir.sh
+. "$ROOT/scripts/lib/models_dir.sh"
+
 TESTS_RUN=0
 TESTS_FAILED=0
 TESTS_SKIPPED=0
+# Skips are not equal. The model-fidelity checks are this file's strongest
+# evidence, so their absence gets named specifically in the summary rather than
+# folded into a total where three missing proofs look like three missing
+# conveniences.
+MODEL_CHECKS_SKIPPED=0
 
 # A Python interpreter that cannot import Mobius, used to simulate a machine
 # where Mobius was never installed. Falls back to skipping those cases.
@@ -55,6 +69,12 @@ pass() {
 skip() {
   TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
   printf 'skip %s\n' "$1"
+}
+
+# skip_model <reason> - a skip that also records lost model-fidelity evidence.
+skip_model() {
+  MODEL_CHECKS_SKIPPED=$((MODEL_CHECKS_SKIPPED + 1))
+  skip "$1"
 }
 
 # assert_contains <name> <haystack> <needle>
@@ -340,18 +360,19 @@ if [ -n "$GENERATOR_PYTHON" ] &&
   # that catches lexical-vs-numeric layer ordering: sorting the port names as
   # strings puts key_cache.10 before key_cache.2 and silently mis-pairs every
   # buffer past the ninth layer, which the 1-layer fixture cannot detect.
-  real_scatter="$ROOT/models/qwen2.5-0.5b-scatter-v2"
-  if [ -f "$real_scatter/model.onnx" ] && [ -f "$real_scatter/inference_metadata.yaml" ]; then
+  real_scatter="$(resolve_model_dir "$ROOT" qwen2.5-0.5b-scatter-v2 || true)"
+  if [ -n "$real_scatter" ] && [ -f "$real_scatter/model.onnx" ] &&
+    [ -f "$real_scatter/inference_metadata.yaml" ]; then
     assert_derives_io "generator reproduces the 24-layer scatter model io block" \
       "$real_scatter" "$real_scatter/inference_metadata.yaml"
   else
-    skip "24-layer generator check (no local $real_scatter)"
+    skip_model "24-layer generator check (no qwen2.5-0.5b-scatter-v2 in any candidate models dir)"
   fi
 
   # Ordering is a correctness property, not a cosmetic one. Reuse the --check
   # output captured in the shell; never invoke the generator without --check
   # from the tests, since without it the generator WRITES to the model dir.
-  if [ -f "$real_scatter/model.onnx" ]; then
+  if [ -n "$real_scatter" ] && [ -f "$real_scatter/model.onnx" ]; then
     TESTS_RUN=$((TESTS_RUN + 1))
     derived_block="$("$GENERATOR_PYTHON" "$GENERATOR" "$real_scatter" --check 2>&1)"
     if printf '%s' "$derived_block" | "$GENERATOR_PYTHON" -c '
@@ -366,14 +387,14 @@ sys.exit(0 if indices == list(range(len(indices))) else 1)
         "got: $(printf '%s' "$derived_block" | grep -c 'key_cache\.') entries out of order"
     fi
   else
-    skip 'numeric layer ordering check (no local scatter model)'
+    skip_model 'numeric layer ordering check (no local scatter model)'
   fi
 
   # A dynamic-cache model has no scatter ABI; say so instead of emitting a
   # bogus declaration.
   TESTS_RUN=$((TESTS_RUN + 1))
-  dynamic_model="$ROOT/models/qwen2.5-0.5b"
-  if [ -f "$dynamic_model/model.onnx" ]; then
+  dynamic_model="$(resolve_model_dir "$ROOT" qwen2.5-0.5b || true)"
+  if [ -n "$dynamic_model" ] && [ -f "$dynamic_model/model.onnx" ]; then
     if output="$("$GENERATOR_PYTHON" "$GENERATOR" "$dynamic_model" --check 2>&1)"; then
       fail "generator rejects a dynamic-cache model"
     else
@@ -385,7 +406,7 @@ sys.exit(0 if indices == list(range(len(indices))) else 1)
     fi
   else
     TESTS_RUN=$((TESTS_RUN - 1))
-    skip "dynamic-model rejection check (no local $dynamic_model)"
+    skip_model "dynamic-model rejection check (no qwen2.5-0.5b in any candidate models dir)"
   fi
 else
   skip 'static_cache generator checks (onnx/pyyaml unavailable)'
@@ -747,6 +768,119 @@ else
     "scripts/lib/mobius_env.sh sends readers to README.md section '$cited_heading', which no longer exists; update both together"
 fi
 
+# ---------------------------------------------------------------------------
+# scripts/lib/models_dir.sh
+#
+# The resolver decides whether this file's strongest checks RUN or SKIP, so a
+# bug here is silent by construction: it does not fail anything, it just makes
+# evidence quietly stop existing. These use synthetic trees under a temp dir,
+# never the real models directory.
+# ---------------------------------------------------------------------------
+
+models_fixture="$(mktemp -d)"
+mkdir -p "$models_fixture/repo/models/.hf_cache" \
+  "$models_fixture/repo/models/.scratch" \
+  "$models_fixture/onnx-genai/models/qwen2.5-0.5b-scatter-v2"
+: >"$models_fixture/onnx-genai/models/qwen2.5-0.5b-scatter-v2/model.onnx"
+
+# THE TRAP THIS FILE EXISTS FOR: an empty-but-present models/ holding only
+# .hf_cache and .scratch is the normal state of a fresh worktree. A `[[ -d ]]`
+# test on the directory selects it and defeats the sibling fallback, which is
+# exactly how run-demo.sh started failing tonight with no edit to it.
+TESTS_RUN=$((TESTS_RUN + 1))
+resolved="$(MODELS_DIR='' resolve_model_dir "$models_fixture/repo" qwen2.5-0.5b-scatter-v2 || true)"
+# Compare against the physical path: the fixture root itself may be a symlink
+# (macOS /tmp is), so a literal string compare fails for a reason that has
+# nothing to do with the behaviour under test.
+expected_sibling="$(cd "$models_fixture/onnx-genai/models/qwen2.5-0.5b-scatter-v2" && pwd -P)"
+case "$resolved" in
+  "$expected_sibling")
+    pass "an empty-but-present models/ does not defeat the sibling fallback" ;;
+  *)
+    fail "an empty-but-present models/ does not defeat the sibling fallback" \
+      "resolved to '$resolved'; a dir holding only .hf_cache/.scratch must lose to a sibling that has the model" ;;
+esac
+
+# A dotfile-only directory must not read as "contains a model". Without this,
+# the check above could pass for the wrong reason on some other machine.
+TESTS_RUN=$((TESTS_RUN + 1))
+if models_dir_contains_model "$models_fixture/repo/models"; then
+  fail "a models dir holding only dotfiles does not count as containing a model" \
+    "an empty-but-present dir was accepted, so the fallback would never be reached"
+else
+  pass "a models dir holding only dotfiles does not count as containing a model"
+fi
+
+# An explicit override must never silently fall through to somewhere the caller
+# did not name -- that would run a check against a model they did not choose
+# and report it under their command.
+TESTS_RUN=$((TESTS_RUN + 1))
+if MODELS_DIR="$models_fixture/repo/models" \
+  resolve_model_dir "$models_fixture/repo" qwen2.5-0.5b-scatter-v2 >/dev/null 2>&1; then
+  fail "MODELS_DIR does not fall back to a sibling checkout" \
+    "an explicit MODELS_DIR that lacks the model resolved anyway, so the run silently used a model the caller did not name"
+else
+  pass "MODELS_DIR does not fall back to a sibling checkout"
+fi
+
+# Resolution is per MODEL, not per directory: a checkout may hold the scatter
+# model and not the dynamic one, and a whole-directory match would send both
+# lookups to a root that satisfies only one.
+TESTS_RUN=$((TESTS_RUN + 1))
+if MODELS_DIR='' resolve_model_dir "$models_fixture/repo" qwen2.5-0.5b >/dev/null 2>&1; then
+  fail "a model missing from every candidate resolves to nothing" \
+    "resolved a model that exists nowhere, so a check would run against the wrong export"
+else
+  pass "a model missing from every candidate resolves to nothing"
+fi
+
+rm -rf "$models_fixture"
+
+# The loud banner is the only thing standing between a narrow run and a reader
+# who believes it was a full one, and it lives at the very end of this file
+# where it is easy to lose in an edit. Guard its two load-bearing properties:
+# that a model-fidelity skip is counted separately, and that the banner names
+# the command that restores the evidence. A banner that reported only a TOTAL
+# would say "3 skipped" for three missing conveniences and three missing proofs
+# alike, which is the exact ambiguity it exists to remove.
+TESTS_RUN=$((TESTS_RUN + 1))
+# Written to a file rather than piped into grep: under `set -o pipefail`,
+# `producer | grep -q` lets grep exit early on a match, the producer takes
+# SIGPIPE, and the pipeline reports 141 -- turning a MATCH into a failure,
+# nondeterministically, depending on which process wins the race.
+self_src_file="$(mktemp)"
+grep -v '^[[:space:]]*#' "$ROOT/scripts/build_qwen_test.sh" >"$self_src_file"
+missing_banner_parts=""
+# Each pattern uses a glob char class so it does NOT literally contain the
+# string it searches for. Without that, these three patterns are themselves
+# occurrences, the guard matches its own source, and it passes green with the
+# entire banner deleted. That has now happened three times in this repo; a
+# self-inspecting test must be written so it cannot see itself.
+# Each pattern uses a regex char class so it does NOT literally contain the
+# string it searches for. Without that, these patterns are themselves
+# occurrences, the guard matches its own source, and it passes green with the
+# entire banner deleted. That has now happened three times in this repo; a
+# self-inspecting test must be written so it cannot see itself.
+# shellcheck disable=SC2016  # the $(( )) is a literal being searched for, not an expansion
+if ! grep -q 'MODEL_CHECK[S]_SKIPPED=\$((MODEL_CHECKS_SKIPPED + 1))' "$self_src_file"; then
+  missing_banner_parts="$missing_banner_parts skip_model-does-not-count"
+fi
+if ! grep -q 'MODEL[S]_DIR=/path/to/onnx-genai/models' "$self_src_file"; then
+  missing_banner_parts="$missing_banner_parts banner-omits-the-enabling-command"
+fi
+# shellcheck disable=SC2016  # literal search string, not an expansion
+if ! grep -q 'i[f] \[ "\$MODEL_CHECKS_SKIPPED" -gt 0 \]' "$self_src_file"; then
+  missing_banner_parts="$missing_banner_parts banner-does-not-branch-on-model-skips"
+fi
+
+rm -f "$self_src_file"
+if [ -z "$missing_banner_parts" ]; then
+  pass "the skip banner names the lost model evidence and how to restore it"
+else
+  fail "the skip banner names the lost model evidence and how to restore it" \
+    "missing:$missing_banner_parts; without these a narrower run reports a bare total and reads as a full pass"
+fi
+
 # A raw skip-printf bypasses the counter, so the summary would under-report and
 # the weaker green becomes invisible again. Comments are stripped before the
 # count: this guard is about code, and prose that merely discusses the pattern
@@ -774,7 +908,37 @@ esac
 printf '\n%d tests, %d failed, %d skipped\n' \
   "$TESTS_RUN" "$TESTS_FAILED" "$TESTS_SKIPPED"
 if [ "$TESTS_SKIPPED" -gt 0 ]; then
-  printf 'note: %d check(s) did not run on this machine, so this pass is narrower than a full run. Read the skip lines before citing it as green.\n' \
-    "$TESTS_SKIPPED"
+  # A reviewer must not be able to finish this run without seeing what did not
+  # execute. "Visible if you look" is not visible: relying on a reader noticing
+  # skip lines scrolled past a hundred ok lines is how a weaker green passes for
+  # a full one. So this is a block, at the end, after the count they already
+  # read, naming the missing evidence and the exact command that restores it.
+  printf '\n'
+  printf '=======================================================================\n'
+  printf '  %d CHECK(S) DID NOT RUN. THIS PASS IS NARROWER THAN A FULL RUN.\n' "$TESTS_SKIPPED"
+  printf '=======================================================================\n'
+  if [ "$MODEL_CHECKS_SKIPPED" -gt 0 ]; then
+    printf '  MODEL-FIDELITY EVIDENCE DID NOT RUN (%d check(s)).\n' "$MODEL_CHECKS_SKIPPED"
+    printf '  Not verified: that the generator reproduces the real 24-layer\n'
+    printf '  export byte-for-byte, and that cache ports pair by NUMERIC layer\n'
+    printf '  index. Lexical ordering puts key_cache.10 before key_cache.2 and\n'
+    printf '  silently mis-pairs every buffer past the ninth layer -- the\n'
+    printf '  1-layer fixture cannot detect it. These are the strongest checks\n'
+    printf '  in this file and they are the ones that just did not happen.\n'
+    printf '\n'
+    printf '  Cause: models are gitignored, so no clone or worktree has them.\n'
+    # Report what was ACTUALLY searched. MODELS_DIR suppresses the candidate
+    # list entirely, so printing the candidates under an override would put a
+    # false statement inside the block whose entire purpose is accuracy.
+    if [ -n "${MODELS_DIR:-}" ]; then
+      printf '  Searched: %s only (MODELS_DIR is set, so no fallback was tried)\n' "$MODELS_DIR"
+    else
+      printf '  Searched: %s\n' "$(models_dir_candidates "$ROOT" | tr '\n' ' ')"
+    fi
+    printf '  Enable with ONE command, pointing at a checkout that has them:\n'
+    printf '    MODELS_DIR=/path/to/onnx-genai/models scripts/build_qwen_test.sh\n'
+  fi
+  printf '  Read every skip line above before citing this run as green.\n'
+  printf '=======================================================================\n'
 fi
 [ "$TESTS_FAILED" -eq 0 ]

@@ -89,6 +89,44 @@ it is a different defect with a different fix.
 which is gitignored (`.gitignore:2`) and therefore absent from this branch.
 A skip here is expected, not a regression.
 
+**(d) The build-script suite's model-fidelity evidence: runs here, will NOT run
+for you unless you have a models directory.** This one is different from (c) in
+a way that matters, so please do not read it as more of the same.
+
+`scripts/build_qwen_test.sh` reports **81 tests, 0 failed, 0 skipped** on a
+machine that has a checkout containing `models/qwen2.5-0.5b-scatter-v2`. It
+finds one via `scripts/lib/models_dir.sh`, which searches `<repo>/models` and
+then the sibling `../onnx-genai/models`, accepting a candidate only if it
+actually **contains** `model.onnx` — an empty-but-present `models/` holding
+only `.hf_cache` and `.scratch` is the normal state of a fresh worktree, and a
+plain directory-existence test selects it and defeats the fallback.
+
+**On a machine with no models anywhere — a fresh clone, or CI — three checks
+skip, and they are the strongest three in the file:**
+
+| Check | What is not verified when it skips |
+|---|---|
+| `generator reproduces the 24-layer scatter model io block` | that the generator matches a real 24-layer export rather than only the 1-layer fixture |
+| `cache ports are ordered numerically by layer, not lexically` | that `key_cache.10` sorts after `key_cache.2` |
+| `generator rejects a dynamic-cache model` | that a model with no scatter ABI is refused instead of given a bogus declaration |
+
+The middle one is the load-bearing one: lexical ordering silently mis-pairs
+every buffer past the ninth layer, and **the 1-layer fixture cannot detect it,
+by construction.** All three are mutation-proven — changing the generator's
+`sorted(...)` to a lexical sort turns them red.
+
+You do not have to remember any of this. **A run that skips them prints a
+banner naming the lost evidence and the single command that restores it**
+(`MODELS_DIR=/path/to/onnx-genai/models scripts/build_qwen_test.sh`). The
+banner exists because relying on a reviewer noticing three `skip` lines
+scrolled past seventy `ok` lines is not a control — it is a hope, and it is the
+same "visible if you look" that let `panels.css` survive eight reports.
+
+> **The residual gap, stated plainly: `0 skipped` on this branch is a claim
+> about the machine that ran it, not about the branch.** If your run says
+> `3 skipped`, the suite is telling you the truth and the model-fidelity
+> evidence is genuinely absent from your run — not weakened, absent.
+
 ---
 
 ## 2. `/v1/resources`: fixed on one path only
