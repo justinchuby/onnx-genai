@@ -644,7 +644,11 @@ An early check fired one identical long prefix twice, saw the counter move and
 latency fall 1.53 s → 1.22 s, and concluded the cache worked — with no control
 arm, so warm-up and a cache hit were the same observation. A later controlled
 run put the shared-prefix arm **7 % slower** than a control sharing nothing. A
-third run, warm and interleaved, put it **17 % faster**.
+third run, warm and interleaved, put it **17 % faster**. **Neither figure is a
+result: the author of the 7 % withdrew it when the interleaved re-run came back
+with the opposite sign, and both are smaller than this machine's measured 9.8 %
+noise floor.** They are reported here as evidence about the *instrument*, not
+about the cache.
 
 **Those last two contradict each other, so the instrument cannot resolve a
 difference of that size.** The measurements were taken on a machine at load

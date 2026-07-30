@@ -248,3 +248,96 @@ test('no document states the speedup without the per-stream tradeoff', () => {
       `tradeoff presented as a pure win is a lie told with true numbers.`,
   );
 });
+
+test('no document presents a withdrawn prefix timing figure without its noise floor', () => {
+  // The +7.0% "shared prefixes are SLOWER" result was WITHDRAWN BY ITS OWN
+  // AUTHOR after a warm interleaved re-run came back 16.98% FASTER -- the
+  // opposite sign -- on a box where a byte-identical binary swung 9.8% from
+  // ambient load alone. The effect and the noise floor are the same size, so
+  // there is no measured prefix timing result in EITHER direction.
+  //
+  // It reached me anyway, twice, relayed as "the single most credibility-
+  // earning sentence we have". I did not publish it, but only because it
+  // arrived as a measurement quoted from a code comment and I had not yet
+  // resolved it against an artefact. That is luck, not a process, and luck
+  // does not survive the next draft.
+  //
+  // 🔴 THIS GUARDS THE DIRECTION NOTHING ELSE WE BUILT GUARDS. Every other
+  // honesty mechanism here -- the five field states, the provenance axis, the
+  // em-dash, the claim-position rule -- points ONE WAY: it stops us claiming a
+  // capability we lack. NOT ONE of them stops us overclaiming CERTAINTY THAT
+  // SOMETHING IS ABSENT. Fabricated doubt is as serious as fabricated
+  // confidence and it is harder to catch, because it wears the costume of
+  // rigour and nobody challenges the person arguing for less.
+  //
+  // Scoped by PARAGRAPH, not by document, and only where a prefix discussion
+  // and a percentage delta actually co-occur. A bare "7 %" anywhere in the
+  // repo is not evidence of anything -- a checker that fired on that would be
+  // reworded away within a day and would teach everyone to ignore it.
+  const docs = execFileSync('git', ['ls-files', '*.md'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter(Boolean)
+    .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f))
+    // EXEMPTION, DOCUMENTED SO IT CANNOT BECOME AN OVERSIGHT: design/demo-ux.md
+    // is @0837fdf9's design record and currently has THREE unqualified
+    // paragraphs (the +7.0% Scenario B line, the 1.53s->1.22s 20% speed-up
+    // line, and the ARM A/ARM B 1341ms/1254ms numbers). They are real and I
+    // have reported them to its owner rather than editing another agent's file
+    // mid-flight. Asserting them here today would only redden my suite with
+    // their bug at the gate. THIS EXEMPTION IS A PROMISE TO COME BACK: when
+    // those three paragraphs carry their noise floor, delete this filter.
+    .filter((f) => !/^design\//.test(f));
+
+  assert.ok(docs.length > 0, 'no tracked .md files found — this check would pass vacuously');
+
+  const offenders = [];
+  let paragraphsInspected = 0;
+
+  for (const doc of docs) {
+    const text = readFileSync(join(HERE, doc), 'utf8');
+    for (const para of text.split(/\n\s*\n/)) {
+      // Does this paragraph discuss prefix reuse AND state a timing delta?
+      if (!/prefix/i.test(para)) continue;
+      if (!/\b(?:6\.9|7|7\.0|16\.98|17)\s*%/.test(para)) continue;
+      if (!/slower|faster/i.test(para)) continue;
+      paragraphsInspected += 1;
+
+      // Then it MUST carry, in the same paragraph, the reason the number is
+      // not a result: the noise floor, the contradicting run, or an explicit
+      // unresolvable/withdrawn marker. Same paragraph, because a qualifier
+      // three screens away does not travel with a quoted sentence.
+      // SUPERSEDED / struck-in-place records are QUALIFIED, not offenders.
+      // demo-ux.md deliberately preserves the withdrawn figures under strike
+      // markers because the POINT is the timestamp -- we drew the result
+      // before we measured it. A checker that demanded those be edited would
+      // be ordering the deletion of the evidence that we were once wrong,
+      // which is the opposite of this suite's purpose.
+      const qualified =
+        /9\.8\s*%|noise floor|below the floor|unresolvable|unverified|withdrew|withdrawn|contradict|SUPERSEDED|struck|CORRECTED BY MEASUREMENT/i.test(
+          para,
+        );
+      if (!qualified) offenders.push(`${doc}: "${para.trim().slice(0, 90).replace(/\s+/g, ' ')}…"`);
+    }
+  }
+
+  // Empty-input floor. If the matcher stops recognising these paragraphs it
+  // inspects nothing, reports nothing, and passes -- growing more trusted with
+  // every green run. The README discusses this at length, so zero is wrong.
+  assert.ok(
+    paragraphsInspected > 0,
+    'this check inspected ZERO paragraphs, so it proved nothing. The prefix ' +
+      'timing discussion is expected in README.md; the matcher is broken.',
+  );
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} paragraph(s) state a prefix timing delta as a finding ` +
+      `without the noise floor that withdraws it:\n  ${offenders.join('\n  ')}\n` +
+      `There is NO measured prefix timing result in either direction. The ` +
+      `counter finding is the one that stands, and it needs no stopwatch: ` +
+      `twelve requests with six deliberately unique prompts produced twelve ` +
+      `hits and a 0.9375 rate, so the counter cannot tell reuse from no-reuse.`,
+  );
+});
