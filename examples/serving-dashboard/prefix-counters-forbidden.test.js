@@ -99,6 +99,63 @@ function sourceFiles(dir = ROOT, found = []) {
 }
 
 describe('the prefix-cache counters are unnameable', () => {
+  // ⚠️ THIS CHECK PASSED WITH THE ENTIRE DASHBOARD EMPTIED AND COMMITTED.
+  //
+  // Found by mutation: every tracked non-test file in examples/serving-dashboard
+  // was truncated to zero bytes and committed in a throwaway worktree. Of the
+  // six checks probed that way, five reddened. This one stayed 3 pass / 0 fail.
+  //
+  // The mechanism is the whole reason this test exists in the first place. Both
+  // scanning tests below assert an ABSENCE over an enumerated set, and neither
+  // put a floor under the enumeration -- so "no module names a forbidden
+  // counter" and "there are no modules" produce the identical green. That is
+  // absent-versus-zero, reported by the guard whose subject IS absent-versus-
+  // zero, and it is the direction every broken checker fails in: toward passing.
+  //
+  // So this arm runs first and asserts the scan can see. It is not a test of
+  // the product; it is the instrument's own calibration, and a red here
+  // invalidates the two arms below rather than reporting a defect in the code.
+  it('CAN RUN: the scan reaches real source and the scanner still fires', () => {
+    const files = sourceFiles();
+
+    // A count alone would not have caught the mutation that found this: the
+    // files were all still THERE, they were merely empty. Bytes are the
+    // property that actually went to zero.
+    const bytes = files.reduce((total, file) => total + readFileSync(file, 'utf8').length, 0);
+    assert.ok(
+      files.length >= 20 && bytes >= 100_000,
+      `the scan reached ${files.length} files totalling ${bytes} bytes. That is ` +
+        `too little to be this dashboard, so the two absence checks below would ` +
+        `pass by inspecting nothing. Fix the enumerator, not the ceiling.`,
+    );
+
+    // POSITIVE CONTROL, anchored on this file's OWN declared invariant rather
+    // than on a string someone might delete: telemetry-provenance.js is in the
+    // allowlist as PERMANENT, precisely because the register that forbids these
+    // fields must name them. So the scanner MUST find one there. If it does
+    // not, either the register stopped recording them -- which is a real
+    // finding -- or `FORBIDDEN` no longer matches how they are spelled, which
+    // would make every green below meaningless.
+    const register = readFileSync(join(ROOT, 'telemetry-provenance.js'), 'utf8');
+    const found = FORBIDDEN.filter((field) => register.includes(field));
+    assert.ok(
+      found.length > 0,
+      'the scanner found NONE of the forbidden spellings in telemetry-provenance.js, ' +
+        'which the allowlist calls "permanent: the register that forbids them". ' +
+        `Either the register no longer names them, or FORBIDDEN (${FORBIDDEN.join(', ')}) ` +
+        'has drifted from the spellings in use -- and a ban that matches no ' +
+        'spelling in use is the exact defect that let store-adapter.js bind ' +
+        'prefix_cache.hits while this test passed.',
+    );
+
+    // And the UI-copy regex, both directions: it must catch the banned phrase
+    // and must not catch an innocent one. A regex that matches nothing and a
+    // codebase that says nothing are indistinguishable from the assertion site.
+    const RATE_COPY = /['"`][^'"`]*\b(cache hit rate|prefix hit rate|cache lookups)\b/i;
+    assert.equal(RATE_COPY.test(`const label = 'Prefix hit rate';`), true, 'the UI-copy regex no longer fires');
+    assert.equal(RATE_COPY.test(`const label = 'Tokens generated';`), false, 'the UI-copy regex flags everything');
+  });
+
   it('is not referenced by any module outside the shrinking allowlist', () => {
     /** @type {string[]} */
     const violations = [];
