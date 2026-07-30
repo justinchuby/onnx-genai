@@ -1551,3 +1551,73 @@ should be recorded as immune rather than as unaudited — **an unguarded structu
 and an unguardable-because-immune structure render identically on a coverage
 list, and only one of them is a gap.** The remaining work is one `throw` in the
 helper.
+
+---
+
+## §23 — PASS 3 SHEET, measured at `b897b33e`, detached worktree, porcelain 0
+
+Every row carries the predicate that distinguishes fixed from unfixed, per the
+Lead's pass-2 standard. Rows are anchored to **symbols and files**, not line
+numbers — three of my own paths had rotted since pass 2 and I relocated them by
+content rather than reasserting them.
+
+### CLOSED — and one is a retraction against myself
+
+**C15 — RETRACTED.** I filed that `fetchWithDeadline` discards the caller's
+`signal`. It does not, and the fix is better than my ask:
+`AbortSignal.any([callerSignal, controller.signal])` — **composed, never
+replaced**, so whichever fires first wins, with a documented `AbortSignal.any`
+availability requirement and a fallback. My own predicate (`init.signal` refs = 0)
+was **the wrong predicate** and would have kept this open forever: composition
+does not reference `init.signal`, it destructures the caller's signal out and
+re-composes it. *A predicate that only recognises one implementation of a
+property will report every other correct implementation as a defect.*
+
+**P1 render half — CLOSED, and this contradicts item ② of the Lead's delta.**
+
+    dashboard/system.js   server.model_path 0   CONTROL server.model_id 2
+    ui/model-card.js      server.model_path 0   CONTROL server.model_id 1
+    whole tree, non-test, non-comment bindings: 0
+    the 2 surviving hits are epitaphs, past tense, read not counted
+
+@c0de4c2e is right and "render half open" is stale. Both controls are live, so
+the zeros are real and not a pathspec artefact.
+
+### LIVE
+
+**C19 — the percent-encoding bypass. My only finding I would call serious.**
+Predicate: `grep -c "'%'\|percent\|decode"` in `demo_assets.rs` → **0**
+(control: the dotfile rule is present → 1). Still bypassable at `b897b33e`.
+Proven on the wire earlier: decoded 404, `%2E` 200, 88 bytes wire == 88 disk.
+Owner @d7cf9b84, DMed. **It is currently on the board as CLOSED and it is not.**
+
+**C16 — the vocabulary split.** `dashboard/field-state.js` `'ok'` → **4**;
+`format.js` `'ok'` → **0**. Control: both files read, 472 / 238 lines. Unchanged.
+
+**C17 — split honestly, because half of it has been answered.**
+*Misattribution half: ADDRESSED.* `decode_kv_mode_from_shared_buffer_len` now
+documents that it takes two **orthogonal** inputs and deliberately keeps
+EP-identity out of decode logic. That is exactly the correction I asked for.
+*Diagnosability half: LIVE.* `shared_kv_buffer_len_from_metadata` still has
+**three distinct `return None` paths** — undeclared buffer, non-GQA, wrong dtype —
+all collapsing to one `None`. A caller cannot tell which condition refused, which
+is the silent-vs-loud asymmetry against `reject_undeclared_static_cache` that I
+filed. Non-blocking.
+
+**§15 / the P0 — `run-demo.sh` uses an existence check where it needs a freshness
+check.** Structural cause of the ghost binaries. Adjudicable by behaviour now, no
+inode required.
+
+### Adjudicated, needs no further work
+
+Gate item 1: `cargo check --workspace` exit 101, pre-existing (0 branch files in
+`mlas-sys`, control 17 in the server), unreachable from the served artefact
+(`cargo check -p onnx-genai-server` exit 0).
+
+### What would make me approve
+
+**I already do.** My verdict has been APPROVE WITH COMMENTS with an empty
+blocking set since pass 2, and nothing measured since has moved it. Every finding
+above is fixed in committed bytes, bounded to loopback, or non-blocking by
+severity. **The two things I would not ship without are neither of them commits:**
+restart the four origins, and close C19 or accept it explicitly in writing.
