@@ -562,6 +562,17 @@ The engine holds no concurrent-reader path. Both driver paths take an **exclusiv
 
 **One subtlety when placing the write.** `run_fallback_engine_driver` delegates to `handle_driver_command`, so instrumenting the shared handler covers the pipeline path too; there is no separate site to add for it. A redundant extra site would not be harmless — two writers to the same atomic publishing at different points in the step produce values that are individually valid and jointly inconsistent.
 
+**Measured.** QA timed endpoint latency during a 384-token generation on a clean tree:
+
+| Endpoint | Idle | During generation |
+|---|---|---|
+| `/metrics` | 0.8 ms | **14,784 ms** (5 polls completed) |
+| `/v1/resources` | 0.8 ms | **14,785 ms** (5 polls completed) |
+| `/v1/status` | 0.9 ms | 1.8 ms (61 polls, clean 4 Hz) |
+| `/v1/debug/kv` | 0.8 ms | 1.9 ms (61 polls, clean 4 Hz) |
+
+The split is exactly the invariant: the two slow endpoints await a driver round-trip, the fast ones do not. **The stall is the full duration of the generation, not a fixed penalty** — it scales with how much work the engine is doing, so it is worst precisely when observation matters.
+
 > **Stated as a rule:** *observability must not traverse the command channel — publish, don't request.* Any telemetry modelled as a `DriverCommand` inherits this ceiling by construction and will read as **frozen under load and fine when idle**, which is the hardest failure mode to catch, because every test that does not hold load passes.
 
 ---
@@ -724,6 +735,27 @@ Two consequences worth separating:
 **Not the cause:** the pipeline driver arm is *not* at fault. It replies with an explicit `Err` for both `ResourceSnapshot` (`driver.rs:479-483`) and `SetVramLimit` (`driver.rs:485-489`) rather than dropping the oneshot, so pipeline models return a clean error instead of hanging. The deferral above is the whole mechanism.
 
 **This is the practical face of invariant §5.11**, and it is why observability must be collected inline in the batch loop rather than requested through the command channel: *the command channel is not serviced during batch decode, which is exactly when observability matters most.*
+
+---
+
+### 8.11 `/metrics` inherits the driver round-trip for two gauges it treats as optional ⚠️
+
+`prometheus_metrics` (`admin.rs:391-408`) does two things:
+
+```rust
+let mut output = crate::metrics::encode_prometheus();          // atomic registry, ~0.8 ms
+if let Some(handle) = state.registry.resolve("")?
+    && let Ok(snapshot) = handle.engine.resource_snapshot().await   // driver round-trip
+{
+    output.push_str(&crate::metrics::encode_resource_governor(&snapshot));
+}
+```
+
+**The first line is already fast and already correct** — it reads the lock-free `static REGISTRY` (§4.8) and needs no engine. Everything genuinely measured on this endpoint (TTFT and e2e histograms, token counters, session and queue gauges) is produced there.
+
+**The entire stall comes from the second part**, which exists only to append resource-governor gauges. Per §5.15 that `.await` parks behind the driver's exclusive borrow for the whole of a generation, so an endpoint that is 0.8 ms idle becomes ~15 s under load — **and the part that stalls is not the part carrying the real data.**
+
+> **Why this is a small fix, not a redesign.** The handler is *already* written to tolerate absent resource gauges: the `if let Ok(..)` arm silently omits them when the snapshot fails. **Degrading gracefully is existing, intended behaviour** — so satisfying it from a cached or published snapshot rather than a round-trip requires no change to the response contract and no change to any consumer. The honest telemetry on this endpoint is being held hostage by two optional gauges.
 
 ---
 
