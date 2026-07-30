@@ -1266,11 +1266,19 @@ Two independent measurements, taken different ways, agree:
 | Method | What it counts | Result |
 |---|---|---|
 | Live `data-state` census of the assembled page in a real browser | Rendered field states | `unavailable` **40** · `pending` 7 · `measured` 2 · `not-applicable` 1 |
-| Static check of every key `dashboard/kv-memory.js` passes to `field()` against the client catalogue | Keys that *could* resolve at all | **10 of 13 have no catalogue entry (77%)** |
+| Static check of every key `dashboard/kv-memory.js` passes to `field()` against the client catalogue | Keys that *could* resolve at all | **3 of 13 have no catalogue entry (23%)** |
 
-One counts pixels, the other counts bindings, and they land on the same number
-from opposite directions. Treat that agreement as the finding, not either
-figure alone.
+> **⚠️ THESE TWO ROWS NO LONGER AGREE, AND THE DISAGREEMENT IS THE POINT.** They
+> used to: both said roughly 77% empty, one counting pixels and one counting
+> bindings, and that agreement was presented as the finding. The static row has
+> since moved to 23% because `/v1/debug/kv/blocks` was bound (see the KV panel
+> note below). **The browser census row above it has NOT been re-taken**, so it
+> describes an older tree and is kept, marked, rather than quietly deleted or
+> silently re-used as if it were current. Two measurements that agreed and then
+> stopped agreeing is a REPORT ABOUT WHEN EACH WAS TAKEN, not a contradiction to
+> be smoothed over — and re-running only the cheap one while letting the reader
+> assume both were refreshed is precisely the error this section exists to warn
+> about.
 
 **What this means for you as a reader:**
 
@@ -1369,28 +1377,40 @@ there rather than em-dash it: show **decode row occupancy** — active rows agai
 the effective batch capacity — same component, different noun, no fabricated
 numbers.
 
-> **⚠️ That redefinition is designed and not yet live, and this paragraph used to
-> claim otherwise.** It read *"which is real, measurable, and moves under load …
-> nothing on screen that looks broken."* Both fields it needs — `kv.slots_filled`
-> and `kv.slot_capacity` — are recorded as unpublished in
-> `dashboard/field-keys.test.js:53-54` (*"block-table endpoint, not yet landed"*),
-> so on the static-cache profile **the KV panel em-dashes: exactly the outcome the
+> **✅ THAT REDEFINITION IS NOW LIVE — AND THE RECORD OF WHEN IT WAS NOT IS KEPT
+> ON PURPOSE.** Both fields it needs, `kv.slots_filled` and `kv.slot_capacity`,
+> are published: they are derived from `/v1/debug/kv/blocks`
+> (`BlockTableResponse`, `routes/mod.rs`), and on the static-cache profile the
+> endpoint answers `applicable: false` with its own written reason, so that
+> profile now shows **not-applicable with a sentence** rather than an em-dash.
+>
+> **What this paragraph said before it was true is worth keeping.** It read
+> *"which is real, measurable, and moves under load … nothing on screen that
+> looks broken"* at a time when both fields were recorded as unpublished, so on
+> the static-cache profile **the KV panel em-dashed: exactly the outcome the
 > paragraph claimed to have avoided.**
 >
-> It is worth being blunt about how this one happened, because it is the most
+> It is worth being blunt about how that happened, because it is the most
 > instructive error in this document. **Nothing here was ever untrue of the
 > design; it was written from the design and then read as a report about the
 > page.** No reviewer catches that, because the sentence is well-formed,
 > internally consistent, and cites a real mechanism — and the code it describes
-> really does contain the redefinition. Only the *data* is missing. **A page whose
-> entire thesis is "never present a fabricated number as real" had, in its own
-> documentation, a fabricated success story about refusing to fabricate.**
+> really did contain the redefinition. Only the *data* was missing. **A page
+> whose entire thesis is "never present a fabricated number as real" had, in its
+> own documentation, a fabricated success story about refusing to fabricate.**
 >
 > The general form, and the reason it survived so long: **prose has no tense
 > discipline.** Code cannot half-exist, but a sentence about code can silently
 > mean *is*, *will be*, or *was designed to be*, and all three render
 > identically. Every "which is real and moves under load" in a design document is
 > a claim about a runtime nobody re-checked.
+>
+> **AND NOTE HOW THIS CORRECTION ARRIVED.** Not from a reader, and not from
+> anybody re-reading the paragraph: `check-perf-claims.test.js` failed on the
+> commit that landed the fields and named the exact sentence to delete. The
+> lesson generalises past this one caveat — **a caveat that outlives its defect
+> teaches readers to skip caveats** — so the claim had to be executable, or it
+> would have rotted in the flattering direction and nobody would have noticed.
 
 **Note on the denominator:** the ceiling is `effective_batch_capacity()` —
 `min(max_batch, max_queue_depth)` — not the raw `--max-batch` flag, which this

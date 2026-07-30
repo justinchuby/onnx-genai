@@ -210,6 +210,18 @@ const KNOWN_UNRENDERED = [
   // it is a server-side serde question and outside this change.
   'build_sha',
   'build_dirty',
+
+  // -- /v1/debug/kv -----------------------------------------------------------
+  // NOT A REGRESSION, AND WORTH SAYING WHY, BECAUSE THE COUNT LOOKS LIKE ONE.
+  // The FACT is on screen; this particular SPELLING of it is not. kv.pages_shared
+  // used to be read from /v1/debug/kv's `kv_pages_shared`, and is now derived
+  // from /v1/debug/kv/blocks' `pages_shared` instead, so no shipped module names
+  // the older field any more. The block table was preferred because it reports
+  // the window it actually scanned (`window.scanned`, `window.truncated`), so a
+  // truncated read is visible rather than silently reported as a whole-pool
+  // figure. Two endpoints serving one fact is a server-side tidy-up, not a
+  // dashboard defect, and it is left to whoever owns /v1/debug/kv.
+  'kv_pages_shared',
 ];
 
 /**
