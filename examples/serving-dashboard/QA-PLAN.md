@@ -373,10 +373,20 @@ how it behaves here more than on the happy path.
       spread ≈33 points. Per the project's own rule (*spread > effect size ⇒ INCONCLUSIVE, not a
       pass*), **Scenario B's payoff is currently UNVERIFIED — neither confirmed nor refuted.**
       **Required protocol before any speedup number is displayed or documented:** quiet machine
-      (this was taken at `load average 22.56` on 10 cores, where a byte-identical binary swings
-      −9.8%), warm the server first to remove cold-start, **measure TTFT and not e2e** (reuse can
+      (this was taken at `load average 22.56` on 10 cores, where a **null A/B on a
+      byte-identical binary — true delta zero by construction — swung +52.30 % / −40.17 % across
+      six pairs**, `perf-baseline.md` §8.1), warm the server first to remove cold-start, **measure TTFT and not e2e** (reuse can
       only shorten *prefill*; e2e buries it under decode), strictly interleaved, **n ≥ 15/arm**,
-      report **median + n + CV + 95% CI**. **Overlapping CIs ⇒ cut Scenario B.** A genuine
+      report **median + n + CV + 95% CI**. **Overlapping CIs ⇒ cut Scenario B.**
+      > ⚠️ **`n ≥ 15` was sized against a noise floor of −9.8 %, which `perf-baseline.md` §6f later
+      > RETRACTED as evidence (that run overlapped two CPU-heavy ONNX exports, so its swing has a
+      > cause and is not ambient). The clean floor is ~5× larger, so treat `n ≥ 15` as a MINIMUM
+      > that has not been re-derived, never as sufficiency.** The criterion that survives the
+      > correction untouched is the **CI-overlap** rule, because it is calibrated by the data it is
+      > handed rather than by a number written here in advance — and §8.2 is the proof it is
+      > needed: on that null run the *mean* passed a ±2 % band while the CI was 17.5× wider than
+      > the band. **A tolerance test that reports only a central tendency cannot fail for the right
+      > reason.** A genuine
       full-prefix hit should collapse TTFT by ~90% (prefill is ~90% of TTFT, measured), so the
       real effect is far too large to hide in noise on a quiet machine — if it is not obvious,
       it is not there.
