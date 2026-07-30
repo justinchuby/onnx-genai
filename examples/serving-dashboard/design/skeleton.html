@@ -254,6 +254,35 @@
     background: var(--og-bg-raised); color: var(--og-fg-muted);
     font-size: var(--og-type-sm); margin: var(--og-space-6) 0;
   }
+
+  /* ── CAPABILITY PROFILE ─────────────────────────────────────────────────
+     Continuous batching and paged KV are mutually exclusive in this runtime
+     (engine/batched.rs:101-110 — ContinuousBatchManager never touches the
+     page table). The visitor does not choose: the loaded model decides. So
+     the page DETECTS a profile and states what is live. Informational
+     styling, never a warning — this is a real architectural tradeoff worth
+     leading with, not a fault to apologise for. */
+  .profile {
+    display: flex; align-items: center; gap: var(--og-space-3);
+    height: 40px; padding: 0 var(--og-space-5);
+    background: var(--og-bg-raised); border: 1px solid var(--og-border);
+    border-radius: var(--og-radius-md);
+    font-size: var(--og-type-sm); color: var(--og-fg-muted);
+    font-family: var(--og-font-mono);
+  }
+  .profile strong { color: var(--og-fg); font-weight: var(--og-weight-medium); }
+  .profile__live { color: var(--og-ok); }
+  .profile__off  { color: var(--og-fg-subtle); }
+  .profile__why  { margin-left: auto; color: var(--og-info); cursor: help; }
+
+  /* One card, not six identical dead panels. Six capability notices is the
+     wall-of-zeros failure in a politer typeface. */
+  .inactive { text-align: center; color: var(--og-fg-muted); }
+  .inactive__mark { color: var(--og-fg-subtle); }
+  .inactive__names {
+    color: var(--og-fg); font-family: var(--og-font-mono);
+    font-size: var(--og-type-sm); margin: var(--og-space-3) 0 var(--og-space-4);
+  }
   h3.sec { margin: var(--og-space-8) 0 var(--og-space-4); font-size: var(--og-type-lg); font-weight: var(--og-weight-medium); }
 </style>
 </head>
@@ -287,8 +316,10 @@
       <div class="tile__label caps">aggregate output <abbr class="value__src" title="Derived: sum of SSE token deltas over a 2 s sliding window">ᴰ</abbr></div>
     </div>
     <div class="tile">
-      <div class="tile__num">0.0<span class="tile__unit">%</span></div>
-      <div class="tile__label caps">prefix hit rate <abbr class="value__src" title="Server counter · prefix_cache_hits / lookups · 250 ms">ˢ</abbr></div>
+      <div class="tile__num value" data-state="unavailable">
+        <span class="value__num" title="Prefix caching lives in the paged KV manager, which the continuous-batch path bypasses. prefix_cache_hit_len is a hardcoded 0 at batched.rs:262. This is a fabricated zero, not a measurement. Run --model models/qwen2.5-0.5b to see real prefix caching.">—</span><span class="tile__unit">%</span>
+      </div>
+      <div class="tile__label caps">prefix hit rate <span style="color:var(--og-fg-subtle)">· static profile</span></div>
     </div>
     <div class="tile">
       <div class="tile__num value" data-state="unavailable">
@@ -312,6 +343,44 @@
   </p>
 
   <!-- ── THE FOUR STATES ──────────────────────────────────────────────── -->
+
+  <h3 class="sec">Capability profile <span class="caps">— detected, never selected</span></h3>
+  <div class="profile">
+    <span aria-hidden="true">◈</span>
+    <strong>static-cache profile</strong>
+    <span>·</span>
+    <span class="profile__live">continuous batching LIVE</span>
+    <span>·</span>
+    <span class="profile__off">paged KV bypassed by design</span>
+    <span class="profile__why" tabindex="0"
+      title="Continuous batching buys throughput by taking KV out of the pageable pool and putting it in fixed in-place decode rows. Paged KV buys sharing, prefix reuse and eviction by keeping KV in a managed page table. This runtime implements both; today they are alternatives rather than a composition.">&#9432; why?</span>
+  </div>
+  <p class="note">
+    Naming <em>both</em> halves in one sentence — what is live AND what is bypassed —
+    is what stops a visitor concluding something is broken. The tradeoff is real,
+    instructive, and unique to this project. Lead with it.
+  </p>
+
+  <h3 class="sec">Inactive panel group <span class="caps">— one card, not six dead panels</span></h3>
+  <div class="panels">
+    <section class="panel" data-panel-id="inactive">
+      <header class="panel__head"><h2 class="panel__title">Not active in this configuration</h2><div class="panel__tools">&#9432;</div></header>
+      <div class="panel__body inactive">
+        <svg class="inactive__mark" width="40" height="40" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+          <rect x="14" y="14" width="36" height="36" rx="4" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 5"/>
+        </svg>
+        <div class="inactive__names">Paged KV block table · Prefix cache</div>
+        <p style="font-size:var(--og-type-sm)">
+          This server runs a static KV cache, so KV lives in fixed decode rows
+          rather than a paged pool. These panels have no data source here —
+          <strong>not zero, absent.</strong>
+        </p>
+        <div class="cmd" style="justify-content:center">--model models/qwen2.5-0.5b<span style="margin-left:var(--og-space-4);color:var(--og-fg-subtle)">&#8681;</span></div>
+        <p class="caps" style="margin-top:var(--og-space-4)">everything else on this page is live</p>
+      </div>
+    </section>
+  </div>
+
   <h3 class="sec">The four value states</h3>
   <div class="panels">
     <section class="panel" data-panel-id="states">
