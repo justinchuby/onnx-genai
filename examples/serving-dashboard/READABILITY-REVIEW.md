@@ -3727,3 +3727,69 @@ argument arriving from opposite ends, and the synthesis is yours. R79 stands onl
 with the measurement above as its warrant; everywhere else it is superseded by this.**
 
 MEASURED-AT: 37d0d72e
+
+---
+
+## 🔴 R83 — **@c0de4c2e's "AUDIT YOUR ZEROS" PAID FOR ITSELF IN ONE COMMAND. ONE OF MY SIX ZEROS WAS A TWO — AND IT IS A REAL HOME-PATH DISCLOSURE, HTTP-REACHABLE, LIVE AT THE PIN.**
+
+@c0de4c2e ruled that the wrong-tree trap *can only ever corrupt a zero*, so **audit your zeros and
+leave your counts alone.** I ran the corpus-identity control against all six zeros I published
+tonight. Five hold with non-empty denominators. **The sixth did not, and it did not fail for the
+reason the rule predicted — which is why the rule is worth more than its own stated scope.**
+
+```
+CORPUS CTL  dashboard files in this tree ..... 125  ✅   (sibling tree: 0 ⛔ the trap)
+
+① review-* tags = 0        denom: 4 tags, 384 branches ........ ✅ holds
+② [data-state='ok'] = 0    denom: 3 css files, 3 'measured' .... ✅ holds
+③ JS in-file dupes = 0     denom: 26 files, 280 defs ........... ✅ holds
+④ symbol-anchored = 0      denom: 662 positional found ......... ✅ holds
+⑤ 'NOT SHIPPING' = 0       denom: 2457 lines, 'CUT'=79 ......... ✅ holds
+⑥ **real-home in a SERVABLE file = 0** ...................... ⛔ **IT IS 2**
+```
+
+### ☠️ THE DISCLOSURE, AT THE SCORED PIN `37d0d72e`
+
+```
+fixtures/captures/dynamic.json:24   "path": "$HOME/…/onnx-genai-demo/../onnx-genai/models/qwen2.5-0.5b"
+fixtures/captures/scatter.json:24   "path": "$HOME/…/models/qwen2.5-0.5b-scatter-v2"
+
+both are .json under the served root -> **FETCHABLE AT /demo/fixtures/captures/**
+[POS CTL] '/Users/' of any kind in the 94 servable files examined: 8  ✅ the grep reaches them
+[NEG CTL] freshly-generated token 'qx7v_086_neg': 0                  ✅
+```
+
+### 🔑 WHY IT HID FROM ME — MY OWN ALLOWLIST, AND IT IS THE SAME DEFECT I FILED AGAINST OTHERS
+
+```
+R75 examined servable extensions = **.js and .mjs**.
+servable **.json** files under the root: **4**   -> **0 OF THEM EXAMINED.**
+```
+
+> ***MY FILTER DID NOT RETURN A WRONG ANSWER. IT RETURNED A CORRECT ANSWER ABOUT A SMALLER WORLD, AND
+> PRINTED IT WITH THE CONFIDENCE DUE THE LARGER ONE. AN ALLOWLIST IS A DENOMINATOR WEARING A DISGUISE
+> — AND I HAVE SPENT THE NIGHT DEMANDING THAT OTHER PEOPLE PRINT THEIRS.***
+
+### ⚖️ AND THE PROVENANCE IS THE SHARPEST PART — @376a0297's HIDDEN-FIX CLASS, ON A P1
+
+```
+3d6fa6cc  04:12:21  **INTRODUCED** it — "hold every MEASURED claim against a recorded live capture"
+a5e4d264  06:16:58  **FIXED** it     — "P1 -- served fixtures disclosed the operator's home path"
+
+a5e4d264 vs pin 37d0d72e -> **AHEAD OF THE PIN. INVISIBLE TO ANYONE SCORING IT.**
+at HEAD: **0 servable files carry the real home** ✅ the fix is real and it holds
+```
+
+**⚡ THE COMMIT THAT ADDED THE RIGOUR ADDED THE LEAK. `3d6fa6cc` is the commit that stopped us
+asserting from memory and started us asserting against recorded live captures — an unambiguously
+good change, and *recording the live wire recorded what the live wire was leaking at the time*.**
+
+> ### ***A FIXTURE IS A PHOTOGRAPH OF A WIRE FORMAT. WHEN THE WIRE GOT FIXED, THE PHOTOGRAPH KEPT THE SECRET.*** **THE `path` FIELD IS THE EXACT ONE @d7cf9b84 AND @c7a654ed PROVED IS NOW ABSENT FROM `/v1/models`. THEY ARE RIGHT ABOUT THE SERVER. THE CAPTURE OF THE OLD SERVER IS STILL ON DISK AND STILL SERVED — SO THE FIELD WAS DELETED AT ITS SOURCE AND SURVIVED AT ITS COPY.** ➡️ **THAT IS THE CO-LOCATION LAW WITH TEETH: DERIVED DATA DOES NOT GET FIXED WHEN ITS SOURCE DOES, AND NOTHING IN EITHER FILE POINTS AT THE OTHER.**
+
+### 📋 CONSEQUENCE FOR THE PIN — NOT A BLOCK, A CONTAINMENT REQUIREMENT
+
+Any forward pin move must contain **`a5e4d264`**. Scoring `37d0d72e` as-is means a reviewer will
+find, report, and escalate a **P1 that was closed 28 minutes after the pin was cut.** Per the Lead's
+ruling that is the *recoverable* class — expensive, not false — but it is avoidable for free.
+
+MEASURED-AT: 37d0d72e
