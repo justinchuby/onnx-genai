@@ -25,7 +25,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -370,4 +370,58 @@ test('no copy-pasteable server command points --model at a config file', () => {
       );
     }
   }
+});
+
+// Release-gate check, requested by the lead after `--max-batch` circulated as
+// "approved and surfaced" and was reasoned from twice before anyone grepped
+// cli.rs for it: EVERY flag named anywhere in the demo's documents and UI
+// strings must exist in the server CLI -- not merely the flags inside
+// copy-pasteable commands.
+//
+// The earlier check only read pasteable blocks, so a flag discussed in prose
+// could be invented, renamed, or retired with nothing to catch it. Prose is
+// where flags are justified, which is exactly where a stale one is most
+// convincing.
+//
+// Flags belonging to other tools are classified explicitly rather than
+// skipped by pattern. The map is fail-closed: an unrecognised flag is a
+// failure, so a new foreign flag must be named here rather than silently
+// tolerated. An allowlist that swallows unknowns is the superset-of-reality
+// bug that let an earlier version of this suite pass its own mutation.
+const FOREIGN_FLAGS = new Map([
+  ['--release', 'cargo'],
+  ['--test', 'cargo / node --test'],
+  ['--runtime', 'mobius build'],
+  ['--fail', 'curl'],
+  ['--silent', 'curl'],
+  ['--max-time', 'curl'],
+]);
+
+const flagBearingDocuments = {
+  'README.md': readme,
+  'run-demo.sh': runDemoCode,
+  'index.html': indexHtml,
+  'ui/launch-command.js': LAUNCH_COMMAND,
+  ...(existsSync(join(demoDir, 'QA-PLAN.md'))
+    ? { 'QA-PLAN.md': read('QA-PLAN.md') }
+    : {}),
+};
+
+test('every flag named in any demo document exists in the server CLI', () => {
+  let checked = 0;
+  for (const [name, text] of Object.entries(flagBearingDocuments)) {
+    for (const [, flag] of text.matchAll(/(?<![\w-])(--[a-z][a-z0-9-]+)/g)) {
+      if (FOREIGN_FLAGS.has(flag)) continue;
+      checked += 1;
+      assert.ok(
+        cliFlags.has(flag),
+        `${name} names ${flag}, which does not exist in ` +
+          `crates/onnx-genai-server/src/cli.rs.\n` +
+          `Either it was renamed or removed, or it was never built -- a flag ` +
+          `described as "approved" reads exactly like a flag that shipped.\n` +
+          `If it belongs to another tool, add it to FOREIGN_FLAGS with its owner.`,
+      );
+    }
+  }
+  assert.ok(checked > 10, `expected to check many flags, checked ${checked}`);
 });
