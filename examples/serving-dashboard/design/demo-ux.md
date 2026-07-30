@@ -5487,7 +5487,35 @@ one known key by name (AC106: a regex matching nothing reports zero duplicates f
 
 **It was RED at `24012faf` and is GREEN at `08633394`** — red for roughly ninety
 seconds, during which the fix landed in a file I do not own, in the non-obvious
-direction I would have prescribed: delete `:637`, keep `:497`.
+direction I would have prescribed: **the terse `"Batch limit"` entry was deleted and the
+`label: 'Effective batch capacity'` entry — the one carrying a symbol anchor and its
+reasoning — was kept.**
+
+> **⛔ THE PRECEDING SENTENCE PREVIOUSLY CARRIED AN IMPERATIVE VERB FOLLOWED BY TWO BARE,
+> FILENAMELESS COORDINATES — THE `637` AND `497` LINES OF `telemetry-provenance.js`. THAT
+> FORM IS WITHDRAWN, AND I AM DESCRIBING IT RATHER THAN REPRODUCING IT ON PURPOSE.**
+> **My first attempt at this very repair quoted the old fragment verbatim inside the
+> withdrawal, and my own check then found the armed byte-sequence still present and still
+> greppable — the paragraph said WITHDRAWN and the bytes still said DELETE.** A withdrawal
+> that reproduces its own instruction re-arms it for every reader who arrives by search
+> rather than by reading. **IT WAS NEVER AN IMPERATIVE IN INTENT** — it narrates a fix that
+> had already landed, and D276 above already records `RESOLVED`. **BUT IT WAS ONE `grep`
+> AWAY FROM READING AS ONE, AND THE COORDINATES HAVE SINCE ROTTED ONTO UNRELATED CONTENT,
+> WHICH IS WORSE THAN EITHER PROBLEM ALONE.** Re-derived at HEAD, with a control:
+> ```
+> telemetry-provenance.js is 1062 lines
+>   line 497 -> `dynamic: { unfalsifiable: … }`   ⬅ A DIFFERENT ENTRY ENTIRELY
+>   the surviving batch entry is at the `label: 'Effective batch capacity'` site,
+>   ~84 lines BELOW the coordinate this section named
+>   CONTROL: 35 register keys parsed, so the file was read, and a zero would be a zero
+> ```
+> **☠️ SO ANYONE EXECUTING THE OLD FRAGMENT TODAY WOULD *KEEP THE WRONG ENTRY*. THE DANGER
+> IS NOT THAT THE WORLD CONVERGED ON ONE COPY — IT IS THAT THE COORDINATES DRIFTED ONTO
+> SOMEBODY ELSE'S WORK WHILE THE SENTENCE KEPT ITS CONFIDENT PHRASING.** A positional
+> citation does not decay into an error; **it decays into a DIFFERENT, EQUALLY CONFIDENT
+> CLAIM.** That is D163 and D305, demonstrated on the one citation in this document most
+> likely to be acted on.
+
 
 > **AND I NEARLY SHIPPED THIS SECTION SAYING *"IT IS RED AT HEAD"* IN THE PRESENT
 > TENSE — IN THE SAME COMMIT AS D278, WHICH EXISTS BECAUSE I DID EXACTLY THAT IN
@@ -6193,3 +6221,78 @@ No static instrument can. **The retirement arm is the mitigation: an exemption t
 describing the tree turns red, so the list cannot quietly become fiction** — but a
 vocabulary declared in a file nobody thought to read stays invisible to it, exactly as
 `format.js` was invisible to §88 until tonight.
+
+---
+
+## 90. THE CENSUS COULD NOT SEE THE ONE CITATION THAT MATTERED (D305–D307)
+
+I ran a census of positional citations in this document, reported **192 true `file:LINE`
+citations**, and used that number to argue the document's citation hygiene was
+understood. **The single citation that had to be neutralised tonight was in none of the
+192.** It was `:637` — a bare coordinate with **no filename** — and the census requires a
+filename before the colon in order to classify a match at all.
+
+- **D305:** **A CITATION WITHOUT A FILENAME IS THE MOST DANGEROUS FORM AND IT IS THE ONLY
+  FORM NO AUDIT COVERS.** It is unresolvable by a human, because there is nothing to
+  open. It is invisible to a machine, because every census keys on the filename. **The
+  weakest citation is therefore also the unaudited one, and those two properties are not
+  independent — the same missing token causes both.** Required: a citation carries a
+  filename, or it is not a citation. **And the census must count what it could not parse
+  and print that number beside its result.**
+- **D306:** **A CENSUS THAT SILENTLY DROPS WHAT IT CANNOT PARSE REPORTS A CLEAN NUMBER
+  ABOUT A SUBSET AND NAMES IT AFTER THE WHOLE.** Mine did. `192` was true of *citations
+  with filenames* and was published as a fact about *citations*. The denominator was
+  never wrong; **the NOUN was.** A partial census must either refuse to emit a total or
+  emit `parsed / skipped` as one inseparable pair.
+- **D307:** **STATE THE NUMBER YOU ALMOST PUBLISHED.** My first pattern was
+  `:[0-9]{2,4}` and it returned **267**. The extra **36 were TIMESTAMPS** — including the
+  `OBSERVED 00:51` stamps **I added to §53 to fix a staleness defect.** **MY INSTRUMENT
+  COUNTED MY OWN REPAIR AS AN INSTANCE OF THE DEFECT IT WAS MEASURING**, and the only
+  reason `267` was never published is that I refused to report from a pattern I had not
+  validated against a known case. **A corrected count with the error shown is worth more
+  than a correct count**, because it tells the next reader which direction the instrument
+  fails in.
+- **D308:** **A WITHDRAWAL MUST NOT REPRODUCE THE INSTRUCTION IT WITHDRAWS. DESCRIBE IT.**
+  My first attempt at neutralising the armed citation **quoted the fragment verbatim inside
+  the withdrawal notice** — so the paragraph read `WITHDRAWN` while the bytes still read as
+  an imperative verb followed by two coordinates. **My own check caught it: the armed
+  byte-sequence was still present, in the commit whose entire purpose was to remove it.**
+  ⛔ **THIS IS THE LIMIT OF *STRIKE, DO NOT DELETE*, AND IT IS A REAL LIMIT: THAT RULE IS
+  CORRECT FOR A WITHDRAWN *ARGUMENT*, WHICH LOSES ITS FORCE WHEN STRUCK — AND WRONG FOR A
+  WITHDRAWN *INSTRUCTION*, WHICH DOES NOT.** Prose is struck for a reader; **a byte-sequence
+  is not struck for a `grep`.** An argument is disarmed by context; **an instruction is
+  disarmed only by not being there.**
+
+
+### 90.1 WHAT I AM DELIBERATELY NOT DOING
+
+**I am not retro-converting the 192.** They are a real debt and it is recorded here as
+one. Converting them on a branch taking a commit a minute would be exactly the churn the
+rule exists to prevent, and it would touch sections other agents are actively editing.
+**RECORD THE CLASS, FIX THE ONE THAT IS ARMED** — the armed one is fixed above, by symbol.
+
+### 90.2 THE CORRECTION I OWE ON THE ARMED CITATION ITSELF
+
+The order to neutralise `:637`/`:497` described it as an imperative that **retargeted**
+when the world converged on a single entry. **I read the bytes before acting and that
+premise is not what the file says:** the sentence is past-tense narration of a fix that
+had already landed, in a section titled *"red on arrival, green ninety seconds later"*,
+and the resolution is recorded two hundred lines above it.
+
+**⛔ BUT THE CONCLUSION WAS RIGHT, FOR A MECHANISM NOBODY HAD MEASURED.** I went to check
+whether `:497` still named the entry it claimed, and it does not — **it has drifted onto
+an unrelated `dynamic.unfalsifiable` block ~84 lines away.** So executing the old
+fragment today would **keep the wrong entry**, not delete the last one.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D305 | A citation must carry a filename, or it is not a citation | Filenameless citations are unresolvable by humans AND invisible to every census — one missing token causes both |
+| D306 | A partial census emits `parsed / skipped` or refuses to emit a total | `192` was true of a subset and was named after the whole; the denominator was right and the noun was wrong |
+| D307 | Publish the number you almost published, and why it was wrong | `267` counted 36 timestamps, including the stamps added to repair a staleness defect |
+| D308 | A withdrawal describes the instruction it withdraws; it never reproduces it | Prose is struck for a reader; a byte-sequence is not struck for a `grep`. An argument is disarmed by context, an instruction only by absence |
+
+**🔑 AND THE GENERAL LAW THIS SECTION EXISTS FOR: A POSITIONAL CITATION DOES NOT DECAY
+INTO AN ERROR — IT DECAYS INTO A DIFFERENT, EQUALLY CONFIDENT CLAIM.** An error invites a
+check. A confident claim about the wrong subject does not. **That is why the repair is
+`symbol`, never `symbol + line`, and why "the line is still roughly right" is not a
+defence.**
