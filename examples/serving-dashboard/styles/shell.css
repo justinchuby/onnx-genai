@@ -166,7 +166,21 @@ body[data-blocked] .app {
 
 [data-state='pending'] {
   color: var(--og-pending-fg);
-  font-style: italic;
+  /* The second channel. It used to be `font-style: italic`, which was a NO-OP:
+     the pending glyph is PENDING_TEXT = '···', three middle dots, and
+     punctuation has no asymmetric stroke to slant. So pending was the one state
+     carried by colour alone while APPEARING to have a redundant channel — the
+     worst of both, because the italic declaration read as covered.
+
+     It matters more than its duration suggests: every field begins here, the
+     first request takes seconds, so this is the state a visitor sees while they
+     are deciding whether the page works. Attention is not duration.
+
+     `solid` is deliberately the FIFTH border style, joining dashed (stale),
+     dotted (unavailable) and double (not-applicable), so all five states stay
+     distinguishable with colour switched off entirely — which is the version
+     that survives a projector and a grayscale screenshot. */
+  border-bottom: 1px solid var(--og-pending-fg);
 }
 
 [data-state='stale'] {

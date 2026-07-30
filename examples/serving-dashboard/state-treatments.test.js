@@ -54,14 +54,40 @@ test('shell.css does not style a state that cannot occur', () => {
   );
 });
 
-test('the three absence states are distinguishable without colour', () => {
+test('every non-measured state is distinguishable without colour', () => {
   // AC25. unavailable, not-applicable and stale all render an em-dash or a
   // de-emphasised value, and their foreground colours are deliberately close.
   // If they are separated by colour alone, a grayscale or colourblind reader
   // cannot tell "not built yet" from "meaningless here" — which is the single
   // distinction this demo exists to teach.
+  //
+  // PENDING IS IN THIS LIST AND USED NOT TO BE, AND ITS ABSENCE IS WHY A REAL
+  // DEFECT SURVIVED. This test read "the three absence states" and iterated a
+  // hardcoded three, so the one state whose second channel was a no-op —
+  // `font-style: italic` on '···', which has no stroke to slant — sat outside
+  // the loop. The guard could not reach the failing branch, so it was green for
+  // a reason unrelated to the code being right. Pending is not an absence
+  // state, but it is a NON-MEASURED one, and the reader's need is identical:
+  // do not mistake a value that has not arrived for one that has.
   const borders = {};
-  for (const state of [FIELD_STATES.STALE, FIELD_STATES.UNAVAILABLE, FIELD_STATES.NOT_APPLICABLE]) {
+  const covered = [
+    FIELD_STATES.PENDING,
+    FIELD_STATES.STALE,
+    FIELD_STATES.UNAVAILABLE,
+    FIELD_STATES.NOT_APPLICABLE,
+  ];
+  // Derived, not hardcoded: every state except MEASURED must appear above. If a
+  // sixth state is ever added, this fails until someone decides its treatment.
+  const expected = Object.values(FIELD_STATES).filter((s) => s !== FIELD_STATES.MEASURED);
+  assert.deepEqual(
+    [...covered].sort(),
+    [...expected].sort(),
+    'a field state is missing from this check, so nothing verifies it is legible ' +
+      'without colour. Add it to `covered` and give it a border style no other ' +
+      'state uses.',
+  );
+
+  for (const state of covered) {
     const block = shellCss.match(
       new RegExp(`\\[data-state='${state}'\\][^{]*\\{([^}]*)\\}`),
     );
@@ -70,11 +96,22 @@ test('the three absence states are distinguishable without colour', () => {
     assert.ok(border, `${state} has no border-bottom, so it relies on colour alone`);
     borders[state] = border[1].trim();
   }
-  const patterns = Object.values(borders);
+
+  // Compare the STYLE keyword, not the whole declaration: two states with
+  // different colours but both `1px dotted` are identical in grayscale, and
+  // comparing full strings would call that distinct.
+  const styleOf = (decl) => decl.split(/\s+/).find((t) => /^(solid|dashed|dotted|double)$/.test(t));
+  const patterns = Object.fromEntries(
+    Object.entries(borders).map(([state, decl]) => [state, styleOf(decl)]),
+  );
+  assert.ok(
+    Object.values(patterns).every(Boolean),
+    `a state's border has no recognised line style: ${JSON.stringify(borders)}`,
+  );
   assert.equal(
-    new Set(patterns).size,
-    patterns.length,
-    `these absence states share a border pattern and differ only by colour: ${JSON.stringify(borders)}`,
+    new Set(Object.values(patterns)).size,
+    Object.values(patterns).length,
+    `these states share a border pattern and differ only by colour: ${JSON.stringify(patterns)}`,
   );
 });
 
