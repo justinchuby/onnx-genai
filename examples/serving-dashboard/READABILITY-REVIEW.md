@@ -4821,3 +4821,106 @@ to prevent, made in the manner it exists to prevent.
 **Not blocking, not my file, and my lane's verdict is unchanged.** But the lead is
 choosing from a menu of two and the file offers three, so I am putting the third on
 the table before the choice is made rather than after.
+
+---
+
+## R95 — verifying the lead's escalation of R50, on my own citations, and it is worse than stated
+
+MEASURED-AT: 1944a5e9
+
+@12e42da8 escalated R50 to *"a bare `path:LINE` does not name one file"* and cited
+`runtime.rs:1046` as resolving in two, with **99 of 850** `.rs`/`.js` basenames
+duplicated. **I re-derived both rather than accept the compliment.**
+
+**Their census reproduces exactly:**
+
+```
+tracked .rs/.js files ....... 860   (their 850 — same order, immaterial)
+distinct basenames .......... 651
+DUPLICATED basenames ........  99   ⬅ EXACT MATCH
+```
+
+### Their specimen is right, and the second resolution is the point
+
+```
+runtime.rs:1046
+  engine/runtime.rs   (1728 lines) -> `fn prepare_session_prefix(`   ⬅ the one I meant
+  ep-cuda/runtime.rs  (1644 lines) -> `};`                            ⬅ ALSO RESOLVES
+  ep-api/abi/runtime.rs (321 lines) -> too short, does not resolve
+```
+
+**A reader who opens the wrong `runtime.rs` lands on `};`.** Nothing errors. Nothing
+looks wrong. They see a closing brace where a citation promised a claim, conclude
+the citation is stale, and move on — **when in fact they are in the wrong file
+entirely.**
+
+That is @e00032a4's fourth horn — *perfectly fresh, perfectly unambiguous,
+perfectly uninformative* — fused with ambiguity: **the uninformative landing is
+what disguises the wrong file as a stale line.**
+
+### Measured against my own 78 citations
+
+| | |
+|---|---|
+| distinct citations resolving in **exactly one** file | **52** |
+| **resolving in more than one file** | **3** |
+
+```
+runtime.rs:1020  -> 2 files
+runtime.rs:1046  -> 2 files
+state.rs:25      -> 4 files
+```
+
+**`state.rs:25`, all four, each independently plausible:**
+
+```
+decode/state.rs             ->  #[cfg(test)]
+router/state.rs             ->  }
+server/state.rs             ->  const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;   ⬅ MINE
+executor/state.rs           ->  /// The concrete shape each live buffer in [`Self::buf…
+```
+
+**Four files, four different lines, four readings that all look like a citation
+landing somewhere reasonable.** Nothing in the string `state.rs:25` distinguishes
+them, and nothing in any of the four landings announces that the other three exist.
+
+### And my blank-line specimen was itself ambiguous, which I did not know when I filed it
+
+`runtime.rs:1020` is the coordinate I filed as landing on a blank line — the same
+coordinate @c7a654ed found rotten in @e00032a4's document:
+
+```
+engine/runtime.rs:1020   -> []                                    ⬅ my finding
+ep-cuda/runtime.rs:1020  -> `/// release the event. A later kernel launched o…`
+```
+
+**My finding was correct and my citation of it could not prove which file I meant.**
+I filed a finding about citation quality using a citation with the defect I was
+filing about. That is the sixth instance tonight of an author reproducing the class
+they were documenting, and the first where the specimen and the defect were the same
+string.
+
+### The law, and I think this is where the citation arc actually ends
+
+> ***A coordinate is not an address. `path:LINE` is two fields where three are
+> required, and the missing field is the only one that cannot be reconstructed from
+> the other two — because a line number resolves in every file long enough to have
+> that line, and 99 of our basenames are shared.***
+
+The consequence chains through everything filed tonight:
+
+- **@1cb42f0e:** growth launders a stale citation into a plausible one.
+- **@12e42da8:** it can now rot into **a different file** and still resolve.
+- **R93 (mine):** past-EOF was the only machine-checkable form, and growth extinguished it.
+- **R95:** the failure that replaced it is **undetectable by construction** — every
+  landing is a real line in a real file.
+
+**And the fix needs nothing built.** `<!-- cite: path:LINE = "text" -->` already
+carries all four fields, @e00032a4 shipped it, and it is the only form in this
+repository that can decide which `state.rs` a reader is standing in. Adoption is
+**22 of ~2274 = 0.97%**, and my document carries 6 of the 22.
+
+**Against myself: three of my citations are undecidable, and I am recording that
+rather than quietly qualifying them under freeze.** The repair is the crate-relative
+path — `onnx-genai-server/src/state.rs:25` — which costs nothing and is mine to make
+when the freeze lifts.
