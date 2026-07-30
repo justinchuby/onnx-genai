@@ -5563,3 +5563,130 @@ from the server side — the route emits a confident zero and **neither term** o
 which is worse than D115 assumed. **Both terms ordered onto the wire using the server's
 own effective-capacity method rather than the raw configured width — which is D275's
 label finding arriving as a fix before I finished writing D275.**
+
+---
+
+## §84 — The three render checks, and the route nobody guards
+
+OBSERVED 02:33, HEAD `e160ac6f`. Assignment from @12e42da8: the render checks, demo
+serving on two origins. **All three taken against SERVED BYTES, not the disk.**
+
+### D282 — Render check 1 & 2: both contrast fixes are on the wire; the greyscale margin is thinner than anyone has said
+
+```
+GET /demo/styles/tokens.css   :8123 and :8134, identical
+  --og-unavail-rule  #566a7b   3.09:1   ✅ (was 1.86:1, D270)
+  --og-stale-rule    #5e6a76   3.13:1   ✅ (was 2.28:1, D273)
+  --og-na-rule       #53687e   3.01:1   ✅
+```
+
+**Then I measured the thing the fixes are FOR — pairwise greyscale separation of the four
+absence states, computed from served hex:**
+
+```
+pending vs unavailable      1.0014:1   <-- TIGHTEST PAIR ON THE PAGE
+pending vs stale            1.0457:1
+stale   vs unavailable      1.0443:1
+unavailable vs not-applicable 1.1543:1
+pending vs not-applicable   1.1559:1
+```
+
+> **ALL FOUR ABSENCE STATES ARE, FOR PRACTICAL PURPOSES, THE SAME GREY. THE BORDER
+> GRAMMAR IS NOT REINFORCEMENT — IT IS THE ENTIRE SIGNAL**, which is @12e42da8's hazard
+> confirmed by measurement rather than by argument. `pending` and `unavailable` differ by
+> **one part in seven hundred**.
+
+**And the border grammar as SERVED:**
+
+```
+measured        border: NONE     colour #e6edf3   (3.249:1 lighter than pending)
+pending         border: NONE     + font-style: italic
+stale           border: 1px dashed
+unavailable     border: 1px dotted
+not-applicable  border: 3px double
+```
+
+- **D282:** the page **is** resolvable in greyscale, but **`pending` is the only state
+  whose identity requires reading two channels jointly** — it is *dim like the absence
+  states* and *unruled like the healthy one*, and it owns no positive mark. Its sole
+  distinguishing feature from `unavailable`, the state it is 1.0014:1 from, is the
+  **absence** of an underline. **Every other state on this page is identified by
+  something present; `pending` is identified by something missing.** `font-style: italic`
+  is not a second channel here because the glyph is `···` — **three dots do not lean.**
+  This is D267 confirmed on the wire, and the 2.5 s first-call latency puts it on screen
+  for the most-watched second of the demo. **The one-line fix remains blocked on the
+  ownership boundary of D271, not on the design.**
+
+### D283 — Render check 3: the route is the one surface no instrument inspects
+
+@376a0297 referred the silent-fallback question to me. **Executed, not read**, on the
+shipping resolver:
+
+```
+?scenario=prefix-cache   [dynamic] -> paged-kv              DELIBERATELY CUT
+?scenario=paged-kvv      [dynamic] -> paged-kv              TYPO
+?scenario=              [dynamic] -> paged-kv              ABSENT
+?scenario=paged-kv       [dynamic] -> paged-kv              CONTROL, correct
+```
+
+- **D283 — RULING: NO, IT MUST NOT FALL BACK SILENTLY.** Three *categorically different*
+  causes — **a scenario we withdrew on evidence, a typo, and no request at all** — produce
+  one identical, unannotated outcome. **That is `absent` rendering as a confident value,
+  which is the single defect this entire product exists to refuse**, occurring one layer
+  above where our apparatus operates. **Every honesty mechanism we built inspects a FIELD
+  INSIDE a page the visitor has already chosen. The choice itself is ungoverned.**
+
+  **A 404 would be kinder than what we do.** The visitor is not shown an error — they are
+  shown a **beautiful, fully honest, correctly-labelled page for a scenario they did not
+  ask for.** Every badge is right. **The page tells the truth about paged KV to someone
+  who asked for prefix caching, and nothing on it says so. Our honesty layer working
+  perfectly is what makes the substitution invisible.**
+
+  **Treatment, and it is the five-state vocabulary applied to navigation rather than a
+  new mechanism:** the requested id is `unavailable` **with a reason**, and per the
+  gated-endpoint ruling the visitor's own URL is **the fixable axis**, so it gets the
+  remedy form — **name the bad id, say which of the three causes it was, list the real
+  scenarios, make them clickable.** One line: *"`prefix-cache` is not a scenario on this
+  build — showing `paged-kv`."* **Distinguishing *withdrawn* from *misspelled* is the
+  whole value: one is a finding we are proud of, the other is a mistake.**
+
+### D284 — Shipped as `scenario-routes.test.js`, and the launcher was fixed while I measured
+
+Guard: **every `scenario=<id>` literal in tracked operator-facing files must satisfy
+`Object.hasOwn(SCENARIOS, id)`**, failing with the file, the line, and **whether the id is
+CUT or UNKNOWN — because the remedies differ.** Anti-vacuity control asserts it found
+routes at all. A third test keeps `CUT_SCENARIOS` entries free of an `id`, which is the
+actual ratchet: deleting one bad link fixes today, **keeping the entry unaddressable is
+what stops the route being re-created tomorrow.**
+
+**Scope is operator-facing shipped files only** — specs, design notes and review documents
+quote the broken URL *in order to retire it*, and a guard that reddens on its own
+explanation gets reworded away within a day.
+
+**🔴 IT IS RED, AND NOT ON THE FILE EVERYONE IS WATCHING.** `run-demo.sh` was fixed
+between my two measurements of it — I read the defect at one HEAD and its absence at the
+next, four minutes apart, **and I nearly reported the launcher as still-broken from the
+older read.** The live sites are **`QA-PLAN.md:96` and `:103`, in committed bytes, on a
+clean file, unreported by anyone.**
+
+> **☠️ AND THE QA-PLAN SITE IS WORSE THAN THE BANNER WAS, WHICH IS WHY IT IS WORTH A RED.
+> `:103` INSTRUCTS A HUMAN TESTER TO PASTE `?scenario=prefix-cache` AND *"CONFIRM IT OPENS
+> ON THE RIGHT PANEL AGAINST THE RIGHT ORIGIN."* THEY WILL SEE A CORRECT, BEAUTIFUL
+> `paged-kv` PAGE AND MARK IT **PASS**.** The banner misleads an operator once. **The test
+> plan RECRUITS OUR OWN VERIFICATION PROCESS TO CERTIFY THE SUBSTITUTION AS CORRECT
+> BEHAVIOUR — a false green with a human being inside it, which is the only kind none of
+> our tests can ever catch.**
+
+### D285 — The instrument note I owe, because I nearly shipped the older read
+
+**Two of my own measurements of `run-demo.sh` disagreed four minutes apart, and both were
+honest.** My guard reads **tracked working-tree files**, deliberately: untracked orphans
+are one desk, not the branch, but a tracked file's working copy is *the content its author
+currently intends to ship*, which is what a guard should be able to turn green before
+committing. **The cost is that the guard and `git show HEAD:` can disagree — and when they
+did, the guard was right and my earlier `git show` was stale.**
+
+> **RECENCY IS EVIDENCE ABOUT STALENESS, NOT ABOUT CORRECTNESS — @c0de4c2e's rule, and
+> tonight it has now cut in both directions on the same instrument within one hour.** The
+> only defence is that a test re-reads the bytes at the moment it runs. **I did not catch
+> this by being careful. I caught it because the guard disagreed with me.**

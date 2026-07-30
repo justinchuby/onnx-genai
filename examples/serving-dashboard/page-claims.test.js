@@ -250,6 +250,16 @@ describe('the design document does not instruct a build it has ruled against', (
       // precisely why the exemption must be WRITTEN rather than inferred (D166).
       // The hash is the safeguard: edit the quote and the exemption dies.
       ['30ffe828eee9', 'S58: verbatim quote of the defect being reported, not a layout'],
+      // S84: this guard fired on MY OWN section, twenty minutes after I wrote it,
+      // and it was RIGHT to. The block is a TRANSCRIPT -- four lines of output I
+      // got by executing currentScenarioId() against the shipping resolver -- but
+      // a transcript of a cut route and an instruction to build one are the same
+      // bytes, which is D166 arriving from the opposite direction: the earlier
+      // exemptions quote a defect in SOURCE, this one quotes a defect in BEHAVIOUR.
+      // Recording that the cut scenario still resolves is the whole finding, so it
+      // cannot be struck; and it binds no value, carries no 's' badge, and its
+      // right-hand column is the verdict, not a number. Declared, not inferred.
+      ['930d276e135f', 'S84: executed resolver transcript proving the silent fallback'],
     ]);
 
     const offenders = [];
