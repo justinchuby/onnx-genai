@@ -227,6 +227,67 @@ Unavailable today (documented zeros / not plumbed): `kv.usage`, `kv.pages_used`,
 
 ---
 
+## 3a. Field paths — the authoritative names
+
+`telemetry-provenance.js` is the registry, and its keys are the paths
+`store.field(path)` resolves. **An unknown path is safe**: the store returns a
+real `unavailable` field whose reason names the missing key —
+
+```js
+store.field('kv.blocks_used')
+// { state: 'unavailable', reason: 'No field named "kv.blocks_used" is published…' }
+```
+
+— so a typo degrades to an honest em-dash rather than `undefined`, a crash or a
+zero. That is the correct failure direction, but it is not a good END state: the
+reason explains our plumbing to a visitor who wants to know about the *server*.
+Bind the real name where one exists, and where none does, pass a reason that
+says what the server does not compute and why.
+
+`demo-ux.md` §3.2 sketched a flat namespace that was never implemented. Where
+the two differ, the registry wins. Renames:
+
+| demo-ux.md §3.2 | registry key | note |
+|---|---|---|
+| `throughput.aggregate_tok_s` | `throughput.observed` | derived from the token counter. **Not** `throughput.tokens_per_second`, which the server hardcodes to zero |
+| `scheduler.running` | `batch.in_flight` | |
+| `scheduler.waiting` | `metrics.requests_waiting` | |
+| `kv.blocks_used` / `_total` / `_shared` | `kv.pages_used` / `pages_total` / `pages_shared` | "pages" is the engine's own word |
+| `resources.kv_bytes_limit` | `resources.kv_budget_bytes` | derived, not reported |
+| `latency.*_p50/p95/max` | `metrics.ttft`, `metrics.e2e_latency` | **no percentiles exist.** The server exposes a single current value per metric, not a distribution |
+
+Paths with **no registry key at all** — the server does not compute them, so
+they cannot be bound, renamed or awaited: `scenario.makespan_ms`,
+`scheduler.max_batch`, `scheduler.preemptions_total`, `queue.depth_peak`,
+`kv.block_size`, `kv.slots_filled`, `kv.slot_capacity`, `kv.allocations`,
+`kv.frees`, `kv.allocation_failures`, `kv.hot_evictions`,
+`kv.prefix_evictions`, `kv.refcount_histogram`, `kv.tiers`,
+`server.decode_backend`, `server.quantization`, `server.version`,
+`server.uptime_ms`, `resources.kv_bytes_used`, `resources.host_ram_used`,
+`resources.host_ram_limit`, `resources.disk_spill_bytes`.
+
+`client.*` is not in the registry by design: the registry describes what the
+SERVER publishes. A client measurement is built with `measuredField(value, {
+sourceClass: 'client', origin })` at the point of measurement.
+
+> ⚠️ **Do not bind any `prefix.*` / `prefix_cache.*` path.** Ruled final, and
+> `prefix-counters-forbidden.test.js` enforces it as a shrinking ratchet. Those
+> counters are not stubs — they are precisely computed and entirely false
+> (~95%, because the counter increments on any nonzero token match and every
+> chat request shares the template preamble), while a controlled measurement
+> found reuse ABSENT. Every other safeguard here hunts fabricated *zeros*; a
+> confident 95% invites no scrutiny at all, which is what makes it the most
+> dangerous number in the tree.
+
+**Absence is not one thing.** Before binding a missing path to
+`unavailableField`, check the classification in the registry:
+`NOT_PLUMBED` and `DOCUMENTED_ZERO` mean *unavailable* (plumbing would fix it);
+`STRUCTURALLY_BYPASSED` means *not-applicable* (plumbing would not). Use
+`neverMeasuredField()` rather than deciding per call site — the mapping was
+copied three times before and drifted in two of them.
+
+---
+
 ## 3b. Rendering — `format.js`
 
 **Do not branch on `field.state` in a panel.** Every `if (field.state === '…')`
