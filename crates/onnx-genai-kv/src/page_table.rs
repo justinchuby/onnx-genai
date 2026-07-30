@@ -615,6 +615,36 @@ pub struct SequenceUsage {
     /// conversation that attached to a cached prefix is mostly shared.
     pub shared: usize,
 }
+/// Holds the optional telemetry mirror, and **drops it on clone**.
+///
+/// A cloned [`PageTable`] is a separate pool with its own pages. If the mirror
+/// came along, both pools would publish into one set of gauges and every
+/// counter would double-count. A newtype keeps `#[derive(Clone)]` on the table
+/// itself, so a field added later cannot silently reintroduce the bug.
+#[derive(Debug, Default)]
+struct TelemetryHandle(Option<Arc<KvTelemetry>>);
+
+impl Clone for TelemetryHandle {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+/// One physical page as seen by a block-table view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageBlock {
+    pub id: PageId,
+    /// Active references. `> 1` means genuinely shared by CoW or prefix reuse.
+    pub ref_count: u32,
+    /// Filled token slots. The gap to `page_size` is paging's fragmentation
+    /// cost, and is the point of drawing blocks rather than a single gauge.
+    pub filled_slots: usize,
+    /// Tier this page currently lives on. A page demoted to the cold tier keeps
+    /// its references, so it is still in use.
+    pub device: Device,
+    /// Lowest-numbered sequence holding this page, if any.
+    pub owner: Option<SequenceId>,
+}
 
 #[derive(Clone)]
 pub struct PageTable {
@@ -663,7 +693,7 @@ pub struct PageTable {
     /// Optional lock-free mirror of this pool's counters, readable from another
     /// thread while a generation is in flight. `None` on every path that has no
     /// reader, which is the default.
-    telemetry: Option<Arc<KvTelemetry>>,
+    telemetry: TelemetryHandle,
 }
 
 impl PageTable {
@@ -836,7 +866,7 @@ impl PageTable {
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
-            telemetry: None,
+            telemetry: TelemetryHandle::default(),
         }
     }
 
@@ -852,7 +882,64 @@ impl PageTable {
         // not start the gauges from a false zero.
         let (in_use, shared) = self.live_page_counts();
         telemetry.set_live_gauges(in_use, shared);
-        self.telemetry = Some(telemetry);
+        self.telemetry = TelemetryHandle(Some(telemetry));
+    }
+
+    /// A stable, ordered window over the physical pages.
+    ///
+    /// **Ordering is by page id, and that is load-bearing.** `pages` is a
+    /// `HashMap`, so iterating it directly yields a different order on every
+    /// call; a block-table rendered from that would reshuffle on every poll and
+    /// show motion that isn't happening. Sorting costs `O(n log n)` per call,
+    /// which is irrelevant at the 1 Hz this is designed for and buys a
+    /// visualisation whose blocks stay put unless the pool actually changed.
+    ///
+    /// Windowed rather than whole-pool because the block table is the one
+    /// endpoint whose response grows with pool size; `start` is an offset into
+    /// the ordered pages, not a page id, so paging through is total even when
+    /// ids are sparse after cold-tier growth.
+    pub fn block_window(&self, start: usize, count: usize) -> Vec<PageBlock> {
+        let mut ids: Vec<PageId> = self.pages.keys().copied().collect();
+        ids.sort_unstable();
+
+        let owners = self.page_owners();
+        ids.iter()
+            .skip(start)
+            .take(count)
+            .filter_map(|id| {
+                let page = self.pages.get(id)?;
+                Some(PageBlock {
+                    id: *id,
+                    ref_count: page.ref_count,
+                    filled_slots: page.filled,
+                    device: page.device,
+                    owner: owners.get(id).copied(),
+                })
+            })
+            .collect()
+    }
+
+    /// Reverse index from page to the sequence holding it.
+    ///
+    /// A shared page has several owners; this reports the lowest sequence id so
+    /// the answer is deterministic across polls. Callers wanting to show
+    /// sharing should use `ref_count > 1`, which is exact, rather than trying to
+    /// infer it from ownership.
+    fn page_owners(&self) -> HashMap<PageId, SequenceId> {
+        let mut owners: HashMap<PageId, SequenceId> = HashMap::new();
+        for (seq, pages) in &self.sequences {
+            for page_id in pages {
+                owners
+                    .entry(*page_id)
+                    .and_modify(|current| {
+                        if seq < current {
+                            *current = *seq;
+                        }
+                    })
+                    .or_insert(*seq);
+            }
+        }
+        owners
     }
 
     /// `(pages_in_use, pages_shared)`, computed directly from the pages.
@@ -889,7 +976,7 @@ impl PageTable {
     /// Called after every `stats` mutation. Copying the whole set is a handful
     /// of relaxed stores and makes it impossible for a counter to drift.
     fn publish_counters(&self) {
-        if let Some(telemetry) = &self.telemetry {
+        if let Some(telemetry) = &self.telemetry.0 {
             telemetry.publish_counters(&self.stats);
         }
     }
@@ -976,7 +1063,7 @@ impl PageTable {
                 self.clock += 1;
                 page.last_access = self.clock;
             }
-            if let Some(telemetry) = &self.telemetry {
+            if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(0, 1);
             }
             return Some(page_id);
@@ -995,7 +1082,7 @@ impl PageTable {
             self.clock += 1;
             page.last_access = self.clock;
             self.pages.insert(page_id, page);
-            if let Some(telemetry) = &self.telemetry {
+            if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(0, 1);
             }
             return Some(page_id);
@@ -1015,7 +1102,7 @@ impl PageTable {
                 self.free_pages.entry(device).or_default().push(page_id);
                 self.stats.frees += 1;
             }
-            if let Some(telemetry) = &self.telemetry {
+            if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(previous, current);
                 telemetry.publish_counters(&self.stats);
             }
@@ -1030,7 +1117,7 @@ impl PageTable {
             let current = page.ref_count;
             self.clock += 1;
             page.last_access = self.clock;
-            if let Some(telemetry) = &self.telemetry {
+            if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(previous, current);
             }
             true

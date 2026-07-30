@@ -427,6 +427,94 @@ mod tests {
         assert_no_drift(&table, &telemetry, "concurrent reads");
     }
 
+    /// A cloned pool is a *separate* pool. If it inherited the mirror, both
+    /// would publish into one set of gauges and every counter would double.
+    #[test]
+    fn cloning_a_pool_does_not_share_its_telemetry() {
+        let (mut table, telemetry) = pool(8);
+        table.allocate(GPU).expect("pool has capacity");
+        assert_eq!(telemetry.snapshot().pages_in_use, 1);
+
+        let mut cloned = table.clone();
+        cloned.allocate(GPU).expect("clone has capacity");
+        cloned.allocate(GPU).expect("clone has capacity");
+
+        assert_eq!(
+            telemetry.snapshot().pages_in_use,
+            1,
+            "the clone must not publish into the original's gauges"
+        );
+        assert_no_drift(&table, &telemetry, "cloning the pool");
+    }
+
+    /// Block ordering must be stable across polls. `pages` is a `HashMap`, so
+    /// unsorted iteration would reshuffle the block table on every refresh and
+    /// render motion that never happened.
+    #[test]
+    fn block_window_ordering_is_stable_across_calls() {
+        let (mut table, _telemetry) = pool(32);
+        for _ in 0..20 {
+            table.allocate(GPU).expect("pool has capacity");
+        }
+
+        let first: Vec<_> = table.block_window(0, 20).iter().map(|b| b.id).collect();
+        for _ in 0..10 {
+            let again: Vec<_> = table.block_window(0, 20).iter().map(|b| b.id).collect();
+            assert_eq!(first, again, "block order must not change between polls");
+        }
+        assert!(
+            first.windows(2).all(|w| w[0] < w[1]),
+            "must be ordered by id"
+        );
+    }
+
+    #[test]
+    fn block_window_pages_through_without_gaps_or_repeats() {
+        let (mut table, _telemetry) = pool(16);
+        for _ in 0..16 {
+            table.allocate(GPU).expect("pool has capacity");
+        }
+        let total = table.total_pages();
+        assert!(total >= 16);
+
+        let mut paged = Vec::new();
+        let mut start = 0;
+        while start < total {
+            let window = table.block_window(start, 5);
+            assert!(window.len() <= 5);
+            paged.extend(window.iter().map(|b| b.id));
+            start += 5;
+        }
+
+        let whole: Vec<_> = table.block_window(0, total).iter().map(|b| b.id).collect();
+        assert_eq!(paged, whole, "paging must cover exactly the whole pool");
+    }
+
+    #[test]
+    fn block_window_beyond_the_end_is_empty_rather_than_panicking() {
+        let (mut table, _telemetry) = pool(4);
+        table.allocate(GPU).expect("pool has capacity");
+        assert!(table.block_window(10_000, 10).is_empty());
+        assert!(table.block_window(0, 0).is_empty());
+    }
+
+    /// The block table exists to show fragmentation and sharing, so those two
+    /// fields must reflect reality rather than pool-level aggregates.
+    #[test]
+    fn block_window_reports_per_page_sharing() {
+        let (mut table, _telemetry) = pool(8);
+        let shared = table.allocate(GPU).expect("pool has capacity");
+        let solo = table.allocate(GPU).expect("pool has capacity");
+        table.retain(shared);
+
+        let blocks = table.block_window(0, 8);
+        let shared_block = blocks.iter().find(|b| b.id == shared).expect("present");
+        let solo_block = blocks.iter().find(|b| b.id == solo).expect("present");
+
+        assert_eq!(shared_block.ref_count, 2);
+        assert_eq!(solo_block.ref_count, 1);
+    }
+
     #[test]
     fn gauges_saturate_rather_than_underflowing() {
         let telemetry = KvTelemetry::default();
