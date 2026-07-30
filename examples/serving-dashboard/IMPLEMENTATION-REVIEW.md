@@ -1757,3 +1757,51 @@ struck it**, so no row can be quoted into a claim about the tree.
 Ancillary, and the same lesson one level down: my own citation to the surviving doc comment named a
 line number that had drifted by thirty lines. Both instances are now symbol-anchored. **A line
 number is a citation that rots silently; a symbol either resolves or it does not.**
+
+## Re-verification #3 — every row carries the SHA it was observed at
+
+Ordered by the Project Lead, who asked the right question: *are these findings, or are they
+photographs of an older tree?* **A review table is a findings list with no expiry column**, and this
+one now has one. Measured in a detached worktree at `review-0` = `6ecd9183`, **porcelain 0**, by
+execution — not by reading the previous row.
+
+| Finding | Status | Observed at | Evidence |
+| --- | --- | --- | --- |
+| **F1** | 🟡 **LATENT — fix landing** | `6ecd9183` | Re-scoped, see below. Not a shipped fabrication. |
+| **F3** | 🔴 **LIVE** | `6ecd9183` | All three stacks ship: `format.js`, `telemetry-field.js`, `dashboard/field-state.js`. The alias is real, not a substring match: `field-state.js` → `ok: RENDER_STATES.OK`. Control: `'measured'` appears 6× in the same file, so the search is not vacuous. |
+| **F4-revised** | 🔴 **LIVE** | `6ecd9183` | `dashboard/prefix-cache.js` still declares `staleCeilingMs: null`, and `dashboard/field-state.js` documents that null is silently handed a 10-second expiry. Control: `system.js` declares an explicit `30000`, so the field is genuinely read. |
+| **F11** | ⚪ **RETRACTED** (unchanged) | `6ecd9183` | Already retracted in this document. Re-measured anyway: 2 `role="group"` sites, 0 with a nearby `aria-label`. **I am not re-opening it on that number** — a JSX/template-built role is invisible to this grep, so the measurement is a floor, not a census. |
+| **F12** | 🟢 **STRUCK** | `6ecd9183` | `repair-citations.test.js` now exists — 6,145 bytes, **6 tests, 6 pass**. It tests the exact property I filed: `it('REFUSES a cited file with uncommitted changes')` asserting `/DECLINED/`. The tool no longer computes from the dirty tree; it declines. |
+| **F15** | 🟢 **CLOSED** (unchanged) | `6ecd9183` | Already closed in this document; no contrary evidence found. |
+| **F16** | 🔴 **LIVE** | `6ecd9183` | `check-field-states.test.js` still reads `FIELD_STATES.MEASURED ?? FIELD_STATES.OK`. The enum has no `OK`, so the fallback is dead and the guard fires only if **both** spellings vanish — a state no half-swept rename can produce. **A guard that is green because it cannot fail.** |
+
+### Two instrument notes from this pass, both of which nearly cost a wrong row
+
+**A false LIVE, caught.** My first F3 measurement was `grep -c "ok"`, which matches `token`,
+`broken` and `look`. It returned 8 and I nearly banked it. The corrected pattern found the real
+alias and the row survives — **but it survives on evidence I did not have when I first wrote the
+number.** A right answer from a wrong instrument is still a wrong instrument.
+
+**A false STUB, caught by the runner.** I counted `repair-citations.test.js`'s tests with
+`grep -c "^test("` and got **0** on a file with **6 passing tests** — it uses `describe`/`it`.
+Had I trusted the zero I would have called a real, targeted test file a stub and left F12 open.
+**The thing that saved it was executing the file instead of describing it**, which is the same
+correction this review has issued to four other people tonight.
+
+### F1, re-scoped on someone else's better evidence
+
+The wire reports `page_size=16`, which can only originate from `kv_model.tensor_config`. **Both
+demo origins are therefore genuinely paged, and the `!continuous_batch_supported` inference reaches
+the right answer on the shipped configuration.** F1 was never a shipped fabrication and this
+document should not have implied one.
+
+It is **latent, not live**: the native backend hardcodes `kv_model: None`, so the predicate is one
+configuration change away from lying, and the fix is landing anyway. That distinction is
+load-bearing for anyone deciding whether the product misrepresented itself. **It did not.** What it
+had was a correct output produced by reasoning that does not guarantee correctness — which is worth
+fixing precisely because nothing would have told us when it started being wrong.
+
+**Recorded because I got this wrong in the other direction:** I carried F1 as a live blocker on the
+strength of a code shape without measuring the runtime values it produces. The shape was genuinely
+bad. The claim I attached to it — that we were reporting a false capability to a visitor — was not
+verified, and it was the more serious half.
