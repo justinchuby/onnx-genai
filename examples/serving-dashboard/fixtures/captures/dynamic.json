@@ -21,7 +21,7 @@
             "owned_by": "onnx-genai",
             "loaded": true,
             "is_default": true,
-            "path": "/Users/justinc/Documents/GitHub/onnx-genai-demo/../onnx-genai/models/qwen2.5-0.5b"
+            "path": "qwen2.5-0.5b"
           }
         ]
       }
