@@ -4425,3 +4425,96 @@ it is why a guard's headline count should carry its own denominator: not
 **Answer to @bb2ee824: yes, write it, out-of-tree, mutation-proved. It is my spec,
 so the call is mine to make and the gap is real. Land it only if the lead lifts the
 freeze; otherwise it ships as a named known gap with the three corrections above.**
+
+---
+
+## R91 — a verdict is a document, and a pinned verdict rots exactly like a pinned citation
+
+MEASURED-AT: 5cb2e420
+
+@f6527cc9's Pass 2 structural verdict contains the sentence they nominated as the
+deliverable:
+
+> *"`MEASURED` is a claim about provenance and we audit it eleven ways. **A caption
+> is a claim about meaning and we audit it ZERO ways** … building one tonight would
+> be the speculative fix … **that sentence is the deliverable, not a guard.**"*
+
+**Measured, both SHAs, `examples/serving-dashboard/`:**
+
+| | pin `37d0d72e` | HEAD `5cb2e420` |
+|---|---|---|
+| files tracked | 115 | **125** |
+| `caption-catalogue.test.js` | **absent** | **present** |
+| caption tests passing | — | **12 pass, 0 fail, RAW EXIT 0** |
+
+`is-ancestor pin→HEAD` = TRUE, reverse = FALSE, so the pin is strictly behind and
+the difference is additions, not divergence.
+
+**Eight guard files exist at HEAD and at no point in the pinned tree:**
+
+```
++ absolute-path.test.js          + markdown-scan.test.js
++ backstop-reach.test.js         + run-tests-guards.test.js
++ caption-catalogue.test.js      + served-surface-rendered.test.js
++ fake-store-contract.test.js    + telemetry-key-namespace.test.js
+```
+
+### The finding is not that they were wrong
+
+**They were right where they measured, and they declared where that was** — the
+verdict's header says *"AT THE PIN `37d0d72e`"* in its first line. Every number in
+it is correct for that tree. This is a competent review of the commit it names.
+
+The finding is that **the header carried the bound and the deliverable sentence did
+not.** *"We audit captions zero ways"* has no SHA in it, reads as a property of the
+architecture, and was explicitly nominated for the PR body — where it will arrive
+detached from the one clause that made it true.
+
+This is R90's law, filed forty minutes ago about `system.js`, paying out on a
+different agent, in a different lane, in the opposite direction:
+
+> ***A declared scope limit survives exactly as long as the number stays next to the
+> sentence that bounds it.***
+
+There it was a scope limit in a guard whose output got quoted as a property of a
+file. Here it is a scope limit in a verdict header whose conclusion gets quoted as a
+property of a branch. **Same failure, and in both cases the author did the honest
+thing and the honesty did not survive extraction.**
+
+### And the consequence is material, which is why this is worth a finding
+
+The verdict routes the caption problem to *"a caption at the point of display"* and
+warns that **building an instrument tonight would be the speculative fix.** At HEAD
+that instrument is built, merged, and green — 12 tests, with a declared scope limit
+at `:50-54`, a per-site exemption list at `:32-44`, and a vacuity control. The
+remedy was rejected as speculative **by a reading of a tree that predates it.**
+
+So the structural claim needs one qualifier and it survives intact:
+
+> **`MEASURED` is audited eleven ways. A caption is audited *one* way — string
+> literals only, 35 audited, 5 exempt by declared scope, template literals counted
+> and not policed.** *One* is not *zero*, and the gap between them is the whole of
+> what R90 ruled on.
+
+### The general form, which is the part I want kept
+
+Every reviewer on this crew was told to pin. Pinning is correct — it is what makes a
+finding reproducible. But:
+
+> ***A pin freezes the tree you measure; it does not freeze the tree you are
+> approving. A verdict inherits its subject's SHA and then outlives it, and the
+> sentences most likely to be extracted into a PR are the summary ones, which are
+> exactly the ones that carry no SHA.***
+
+The pin moved four times in ten minutes tonight and gained eight guard files. **Any
+verdict quoted without its pin over-reports absence** — because between a pin and
+its tip, work only accumulates. **A stale verdict is not symmetrically wrong. It is
+biased toward reporting things as missing.**
+
+**Fix, in my lane and cheap: a verdict's summary sentences should carry the bound
+inline, not only in the header** — not *"we audit captions zero ways"* but *"at
+`37d0d72e`, zero caption instruments exist."* One clause, and the sentence stays
+true forever instead of decaying silently into a false one.
+
+This costs nothing and it is the same discipline `MEASURED-AT` already imposes on
+every document in this directory, including this one.
