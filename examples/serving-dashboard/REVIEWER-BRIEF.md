@@ -244,6 +244,60 @@ without identifying its subject.
 
 ---
 
+## 0.9 Two defects confirmed in a real browser, after this brief was written
+
+Both were invisible to ~30 review findings, 545 green tests and a nine-item gate.
+Both were found by one browser load. Neither is subtle once seen.
+
+**P1 — the page renders an absolute filesystem path, including the operator's
+username, as visible text on both origins.** Not a `data-` attribute: it is the
+element's text content *and* its `title` tooltip, under the label `Directory`.
+
+```
+git grep -n "server.model_path" -- examples/serving-dashboard
+curl -s http://127.0.0.1:8134/v1/models | grep -o '/Users/[^"]*'
+```
+
+I refuted this P1 in public and **I was wrong**; so was the Critical Reviewer,
+independently, by the identical route. We both evaluated the catalogue's
+accessor `served.path` against the **raw** `/v1/models` body, where it returns
+`undefined`. The shipping store calls `projectServedModel()` first, which
+synthesises a `served` key from the `data[]` list — so at runtime it resolves to
+the full path. **We tested the right accessor against the wrong object, agreed
+with each other, and treated the agreement as verification.**
+
+> Note what this is *not*: the server's gate is correct. `may_disclose_model_paths()`
+> restricts the path to loopback, which is sound. **But a demo runs on loopback in
+> front of a projector — the gate is open by construction in the only configuration
+> we ship.** The defence is right and irrelevant. Show `qwen-dynamic`, not a path.
+
+**P1 — a field with no state attribute, or an unrecognised one, renders
+byte-for-byte identically to a fully trusted measurement.** Three screenshots,
+2219 bytes each, identical. **The failure degrades toward confidence, not toward
+caution**, and it is the one defect no test we own could ever have seen, because
+none of our eleven hundred assertions looks at a pixel.
+
+### The sentence that covers F1, C1 and the router zeros at once
+
+> **At every hop we discard the reason and keep the value.** The driver reduces
+> five distinct named errors to one bit (`.is_ok()`); the status handler reduces
+> *cannot measure* to an absent key; the router reduces an absent key to `0.0`.
+> **The final consumer acts on a number that no layer ever measured** — and under
+> `LeastKvUsage` that fabricated zero is the global minimum, so the node that
+> cannot measure itself beats every honest node, deterministically, and gets more
+> attractive the more broken it is.
+
+*(Credit: the Code Reviewer stated this; I am recording it because it is the most
+compressed true thing said tonight and it explains three separate findings.)*
+
+### One known-false claim already committed
+
+`demo-spec.md` **AC192 is known-false and was publicly retracted by its author.**
+The catalogue has exactly **one** `batch.capacity` key and it is the correct one.
+Do not act on AC192, and do not delete anything on its authority.
+
+---
+
 ## 1. Pre-existing reds that are not ours
 
 **`cargo test --workspace` does not fail tests on arm64 macOS — it fails to
@@ -599,7 +653,9 @@ The suite is a command, not a number. Run it, and state the command **and your
 working directory** alongside any result you report:
 
 ```
-cd examples/serving-dashboard && node --test
+cd examples/serving-dashboard && node --test    # bare = recurses; an explicit
+# glob does NOT. Print `node -v` beside the result, and treat any total below
+# 500 as a FAILED RUN, not a small one. `tests 0, exit 0` is a real outcome here.
 ```
 
 That invocation is the only total the release gate accepts. Anything narrower —
