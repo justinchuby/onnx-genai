@@ -317,10 +317,18 @@ test('no review document was measured before the tree reviewers extract', () => 
     // A document is fresh if ANY of its declarations is at-or-after the review point.
     // Not the last one positionally: nothing forces append order, and a document that
     // was re-measured is fresh regardless of where on the page it said so.
+    // PEEL BOTH SIDES. `merge-base --is-ancestor` peels an annotated tag automatically;
+    // `rev-parse` does NOT. That asymmetry lived inside this one comparison and made it
+    // accuse the most compliant possible author: the lead's order is "write the raw hex",
+    // the obvious way to obtain it is `git rev-parse review-3`, and for an annotated tag
+    // that returns the TAG OBJECT (02249627), not the commit (37d0d72e). is-ancestor said
+    // TRUE, rev-parse said "different object", and the doc was scored stale for naming the
+    // review point exactly. Only review-3 is annotated, so this was one tag away from
+    // firing at three reviewers at once.
     const fresh = declared.filter((measuredAt) => {
       try {
         git('merge-base', '--is-ancestor', measuredAt, boundary);
-        return git('rev-parse', measuredAt) === boundary;
+        return git('rev-parse', `${measuredAt}^{commit}`) === boundary;
       } catch {
         return true; // not an ancestor of the boundary => at or after it
       }
