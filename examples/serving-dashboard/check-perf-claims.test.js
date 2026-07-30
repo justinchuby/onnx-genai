@@ -160,7 +160,20 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   assertShippingTree();
 
   // A guard must quote what it forbids, which is why the digits are here.
-  const RATIO = /\b2\.4[5-9]\s*×|\b2\.5\s*×|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
+  //
+  // `[×xX]` and not `×` alone. The typographic multiplication sign was the only
+  // form matched for most of this branch's life, and a plain ASCII `2.46x` --
+  // which is what anyone types who is not copying from an existing document --
+  // slipped straight through. `\b2\.46\b` does not save it either: in `2.46x`
+  // the digit and the letter are both word characters, so there is no boundary
+  // between them and the alternative never fires.
+  //
+  // Measured before widening, so this is not a speculative hardening: five
+  // shipped documents already carry the ASCII form, all five with a retraction
+  // beside them, and widening the pattern produced ZERO new offenders. The
+  // blindness was real and was being masked by the fact that every existing
+  // ASCII occurrence happened to be already withdrawn.
+  const RATIO = /\b2\.4[5-9]\s*[×xX]|\b2\.5\s*[×xX]|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
   const ARMS = /\b0\.62\s*×|\b82\.\d{3}\s*tok|\b33\.\d{3}\s*tok|\+147\s*%/;
 
   // PERMANENT exclusions, SCOPED TO A PATTERN CLASS RATHER THAN TO A FILE.
@@ -342,10 +355,21 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   );
 
   // Once the tree is clean, a dead matcher and a clean tree are byte-identical.
+  //
+  // The ASCII arm is asserted SEPARATELY from the typographic one on purpose:
+  // a single control containing `2.46×` passed for this guard's whole life
+  // while `2.46x` was invisible, so one probe per FORM is the only version of
+  // this control that can detect the gap it is here to detect.
   assert.ok(
     RATIO.test('aggregate was 2.46× single-request') && ARMS.test('+147 %'),
     'the withdrawn-ratio matchers no longer fire against a synthetic positive '
       + 'control — this guard has gone blind and would pass on any tree.',
+  );
+  assert.ok(
+    RATIO.test('aggregate was 2.46x single-request') && RATIO.test('a 2.46X gain'),
+    'the withdrawn-ratio matcher no longer fires on the plain ASCII form. That '
+      + 'is the form a person TYPES rather than copies, so this is the arm most '
+      + 'likely to carry a fresh claim, and it is the arm that was missing.',
   );
 
   // Anti-rot, the SAME rule the deferrals get, now applied to the bucket that
