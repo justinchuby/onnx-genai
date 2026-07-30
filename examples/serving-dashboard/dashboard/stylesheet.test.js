@@ -16,7 +16,7 @@
 // tell those apart.
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { after, before, describe, it } from 'node:test';
 
@@ -387,5 +387,60 @@ describe('the panel stylesheet is actually reachable from the page', () => {
     // tokens.css it would render worse than unstyled: every custom property
     // resolves to nothing, so text and hatches lose their colour entirely.
     assert.match(page, /<link[^>]+href=["'][^"']*styles\/tokens\.css["']/);
+  });
+});
+
+describe('page/stylesheet wiring is complete in BOTH directions', () => {
+  // The two tests above name `panels.css` and `tokens.css` explicitly, which
+  // fixes the orphan we actually hit and nothing else. The next orphan will be
+  // a file that does not exist yet, and it will fail exactly as silently: an
+  // unlinked stylesheet is not a 404, not a console warning, not a DevTools
+  // entry — the file is simply never requested.
+  //
+  // Checking both directions closes the class rather than the instance.
+
+  const STYLES_DIR = fileURLToPath(new URL('../styles/', import.meta.url));
+
+  /** Every href the page links, in order, so duplicates stay visible. */
+  function linkedHrefs() {
+    return [...page.matchAll(/<link[^>]+href=["']([^"']+\.css)["']/g)].map((match) => match[1]);
+  }
+
+  it('links no stylesheet that is missing from disk', () => {
+    // A typo'd href IS a 404, but it is a 404 for a stylesheet — the page
+    // still renders, just unstyled, and nobody reads the network tab of a page
+    // that looks like it loaded.
+    const missing = linkedHrefs()
+      .map((href) => href.replace(/^\.\//, ''))
+      .filter((href) => href.startsWith('styles/'))
+      .filter((href) => !existsSync(fileURLToPath(new URL(`../${href}`, import.meta.url))));
+
+    assert.deepEqual(missing, [], `index.html links stylesheets that do not exist: ${missing}`);
+  });
+
+  it('leaves no stylesheet on disk unlinked', () => {
+    const onDisk = readdirSync(STYLES_DIR).filter((name) => name.endsWith('.css'));
+    assert.ok(onDisk.length >= 3, 'expected the styles directory to hold the real stylesheets');
+
+    const linked = new Set(linkedHrefs().map((href) => href.split('/').pop()));
+    const orphans = onDisk.filter((name) => !linked.has(name)).sort();
+
+    assert.deepEqual(
+      orphans,
+      [],
+      `these stylesheets exist but nothing loads them, so their rules silently do ` +
+        `nothing: ${orphans.join(', ')}. A file that EXISTS and a file that is USED are ` +
+        `different claims, and only one of them reaches the screen.`,
+    );
+  });
+
+  it('links each stylesheet exactly once, so cascade order is unambiguous', () => {
+    // A stylesheet linked twice wins over anything declared between its two
+    // links. That is invisible in every tool and reorders the cascade in a way
+    // no one would think to look for.
+    const names = linkedHrefs().map((href) => href.split('/').pop());
+    const duplicated = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
+
+    assert.deepEqual(duplicated, [], `linked more than once: ${duplicated.join(', ')}`);
   });
 });
