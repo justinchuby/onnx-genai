@@ -1108,10 +1108,39 @@ why. A scenario that cannot run is absent rather than disabled, because an
 unclickable tab is an invitation to feel excluded.
 
 The one place this could have gone wrong is the KV panel, which has no pages to
-count on the static-cache profile. Rather than em-dashing it, the panel is
-*redefined* there: it shows **decode row occupancy** — active rows against
-`--max-batch` — which is real, measurable, and moves under load. Same component,
-different noun, no fabricated numbers, and nothing on screen that looks broken.
+count on the static-cache profile. The *design* answer was to redefine the panel
+there rather than em-dash it: show **decode row occupancy** — active rows against
+the effective batch capacity — same component, different noun, no fabricated
+numbers.
+
+> **⚠️ That redefinition is designed and not yet live, and this paragraph used to
+> claim otherwise.** It read *"which is real, measurable, and moves under load …
+> nothing on screen that looks broken."* Both fields it needs — `kv.slots_filled`
+> and `kv.slot_capacity` — are recorded as unpublished in
+> `dashboard/field-keys.test.js:53-54` (*"block-table endpoint, not yet landed"*),
+> so on the static-cache profile **the KV panel em-dashes: exactly the outcome the
+> paragraph claimed to have avoided.**
+>
+> It is worth being blunt about how this one happened, because it is the most
+> instructive error in this document. **Nothing here was ever untrue of the
+> design; it was written from the design and then read as a report about the
+> page.** No reviewer catches that, because the sentence is well-formed,
+> internally consistent, and cites a real mechanism — and the code it describes
+> really does contain the redefinition. Only the *data* is missing. **A page whose
+> entire thesis is "never present a fabricated number as real" had, in its own
+> documentation, a fabricated success story about refusing to fabricate.**
+>
+> The general form, and the reason it survived so long: **prose has no tense
+> discipline.** Code cannot half-exist, but a sentence about code can silently
+> mean *is*, *will be*, or *was designed to be*, and all three render
+> identically. Every "which is real and moves under load" in a design document is
+> a claim about a runtime nobody re-checked.
+
+**Note on the denominator:** the ceiling is `effective_batch_capacity()` —
+`min(max_batch, max_queue_depth)` — not the raw `--max-batch` flag, which this
+paragraph also used to name. Dividing by `--max-batch` **overstates the ceiling**
+whenever the queue is the binding constraint, which understates occupancy and
+flatters the page.
 
 So provenance is keyed by **(field, profile)**, not by field name alone. The same
 field legitimately has different states on the two profiles — prefix cache hit
