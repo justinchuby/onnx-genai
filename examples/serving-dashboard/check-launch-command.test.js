@@ -190,16 +190,29 @@ test('every copy-pasteable command passes --demo-assets-dir', () => {
   // exactly the kind of silent, environment-dependent instruction this test
   // exists to stop shipping.
   //
-  // Scoped to the two sources owned by the docs. index.html's file:// guard and
-  // ui/launch-command.js are owned by the demo developer and still omit the
-  // flag; widening this assertion to cover them is tracked with that owner, and
-  // asserting it here today would only break their suite with their own bug.
-  const owned = {
-    'README.md': copyPasteableCommands['README.md'],
-    'run-demo.sh': copyPasteableCommands['run-demo.sh'],
-  };
+  // NOW SCOPED TO ALL FOUR SOURCES. This assertion was deliberately narrowed to
+  // the two doc-owned sources while index.html's file:// guard and
+  // ui/launch-command.js still omitted the flag -- those belong to the demo
+  // developer, and asserting it here would have broken their suite with a
+  // defect they had not been told about yet. @bb2ee824 has since fixed both
+  // (verified independently here, not taken on report), so the exemption is
+  // spent and the narrow scope is now the only thing that could let it return.
+  //
+  // An exemption is a promise to come back. Left in place after its reason
+  // expires it becomes indistinguishable from an oversight, and it is silent
+  // either way -- the check stays green while covering less than its name says.
+  //
+  // Empty-input floor: `Object.entries({})` iterates zero times and this test
+  // would pass without checking anything, growing more trusted with every green
+  // run. Naming the four sources explicitly also makes DELETING one a failure
+  // rather than a silent reduction in coverage.
+  assert.deepEqual(
+    Object.keys(copyPasteableCommands).sort(),
+    ['README.md', 'index.html', 'run-demo.sh', 'ui/launch-command.js'],
+    'the set of copy-pasteable command sources changed; this test must cover all of them',
+  );
 
-  for (const [name, commands] of Object.entries(owned)) {
+  for (const [name, commands] of Object.entries(copyPasteableCommands)) {
     assert.ok(
       commands.includes('--demo-assets-dir'),
       `${name} must pass --demo-assets-dir so the command works from any directory`,
