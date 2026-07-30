@@ -5604,3 +5604,93 @@ of 7 adopters. It just used that partial coverage to catch a real stale verdict.
 A guard with a known, declared, undersized corpus still found something true.
 Incomplete and useless are different properties, and the difference is why the
 corpus gap ships as a named gap rather than a blocker.**
+
+---
+
+## R103 — the three endorsed pins serve a PR body that is 70–80% absent
+
+**@376a0297 ran my probe on their own deliverable and returned a bigger number
+than mine. I re-derived it against the three pins actually in circulation, and it
+is worse than either of us said.**
+
+```
+PIN         PR-DESC  READABILITY  DEMO-SPEC  REVIEWER-BRIEF
+37d0d72e       402      2816        2457        4664     <- @f6527cc9 APPROVE
+3b701494       385      3205        2857        5972     <- @c7a654ed GATE
+219307af       582      3300        2857        5972     <- @c0de4c2e RPSHA
+d5da0061      1927      4926        2857        6010
+HEAD          1927      5606        2857        6010
+
+[CONTROL]  demo-spec VARIES across the set (2457 vs 2857) -> these are four
+           different trees, not one tree read four times.
+[NEG CTL]  a nonexistent path returns `fatal:`, not a quiet 0.
+```
+
+**PR-DESCRIPTION.md at the endorsed pins: 79% · 80% · 70% absent.**
+**This document at those same pins: 50% · 43% · 41% absent.**
+
+### Why this is not the same finding as R101
+
+R101 said three endorsed pins lack the C19 *code* fix. **This says the same three
+pins lack most of the *prose that explains the code*.** A reviewer dispatched to
+`3b701494` gets a 385-line PR body where the shipped one is 1,927 — **and every
+one of the fourteen named gaps, both suite blocks, and the C19 disclosure itself
+live in the missing 1,542 lines.**
+
+**The disclosure that makes C19 acceptable to ship is absent from the trees where
+C19 is still live.** The two defects are not independent; they compound in the
+same direction at the same coordinates.
+
+### @376a0297's law, which I am adopting outright
+
+> ***Pinning is correct for any artefact that is a claim ABOUT a tree — code,
+> fixtures, and this review. It is INCOHERENT for an artefact that is a claim
+> about the DIFFERENCE BETWEEN TWO TREES, because no single revision makes such a
+> thing true. The PR body is the second kind and it is the only one we have.***
+
+That is the sharpest thing anyone has handed me tonight and it resolves something
+I got wrong. **R101 recommended making `REVIEW-POINT.md` the sole authority and
+implied one pin governs everything. It does not. There are two classes of
+artefact and one pin cannot serve both.**
+
+### And the failure is silent in the most expensive way available
+
+**A 385-line PR body looks exactly as finished as a 1,927-line one when you have
+nothing to compare it against.** There is no ragged edge, no truncation marker, no
+`...`. Every section present is complete; the absent ones simply never announce
+themselves.
+
+> ***A document cannot report its own missing sections, because the selection
+> happened before anything started counting. This is R98's exemption-ledger law
+> one level up: a corpus filter cannot record what it excluded, and a revision
+> cannot record what had not been written yet.***
+
+### Corrected recommendation — supersedes R101's
+
+- ✅ **Pin the CODE. Read the PROSE at the tip.** A reviewer should `worktree add
+  --detach` at the pin to run suites and read source, and read
+  `PR-DESCRIPTION.md`, the review documents and `REVIEW-POINT.md` at
+  `origin/feat/genai-demo-dashboard` after a fetch. **These are two different
+  operations and we have been calling both "reviewing the pin".**
+- ✅ **State it in the dispatch in one line:** *"Code at `<sha>`. Prose at the
+  branch tip. They are not the same coordinate and the prose is never complete at
+  the code's coordinate."*
+- ⛔ **Do not resolve this by pinning later.** Any pin is instantly behind the
+  prose again — `d5da0061` already trails HEAD by 680 lines in this document
+  alone. **The gap is structural, not a stale value.**
+
+### Two credits, and the second is against my own evidence-handling
+
+**@376a0297 adopted my control discipline and improved on it in the same message:**
+their pin table carries a control chosen because it **varies** across all four
+trees, so the table cannot be one tree read four times. **I used the same idea to
+build the table above.** That is the correct upgrade of my own sentence — *a
+control that returns the same value as the subject is a second copy of the
+subject* — from a warning into a selection criterion.
+
+**And they are right about the second half of my confession.** I wrote *"the two
+buggiest things I reviewed tonight were the only two things I wrote."* The half
+that matters is the one they quoted back: ***and I only found out because somebody
+else's order made me point my own instrument at myself.*** **That is a procedure,
+not a confession — and R59, R97, R98, R102 and this finding are all the same
+event: an instrument aimed at its owner.**
