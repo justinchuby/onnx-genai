@@ -2644,3 +2644,47 @@ AC39 reads: *"Verified today: the current binary returns **404 on `/demo`**, zer
 |---|---|---|
 | D99 | An honesty process that only ratchets toward understating is **not calibrated, it is inversely biased** | Each understating step feels virtuous, so nothing flags the drift. Verify before weakening a claim, exactly as before strengthening one |
 | D100 | AC43 stands **verbatim** — eviction verified at `paged_decode.rs:44` ← `flat_autoregressive.rs:307` | LRU prefix eviction is wired and reachable |
+
+---
+
+## 36. THREE LIVE CONTRADICTIONS BETWEEN RATIFIED ARTIFACTS — the spec disagrees with the ruling, and with ITSELF
+
+Verified on disk, not remembered. All three change what somebody builds in the next few minutes.
+
+### 36.1 🔴 THE SPEC MANDATES `ok`; THE RULING AND THE CODE SAY `measured` — AND THE SPEC CONTRADICTS ITSELF ABOUT IT
+
+`demo-spec.md:185` rules **`ok`, NOT `measured`** — carrying the orthogonality rationale (*"a field whose state read `measured` while its source badge read `estimated` would contradict itself"*). **That argument is MINE, and it was overturned.** @12e42da8 yielded and I reversed my own D65 in §32. The final enum is `measured`.
+
+**And the spec's own AC49, 189 lines later, treats `ok` as the STALE value:**
+> *"a module built against the older shape passing `state: 'ok'` renders a **live-looking number**."*
+
+**So the spec simultaneously MANDATES `ok` in §3.1 and cites `ok` as the canonical example of the enum-migration bug in AC49.** A dev binding to §3.1 builds precisely the defect AC49 exists to prevent.
+
+**This is the reconstruction hazard doing exactly what we predicted, one level up.** The spec is a *record* of rulings; a record rebuilt from a ruling that has since been reversed **re-enters the document wearing the reconstruction's fresh timestamp** and outranks the newer decision by looking more authoritative. **@376a0297 — §3.1 must say `measured`, and the retired rationale should be kept with an explicit "superseded, and here is why" rather than deleted**, or someone re-derives it in three weeks exactly as I did.
+
+### 36.2 🔴 DOES THE BLOCK GRID HAVE PER-CELL OWNERSHIP? TWO RULINGS SAY OPPOSITE THINGS
+
+- **@376a0297:** per-cell ownership *"isn't reachable from the server crate"* — `SequenceUsage` consumes the `Vec<PageId>` into a length (`page_table.rs:867-875`). AC15 is caveated to a degraded form, **and the hover-linked swimlane↔KV highlight is declared to fall with it.**
+- **@12e42da8 (QA plan §0/B3, APPROVED AND IN FLIGHT):** @d7cf9b84 owns an accessor returning `Vec<PageBlock { id, ref_count, filled_slots, tier, **owner** }>`.
+
+**`owner` is exactly the field the PM says is unreachable.** Both are right about their own premise — the PM read *today's* server crate; the Lead approved *an engine change that adds it.* **The contradiction is a TENSE problem, not a facts problem**, and tense is invisible in a spec written in the present.
+
+**It is load-bearing for me in two places, so I need it resolved, not averaged:** §25's **sharing-by-selection** (select a sequence, its blocks light up) requires `owner` **and** a stable `id` across frames; without both it degrades to an anonymous fill meter. **D101: I design to the DEGRADED form and treat `owner` as an enhancement that lights up when the engine change lands.** A grid that is honest and good without ownership, and better with it, is the only version that can't be wrong — and it means **a slip in @d7cf9b84's engine work costs a feature, not a panel.**
+
+### 36.3 GRID CADENCE — the PM's 1 Hz and my event-sampling agree; take the stricter one
+
+@376a0297 ruled **1 Hz, not 4 Hz** (4096 cells × 4 Hz ≈ 1 MB/s of JSON straight into AC33's budget). §27/D78 already ruled the grid **event-sampled** rather than polled at all. **These aren't in conflict — event-sampling is strictly cheaper than 1 Hz, and their justification is the better articulation of why:**
+
+> **Gauges and sparklines need 4 Hz because the eye reads them as MOTION. The block grid is read as a STATE YOU INSPECT, not a flow you watch.**
+
+**D102: event-sampled is canonical; 1 Hz is the fallback ceiling if event hooks aren't available. Never 4 Hz.** And their cut-order call is right and I'm adopting it verbatim: **if cadence must be traded against fidelity, keep the blocks and slow the refresh.**
+
+### 36.4 ✅ Confirmed, no action: no `preempted` lane
+
+@d7cf9b84 asks for no preemption lane. **Already ruled in §28/D83 — the swimlane is 4 states with no reserved lane**, decided when their first blocker landed. Their four-independent-blockers finding doesn't change the design, it just makes it unarguable. **A reserved-but-never-filled lane is a fabricated zero in layout form** — it occupies space, implies a category, and reads as *"this never happens"* rather than *"this cannot happen."*
+
+| # | Decision | Rationale |
+|---|---|---|
+| D101 | Design the block grid to the **degraded** (no-`owner`) form; ownership is an enhancement | A slip in the engine change then costs a feature, not a panel |
+| D102 | Grid is **event-sampled**; 1 Hz fallback ceiling; never 4 Hz | The grid is a state you inspect, not a flow you watch |
+| D103 | A reserved-but-unfillable lane is **a fabricated zero in layout form** | It implies a category and reads as "never happens", not "cannot happen" |
