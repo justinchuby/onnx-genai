@@ -778,3 +778,78 @@ router.** The lesson is not *check your work*; it is that **the symbol most natu
 search for is the one the fix removed**, so resolving a citation by the defect it discusses
 is guaranteed to fail exactly when the defect has been repaired.
 
+## 12. C16 (NEW, MAJOR, non-blocking) — two modules own the same vocabulary and answer opposite things about the same input
+
+@c8d9a40e found that `dashboard/testing/fake-store.js` mints `state: 'ok'` and that the
+product refuses to render it. I verified it independently and **the cause is not the one
+that reading the fixture suggests.** Executed at HEAD `e9bf0285`:
+
+```
+telemetry-field.js  FIELD_STATES values -> ["measured","pending","stale",
+                                            "unavailable","not-applicable"]
+     'ok' among them ................... false
+
+dashboard/field-state.js normalise('ok') -> "measured"     ⬅ ACCEPTS IT
+format.js       formatField({state:'ok'}) -> "—" + console.error  ⬅ REFUSES IT
+```
+
+`format.js:55` builds its gate as `KNOWN_STATES = new Set(Object.values(FIELD_STATES))` —
+strictly the canonical values. `field-state.js:101-102` maintains a **separate** alias map
+whose comment reads *"BOTH SPELLINGS OF THE MEASURED STATE ARE ACCEPTED, DELIBERATELY."*
+Neither table derives from the other. **The same string is legal in one module and a
+reportable defect in the other, and both behaviours are deliberate and commented.**
+
+So the fixture author was not careless. They wrote `'ok'` against a module that documents
+`'ok'` as supported, and it *is* supported there. The defect is that support is not a
+property of the product — it is a property of which module you reach first. **A tolerance
+that lives in one consumer and not in its sibling is worse than either strictness or
+tolerance chosen consistently, because it makes the correct-looking fixture wrong only on
+the path nobody asserts against.**
+
+### 12.1 Blast radius, counted rather than inherited
+
+```
+stylesheet.test.js 51 · panels.test.js 36 · scheduling.test.js 16 · field-state.test.js 6
+panel-kit.test.js 2 · accessibility.test.js 1 · model-path-disclosure.test.js 1
+TOTAL 113 fixture fields   (RED at 0)   CONTROL: 8 files import fake-store
+```
+
+@c8d9a40e reported ~112 across 6 files; I get 113 across 7, the extra being the
+`model-path-disclosure.test.js` they had just landed. Their bound was right.
+
+**Every one of those 113 fields exercises the unknown-state branch, not the measured
+branch.** The suite is green because panel tests overwhelmingly assert structure and class
+names rather than rendered values. This is the largest vacuity on the branch: our most
+common render path — a healthy number — is substantially less tested than the count
+suggests. I state that as a bound, not a measurement; establishing the true figure means
+flipping the fixture and reading what breaks, which is exactly what must not be done at
+04:30 by someone who owns none of those six files.
+
+### 12.2 The ruling, because the obvious fix is the wrong one
+
+There are two ways to reconcile the vocabularies and **only one is correct**:
+
+- ⛔ **Do not widen `format.js`.** Its strictness is the thesis of this entire branch — a
+  terminal branch that refuses to render an unrecognised state, with a comment saying *"a
+  default branch that renders as fine is how AC6 dies quietly."* Adding `'ok'` to
+  `KNOWN_STATES` would resolve the disagreement by deleting the only component that
+  noticed it.
+- ✅ **Delete the alias in `field-state.js`, then fix the fixture.** An alias map that
+  accepts a retired spelling is what keeps the retired spelling alive; it is the mechanism
+  by which a nine-times-retracted enum value is still executing. The fixture should not
+  mint a raw string literal for an enum-valued field at all — it should import
+  `FIELD_STATES.MEASURED`, at which point the two tables cannot disagree because there is
+  only one.
+
+**The general form, which is the third time this exact shape has appeared in my review:** a
+value's meaning is decided by a permissive layer the author read and a strict layer they
+did not. `panel-kit.js`'s `options.label ?? field?.label`, `resolveForOrigin`'s
+`{...entry, ...override}`, and now `normalise('ok')` versus `KNOWN_STATES` are one defect
+wearing three costumes — **two places that both get to decide, and no statement anywhere
+about which one wins.**
+
+I am filing this, not fixing it. It spans six test files I do not own, in a freeze, and
+@c8d9a40e's reason for declining it is the correct one: some of those tests may have been
+written honestly against the em-dash behaviour they were accidentally getting, and nobody
+can know which without running it.
+
