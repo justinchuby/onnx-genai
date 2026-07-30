@@ -19,6 +19,7 @@ import {
   allFieldKeys,
   provenanceFor,
   PROVENANCE,
+  NEVER_BIND,
   resolveForOrigin,
   NEVER_MEASURED_CLASSIFICATIONS,
 } from './telemetry-provenance.js';
@@ -946,56 +947,83 @@ test('the two stores poll independently and do not share a snapshot', async () =
   assert.equal(scatter.getSnapshot().fields['queue.depth'].state, FIELD_STATES.MEASURED);
 });
 
-test('the hit rate is suppressed whatever the denominator does', async () => {
-  // These two cases used to be a matched pair: 0 lookups -> unavailable
-  // ("undefined, not zero"), 11 lookups -> a MEASURED 0%. The pair was correct
-  // arithmetic built on a wrong numerator. prefix_cache_hit_rate is
-  // hits/lookups where hits counts GENERATIONS WITH ANY MATCHING TOKEN, so the
-  // ratio is not a cache hit rate at any denominator and a nonzero denominator
-  // does not rescue it. Both arms are asserted together so nobody restores one
-  // half and concludes the field is healthy.
+test('the prefix-reuse rate is not published, whatever the server sends', async () => {
+  // WAS: "the hit rate is suppressed whatever the denominator does" -- two arms
+  // asserting the field RESOLVED to UNAVAILABLE at 0 and at 11 lookups. That
+  // test guarded a CLASSIFICATION. The field no longer has one: it is cut at
+  // the register and banned in NEVER_BIND, so the correct assertion is now
+  // ABSENCE -- which is precisely the thing a suppressed-value test cannot see,
+  // because a suppressed field and an absent one both render no number.
+  //
+  // The wire is made HOSTILE on purpose. It sends a rate under BOTH the name
+  // the register used to bind AND the name the server actually ships today. A
+  // cut that removed the catalogue row while some other path still read the
+  // body would surface one of them and fail here.
   for (const lookups of [0, 11]) {
     const store = createTelemetryStore({
       baseUrl: BASE_URL,
       origin: 'dynamic',
       fetchImpl: fakeFetch(
         healthyRoutes({
-          [ENDPOINTS.DEBUG_KV]: { body: { ...debugKvBody(), prefix_cache_hit_rate: 0 } },
+          [ENDPOINTS.DEBUG_KV]: {
+            body: {
+              ...debugKvBody(),
+              prefix_cache_hit_rate: 0.94,
+              generation_prefix_reuse_rate: 0.94,
+            },
+          },
           [ENDPOINTS.METRICS]: { text: metricsBody({ lookups }) },
         }),
       ),
     });
     await store.pollOnce();
+    const fields = store.getSnapshot().fields;
 
-    const rate = store.getSnapshot().fields['prefix_cache.hit_rate'];
-    assert.equal(rate.state, FIELD_STATES.UNAVAILABLE, `lookups=${lookups}`);
-    assert.equal(rate.value, null, `lookups=${lookups}`);
-    assert.match(rate.reason, /not cache hits|matching token/i, `lookups=${lookups}`);
+    // POSITIVE CONTROL FIRST. Every assertion below is an absence, and an empty
+    // snapshot satisfies all of them. This proves the poll ran and built fields.
+    assert.equal(
+      fields['queue.depth'].state,
+      FIELD_STATES.MEASURED,
+      `the store built no fields at lookups=${lookups}, so the absences below prove nothing`,
+    );
+
+    assert.equal(fields['prefix_cache.hit_rate'], undefined, `lookups=${lookups}`);
+
+    // The property rather than the one key: any prefix rate, under any
+    // spelling, reaching the snapshot is the defect.
+    const rateish = Object.keys(fields).filter((key) => /prefix/i.test(key) && /rate/i.test(key));
+    assert.deepEqual(rateish, [], `a prefix rate reached the snapshot at lookups=${lookups}`);
   }
 });
 
-test('the zero-denominator correction is retained as a dormant second line', async () => {
-  // suppressUndefinedHitRate() in telemetry-store.js is now UNREACHABLE: it
-  // returns early unless prefix_cache.hit_rate is MEASURED, and the field is
-  // MISATTRIBUTED on every origin. It is deliberately NOT deleted -- it is the
-  // only thing standing between a 0/0 and a rendered "0%" if anyone ever
-  // reclassifies the rate back to MEASURED, and that reclassification would
-  // otherwise silently re-open a defect we already fixed once.
+test('the cut is enforced by a ban on the name that actually ships', () => {
+  // WAS: "the zero-denominator correction is retained as a dormant second
+  // line", which asserted suppressUndefinedHitRate() stayed present-but-dormant
+  // so that a future reclassification could not silently re-open the 0/0
+  // defect. That guard is now deleted and this replaces it with a STRONGER
+  // invariant: a banned field cannot be reclassified at all, so there is no
+  // reclassification for a dormant guard to catch.
   //
-  // Dead code that nobody can see is a maintenance hazard, so its dormancy is
-  // asserted rather than commented: THIS test is what goes red when the
-  // precondition changes, and it names the file to look in.
-  for (const origin of ['dynamic', 'scatter']) {
-    const entry = provenanceFor('prefix_cache.hit_rate', origin);
-    assert.notEqual(
-      entry.classification,
-      'MEASURED',
-      `prefix_cache.hit_rate became MEASURED on ${origin}. suppressUndefinedHitRate() ` +
-        'in telemetry-store.js is live again -- confirm the 0/0 case is still covered ' +
-        'before deleting it, and re-read the MISATTRIBUTED ruling in ' +
-        'telemetry-provenance.js first.',
-    );
-  }
+  // AND THE POINT OF THIS TEST IS THE SPELLING. The register used to bind
+  // `prefix_cache_hit_rate`. That name is on NO json route any more -- the
+  // server renamed it -- so a ban inherited against the dead spelling would
+  // pass every check in this suite while protecting nothing. The ban has to
+  // name the field the server actually sends today.
+  assert.equal(
+    PROVENANCE['prefix_cache.hit_rate'],
+    undefined,
+    'the rate is back in the register; it was cut at the registry, not merely reclassified',
+  );
+
+  const banned = NEVER_BIND.filter((entry) => entry.field === 'generation_prefix_reuse_rate');
+  assert.equal(banned.length, 1, 'the LIVE wire name must be the banned one, not the dead spelling');
+  assert.equal(banned[0].endpoint, ENDPOINTS.DEBUG_KV);
+  assert.match(
+    banned[0].why,
+    /runtime\.rs:\d+/,
+    'the ban must cite the engine branch where a counted reuse materialises no KV, ' +
+      'because that is the reason the rate survives its own rename as a false number',
+  );
 });
 
 test('no prefix-cache hit field is MEASURED on any origin', async () => {
@@ -1517,11 +1545,18 @@ test('a bypassed field keeps one state across every path that can build it', asy
   // The bug was three paths disagreeing about one unchanging architectural
   // fact: not-applicable after a poll, unavailable on the first frame, pending
   // when the server was down -- the answer depended only on WHEN you looked.
+  //
+  // The exemplar used to be `prefix_cache.hit_rate`, which has since been cut
+  // at the register. It is deliberately NOT replaced with another prefix
+  // counter: those are themselves under a standing ruling and would take this
+  // invariant down with them the day they go. `sessions.paused` is bypassed on
+  // the scatter server for an architectural reason that is not in dispute, so
+  // the property outlives the argument about the prefix cache.
   const store = storeWith({}, { origin: 'scatter' });
 
-  const firstFrame = store.field('prefix_cache.hit_rate').state;
+  const firstFrame = store.field('sessions.paused').state;
   await store.pollOnce();
-  const afterFailedPoll = store.field('prefix_cache.hit_rate');
+  const afterFailedPoll = store.field('sessions.paused');
 
   assert.equal(
     afterFailedPoll.state,

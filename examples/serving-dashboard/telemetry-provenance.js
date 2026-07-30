@@ -782,41 +782,6 @@ export const PROVENANCE = Object.freeze({
       dynamic: { classification: 'MEASURED' },
     },
   },
-  'prefix_cache.hit_rate': {
-    source: ENDPOINTS.DEBUG_KV,
-    path: 'prefix_cache_hit_rate',
-    classification: 'MEASURED',
-    unit: 'ratio',
-    evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:126-130 — hits/lookups, but emits a literal ' +
-      '0.0 when lookups == 0, so an undefined rate and a genuine 0% are the same bytes. The ' +
-      'store corrects this where the denominator is still in scope.',
-    label: 'Prefix-cache hit rate',
-    byOrigin: {
-      scatter: {
-        // Pinned at literal 0 by the bypass, so 0 is what "still true" looks like.
-        stubValue: 0,
-        classification: 'STRUCTURALLY_BYPASSED',
-        reason:
-          'This server batches with a static cache, and that path never consults the prefix ' +
-          'cache, so there is no rate to report. A 0% here would imply a cache that tried. ' +
-          'The engine asserts the bypass: ' +
-          'crates/onnx-genai-engine/tests/batched_static_decode.rs:53 requires ' +
-          'prefix_cache_hit_len == 0 for every batched result.',
-      },
-      dynamic: {
-        unfalsifiable:
-          'This counter is not pinned -- it rises on every completed generation, so no '
-          + 'value on the wire can confirm or deny that it is counting the wrong thing. '
-          + 'The disqualifying evidence is in the SERVER SOURCE, not in the reading: '
-          + 'metrics.rs:232-237 returns one hit for any nonzero match. If that function '
-          + 'ever weights a hit by reuse length, this classification is stale.',
-        classification: 'MISATTRIBUTED',
-        reason:
-          'The counter is live and correct on this server -- and it counts GENERATIONS WITH AT LEAST ONE MATCHING TOKEN, not cache hits. crates/onnx-genai-server/src/metrics.rs:232-237 scores exactly one hit for any prefix_cache_hit_len > 0, and every /v1/chat/completions request shares the ~24-token chat-template preamble, so it reads the same with and without reuse (measured: 12 requests, 6 deliberately unique prompts, +12 hits). metrics.rs:230-231 concedes it upstream: reusing 8 tokens of a 900-token prompt and reusing 890 are both exactly one hit.',
-      },
-    },
-  },
 
   // ── GET /v1/resources ───────────────────────────────────────────────────
   // Ungated and genuinely computed from the configured limits.
@@ -968,6 +933,32 @@ export const NEVER_BIND = Object.freeze([
           'reading `path` off a /v1/models body.',
       }),
     ]),
+  }),
+  Object.freeze({
+    endpoint: ENDPOINTS.DEBUG_KV,
+    field: 'generation_prefix_reuse_rate',
+    why:
+      'The prefix-reuse rate, banned under the name it ACTUALLY SHIPS rather than the one it ' +
+      'used to have. This register bound `prefix_cache_hit_rate` until this commit; the server ' +
+      'has since renamed the JSON, and the old spelling is now on no route at all -- measured, ' +
+      'not assumed: grep for hit_rate under crates/onnx-genai-server/src/routes/ returns 0 ' +
+      'while prefix_cache returns 5, so the instrument fires. A ban written against the dead ' +
+      'spelling would have protected nothing while looking thorough, which is the failure mode ' +
+      'this list exists to prevent. ' +
+      'WHY THE RATE IS DISQUALIFIED AND NOT MERELY MISNAMED: the numerator scores one for any ' +
+      'nonzero prefix match (crates/onnx-genai-server/src/metrics.rs:232-236 maps every ' +
+      'length > 0 to exactly one), so reusing 8 tokens of a 900-token prompt and reusing 890 ' +
+      'are the same event. ' +
+      'AND THE PART THAT SURVIVES THE RENAME -- in the token-prefix branch a counted reuse ' +
+      'SAVES NO WORK AT ALL. crates/onnx-genai-engine/src/engine/runtime.rs:1067-1075 computes ' +
+      'a longest-common-prefix over cached token sequences, filters on length > 0, and assigns ' +
+      'the result WITHOUT retaining a page, attaching a sequence, or touching the KV cache. ' +
+      'Only the paged branch below it sets `loaded_prompt_prefix`, and that is the single ' +
+      'variable that shortens the prefill. So on a runner or windowed engine the prompt is ' +
+      'prefilled in full while the wire still reports reuse: a hit and a miss cost the same. ' +
+      'The honest new name is therefore still false, and no denominator can repair it -- which ' +
+      'is why this is a ban rather than a classification. The panel teaches the mechanism and ' +
+      'reports TTFT; it never reports this counter.',
   }),
 ]);
 

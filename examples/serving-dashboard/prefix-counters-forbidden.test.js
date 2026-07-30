@@ -83,8 +83,6 @@ const ALLOWLIST = new Map([
   // and must never be bound. Naming a forbidden field in the register that
   // forbids it is the one legitimate use.
   ['telemetry-provenance.js', 'permanent: the register that forbids them'],
-  // DEBT — owned by the panel authors, must reach zero before release.
-  ['telemetry-store.js', 'debt: store still projects the field'],
 ]);
 
 /** @returns {string[]} every .js file in the demo, excluding tests and deps */
@@ -208,7 +206,21 @@ describe('the prefix-cache counters are unnameable', () => {
       // real, tested behaviour. It cannot go until the field stops being
       // published, and that is a ruling, not a refactor: see the dynamic-origin
       // finding recorded beside PROVENANCE['prefix_cache.hits'].
-      2,
+      //
+      // 2 -> 1 by @bb2ee824: THE RULING ARRIVED AND THE DEBT IS PAID. @12e42da8
+      // cut the rate at the register, so the entry above is now satisfied on
+      // its own stated condition -- "it cannot go until the field stops being
+      // published" -- rather than waived. The store's guard is deleted, and a
+      // tombstone in its place records that ALL THREE of its premises had
+      // expired: the field is gone from the register (banned in NEVER_BIND),
+      // the server returns None instead of 0.0 for an undefined ratio
+      // (metrics.rs:244-249, `defined_ratio`), and the wire name it read had
+      // already been renamed server-side, so the lookup was dead before either.
+      //
+      // Only the PERMANENT entry remains. This number should never reach 0:
+      // the register that forbids these fields must keep naming them, and the
+      // CAN RUN arm above asserts exactly that.
+      1,
       'The allowlist changed size. It may only SHRINK -- if you removed a ' +
         "binding, drop its entry and lower this number. If you added one, don't.",
     );

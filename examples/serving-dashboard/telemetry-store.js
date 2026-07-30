@@ -882,43 +882,29 @@ export function createTelemetryStore({
       });
     }
     addDerivedThroughput(fields, timestampMs);
-    suppressUndefinedHitRate(fields);
     return Object.freeze(fields);
   }
 
-  /**
-   * A hit rate computed from zero lookups is emitted as a literal 0.0 by BOTH
-   * endpoints that report it — metrics.rs:301-305 and routes/admin.rs:126-130
-   * each do `if lookups == 0 { 0.0 }`. So "nothing has been looked up yet" and
-   * "we looked and hit nothing" are the SAME BYTES on the wire.
-   *
-   * Nothing downstream can recover the difference, so it has to be corrected
-   * here, where the denominator is still in scope. Rendering an unqualified
-   * "0% hit rate" for an idle server is a fabricated measurement.
-   *
-   * @param {Record<string, import('./telemetry-field.js').TelemetryField>} fields
-   */
-  function suppressUndefinedHitRate(fields) {
-    const rate = fields['prefix_cache.hit_rate'];
-    if (!rate || rate.state !== FIELD_STATES.MEASURED) return;
-
-    const denominator = fields['metrics.prefix_cache_lookups'] ?? fields['prefix_cache.lookups'];
-    if (!denominator || denominator.state !== FIELD_STATES.MEASURED) return;
-    if (Number(denominator.value) !== 0) return;
-
-    fields['prefix_cache.hit_rate'] = unavailableField(
-      'The server reports a 0.0 hit rate, but nothing has been looked up yet, and it emits the ' +
-        'same 0.0 in both cases (metrics.rs:301-305). A rate with a zero denominator is ' +
-        'undefined, not zero.',
-      {
-        source: rate.source,
-        sourceClass: rate.sourceClass,
-        origin: rate.origin,
-        label: rate.label,
-        unit: rate.unit,
-      },
-    );
-  }
+  // TOMBSTONE -- `suppressUndefinedHitRate` lived here and is deliberately gone.
+  //
+  // It rewrote the prefix-reuse rate to `unavailable` whenever the denominator
+  // was still zero, because the server used to emit a literal 0.0 for a ratio
+  // that was undefined. ALL THREE OF ITS PREMISES HAVE SINCE EXPIRED:
+  //
+  //   1. The field it keyed on is no longer in the provenance register at all.
+  //      It is banned outright in NEVER_BIND, so nothing resolves it and this
+  //      guard could only ever return on its first line.
+  //   2. The server no longer emits 0.0 for an undefined ratio. `defined_ratio`
+  //      (crates/onnx-genai-server/src/metrics.rs:244-249) returns None at a
+  //      zero denominator, and the field is then omitted from the JSON body
+  //      rather than sent as a number -- absence, which is the honest wire.
+  //   3. The wire name it read was renamed server-side, so the lookup had in
+  //      fact been dead for longer than either of the above.
+  //
+  // Kept as a comment because the guard was CORRECT when written, and deleting
+  // it silently would invite the next reader to rebuild it. The reason it must
+  // not come back is a property of the counter, not of the denominator, and is
+  // recorded once in NEVER_BIND rather than restated here.
 
   /**
    * Throughput, derived client-side by differentiating the cumulative token
