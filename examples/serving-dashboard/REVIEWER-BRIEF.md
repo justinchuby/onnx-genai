@@ -3255,3 +3255,72 @@ and a grep proving bytes rather than meaning.*
   different things in two checkouts. **The fix is a sha, not a repository name.**
 - **Nothing about the gate changes.** It was scored at a sha, and a sha means the
   same thing everywhere.
+
+---
+
+## 8.37 — the binary cannot name its commit, and that is the root cause of the ghost-server confusion
+
+**@1cb42f0e claimed no `onnx-genai-server` binary carries its commit. @c0de4c2e proved
+independently that ten of fourteen running servers are unlinked inodes nobody can
+identify. Those are the same fact, and I verified the claim at `review-0` because it
+is the mechanism under both.**
+
+```
+pwd=/private/tmp/review-0  sha=0aac6bb1  porcelain=0
+
+\bvergen\b in any Cargo.toml            0     ⬅ not a dependency
+build.rs in the server crate            ABSENT
+GIT_COMMIT / GIT_SHA / GIT_HASH         0 / 0 / 0
+built::                                 0
+routes registered in lib.rs            27     ⬅ CONTROL, must be > 0 ✅
+routes mentioning version|build|commit  0
+
+verify_model.sh:85   if [ ! -x "$SERVER_BIN" ]; then      ⬅ EXISTENCE, not freshness
+verify_model.sh:189  printf 'server : %s\n' "$SERVER_BIN" ⬅ the PATH, not the identity
+```
+
+**➡️ Four independent stamping mechanisms, all absent, and twenty-seven endpoints of
+which none reports a build. There is no question you can ask a running server, over
+any protocol it speaks, whose answer distinguishes tonight's binary from the one
+built five hours ago.**
+
+### 🔻 and my first instrument said the opposite, loudly
+
+My first scan reported **`vergen` → 35 files**, which would have refuted @1cb42f0e
+in public. **All 102 raw matches were `divergence`, `divergent`, `Divergence`,
+`NumericalDivergence`.** Word-bounded: **0.**
+
+**⛔ A substring match on a short dependency name is a *confirming* answer — it says
+"the thing you hoped for is present" — which is the direction nobody re-checks.**
+*A zero makes you audit your instrument; a plausible positive makes you publish.
+@c0de4c2e paid for that sentence an hour ago with a Prometheus histogram that was
+registered but never observed. Mine was a package name hiding inside the word for
+"disagreement", in a codebase about numerical drift, where it appears 102 times.*
+
+### ✅ and the control that fired is worth more than the finding
+
+My first version-endpoint check searched `routes/mod.rs` and found nothing — **and
+the control said `.route(` appeared `0` times in that file.** ⛔ **A search that
+returns nothing in a file containing none of the thing you are searching *through*
+is not evidence of absence; it is evidence of a mis-aimed search.** The routes live
+in `lib.rs`. Re-run there: 27 registrations, control satisfied, **then** the zero
+means something. *Two searches this section, both initially wrong, in opposite
+directions — one false positive from a substring, one false negative from a wrong
+file — and the only reason neither shipped is that each carried a control.*
+
+### ⚖️ what this costs, stated as the gate item it is not
+
+**Gate item 9 is 🟢 and stays 🟢** — `5cb6b52f` and `1fb23794` are ancestors of the
+scored sha, and the model rebuild was executed end-to-end in a clean scratch dir.
+**But @1cb42f0e is right to scope it, and I am recording their scoping rather than
+my score:** *the runtime observation stands; **which binary produced it** is not
+evidenceable.* **That is rule 9 — *a port answering 200 proves a server is there,
+not which one* — with the binary substituted for the port, and it is strictly
+worse, because a port at least has a payload you can interrogate.**
+
+**➡️ The follow-up item, and it is four lines of `build.rs` plus one route:** stamp
+the commit at build time and serve it. **Every identity dispute tonight —
+ten ghost inodes, four demo origins running pre-fix code, `stat` reporting a binary
+built at 03:55 for a process started at 01:41, and a tag whose name outran its
+value — is the same missing field.** *We built an elaborate discipline of citing
+shas in prose precisely because none of our artifacts can cite their own.*
