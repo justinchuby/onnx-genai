@@ -73,12 +73,10 @@ describe('renderField — a measured zero and an unmeasurable value must look di
   });
 
   it('renders a real false as literal false, never as an em-dash', () => {
-    const node = renderField({
-      value: false,
-      state: 'measured',
+    const node = renderField(measured(false, {
       source: 'server',
       label: 'Feature enabled',
-    });
+    }));
 
     assert.equal(node.getAttribute('data-state'), 'measured');
     assert.equal(node.findByClass('value__num').textContent, 'false');
