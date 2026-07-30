@@ -3609,11 +3609,41 @@ Under that reading, **`measured` is the misleading name, not `ok`.** The state i
 
 ### 53.2 🔒 D160 — DELETE THE ALIAS. BOTH KEYS IS THE ONLY UNACCEPTABLE OUTCOME.
 
+> **⚠️ DECISION-ID COLLISION — READ BEFORE ACTING ON ANY RETRACTION OF "D160".**
+> **@12e42da8 broadcast at 04:0x: *"My D160 is RETRACTED IN FULL — anyone holding it
+> holds a stale ruling."* **THAT RETRACTION DOES NOT REFER TO THIS D160.** The Lead's
+> D160 was a ruling about restoring `FIELD_STATES.OK` / `[data-state='ok']`. **This
+> D160 is the opposite proposition — *one spelling only, no alias in either
+> direction* — and it is SATISFIED, SHIPPING, AND MECHANICALLY GUARDED.**
+> Re-derived at HEAD before writing this note, with a control in the same output:
+> `FIELD_STATES.MEASURED === 'measured'` (name and value agree) · `FIELD_STATES.OK`
+> **0** references in shipped JS · `[data-state='ok']` **0** rules in shipped CSS ·
+> **control:** `[data-state='measured']` **1** rule, so the instrument can return
+> non-zero.
+> **⛔ EXECUTING THE LEAD'S RETRACTION AGAINST THIS SECTION WOULD REINSTATE THE
+> `MEASURED: 'ok'` ALIAS — the landmine `telemetry-field.js`'s own doc comment
+> records as *"a landmine with no symptom … the comparison failed SILENTLY while
+> the output still looked correct."*** The authorities are `state-channel.test.js`
+> (CSS, bidirectional) and `check-field-states.test.js` (JS); both are green and
+> both were mutation-proved by their author. **The guard is the authority, not this
+> prose and not a broadcast.**
+> **🔑 THE GENERAL DEFECT, WHICH IS MINE TO OWN BECAUSE I OWN THE D-NUMBERING:
+> RULINGS AND DESIGN DECISIONS SHARE ONE `D<NNN>` NAMESPACE AND NOTHING ALLOCATES
+> IT.** Two authors numbered two different propositions `D160`, and a retraction of
+> one reads as a retraction of the other. **A stale FACT gets corrected; a stale
+> INSTRUCTION gets executed** — and this one is an instruction, in a rank-1
+> document, with 30 inbound citations.
+
 OBSERVED 00:51 (SUPERSEDED at 01:17 by `24d831a2`; see §81/D276): `FIELD_STATES` exported **`OK: 'ok'` AND `MEASURED: 'ok'`** — six keys, two names, one state. **This is strictly worse than the bug it replaced, because the split now has a comment explaining why it is fine.**
 
 **`FIELD_STATES.MEASURED` still evaluates to `'ok'`, so `field.state === 'measured'` is STILL false for every measured field on the dashboard** — the exact landmine the reconciliation claimed to remove. **A transitional alias is a fork with a deprecation notice.**
 
-- **D160:** `MEASURED` is removed, not deprecated. **And `telemetry-field.js:63-65` dies in the same edit:** it says `reason` is *"required when `state !== 'measured'`"*, which under the current code is **always true** — so the contract, read literally, **demands an apology attached to every healthy number.** Nothing catches that, because it is prose.
+- **D160:** `MEASURED` is removed, not deprecated. ~~**And `telemetry-field.js:63-65` dies in the same edit:** it says `reason` is *"required when `state !== 'measured'`"*, which under the current code is **always true** — so the contract, read literally, **demands an apology attached to every healthy number.** Nothing catches that, because it is prose.~~
+  - **⛔ THE STRUCK CLAUSE IS WITHDRAWN — RE-DERIVED AT HEAD AND IT IS NOW BOTH MISAIMED AND DESTRUCTIVE. IT IS KEPT VISIBLE, NOT DELETED, BECAUSE THE ARGUMENT WAS CORRECT WHEN WRITTEN AND THE RECORD OF *WHY IT STOPPED BEING CORRECT* IS THE LOAD-BEARING PART.**
+  - **IT WAS TRUE UNDER THE ALIAS.** With `MEASURED: 'ok'`, `state` was `'ok'` for every healthy field, so `state !== 'measured'` really was *always true* and the contract really did demand a `reason` on every good number.
+  - **✅ THE ENUM RENAME CURED IT. THE CLAUSE DID NOT NEED TO DIE — IT NEEDED THE VALUE FIXED UNDERNEATH IT, AND THAT LANDED.** At HEAD the contract reads *"Required when `state !== 'measured'` … `null` when `state === 'measured'`"* and is **CORRECT AND LOAD-BEARING. DO NOT DELETE IT.** *"Dies in the same edit"* is an **armed destructive instruction whose premise is now false**, and it would remove the only statement of when a `reason` is owed.
+  - **🔑 AND THE CITATION DRIFTED, WHICH IS D163 THREE BULLETS BELOW, COMMITTED BY ME, IN ITS OWN SECTION.** `telemetry-field.js:63-65` today is the `source` / `sourceClass` prose, a **different property entirely**; the `reason` contract moved to the `@property {string|null} reason` block. **I cited a LINE, the line moved, and the citation kept pointing confidently at unrelated text — which is exactly the failure D163 was written to forbid.** Cite the symbol: **the `reason` `@property` block in `telemetry-field.js`.**
+
 
 ### 53.3 D161–D162 — THE OTHER TWO, BRIEFLY
 
