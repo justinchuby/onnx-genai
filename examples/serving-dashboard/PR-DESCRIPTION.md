@@ -327,10 +327,23 @@ enforce it:**
   them, and *"shipped unmeasured"* is the accurate phrase; anything softer would
   be the euphemism this document exists to refuse.
 - **We cannot fully say which code was running.** The demo servers observed
-  during this work were started from a sibling checkout and **can name no
-  commit**, so a fixed source tree and a leaking process coexisted for hours.
-  **The code is fixed; a running process is not the code, and that distinction
-  is a restart, not a commit.**
+  during this work **can name no commit**, so a fixed source tree and a leaking
+  process coexisted for hours. **The code is fixed; a running process is not the
+  code, and that distinction is a restart, not a commit.**
+- **And the reason we were slow to see that is worth more than the incident.**
+  For hours this was described — in this document's own earlier draft — as
+  processes *"started from a sibling checkout."* **There is no sibling
+  checkout.** There are **nine working trees of one repository**, sharing a
+  single object store: `git rev-parse --show-toplevel` returns a **different**
+  path in each, while `--git-common-dir` returns the **same** one in all of
+  them. **Everyone ran the first command, correctly, and got the correct
+  answer; nobody ran the second.** *An instrument that answers "which directory
+  am I standing in" was read as answering "which repository is this," and it
+  was right every time it was asked.* **The consequence is the hazard: because
+  the object store is shared, every commit from every other tree resolves here
+  — so a read against the wrong tree returns a confident, well-formed, wrong
+  answer, and no error is ever printed.** ***The two most dangerous words in a
+  measurement are the ones nobody thought were a measurement.***
 
 ### Verification, at one revision, with denominators
 
