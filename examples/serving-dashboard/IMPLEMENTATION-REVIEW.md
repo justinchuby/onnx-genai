@@ -1,6 +1,6 @@
 # Implementation Review — `feat/genai-demo-dashboard`
 
-MEASURED-AT: 37d0d72e192d4fdbfab48f12761007e470cb670f
+MEASURED-AT: 3b70149438a4ce0b815f942fdd46a0663ecdd524
 
 Reviewer: Code Reviewer, agent id `agent:73e77d95` (lane: correctness, readability, patterns,
 test coverage, code quality). **That is an AGENT ID, not a commit.** It is prefixed `agent:`
