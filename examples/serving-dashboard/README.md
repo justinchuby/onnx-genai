@@ -148,16 +148,32 @@ the command that actually works.
 Under the hood it runs, per server:
 
 ```bash
-# Every path below is relative to the repo root, so start there.
+# Asset paths are relative to THIS checkout, so start at its root.
 cd "$(git rev-parse --show-toplevel)"
 
+# Models are NOT. `models/` is gitignored, so it is empty in a fresh clone and
+# in every git worktree -- the models usually live in one primary checkout.
+# Point this at whichever directory actually holds them.
+MODELS_DIR=/path/to/onnx-genai/models
+
 ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
-  --model models/qwen2.5-0.5b-scatter-v2 \
+  --model "${MODELS_DIR}/qwen2.5-0.5b-scatter-v2" \
   --model-id qwen-scatter \
   --addr 127.0.0.1:8123 \
   --demo-assets-dir examples/serving-dashboard \
   --enable-debug-endpoints
 ```
+
+> **The two paths in that command have opposite roots, which is why the `cd`
+> alone is not enough.** `--demo-assets-dir` must resolve inside *this* checkout,
+> because that is where the assets are. `--model` must resolve inside whichever
+> checkout holds the (gitignored, unshared) models. In a plain clone those are
+> the same directory and a bare `models/…` works; in a worktree they are not,
+> and a bare `models/…` fails with a missing-model error that reads like a
+> corrupt download. `run-demo.sh` handles this for you: it falls back to a
+> sibling `../onnx-genai/models`, and it selects a candidate by checking that it
+> **contains** the model — not merely that `models/` exists, which is always true
+> and would defeat the fallback.
 
 Run it from anywhere else and you get the demo's most confusing failure mode:
 **the API works perfectly and only `/demo` is broken.** `--model` and
@@ -191,10 +207,15 @@ deliberately **not `/metrics` or `/v1/resources`**, even though both expose
 genuinely measured data. Those two answer in under a millisecond when the server
 is idle and **block for the entire duration of a generation** when it is not —
 around 15 seconds on the reference machine — because each one round-trips a
-command to the driver thread that is busy decoding. Polling them would freeze
-the dashboard during exactly the activity it exists to show, and it would look
-perfect in every idle test. If you add a panel, check what your endpoint costs
-*under load*; the fast path and the slow path are indistinguishable at rest.
+command to the driver thread that is busy decoding (`/v1/resources` awaits
+`resource_snapshot()` at `crates/onnx-genai-server/src/routes/admin.rs:263-266`).
+Measured during a single 384-token generation: `/v1/status`, `/v1/debug/kv` and
+`/health` completed **61 polls at a clean 4 Hz, ~1.8 ms each**, while
+`/v1/resources` and `/metrics` completed **5, blocking 14,784 ms**.
+Polling them would freeze the dashboard during exactly the activity it exists to
+show, and it would look perfect in every idle test. If you add a panel, check
+what your endpoint costs *under load*; the fast path and the slow path are
+indistinguishable at rest.
 | `--addr` | Defaults to `127.0.0.1:8080`. The demo uses `:8123` and `:8124` so it does not collide with a server you already have running. |
 
 Overridable via environment: `MODELS_DIR`, `SCATTER_MODEL`, `DYNAMIC_MODEL`,
@@ -649,11 +670,20 @@ property of the data. Nothing in the page ever receives a bare number. Every
 field arrives as:
 
 ```js
-{ value, state, source, reason, unit, observedAtMs }
+{ value, state, source, sourceClass, origin, originModelId,
+  label, reason, unit, observedAtMs, derivedFrom, provenanceWarning }
 ```
 
-where `state` is `measured`, `pending`, `stale`, `unavailable` or
+where `state` is one of five: **measured**, `pending`, `stale`, `unavailable` or
 `not-applicable`. Panels branch on `state` before reading `value`.
+
+> ⚠️ **The measured state's wire value is the string `'ok'`, not `'measured'`.**
+> The constant is `FIELD_STATES.OK` (`telemetry-field.js:119`). A rename to
+> `'measured'` has been ratified but **has not landed**, so a comparison written
+> as `field.state === 'measured'` is `false` for every measured field on the page
+> today. Compare against the constant, never against a string literal. This
+> README says *measured* because that is the concept; the wire says `'ok'`, and
+> `check-field-states.test.js` fails the moment those two stop matching.
 `telemetry-provenance.js` holds the classification of every field and emits
 documented zeros as `unavailable` **even when the response carried a parseable
 number**, so a panel cannot accidentally bind to a placeholder.
@@ -919,8 +949,23 @@ drifted between its four appearances.
 | "Opened from disk" blocks the page. | The page was opened as a `file://` URL. It has to be served by the server; open the printed URL. |
 | The script says a model directory does not exist. | Models are gitignored. Build them, or set `MODELS_DIR`. |
 | Port already in use. | `SCATTER_PORT` / `DYNAMIC_PORT`, or stop the server still holding it. |
-| A telemetry endpoint returns **404**. | A missing gate flag — almost always `--enable-debug-endpoints`. An **unregistered route 404s**, so this is what a forgotten flag looks like. |
+| A telemetry endpoint returns **404**. | **Three different causes with three different fixes — check which gate before reaching for a flag.** See the table below. |
 | A telemetry endpoint returns **403**. | A route that *is* registered but whose feature is disabled server-side. **This is not a missing flag** and adding flags will not fix it. Checking for 403 to detect a closed gate is the common misdiagnosis — the gate you can open is the 404. |
+
+### A 404 is three different bugs
+
+An unregistered route 404s, and **every one of these gates produces the same
+404**. Reaching for a flag is right one time in three; the other two send you to
+fix something that is not broken.
+
+| Gate | Example | What actually fixes it |
+|---|---|---|
+| **Runtime flag** | `/v1/debug/kv` | Pass `--enable-debug-endpoints`. |
+| **Compile-time feature** | `/metrics` — `#[cfg(feature = "metrics")]` at `crates/onnx-genai-server/src/lib.rs:128` | **Rebuild with the feature on. No flag can help**, and the server will not tell you the difference. (It is on by default, so this bites people who trimmed features.) |
+| **Config path** | `/demo/` — gated on `state.config.demo_assets_dir` at `crates/onnx-genai-server/src/lib.rs:92` | Pass `--demo-assets-dir`, or launch from the repo root. The path is resolved **relative to the current working directory**, and a missing directory is treated as *"no assets configured"* rather than as an error — so the server boots happily and only `/demo` is missing. |
+
+The last row is the nastiest, because it is the only one where the server had
+the information to warn you and chose not to.
 
 ## Accessibility
 
