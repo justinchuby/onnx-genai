@@ -151,12 +151,13 @@ body[data-blocked] .app {
  * which is why the store never hands out a value for a field that has none.
  *
  * THE SELECTOR VALUES ARE THE FIELD_STATES WIRE VALUES, NOT THEIR CONSTANT
- * NAMES. A good reading is the string 'ok' — the constant is spelled
- * FIELD_STATES.MEASURED because *measured* names provenance while *ok* names
- * approval, but 'ok' is what lands in the DOM. This selector said 'measured'
- * and therefore matched NOTHING: every measured value silently fell back to
- * inherited styling, which looks close enough to correct that only a
- * cross-language check finds it. state-treatments.test.js is that check.
+ * NAMES. A good reading is the string 'ok', and the constant is FIELD_STATES.OK
+ * — name and value agree, so the two can no longer drift apart. They did once:
+ * the constant was spelled MEASURED while its value stayed 'ok', so this
+ * selector said 'measured' and therefore matched NOTHING. Every measured value
+ * silently fell back to inherited styling, which looks close enough to correct
+ * that only a cross-language check finds it. state-treatments.test.js is that
+ * check.
  */
 
 [data-state='ok'] {

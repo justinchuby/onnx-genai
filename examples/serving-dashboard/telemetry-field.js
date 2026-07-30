@@ -121,21 +121,6 @@ export const FIELD_STATES = Object.freeze({
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',
   NOT_APPLICABLE: 'not-applicable',
-
-  /**
-   * @deprecated Use `FIELD_STATES.OK`.
-   *
-   * A transitional alias, not a sixth state — it is the same string. It exists
-   * so the rename did not have to be a flag-day edit landing atomically across
-   * every consumer, which matters here because several of those consumers are
-   * being edited concurrently. Delete it once no `FIELD_STATES.MEASURED`
-   * reference remains; the test below fails if it ever becomes a distinct
-   * value rather than an alias.
-   *
-   * Never global-replace the string `ok` to remove it: `status: 'ok'` is the
-   * HTTP health payload, and renaming that fakes an unreachable server.
-   */
-  MEASURED: 'ok',
 });
 
 /**

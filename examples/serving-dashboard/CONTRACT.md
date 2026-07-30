@@ -50,11 +50,13 @@ parseable number for them.** You cannot accidentally bind a panel to a lie.
 }
 ```
 
-> ⚠️ **`state` for a good reading is the string `'ok'`, not `'measured'`.**
-> The constant is named `FIELD_STATES.MEASURED` because *measured* names
-> provenance while *ok* names approval — but the ratified wire value is `'ok'`.
-> **Always compare against `FIELD_STATES.*`, never a string literal**, and this
-> mismatch can never bite you.
+> ⚠️ **`state` for a good reading is the string `'ok'`, and the constant is
+> `FIELD_STATES.OK`.** The constant was briefly spelled `MEASURED` while its
+> value was `'ok'`, which made `field.state === 'measured'` silently false for
+> every measured field on the page. Name and value now agree (ruling D160), and
+> the alias was deleted rather than deprecated — a transitional alias is a fork
+> with a deprecation notice.
+> **Always compare against `FIELD_STATES.*`, never a string literal.**
 
 | `state` | Meaning | Render as |
 |---|---|---|
