@@ -616,6 +616,24 @@ body[data-blocked] .app {
   color: var(--og-na-note);
 }
 
+/* The literal command for a server that is not running. Monospaced and on a
+   sunken surface so it reads as something to COPY, not as prose to skim --
+   this is the one element in the note the visitor is meant to act on.
+   `user-select: all` makes it a single click-drag rather than a careful
+   selection across five wrapped lines with trailing backslashes, where
+   missing one character produces a confusing shell error. */
+.scenario-switcher__note-command {
+  margin: var(--og-space-2) 0 0;
+  padding: var(--og-space-3) var(--og-space-4);
+  background: var(--og-bg-sunken);
+  border-radius: var(--og-radius-md);
+  font-family: var(--og-font-mono);
+  color: var(--og-fg);
+  white-space: pre-wrap;
+  overflow-x: auto;
+  user-select: all;
+}
+
 /* A URL that misdescribes the server it points at. Uses the stale tokens: the
    page is correct, but the LINK is out of date with reality. */
 .scenario-switcher__contradiction {

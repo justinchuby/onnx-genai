@@ -20,25 +20,73 @@
 //                   and context-length fields. Without it those panels degrade
 //                   to "unavailable" and the model card loses context length.
 
+/**
+ * The demo runs TWO servers, because continuous batching and paged KV are
+ * mutually exclusive in this runtime — one process cannot demonstrate both.
+ * Keyed by the SAME `serverClass` vocabulary scenario-origins.js uses, so a
+ * scenario can name the server it needs without a second mapping to drift.
+ *
+ * A single set of constants could only ever describe one of the two, which is
+ * how "start the other server" ended up as generic advice: the page had no way
+ * to say WHICH server or WITH WHICH MODEL, and a visitor cannot act on that.
+ */
+export const SERVERS = Object.freeze({
+  scatter: Object.freeze({
+    serverClass: 'scatter',
+    address: '127.0.0.1:8123',
+    modelDir: 'models/qwen2.5-0.5b-scatter-v2',
+    modelId: 'qwen-scatter',
+    label: 'static-cache server',
+    // What it is FOR, in the visitor's terms rather than the engine's.
+    demonstrates: 'continuous batching',
+  }),
+  dynamic: Object.freeze({
+    serverClass: 'dynamic',
+    address: '127.0.0.1:8124',
+    modelDir: 'models/qwen2.5-0.5b',
+    modelId: 'qwen-dynamic',
+    label: 'dynamic-model server',
+    demonstrates: 'paged KV block allocation',
+  }),
+});
+
+/**
+ * The exact, copy-pasteable launch command for one server.
+ *
+ * @param {keyof typeof SERVERS} serverClass
+ * @returns {string}
+ */
+export function launchCommandFor(serverClass) {
+  const server = SERVERS[serverClass];
+  if (!server) {
+    // Loud rather than a blank command block: a failure state that renders an
+    // empty <pre> looks like the page is still loading, and the visitor waits.
+    throw new RangeError(
+      `Unknown server class "${serverClass}". Known: ${Object.keys(SERVERS).join(', ')}.`,
+    );
+  }
+  return [
+    'cargo build --release -p onnx-genai-server',
+    '',
+    `ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \\`,
+    `  --model ${server.modelDir} \\`,
+    `  --model-id ${server.modelId} \\`,
+    `  --addr ${server.address} \\`,
+    '  --enable-debug-endpoints',
+  ].join('\n');
+}
+
 /** Default address the server binds, matching the documented launch command. */
-export const DEFAULT_SERVER_ADDRESS = '127.0.0.1:8123';
+export const DEFAULT_SERVER_ADDRESS = SERVERS.scatter.address;
 
 /** The model directory the demo is built and verified against. */
-export const RECOMMENDED_MODEL_DIR = 'models/qwen2.5-0.5b-scatter-v2';
+export const RECOMMENDED_MODEL_DIR = SERVERS.scatter.modelDir;
 
 /**
  * The exact, copy-pasteable launch command. Shown verbatim in both blocking
  * failure states and quoted in the README.
  */
-export const LAUNCH_COMMAND = [
-  'cargo build --release -p onnx-genai-server',
-  '',
-  `ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \\`,
-  `  --model ${RECOMMENDED_MODEL_DIR} \\`,
-  '  --model-id qwen-scatter \\',
-  `  --addr ${DEFAULT_SERVER_ADDRESS} \\`,
-  '  --enable-debug-endpoints',
-].join('\n');
+export const LAUNCH_COMMAND = launchCommandFor('scatter');
 
 /**
  * Where the visitor opens the demo once the server is up.

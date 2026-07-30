@@ -34,6 +34,8 @@ import {
   RECOMMENDED_MODEL_DIR,
   LAUNCH_COMMAND,
   DEMO_URL,
+  SERVERS,
+  launchCommandFor,
 } from './ui/launch-command.js';
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
@@ -458,4 +460,56 @@ test('every ?scenario= value in the README is a real scenario id', async () => {
         `dashboard -- just not the scenario the surrounding prose describes.`,
     );
   }
+});
+
+// --- The second server ------------------------------------------------------
+//
+// The demo runs TWO servers because continuous batching and paged KV are
+// mutually exclusive in this runtime. A single set of constants could only
+// describe one of them, which is why the unreachable-scenario note used to say
+// "the other server" -- unactionable once there is more than one thing a
+// visitor could start.
+
+test('both servers are defined, and they differ in every field that matters', () => {
+  const { scatter, dynamic } = SERVERS;
+
+  assert.notEqual(scatter.address, dynamic.address, 'two servers cannot share a port');
+  assert.notEqual(scatter.modelDir, dynamic.modelDir, 'the model IS the difference between them');
+  assert.notEqual(scatter.modelId, dynamic.modelId, 'attribution keys on the model id');
+
+  // The scatter model must be a static-cache build or batching silently falls
+  // back to the per-request path, and the demo disproves its own headline.
+  assert.match(scatter.modelDir, /-scatter/, 'batching needs a -scatter model');
+  assert.doesNotMatch(dynamic.modelDir, /-scatter/, 'paged KV needs a NON-scatter model');
+});
+
+test('each launch command names its own server, not the other one', () => {
+  for (const [serverClass, server] of Object.entries(SERVERS)) {
+    const command = launchCommandFor(serverClass);
+    assert.ok(command.includes(`--model ${server.modelDir}`), `${serverClass}: model dir`);
+    assert.ok(command.includes(`--addr ${server.address}`), `${serverClass}: address`);
+    assert.ok(command.includes(`--model-id ${server.modelId}`), `${serverClass}: model id`);
+    assert.ok(
+      command.includes('--enable-debug-endpoints'),
+      `${serverClass}: without this the KV and prefix-cache panels go unavailable`,
+    );
+    assert.ok(
+      !command.includes('--enable-admin-endpoints'),
+      `${serverClass}: nothing calls /v1/admin/* and the server has no auth`,
+    );
+  }
+});
+
+test('an unknown server class throws rather than rendering an empty command', () => {
+  // A failure state that renders a blank <pre> looks like the page is still
+  // loading, so the visitor waits instead of acting. Fail loudly at the source.
+  assert.throws(() => launchCommandFor('nonexistent'), /Unknown server class/);
+});
+
+test('the scatter launch command is still the one the README and index.html quote', () => {
+  // The refactor to a two-server registry must not have moved the string the
+  // other three copies are checked against.
+  assert.equal(LAUNCH_COMMAND, launchCommandFor('scatter'));
+  assert.equal(DEFAULT_SERVER_ADDRESS, SERVERS.scatter.address);
+  assert.equal(RECOMMENDED_MODEL_DIR, SERVERS.scatter.modelDir);
 });

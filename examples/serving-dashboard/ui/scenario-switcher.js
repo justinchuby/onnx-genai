@@ -21,6 +21,7 @@
 // says what is missing and the command that supplies it.
 
 import { SCENARIOS, planScenario, scenarioHref } from '../scenario-origins.js';
+import { SERVERS, launchCommandFor } from './launch-command.js';
 
 /**
  * Render the scenario tabs and the note covering whatever is unreachable.
@@ -169,10 +170,18 @@ function buildUnreachableNote(unreachable) {
 
   const heading = document.createElement('h3');
   heading.className = 'scenario-switcher__note-heading';
+  // Name the server in the heading when every unreachable scenario needs the
+  // SAME one, which is the common case in a two-server demo. "The other server"
+  // is vague the moment the body text below names it specifically, and a
+  // heading that is less precise than the paragraph under it reads as a
+  // different, larger problem than the one being described.
+  const missingClasses = [...new Set(unreachable.map(({ plan }) => plan.scenario.serverClass))];
+  const onlyServer = missingClasses.length === 1 ? SERVERS[missingClasses[0]] : null;
+  const serverPhrase = onlyServer ? `the ${onlyServer.label}` : 'another server';
   heading.textContent =
     unreachable.length === 1
-      ? 'One scenario needs the other server'
-      : `${unreachable.length} scenarios need the other server`;
+      ? `One scenario needs ${serverPhrase}`
+      : `${unreachable.length} scenarios need ${serverPhrase}`;
   note.append(heading);
 
   const list = document.createElement('ul');
@@ -181,7 +190,12 @@ function buildUnreachableNote(unreachable) {
     const item = document.createElement('li');
     const name = document.createElement('strong');
     name.textContent = plan.scenario.label;
-    item.append(name, document.createTextNode(` — ${plan.scenario.why}`));
+    const server = SERVERS[plan.scenario.serverClass];
+    // Name the SPECIFIC server. "The other server" is unactionable once there
+    // is more than one thing a visitor could start, and demo-spec.md:120
+    // requires the dynamic-model server to be named as such.
+    const needs = server ? ` — needs the ${server.label}. ` : ' — ';
+    item.append(name, document.createTextNode(`${needs}${plan.scenario.why}`));
     list.append(item);
   }
   note.append(list);
@@ -193,6 +207,25 @@ function buildUnreachableNote(unreachable) {
     'servers and prints a URL carrying their addresses, which is what makes these ' +
     'scenarios reachable from this page.';
   note.append(fix);
+
+  // The exact command for each missing server, deduplicated: two scenarios
+  // needing the same server is one thing to start, not two. Shown because
+  // "run run-demo.sh" does not help a visitor who is deliberately running one
+  // server by hand, which is the case where this note actually appears.
+  for (const serverClass of missingClasses) {
+    const server = SERVERS[serverClass];
+    if (!server) continue;
+
+    const heading2 = document.createElement('p');
+    heading2.className = 'scenario-switcher__note-fix';
+    heading2.textContent = `Or start the ${server.label} yourself — it demonstrates ${server.demonstrates}:`;
+    note.append(heading2);
+
+    const pre = document.createElement('pre');
+    pre.className = 'scenario-switcher__note-command';
+    pre.textContent = launchCommandFor(serverClass);
+    note.append(pre);
+  }
 
   return note;
 }
@@ -220,15 +253,28 @@ export function describeSwitcher(reachable, unreachable, currentScenarioId) {
     `Showing ${currentLabel}.`,
     `${reachable.length} ${reachable.length === 1 ? 'scenario is' : 'scenarios are'} available`,
   ];
+  // Name the server rather than saying "the other server". A screen-reader user
+  // gets this string INSTEAD of the visual note, not in addition to it, so any
+  // fact the note names must be here too or the text view is a downgrade.
+  const remoteClasses = [
+    ...new Set(
+      reachable.filter(({ plan }) => plan.requiresNavigation).map(({ plan }) => plan.scenario.serverClass),
+    ),
+  ];
+  const remoteServer = remoteClasses.length === 1 ? SERVERS[remoteClasses[0]] : null;
+  const remotePhrase = remoteServer ? `the ${remoteServer.label}` : 'another server';
   parts.push(
     remote === 0
       ? 'on this server.'
-      : `, ${local} on this server and ${remote} on the other server, which opens in a new page.`,
+      : `, ${local} on this server and ${remote} on ${remotePhrase}, which opens in a new page.`,
   );
   if (unreachable.length > 0) {
+    const missingClasses = [...new Set(unreachable.map(({ plan }) => plan.scenario.serverClass))];
+    const missingServer = missingClasses.length === 1 ? SERVERS[missingClasses[0]] : null;
+    const missingPhrase = missingServer ? `the ${missingServer.label} is` : 'the servers that measure them are';
     parts.push(
       `${unreachable.length} more ${unreachable.length === 1 ? 'is' : 'are'} unavailable ` +
-        'because the server that measures them is not running.',
+        `because ${missingPhrase} not running.`,
     );
   }
   return parts.join(' ').replace(/\s+,/g, ',');

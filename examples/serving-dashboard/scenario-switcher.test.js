@@ -80,7 +80,12 @@ test('describe() names the current scenario and where the others live', () => {
   const sentence = describeSwitcher(reachable, unreachable, 'continuous-batching');
 
   assert.match(sentence, /Continuous batching/);
-  assert.match(sentence, /other server/);
+  assert.match(
+    sentence,
+    /dynamic-model server/,
+    'the text view must name the server, not say "the other server" -- a ' +
+      'screen-reader user gets this INSTEAD of the visual note, not as well as it',
+  );
   assert.doesNotMatch(sentence, /unavailable/);
 });
 
@@ -138,5 +143,32 @@ test('index.html does not name scenario ids, which only the registry may do', ()
   assert.ok(
     html.includes('id="scenario-switcher"'),
     'index.html must provide the switcher mount point',
+  );
+});
+
+// --- The note names the server it needs -------------------------------------
+
+test('the unreachable note names the specific server, and describeSwitcher agrees', () => {
+  // "The other server" is unactionable in a two-server demo, and
+  // demo-spec.md:120 requires the dynamic-model server to be named as such.
+  // describeSwitcher is the assistive-technology text view, so it must carry
+  // the same fact as the visual note rather than a vaguer version of it.
+  const { reachable, unreachable } = planAll(SCATTER_ONLY, SCATTER);
+
+  assert.ok(unreachable.length > 0, 'with only the scatter origin, some scenarios must be out');
+  for (const { plan } of unreachable) {
+    assert.equal(
+      plan.scenario.serverClass,
+      'dynamic',
+      'only dynamic-server scenarios can be unreachable when the scatter origin is present',
+    );
+  }
+
+  const description = describeSwitcher(reachable, unreachable, 'continuous-batching');
+  assert.match(description, /dynamic-model server/, 'the missing server must be named');
+  assert.doesNotMatch(
+    description,
+    /the other server/,
+    'the vague phrasing must not survive anywhere a visitor can read it',
   );
 });
