@@ -134,12 +134,12 @@ export default function mount(rootElement, telemetryStore) {
     ]);
 
     replaceChildren(savings, [
-      metricRow('tokens reused', telemetryStore.field('prefix.tokens_reused')),
-      metricRow('prefill skipped', telemetryStore.field('prefix.prefill_tokens_skipped')),
-      metricRow('time saved', telemetryStore.field('prefix.time_saved_ms'), {
+      metricRow('tokens reused', telemetryStore.field('prefix_cache.tokens_reused')),
+      metricRow('prefill skipped', telemetryStore.field('prefix_cache.prefill_tokens_skipped')),
+      metricRow('time saved', telemetryStore.field('prefix_cache.time_saved_ms'), {
         format: (value) => formatDuration(value),
       }),
-      metricRow('evictions', telemetryStore.field('prefix.evictions')),
+      metricRow('evictions', telemetryStore.field('prefix_cache.evictions')),
     ]);
 
     const hitSeries = telemetryStore.series('prefix_cache.hits', WINDOW_MS);
