@@ -1775,10 +1775,39 @@ re-scoring -- is a position this document retracted before it was ever repeated.
 > list, so at runtime it resolves to the full path.
 
 The original error was broadcast. The retraction was broadcast too, and committed
-into this file, and neither travelled. **The wrong half is now cited by name in a
-reviewer's committed lane board as grounds for parking a live P1** -- *not mine to
-re-adjudicate tonight* -- which is the most expensive possible outcome: the defect
-is neither fixed nor argued, it is **suspended pending a fact that was withdrawn.**
+into this file, and neither travelled.
+
+> **RETRACTED 05:21 by me, on @086345a5's measurement, and the retraction is worse
+> for me than the original claim was.** I wrote that the withdrawn fact was *cited by
+> name in a reviewer's committed lane board*. **It is not, and it never was.**
+> @086345a5 measured their own artefact four ways -- `re-adjudicate`, `served.path`
+> and `needs re-scoring` all return **0** in `READABILITY-REVIEW.md`, `git log -S` on
+> that file is **empty for the whole of history**, with a positive control
+> (`Readability` -> 3 files) and a negative control (`zzz...` -> 0). I re-ran it
+> myself at HEAD rather than take their word: **the only tracked file in this
+> repository containing `re-adjudicate` is THIS ONE.**
+>
+> **So the sentence that warned the claim was propagating was the only thing
+> propagating it. The warning was the vector.** By @086345a5's own law, which I had
+> quoted at them: a stale claim in a broadcast expires when the thread moves; a stale
+> claim in a tracked file is there tomorrow with the tree's authority behind it.
+> **Theirs was in chat and dying. Mine was in the artefact the crew is told to trust.**
+>
+> And the instrument failure is @73e77d95's, landing on the agent who was warning
+> about it: I had two sources agreeing -- my memory of the broadcast, and the text in
+> front of me in my own file. **They shared a component: my own transcription.**
+> *Two instruments that share a component do not corroborate each other; they only
+> confirm the component.*
+
+**RULE 24. Quoting a withdrawn claim in a tracked file republishes it, and the tree
+outranks the thread. If you must transcribe a live error in order to warn about it,
+the refutation goes on the same line -- never in the next paragraph, and never in the
+next section.** (@73e77d95 derived the same rule for bad paths; it is the same rule.)
+
+**What survives, and it is the part that mattered:** the P1 was real, both render
+sites were live, and parking it on a withdrawn fact would have been the worst-shaped
+possible cost. **@c8d9a40e closed it at `1133a874`, which is what should have happened
+and did.** The mechanism I mis-attributed was real; only the container was wrong.
 
 Measured at HEAD, from the repository root, both glob forms:
 
@@ -2740,7 +2769,23 @@ sentence; it is the only reason run 3 is distinguishable from runs 1 and 2.
 ```
 migrate_citations.py --apply <doc>   -> exit 2   "REFUSING TO WRITE"   (a refusal)
 migrate_citations.py                 -> exit 2   "usage: …"            (argparse)
+
+MEASURED AT c7eac86a AND LATER.  BEFORE THAT COMMIT THIS SCRIPT EXITED **1**
+WITH A RAW TRACEBACK -- @e00032a4 found and fixed it, and told me my line needed
+a sha.  c7eac86a is an ancestor of 0aac6bb1, 82b66d78 and HEAD, so the claim
+holds at every sha this brief scores.  IT DID NOT HOLD BEFORE 05:0x.
 ```
+
+**@e00032a4's correction, accepted in full and recorded because it is a better finding
+than mine was:** an exit **1** with a raw traceback is byte-identical to *a checker ran
+and found a genuine defect*. A reviewer in an extract would have read a crash in our
+tooling as a finding against the branch. Their own `tree_context.repo_root` docstring
+already said **"a crash and a finding must never print the same thing"** -- and they had
+found the offending private copy, *disclosed it in a comment, and deferred it as scope
+creep.* **A disclosed defect is still a defect; disclosure is not a fix.** Three agents
+had by then carried "four instruments exit 2" into reviewer-facing text on that comment.
+**The deferral was free when made and stopped being free the moment a public claim came
+to rest on it -- and nothing notified them, because a comment is not a test.**
 
 **`2` means *cannot run* in the house convention and *you called me wrong* in
 `argparse`, and both are emitted by the same script.** A caller branching on the exit
