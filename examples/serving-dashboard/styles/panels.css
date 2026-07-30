@@ -1,0 +1,792 @@
+/* Copyright (c) Microsoft Corporation.
+ *
+ * Panel internals. Dashboard-owned; see demo-ux.md §3.1.
+ *
+ * SCOPE: everything here is inside a `.panel__body`. The panel frame, header,
+ * collapse control and "view as table" toggle belong to the shell, so they are
+ * absent from this file by design — uniform chrome cannot drift if only one
+ * owner can write it.
+ *
+ * RULES THIS FILE FOLLOWS:
+ *   • Every colour, space and size is a `--og-` token. No panel invents a
+ *     value; the fastest route to a patchwork UI is fifteen slightly different
+ *     greys, and the token set is the designer's to extend, not ours.
+ *   • Sizing uses `@container`, never `@media`. A panel is ~340px in a one-
+ *     column layout and ~700px in a two-column one, and a media query cannot
+ *     see that difference.
+ *   • Meaning is never carried by colour alone. Every state that has a colour
+ *     also has a glyph, a word, or a shape (AC25).
+ */
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   THE VALUE — the §4.1 four states.
+   These rules are load-bearing. Their entire value is that they look identical
+   in every panel, so a visitor learns the convention once and then reads the
+   whole page correctly. Do not restyle them per panel.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+.value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+  font-family: var(--og-font-mono);
+  font-variant-numeric: tabular-nums;
+  /* The slot never collapses: when KV plumbing lands, values must appear
+     without the layout jumping. Layout shift on data arrival makes the page
+     feel unreliable at exactly the moment it becomes more reliable. */
+  min-width: var(--og-value-slot, 5ch);
+}
+
+.value__num {
+  color: var(--og-fg);
+  font-variant-numeric: tabular-nums;
+}
+
+.value__num--unavailable {
+  color: var(--og-unavail-fg);
+  /* The dashed underline is what makes the em-dash discoverable. A bare "—"
+     looks like a rendering bug; an underlined one with a help cursor is
+     visibly an affordance. */
+  border-bottom: 1px dashed var(--og-unavail-rule);
+  cursor: help;
+}
+
+.value__num--pending {
+  color: var(--og-pending-fg);
+  letter-spacing: 0.12em;
+}
+
+.value__unit {
+  color: var(--og-fg-subtle);
+  font-size: var(--og-type-xs);
+}
+
+.value__src {
+  color: var(--og-fg-subtle);
+  font-size: var(--og-type-2xs);
+  text-decoration: none;
+  cursor: help;
+}
+
+.value__src--server { color: var(--og-fg-subtle); }
+.value__src--client { color: var(--og-fg-subtle); }
+.value__src--derived { color: var(--og-fg-subtle); }
+
+.value__src--estimated {
+  color: var(--og-estimated-fg);
+}
+
+.value__src--simulated {
+  /* Never a superscript. A superscript is easy to miss, and a value nobody
+     measured must be impossible to miss. The ugliness is the point. */
+  color: var(--og-simulated-fg);
+  border: 1px dashed var(--og-simulated-rule);
+  border-radius: var(--og-radius-pill);
+  padding: 0 var(--og-space-2);
+  font-size: var(--og-type-2xs);
+  letter-spacing: var(--og-tracking-caps);
+}
+
+.value[data-stale='true'] .value__num {
+  color: var(--og-fg-muted);
+}
+
+.value__stale {
+  color: var(--og-warn);
+  font-size: var(--og-type-2xs);
+  letter-spacing: var(--og-tracking-caps);
+  cursor: help;
+}
+
+.value:focus-visible,
+.spark:focus-visible,
+.utilization-bar:focus-visible,
+.resource-row__label:focus-visible,
+.resource-row__absent:focus-visible {
+  outline: var(--og-focus-ring);
+  outline-offset: var(--og-focus-offset);
+  border-radius: var(--og-radius-sm);
+}
+
+/* ── Rows, sections, heroes ──────────────────────────────────────────────── */
+
+.metric-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--og-space-4);
+  padding: var(--og-space-2) 0;
+  border-bottom: 1px solid var(--og-border-subtle);
+}
+
+.metric-row__label {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+}
+
+.metric-row--alarm .metric-row__label,
+.metric-row--alarm .value__num {
+  color: var(--og-bad);
+}
+
+.metric-row__alarm-note {
+  /* The word carries the meaning; the colour only reinforces it (AC25). */
+  color: var(--og-bad);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  flex-basis: 100%;
+}
+
+.panel-section {
+  margin: var(--og-space-5) 0 var(--og-space-2);
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  font-weight: var(--og-weight-medium);
+  letter-spacing: var(--og-tracking-caps);
+  text-transform: uppercase;
+}
+
+.hero-figure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--og-space-3);
+}
+
+.hero-figure .value__num {
+  font-size: var(--og-type-xl);
+  font-weight: var(--og-weight-light);
+}
+
+.hero-figure__caption {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+}
+
+.acronym {
+  border-bottom: 1px dotted var(--og-fg-subtle);
+  cursor: help;
+  text-decoration: none;
+}
+
+/* ── Sparklines ─────────────────────────────────────────────────────────── */
+
+.spark {
+  display: block;
+  margin: var(--og-space-2) 0 var(--og-space-4);
+  background: var(--og-bg-sunken);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-sm);
+}
+
+.spark__canvas {
+  display: block;
+  width: 100%;
+}
+
+/* ── Capability notice (§4.4) ───────────────────────────────────────────── */
+
+.capability-notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--og-space-3);
+  padding: var(--og-space-6);
+  border: 1px dashed var(--og-border-strong);
+  border-radius: var(--og-radius-md);
+  background: var(--og-bg-sunken);
+  text-align: center;
+}
+
+.capability-notice__title {
+  color: var(--og-fg);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-md);
+  font-weight: var(--og-weight-medium);
+}
+
+.capability-notice__body {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+  line-height: var(--og-leading-body);
+}
+
+.capability-notice__cmdrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--og-space-3);
+}
+
+.capability-notice__cmd {
+  padding: var(--og-space-2) var(--og-space-4);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-bg);
+  color: var(--og-fg);
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-sm);
+  user-select: all;
+}
+
+.capability-notice__copy {
+  padding: var(--og-space-2) var(--og-space-4);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-bg-raised);
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  cursor: pointer;
+  transition: background var(--og-dur-fast) var(--og-ease);
+}
+
+.capability-notice__copy:hover {
+  background: var(--og-bg-hover);
+}
+
+.capability-notice__copy:focus-visible {
+  outline: var(--og-focus-ring);
+  outline-offset: var(--og-focus-offset);
+}
+
+.capability-notice__footer {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+}
+
+/* ── Panel: scheduling ──────────────────────────────────────────────────── */
+
+.panel-scheduling__counters,
+.panel-scheduling__footer,
+.panel-kv-memory__counters {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0 var(--og-space-6);
+}
+
+@container (min-width: 520px) {
+  .panel-scheduling__counters,
+  .panel-scheduling__footer,
+  .panel-kv-memory__counters,
+  .panel-kv-memory__grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.occupancy {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--og-space-3);
+}
+
+.occupancy__count .value__num {
+  font-size: var(--og-type-lg);
+}
+
+.occupancy__of,
+.occupancy__max-label {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+}
+
+.occupancy__note {
+  flex-basis: 100%;
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  line-height: var(--og-leading-body);
+}
+
+.capacity-bar {
+  display: flex;
+  gap: var(--og-space-1);
+  flex-basis: 100%;
+  margin-top: var(--og-space-2);
+}
+
+.capacity-bar__slot {
+  /* Discrete ticks rather than a continuous bar: "3 of 4" should be countable,
+     not estimated by eye. */
+  flex: 1 1 0;
+  height: 10px;
+  border: 1px solid var(--og-border-strong);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-bg-sunken);
+}
+
+.capacity-bar__slot--used {
+  background: var(--og-accent);
+  border-color: var(--og-accent);
+}
+
+.queue-summary {
+  display: grid;
+  gap: 0 var(--og-space-6);
+}
+
+/* ── Panel: throughput ──────────────────────────────────────────────────── */
+
+.per-request {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--og-space-3);
+}
+
+.per-request__empty,
+.per-request__elided,
+.refcounts__empty,
+.requests-table__caption {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+}
+
+.request-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+  padding: var(--og-space-1) var(--og-space-3);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-pill);
+  background: var(--og-bg-sunken);
+  font-size: var(--og-type-sm);
+}
+
+.request-chip__id {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-mono);
+}
+
+/* Sequence identity is colour PLUS marker glyph, never colour alone. The glyph
+   lives in the markup; these rules only tint it. */
+.request-chip[data-seq='0'] .request-chip__marker,
+.requests-table__row[data-seq='0'] .requests-table__marker { color: var(--og-seq-0); }
+.request-chip[data-seq='1'] .request-chip__marker,
+.requests-table__row[data-seq='1'] .requests-table__marker { color: var(--og-seq-1); }
+.request-chip[data-seq='2'] .request-chip__marker,
+.requests-table__row[data-seq='2'] .requests-table__marker { color: var(--og-seq-2); }
+.request-chip[data-seq='3'] .request-chip__marker,
+.requests-table__row[data-seq='3'] .requests-table__marker { color: var(--og-seq-3); }
+.request-chip[data-seq='4'] .request-chip__marker,
+.requests-table__row[data-seq='4'] .requests-table__marker { color: var(--og-seq-4); }
+.request-chip[data-seq='5'] .request-chip__marker,
+.requests-table__row[data-seq='5'] .requests-table__marker { color: var(--og-seq-5); }
+.request-chip[data-seq='6'] .request-chip__marker,
+.requests-table__row[data-seq='6'] .requests-table__marker { color: var(--og-seq-6); }
+.request-chip[data-seq='7'] .request-chip__marker,
+.requests-table__row[data-seq='7'] .requests-table__marker { color: var(--og-seq-7); }
+
+.latency-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--og-type-sm);
+}
+
+.latency-table th {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  font-weight: var(--og-weight-medium);
+  text-align: right;
+  padding: var(--og-space-2);
+}
+
+.latency-table__label {
+  text-align: left !important;
+  display: flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+}
+
+.latency-table__origin {
+  color: var(--og-fg-subtle);
+  font-size: var(--og-type-2xs);
+  letter-spacing: var(--og-tracking-caps);
+  text-transform: uppercase;
+}
+
+.latency-table td {
+  padding: var(--og-space-2);
+  text-align: right;
+  border-top: 1px solid var(--og-border-subtle);
+}
+
+.latency-table__divergence {
+  color: var(--og-warn);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  line-height: var(--og-leading-body);
+  text-align: left !important;
+}
+
+.panel-throughput__makespan {
+  margin-top: var(--og-space-5);
+}
+
+.panel-throughput__makespan-note {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+}
+
+/* ── Panel: KV memory ───────────────────────────────────────────────────── */
+
+.panel-kv-memory__hero {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--og-space-3);
+}
+
+.panel-kv-memory__hero .value__num {
+  font-size: var(--og-type-xl);
+  font-weight: var(--og-weight-light);
+}
+
+.block-fraction {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+  margin-left: auto;
+}
+
+.block-fraction__slash,
+.block-fraction__unit,
+.resource-row__of {
+  color: var(--og-fg-subtle);
+  font-size: var(--og-type-xs);
+}
+
+.utilization-bar {
+  height: 14px;
+  margin: var(--og-space-3) 0;
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-bg-sunken);
+  overflow: hidden;
+}
+
+.utilization-bar__fill {
+  display: block;
+  height: 100%;
+  background: var(--og-accent);
+}
+
+.utilization-bar--unavailable {
+  /* The §4.3 hatch, in CSS rather than canvas — same 45°, same 6px pitch, so
+     an unavailable bar and an unavailable sparkline read as one language. */
+  cursor: help;
+  background-color: var(--og-unavail-bg);
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--og-unavail-hatch) 0,
+    var(--og-unavail-hatch) 1px,
+    transparent 1px,
+    transparent 6px
+  );
+}
+
+.panel-kv-memory__grid {
+  display: grid;
+  gap: 0 var(--og-space-6);
+}
+
+.panel-kv-memory__note {
+  margin: var(--og-space-3) 0;
+  padding-left: var(--og-space-4);
+  border-left: 2px solid var(--og-border-strong);
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+  line-height: var(--og-leading-body);
+}
+
+.refcounts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--og-space-2);
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.refcounts__row {
+  display: grid;
+  grid-template-columns: 3ch 1fr auto;
+  align-items: center;
+  gap: var(--og-space-3);
+}
+
+.refcounts__key {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-xs);
+  cursor: help;
+}
+
+.refcounts__bar {
+  height: 8px;
+  min-width: 2px;
+  border-radius: var(--og-radius-sm);
+  background: var(--og-info);
+}
+
+.refcounts__count {
+  color: var(--og-fg);
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.kv-tiers {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.kv-tiers__row {
+  display: flex;
+  justify-content: space-between;
+  padding: var(--og-space-1) 0;
+  font-size: var(--og-type-sm);
+}
+
+.kv-tiers__name {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+}
+
+.kv-tiers__pages {
+  font-family: var(--og-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Panel: prefix cache ────────────────────────────────────────────────── */
+
+.panel-prefix-cache__hero {
+  display: flex;
+  align-items: baseline;
+  gap: var(--og-space-3);
+}
+
+.panel-prefix-cache__hero .value__num {
+  font-size: var(--og-type-xl);
+  font-weight: var(--og-weight-light);
+}
+
+/* ── Panel: requests ────────────────────────────────────────────────────── */
+
+.requests-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--og-type-xs);
+}
+
+.requests-table th {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-ui);
+  font-weight: var(--og-weight-medium);
+  text-align: left;
+  padding: var(--og-space-2);
+  border-bottom: 1px solid var(--og-border);
+}
+
+.requests-table td {
+  padding: var(--og-space-2);
+  border-bottom: 1px solid var(--og-border-subtle);
+  white-space: nowrap;
+}
+
+.requests-table__sort {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.requests-table__sort:hover {
+  color: var(--og-fg);
+  text-decoration: underline;
+}
+
+.requests-table__sort:focus-visible {
+  outline: var(--og-focus-ring);
+  outline-offset: var(--og-focus-offset);
+}
+
+.requests-table__marker {
+  margin-right: var(--og-space-2);
+}
+
+.requests-table__tokens {
+  font-family: var(--og-font-mono);
+}
+
+.requests-table__finish {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-mono);
+}
+
+.request-state {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+  font-family: var(--og-font-ui);
+}
+
+/* Each state has a glyph in the markup as well as a colour here, so the column
+   is readable in grayscale and to a colourblind reader (AC25). */
+.request-state--sent      { color: var(--og-fg-muted); }
+.request-state--streaming { color: var(--og-info); }
+.request-state--done      { color: var(--og-ok); }
+.request-state--error     { color: var(--og-bad); }
+.request-state--cancelled { color: var(--og-fg-subtle); }
+.request-state--unknown   { color: var(--og-unavail-fg); }
+
+/* ── Panel: system ──────────────────────────────────────────────────────── */
+
+.panel-system__model {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--og-space-2) var(--og-space-5);
+  margin: 0;
+  font-size: var(--og-type-sm);
+}
+
+.panel-system__model dt {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+}
+
+.panel-system__model dd {
+  margin: 0;
+}
+
+.resource-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--og-space-3);
+  padding: var(--og-space-2) 0;
+  border-bottom: 1px solid var(--og-border-subtle);
+}
+
+.resource-row__label {
+  color: var(--og-fg-muted);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+  /* Focusable because it carries the accounting caveat, and a caveat only
+     reachable by mouse hover is not reachable at all. */
+  border-bottom: 1px dotted var(--og-fg-subtle);
+  cursor: help;
+}
+
+.resource-row__headroom {
+  color: var(--og-fg-subtle);
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-xs);
+  margin-left: auto;
+}
+
+.resource-row__absent {
+  color: var(--og-unavail-fg);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+  font-style: italic;
+  border-bottom: 1px dashed var(--og-unavail-rule);
+  cursor: help;
+}
+
+.connection {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--og-space-2);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-xs);
+}
+
+.connection--live    { color: var(--og-ok); }
+.connection--slow    { color: var(--og-warn); }
+.connection--retrying{ color: var(--og-warn); }
+.connection--offline { color: var(--og-bad); }
+.connection--unknown { color: var(--og-fg-subtle); }
+
+/* ── Narrow layouts (AC29: legible at 1280×720 with no horizontal scroll) ─── */
+
+@container (max-width: 420px) {
+  .panel-scheduling__counters,
+  .panel-scheduling__footer,
+  .panel-kv-memory__counters,
+  .panel-kv-memory__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .requests-table {
+    /* The audit table is the one place horizontal scrolling is preferable to
+       dropping columns: an audit surface with hidden columns is not an audit
+       surface. */
+    display: block;
+    overflow-x: auto;
+  }
+
+  .block-fraction {
+    margin-left: 0;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   PANEL REGIONS
+   Each panel groups its body into named regions. They carry no visual weight of
+   their own beyond rhythm — the shell owns the frame, and a region that drew a
+   border would put a box inside a box.
+   ───────────────────────────────────────────────────────────────────────────*/
+
+.panel-throughput__hero,
+.panel-throughput__per-request,
+.panel-scheduling__occupancy,
+.panel-scheduling__queue,
+.panel-prefix-cache__counts,
+.panel-prefix-cache__savings,
+.panel-system__self,
+.panel-system__resources {
+  display: block;
+  margin-bottom: var(--og-space-4);
+}
+
+.panel-throughput__per-request,
+.panel-scheduling__queue,
+.panel-prefix-cache__savings,
+.panel-system__resources {
+  margin-bottom: 0;
+}
+
+.latency-table__row:last-child td {
+  border-bottom: none;
+}
+
+/* Glyph + label: the pair that keeps state readable without colour. The glyph
+   is never decorative and must never be `aria-hidden` alone — the label is the
+   accessible text, the glyph is the grayscale-safe redundancy. */
+
+.connection__glyph,
+.request-state__glyph {
+  font-size: var(--og-type-xs);
+  line-height: 1;
+}
+
+.connection__label,
+.request-state__label {
+  font-family: var(--og-font-ui);
+}
+
+.resource-row--absent .resource-row__label {
+  border-bottom-style: dashed;
+}

@@ -1,0 +1,6 @@
+{
+  "type": "module",
+  "private": true,
+  "name": "onnx-genai-dashboard-panels",
+  "description": "NOT an npm package and NOT a build step. This file exists only so `node --test dashboard/` treats these .js files as the ES modules they already are. There are no dependencies, no scripts, and nothing to install — the browser loads these files directly from the server's static route. Do not add dependencies here; see ../README.md for why this demo deliberately has no bundler."
+}
