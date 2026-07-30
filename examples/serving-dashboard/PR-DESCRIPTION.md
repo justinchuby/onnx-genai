@@ -586,3 +586,84 @@ spec section, and the doc comment is accurate about what the function *does*.
 
 **Not a regression. Nothing in this PR changes it. Named so the next person
 does not spend an afternoon writing a YAML file that has no reader.**
+
+---
+
+## Four additions closing this document out
+
+**Ordered onto the gate by @c7a654ed and @12e42da8. Seven of their eight
+required disclosures were already here; these are the four that were not.**
+
+### 1. The test fixtures default to a retired state — measured, not relayed
+
+```
+dashboard/testing/fake-store.js:65   state: options.state ?? 'ok'
+field-state.js                       OK: 'measured'
+   ⬅ 'ok' IS THE RETIRED SPELLING. THE LIVE ENUM IS 'measured'.
+test files importing fake-store:  **8**
+   accessibility · model-path-disclosure · panel-bypass · panel-kit ·
+   panels · scheduling · stylesheet · fake-store-contract
+[POSITIVE CONTROL] test files importing panel-kit: 6   [NEG] fake-zqq-store: 0
+```
+
+**@12e42da8 reports ~112 fixture fields rendering as em-dashes while their tests
+believe they are measured. I have not reproduced that count and I am not
+publishing it as mine — what I measured is the default, the retirement, and the
+blast radius of eight files.** *The direction is not in doubt; the magnitude is
+somebody else's number and it is labelled as such.*
+
+**This is the highest-leverage instance of the fallback bias in the whole
+release, because it is upstream of the tests rather than in the product:
+*a fixture that defaults to a claim teaches every test written against it to
+expect a claim.*** The bias reproduces itself in the suite faster than in the
+code, and each new test makes it harder to remove.
+
+### 2. Length is a claim we never guarded
+
+At 320px the leaked model path rendered **four wrapped lines / 81px**; the model
+name above it rendered **one line / 20px**. **Nobody chose to emphasise the
+presenter's home directory — string length chose it.**
+
+**And the CSS is correct.** `overflow-wrap: anywhere` refuses to hide data, which
+is exactly right for honest values. **A rule adopted to protect honesty became a
+megaphone the moment the content was something we should never have shown.**
+
+> **Every guard in this repository asks whether a value is TRUE. Not one asks how
+> much SPACE it takes.**
+
+**It generalises past the row that was deleted: every unbounded-length field
+inherits it — an error `reason`, a provenance warning, a stale-field
+explanation.** ***So the most emphatic element on most of our panels is the
+honesty layer apologising for not having a number.*** **This is *a layout is a
+claim* arriving from the opposite direction, and it is visible only in a
+browser** — which is why thirteen instruments missed it.
+
+### 3. Two sentences about how this work actually got done
+
+> ***The cheapest fix on the board was the only one with no owner — and that is
+> not a coincidence. It is cheap because it is a deletion, and our tracking
+> apparatus is built to observe additions.***
+
+> ***A search for the defect never shows you its neighbour — and the neighbour
+> was the fix.***
+
+**The second fired four times, most tellingly on a ruling rather than on a
+grep.** **We were rescued by individuals, not by the system, and that stands as a
+finding even though every defect got fixed.**
+
+### 4. What this PR is pinned to, and what it is not
+
+**This document quotes every number with the revision it was taken at, and it
+quotes more than one, because more than one is true.** `744/114` and `710/109`
+are **two quantities, not two readings** — different runners over different
+file sets. **Neither is wrong and they must not be added, averaged or
+reconciled.**
+
+**The pin itself is not mine to set** and was still moving when this was written.
+**Whatever revision is finally announced, the numbers in §2 must be re-measured
+there with `./run-tests.sh` and no hand-written glob** — the canonical runner is
+the only one that reports its own tree, its own dirtiness, and refuses to score
+a total containing uncommitted files.
+
+> **A number in this document without a revision beside it is a defect in this
+> document. If you find one, it is mine.**
