@@ -193,7 +193,7 @@ policy, and two Prometheus gauges.
 `deserializes_minimal_status_with_defaults`, which asserts `kv_usage == 0.0`. Each is
 correct about its own side. Nothing tests the seam.
 
-**Recommended fix — narrow, in `apply_status` (`node.rs`), not in the type.** The wide
+**Recommended fix — narrow, in `apply_status` (`crates/onnx-genai-router/src/node.rs`), not in the type.** The wide
 fix (making 14 fields `Option`) touches ~8 scoring sites, 2 gauges, ~15 test
 constructors and the `api.rs` re-exports. Instead: **`apply_status` should treat an
 omitted load-bearing field as a missed poll**, feeding the existing
@@ -257,7 +257,7 @@ Two consequences worth carrying past this PR:
 | **C7/C8** | `ServeDir` publishes the whole assets directory; no CSP header | minor | read |
 | **C5** | `may_disclose_model_paths()` keys on **bind address rather than peer** — and the demo binds `127.0.0.1` by default, so the disclosure branch is the **default path for every demo run**, not an edge case | 🔴 **LIVE AT `review-0`** · closed at HEAD by `2da3e851` (after the tag) — see §7.2 and §7.7 | executed |
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
-| **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
+| **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `crates/onnx-genai-server/src/tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
 | **C12** | ~~`fetchWithDeadline` is the only network path by discipline, not by construction; nothing asserts it~~ | **RETRACTED — false when filed. See §7.6** | executed |
 | **C15** | `fetchWithDeadline` **silently discards a caller-supplied `signal`** — `{ ...init, signal: controller.signal }` spreads the caller's key and then overwrites it. The docstring promises *"everything else is passed through to the underlying fetch untouched"*; that promise is false for the one key that controls cancellation. Executed at `review-0`: caller's `abort()` leaves the request **PENDING**. 🟡 latent — zero shipped callers pass a signal today | 🟡 NEW, latent, structural — see §8.1 | executed |
 
@@ -395,7 +395,7 @@ CATALOGUE READS (path:)        WIRE ACTUALLY SERVES
 telemetry-store.js:1228  readPath(body, entry.path)   -- no alias map anywhere in JS
 ```
 
-`generations_with_prefix_reuse` appears in `routes/admin.rs`, `routes/mod.rs`, `tests.rs`,
+`generations_with_prefix_reuse` appears in `crates/onnx-genai-server/src/routes/admin.rs`, `crates/onnx-genai-server/src/routes/mod.rs`, `crates/onnx-genai-server/src/tests.rs`,
 `docs/ARCHITECTURE.md`, `README.md` and `demo-spec.md` — and in **zero JavaScript files**.
 **Every artifact in the repository tracked the rename except the one whose entire job is
 to state what is real.** The store degrades honestly (`"responded, but carried no value"`),
@@ -723,4 +723,35 @@ The floor mattered here. My first read of `:9124` returned zero bytes and zero o
 of the key — which is byte-identical to the finding I was looking for. The port was dead.
 An absent key and an absent server produce the same number, and only the length check told
 them apart.
+
+## 11. An audit of my own citations, prompted by the Lead's phantom-`dashboard/` finding
+
+I extracted every path token from this document and reconciled it against `git ls-files`.
+**19 of 22 were bare basenames.** Most resolve uniquely, but three do not, and the
+ambiguity is not theoretical:
+
+```
+tests.rs   -> 10 tracked candidates
+state.rs   ->  4   (engine/decode, router, server, runtime-session/executor)
+node.rs    ->  2   (onnx-genai-router, onnx-runtime-ir)
+CONTROL: driver.rs, admin.rs, cli.rs, api.rs, router.rs -> exactly 1 each
+```
+
+Every ambiguous citation in this file is now fully qualified, each resolved **by symbol**
+and each with a control that correctly returned 0 in the crate I did not choose —
+`apply_status` is in the router's `node.rs` and not in `onnx-runtime-ir`'s;
+`no_configuration_can_re_enable_full_path_disclosure` is in the server's `tests.rs` and
+not the engine's.
+
+The reason this is worse than untidiness is the Lead's: these basenames exist at
+**identical paths in the sibling repository**, so a bare `state.rs` does not fail to
+resolve for a reader — it resolves, in a tree where we do not leak. An unqualified
+citation is not a citation with a missing prefix; it is a citation that will confidently
+answer a question about the wrong artifact. My deliverable was 19/22 exposed to that and
+I did not notice until someone else found it in their own output.
+
+I repaired these by locating each symbol first and asserting the expected occurrence count
+before substituting, because the mechanical version of this exact repair put *"X hardcodes
+X"* into the README an hour ago. The substitution is the easy half; knowing which of ten
+`tests.rs` you meant is the whole job.
 
