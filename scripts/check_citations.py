@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -247,9 +248,17 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
     """
     if cited in tracked:
         return cited
-    candidates = [t for t in tracked if t.endswith("/" + cited)]
+    # SORTED, AND THAT IS NOT COSMETIC. `tracked` IS A set, SO ITERATION ORDER
+    # FOLLOWS STRING HASHES, AND PYTHON RANDOMISES THOSE PER PROCESS. Without
+    # this sort the "arbitrary" tie-break below is not merely arbitrary, it is
+    # NON-DETERMINISTIC ACROSS RUNS: measured on this repo, `state.rs` resolved
+    # to FOUR DIFFERENT FILES over 12 identical invocations, and the
+    # POSITIONAL_OUT_OF_RANGE report for `state.rs:282` in docs/PIPELINE.md
+    # appeared in 9 of 10 runs of the SAME command at the SAME commit.
+    # A check that answers differently on identical input is not a check.
+    candidates = sorted(t for t in tracked if t.endswith("/" + cited))
     if not candidates:
-        candidates = [t for t in tracked if t.rsplit("/", 1)[-1] == cited]
+        candidates = sorted(t for t in tracked if t.rsplit("/", 1)[-1] == cited)
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -464,6 +473,41 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
         # The prose means line 28, DEFAULT_MAX_BATCH = 4. All eleven are wrong
         # by 1024x, and ALL ELEVEN RESOLVE CLEANLY, because 25 <= 467.
         unverifiable.append(c)
+
+        # A BARE BASENAME WITH SEVERAL CANDIDATES IS RESOLVED BY A TIE-BREAK,
+        # NOT BY A CHECK. The symbol-anchored path above decides ambiguity BY
+        # CONTENT and reports when it cannot; a positional citation carries no
+        # symbol, so there is nothing to decide with -- and the result was
+        # being returned with exactly the same confidence as a decided one.
+        #
+        # Corpus at time of writing: 422 positional citations name a basename
+        # that matches more than one tracked file. `lib.rs` matches FORTY.
+        # `state.rs:25` -- the very example this function's docstring uses to
+        # explain wrong-but-resolving citations -- has FOUR candidates, and the
+        # reading that makes the docstring true holds in exactly ONE of them.
+        #
+        # Reported, never failed: the citation may well be right, and the
+        # author is the only one who knows which file they meant. What is not
+        # acceptable is that the guess was silent.
+        if c.path not in tracked:
+            cands = sorted(t for t in tracked if t.endswith("/" + c.path))
+            if not cands:
+                cands = sorted(t for t in tracked if t.rsplit("/", 1)[-1] == c.path)
+            if len(cands) > 1:
+                shown = ", ".join(cands[:4])
+                more = f", and {len(cands) - 4} more" if len(cands) > 4 else ""
+                reports.append(
+                    Failure(
+                        "AMBIGUOUS_POSITIONAL_PATH",
+                        c,
+                        f"positional citation '{c.raw}' names a bare filename "
+                        f"matching {len(cands)} tracked files, so the file it was "
+                        f"checked against was chosen by tie-break, not decided: "
+                        f"{shown}{more}. This run used '{real}'. Every other "
+                        f"finding about this citation is a finding about that "
+                        f"one file. Qualify the path to make the answer stable.",
+                    )
+                )
         if real not in line_cache:
             line_cache[real] = source_text(repo, real).splitlines()
         lines = line_cache[real]
@@ -830,13 +874,16 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
                                   "which is why no range check has ever seen them",
             "CITE_MARKER_OUT_OF_RANGE": "markers naming a line past the end of the file",
             "CITE_MARKER_UNRESOLVABLE": "markers naming a path that is not a file in this tree",
+            "AMBIGUOUS_POSITIONAL_PATH": "bare filenames matching several tracked files -- the file "
+                                         "checked was chosen by TIE-BREAK, not decided by content",
         }
         for kind, items in sorted(groups.items()):
             print(f"\n--- {len(items)} non-fatal [{kind}]: "
                   f"{headers.get(kind, 'see detail')} ---")
             for f in items[:5]:
                 print(f"  {f.citation.doc}:{f.citation.line_no}  {f.citation.raw}")
-                if kind == "AMBIGUOUS_SYMBOL" or kind.startswith("CITE_MARKER"):
+                if (kind == "AMBIGUOUS_SYMBOL" or kind.startswith("CITE_MARKER")
+                        or kind == "AMBIGUOUS_POSITIONAL_PATH"):
                     print(f"      {f.detail}")
             if len(items) > 5:
                 print(f"  ... and {len(items) - 5} more")
@@ -981,6 +1028,74 @@ def self_test() -> int:
         "cite-marker naming a missing file is CAUGHT as UNRESOLVABLE",
         SAMPLE_DOC + '<!-- cite: src/nope.rs:1 = "anything" -->\n',
         _MARK_SRC, "CITE_MARKER_UNRESOLVABLE")
+
+    # AMBIGUITY ARM. NOTE THE SEPARATE RUNNER, AND IT IS NOT DUPLICATION:
+    # run_report_case above filters kinds to startswith("CITE_MARKER"), so it is
+    # STRUCTURALLY INCAPABLE of observing AMBIGUOUS_POSITIONAL_PATH and would
+    # have scored a do-nothing detector as passing -- the same trap that runner
+    # was itself written to escape, one layer up.
+    def run_ambiguity_case(name: str, doc_text: str, expect_kind: str | None):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            for sub in ("a", "b"):
+                (repo / "src" / sub).mkdir(parents=True)
+                (repo / "src" / sub / "dup.rs").write_text(_MARK_SRC)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "d.md").write_text(doc_text)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            _, stats = check(repo, repo / "docs" / "d.md", {})
+            kinds = {f.kind for f in stats["reports"]
+                     if f.kind == "AMBIGUOUS_POSITIONAL_PATH"}
+            if expect_kind is None:
+                ok = not kinds
+                detail = "no ambiguity complaint, as required" if ok else f"unexpectedly raised {kinds}"
+            else:
+                ok = expect_kind in kinds
+                detail = f"raised {kinds}" if ok else f"DID NOT RAISE {expect_kind}; got {kinds or 'nothing'}"
+            results.append((name, ok, detail))
+
+    run_ambiguity_case(
+        "bare basename matching 2 files DISCLOSES the tie-break",
+        SAMPLE_DOC + "see `dup.rs:2` here\n", "AMBIGUOUS_POSITIONAL_PATH")
+
+    # POSITIVE CONTROL: a qualified path is decided, not guessed, and must be
+    # silent -- otherwise the case above proves only that it complains always.
+    run_ambiguity_case(
+        "fully-qualified path is SILENT (anti-vacuity)",
+        SAMPLE_DOC + "see `src/a/dup.rs:2` here\n", None)
+
+    # THE REGRESSION TEST FOR THE ACTUAL BUG, and it must cross a process
+    # boundary: within ONE process a set's iteration order is stable, so an
+    # in-process assertion cannot see hash randomisation at all. Two seeds,
+    # two processes, one required answer.
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td)
+        for sub in ("a", "b", "c", "d"):
+            (repo / "src" / sub).mkdir(parents=True)
+            (repo / "src" / sub / "dup.rs").write_text(_MARK_SRC)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        prog = (
+            "import sys,subprocess;sys.path.insert(0,%r)\n"
+            "from pathlib import Path\n"
+            "from check_citations import resolve_path\n"
+            "t=set(subprocess.run(['git','ls-files'],capture_output=True,"
+            "text=True,cwd=%r).stdout.split())\n"
+            "print(resolve_path(Path(%r),t,'dup.rs'))\n"
+        ) % (str(Path(__file__).resolve().parent), str(repo), str(repo))
+        seen = set()
+        for seed in ("1", "2", "3", "4", "5", "6"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            out = subprocess.run([sys.executable, "-c", prog], capture_output=True,
+                                 text=True, env=env, cwd=repo)
+            seen.add(out.stdout.strip())
+        ok = len(seen) == 1
+        results.append((
+            "ambiguous basename resolves IDENTICALLY across 6 hash seeds",
+            ok,
+            f"one stable answer: {seen.pop()}" if ok
+            else f"NON-DETERMINISTIC across processes: {sorted(seen)}"))
 
     # 0. Control: unmutated tree must be green, or every later case is vacuous.
     run_case("control (unmutated)", lambda r: None, None)
