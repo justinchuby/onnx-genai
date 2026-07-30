@@ -650,3 +650,23 @@ Full report: `docs/benchmarks/2026-07-27-foundry-native-vs-ort-cuda.md`
 **By:** Mary
 **What:** Native CUDA now distinguishes metadata-declared fixed `state_pairs` from growable KV pairs. Growable rank-4 KV retains its existing capacity-bucket and logical sequence-axis behavior. Fixed recurrent state is allocated at its declared rank and static geometry, batch is bound to one, storage is zero-initialized, and the state is excluded from KV bytes-per-token accounting and capacity growth. The Qwen3.6-27B INT4 graph now clears the former rank-3 FP16 `conv_state` allocation failure and reaches its next blocker: unsupported rank-3/1-D CUDA Conv.
 **Why:** Hybrid attention/recurrent decoders carry fixed convolution and recurrent tensors that use replace semantics rather than sequence growth. Treating every past/present pair as rank-4 KV incorrectly applied axis-2 capacity growth to arbitrary declared state.
+
+### 2026-07-30: Add native CUDA rank-3 Conv1D
+**By:** Mary
+**What:** CUDA `Conv` now handles rank-3 NCL tensors with an output-owned NVRTC kernel while preserving the existing rank-4 cuDNN path. The rank-3 path supports f32/f16/bf16, optional bias, groups/depthwise convolution, stride, dilation, explicit asymmetric/causal padding, and ONNX `VALID`/`SAME_UPPER`/`SAME_LOWER` geometry. GPU parity against the CPU EP covers basic, depthwise causal FP16, and grouped strided/dilated cases. The Qwen3.6-27B INT4 native CUDA probe clears `__fn0_Conv_node_12` and proceeds to the next blocker: missing inferred shape for the layer-0 linear-attention `Silu` output.
+**Why:** Hybrid/recurrent LLM blocks use depthwise causal Conv1D over their fixed convolution state. The CUDA kernel previously accepted only rank-4 NCHW tensors and failed the real 27B graph after recurrent-state allocation was fixed.
+
+### 2026-07-30: Register Microsoft Silu with unary shape inference
+**By:** Mary
+**What:** Added `com.microsoft::Silu` version 1 to the shared shape- and dtype-preserving unary inference catalog. Static, symbolic, rank-agnostic, unknown-rank, dtype, and since-version behavior are covered by unit tests. The Qwen3.6-27B source graph contains `com.microsoft::CausalConvWithState`; native lowering exposes its activation as `com.microsoft::Silu`, whose output previously remained untyped. With the rule registered, the real native CUDA probe clears the Silu shape failure and reaches the next blocker: `internal executor error: value#1414 not produced`.
+**Why:** SiLU is elementwise and must preserve its input tensor's complete symbolic geometry and dtype. Routing it through the existing generic unary rule fixes the whole contrib-op class without model-specific shape logic.
+
+### 2026-07-27: 7B native CUDA decode bottleneck localization (Foundry, H200)
+**By:** Cohaagen (perf)
+**What:** A native CUDA-graph decode trace for qwen2.5-7b-instruct on H200 (device 1) attributes 66.9% of one steady decode step's kernel time to symmetric int4 `MatMulNBits` GEMVs and 33.1% to split-K GQA. The largest individual slices are GQA decode (33.1%), square o_proj `gemv_f16_general` (19.5%), down projection (16.0%), fused gate/up (15.6%), and qkv GEMV (15.3%).
+**Why:** This is measurement-only localization. It scopes future work to a separately reviewed o_proj grid-widening/split-K experiment or GQA partial-plus-merge fusion, while preserving the guardrail that symmetric gate/up register prefetch regresses.
+
+### 2026-07-27: o_proj split-K grid-widening is a negative result
+**By:** Cohaagen (perf)
+**What:** Widening the existing two-way split-K dispatch gate for the 7B square o_proj GEMV regressed steady native CUDA decode on H200 from 309.05 to 307.23 tok/s (−0.59%, repeatable across 5/5 trials); 1.5B and 0.5B remained within noise, and 7B greedy token IDs were byte-identical. The change was reverted.
+**Why:** Two-way split-K raises o_proj only from roughly 0.42 to 0.85 wave while adding a shared-memory reduction, so its reduction cost exceeds the grid-fill benefit. Do not retry this lever. A larger (3–4 way) specialized split factor would be a new kernel requiring its own A/B; GQA profiling remains the other candidate.
