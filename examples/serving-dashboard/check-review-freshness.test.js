@@ -59,6 +59,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // last, which is how four independent reviewers all missed the `ui/` test directory.
 const REVIEW_DOCS = readdirSync(HERE)
   .filter((name) => /(REVIEW|BRIEF)/.test(name) && name.endsWith('.md'))
+  .filter((name) => name !== 'REVIEW-POINT.md')
   .sort();
 
 const MARKER = /^MEASURED-AT:\s*(\S+)\s*$/m;
@@ -166,44 +167,58 @@ test('every review document that declares a measurement SHA declares a real one'
 // its own output. So the tag is resolved to a SHA once, that SHA is printed, and
 // the printed SHA is what the assertion talks about.
 test('no review document was measured before the tree reviewers extract', () => {
-  const tags = git('tag', '--list', 'review-*')
-    .split('\n')
-    .filter(Boolean)
-    .map((name) => ({ name, sha: git('rev-parse', `${name}^{commit}`) }));
-
-  if (tags.length === 0) {
-    console.log('  note: no review-* tag exists; backward drift is not defined yet');
-    return;
+  // The review point is DECLARED, never inferred. An earlier version of this test
+  // picked the newest review-* tag by commit date, which is a reasonable heuristic
+  // and was WRONG: the lead designated review-1 (04:02), while the newest by date is
+  // review-2 (04:19). The heuristic would have enforced a boundary nobody chose,
+  // silently, on every review document, with a plausible justification attached.
+  //
+  // That is the more dangerous of the two failure modes. A wrong answer a human
+  // states can be argued with; a wrong answer a test computes gets obeyed. So when
+  // the declaration is missing this fails and names the candidates rather than
+  // picking one -- refusing to answer is a valid measurement, inventing a
+  // denominator is not.
+  const declarationPath = join(HERE, 'REVIEW-POINT.md');
+  let declaration = null;
+  try {
+    declaration = readFileSync(declarationPath, 'utf8');
+  } catch {
+    const candidates = git('tag', '--list', 'review-*').split('\n').filter(Boolean);
+    assert.fail(
+      `REVIEW-POINT.md is missing, so no tree is declared as the review point. ` +
+        `Candidates, none authoritative: ${candidates.join(', ') || '(none)'}. ` +
+        `Declare one rather than letting this test guess.`,
+    );
   }
 
-  // The newest tag by commit date, not by NAME: review-1 is timestamped 04:02 and
-  // review-0 is 04:16 on this branch. The numbering implies an order the timestamps
-  // deny, and readers sort by the name without looking.
-  const boundary = tags
-    .map((t) => ({ ...t, when: Number(git('log', '-1', '--format=%ct', t.sha)) }))
-    .sort((a, b) => b.when - a.when)[0];
+  const declared = /^REVIEW-POINT-SHA:\s*([0-9a-f]{7,40})\s*$/m.exec(declaration);
+  assert.ok(
+    declared,
+    'REVIEW-POINT.md declares no REVIEW-POINT-SHA, or declares it as a ref name. ' +
+      'It must be a raw hex SHA: a tag name re-points without warning.',
+  );
 
-  console.log(`  boundary: ${boundary.name} resolved to ${boundary.sha.slice(0, 8)}`);
+  const boundary = git('rev-parse', `${declared[1]}^{commit}`);
+  console.log(`  review point: ${declared[1]} -> ${boundary.slice(0, 8)}`);
 
   for (const doc of REVIEW_DOCS) {
     const match = MARKER.exec(readFileSync(join(HERE, doc), 'utf8'));
     if (!match) continue;
-    const declared = match[1];
+    const measuredAt = match[1];
 
     let predatesBoundary = false;
     try {
-      git('merge-base', '--is-ancestor', declared, boundary.sha);
-      predatesBoundary = git('rev-parse', declared) !== boundary.sha;
+      git('merge-base', '--is-ancestor', measuredAt, boundary);
+      predatesBoundary = git('rev-parse', measuredAt) !== boundary;
     } catch {
       predatesBoundary = false;
     }
 
     assert.ok(
       !predatesBoundary,
-      `${doc} was measured at ${declared}, which is an ancestor of ${boundary.name} ` +
-        `(${boundary.sha.slice(0, 8)}). Every row in it describes a tree that the ` +
-        `review point has already moved past. Re-measure and update MEASURED-AT. ` +
-        `Quote the resolved SHA, never the tag name -- the name moves.`,
+      `${doc} was measured at ${measuredAt}, which is an ancestor of the declared ` +
+        `review point ${boundary.slice(0, 8)}. Every row in it describes a tree that ` +
+        `the review has already moved past. Re-measure and update MEASURED-AT.`,
     );
   }
 });

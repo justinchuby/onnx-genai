@@ -755,3 +755,30 @@ because the obvious spelling of this check — `merge-base --is-ancestor <mine> 
 re-introduces the exact defect the marker exists to block: **it anchors a freshness decision to
 a mutable name, so the set of documents it condemns changes silently, and the run that
 condemned you cannot be reproduced from its own output.**
+
+### R24 🟢 Which tree reviewers extract was never written down, and my own guard guessed wrong
+
+Three `review-*` tags exist and nothing in the repository said which one was authoritative. At
+`33c7a77c` three parties held three different answers, all defensible: the lead declared
+`review-1` (`fca13038`); a secretary's board carried `review-0` (`6ecd9183`, correct when
+measured at 03:57); and **`check-review-freshness.test.js` — my own guard, shipped an hour
+earlier — inferred `review-2` (`0bc86726`) by taking the newest tag by commit date.**
+
+**The guard's answer was the most dangerous of the three precisely because it was automatic.**
+It would have enforced a boundary nobody chose, on every review document, silently, with a
+plausible justification attached. *A wrong answer a human states can be argued with. A wrong
+answer a test computes gets obeyed.*
+
+Fixed by `REVIEW-POINT.md`, which records the declaration, and by making the guard **read it
+and fail while naming the candidates when it is absent, rather than picking one.** Refusing to
+answer is a valid measurement; inventing a denominator is not. Mutation-proven on three arms —
+declaration deleted, SHA given as a tag name, review point moved ahead of this document — each
+raw exit 1, restored raw exit 0.
+
+Two properties of the tags made this worse and both are worth fixing at the source. **The
+numbering does not sort by time** (`review-1` 04:02, `review-0` 04:16, `review-2` 04:19), and
+**all three are lightweight tags** — `git cat-file -t review-1` returns `commit`, not `tag`. A
+lightweight tag carries no tagger, no date, no message and no reflog, which is exactly why
+`review-0` could move 60 commits leaving no evidence in the repository that it had moved. **An
+annotated tag would have carried the designation in the object itself and this file would be
+unnecessary.**
