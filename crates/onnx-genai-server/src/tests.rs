@@ -1236,14 +1236,18 @@ async fn status_stamps_the_commit_the_binary_was_built_from() {
         "build_sha must be an 8-char hex commit or the literal `unknown`, got {sha:?}"
     );
 
-    // Three states, not two. "We could not tell" is a different claim from "the
-    // tree was clean", and collapsing them asserts a cleanliness never observed.
-    let dirty = body["build_dirty"]
-        .as_str()
-        .expect("build_dirty must always be present");
+    // Three states, not two: `true` (dirty), `false` (observed clean), and
+    // JSON `null` (`unknown` -- we could not tell). It must be a boolean-or-null,
+    // never a boolean-shaped STRING like "false" (truthy in JS), and it must be
+    // present in every state -- absence would be a fourth, ambiguous claim.
     assert!(
-        matches!(dirty, "true" | "false" | "unknown"),
-        "build_dirty must be one of true/false/unknown, got {dirty:?}"
+        body.get("build_dirty").is_some(),
+        "build_dirty must always be present, in all three states"
+    );
+    let dirty = &body["build_dirty"];
+    assert!(
+        dirty.is_boolean() || dirty.is_null(),
+        "build_dirty must be a JSON boolean or null, never a string, got {dirty:?}"
     );
 
     // The stamp describes the build, so it must not appear in `unavailable`:
@@ -1252,6 +1256,49 @@ async fn status_stamps_the_commit_the_binary_was_built_from() {
         assert!(
             !unavailable.contains_key("build_sha"),
             "build_sha is unconditional and must never be explained as unavailable"
+        );
+    }
+}
+
+/// #482: `build_dirty` is a three-state `bool`-or-`null`, never a
+/// boolean-shaped string. `"false"` on the wire is truthy in JavaScript, so a
+/// string inverts the clean-build case for ordinary truthiness checks. This
+/// pins the parse AND the serialized JSON shape for every stamp value.
+#[test]
+fn build_dirty_stamp_maps_to_the_three_state_wire_contract() {
+    use crate::routes::parse_build_dirty;
+
+    // The parse itself: the two boolean stamps, plus everything else -> unknown.
+    assert_eq!(parse_build_dirty("true"), Some(true));
+    assert_eq!(parse_build_dirty("false"), Some(false));
+    assert_eq!(parse_build_dirty("unknown"), None);
+    assert_eq!(
+        parse_build_dirty(""),
+        None,
+        "an empty stamp is unknown, not clean"
+    );
+    assert_eq!(
+        parse_build_dirty("dirty"),
+        None,
+        "an unrecognized stamp is unknown"
+    );
+
+    // The serialized JSON shape a client actually receives. A clean build must
+    // emit the boolean `false`, NOT the string "false"; unknown must emit null;
+    // and the value is present (Option<bool> is never skipped) in all states.
+    for (stamp, expected) in [
+        ("true", serde_json::json!(true)),
+        ("false", serde_json::json!(false)),
+        ("unknown", serde_json::Value::Null),
+    ] {
+        let value = serde_json::to_value(parse_build_dirty(stamp)).expect("serialise");
+        assert_eq!(
+            value, expected,
+            "stamp {stamp:?} must serialise as {expected} (a boolean or null, never a string)"
+        );
+        assert!(
+            !value.is_string(),
+            "build_dirty must never be a boolean-shaped string; stamp {stamp:?} gave {value}"
         );
     }
 }
@@ -5748,6 +5795,84 @@ fn an_untruncated_block_mirror_does_not_claim_truncation() {
     let value = serde_json::to_value(&response).expect("serialise");
     assert_eq!(value["window"]["truncated"].as_bool(), Some(false));
     assert_eq!(value["window"]["pool_total"].as_u64(), Some(40));
+}
+
+/// #481: a short-window scan is truncated even when the mirror cap does NOT bite.
+///
+/// This is the reported live case: `scanned = 256`, `pool_total = 1024`, and the
+/// capped mirror `total` also reads 1024, so the old `pool_total > total`
+/// predicate was `1024 > 1024 == false` and reported a partial view as complete.
+/// The corrected predicate compares the ACTUAL returned window (`scanned`)
+/// against the pool, so a 256-of-1024 scan is truncated.
+#[test]
+fn a_short_window_scan_is_truncated_even_when_the_mirror_cap_does_not_bite() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = vec![None; 256];
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,    // start
+        1024, // total (mirror cap -- equal to pool here, so the old predicate blinded)
+        1024, // pool_total
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    assert_eq!(
+        value["window"]["scanned"].as_u64(),
+        Some(256),
+        "the scan examined a short window of the pool"
+    );
+    assert_eq!(
+        value["window"]["truncated"].as_bool(),
+        Some(true),
+        "scanned (256) < pool_total (1024) means the view omits 768 pages and is truncated, \
+         even though the mirror cap did not bite and pool_total == total"
+    );
+}
+
+/// #481: a full scan from page 0 that returns the whole pool is NOT truncated.
+#[test]
+fn a_full_scan_from_the_start_is_not_truncated() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = vec![None; 40];
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,  // start
+        40, // total
+        40, // pool_total -- scanned (40) covers the whole pool
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    assert_eq!(
+        value["window"]["truncated"].as_bool(),
+        Some(false),
+        "start == 0 and scanned (40) >= pool_total (40): the window is complete"
+    );
+}
+
+/// #481: any window that starts past page 0 is truncated, regardless of length --
+/// pages before `start` are omitted by definition.
+#[test]
+fn a_windowed_scan_that_starts_past_zero_is_truncated() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = vec![None; 8];
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        8,  // start > 0
+        16, // total
+        16, // pool_total -- even if scanned reached the tail, pages 0..8 are missing
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    assert_eq!(
+        value["window"]["start"].as_u64(),
+        Some(8),
+        "the window starts past the first page"
+    );
+    assert_eq!(
+        value["window"]["truncated"].as_bool(),
+        Some(true),
+        "start > 0 omits the pages before it, so the view is truncated"
+    );
 }
 
 /// C4: the four `batch_*` occupancy fields describe ONE driver's batch, while

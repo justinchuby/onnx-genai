@@ -332,15 +332,19 @@ pub(crate) struct NodeStatus {
     /// `unknown` when git could not be consulted at build time. That is a real
     /// state and it is reported rather than guessed.
     build_sha: &'static str,
-    /// Whether tracked files were modified when this binary was built:
-    /// `"true"`, `"false"` or `"unknown"`.
+    /// Whether tracked files were modified when this binary was built.
     ///
-    /// A string rather than a bool because "we could not tell" is a third
-    /// answer, and collapsing it into `false` would assert a clean tree we
-    /// never observed. See `build.rs` for why this is a hint rather than a
+    /// Three states carried honestly as `bool`-or-`null`: `true` (dirty),
+    /// `false` (observed clean), and `null` (`unknown` -- we could not tell).
+    /// It is never a boolean-shaped STRING: `"false"` is truthy in JavaScript,
+    /// so a string would invert the clean-build case for ordinary truthiness
+    /// checks. `null` preserves the third answer without collapsing it into
+    /// `false`, which would assert a clean tree we never observed. Present in
+    /// all three states (never `skip`ped), because absence is a fourth,
+    /// ambiguous claim. See `build.rs` for why this is a hint rather than a
     /// guarantee: cargo decides when to re-stamp, so a stale `false` is
     /// possible. `build_sha` is the load-bearing half.
-    build_dirty: &'static str,
+    build_dirty: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_hashes: Option<Vec<String>>,
     /// Explanations for every field omitted above, keyed by field name.
@@ -348,7 +352,26 @@ pub(crate) struct NodeStatus {
     unavailable: BTreeMap<&'static str, FieldUnavailable>,
 }
 
-/// Per-session detail entry in [`NodeStatus::sessions`] (§34.8).
+/// Map the compile-time `ONNX_GENAI_BUILD_DIRTY` stamp onto the three-state wire
+/// contract for [`NodeStatus::build_dirty`].
+///
+/// `build.rs` stamps one of `"true"`, `"false"`, or `"unknown"` (and, defensively,
+/// an empty or unrecognized value is treated as unknown). The wire form is
+/// `bool`-or-`null`, never a boolean-shaped string:
+///
+/// - `"true"`  -> `Some(true)`  (serialized as JSON `true`)
+/// - `"false"` -> `Some(false)` (serialized as JSON `false`, NOT `"false"`)
+/// - anything else -> `None`    (serialized as JSON `null`)
+///
+/// Kept as one shared helper so the parse lives in exactly one place rather than
+/// being re-matched at each call site.
+pub(crate) fn parse_build_dirty(stamp: &str) -> Option<bool> {
+    match stamp {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionStatus {
     id: String,
@@ -892,12 +915,17 @@ pub(crate) struct BlockWindow {
     /// pages in use than exist on screen -- a visible arithmetic contradiction
     /// with no explanation available anywhere in the response.
     pool_total: usize,
-    /// Whether the mirror stops short of the pool.
+    /// Whether this window stops short of the whole pool.
     ///
-    /// A derived boolean rather than something the client infers from
-    /// `pool_total > total`, because the inference is exactly what a client
-    /// renders a contradiction by failing to make. The cap is correct and
-    /// deliberate; what was wrong was that it was invisible on the wire.
+    /// Derived from the ACTUAL returned window against the pool size --
+    /// `start > 0 || scanned < pool_total` -- not from `pool_total > total`.
+    /// Comparing the two pool-size mirrors (`pool_total` vs the capped `total`)
+    /// cannot see a short-window scan: a request for 256 pages of a 1024-page
+    /// pool returns `scanned == 256` while both mirrors read 1024, so the old
+    /// predicate reported `false` for a view that omitted 768 pages. A window
+    /// that starts past page 0, or returns fewer pages than the pool holds, is
+    /// truncated. The cap is correct and deliberate; what was wrong was that a
+    /// partial view looked complete on the wire.
     truncated: bool,
 }
 
@@ -1057,7 +1085,7 @@ impl BlockTableResponse {
                 observed,
                 total,
                 pool_total,
-                truncated: pool_total > total,
+                truncated: start > 0 || scanned < pool_total,
             }),
             blocks: Some(blocks),
         }
