@@ -84,7 +84,7 @@ another real model) to see the GPU win in the it/s card.
 - **Config load + visualization** works for any ComfyUI or native config with no
   model present.
 - **Image diffusion** needs a real Stable Diffusion package built **from scratch**
-  by [Mobius](https://github.com/justinchuby/mobius) (no `torch.onnx.export`, no
+  by [Mobius](https://github.com/onnxruntime/mobius) (no `torch.onnx.export`, no
   `optimum` — every ONNX graph is authored directly with `onnx_ir`/`onnxscript`).
   Build a classic Stable Diffusion 1.x package (fp16) from a cached Hugging Face
   checkpoint:

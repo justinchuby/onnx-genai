@@ -69,21 +69,41 @@ are supported and correct; they are simply not yet available at once. See
 
 ### Build a model with Mobius
 
-`scripts/build_qwen.sh` builds `Qwen/Qwen2.5-0.5B-Instruct` using a local
-[Mobius](https://github.com/justinchuby/mobius) checkout:
+Models are exported to ONNX by [Mobius](https://github.com/onnxruntime/mobius),
+which lives in a separate repository and is **not published to PyPI**. Install
+it from source first:
+
+```bash
+pip install "git+https://github.com/onnxruntime/mobius"
+```
+
+> Do not run `pip install mobius` — that name belongs to an unrelated project
+> on PyPI. The distribution is `mobius-ai`; the import name is `mobius`.
+
+`scripts/build_qwen.sh` then builds `Qwen/Qwen2.5-0.5B-Instruct`:
+
+```bash
+scripts/build_qwen.sh
+# Output: models/qwen2.5-0.5b
+```
+
+The script auto-detects Mobius: an installed package, or a checkout beside this
+repository. To point at a specific checkout, set `MOBIUS_DIR`:
 
 ```bash
 MOBIUS_DIR=/path/to/mobius scripts/build_qwen.sh
-# Output: models/qwen2.5-0.5b
 ```
 
 For bounded, in-place KV storage and efficient long-context decode, export a
 static-cache model. `MAX_SEQ_LEN` fixes the cache capacity at build time:
 
 ```bash
-MOBIUS_DIR=/path/to/mobius STATIC_CACHE=1 MAX_SEQ_LEN=8192 scripts/build_qwen.sh
+STATIC_CACHE=1 MAX_SEQ_LEN=8192 scripts/build_qwen.sh
 # Output: models/qwen2.5-0.5b-scatter
 ```
+
+Run `scripts/build_qwen.sh --help` for the full list of environment variables
+(`MODEL_ID`, `OUT_DIR`, `DTYPE`, `EP`, `PYTHON`, `DRY_RUN`).
 
 ### Run the CLI
 
