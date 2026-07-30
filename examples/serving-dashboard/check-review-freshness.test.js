@@ -203,46 +203,91 @@ test('every review document that declares a measurement SHA declares a real one'
     `  corpus: ${adopters.length} checked, ${abstainers.length} abstaining (${abstainers.join(', ') || 'none'})`,
   );
 
+  // Resolve HEAD ONCE, before the loop. This call site names HEAD a single time
+  // in the source, but it used to sit inside the loop below -- so it re-resolved
+  // per document, and on a branch taking ~79 commits an hour the first document
+  // and the last were scored against different trees. One verdict, two subjects.
+  // The syntactic rule ("never name HEAD twice") does not catch this shape: one
+  // occurrence inside a loop IS N occurrences at runtime.
+  const headSha = git('rev-parse', 'HEAD');
+  console.log(`  scored against: ${headSha}`);
+
+  // Collect every document's verdict, then assert once. This loop used to assert
+  // inside itself, so the FIRST bad document threw and the rest were never
+  // examined -- while the corpus line above still announced all of them as
+  // "checked". A printed denominator that counts what was ENUMERATED rather than
+  // what was VERIFIED is the same false-green we have been hunting all night, and
+  // it was in my own guard. One red document must not conceal three others.
+  const problems = [];
+  let verified = 0;
+
   for (const [doc, declared] of adopters) {
-    assert.match(
-      declared,
-      /^[0-9a-f]{7,40}$/,
-      `${doc} anchors itself to "${declared}", which is not a raw hex SHA. A ref name ` +
-        `re-points without warning -- review-0 moved 60 commits during one session.`,
-    );
+    if (!/^[0-9a-f]{7,40}$/.test(declared)) {
+      problems.push(
+        `${doc} anchors itself to "${declared}", which is not a raw hex SHA. A ref ` +
+          `name re-points without warning -- review-0 moved 60 commits in one session.`,
+      );
+      continue;
+    }
 
     let type = null;
     try {
       type = git('cat-file', '-t', declared);
     } catch {
-      assert.fail(
+      problems.push(
         `${doc} declares MEASURED-AT ${declared}, which is not an object in this ` +
           `repository. Eight hex characters is also the shape of an agent id.`,
       );
+      continue;
     }
-    assert.equal(
-      type,
-      'commit',
-      `${doc} declares MEASURED-AT ${declared}, which is a ${type}, not a commit.`,
-    );
+    if (type !== 'commit') {
+      problems.push(
+        `${doc} declares MEASURED-AT ${declared}, which is a ${type}, not a commit.`,
+      );
+      continue;
+    }
 
-    // The load-bearing assertion. Not "is it recent" -- recency is a judgement and
+    // The load-bearing check. Not "is it recent" -- recency is a judgement and
     // would go red on every fast branch. "Is it still on this history" is a fact:
-    // if the measured commit is not an ancestor of HEAD, the document describes a
-    // tree that this branch never passed through, and every row in it is unmoored.
+    // if the measured commit is not an ancestor of the pinned head, the document
+    // describes a tree this branch never passed through, and every row is unmoored.
     let isAncestor = true;
     try {
-      git('merge-base', '--is-ancestor', declared, 'HEAD');
+      git('merge-base', '--is-ancestor', declared, headSha);
     } catch {
       isAncestor = false;
     }
-    assert.ok(
-      isAncestor,
-      `${doc} was measured at ${declared}, which is NOT an ancestor of HEAD. The ` +
-        `document describes a tree this branch is not on. Re-measure and update the ` +
-        `marker, or the rows below it are claims about a history that was abandoned.`,
-    );
+    if (!isAncestor) {
+      problems.push(
+        `${doc} was measured at ${declared}, which is NOT an ancestor of ${headSha}. ` +
+          `The document describes a tree this branch is not on. Re-measure and update ` +
+          `the marker, or the rows below it are claims about a history that was ` +
+          `abandoned. (The head is named as a SHA, not as "HEAD", so this verdict is ` +
+          `reproducible after the branch moves on.)`,
+      );
+      continue;
+    }
+    verified += 1;
   }
+
+  // Anti-vacuity: every document must reach a verdict. If this ever fails, the
+  // loop above grew a path that neither verifies nor complains -- a silent skip
+  // printed in the same column as a pass.
+  assert.equal(
+    verified + problems.length,
+    adopters.length,
+    `${adopters.length} documents were enumerated but only ${verified + problems.length} ` +
+      `reached a verdict. A document that is neither verified nor reported is a hole ` +
+      `in the corpus, not a pass.`,
+  );
+  console.log(`  verdicts: ${verified} fresh, ${problems.length} stale`);
+
+  assert.deepEqual(
+    problems,
+    [],
+    `${problems.length} of ${adopters.length} review document(s) are stale at ` +
+      `${headSha}:\n  - ${problems.join('\n  - ')}`,
+  );
 
   if (abstainers.length > 0) {
     // Printed, never silent: a guard whose scope shrinks quietly is the defect.
