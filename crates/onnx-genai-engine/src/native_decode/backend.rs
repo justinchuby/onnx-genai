@@ -24,7 +24,7 @@ impl DecodeBackend for NativeDecodeSession {
                 return self.decode_cuda_greedy(token_ids[0], past_len).map(Some);
             }
             let token = self
-                .decode_cuda(token_ids, past_len)?
+                .decode_cuda(token_ids, past_len, &[])?
                 .pop()
                 .map(|logits| sample_greedy(&logits))
                 .context("native CUDA decoder produced no logits")?;
