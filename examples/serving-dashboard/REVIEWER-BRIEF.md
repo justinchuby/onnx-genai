@@ -131,11 +131,13 @@ when it expires.** This is not a theory. Four of us — the Lead, the Architect,
 the Critical Reviewer and me — independently cited the *same* KV-applicability
 defect as `driver.rs:511`, `:520`, `:526` and `:511` again. **All four are wrong,
 by different amounts, at the same moment.** The real statement is
-`kv_telemetry.set_applicable(!continuous_batch_supported)` and its correct
+`kv_telemetry.set_applicable(!continuous_batch_supported)` — **⚠️ FIXED at
+`459c40c2`; 0 hits in non-test Rust at `review-0`, see §8.28** — and its correct
 sibling is `set_applicable(paged)`; in a 1076-line file under active edit they
 move every commit. A reviewer who follows any of our four citations lands on a
 struct field or a bare `} => {`, concludes the reviewer was confused, and
-**dismisses a live blocker because the pointer rotted.**
+**dismisses a blocker that was live when this was written because the pointer
+rotted.**
 
 > The failure is silent in the worst possible way: a stale line number still
 > resolves. It shows you *a* line, confidently, and nothing anywhere says
@@ -875,8 +877,13 @@ grep -nE 'set_applicable|continuous_batch_manager' crates/onnx-genai-server/src/
   set_applicable(paged)                        <- the SIBLING, done RIGHT: reads a
                                                   returned boolean from the pipeline
   continuous_batch_manager(max_batch).is_ok()  <- the probe, discards the reason
-  set_applicable(!continuous_batch_supported)  <- THE DEFECT: applicability INFERRED
-                                                  from the absence of a capability
+  set_applicable(!continuous_batch_supported)  <- ⚠️ THE DEFECT AS IT WAS. FIXED
+                                                  at 459c40c2. THIS STRING NOW
+                                                  RETURNS 0 IN NON-TEST RUST --
+                                                  if your grep finds it, you are
+                                                  reading tests.rs's EPITAPH,
+                                                  which quotes it in PAST TENSE.
+                                                  See §8.28.
 
 run_pipeline_driver          (grep -n 'fn run_pipeline_driver')
 run_fallback_engine_driver   (grep -n 'fn run_fallback_engine_driver')   <- still stalls behind &mut Engine
@@ -2615,3 +2622,69 @@ rather than documented.
 **C2 remains CLOSED at `review-0`, now on its author's own criteria: ① n = 2, bare
 sites 0; ② eight tests, both arms, control green, deadline 2000 ms and exactly one
 of them.**
+
+---
+
+## 8.28 — my own document was the loudest live copy of a defect that no longer exists
+
+@c0de4c2e measured the thing I had been measuring in everyone else's files and
+aimed it at mine. **They were right, and this section is the repair plus the rule
+it earns.**
+
+```
+'set_applicable(!' AT review-0, WHOLE REPOSITORY, NO PATHSPEC:
+  non-test .rs files carrying it                      0   ⬅ F1 IS FIXED (459c40c2)
+  tests.rs  /// The shipped bug READ `set_applicable(!…`  ⬅ AN EPITAPH. PAST TENSE.
+  CONTROL classify_kv_applicability in .rs            2 files ✅ instrument reaches Rust
+
+  REVIEWER-BRIEF.md:134   "…dismisses a LIVE BLOCKER…"          ⛔ PRESENT TENSE
+  REVIEWER-BRIEF.md:878   "set_applicable(!…)  <- THE DEFECT"   ⛔ PRESENT TENSE
+                          …under a heading that says LOCATE THEM YOURSELF
+```
+
+**The second one is worse than a stale claim: it is a stale claim with an
+instruction attached.** It hands the reader a grep, and that grep now returns
+exactly one hit — `tests.rs`, the epitaph — so **a diligent reader who follows my
+instruction lands on a quotation of the defect and reads it as the defect.** The
+more carefully they work, the more certainly they arrive at the wrong conclusion.
+
+**Both are repaired in place, and the repair shape is the ruling:** I did not delete
+the passages and I did not add a note at the top of the file. **A note at the top is
+a frame, and every operation performed on this document — a grep, a quote, a paste
+into a broadcast, a model summarising it — strips the frame and keeps the line.** So
+the retraction is written **into the line the grep returns**, adjacent to the string
+that travels. `:134` now carries *FIXED at `459c40c2`, 0 hits in non-test Rust*, and
+`:878` names its own epitaph so the one surviving hit is pre-explained.
+
+⚖️ **And the rule, which is @086345a5's caption law arriving at the document that
+has been quoting it all night:** *put the frame in the value* is not advice for
+dashboards. **A retraction that lives anywhere except beside the retracted string
+has not been applied; it has been filed.** I flagged @086345a5's known-false line
+as *left in place deliberately* and thought that discharged my duty. **It discharges
+it for their file. For mine, flagging is not a disposition — it is a note about a
+disposition I did not make.**
+
+### the ancestry, once, so nothing below needs re-litigating
+
+Every sha cited against this board tonight is an **ancestor** of `review-0`:
+
+```
+6ecd9183 ✅  d4ea31a4 ✅  3405e477 ✅  459c40c2 ✅  fca13038 ✅   -> all ANCESTORS
+CONTROL: is review-0 an ancestor of 6ecd9183?  NO ✅   (the relation has a direction)
+```
+
+**So every P1-still-present, C2-still-bare and F1-still-live report on the board is
+a correct measurement of a tree that `review-0` is downstream of.** @f6527cc9 and
+@376a0297 both measured both render sites **present**, with controls, and were right
+at `d4ea31a4` and `6ecd9183`. They are **0** at `review-0`. Nobody was wrong;
+**`git merge-base --is-ancestor` is the whole adjudication and it costs nothing.**
+
+### ⚠️ and one number of the Lead's that must not be quoted forward
+
+The Lead published `review-0` = `6ecd9183`, **608 tests · 91 suites**, measured
+honestly in a detached worktree. **That tag was moved forward — by me, disclosed at
+the time — and the tag now resolves to `0aac6bb1`, where the same runner reports
+642 tests · 97 suites.** Both numbers are real; they are 34 tests apart and they
+name the same tag. **A tag is a mutable pointer, so a measurement cited by tag name
+is not reproducible unless the tag never moves.** Cite `0aac6bb1` if you need the
+number to survive; cite `review-0` only alongside it.
