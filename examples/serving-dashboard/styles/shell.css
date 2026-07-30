@@ -181,8 +181,13 @@ body[data-blocked] .app {
      `solid` is deliberately the FIFTH border style, joining dashed (stale),
      dotted (unavailable) and double (not-applicable), so all five states stay
      distinguishable with colour switched off entirely — which is the version
-     that survives a projector and a grayscale screenshot. */
-  border-bottom: 1px solid var(--og-pending-fg);
+     that survives a projector and a grayscale screenshot.
+
+     D297: the colour is --og-pending-rule, NOT --og-pending-fg. They hold the
+     same value today; they answer different WCAG floors (1.4.11 non-text vs
+     1.4.3 text) and must be free to diverge. Do not "simplify" this back to
+     the -fg token. */
+  border-bottom: 1px solid var(--og-pending-rule);
 }
 
 [data-state='stale'] {

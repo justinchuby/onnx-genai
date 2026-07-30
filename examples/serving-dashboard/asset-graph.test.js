@@ -436,3 +436,66 @@ describe('every design token reaches the screen', () => {
     });
   });
 });
+
+/**
+ * D297 — A RULE IS A NON-TEXT CHANNEL AND MUST BE DRAWN FROM A NON-TEXT TOKEN.
+ *
+ * `pending` was the only state whose underline was painted with its own TEXT
+ * colour (`var(--og-pending-fg)`). Every sibling already had a dedicated
+ * `-rule`. That is not untidiness: a `-fg` is tuned to 4.5:1 for text
+ * (WCAG 1.4.3) and a rule to 3:1 for non-text (1.4.11), so ONE VALUE WAS
+ * ANSWERING TWO FLOORS and a retune for either silently moved the other.
+ *
+ * I did exactly that at 03:03:28 -- raised --og-pending-fg for TEXT contrast
+ * and moved this underline with it, without knowing the underline existed.
+ * The coupling was invisible because the rule had no name of its own; the
+ * sparkline fossils survived the same way. A VALUE WITH NO NAME IS A VALUE
+ * NOBODY SWEEPS.
+ *
+ * So this is the class, not the instance: one offender is a defect, a second
+ * would be a pattern, and the check costs nothing.
+ */
+describe('every state rule is drawn from a -rule token', () => {
+  // Comments are stripped FIRST. This file's own fix writes the string
+  // `--og-pending-fg` into a shell.css comment explaining what not to do, and
+  // a matcher that cannot tell a declaration from prose about a declaration
+  // would read that warning as the very defect it warns about.
+  const shell = css['shell.css'].replace(/\/\*[\s\S]*?\*\//g, '');
+  const blocks = [...shell.matchAll(/\[data-state='([a-z-]+)'\][^{]*\{([^}]*)\}/g)].map(
+    (m) => ({ state: m[1], body: m[2] }),
+  );
+  const ruled = blocks
+    .map(({ state, body }) => {
+      const m = body.match(/border-bottom\s*:[^;]*var\(\s*(--og-[\w-]+)\s*\)/);
+      return m ? { state, token: m[1] } : null;
+    })
+    .filter(Boolean);
+
+  it('actually finds the state rules (anti-vacuity)', () => {
+    // Without this, a selector rename or a comment-stripping bug yields zero
+    // blocks, zero offenders, and a permanently green test that inspects
+    // nothing -- the vacuous pass that has caught six instruments this session.
+    assert.ok(
+      ruled.length >= 4,
+      `Expected the state underlines; found ${ruled.length} ` +
+        `(${ruled.map((r) => r.state).join(', ') || 'none'}). The matcher has ` +
+        'gone blind -- fix the matcher, do not relax the threshold.',
+    );
+  });
+
+  it('never paints a rule with a text token', () => {
+    const offenders = ruled
+      .filter(({ token }) => !token.endsWith('-rule'))
+      .map(({ state, token }) => `[data-state='${state}'] -> ${token}`);
+    assert.deepEqual(
+      offenders,
+      [],
+      'A state underline is painted with a non-`-rule` token. The underline is ' +
+        'the NON-COLOUR CHANNEL: with colour switched off it is the only thing ' +
+        'separating four absence states, which sit within 1.05:1 of each other ' +
+        'in greyscale. Binding it to a text token makes it collateral damage of ' +
+        'the next text-contrast retune, and that retune will look correct and ' +
+        `test green.\nOFFENDERS: ${offenders.join(', ')}`,
+    );
+  });
+});

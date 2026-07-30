@@ -133,6 +133,29 @@
   --og-unavail-bg: #131920;
   --og-unavail-label: #6e7d8c;
   --og-pending-fg: #788ca2;  /* 5.01:1 on --og-bg-raised, WCAG AA 1.4.3 */
+  /* D297. `pending` was the ONLY state drawing its rule from its own TEXT
+     token: shell.css said `border-bottom: 1px solid var(--og-pending-fg)`.
+     Every sibling has a dedicated `-rule`. THE VALUE IS UNCHANGED -- this is
+     a no-op on screen and a decoupling in the maintenance graph.
+
+     WHY IT MATTERS, AND I AM THE PROOF: one token cannot serve two contrast
+     floors. `-fg` is tuned to 4.5:1 for TEXT (1.4.3); a rule is tuned to
+     3:1 for NON-TEXT (1.4.11). They are different requirements bound to one
+     value, so a retune for either silently moves the other. I RETUNED
+     --og-pending-fg AT 03:03:28 FOR TEXT CONTRAST AND SILENTLY MOVED THIS
+     UNDERLINE WITH IT. Nobody noticed, because nothing named it.
+
+     AND IT IS DELIBERATELY THE BRIGHTEST RULE, WHICH LOOKS WRONG UNTIL YOU
+     MEASURE IT. The three sibling rules are MUTUALLY INDISTINGUISHABLE with
+     colour switched off -- stale/unavail 1.015:1, stale/na 1.041:1,
+     unavail/na 1.026:1. Colour carries NOTHING between them; the dashed /
+     dotted / double grammar is the entire signal. This rule is the only one
+     with real luminance separation (1.60-1.66:1 from each sibling), so
+     "harmonising" it down to the ~3.1 cluster would delete the last
+     distinction the absence set has and collapse four treatments into one
+     grey. The consistency that is worth having here is STRUCTURAL (every
+     state owns a -rule), not chromatic. */
+  --og-pending-rule: #788ca2;  /* 5.01:1 on --og-bg-raised, WCAG 1.4.11 */
   /* `not-applicable` — DELIBERATELY BRIGHTER THAN `unavailable`, and this is
      the one place where "more visible" is the honest choice rather than the
      flattering one. `unavailable` is our gap and is apologetic. THIS is an
