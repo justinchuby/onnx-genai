@@ -135,6 +135,16 @@ impl DimExpr {
         self.as_const().is_some()
     }
 
+    /// Every symbol id appearing in this expression (across all monomials), with
+    /// possible repeats. Used to raise a child interner's floor above symbols
+    /// that reach a subgraph only through a container-type seed.
+    pub fn symbol_ids(&self) -> impl Iterator<Item = SymbolId> + '_ {
+        self.terms
+            .keys()
+            .flat_map(|mono| mono.iter().copied())
+            .map(SymbolId)
+    }
+
     /// Drop any term whose coefficient collapsed to zero.
     fn prune(mut self) -> Self {
         self.terms.retain(|_, c| *c != 0);

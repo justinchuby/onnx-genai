@@ -4,7 +4,9 @@
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
 };
-use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
+use onnx_runtime_shape_inference::{
+    DimExpr, InferenceRegistry, InferenceReport, MergePolicy, TensorType, ValueType,
+};
 
 /// Encode i64 values as little-endian bytes for an inline initializer.
 fn i64_bytes(vals: &[i64]) -> Vec<u8> {
@@ -1534,4 +1536,323 @@ fn tensor_only_path_is_byte_identical_after_container_type_model() {
         assert_eq!(graph.value(value).dtype, DataType::Float32);
         assert_eq!(graph.value(value).shape, expected, "value {value:?}");
     }
+}
+
+// ===========================================================================
+// Container-aware control flow (#449 inc3a): sequence types threaded through
+// `If` branches and `Loop` carried dependencies. Container outputs live in the
+// parallel container map, so they are observed via `report.containers` (keyed
+// by the outer control-flow node's output value id), never on the IR `Value`.
+// ===========================================================================
+
+/// The tensor leaf of a `Sequence<Tensor>` container type.
+fn sequence_tensor(value_type: &ValueType) -> &TensorType {
+    value_type
+        .as_sequence_element()
+        .and_then(ValueType::as_tensor)
+        .expect("expected a Sequence<Tensor> container type")
+}
+
+/// A branch whose single output is a `Sequence<Tensor{element_type, shape}>`,
+/// built by `SequenceConstruct` over a concrete tensor input. The branch input
+/// is a resolved local (a branch graph input), so the sequence element shape is
+/// fully determined inside the branch.
+fn sequence_construct_branch(element_type: DataType, shape: Shape) -> Graph {
+    let mut branch = Graph::new();
+    let input = branch.create_named_value("local", element_type, shape);
+    branch.add_input(input);
+    let seq = branch.create_named_value("seq", element_type, Shape::new());
+    branch.mark_value_type_unknown(seq);
+    branch.mark_value_shape_unknown(seq);
+    branch.insert_node(node(0, "SequenceConstruct", vec![Some(input)], vec![seq]));
+    branch.add_output(seq);
+    branch
+}
+
+fn run_if(then_branch: Graph, else_branch: Graph) -> (Graph, ValueId, InferenceReport) {
+    let (mut graph, output) = if_graph(then_branch, else_branch);
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer If with container branches");
+    (graph, output, report)
+}
+
+#[test]
+fn if_unifies_matching_sequence_branch_outputs() {
+    let (_graph, output, report) = run_if(
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]),
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]),
+    );
+
+    let container = report
+        .containers
+        .get(&output)
+        .expect("If output must be a container");
+    let tensor = sequence_tensor(container);
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
+        "matching branch element shapes stay concrete"
+    );
+}
+
+#[test]
+fn if_sequence_branch_extent_disagreement_degrades_to_symbol() {
+    let (_graph, output, report) = run_if(
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]),
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2), Dim::Static(5)]),
+    );
+
+    let tensor = sequence_tensor(report.containers.get(&output).expect("container output"));
+    assert_eq!(tensor.dtype, DataType::Float32);
+    let shape = tensor.shape.as_ref().expect("element shape known");
+    assert_eq!(
+        shape[0],
+        DimExpr::constant(2),
+        "agreeing dim stays concrete"
+    );
+    assert!(
+        shape[1].as_symbol().is_some(),
+        "disagreeing element extent must degrade to a fresh symbol, got {:?}",
+        shape[1]
+    );
+}
+
+#[test]
+fn if_sequence_branch_dtype_disagreement_errors() {
+    let (mut graph, _output) = if_graph(
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2)]),
+        sequence_construct_branch(DataType::Int64, vec![Dim::Static(2)]),
+    );
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let error = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect_err("mismatched sequence element dtypes must error");
+    let message = format!("{error}");
+    assert!(
+        message.contains("If"),
+        "error must be attributed to If, got {message}"
+    );
+}
+
+#[test]
+fn if_container_versus_tensor_branch_disagreement_errors() {
+    let (mut graph, _output) = if_graph(
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2)]),
+        identity_branch(vec![Dim::Static(2)]),
+    );
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let error = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect_err("a container branch and a tensor branch cannot unify");
+    let message = format!("{error}");
+    assert!(
+        message.contains("container"),
+        "error must explain the container/tensor mismatch, got {message}"
+    );
+}
+
+/// A `Loop` body that accumulates into its carried sequence: `SequenceInsert`
+/// of a concrete tensor into the seeded carried sequence each iteration.
+fn sequence_accumulator_loop_body(element_type: DataType, shape: Vec<Dim>) -> Graph {
+    let mut body = Graph::new();
+    let iter = body.create_named_value("iter", DataType::Int64, Shape::new());
+    body.add_input(iter);
+    let cond_in = body.create_named_value("cond_in", DataType::Bool, Shape::new());
+    body.add_input(cond_in);
+    let seq_in = body.create_named_value("seq_in", element_type, Shape::new());
+    body.mark_value_type_unknown(seq_in);
+    body.mark_value_shape_unknown(seq_in);
+    body.add_input(seq_in);
+
+    let cond_out = body.create_named_value("cond_out", DataType::Bool, Shape::new());
+    body.insert_node(node(0, "Identity", vec![Some(cond_in)], vec![cond_out]));
+
+    let dims: Vec<usize> = shape
+        .iter()
+        .map(|dim| match dim {
+            Dim::Static(extent) => *extent,
+            _ => 1,
+        })
+        .collect();
+    let byte_len: usize = dims.iter().product::<usize>() * 4;
+    let ins = body.create_named_value("ins", element_type, shape);
+    body.set_initializer(
+        ins,
+        WeightRef::Inline(TensorData::from_raw(
+            element_type,
+            dims,
+            vec![0u8; byte_len],
+        )),
+    );
+
+    let seq_out = body.create_named_value("seq_out", element_type, Shape::new());
+    body.mark_value_type_unknown(seq_out);
+    body.mark_value_shape_unknown(seq_out);
+    body.insert_node(node(
+        1,
+        "SequenceInsert",
+        vec![Some(seq_in), Some(ins)],
+        vec![seq_out],
+    ));
+
+    body.add_output(cond_out);
+    body.add_output(seq_out);
+    body
+}
+
+/// A `Loop` body that passes its carried sequence straight through (body output
+/// is the seeded formal input), proving a seeded container flows to the output.
+fn sequence_passthrough_loop_body(element_type: DataType) -> Graph {
+    let mut body = Graph::new();
+    let iter = body.create_named_value("iter", DataType::Int64, Shape::new());
+    body.add_input(iter);
+    let cond_in = body.create_named_value("cond_in", DataType::Bool, Shape::new());
+    body.add_input(cond_in);
+    let seq_in = body.create_named_value("seq_in", element_type, Shape::new());
+    body.mark_value_type_unknown(seq_in);
+    body.mark_value_shape_unknown(seq_in);
+    body.add_input(seq_in);
+
+    let cond_out = body.create_named_value("cond_out", DataType::Bool, Shape::new());
+    body.insert_node(node(0, "Identity", vec![Some(cond_in)], vec![cond_out]));
+    body.add_output(cond_out);
+    body.add_output(seq_in);
+    body
+}
+
+/// Build a `Loop` carrying one sequence accumulator. The initial carried
+/// operand is a sequence produced by an outer `SequenceConstruct` over a
+/// concrete tensor of `elem_shape`. Returns `(graph, carried_output, report)`.
+fn run_sequence_loop(
+    body: Graph,
+    element_type: DataType,
+    elem_shape: Vec<Dim>,
+) -> (ValueId, InferenceReport) {
+    let mut graph = Graph::new();
+    let m = graph.create_named_value("M", DataType::Int64, Shape::new());
+    graph.add_input(m);
+    let cond = graph.create_named_value("cond", DataType::Bool, Shape::new());
+    graph.add_input(cond);
+    let elem = graph.create_named_value("elem", element_type, elem_shape);
+    graph.add_input(elem);
+
+    let seq0 = graph.create_named_value("seq0", element_type, Shape::new());
+    graph.mark_value_type_unknown(seq0);
+    graph.mark_value_shape_unknown(seq0);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(elem)], vec![seq0]));
+
+    let carried_out = graph.create_named_value("carried_out", element_type, Shape::new());
+    graph.mark_value_type_unknown(carried_out);
+    graph.mark_value_shape_unknown(carried_out);
+    let loop_node = graph.insert_node(node(
+        1,
+        "Loop",
+        vec![Some(m), Some(cond), Some(seq0)],
+        vec![carried_out],
+    ));
+    graph.subgraphs.insert((loop_node, "body".into()), body);
+    graph.add_output(carried_out);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Loop carrying a sequence");
+    (carried_out, report)
+}
+
+#[test]
+fn loop_carries_sequence_accumulator_preserving_element_type() {
+    let (carried_out, report) = run_sequence_loop(
+        sequence_accumulator_loop_body(DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]),
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+
+    let tensor = sequence_tensor(
+        report
+            .containers
+            .get(&carried_out)
+            .expect("container output"),
+    );
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
+        "inserting a matching element preserves the sequence element shape"
+    );
+}
+
+#[test]
+fn loop_passthrough_preserves_seeded_sequence_dtype() {
+    let mut graph = Graph::new();
+    let batch = graph.intern_symbol("batch");
+    let m = graph.create_named_value("M", DataType::Int64, Shape::new());
+    graph.add_input(m);
+    let cond = graph.create_named_value("cond", DataType::Bool, Shape::new());
+    graph.add_input(cond);
+    let elem = graph.create_named_value(
+        "elem",
+        DataType::Float16,
+        vec![Dim::Symbolic(batch), Dim::Static(3)],
+    );
+    graph.add_input(elem);
+
+    let seq0 = graph.create_named_value("seq0", DataType::Float16, Shape::new());
+    graph.mark_value_type_unknown(seq0);
+    graph.mark_value_shape_unknown(seq0);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(elem)], vec![seq0]));
+
+    let carried_out = graph.create_named_value("carried_out", DataType::Float16, Shape::new());
+    graph.mark_value_type_unknown(carried_out);
+    graph.mark_value_shape_unknown(carried_out);
+    let loop_node = graph.insert_node(node(
+        1,
+        "Loop",
+        vec![Some(m), Some(cond), Some(seq0)],
+        vec![carried_out],
+    ));
+    graph.subgraphs.insert(
+        (loop_node, "body".into()),
+        sequence_passthrough_loop_body(DataType::Float16),
+    );
+    graph.add_output(carried_out);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Loop passing a seeded sequence through");
+
+    let tensor = sequence_tensor(
+        report
+            .containers
+            .get(&carried_out)
+            .expect("container output"),
+    );
+    assert_eq!(
+        tensor.dtype,
+        DataType::Float16,
+        "seeded element dtype preserved"
+    );
+    let shape = tensor.shape.as_ref().expect("element shape known");
+    assert_eq!(shape.len(), 2);
+    assert!(
+        shape[0].as_symbol().is_some(),
+        "a seeded symbolic dim degrades to a fresh parent symbol, got {:?}",
+        shape[0]
+    );
+    assert_eq!(
+        shape[1],
+        DimExpr::constant(3),
+        "concrete element extent preserved"
+    );
 }
