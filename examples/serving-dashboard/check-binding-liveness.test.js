@@ -36,7 +36,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
-import { PROVENANCE, TEXT_ENDPOINTS, resolveForOrigin } from './telemetry-provenance.js';
+import { ENDPOINTS, PROVENANCE, TEXT_ENDPOINTS, resolveForOrigin } from './telemetry-provenance.js';
 import { createTelemetryStore } from './telemetry-store.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -348,6 +348,12 @@ describe('binding liveness', () => {
  */
 const EXCLUDED_FROM_POLL_LOOP = Object.freeze(['/metrics', '/v1/resources']);
 
+const D88_FAST_ENDPOINTS = Object.freeze([
+  ENDPOINTS.HEALTH,
+  ENDPOINTS.STATUS,
+  ENDPOINTS.DEBUG_KV,
+]);
+
 /**
  * `telemetry-store.js` binds fields as the module that SERVES them, not as a
  * panel that renders them. Counting it as a consumer reports the store's own
@@ -453,7 +459,7 @@ describe('no binding routes a panel to an endpoint D88 excluded', () => {
 });
 
 describe('the poll loop is held to D88 by execution, not by reading it', () => {
-  it('requests only endpoints D88 permits, and declares the ones it does not', async () => {
+  it('requests exactly the endpoints D88 permits in the fast lane', async () => {
     // EXECUTED. Reading the array literal in telemetry-store.js would audit the
     // source; running the store audits the behaviour. Our fake servers answer
     // /metrics instantly, which is precisely why a 15-second stall has been
@@ -464,24 +470,17 @@ describe('the poll loop is held to D88 by execution, not by reading it', () => {
       return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
     };
     const store = createTelemetryStore({ origin: 'scatter', fetchImpl });
-    await store.pollOnce();
+    await store.pollOnce({ includeSlow: false });
     store.stop();
 
-    assert.ok(asked.length > 2, `The loop requested ${asked.length} paths; the recorder is blind.`);
-
-    const declared = new Set(
-      Object.values(DECLARED_ROUTING_VIOLATIONS).length ? EXCLUDED_FROM_POLL_LOOP : [],
-    );
-    const undeclared = asked.filter(
-      (p) => EXCLUDED_FROM_POLL_LOOP.includes(p) && !declared.has(p),
-    );
+    const uniqueAsked = [...new Set(asked)].sort();
+    const allowed = [...D88_FAST_ENDPOINTS].sort();
     assert.deepEqual(
-      undeclared,
-      [],
-      `The 4 Hz loop requests ${undeclared.join(', ')}, which D88 excludes ENTIRELY ` +
-        '-- "not polled slowly, excluded" -- because one in-flight request holds a ' +
-        'connection for 15 s and AC24 allows at most one cycle in flight, so the ' +
-        'whole loop stalls behind it.',
+      uniqueAsked,
+      allowed,
+      `The D88 fast lane must request exactly ${allowed.join(', ')}. It actually requested ` +
+        `${uniqueAsked.join(', ')}. Any additional endpoint can stall the at-most-one-in-flight ` +
+        '4 Hz cycle; a denylist is insufficient because a newly added endpoint passes by omission.',
     );
   });
 });

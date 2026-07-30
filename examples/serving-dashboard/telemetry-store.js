@@ -62,10 +62,11 @@ export const CONNECTION_STATES = Object.freeze({
 /**
  * PER-ENDPOINT POLL CADENCE.
  *
- * Polling six endpoints every 250 ms is 24 requests/second, which eats into the
- * server's <2% overhead budget (AC33) to re-fetch values that cannot have
- * changed. Model context length is fixed for the life of the process; resource
- * LIMITS are configuration. Only the live counters need the full rate.
+ * AC33's "<2% decode overhead" requirement is UNMEASURED. Request count is not
+ * decode overhead and this cadence table is not evidence for that requirement.
+ * Settling AC33 requires repeated under-load runs of telemetry-on and
+ * telemetry-off arms, with the entire 95% CI of the run-mean difference inside
+ * ±2% (perf-baseline.md §6d). These cadences only bound network frequency.
  *
  * A cadence of 0 means "every poll". Anything else is the minimum gap between
  * requests to that endpoint; in between, the last response is reused and its
@@ -95,6 +96,20 @@ const BLOCK_TABLE_MAX_WINDOW = 1024;
 const REQUEST_QUERY = Object.freeze({
   [ENDPOINTS.DEBUG_KV_BLOCKS]: `?start=0&count=${BLOCK_TABLE_MAX_WINDOW}`,
 });
+
+const D88_FAST_ENDPOINTS = Object.freeze([
+  ENDPOINTS.HEALTH,
+  ENDPOINTS.STATUS,
+  ENDPOINTS.DEBUG_KV,
+]);
+
+const SLOW_ENDPOINTS = Object.freeze([
+  ENDPOINTS.DEBUG_KV_BLOCKS,
+  ENDPOINTS.DEBUG_CONFIG,
+  ENDPOINTS.METRICS,
+  ENDPOINTS.RESOURCES,
+  ENDPOINTS.MODELS,
+]);
 
 /** Poll cadence bounds. The spec fixes the dashboard at 250-500 ms. */
 export const MIN_POLL_INTERVAL_MS = 100;
@@ -214,6 +229,20 @@ export function createTelemetryStore({
   /** True while a poll cycle is in flight. Guarantees at most one outstanding
    *  request set — a slow server must never queue up polls behind it. */
   let pollInFlight = false;
+  let slowPollInFlight = false;
+  /** @type {Record<string, SourceResult>} */
+  let latestSourceResults = Object.fromEntries(
+    [...D88_FAST_ENDPOINTS, ...SLOW_ENDPOINTS].map((path) => [
+      path,
+      {
+        ok: false,
+        body: null,
+        status: null,
+        serverMessage: null,
+        transportError: null,
+      },
+    ]),
+  );
   /** @type {ReturnType<typeof setTimeout>|null} */
   let timerHandle = null;
   let consecutiveFailures = 0;
@@ -279,7 +308,7 @@ export function createTelemetryStore({
     start() {
       if (running) return;
       running = true;
-      void runPollCycle();
+      void runPollCycle({ slowMode: 'background' });
     },
 
     stop() {
@@ -337,8 +366,11 @@ export function createTelemetryStore({
       };
     },
 
-    async pollOnce() {
-      await runPollCycle({ scheduleNext: false });
+    async pollOnce({ includeSlow = true } = {}) {
+      await runPollCycle({
+        scheduleNext: false,
+        slowMode: includeSlow ? 'await' : 'none',
+      });
       return snapshot;
     },
   };
@@ -352,13 +384,33 @@ export function createTelemetryStore({
    *
    * @param {object} [options]
    * @param {boolean} [options.scheduleNext]
+   * @param {'await'|'background'|'none'} [options.slowMode]
    */
-  async function runPollCycle({ scheduleNext = true } = {}) {
+  async function runPollCycle({ scheduleNext = true, slowMode = 'background' } = {}) {
     if (pollInFlight) return;
     pollInFlight = true;
     try {
-      const results = await fetchAllSources();
-      publish(buildSnapshot(results));
+      const fastPaths =
+        snapshot.connection.state === CONNECTION_STATES.UNREACHABLE
+          ? [ENDPOINTS.HEALTH, ENDPOINTS.STATUS]
+          : D88_FAST_ENDPOINTS;
+      latestSourceResults = {
+        ...latestSourceResults,
+        ...(await fetchSources(fastPaths)),
+      };
+
+      if (slowMode === 'await') {
+        latestSourceResults = {
+          ...latestSourceResults,
+          ...(await fetchSources(SLOW_ENDPOINTS)),
+        };
+        publish(buildSnapshot(latestSourceResults));
+      } else if (slowMode === 'background') {
+        publish(buildSnapshot(latestSourceResults));
+        void runSlowPoll();
+      } else {
+        publish(buildSnapshot(latestSourceResults));
+      }
     } catch (error) {
       // A throw here is a bug in the store, not a server failure — server
       // failures are captured per-endpoint inside fetchAllSources(). Surface it
@@ -371,6 +423,20 @@ export function createTelemetryStore({
           void runPollCycle();
         }, nextDelayMs());
       }
+    }
+  }
+
+  async function runSlowPoll() {
+    if (slowPollInFlight || snapshot.connection.state === CONNECTION_STATES.UNREACHABLE) return;
+    slowPollInFlight = true;
+    try {
+      latestSourceResults = {
+        ...latestSourceResults,
+        ...(await fetchSources(SLOW_ENDPOINTS)),
+      };
+      publish(buildSnapshot(latestSourceResults));
+    } finally {
+      slowPollInFlight = false;
     }
   }
 
@@ -389,24 +455,7 @@ export function createTelemetryStore({
    *
    * @returns {Promise<Record<string, SourceResult>>}
    */
-  async function fetchAllSources() {
-    // While unreachable, probe only the two ungated endpoints that determine
-    // the connection state. Asking a server we cannot reach for detail it
-    // cannot give quadruples the failed-request noise for no information.
-    const paths =
-      snapshot.connection.state === CONNECTION_STATES.UNREACHABLE
-        ? [ENDPOINTS.HEALTH, ENDPOINTS.STATUS]
-        : [
-            ENDPOINTS.HEALTH,
-            ENDPOINTS.STATUS,
-            ENDPOINTS.DEBUG_KV,
-            ENDPOINTS.DEBUG_KV_BLOCKS,
-            ENDPOINTS.DEBUG_CONFIG,
-            ENDPOINTS.METRICS,
-            ENDPOINTS.RESOURCES,
-            ENDPOINTS.MODELS,
-          ];
-
+  async function fetchSources(paths) {
     const settled = await Promise.all(paths.map((path) => fetchSource(path)));
     /** @type {Record<string, SourceResult>} */
     const byPath = {};
