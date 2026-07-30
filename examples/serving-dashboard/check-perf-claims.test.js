@@ -579,3 +579,56 @@ test('no source file states the withdrawn prefix timing result as a live finding
       offenders.join('\n'),
   );
 });
+
+// ---------------------------------------------------------------------------
+// The README states how much of the page is populated: "10 of 13 have no
+// catalogue entry (77%)". That number is a MEASUREMENT, and measurements in
+// prose decay silently.
+//
+// This one decays in the flattering direction, which is why it needs a guard
+// more than a harsh number would. As keys get plumbed the true figure FALLS,
+// so a stale README understates our own progress -- and nobody files a bug
+// against a document that is too modest. The pressure that normally corrects
+// an inaccurate claim is entirely absent here, in both directions:
+// overstatement gets challenged, understatement gets a shrug.
+//
+// So the ratio is recomputed from HEAD on every run and the prose must match.
+test('the README populated-fields ratio still matches the tree it describes', () => {
+  assertShippingTree();
+
+  const PANEL = 'dashboard/kv-memory.js';
+  const keys = [
+    ...new Set(
+      Array.from(shipped(PANEL).matchAll(/field\(\s*'([^']+)'/g), (m) => m[1]),
+    ),
+  ];
+  assert.ok(
+    keys.length > 5,
+    `only ${keys.length} field() keys found in ${PANEL} — the extractor has `
+      + 'probably gone blind rather than the panel having shrunk. Refusing to '
+      + 'compute a ratio from a corpus this small.',
+  );
+
+  const catalogue = shipped('telemetry-provenance.js');
+  const missing = keys.filter((k) => !catalogue.includes(`'${k}'`));
+  const pct = Math.round((missing.length / keys.length) * 100);
+
+  const claim = new RegExp(
+    `\\*\\*${missing.length} of ${keys.length} have no catalogue entry \\(${pct}%\\)\\*\\*`,
+  );
+
+  assert.ok(
+    claim.test(README),
+    'The README\'s populated-fields ratio no longer matches the tree.\n'
+      + `  measured now : ${missing.length} of ${keys.length} keys in ${PANEL} `
+      + `have no catalogue entry (${pct}%)\n`
+      + `  README says  : see the "How much of the page is actually populated" table\n`
+      + (missing.length < keys.length / 2
+        ? '  Coverage has IMPROVED past the halfway mark. Update the prose and '
+          + 'consider whether the surrounding caveats still describe the page.\n'
+        : '')
+      + `  Unresolvable keys: ${missing.join(', ')}\n\n`
+      + `  Replacement text, verbatim: **${missing.length} of ${keys.length} `
+      + `have no catalogue entry (${pct}%)**`,
+  );
+});

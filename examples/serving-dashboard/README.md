@@ -999,6 +999,44 @@ differs in each:
 | **`···`** *pending* | Measurable; no sample has arrived yet. | Wait a moment. This one resolves on its own. |
 | **`n/a` + an on-screen caption** *not applicable* | Meaningless on this execution path — the question was never asked. | Not a gap in our work. This is the architecture, and the caption says which part. |
 
+### How much of the page is actually populated
+
+The mechanism above is the honest part. The **magnitude** is the part a reader
+deserves before they run this and form an impression, so here it is plainly:
+**most fields on a first run are `—`.**
+
+Two independent measurements, taken different ways, agree:
+
+| Method | What it counts | Result |
+|---|---|---|
+| Live `data-state` census of the assembled page in a real browser | Rendered field states | `unavailable` **40** · `pending` 7 · `measured` 2 · `not-applicable` 1 |
+| Static check of every key `dashboard/kv-memory.js` passes to `field()` against the client catalogue | Keys that *could* resolve at all | **10 of 13 have no catalogue entry (77%)** |
+
+One counts pixels, the other counts bindings, and they land on the same number
+from opposite directions. Treat that agreement as the finding, not either
+figure alone.
+
+**What this means for you as a reader:**
+
+- **The two headline panels — KV memory and throughput — are mostly em-dash.**
+  They are the panels whose subject matter is most interesting and whose
+  telemetry is least plumbed. That is an unhappy coincidence and it is not
+  disguised anywhere on the page.
+- **This is the demo working, not failing.** Every one of those dashes is a
+  metric the runtime may genuinely compute and that no endpoint publishes. The
+  entire point of this page is that it says so instead of inventing a number.
+- **But do not read a mostly-dashed page as a mostly-finished one.** The
+  honesty machinery is complete and well-tested; the *telemetry coverage behind
+  it* is early. Those are two different maturity levels and the page's calm
+  presentation can blur them.
+
+> **The uncomfortable version, stated because omitting it would be the same
+> move this project exists to refuse:** a dashboard that degrades beautifully
+> is still a dashboard that is not showing you very much yet. We think the
+> degradation is the transferable contribution and the coverage is a matter of
+> plumbing more endpoints. A reader is entitled to weigh that differently, and
+> they can only do so if we give them the ratio — so we give them the ratio.
+
 **`not-applicable` is the one state that is not just a different glyph — it
 changes scale.** When *every* field in a panel is not-applicable, the panel does
 not fill with markers: the header stays, **the body is replaced by the
