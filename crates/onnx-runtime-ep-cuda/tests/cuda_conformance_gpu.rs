@@ -265,6 +265,95 @@ fn dropout_cases() -> Vec<Case> {
     ]
 }
 
+fn instance_normalization_cases() -> Vec<Case> {
+    let values = [-3.0, -1.0, 1.0, 3.0, 2.0, 4.0, 6.0, 8.0];
+    let mut cases = FLOAT_DTYPES
+        .into_iter()
+        .map(|dtype| Case {
+            label: format!("InstanceNormalization[{dtype:?}]"),
+            op: "InstanceNormalization",
+            domain: "",
+            opset: 6,
+            inputs: vec![
+                float_input(dtype, &[1, 4, 2], &values),
+                float_input(dtype, &[4], &[1.0, 0.5, 1.5, 2.0]),
+                float_input(dtype, &[4], &[0.0, 1.0, -1.0, 0.25]),
+            ],
+            outputs: vec![(dtype, vec![1, 4, 2])],
+            attrs: vec![("epsilon", Attribute::Float(1e-5))],
+            compare: Compare::Float {
+                tol: float_tol(dtype) * 2.0,
+            },
+        })
+        .collect::<Vec<_>>();
+    cases.push(Case {
+        label: "InstanceNormalization[f32,large-offset]".into(),
+        op: "InstanceNormalization",
+        domain: "",
+        opset: 6,
+        inputs: vec![
+            float_input(
+                DataType::Float32,
+                &[1, 1, 4],
+                &[10_000.0, 10_001.0, 9_999.0, 10_002.0],
+            ),
+            float_input(DataType::Float32, &[1], &[1.0]),
+            float_input(DataType::Float32, &[1], &[0.0]),
+        ],
+        outputs: vec![(DataType::Float32, vec![1, 1, 4])],
+        attrs: vec![("epsilon", Attribute::Float(1e-5))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    cases
+}
+
+fn group_normalization_cases() -> Vec<Case> {
+    let values = [-3.0, -1.0, 1.0, 3.0, 2.0, 4.0, 6.0, 8.0];
+    let mut cases = Vec::new();
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("GroupNormalization-18[{dtype:?}]"),
+            op: "GroupNormalization",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(dtype, &[1, 4, 2], &values),
+                float_input(dtype, &[2], &[1.0, 0.5]),
+                float_input(dtype, &[2], &[0.25, -0.5]),
+            ],
+            outputs: vec![(dtype, vec![1, 4, 2])],
+            attrs: vec![
+                ("num_groups", Attribute::Int(2)),
+                ("epsilon", Attribute::Float(1e-5)),
+            ],
+            compare: Compare::Float {
+                tol: float_tol(dtype) * 2.0,
+            },
+        });
+        cases.push(Case {
+            label: format!("GroupNormalization-21[{dtype:?}]"),
+            op: "GroupNormalization",
+            domain: "",
+            opset: 21,
+            inputs: vec![
+                float_input(dtype, &[1, 4, 2], &values),
+                float_input(dtype, &[4], &[1.0, 0.5, 1.5, 2.0]),
+                float_input(dtype, &[4], &[0.0, 1.0, -1.0, 0.25]),
+            ],
+            outputs: vec![(dtype, vec![1, 4, 2])],
+            attrs: vec![
+                ("num_groups", Attribute::Int(2)),
+                ("epsilon", Attribute::Float(1e-5)),
+                ("stash_type", Attribute::Int(1)),
+            ],
+            compare: Compare::Float {
+                tol: float_tol(dtype) * 2.0,
+            },
+        });
+    }
+    cases
+}
+
 fn nonzero_cases() -> Vec<Case> {
     vec![
         Case {
@@ -1706,6 +1795,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("DequantizeLinear", dequantize_linear_cases()));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
+    p.push(sweep(
+        "InstanceNormalization",
+        instance_normalization_cases(),
+    ));
+    p.push(sweep("GroupNormalization", group_normalization_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // Batch 10 (issue #67): normalization, global reductions, quantization, and

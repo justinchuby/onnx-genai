@@ -104,6 +104,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `SkipSimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `RMSNorm(input + skip + bias)·γ` with no mean subtraction. Right-aligned broadcast `skip`, optional `bias`, and optional mean/inverse-RMS/residual-sum outputs (`normalization.rs`). f32. |
 | `RMSNormalization` / `SimplifiedLayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
 | `BatchNormalization` | `` | ✅ | **NVRTC-custom** | Inference-mode channel-wise normalization for contiguous f32/f16/bf16 NCHW-style tensors; custom epsilon and per-channel scale/bias/mean/variance (`batch_normalization.rs`). |
+| `InstanceNormalization`, `GroupNormalization` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank contiguous NCHW-style f32/f16/bf16 normalization. Instance normalization reduces per `(N,C)` slice; group normalization supports opset-18 per-group and opset-21 per-channel affine parameters with float stash semantics (`group_normalization.rs`). |
 | `LpNormalization` | `` | ✅ | **NVRTC block reduction** | Axis-wise p=1/p=2 normalization for f32/f16/bf16, including negative and interior axes with CPU-matched tiny-norm clamping (`global_reduction.rs`). |
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` | See reductions below. |
 
@@ -189,14 +190,14 @@ pre-batch counts retained in the historical wave notes below.
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **173** |
 | CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **157** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **152** |
-| CPU pairs implemented by CUDA in the same domain | **155 / 173** |
-| CPU standard-domain op types implemented by CUDA | **134 / 145** |
+| CUDA registry `(domain, op_type)` pairs | **159** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **154** |
+| CPU pairs implemented by CUDA in the same domain | **157 / 173** |
+| CPU standard-domain op types implemented by CUDA | **136 / 145** |
 
-The **11 remaining CPU `ai.onnx` gaps** are `CenterCropPad`, `Col2Im`,
-`ConvTranspose`, `GridSample`, `GroupNormalization`, `InstanceNormalization`,
-`LpPool`, `NonMaxSuppression`, `QLinearMatMul`, `Resize`, and `Unique`.
+The **9 remaining CPU `ai.onnx` gaps** are `CenterCropPad`, `Col2Im`,
+`ConvTranspose`, `GridSample`, `LpPool`, `NonMaxSuppression`, `QLinearMatMul`,
+`Resize`, and `Unique`.
 
 The decode/transformer-oriented priority set from issue #67 is already covered:
 `LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
@@ -216,7 +217,7 @@ currently registered by the CPU EP include `Conv` (cuDNN).
 |---------|------------------------------|-----------|
 | **cuBLASLt / NVRTC** | `QLinearMatMul` | Quantized matrix multiplication should reuse the existing dequant/GEMM infrastructure. |
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
-| **cuDNN / NVRTC-custom** | `GroupNormalization`, `InstanceNormalization`, `LpPool` | Reduction plus affine/pooling kernels with well-defined contiguous tensor geometry. |
+| **cuDNN / NVRTC-custom** | `LpPool` | Pooling reduction with general ONNX window geometry. |
 | **NVRTC-custom** | `CenterCropPad`, `Col2Im`, `Unique` | Index transforms or data-dependent output construction with no suitable runtime library. |
 | **deferred heavy operators** | `ConvTranspose`, `GridSample`, `NonMaxSuppression`, `Resize` | Larger numerical/geometry surfaces deserve dedicated follow-up waves and focused review. |
 
