@@ -184,6 +184,62 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
     .filter((f) => f.endsWith('.md'))
     .filter((f) => !EXEMPT.has(f));
 
+  // ---------------------------------------------------------------------
+  // DECLARE THE CORPUS.
+  //
+  // The scope above is CORRECT and it is UNDECLARED, and those are different
+  // problems. `-- .` with `cwd: HERE` restricts this guard to ONE DIRECTORY.
+  // Everything else in the repository -- PROGRESS.md, the decisions archive,
+  // every design note -- is invisible to it and always has been.
+  //
+  // That is deliberate: widening this corpus would redden it permanently on
+  // documents nobody is willing to edit tonight, and a guard that cannot be
+  // satisfied gets deleted within a day. A narrow guard that runs beats a
+  // total guard that gets switched off.
+  //
+  // The DEFECT is what the exemption lists imply. Four hand-written entries
+  // read as "we examine everything except these four" -- an exemption list is
+  // a claim about coverage, and a SHORT one claims almost everything. The two
+  // accidentally-visible keys in NOT_YET_PUBLISHED read as a deliberate survey
+  // for exactly this reason. So state the denominator out loud on every run.
+  //
+  // Everything below is DERIVED, never enumerated. A hand-maintained list of
+  // what we do not cover would rot the same way, and rot into a MORE
+  // authoritative-looking artefact -- centralising a fact does not verify it,
+  // it makes it wrong in one place instead of several.
+  //
+  // This block cannot fail. It asserts nothing; it only refuses to let the
+  // scope stay implicit.
+  const prefix = execFileSync('git', ['rev-parse', '--show-prefix'], { cwd: HERE })
+    .toString()
+    .trim();
+  // `--full-tree` is LOAD-BEARING AND THE FIRST VERSION OF THIS BLOCK OMITTED
+  // IT. Without it, `git ls-tree` silently restricts itself to the cwd and
+  // prints paths RELATIVE to the cwd -- so this listing returned only this
+  // directory, nothing matched `prefix`, and the "not examined" figure came out
+  // as 15 when the true answer is 546.
+  //
+  // A declaration written to expose under-coverage under-reported it by a
+  // factor of thirty-six, and it did so SILENTLY and in the FLATTERING
+  // direction, which is the only direction nobody re-checks. `--full-tree`
+  // makes the listing independent of where it is called from, which is the
+  // same property this whole module exists to guarantee.
+  const repoMd = execFileSync('git', ['ls-tree', '-r', '--full-tree', 'HEAD', '--name-only'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter((f) => f.endsWith('.md'));
+  const unexamined = repoMd.filter((f) => !f.startsWith(prefix));
+  const say = (s) => console.log(`CORPUS-SCOPE: ${s}`);
+  say(`this guard reads ${docs.length} .md file(s), and ONLY under ${prefix}`);
+  say(`  in-scope, exempted : ${EXEMPT.size} (${[...EXEMPT].join(', ')})`);
+  say(`  in-scope, deferred : ${Object.keys(DEFERRED).length} (${Object.keys(DEFERRED).join(', ')})`);
+  say(`  NOT EXAMINED AT ALL: ${unexamined.length} of ${repoMd.length} .md file(s) tracked in this repository`);
+  for (const f of unexamined.slice(0, 5)) say(`      e.g. ${f}`);
+  if (unexamined.length > 5) say(`      ... and ${unexamined.length - 5} more`);
+  say('  the exemptions above are exclusions from a ONE-DIRECTORY corpus, NOT');
+  say('  from the repository. A green result here is silence about the rest.');
+  // ---------------------------------------------------------------------
+
   const stillDirty = new Set();
 
   let inspected = 0;
@@ -306,9 +362,11 @@ test('the README does not restate an absolute figure the baseline calls irreprod
 test('no document presents a withdrawn prefix timing figure without its noise floor', () => {
   // The +7.0% "shared prefixes are SLOWER" result was WITHDRAWN BY ITS OWN
   // AUTHOR after a warm interleaved re-run came back 16.98% FASTER -- the
-  // opposite sign -- on a box where a byte-identical binary swung 9.8% from
-  // ambient load alone. The effect and the noise floor are the same size, so
-  // there is no measured prefix timing result in EITHER direction.
+  // opposite sign -- on a box whose MEASURED null-A/B noise floor reaches
+  // +52.30% / -40.17% between paired arms whose true delta is ZERO by
+  // construction (perf-baseline.md §8.1). The effect is far SMALLER than the
+  // noise floor, so there is no measured prefix timing result in EITHER
+  // direction.
   //
   // It reached me anyway, twice, relayed as "the single most credibility-
   // earning sentence we have". I did not publish it, but only because it
@@ -1243,5 +1301,128 @@ test('the README noise floor is the one perf-baseline currently measures, and th
     'the measured noise floor now EXCEEDS the effect a working prefix cache ' +
       'would produce. The README\'s null result is no longer supported by a ' +
       'sensitivity argument and must be restated as simply unmeasured.',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A GUARD SCOPED BY FILE EXTENSION IS A GUARD SCOPED BY GUESSWORK.
+//
+// Every noise-floor check above this line filters the tracked tree with
+// `.endsWith('.md')`. That is a guess about where a claim can live, and it was
+// wrong. When this test was written the retracted 9.8 % figure was stated as
+// live fact in FIVE tracked non-markdown files -- two inside TEST ASSERTION
+// MESSAGES (the remediation text handed to whoever is fixing a failure) and
+// one in `scenario-origins.js`, which SHIPS TO THE BROWSER. The markdown-only
+// guards were green over all five, and could not have been anything else.
+//
+// SCOPE, STATED SO IT CANNOT BE OVERSOLD: this covers exactly the complement
+// of what the guards above cover -- tracked NON-markdown files. The markdown
+// corpus already has three tuned checks with their own exemptions; a second
+// opinion over the same prose would double-report and get reworded away. This
+// is the blind spot, not a replacement.
+//
+// A first draft of this check scanned EVERYTHING and reported fifteen regions,
+// of which most were correct retractions. A detector that fires on everything
+// is indistinguishable from one that works, so it was cut down rather than
+// tuned -- the corpus was the defect, not the threshold.
+test('the retracted 9.8 % floor is not stated as live fact outside markdown', () => {
+  // Prose-carrying source. Deliberately NOT an extension guess about where a
+  // claim lives -- it is the set of tracked text files the .md guards skip.
+  const RETRACTED = /(?<![\d.])9\.8\s*%/;
+  const FLOOR_FRAMING = /noise floor|swung|swings|ambient load|byte-identical binary/i;
+  // Anchored on the NAMED SECTION that performs the retraction, never on a
+  // withdrawal vocabulary. A sibling prose guard in this repo exempted any line
+  // containing `measured`, `no`, or `not`; appending "and measured" to a false
+  // claim flipped it GREEN, so the strictly stronger lie was the one that
+  // passed. An exemption clause is a hole shaped like the words honest people
+  // use. `§6f` cannot be worn by accident, and a claim that does wear it has
+  // cited the document that refutes it.
+  //
+  // MEASURED, NOT ASSUMED: the first draft of this line also accepted
+  // /retract|withdrew|withdrawn/. `scenario-origins.js` withdraws the 7 %
+  // TIMING ARM in the same breath as it cites the stale 9.8 % FLOOR that
+  // supports the withdrawal -- so a withdrawal of one claim bought a free
+  // exemption for a different, still-live one. The guard demonstrated the
+  // vocabulary hole on itself within one run of being written.
+  const NAMES_THE_RETRACTION = /§ ?6f|older 9\.8/i;
+
+  // A guard must quote what it forbids. Excluded BY PATH -- checkable -- rather
+  // than by a pattern that would also excuse anyone who looked like a guard.
+  const SELF = 'check-perf-claims.test.js';
+
+  // Expiring, named, owner-attributed. Under a freeze, reddening another
+  // agent's file is worse than a deferral that reports itself. If a listed file
+  // stops offending, this test FAILS and tells me to delete the row: an
+  // exemption that cannot expire is a suppression, and the direction nobody
+  // reports is the one where the gap has quietly closed.
+  const DEFERRED = Object.freeze({
+    'scenario-origins.js':
+      'SHIPPED browser code owned by @bb2ee824 (023db167 C1, be3ab37c C13). ' +
+      'Reported to them; not mine to edit under freeze.',
+  });
+
+  const corpus = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter(Boolean)
+    .filter((f) => !f.endsWith('.md'))
+    .filter((f) => f !== SELF)
+    .filter((f) => /\.(js|mjs|cjs|sh|css|html|json|py)$/i.test(f));
+
+  // NON-VACUITY BY NAMED MEMBER, not by count. A count is satisfied by twenty
+  // files of the wrong kind; this proves the corpus reaches the two file shapes
+  // the `.md` filter structurally excluded -- a shipped module and a test.
+  assert.ok(
+    corpus.includes('scenario-origins.js') && corpus.includes('dashboard/honesty.test.js'),
+    `the corpus (${corpus.length} files) no longer reaches shipped .js and test .js — ` +
+      'the extension blind spot has returned',
+  );
+
+  const offenders = [];
+  const deferredSeen = new Set();
+
+  for (const file of corpus) {
+    let text;
+    try {
+      text = shipped(file);
+    } catch {
+      continue;
+    }
+    if (!RETRACTED.test(text)) continue;
+
+    // Scoped by REGION, never by document: a file may retract the figure in one
+    // place and must not assert it in another.
+    for (const region of text.split(/\n\s*\n/)) {
+      if (!RETRACTED.test(region) || !FLOOR_FRAMING.test(region)) continue;
+      if (NAMES_THE_RETRACTION.test(region)) continue;
+
+      if (Object.hasOwn(DEFERRED, file)) {
+        deferredSeen.add(file);
+        continue;
+      }
+      const hit = region.split('\n').find((l) => RETRACTED.test(l)) ?? region;
+      offenders.push(`${file}: ${hit.trim().slice(0, 110)}`);
+    }
+  }
+
+  const stale = Object.keys(DEFERRED).filter((f) => !deferredSeen.has(f));
+  assert.deepEqual(
+    stale,
+    [],
+    `DEFERRED lists ${stale.join(', ')}, which no longer states the retracted figure as ` +
+      'a live floor. Delete the entry rather than leaving a suppression nothing tracks.',
+  );
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'These regions present the RETRACTED 9.8 % swing as the current noise floor:\n' +
+      offenders.map((o) => `  - ${o}`).join('\n') +
+      '\n\nperf-baseline.md §6f withdrew that figure as evidence: its window overlapped ' +
+      'two CPU-heavy ONNX exports, so the swing had a CAUSE and was not ambient. The ' +
+      'measured null-A/B floor (§8.1, true delta ZERO by construction) reaches ' +
+      '+52.30 % / -40.17 %. Cite that instead — it is ~5x larger, so every argument of ' +
+      'the form "the effect is smaller than the noise" gets STRONGER. To mention the ' +
+      'old figure at all, name §6f in the same region.',
   );
 });

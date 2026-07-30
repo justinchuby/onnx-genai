@@ -24,7 +24,12 @@
 // prefix-cache-verification.md:91 and :127 -- 7/8 + 12/12 = 19/20 exactly.)
 // (An earlier timing arm reported shared prefixes slower. ITS OWN AUTHOR
 // WITHDREW IT: the interleaved warm re-run came back with the opposite sign,
-// on a box where a byte-identical binary swung 9.8% from ambient load alone.
+// on a box whose MEASURED null-A/B noise floor (perf-baseline.md §8.1, true
+// delta ZERO by construction) reaches +52.30% / -40.17% between paired arms.
+// (An earlier draft cited a 9.8% swing here; §6f retracted that figure as
+// evidence because its window overlapped two CPU-heavy ONNX exports, so the
+// swing had a cause and was not ambient. The real floor is ~5x larger, which
+// makes this argument STRONGER, not weaker.)
 // We ship no prefix timing number. Do not cite one.)
 //
 // `prefix_cache_hits` reads ~95% because it increments on

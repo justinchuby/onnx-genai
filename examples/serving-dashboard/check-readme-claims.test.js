@@ -151,8 +151,9 @@ test('the README does not overclaim CERTAINTY OF ABSENCE either', () => {
       `README.md asserts certainty of absence at line ${line}: "${match[0]}".\n\n` +
         `QA downgraded the prefix-reuse timing result from RED to INCONCLUSIVE: ` +
         `one controlled run put the shared arm 7% SLOWER, another put it 17% ` +
-        `FASTER, on a box at load average 22 where a byte-identical binary ` +
-        `swings 9.8%. Spread exceeds effect size.\n\n` +
+        `FASTER, on a box whose MEASURED null-A/B noise floor reaches ` +
+        `+52.30% / -40.17% between paired arms whose true delta is ZERO by ` +
+        `construction (perf-baseline.md §8.1). Spread exceeds effect size.\n\n` +
         `Report the counter finding (airtight, no timing involved) and call the ` +
         `timing result UNVERIFIED. Understating a capability is still a claim, ` +
         `and it is the one nobody challenges.`,

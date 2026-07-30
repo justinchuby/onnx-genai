@@ -423,8 +423,9 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
         'do not quote a hit RATE. These counters are cumulative since boot, so the ratio ' +
         'describes the process, not the experiment -- it is diluted by warm-up and can be ' +
         'moved to any value with unrelated traffic.) (We could not measure a timing ' +
-        'effect above this machine noise floor — a byte-identical binary swung 9.8% from ' +
-        'ambient load alone — so we ship no prefix timing number at all.)',
+        'effect above this machine noise floor — a strictly interleaved null A/B, ' +
+        'whose true delta is ZERO by construction, swung between +52.30% and ' +
+        '-40.17% (perf-baseline.md §8.1) — so we ship no prefix timing number at all.)',
       instead:
         'render the verified gap itself, with citations and no numbers. There is no ' +
         'client-side substitute either: the TTFT delta measures the same absent effect.',
