@@ -877,7 +877,7 @@ catch one is to read the increment site and ask what actually causes it to move.
 | `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `admin.rs:434-443` |
 | `active_sessions` | concurrent requests | persistent `X-Session-Id` sessions — reads `0` at the busiest moment of a batching run, correctly | **Reported** (Lead), not independently verified here |
 | `kv_usage` (on `/v1/status`) | KV utilisation | hardcoded `0.0`. **Not demo-only:** `RoutingPolicy::LeastKvUsage` sorts on it (`router.rs:247`), so the comparison cannot discriminate and the weighted policy silently loses its 30% term. | **Reported** (@d7cf9b84), traced cross-crate |
-| `created` (on `/v1/models`) | model creation time | **`now_unix()` — the current clock, evaluated per call.** Nothing about the model affects it. | **Verified** — `admin.rs:29` |
+| ~~`created` (on `/v1/models`)~~ | model creation time | ~~**`now_unix()` — the current clock, evaluated per call.**~~ **✅ RESOLVED by `e556b7f4`** — now `directory_mtime_secs(&status.path)` (`routes/admin.rs:58`). Confirmed by observation: two calls 3 s apart returned an identical `created` (§8.13). | **Observed** |
 
 > **🔴 `created` is the most dangerous entry in this table, and it is the one that defeats our own
 > detection heuristic.** Every instinct we have treats **motion as evidence of life**: `stale` exists
@@ -907,7 +907,80 @@ different provenance, and here one is a live count and the other is a compile-ti
 
 ---
 
-## 9. Where to look first
+### 8.13 Observed against a running server — evidence class **Observed** 🟢
+
+Everything above this section is **Read**: derived from source at `file:line`. This section is
+**Observed**: a server was built from HEAD and exercised, and the numbers below are responses it
+actually returned. The distinction matters because three claims in this document changed status
+under observation, and **one of them was false.**
+
+**Provenance of this run** — stated precisely, because an observation is only as good as the
+artifact it was made against:
+
+| | |
+|---|---|
+| Binary | built from HEAD `a5d065b0`, `git status` clean across `crates/`, `Cargo.toml`, `Cargo.lock` |
+| Model | `qwen2.5-0.5b-scatter-v2` (static cache), `--model-id qwen-scatter --max-batch 4`, CPU EP |
+| Confirmed at boot | `INFO onnx_genai_server::driver: continuous batch driver enabled max_batch=4` |
+
+> ⚠️ **A prebuilt binary is not the shipped code.** The `target/release/onnx-genai-server` already
+> present in this worktree was **10 commits behind `crates/`** — it still had `--cors-allow-origin`
+> and lacked `--max-batch`. Observing from it would have "confirmed" gaps that were already fixed
+> and missed the fixes that closed them. **A frozen artifact is the right instrument for a
+> performance baseline and the wrong one for verifying current behaviour.** Rebuild, then check
+> `--help` against the tree before trusting a single response.
+
+#### What observation confirmed
+
+- **§8.12 `prefix_cache_lookups` counts completed generations.** After exactly **two** chat
+  completions, `onnx_genai_prefix_cache_lookups_total` read **2**. This was previously an inference
+  from `metrics.rs:133-135`; it is now a measurement.
+- **§8.3 `tokens_per_second` is a placeholder.** 425 tokens were generated across the run and
+  `/v1/status` still reported `tokens_per_second: 0.0`. The server accumulates totals and never
+  computes a rate.
+- **§4.8 the registry has no model dimension.** The only labels anywhere in `/metrics` are histogram
+  `le=` buckets. Every counter is process-global, exactly as `metrics.rs:74-89` implies.
+- **§8.12 `vram`/`host_ram` are ceilings.** `/v1/resources` reported `vram: {used: 0, limit:
+  5746050801}` — a 5.7 GB limit against a consumption term that is structurally absent.
+- **§8.4a the batching path never hits.** `onnx_genai_prefix_cache_hits_total` was `0` after both
+  generations, alongside a live `lookups` of 2.
+
+#### What observation corrected
+
+- **🔴 `created` is no longer a clock — that §8.12 row is RESOLVED.** The row asserted
+  `created: now_unix()`, re-verified at `routes/admin.rs:29`. Two successive `/v1/models` calls three
+  seconds apart returned the **identical** `created: 1785389982`. Commit **`e556b7f4`** replaced it
+  with `directory_mtime_secs(&status.path)` — a real property of a real directory. **The claim was
+  true when written and false when shipped, and only a running server could tell the difference.**
+- **The misnamed counters now carry honest `HELP` text.** `/metrics` describes
+  `prefix_cache_lookups_total` as *"Generation requests checked for prefix-cache reuse"* and
+  `hit_rate` as *"Fraction of completed generations that reused a cached prefix."* **The metric
+  names still lie; their documentation no longer does.** A Prometheus consumer reading `HELP` gets
+  the truth, and one reading only the name does not — so §8.12 stays open, downgraded.
+
+#### What observation revealed that no reading would have
+
+**§8.10 is PARTIALLY RESOLVED, and the residual is measurable.** `a6fefde2` stopped `/v1/resources`
+blocking until a batch drains, and it no longer does. But telemetry still contends with decode:
+
+| Condition | `/v1/resources` latency |
+|---|---|
+| Idle (control, n=5) | **1.6 – 8.8 ms** |
+| During generation, **first** call (n=2 runs) | **2.49 s, 3.03 s** |
+| During generation, subsequent calls | 27 – 170 ms |
+
+The first read after a batch starts is **~1000× slower than idle**, then synchronises and stays
+cheap. **The control arm is what makes this a finding rather than an anecdote** — without it, 2.5 s
+is equally consistent with ordinary first-call warm-up.
+
+> **Consequence for the dashboard, and it is a design input, not a footnote: a 4 Hz poll issues
+> every 250 ms against an endpoint that can take 2.5 s at exactly the moment generation begins.**
+> The poll that matters most is the one guaranteed to be late. This is the measured form of the
+> threading constraint that motivates event-sampling the block table instead of polling it: a panel
+> that is flat because it was not read is pixel-identical to one that is flat because nothing
+> happened.
+
+
 
 ---
 
