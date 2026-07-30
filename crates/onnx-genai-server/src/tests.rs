@@ -4921,3 +4921,56 @@ fn a_block_table_serves_the_denominator_for_its_own_fill_ratio() {
          denominator must be the measured one rather than the usual one"
     );
 }
+
+/// The batch numerator must be read from the batch, and this is checked in the
+/// source because no unit test can observe it.
+///
+/// Reverting `batch_in_flight` to `snapshot.current_batch_size` is GREEN
+/// across this whole suite. Both readings are zero in an idle fixture, so
+/// every behavioural assertion still holds; the two sources only disagree
+/// under real concurrency, which is measurable on a running server and not
+/// here. That is the same shape as the `pending` vocabulary hole: a property
+/// that lives in the source cannot be caught by a test aimed at the output.
+///
+/// `current_batch_size` is legitimately used once, for `active_batch_size`,
+/// which is honestly named -- it reports generations in flight over HTTP and
+/// claims nothing about batch rows. The guard is that it never reaches a field
+/// paired with a batch capacity.
+#[test]
+fn the_batch_numerator_is_never_read_from_the_http_generation_gauge() {
+    let source = include_str!("routes/admin.rs");
+
+    let offending: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        // Claims only. This doc comment quotes the retired form, and a guard
+        // that cannot tell a claim from a quotation fails on its own prose.
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| line.contains("current_batch_size"))
+        .filter(|line| {
+            line.contains("batch_in_flight")
+                || line.contains("batch_capacity")
+                || line.contains("batch_utilization")
+                || line.contains("batch_queued")
+        })
+        .collect();
+
+    assert!(
+        offending.is_empty(),
+        "a batch field is fed by the per-HTTP-generation gauge, which is \
+         bounded by max_queue_depth rather than by the batch: {offending:?}"
+    );
+
+    let uses = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| line.contains("snapshot.current_batch_size"))
+        .count();
+    assert_eq!(
+        uses, 1,
+        "expected exactly one use of the HTTP generation gauge \
+         (`active_batch_size`); a new one is a numerator looking for a \
+         denominator it does not belong to"
+    );
+}
