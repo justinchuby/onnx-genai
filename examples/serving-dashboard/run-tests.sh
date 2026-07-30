@@ -98,6 +98,60 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
   provenance="${#untracked[@]} untracked, ${#absent[@]} tracked-but-missing"
 fi
 
+# IS THIS CHECKOUT EVEN COMPLETE? -- a question `porcelain 0` DOES NOT ANSWER.
+#
+# @e00032a4 measured a `git worktree add` that failed 14 times on a full disk,
+# could not create its own `scripts/lib` directory, and left behind a directory
+# that still looked like a repository. A citation harness then ran inside it and
+# printed a confident GREEN, because the files it happened to read were among
+# the ones that HAD been written. A half-written checkout is not a clean tree
+# and it is not a dirty tree -- it is a tree that answers questions about files
+# that are not there by not being asked about them.
+#
+# Note the two failure signatures are OPPOSITE and both are silent:
+#   missing a file a test IMPORTS   -> loud, node dies, we were never at risk
+#   missing a file nothing imports  -> the suite is green over a partial tree
+#
+# Scoped to the WHOLE REPOSITORY from the toplevel, not to this directory:
+# @73e77d95 proved `git` pathspecs are silently intersected with your cwd, and
+# @e00032a4's partial tree failed on `scripts/`, which a demo-scoped check would
+# never have looked at. Cheap: one stat per tracked file.
+incomplete=()
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  toplevel=$(git rev-parse --show-toplevel)
+  while IFS= read -r f; do
+    [[ -n $f && ! -e "${toplevel}/${f}" ]] && incomplete+=("$f")
+  done < <(git -C "${toplevel}" ls-tree -r HEAD --name-only 2>/dev/null)
+fi
+
+# FAIL FAST, BEFORE THE TESTS, NOT AFTER THEM.
+#
+# This abort was originally reported alongside the other reconciliation lines,
+# AFTER the suite ran. Proved wrong by running this script inside a real
+# half-written checkout (1999 of 2155 tracked files absent): the suite ran to
+# completion, produced 1100 lines of output and FOUR failing tests with ENOENT
+# stacks pointing at crates/, and only then said the checkout was incomplete.
+# The text even read "every result below is a lie" while the results were
+# ABOVE it.
+#
+# Four misleading reds cost more than one true one. Every test in this suite
+# resolves claims against files on disk, so in an incomplete tree their
+# failures describe the CHECKOUT, not the code -- and whoever reads them goes
+# hunting through crates/ for a defect that is not there. Refuse to produce a
+# number rather than produce one that has to be retracted.
+if (( ${#incomplete[@]} > 0 )); then
+  echo "FAIL: this checkout is INCOMPLETE -- ${#incomplete[@]} of $(git -C "${toplevel}" ls-tree -r HEAD --name-only | wc -l | tr -d ' ') file(s) tracked at HEAD are absent." >&2
+  echo "      This is not a dirty tree and it is not a stale one; it is a" >&2
+  echo "      half-written checkout, and a green from it would be a spotless" >&2
+  echo "      measurement of a repository that was never assembled." >&2
+  echo "      NO TESTS WERE RUN. Fix the checkout, then re-run." >&2
+  echo "      A full disk produces exactly this: 'git worktree add' fails" >&2
+  echo "      partway and still leaves a directory that looks like a repo." >&2
+  printf '      %s\n' "${incomplete[@]:0:10}" >&2
+  (( ${#incomplete[@]} > 10 )) && echo "      ... and $(( ${#incomplete[@]} - 10 )) more" >&2
+  exit 1
+fi
+
 # Same basename in two directories: legal, and tonight it shipped twice with
 # DIFFERENT BYTES while one documented command reached only one of them.
 dupes=$(printf '%s\n' "${test_files[@]}" | sed 's|.*/||' | sort | uniq -d)
@@ -121,6 +175,7 @@ echo "  suites executed  : ${suites:-<unparsed>}"
 echo "  tests            : ${tests:-<unparsed>}"
 echo "  failed           : ${failed:-<unparsed>}"
 echo "  provenance       : ${provenance}"
+echo "  checkout         : ${#incomplete[@]} tracked file(s) missing from this working tree"
 
 status=0
 
@@ -134,6 +189,8 @@ if [[ -n ${dupes} ]]; then
   echo "      Not fatal. But a glob that reaches one copy and not the other" >&2
   echo "      reports a stable total whose meaning silently differs." >&2
 fi
+
+
 
 if (( ${#absent[@]} > 0 )); then
   echo "FAIL: ${#absent[@]} test file(s) are tracked at HEAD but missing from disk:" >&2
