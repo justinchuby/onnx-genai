@@ -300,6 +300,139 @@ This document contains withdrawals. Read every one of them as scoped to the
 question in it, and if the question is not stated, treat the area as unexamined
 rather than as cleared.
 
+### 14. `git show HEAD:` is absolute; `git grep … HEAD` is scoped to where you stand
+
+We escalated all night from *read the file* to *read `HEAD`*, precisely to take
+the desk out of the measurement. One of those two commands does that. The other
+does not, and it is the one that looks more thorough:
+
+```
+IDENTICAL COMMAND · IDENTICAL COMMIT · ONLY THE DIRECTORY DIFFERS
+
+  from repo root                     git grep -c batch_telemetry HEAD -- '*.rs'  ->  4 files
+  from examples/serving-dashboard    (the same command, character for character) ->  0 hits
+
+  git show HEAD:crates/onnx-genai-server/src/lib.rs   from that same subdirectory
+                                                       ->  174 lines. UNAFFECTED.
+```
+
+`git grep <pat> HEAD -- <glob>` does not search the commit. **It searches the
+commit intersected with your current working directory**, and the `HEAD`
+argument makes that invisible, because `HEAD` names a commit rather than a
+place. `git show HEAD:<path>` takes a root-relative path and is immune.
+
+This produced a live order to delete a file that 32 committed references depend
+on, including `lib.rs:25: mod batch_telemetry;`. The zero was real, reproducible,
+and taken from a directory containing no Rust at all. **Deleting the file yields
+`error[E0583]` and the crate does not compile.**
+
+> **Print `pwd` beside `toplevel`, or your measurement has two unstated
+> parameters instead of one.** Most of this crew works from
+> `examples/serving-dashboard`, and every `git grep … HEAD -- '*.rs'` run from
+> there returns a confident, well-formed, correctly-formatted zero about the
+> entire Rust codebase.
+
+And the control failed for a reason worth more than the defect. The finding used
+a **glob** pathspec; the control used an **explicit root-relative path**. A root-
+relative path behaves differently under a subdirectory cwd than a bare glob does,
+so the control exercised an instrument configuration the finding never used and
+returned a healthy number from the wrong machine.
+
+> **A control must differ from the finding in exactly one respect: the expected
+> answer.** Change the command's *shape* — its pathspec form, its anchoring, its
+> flags — and you have validated a different instrument and learned nothing about
+> yours.
+
+### A deduplication can produce a value that was in neither half
+
+`'batch.capacity'` was declared twice in `telemetry-provenance.js`, at `:497` and
+`:637`. JavaScript keeps the **last** definition silently, so the terse entry was
+the one that shipped and the fuller one was discarded with no error. It was fixed,
+and the fix was verified — someone asked *which of the two survived*, which is a
+step almost nobody takes.
+
+Asking it was still not enough, because the honest answer is **neither**:
+
+```
+                 evidence                              label
+  HALF A :497    symbol-anchored, full derivation      (none)
+  HALF B :637    positional — 'admin.rs:178'           'Batch limit'
+  ----------------------------------------------------------------------
+  AT HEAD        A's evidence                          'Effective batch capacity'
+                                                        ^ IN NEITHER HALF
+```
+
+The result is better than both inputs — the positional citation is gone
+(`admin.rs:178` is now zero occurrences) and the label was corrected rather than
+merely chosen. But *which half won* was the wrong question, and it is the question
+the careful reviewer asks. **Diff the result against both inputs, not against your
+expectation of which one deserved to win.** A merge can introduce a third value
+silently, and nothing here made that value better except the judgement of whoever
+performed it.
+
+### The misnomer was retired in the catalogue and still ships in the renderer
+
+This is the same fix, half-landed, and it is live at `HEAD`:
+
+```
+dashboard/scheduling.js:123   const maxBatch = telemetryStore.field('batch.capacity');
+dashboard/scheduling.js:210   renderField(maxBatch, { label: 'Batch limit' })   <- ON SCREEN
+
+telemetry-provenance.js:497   'batch.capacity': { … label: 'Effective batch capacity' }
+```
+
+Same key, two labels, and **the renderer is the one a visitor reads.** The
+catalogue's label is not consulted by this panel at all — `scheduling.js`
+hardcodes nine `label:` strings of its own — so correcting the catalogue changed
+the audit trail and changed nothing on the page.
+
+The distinction matters because the value is not a batch limit. It is
+`effective_batch_capacity`, which `state.rs` defines as
+`max_batch.min(max_queue_depth)`; the catalogue was renamed *precisely because*
+`'Batch limit'` names the wrong quantity. **The renderer therefore ships the exact
+caption the catalogue abandoned, and the rename stands as evidence that the crew
+already agreed it was wrong.**
+
+> Treat *the misnomer was fixed* as a claim about a surface, never about a
+> repository. A caption lives wherever it is written, and a correction lands only
+> where it is applied. This one was reported closed and is on the projector.
+
+### An orphan is a private stale belief; a tracked file is a published one
+
+Thirteen untracked artefacts were found late in the session and there was
+pressure to land them all. Landing one imported a **retracted** measurement into
+the branch four times over, in a commit whose message described it as evidence a
+reviewer must read.
+
+The mechanism is worth stating because it inverts the obvious instinct. An
+append-only working document supersedes its own claims internally — the author
+knows which paragraphs are dead. **Committing it wholesale republishes every
+withdrawn finding in the present tense, with the authority of a tracked file.**
+
+> For any document whose claims have been withdrawn, committing it is strictly
+> worse than leaving it an orphan. Presence is the right first question. It is not
+> the answer. **Distil, do not copy — commit a consolidated current state with
+> retractions marked as retractions.**
+
+A 32-kilobyte artefact was subsequently, deliberately left uncommitted on exactly
+this reasoning: it predates three retractions, and landing it would have moved
+staleness inside the perimeter where it inherits the tree's authority.
+
+### What the citation harness does and does not certify
+
+Gate items and review claims lean on `scripts/check_citations.py`. Its own author
+put the limit in the verdict line, and it belongs beside any green that cites it:
+
+> *A passing run means **only** that each pointer lands on something real. It does
+> **not** mean the surrounding prose is correct.*
+
+A citation harness can never verify that a pointer is the one the sentence is
+about. It can only refuse to let an author believe the question was asked and
+answered. Fourteen citations in the architecture document are flagged **ambiguous**
+and are deliberately not claimed as fixed — the alternative was to infer them from
+surrounding context, which is a checker fabricating the evidence it exists to
+audit.
+
 ### And one about this document
 
 `grep` cannot see negation. The string `'Batch limit'` appears in
