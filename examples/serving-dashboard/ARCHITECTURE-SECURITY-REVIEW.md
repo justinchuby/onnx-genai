@@ -245,6 +245,7 @@ Two consequences worth carrying past this PR:
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
 | **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `state.rs`, `routes/admin.rs` or `cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
 | **C12** | ~~`fetchWithDeadline` is the only network path by discipline, not by construction; nothing asserts it~~ | **RETRACTED — false when filed. See §7.6** | executed |
+| **C15** | `fetchWithDeadline` **silently discards a caller-supplied `signal`** — `{ ...init, signal: controller.signal }` spreads the caller's key and then overwrites it. The docstring promises *"everything else is passed through to the underlying fetch untouched"*; that promise is false for the one key that controls cancellation. Executed at `review-0`: caller's `abort()` leaves the request **PENDING**. 🟡 latent — zero shipped callers pass a signal today | 🟡 NEW, latent, structural — see §8.1 | executed |
 
 **On C10 and five checkouts:** this deserves more weight than its severity suggests.
 With five checkouts of this repository on one machine, launching from the wrong one
@@ -323,6 +324,57 @@ retraction.**
 **7.4 — A false count caught before broadcast.** I nearly reported the router's
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
+
+**8.1 — C15: the deadline seam silently discards a caller's `signal`, and its own
+guard cannot see that it does.** Filed at @c0de4c2e's request to read C2 for
+*correctness* rather than *landedness*.
+
+The `finally`/`clearTimeout` pairing is **correct on every path**, and its comment is the
+most honest paragraph in the dashboard: it states that a leaked timer would be inert
+because each call owns its controller, that what the line prevents is timer accumulation,
+and that *no behavioural test can distinguish its presence from its absence, so the limit
+is written here rather than asserted somewhere it would look stronger than it is.* That is
+the standard, and it needs no change.
+
+The defect is one line up. `fetchWithDeadline` destructures `fetchImpl` and `timeoutMs`
+out of `options`, then calls `fetchImpl(input, { ...init, signal: controller.signal })`.
+A caller-supplied `signal` lands in `init` and is **overwritten by position**. Executed
+against `review-0` bytes:
+
+```
+caller signal === signal fetch received : false
+caller signal was REPLACED             : true
+after caller abort()                   : PENDING     <- cancellation silently dead
+```
+
+**Reachability, stated before severity: zero shipped callers pass a `signal` at
+`review-0`.** The refactor removed `telemetry-store.js`'s own `AbortController` rather
+than leaving it stranded, so this is **latent, not live** — no regression shipped. The
+`@param` typedef lists `fetchImpl`, `timeoutMs`, `headers`, `cache` and does not invite
+`signal`, which mitigates it further.
+
+**What makes it worth filing anyway is that the prose and the guard both assert the
+opposite.** The docstring says *"everything else is passed through to the underlying fetch
+untouched."* That is a universal claim, and it is false for exactly one key — the key a
+future caller reaches for when they need to cancel on unmount, navigation, or a scenario
+switch. This is the module every network call must now go through, so the first caller who
+wants cancellation gets silence rather than an error.
+
+**And the test that should catch it carries a caption broader than its value.**
+`request-deadline.test.js` — *the caller options reach the underlying fetch untouched* —
+passes only `headers` and `cache`, and asserts `assert.ok(seen.signal, 'no signal was
+attached')`. That assertion is **true whether the signal is the caller's or the module's**,
+so it is structurally incapable of distinguishing the two states that matter. It is the
+same shape @73e77d95 found in F2's guard: a check written to be robust to a value is blind
+to that value being wrong. A reader auditing "does this module forward options correctly?"
+finds a green test whose name answers yes and whose body asked two thirds of the question.
+
+**Fix, in preference order.** (1) Compose: `signal: init.signal ?
+AbortSignal.any([init.signal, controller.signal]) : controller.signal` — one line, and it
+makes the caller's intent survive by construction. (2) Refuse: throw on a caller-supplied
+`signal`. Either converts a silent wrong answer into a loud one. What should **not**
+happen is a documentation fix — the interface currently works only because no caller
+exercises the promise it makes, which is an unwritten rule enforced by nothing.
 
 **7.7 — I reported C5 STRUCK against `review-0` and it is LIVE there. That is a false
 green in my own lane, and the mechanism is new tonight.**
