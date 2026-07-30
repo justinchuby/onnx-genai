@@ -3767,6 +3767,7 @@ async fn commands_parked_before_a_batch_starts_are_drained_into_it() {
     let (reply, snapshot_rx) = tokio::sync::oneshot::channel();
     deferred.push_back(crate::driver::DriverCommand::ResourceSnapshot(reply));
 
+    let batch_telemetry = crate::batch_telemetry::BatchTelemetry::default();
     crate::driver::run_static_batch_until_idle(
         &engine,
         &mut rx,
@@ -3775,6 +3776,21 @@ async fn commands_parked_before_a_batch_starts_are_drained_into_it() {
         onnx_genai::GenerateRequest::new("hello"),
         events,
         permit,
+        &batch_telemetry,
+    );
+
+    // The real loop ran, so occupancy must exist and must be commensurable.
+    // Asserted here rather than in a unit test because only the real loop can
+    // show what the manager actually reports mid-batch.
+    let occupancy = batch_telemetry
+        .snapshot()
+        .expect("the batch loop ran, so it must have published an occupancy");
+    assert!(
+        occupancy.active <= occupancy.capacity,
+        "batch published {} rows of {}, which renders as an over-capacity \
+         fraction",
+        occupancy.active,
+        occupancy.capacity
     );
 
     assert!(
@@ -4273,9 +4289,15 @@ async fn every_omitted_status_field_is_explained_and_every_explained_field_is_om
             "{field} is explained as unavailable but was still sent"
         );
         let code = reason.get("code").and_then(Value::as_str).unwrap_or("");
+        // Checked against the server's published vocabulary rather than a
+        // list copied into this test. A copy is what let `pending` ship
+        // without appearing in any constructor: the duplicate agreed with
+        // itself and with nothing else.
         assert!(
-            matches!(code, "unavailable" | "not-applicable"),
-            "{field} has an unrecognised reason code {code:?}"
+            crate::routes::FieldUnavailable::CODES.contains(&code),
+            "{field} has a reason code {code:?} that is not in the server's \
+             published vocabulary {:?}",
+            crate::routes::FieldUnavailable::CODES
         );
         let detail = reason.get("detail").and_then(Value::as_str).unwrap_or("");
         assert!(

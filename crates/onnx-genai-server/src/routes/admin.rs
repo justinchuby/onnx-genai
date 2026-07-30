@@ -88,6 +88,44 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
     // alongside the omissions so a field can never be dropped silently.
     let mut unavailable = BTreeMap::new();
 
+    // Batch occupancy is read from the driver that owns the batch, not from
+    // the process-wide HTTP gauge. `None` until a driver loop has published,
+    // so an idle batch stays distinguishable from a build that never batched.
+    //
+    // The capacity is narrowed by admission per the standing ruling: a client
+    // handed the raw row count would render "3 of 4" on a server whose real
+    // ceiling is one. Admission also bounds the numerator, so the pair stays
+    // commensurable after the narrowing.
+    let occupancy = state
+        .registry
+        .resolve("")
+        .ok()
+        .flatten()
+        .and_then(|handle| handle.engine.batch_telemetry().snapshot())
+        .map(|mut o| {
+            let admission = state.config.max_queue_depth as u64;
+            o.capacity = o.capacity.min(admission);
+            o.active = o.active.min(o.capacity);
+            o
+        });
+    if occupancy.is_none() {
+        for field in [
+            "batch_utilization",
+            "batch_in_flight",
+            "batch_capacity",
+            "batch_queued",
+        ] {
+            unavailable.insert(
+                field,
+                FieldUnavailable::pending(
+                    "no generation has run on this node yet, so the driver has \
+                     published no batch occupancy; a zero here would be \
+                     indistinguishable from an idle batch",
+                ),
+            );
+        }
+    }
+
     // Paged-KV introspection is per-engine and this handler holds no engine
     // reference. The four KV fields travel together: reporting any one of them
     // while the others are absent would imply the pool is partially known.
@@ -162,20 +200,22 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
         active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
         paused_sessions: None,
         tokens_per_second: None,
-        // Real: in-flight generations over the batch the server can actually
-        // assemble. Both terms are measured or configured, not assumed --
-        // `current_batch_size` is a gauge incremented when a generation starts
-        // and decremented when it is dropped.
-        batch_utilization: batch_utilization(
-            snapshot.current_batch_size,
-            state.config.effective_batch_capacity(),
-        ),
-        // The raw numerator, unclamped, so the client never has to invert a
-        // saturating ratio to recover a count the server already knows.
-        batch_in_flight: u32::try_from(snapshot.current_batch_size).unwrap_or(u32::MAX),
+        // Both terms come from the driver's own batch, read as one reading.
+        //
+        // They used to come from different populations: the numerator was
+        // `metrics::REGISTRY.batch_size`, a per-HTTP-generation gauge bounded
+        // by `max_queue_depth` (256 on the demo), while the denominator was
+        // `effective_batch_capacity()` (4). Six concurrent requests therefore
+        // published `batch_in_flight = 6, batch_capacity = 4`. The ratio was
+        // clamped to 1.0 and looked correct; the raw pair renders "6 of 4".
+        batch_utilization: occupancy.map(|o| batch_utilization(o.active, o.capacity as usize)),
+        // The raw numerator, so the client never has to invert a saturating
+        // ratio to recover a count the server already knows.
+        batch_in_flight: occupancy.map(|o| u32::try_from(o.active).unwrap_or(u32::MAX)),
         // The denominator itself, so the client never hardcodes a capacity no
-        // endpoint confirms. Same source as the ratio above, read once.
-        batch_capacity: u32::try_from(state.config.effective_batch_capacity()).unwrap_or(u32::MAX),
+        // endpoint confirms. Same reading as the ratio above.
+        batch_capacity: occupancy.map(|o| u32::try_from(o.capacity).unwrap_or(u32::MAX)),
+        batch_queued: occupancy.map(|o| u32::try_from(o.queued).unwrap_or(u32::MAX)),
         // Session ids are real, and redacted because full ids are bearer
         // tokens (see session.rs). The per-session detail fields are omitted
         // rather than filled with "unknown".

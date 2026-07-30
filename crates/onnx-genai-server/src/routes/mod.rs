@@ -232,7 +232,10 @@ pub(crate) struct NodeStatus {
     paused_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens_per_second: Option<f64>,
-    batch_utilization: f32,
+    /// Omitted until a driver loop publishes an occupancy reading, because a
+    /// zero ratio and "no batch has ever run" are the same bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_utilization: Option<f32>,
     /// The numerator of [`Self::batch_utilization`], **unclamped**.
     ///
     /// Published because the ratio alone cannot be inverted. `batch_utilization`
@@ -244,7 +247,8 @@ pub(crate) struct NodeStatus {
     ///
     /// With this field the client reads both terms directly and can detect
     /// `batch_in_flight > batch_capacity` itself rather than being told "full".
-    batch_in_flight: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_in_flight: Option<u32>,
     /// The denominator of [`Self::batch_utilization`], published so a client
     /// can render "3 of 4" rather than a bare percentage it must trust.
     ///
@@ -254,7 +258,18 @@ pub(crate) struct NodeStatus {
     /// tighter constraint, and `max_batch` alone overstates the ceiling. A
     /// client that received this as `max_batch` would re-derive the wrong
     /// quantity from an honest one.
-    batch_capacity: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_capacity: Option<u32>,
+    /// Requests admitted and waiting for a free row.
+    ///
+    /// Reported beside [`Self::batch_in_flight`] rather than folded into it.
+    /// A request waiting for a row and a request being decoded are different
+    /// facts, and collapsing them is what let an HTTP-level count masquerade
+    /// as batch occupancy: measured live, six concurrent requests against a
+    /// four-row batch published `batch_in_flight = 6, batch_capacity = 4`,
+    /// which renders as "6 of 4".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_queued: Option<u32>,
     sessions: Vec<SessionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_hashes: Option<Vec<String>>,

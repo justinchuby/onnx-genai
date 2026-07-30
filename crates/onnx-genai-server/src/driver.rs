@@ -14,6 +14,8 @@ use onnx_genai_engine::{
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
+use crate::batch_telemetry::BatchTelemetry;
+
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 
@@ -31,6 +33,10 @@ pub(crate) struct EngineDriver {
     /// blocked inside a generation. `None` for pipeline engines, which have no
     /// governor to share.
     governor: Option<Arc<EngineResourceGovernor>>,
+    /// Occupancy of the batch the decoder is stepping, published by the driver
+    /// thread. Shared for the same reason as `kv_telemetry`: the status route
+    /// must answer while that thread is blocked inside a generation.
+    batch_telemetry: Arc<BatchTelemetry>,
 }
 
 pub(crate) enum DriverCommand {
@@ -128,15 +134,24 @@ impl EngineDriver {
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         let kv_telemetry = Arc::new(KvTelemetry::default());
         let driver_telemetry = Arc::clone(&kv_telemetry);
+        let batch_telemetry = Arc::new(BatchTelemetry::default());
+        // Published here, on the caller's thread, rather than from the driver
+        // loop. The width is already known at construction, and publishing it
+        // from the spawned thread would race the first `/v1/status`: the
+        // fields would be present or absent depending on scheduling, which is
+        // the same class of defect as a test that races driver startup.
+        batch_telemetry.publish(0, 0, max_batch);
+        let driver_batch = Arc::clone(&batch_telemetry);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, max_batch, driver_telemetry))
+            .spawn(move || run_engine_driver(owner, rx, max_batch, driver_telemetry, driver_batch))
             .expect("failed to spawn onnx-genai engine driver");
         Self {
             commands,
             generation_capacity,
             kv_telemetry,
             governor,
+            batch_telemetry,
         }
     }
 
@@ -150,6 +165,9 @@ impl EngineDriver {
             generation_capacity: Arc::new(Semaphore::new(0)),
             kv_telemetry: Arc::new(KvTelemetry::default()),
             governor: None,
+            // No driver thread, so nothing ever publishes: the status route
+            // omits the batch fields, which is the truth about this handle.
+            batch_telemetry: Arc::new(BatchTelemetry::default()),
         }
     }
 
@@ -170,6 +188,7 @@ impl EngineDriver {
             generation_capacity: Arc::new(Semaphore::new(0)),
             kv_telemetry: Arc::new(KvTelemetry::default()),
             governor: Some(engine.governor_handle()),
+            batch_telemetry: Arc::new(BatchTelemetry::default()),
         }
     }
 
@@ -182,15 +201,25 @@ impl EngineDriver {
         &self.kv_telemetry
     }
 
+    /// Live batch occupancy, or `None` until a driver loop has published one.
+    pub(crate) fn batch_telemetry(&self) -> &Arc<BatchTelemetry> {
+        &self.batch_telemetry
+    }
+
     pub(crate) fn start_pipeline(engine: PipelineEngine, max_queue_depth: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
         let kv_telemetry = Arc::new(KvTelemetry::default());
         let driver_telemetry = Arc::clone(&kv_telemetry);
+        let batch_telemetry = Arc::new(BatchTelemetry::default());
+        // Pipeline engines run one generation at a time; their batch is one
+        // row wide by construction.
+        batch_telemetry.publish(0, 0, 1);
+        let driver_batch = Arc::clone(&batch_telemetry);
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, 1, driver_telemetry))
+            .spawn(move || run_engine_driver(owner, rx, 1, driver_telemetry, driver_batch))
             .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
@@ -199,6 +228,7 @@ impl EngineDriver {
             // Pipeline engines expose no resource governor, so `/v1/resources`
             // keeps the command path and its honest "not available" error.
             governor: None,
+            batch_telemetry,
         }
     }
 
@@ -495,6 +525,7 @@ fn run_engine_driver(
     rx: mpsc::Receiver<DriverCommand>,
     max_batch: usize,
     kv_telemetry: Arc<KvTelemetry>,
+    batch_telemetry: Arc<BatchTelemetry>,
 ) {
     let mut engine = match owner.0 {
         EngineBackend::Single(engine) => *engine,
@@ -521,10 +552,10 @@ fn run_engine_driver(
 
     if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");
-        run_static_engine_driver(&mut engine, rx, max_batch);
+        run_static_engine_driver(&mut engine, rx, max_batch, &batch_telemetry);
     } else {
         tracing::info!("continuous batch driver disabled; using per-request engine path");
-        run_fallback_engine_driver(&mut engine, rx);
+        run_fallback_engine_driver(&mut engine, rx, &batch_telemetry);
     }
 }
 
@@ -597,9 +628,25 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
     }
 }
 
-fn run_fallback_engine_driver(engine: &mut Engine, mut rx: mpsc::Receiver<DriverCommand>) {
+fn run_fallback_engine_driver(
+    engine: &mut Engine,
+    mut rx: mpsc::Receiver<DriverCommand>,
+    batch_telemetry: &BatchTelemetry,
+) {
+    // This path runs generations inline, one at a time. Its capacity is not
+    // `max_batch` -- no batch exists -- it is one. Publishing that is what
+    // stops the status route pairing a count from this path with a width no
+    // code here honours.
+    batch_telemetry.publish(0, 0, 1);
     while let Some(command) = rx.blocking_recv() {
+        let generating = matches!(command, DriverCommand::Generate { .. });
+        if generating {
+            batch_telemetry.publish(1, 0, 1);
+        }
         handle_driver_command(engine, command);
+        if generating {
+            batch_telemetry.publish(0, 0, 1);
+        }
     }
 }
 
@@ -607,8 +654,15 @@ fn run_static_engine_driver(
     engine: &mut Engine,
     mut rx: mpsc::Receiver<DriverCommand>,
     max_batch: usize,
+    batch_telemetry: &BatchTelemetry,
 ) {
     // The current ContinuousBatchManager API accepts GenerateRequest only.
+    // A batch of known width exists the moment this loop starts, before any
+    // request arrives. Publishing it here means a live node always carries
+    // both terms -- an idle batch reports `0 of 4`, which is a measurement --
+    // and only a driver with no thread behind it omits them.
+    batch_telemetry.publish(0, 0, max_batch);
+
     // X-Session-Id requests keep using the driver's per-request engine path so
     // persistent engine KV/session semantics are preserved until the manager
     // grows a SessionId-aware submit API.
@@ -642,6 +696,7 @@ fn run_static_engine_driver(
                     *request,
                     events,
                     permit,
+                    batch_telemetry,
                 );
             }
             command => handle_driver_command(engine, command),
@@ -662,6 +717,7 @@ pub(crate) fn run_static_batch_until_idle(
     first_request: GenerateRequest,
     first_events: mpsc::Sender<DriverEvent>,
     first_permit: OwnedSemaphorePermit,
+    batch_telemetry: &BatchTelemetry,
 ) {
     let mut manager = match engine.continuous_batch_manager(max_batch) {
         Ok(manager) => manager,
@@ -721,11 +777,25 @@ pub(crate) fn run_static_batch_until_idle(
             }
             break;
         }
+        // Both terms come from `manager` at the same instant. `max_batch()`
+        // is the length of the row array and `active_len()` counts occupied
+        // slots of that same array, so the pair cannot exceed one.
+        batch_telemetry.publish(
+            manager.active_len(),
+            manager.pending_len(),
+            manager.max_batch(),
+        );
+
         route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
         if manager.is_idle() {
             break;
         }
     }
+
+    // The batch is gone. Leaving the last reading in place would leave the
+    // status route reporting rows that no longer exist, which reads as a
+    // wedged server rather than an idle one.
+    batch_telemetry.publish(0, 0, max_batch);
 }
 
 /// Takes one command into a running batch, from either source.
