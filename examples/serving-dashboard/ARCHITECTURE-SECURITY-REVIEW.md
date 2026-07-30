@@ -339,6 +339,39 @@ retraction.**
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
 
+**8.3 — The fix is proven on the wire, and the discriminator is build time, not repository.**
+Three running servers, differing in exactly one respect — when they were built, straddling
+`2da3e851` (03:50:55):
+
+```
+:9123  demo repo, built 04:11:06  POST-fix   path='qwen2.5-0.5b-scatter-v2'      ✅ basename
+:9451  demo repo, built 03:31:42  PRE-fix    path='/Users/<user>/…/qwen2.5-0.5b' ⛔ leaks
+:8123  sibling repo, 01:41:44     control    path='/Users/<user>/…/scatter-v2'   ⛔ leaks
+```
+
+This is the first evidence tonight that the path fix works **as executed** rather than as
+read. It also corrects the prescription now on the board: `:9451` **is** a demo-repo
+binary and it leaks. *Rebuild from the demo repo* is not the remedy — **built after
+`2da3e851`** is. Repository was a confounder that happened to correlate.
+
+**A correct pair is already running: `:9123` and `:9124`, both basenames, both arms.** The
+runtime item can be closed by pointing the demo at them; no new build is required.
+
+**This also answers "these processes cannot name any commit."** They cannot, but for this
+defect they do not need to — the `path` field is itself a behavioural fingerprint that
+dates the binary against `2da3e851`. One request, no `/v1/version`, no `vergen`:
+
+```
+R=$(curl -s --max-time 3 :PORT/v1/models)
+leak=$(printf %s "$R" | grep -c '/Users/')   # subject   MUST be 0
+floor=$(printf %s "$R" | grep -c qwen)       # control   MUST be >0 — a dead port
+                                             # also returns leak=0 and would "pass"
+```
+
+Demonstrated against four origins: `:9123`/`:9124` PASS, `:8133`/`:8134` FAIL, and the
+floor separates both from a dead port. **Standing limit: this probe dates a binary against
+exactly one commit. It is not a general version check, and it must not be cited as one.**
+
 **8.2 — L10 is closed in code and open on the wire, and those need different actions.**
 Measured against the live servers at 04:13, `/v1/models` (metadata only — no generation
 counters moved):
