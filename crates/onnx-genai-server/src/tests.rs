@@ -3549,6 +3549,141 @@ async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
         .expect("the snapshot itself failed");
 }
 
+/// Route-level contract for `/v1/resources`.
+///
+/// ⚠️ WHAT THIS TEST CANNOT PROVE, stated because this bug sets exactly that
+/// trap: it drives the handler through an idle server, so it passes instantly
+/// and forever WHETHER OR NOT the endpoint is reachable under load. The AC31
+/// defect was never in the handler -- the handler is fine -- it was that the
+/// driver thread blocks inside `generate` so the handler is never reached.
+/// A green route suite is therefore compatible with a dead endpoint.
+/// Availability is proven by
+/// `resource_snapshots_answer_while_the_driver_thread_is_blocked` and by the
+/// live sustained-load run; this test pins SHAPE only.
+#[tokio::test]
+async fn resources_reports_limits_with_provenance_not_bare_numbers() {
+    let body = get_json(app(tiny_state()), "/v1/resources").await;
+
+    let limits = body
+        .get("resolved_limits")
+        .expect("resolved_limits must be present");
+    assert!(
+        limits.is_object(),
+        "limits must be a structured object, not a bare scalar: {body}"
+    );
+
+    // A ceiling of zero would render as "no memory available" rather than
+    // "unmeasured", so an unknown limit must be omitted, never zero-filled.
+    for (name, value) in limits.as_object().expect("object") {
+        if let Some(n) = value.as_u64() {
+            assert!(
+                n > 0,
+                "{name} is present and zero; an unmeasured ceiling must be \
+                 omitted rather than published as a real limit of zero"
+            );
+        }
+    }
+}
+
+/// AC31: `/v1/resources` must answer while the driver thread is blocked.
+///
+/// The fallback driver runs generation INLINE on its command loop, so a
+/// `DriverCommand` is only serviced between generations. Under sustained load
+/// -- arrivals overlapping departures -- those gaps close and the endpoint
+/// stops answering: measured at 5 of 6 polls timing out at 10s, worst 7.9s.
+///
+/// This pins the fix behaviourally rather than structurally. The driver has NO
+/// thread draining its command channel, which is what a thread stuck inside
+/// `generate` looks like from the outside, made deterministic. If the snapshot
+/// goes through the channel it is never serviced and this test times out; it
+/// passes only because the governor is read off-thread.
+#[tokio::test]
+async fn resource_snapshots_answer_while_the_driver_thread_is_blocked() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+
+    // Held, never read: the receiver must stay alive so sends park rather than
+    // failing fast with a "driver stopped" error, which would pass for the
+    // wrong reason.
+    let (commands, _never_drained) = tokio::sync::mpsc::channel(1);
+    let driver = crate::driver::EngineDriver::detached_with_governor_for_test(&engine, commands);
+
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        driver.resource_snapshot(),
+    )
+    .await
+    .expect(
+        "/v1/resources did not answer while the driver thread was unavailable; \
+                 under sustained load the endpoint stops answering entirely",
+    );
+
+    snapshot.expect("the snapshot itself failed");
+}
+
+/// The intake regression that the helper-level test above structurally cannot
+/// see, and that hung `/v1/resources` for 7.9s under real sustained load.
+///
+/// `run_static_engine_driver`'s outer loop drains EVERY pending command out of
+/// `rx` into a `deferred` queue before dispatching one of them. The batch loop
+/// it then enters used to read only `rx` -- so anything the outer drain had
+/// already moved to `deferred` was invisible for the whole batch. Two
+/// consequences, one availability and one capability:
+///   * a parked `ResourceSnapshot` waited for the batch to go idle, and under
+///     backfilled load the batch does not go idle;
+///   * parked generations could not join the running batch, so each ran as its
+///     own one-row batch -- continuous batching degrading to serialisation
+///     under exactly the concurrency it exists to overlap.
+///
+/// Asserted after the batch RETURNS rather than during it, which makes this
+/// non-racy: with the bug the command is still sitting in `deferred`,
+/// unanswered, no matter how fast the fixture generates.
+#[tokio::test]
+async fn commands_parked_before_a_batch_starts_are_drained_into_it() {
+    use std::collections::VecDeque;
+
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+
+    let (_tx, mut rx) = tokio::sync::mpsc::channel::<crate::driver::DriverCommand>(8);
+    let (events, _events_rx) = tokio::sync::mpsc::channel(64);
+    let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        .acquire_owned()
+        .await
+        .expect("semaphore permit");
+
+    // Exactly what the outer loop does before entering the batch: park the
+    // observability command it drained out of the channel.
+    let mut deferred = VecDeque::new();
+    let (reply, snapshot_rx) = tokio::sync::oneshot::channel();
+    deferred.push_back(crate::driver::DriverCommand::ResourceSnapshot(reply));
+
+    crate::driver::run_static_batch_until_idle(
+        &engine,
+        &mut rx,
+        &mut deferred,
+        4,
+        onnx_genai::GenerateRequest::new("hello"),
+        events,
+        permit,
+    );
+
+    assert!(
+        deferred
+            .iter()
+            .all(|c| !matches!(c, crate::driver::DriverCommand::ResourceSnapshot(_))),
+        "a resource snapshot parked before the batch started was never drained \
+         into it; /v1/resources hangs for the life of the batch, and under \
+         backfilled load the batch never goes idle"
+    );
+    snapshot_rx
+        .await
+        .expect("the parked snapshot's reply channel was dropped without an answer")
+        .expect("the snapshot itself failed");
+}
+
 /// The complement: commands that need `&mut Engine` cannot be served while the
 /// batch manager holds its borrow, so they must still be parked. This pins the
 /// helper's contract to "answer read-only observability", not "answer anything".

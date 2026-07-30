@@ -28,7 +28,15 @@ pub struct Engine {
     /// Batch scheduler.
     pub(crate) scheduler: Scheduler,
     /// Per-device resource ceilings and shared scheduler byte budget.
-    pub(crate) governor: EngineResourceGovernor,
+    ///
+    /// `Arc` so observability can read it without the driver thread. Every
+    /// accessor here takes `&self`, but the server's fallback driver runs
+    /// generation INLINE on its command loop, so a `/v1/resources` request
+    /// routed through a `DriverCommand` waits for the running generation --
+    /// and under sustained load the gaps between generations close and the
+    /// endpoint stops answering. A shared handle sidesteps the thread
+    /// entirely, and unlike a published mirror it can never be stale.
+    pub(crate) governor: Arc<EngineResourceGovernor>,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
     /// ORT session for decoder execution.

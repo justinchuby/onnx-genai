@@ -191,7 +191,7 @@ mod tests {
             kv_model: None,
             decode_path: ModelDecodePath::Legacy,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
-            governor,
+            governor: Arc::new(governor),
             sessions,
             session: None,
             #[cfg(feature = "native-backend")]

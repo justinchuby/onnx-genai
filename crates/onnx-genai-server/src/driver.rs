@@ -7,8 +7,9 @@ use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
 use onnx_genai_engine::{
-    ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
-    GovernorSnapshot, KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
+    ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError,
+    EngineResourceGovernor, FimConfig, GovernorSnapshot, KvTelemetry, PipelineEngine,
+    PipelineGenerateRequest, ResourceLimit,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -25,6 +26,11 @@ pub(crate) struct EngineDriver {
     /// Shared with the driver thread's engine. Read directly by HTTP handlers,
     /// never through the command channel.
     kv_telemetry: Arc<KvTelemetry>,
+    /// Shared with the driver thread's engine, for the same reason as
+    /// `kv_telemetry`: `/v1/resources` must answer while the driver thread is
+    /// blocked inside a generation. `None` for pipeline engines, which have no
+    /// governor to share.
+    governor: Option<Arc<EngineResourceGovernor>>,
 }
 
 pub(crate) enum DriverCommand {
@@ -116,6 +122,9 @@ impl EngineDriver {
     pub(crate) fn start(engine: Engine, max_batch: usize, max_queue_depth: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
+        // Taken BEFORE the engine moves to the driver thread: this is the only
+        // point at which the server can still touch it.
+        let governor = Some(engine.governor_handle());
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         let kv_telemetry = Arc::new(KvTelemetry::default());
         let driver_telemetry = Arc::clone(&kv_telemetry);
@@ -127,6 +136,7 @@ impl EngineDriver {
             commands,
             generation_capacity,
             kv_telemetry,
+            governor,
         }
     }
 
@@ -139,6 +149,27 @@ impl EngineDriver {
             commands,
             generation_capacity: Arc::new(Semaphore::new(0)),
             kv_telemetry: Arc::new(KvTelemetry::default()),
+            governor: None,
+        }
+    }
+
+    /// An [`EngineDriver`] holding a real engine's governor handle but with NO
+    /// driver thread behind it, so nothing ever drains the command channel.
+    ///
+    /// This is what a driver thread blocked inside `generate` looks like from
+    /// the outside, made deterministic: any request that needs the thread waits
+    /// forever. A test using [`Self::start`] cannot model this, because that
+    /// spawns a live thread which promptly drains whatever it is sent.
+    #[cfg(test)]
+    pub(crate) fn detached_with_governor_for_test(
+        engine: &Engine,
+        commands: mpsc::Sender<DriverCommand>,
+    ) -> Self {
+        Self {
+            commands,
+            generation_capacity: Arc::new(Semaphore::new(0)),
+            kv_telemetry: Arc::new(KvTelemetry::default()),
+            governor: Some(engine.governor_handle()),
         }
     }
 
@@ -165,6 +196,9 @@ impl EngineDriver {
             commands,
             generation_capacity,
             kv_telemetry,
+            // Pipeline engines expose no resource governor, so `/v1/resources`
+            // keeps the command path and its honest "not available" error.
+            governor: None,
         }
     }
 
@@ -410,7 +444,29 @@ impl EngineDriver {
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
     }
 
+    /// A resource snapshot, read WITHOUT the driver thread when possible.
+    ///
+    /// `/v1/resources` is observability: it exists to report on a server that
+    /// is busy, so it must not queue behind the work it describes. The fallback
+    /// driver runs generation INLINE on its command loop, so a `DriverCommand`
+    /// is only serviced between generations -- and under sustained load, with
+    /// arrivals overlapping departures, those gaps close and the endpoint stops
+    /// answering altogether. Measured before this handle existed: 5 of 6 polls
+    /// timed out at 10s, worst 7.9s, while `/v1/status` answered 1046 times
+    /// with a 2.3ms median in the same window.
+    ///
+    /// The governor's accessors take `&self`, so a shared handle is both
+    /// always-available and always-LIVE. That is why this is a shared read and
+    /// not a published mirror: a mirror refreshed between generations is
+    /// staleest exactly when the server is busiest, which is the condition this
+    /// endpoint exists for.
+    ///
+    /// Pipeline engines expose no governor, so they keep the command path and
+    /// its honest "not available" error rather than inventing a snapshot.
     pub(crate) async fn resource_snapshot(&self) -> anyhow::Result<GovernorSnapshot> {
+        if let Some(governor) = &self.governor {
+            return Ok(governor.snapshot());
+        }
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.commands
             .send(DriverCommand::ResourceSnapshot(reply))
@@ -593,7 +649,12 @@ fn run_static_engine_driver(
     }
 }
 
-fn run_static_batch_until_idle(
+/// Runs one static batch to completion.
+///
+/// `pub(crate)` so tests can drive the real loop rather than re-implementing
+/// its intake: the AC31 hang lived in this function's queue handling, and a
+/// test that calls the decision helper directly cannot observe it.
+pub(crate) fn run_static_batch_until_idle(
     engine: &Engine,
     rx: &mut mpsc::Receiver<DriverCommand>,
     deferred: &mut std::collections::VecDeque<DriverCommand>,
@@ -624,30 +685,33 @@ fn run_static_batch_until_idle(
     );
 
     loop {
+        // Commands the OUTER loop already drained out of `rx` live here, and
+        // are invisible to `rx.try_recv()` below. Draining them first is what
+        // makes concurrent arrivals join the *current* batch: without this,
+        // every request the outer loop parked waits for this batch to go idle
+        // and then runs as its own one-row batch -- continuous batching
+        // silently degrades to strict serialisation under exactly the
+        // concurrent load it exists to overlap. It also strands read-only
+        // commands like `/v1/resources` behind every parked generation.
+        for command in std::mem::take(deferred) {
+            intake_during_batch(
+                engine,
+                &mut manager,
+                &mut routes,
+                &mut abandoned,
+                deferred,
+                command,
+            );
+        }
         while let Ok(command) = rx.try_recv() {
-            match command {
-                DriverCommand::Generate {
-                    session_id: None,
-                    request,
-                    events,
-                    permit,
-                } => submit_to_continuous_manager(
-                    &mut manager,
-                    &mut routes,
-                    &mut abandoned,
-                    *request,
-                    events,
-                    permit,
-                ),
-                // MUST stay above the catch-all: anything this returns `None`
-                // for has been answered, and anything it hands back is parked
-                // until the batch drains.
-                command => {
-                    if let Some(deferred_command) = handle_or_defer_during_batch(engine, command) {
-                        deferred.push_back(deferred_command);
-                    }
-                }
-            }
+            intake_during_batch(
+                engine,
+                &mut manager,
+                &mut routes,
+                &mut abandoned,
+                deferred,
+                command,
+            );
         }
 
         if let Err(err) = manager.step() {
@@ -660,6 +724,37 @@ fn run_static_batch_until_idle(
         route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
         if manager.is_idle() {
             break;
+        }
+    }
+}
+
+/// Takes one command into a running batch, from either source.
+///
+/// Extracted so the parked queue and the live channel cannot drift apart: the
+/// AC31 hang was caused by these two intake paths being written separately and
+/// only one of them learning to batch.
+fn intake_during_batch(
+    engine: &Engine,
+    manager: &mut ContinuousBatchManager<'_>,
+    routes: &mut HashMap<usize, DriverRoute>,
+    abandoned: &mut HashMap<usize, DriverRoute>,
+    deferred: &mut std::collections::VecDeque<DriverCommand>,
+    command: DriverCommand,
+) {
+    match command {
+        DriverCommand::Generate {
+            session_id: None,
+            request,
+            events,
+            permit,
+        } => submit_to_continuous_manager(manager, routes, abandoned, *request, events, permit),
+        // MUST stay above the catch-all: anything this returns `None` for has
+        // been answered, and anything it hands back is parked until the batch
+        // drains.
+        command => {
+            if let Some(deferred_command) = handle_or_defer_during_batch(engine, command) {
+                deferred.push_back(deferred_command);
+            }
         }
     }
 }

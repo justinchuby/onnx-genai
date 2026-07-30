@@ -226,6 +226,17 @@ impl Engine {
         &self.governor
     }
 
+    /// A shared handle to the resource governor, readable off the driver thread.
+    ///
+    /// `/v1/resources` uses this instead of a `DriverCommand` round-trip. The
+    /// fallback driver runs generation inline on its command loop, so a queued
+    /// command is only serviced between generations -- under sustained load
+    /// those gaps close and the endpoint stops answering entirely. Reading the
+    /// governor directly is both always-available and always-live.
+    pub fn governor_handle(&self) -> Arc<EngineResourceGovernor> {
+        Arc::clone(&self.governor)
+    }
+
     /// Convenience snapshot of configured and live resource state.
     pub fn resource_snapshot(&self) -> GovernorSnapshot {
         self.governor.snapshot()
