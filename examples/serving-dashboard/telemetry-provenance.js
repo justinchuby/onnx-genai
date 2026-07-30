@@ -581,8 +581,21 @@ export const PROVENANCE = Object.freeze({
     path: 'active_batch_size',
     classification: 'MEASURED',
     unit: 'requests',
-    evidence: 'crates/onnx-genai-server/src/routes/admin.rs:136 (snapshot.current_batch_size)',
-    label: 'Sequences in the current batch',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs:136 (snapshot.current_batch_size). ' +
+      'Counts in-flight HTTP generations, NOT the engine batch: the only writer is ' +
+      'metrics.rs:115, which ticks once per generation in GenerationMetrics::start().',
+    label: 'Generations in flight (debug-KV)',
+    caveat:
+      'AC201. This carried the label "Sequences in the current batch" -- a claim that ' +
+      'the engine steps these sequences together, which this counter does not support. ' +
+      'It reads the SAME gauge as batch.in_flight, whose evidence already says so. The ' +
+      'Rust suite forbids that pairing (the_batch_numerator_is_never_read_from_the_' +
+      'http_generation_gauge) but no Rust test can see this file, so the claim survived ' +
+      'here. NOT deleted as a duplicate: it is a DIFFERENT WIRE FIELD -- active_batch_size ' +
+      'on the debug-KV endpoint, where batch.in_flight is batch_in_flight on /v1/status. ' +
+      'Same Rust source, two endpoints, and scheduling.js binds THIS one. Consolidating ' +
+      'the two is a product decision, not a dedupe.',
   },
   'admission.slots_available': {
     source: ENDPOINTS.DEBUG_KV,

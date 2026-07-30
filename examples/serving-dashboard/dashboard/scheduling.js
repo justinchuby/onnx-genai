@@ -361,7 +361,7 @@ function buildDescription(fields) {
     parts.push(`Batch occupancy ${fields.batchSize.value} of ${fields.maxBatch.value} slots.`);
   } else if (isRenderable(fields.batchSize)) {
     parts.push(
-      `${fields.batchSize.value} sequences in the current batch; the server does not report a ` +
+      `${fields.batchSize.value} generations in flight; the server does not report a ` +
         'batch limit, so occupancy as a percentage is not available.',
     );
   } else {
