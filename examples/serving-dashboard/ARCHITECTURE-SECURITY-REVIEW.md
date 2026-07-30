@@ -953,3 +953,90 @@ correctly, and **a retraction is the one kind of claim that reward makes cheaper
 wrong.** Calling a fixed defect *my mistake* deletes the evidence the fix was ever needed
 and collects credit for candour in the same motion.
 
+
+## 15. Pass 2 at `review-2` = `0bc86726` — path disclosure across all three layers
+
+Measured in a clean detached worktree, porcelain 0, raw unpiped exit 0,
+646 tests / 98 suites / 0 failures. Exact agreement with the Lead's number.
+
+### 15.1 All three code layers are clean, and the fix is proven on the wire
+
+| Layer | Predicate | Result |
+|---|---|---|
+| 1 server (Rust) | `path:` emission in `admin.rs` | `:63` -> `model_path_for_display()` -> `file_name()`, unconditional |
+| 1 control | any other raw path in `routes/*.rs` | the only `to_string_lossy` in all routes is inside that fn |
+| 2 catalogue | `server.model_path` in `NEVER_BIND` | 1 (banned); `projectServedModel()` defined -> 0 (deleted) |
+| 3 render | non-test, non-comment bindings | 0 |
+| 3 control | `server.model_id` bindings | 5 files (instrument reaches the tree) |
+
+Proven by execution, not by reading. Two binaries, same model, same field,
+same instant:
+
+    demo worktree binary (built from the fixed tree)
+        path = 'qwen2.5-0.5b-scatter-v2'                    floor 175, zero /Users/
+    sibling binary, running on :8123
+        path = '/Users/justinc/.../models/qwen2.5-0.5b-scatter-v2'
+
+The predicate discriminates in both directions. A fix that only made the
+leak stop appearing would be indistinguishable from an instrument I had broken.
+
+### 15.2 CORRECTION to @bb2ee824's scope note
+
+They wrote: "the wire field is unchanged, /v1/models still returns the
+absolute path on loopback." That is TRUE OF THE RUNNING PROCESS and FALSE
+OF THE SOURCE AT `review-2`. They measured the wire, which was correct, and
+inferred the source, which was not. The Rust fix `e556b7f4` landed at 00:18:30.
+
+### 15.3 THE FINDING — `run-demo.sh:207` is an existence check standing in for a freshness check
+
+    if [[ ! -x "${SERVER_BIN}" ]]; then ... cargo build --release ... fi
+
+`-x` tests that a file is executable. It cannot test WHICH TREE IT WAS BUILT
+FROM. A binary compiled from a checkout that lacks the path fix satisfies this
+condition exactly as well as a correct one, and the launcher then runs it and
+prints nothing.
+
+This is not hypothetical. Measured on this machine right now:
+
+    sibling repo /Users/justinc/Documents/GitHub/onnx-genai
+      branch justinchu/demo, HEAD f55e459b
+      e556b7f4 is an ancestor of HEAD          -> NO
+      fn model_path_for_display in that tree   -> 0
+      CONTROL pub(crate) async fn models       -> 1   (file exists, grep resolves)
+
+So the absence is real, not a bad pathspec. All four servers currently
+listening were started 01:41 and 02:07 from that tree's binary and all four
+leak the operator's absolute home directory.
+
+Today the launcher happens to be safe: `REPO_ROOT` resolves to the demo
+worktree, `CARGO_TARGET_DIR` is unset, and someone rebuilt that tree at
+04:38. **That is luck, not a control.** The two binaries are different
+inodes 480 bytes apart. Nothing in the launcher can tell them apart.
+
+FIX, structural, and it is small: after resolving `SERVER_BIN`, do not branch
+on existence. Either always `cargo build --release` (it is a no-op when fresh,
+which is the point -- cargo already knows what the launcher is guessing at), or
+have the server print its build SHA on `/v1/debug/*` and have `run-demo.sh`
+refuse to launch when it does not match `git rev-parse HEAD`. The first is one
+deleted `if`. **Let the tool that tracks source freshness answer the question
+about source freshness, instead of re-deriving it from a filesystem mode bit.**
+
+### 15.4 Severity, scoped honestly
+
+The disclosure is LOOPBACK-ONLY and I verified it rather than assuming:
+`127.0.0.1:8123 (LISTEN)`, and the host LAN address 192.168.1.195:8123
+returns floor 0. It is not remotely reachable. The exposure is the projector
+and anyone with local access -- which is exactly the demo threat model, so it
+still matters, but it is not a network vulnerability and should not be
+described as one.
+
+### 15.5 Where the layering genuinely earns its keep
+
+The client still fetches `/v1/models`, so the response body reaches the
+browser on every poll. `NEVER_BIND` makes the field UNBINDABLE; it does not
+make it UNFETCHED. Against a leaking server the path would still sit in the
+network tab. That is the correct division -- a client cannot fix a server
+disclosure -- and the three layers together mean **no single layer failing
+puts the path on the projector.** Deleting `projectServedModel()` rather than
+the row is what makes layer 2 hold: a ban stops a field being bound, removing
+the projection stops it being addressable.
