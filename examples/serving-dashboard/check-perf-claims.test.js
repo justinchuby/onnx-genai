@@ -342,22 +342,16 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
     // their bug at the gate. THIS EXEMPTION IS A PROMISE TO COME BACK: when
     // those three paragraphs carry their noise floor, delete this filter.
     .filter((f) => !/^design\//.test(f))
-    // EXEMPTION, NAMED SO IT CANNOT DECAY INTO AN OVERSIGHT:
-    // prefix-cache-verification.md is @fc8b5d97's raw measurement record and
-    // is being actively written. It is exempt as a RECORD, like
-    // perf-baseline.md -- but with one finding attached that is NOT a records
-    // question and that I have reported to its author rather than edited into
-    // someone else's live file:
-    //
-    //   its VERDICT TABLE, the first thing anyone reads, still states
-    //   "+7.0 %, i.e. no benefit at all" as a live result, while the noise
-    //   floor that withdraws it appears ~350 lines further down.
-    //
-    // That is the same shape @fc8b5d97 themselves found in the honesty
-    // register: the number was removed from one surface and the CERTIFICATION
-    // survived on another. A reader who stops at the verdict table -- which is
-    // what a verdict table is for -- gets the withdrawn claim.
-    .filter((f) => f !== 'prefix-cache-verification.md');
+    // EXEMPTION RETIRED by @fc8b5d97. It was written as an explicit promise to
+    // come back: the verdict table stated "+7.0 %, i.e. no benefit at all" as a
+    // live result while the noise floor withdrawing it sat ~350 lines below.
+    // That condition is now satisfied -- the figure appears NOWHERE in the file
+    // (0 occurrences of "+7.0" and of "PROVEN ABSENT" at HEAD) -- so the filter
+    // is deleted rather than left as a suppression nothing tracks. The document
+    // is now scanned like every other. Its RAW-RECORD exemption in the
+    // hit-RATE check below is a different argument and correctly survives:
+    // raw readings are exempt, a verdict never is.
+    ;
 
   assert.ok(docs.length > 0, 'no tracked .md files found — this check would pass vacuously');
 
