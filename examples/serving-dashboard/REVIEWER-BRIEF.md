@@ -5,7 +5,21 @@ that landed on only one code path, the four fields whose captions are wrong, two
 ratios that behave oppositely on purpose, and what we refused to ship.
 
 ```
-MEASURED-AT: 0bc86726
+MEASURED-AT: 0bc86726          ⛔ STALE — 326 COMMITS BEHIND HEAD 6d7f7d4f (07:13:12).
+                               0bc86726 is 04:19:23. IT IS AN ANCESTOR OF HEAD, SO EVERY
+                               READING BELOW WAS HONEST WHEN TAKEN. IT IS NOT CURRENT.
+GATE-PIN:    3b701494          ⬅ 06:58:15. THE SHA THE GATE SCORED AND THE ONE TO REVIEW.
+                               ANCESTOR-OF-HEAD: VERIFIED. 306 commits after 0bc86726.
+
+⛔ READ THIS BEFORE TRUSTING ANY COORDINATE IN THIS DOCUMENT:
+   A `file.js:NN` COORDINATE IN HERE RESOLVES AGAINST 0bc86726, NOT AGAINST HEAD.
+   THE LINE NUMBERS STILL RESOLVE AT HEAD — THEY JUST POINT AT DIFFERENT CODE.
+   THAT IS THE DANGEROUS CASE: NOT A DANGLING REFERENCE, A **REUSED** ONE.
+   ➡️ RETRIEVE BY CONTENT (`git grep '<the string>'`), NEVER BY LINE NUMBER.
+   Worked example, and it is the reason this warning exists: `ui/model-card.js:25`
+   was `{ key: 'server.model_path', … }` at 0bc86726 and is a live, correct
+   `server.context_length` field at HEAD. Deleting "line 25" today deletes a fix.
+
 BOTH DENOMINATORS — THERE ARE TWO SUITES AND ONE WORD FOR THEM:
   JS    run-tests.sh                            646 tests / 98 suites / 0 fail / raw exit 0
         at 0bc86726 (review-2), detached, porcelain 0
@@ -745,6 +759,24 @@ shipped all along. And note the caption forbids the obvious substitution — a
 field labelled `Directory` cannot host an identifier, so renaming the value under
 it produces a caption that lies. There is a second render site in
 `dashboard/system.js`, and a third copy of the value inside the same loop as the
+
+> ⛔ **THE PARAGRAPH ABOVE IS WRITTEN IN THE PRESENT TENSE AND DESCRIBES THE
+> PRE-FIX TREE. IT IS A DESCRIPTION OF A DEFECT THAT IS NOW CLOSED. DO NOT ACT ON IT.**
+> `server.model_path` was **REMOVED at `1133a874`** and is **0 in shipping code at HEAD**.
+> Measured with the binder-anchored predicate, which is the one to quote:
+> ```
+> SUBJECT  (key: |field\()['"]server\.model_path   in shipping .js  ->  0
+> CONTROL  (key: |field\()['"]server\.model_id     in shipping .js  ->  3
+>          system.js:88 · system.js:283 · model-card.js:24   ⬅ the control fires
+> ```
+> **A bare-name grep for `server.model_path` returns non-zero and is the wrong
+> instrument: it counts obituaries.** A comment can contain a key; it cannot contain
+> a binding. The three surviving mentions are all prose explaining the removal —
+> including one that literally begins *"used to live here"*. Scoring the bare name
+> makes the best-written fix on this branch score worst.
+> **The `Directory` caption argument above is now moot: the field is gone, not renamed.**
+
+
 visible text: it is also written to `aria-label`, which the one instrument that
 finally beat thirty review findings — looking at the page — cannot see.
 
@@ -4327,7 +4359,9 @@ and RULE 26 forbids me from carrying anyone's number, including a good one.**
 
 ---
 
-MEASURED-AT: 0bc86726
+MEASURED-AT: 0bc86726          ⛔ STALE — see the header at :8. 326 commits behind
+                               HEAD 6d7f7d4f. Ancestor-of-HEAD, so honest when taken.
+                               GATE-PIN for review is 3b701494.
 
 ## §9.4 — I audited my own file against three orders aimed at me. Two convict me; the third vindicates a conclusion and condemns the method that produced it.
 
