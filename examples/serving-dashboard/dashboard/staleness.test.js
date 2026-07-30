@@ -58,6 +58,50 @@ describe('AC45(a) — age in text, never colour alone', () => {
   });
 });
 
+describe('the value and its age must not fuse', () => {
+  it('separates them with a real character, not just a flex gap', () => {
+    // The ruled treatment is `41 · 12s old`. The two spans were previously held
+    // apart only by CSS gap, so the screen looked correct while textContent
+    // read "4112s old" — and textContent is what the table view, describe()
+    // and copy-paste actually consume. A fused figure is worse than an
+    // unqualified one: 4112 is a number nobody measured.
+    const node = renderField(staleField(12_000), { staleCeilingMs: 30_000 });
+
+    // The unit and source badge sit between the two, so this asserts the age
+    // is introduced by the separator and — the part that matters — that no
+    // digit of the value ever touches a digit of the age.
+    assert.match(node.textContent, /^41\D+·\s*12s old/);
+    assert.doesNotMatch(node.textContent, /\d\d\d\d/, 'value and age fused into one number');
+  });
+
+  it('separates the em-dash from the age once the value is withheld', () => {
+    const node = renderField(staleField(20_000), { staleCeilingMs: 3000 });
+
+    assert.match(node.textContent, /—\s*·\s*20s old/);
+    assert.doesNotMatch(node.textContent, /\d\d\d/, 'withheld value left digits fused to the age');
+  });
+});
+
+describe('the timestamp property the ruling wrote down', () => {
+  it('accepts `at` as well as `observedAtMs`, since the two contracts disagree', () => {
+    // telemetry-field.js and CONTRACT.md say observedAtMs; the lead's ruled
+    // envelope says `at`. Accepting both means neither spelling loses an age.
+    const { observedAtMs, ...rest } = staleField(4000);
+    const node = renderField({ ...rest, at: observedAtMs }, { staleCeilingMs: 30_000 });
+
+    assert.match(node.textContent, /4s old/);
+  });
+
+  it('still refuses to date a value from an unrecognised property', () => {
+    // The original bug was a Date.now() fallback that claimed every stale
+    // value had just been observed. Unknown property must still withhold.
+    const { observedAtMs, ...rest } = staleField(4000);
+    const node = renderField({ ...rest, lastSeen: observedAtMs }, { staleCeilingMs: 30_000 });
+
+    assert.doesNotMatch(node.textContent, /41/, 'dated the value from a property nobody publishes');
+  });
+});
+
 describe('AC45(b) — past the ceiling it stops being a number', () => {
   it('withholds the number once the value is too old', () => {
     const node = renderField(staleField(20_000), { staleCeilingMs: 3000 });
