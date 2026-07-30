@@ -253,6 +253,26 @@ export function ratioField(numerator, denominator, options = {}) {
     label = 'ratio',
   } = options;
 
+  // Not-applicability is contagious, and it outranks unavailability. A hit
+  // rate computed from two structurally bypassed counters is not "not measured
+  // yet" — that wording promises a value which this server can never produce.
+  // The inputs already say the honest thing; the ratio must not soften it.
+  if (
+    renderStateOf(numerator) === RENDER_STATES.NOT_APPLICABLE ||
+    renderStateOf(denominator) === RENDER_STATES.NOT_APPLICABLE
+  ) {
+    const source =
+      renderStateOf(numerator) === RENDER_STATES.NOT_APPLICABLE ? numerator : denominator;
+    return {
+      value: null,
+      state: RENDER_STATES.NOT_APPLICABLE,
+      source: 'derived',
+      unit: '%',
+      label,
+      reason: source?.reason ?? 'This server cannot produce the inputs for this ratio.',
+    };
+  }
+
   const top = numericValueOf(numerator);
   const bottom = numericValueOf(denominator);
 
