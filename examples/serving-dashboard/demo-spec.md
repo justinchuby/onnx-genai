@@ -2112,3 +2112,41 @@ AFTER  the 12-block  19/20  = 0.95
 6. **Enforce invariants in the SHAPE, not in discipline.** If a panel *can* render a number without stating its state, someone eventually will. (AC46 is this lesson applied to the wire.)
 7. **A getter existing is not the value surviving.** Three findings this session were *a getter exists but throws away exactly the field we need*: `PageUsage` drops page IDs, `GovernorReconfigureOutcome` drops the eviction plan, `driver.rs` drops the reconfigure result. **Before binding a panel to something, check the value survives the WHOLE path — not that a function with the right name exists.**
 8. **Audit your own write path, not just your data.** This document was destroyed by a silent non-atomic write while auditing everyone else's honesty. **Write to a temp file, verify the byte count, then atomically rename.**
+
+---
+
+## AC202 — A completion is a predicate over the subject, never a narrative about the work
+
+**Ordered by the Project Lead at `b04c6e8f` after the ledger reported the P1 render defect GREEN while both render sites were still live.**
+
+Nobody lied and nobody erred. A completion summary was filed that was **accurate about a different gate item**. The DAG scored the task *ID*; the evidence described the *action*; nothing cross-checked them. A completion can therefore be filed with every field true, against work nobody touched.
+
+**Acceptance criterion.** Every completion claim — DAG, board, broadcast or commit message — MUST carry a command that a reader can paste, whose output decides the claim.
+
+- ✅ `server.model_path in shipped .js, tests+catalogue excluded → MUST REACH 0. NOW: 2.`
+- ⛔ *"Removed the model path from the dashboard surfaces."*
+
+The predicate MUST name its **subject**, not its author's intent, and MUST ship with a **positive control** proving the instrument can return non-zero. A zero from a search that cannot find anything is not a measurement.
+
+**Why this is the highest-leverage rule in this document:** a false alarm costs an hour; a false all-clear ships. Every honestly-red item gets eyes. **A falsely-green item is the one item nobody will ever look at again** — so the project-management layer, which decides what is not re-examined, is the most dangerous possible host for a true report aimed at the wrong subject.
+
+---
+
+## AC203 — An honest absence and an internal refusal MUST NOT render as the same pixels
+
+**Found at `ee8542d2` in `dashboard/store-adapter.js`, `fn clientField()`. Severity 🟡 — real, live, shipping, and not a demo blocker.**
+
+```
+:509  { value: null,     state: 'pending', … label: 'Poll interval' }   ← live enum
+:522  { value: <median>, state: 'ok',      … label: 'Poll interval' }   ← RETIRED enum
+```
+
+`telemetry-field.js:153` defines `MEASURED: 'measured'`. `format.js:145` logs *"unknown field state — refusing to render its value, because an unrecognised state is not a measurement"* — **and then renders an em-dash.**
+
+So `client.poll_interval_ms` renders correctly while it has no data and renders `—` the moment it has a real number. **The field works until it works.** The two branches of one function, twelve lines apart, disagree; the `pending` branch is the defect's own control.
+
+**Acceptance criterion.** The glyph for *"we honestly do not have this"* MUST be visually distinct from the glyph for *"we have this and our own code refused it."* Today both are `—`. One is the honesty layer succeeding; the other is the honesty layer reporting its own failure to a console nobody is watching.
+
+**Scope discipline, recorded because it nearly became a false alarm.** `store-adapter.js` contains **three** `state` vocabularies. Series objects (`t`/`v`/`gaps`) and capability objects (`available`/`reason`) use `'ok'` legitimately. Only the **field-shaped** object — `value`/`state`/`source`/`unit`/`label` — is defective. The shipped blast radius is **one site, not six**. *The discriminator is the sibling keys, not the matched value* — and only reading the object shows them.
+
+**And the reason the suite could not see it:** `dashboard/testing/fake-store.js:26` emits the same retired `'ok'`. The fixture and the code under test **share the bug**, so the tests corroborate nothing. Two instruments that share a component do not corroborate each other; they only confirm the component.
