@@ -1,29 +1,89 @@
 # The review point
 
-Reviewers extract exactly one tree. This file records which one, because until now that
-designation existed only in chat.
+Reviewers extract exactly one tree. This file records which one. **This file is the sole
+authority.** Broadcasts, chat messages and tag names do not outrank it, by explicit ruling
+of the project lead.
 
-REVIEW-POINT: review-2
-REVIEW-POINT-SHA: 0bc86726
+REVIEW-POINT-SHA: 219307afcb7f3a27989e4f9d246a6ffa890f885e
 
-Re-declared by the project lead at 04:51 and pinned as *"the scoring and review artifact"*,
-superseding `review-0` = `0aac6bb1` (04:19) which itself superseded `review-1` = `fca13038`
-(04:30). **Three declarations in thirty-one minutes.** Each earlier one was not wrong — each
-was spent. All are strict ancestors, so no finding is void; every one is re-derivable.
+**That is a raw hex SHA and it is deliberately not a tag name.** Three tags existed
+(`review-0` `review-1` `review-2`); all three are retired. `review-0` was silently
+re-pointed across sixty commits, and the tag numbers did not order the commits — see the
+section below, which is retained precisely because it is the argument for this line's form.
 
-> **⛔ This file has now been re-pointed three times, and that is the argument for its
-> existence rather than an embarrassment to it.** The declaration lives in one place, under
-> version control, with a test that reads it. **The alternative was three coordinates living
-> in chat, which is where they lived when four agents held four different answers.**
+> **A tag is a mutable pointer to an immutable object, and the object's immutability is
+> exactly what hides the move. Every stale SHA still resolves. Nothing ever errors.**
 
-> **⛔ Re-extraction is mandatory, not cosmetic, and the reason is the reverse of the one we
-> built extracts for.** Both P1 render sites are *present* in the older tree and *absent* in
-> this one. A reviewer working from a stale extract files a live defect **correctly for the
-> tree in front of them and wrongly for the tree we ship.**
->
-> **An extract removes drift. It does not remove staleness. We adopted it believing those
-> were one property.** Drift is the tree moving *under* you; staleness is the tree having
-> moved *before* you. Freezing a coordinate cures the first and *guarantees* the second.
+## Measured state at this SHA
+
+Both suites were run at **one SHA**, from **one clean detached worktree**
+(`porcelain 0`), with **raw unpiped exit codes**. Neither number is inherited from
+another agent's report.
+
+| Suite | Result | Raw exit |
+|---|---|---|
+| JavaScript (`bash run-tests.sh`) | **831 tests · 829 pass · 2 fail** · 0 cancelled · 0 skipped · 0 todo · 123 suites · 64 discovered files | **1** |
+| Rust (`cargo test -p onnx-genai-server --no-fail-fast`) | **270 passed · 0 failed · 4 ignored** across 6 test binaries | **0** |
+
+**The JavaScript suite is RED at this SHA and that is not an oversight.** The two failures
+are the exposure ratchet in `served-surface.test.js`:
+
+- `no served measurement is left unrendered, beyond the pinned set`
+- `the exposure ratchet has not been loosened` — *94 tracked files are fetchable at
+  `/demo/` that the page never loads (was 91)*
+
+This guard is working as designed. It fails because files were added inside the served
+asset directory without anyone making a publishing decision about them. **Raising the
+constant would turn the gate green in one character and ship the undecided files.** It has
+been deliberately left red by more than one author. Do not raise it to go green.
+
+**The Rust number is a COLD-TARGET build.** The worktree had no `target/` directory
+before the run, so this also demonstrates the tree builds from nothing. Earlier Rust
+numbers quoted tonight shared a warm `target/` and did not carry that property.
+
+`cargo` prints no total — it prints one `test result:` line per test binary, six of them.
+The 270 is their sum. Without `--no-fail-fast` a failure in the first binary aborts the
+rest, so **the denominator shrinks exactly when something is wrong**; the flag is
+mandatory, not stylistic.
+
+### The 4 ignored Rust tests, by name
+
+1. `tests::audio_endpoints_route_through_tiny_whisper_pipeline` — synthetic Whisper-contract smoke test; run explicitly for audio validation.
+2. `tests::sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image` — missing fixture `vlm-executable/vision.onnx`; `.gitignore` skips `*.onnx` and nobody force-added one.
+3. `tests::vision_request_routes_through_tiny_vlm_pipeline` — requires gitignored `models/tiny-vlm`.
+4. `qwen_real_model_tool_use_chain_end_to_end` — requires the gitignored `models/qwen2.5-0.5b` fixture.
+
+**All four are missing-fixture gates, not disabled assertions.** None is ignored because it fails.
+
+## Extraction recipe — use this exact form
+
+```sh
+git worktree add --detach /tmp/review-tree 219307afcb7f3a27989e4f9d246a6ffa890f885e
+cd /tmp/review-tree/examples/serving-dashboard
+SHIPPING_TREE_REF=219307afcb7f3a27989e4f9d246a6ffa890f885e bash run-tests.sh
+cd /tmp/review-tree && cargo test -p onnx-genai-server --no-fail-fast
+```
+
+> **⛔ Never use `git archive`.** It produces a directory that is not a git repository.
+> Ten JavaScript guards resolve their corpus through git and silently degrade there,
+> dropping tests **without reddening anything**. A smaller green suite and a correct green
+> suite are byte-identical in a report.
+
+`SHIPPING_TREE_REF` makes every guard read one immutable tree instead of whatever happens
+to be on the reviewer's desk.
+
+## Reading the numbers above
+
+- **Verify by presence, never by absence of an error.** A missing file, an unapplied
+  change and a filter that matches nothing all produce the same bytes.
+- **The runner emits its counters as `ℹ tests`, not `# tests`.** Node v25 changed the
+  prefix. A `grep '^# tests'` returns empty, which is indistinguishable from a clean run.
+  This cost at least three agents a false measurement tonight, including the author of
+  this file, who reported the runner as emitting no counters at all. **It emits all six.**
+- **`node --test .` is a phantom red** — it prints `Could not find '.'`, exits 1, and emits
+  zero counters. Use `node --test` with no path argument, or the canonical runner.
+- Both instruments were run here and **agree exactly**: 831/829/2 from the runner and
+  831/829/2 from a bare `node --test`.
 
 ## ⛔ The tag numbers do not order the commits
 
