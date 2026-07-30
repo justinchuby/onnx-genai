@@ -156,8 +156,28 @@ describe('AC45(c) — the ceiling is per-panel, not global', () => {
     const { fileURLToPath } = await import('node:url');
     const dir = fileURLToPath(new URL('.', import.meta.url));
 
+    // Whether a panel reads live telemetry AT ALL. Deliberately NOT a list of
+    // accessor names: an earlier version of this check enumerated
+    // `.field|.series|.rate` and silently misjudged requests.js, which reads
+    // live data through `subscribe`/`subscribeRequests` and renders per-request
+    // rows rather than fields. An allowlist of method names rots the moment the
+    // store grows a method, and it rots SILENTLY toward "reads nothing".
+    const readsTelemetry = (source) => /telemetryStore\./.test(source);
+    const sourceOf = (id) => readFileSync(`${dir}${id}.js`, 'utf8');
+
+    // Floor: if the predicate ever matches nothing, every assertion below
+    // inverts its meaning instead of failing. A guard that can silently decide
+    // no panel reads telemetry is worse than no guard.
+    const reading = PANELS.filter((panel) => readsTelemetry(sourceOf(panel.id)));
+    assert.ok(
+      reading.length >= 4,
+      `only ${reading.length} of ${PANELS.length} panels detected as reading telemetry — ` +
+        'the predicate has stopped matching, not the panels stopped reading',
+    );
+
     for (const panel of PANELS) {
       const { meta } = panel.module;
+      const source = sourceOf(panel.id);
 
       assert.ok(
         'staleCeilingMs' in meta,
@@ -170,10 +190,9 @@ describe('AC45(c) — the ceiling is per-panel, not global', () => {
         // panel has no values. Verified against the module's SOURCE rather
         // than trusted from meta, so a panel cannot opt out of staleness by
         // declaring null while still binding fields.
-        const source = readFileSync(`${dir}${panel.id}.js`, 'utf8');
-        assert.doesNotMatch(
-          source,
-          /\.(?:field|series|rate)\(/,
+        assert.equal(
+          readsTelemetry(source),
+          false,
           `${panel.id} declares a null ceiling but still reads telemetry`,
         );
         continue;
@@ -183,6 +202,20 @@ describe('AC45(c) — the ceiling is per-panel, not global', () => {
         typeof meta.staleCeilingMs,
         'number',
         `${panel.id} has no declared stale ceiling`,
+      );
+
+      // The converse, and it is the direction that is easy to get ordered into:
+      // a numeric ceiling on a panel that reads NO telemetry is a freshness
+      // contract for data that does not exist. It costs nothing at runtime and
+      // passes every other assertion in this file, which is exactly why it
+      // needs one of its own — a reader of the panel meta cannot tell it apart
+      // from a real contract.
+      assert.equal(
+        readsTelemetry(source),
+        true,
+        `${panel.id} declares a numeric stale ceiling (${meta.staleCeilingMs}) but ` +
+          'reads no telemetry. Staleness is a property of a value that stopped ' +
+          'arriving; a panel with no values cannot have one. Declare null.',
       );
     }
   });
