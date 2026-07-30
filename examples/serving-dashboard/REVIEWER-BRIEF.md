@@ -324,6 +324,68 @@ byte-for-byte identically to a fully trusted measurement.** Three screenshots,
 caution**, and it is the one defect no test we own could ever have seen, because
 none of our eleven hundred assertions looks at a pixel.
 
+### The honesty layer is the delivery mechanism, not the missing guard
+
+The instinct on reading the path defect is *our honesty apparatus failed*. It did
+not. It worked exactly as designed and that is why the path is on screen.
+
+`telemetry-provenance.js` classifies `server.model_path` as `NOT_PLUMBED`, with
+evidence reading *"No route returns the model directory today."* That was true
+when written. It is false now — the route returns it, verified live on both
+origins. The store detects precisely this condition: a field the catalogue says
+is absent arrives carrying a value. Its documented remedy is **display the value
+and warn**, on the reasoning that *hiding a real number is the exact failure this
+branch exists to catch*.
+
+That reasoning is correct, and it is written for **numbers**. Applied to the one
+field on this dashboard whose value is an arbitrary operator-controlled string,
+it publishes a home directory and a username to whoever is looking at the
+projector.
+
+> **So the property nobody designed: drift in the catalogue *promotes* a field
+> onto the page.** The branch fires exactly when our documentation is wrong —
+> which is exactly when nobody has reviewed the field. It is an unreviewed render
+> path for arbitrary server strings, and its trigger condition guarantees it only
+> ever fires on fields no one has thought about yet.
+
+Two consequences a reviewer should not have to derive:
+
+**Do not "fix" this by reclassifying the row to `MEASURED`.** That silences the
+only instrument that noticed and leaves the path exactly where it is. The stale
+classification is the symptom; the disclosure is the defect. Reclassify *after*
+the render is fixed, never instead.
+
+**Err-toward-truth is the right default for a gauge and the wrong default for a
+free-text string.** We asked, everywhere in this document, what happens when a
+value is *wrong*. We never once asked what happens when a value is *sensitive*.
+
+The render fix is smaller than it looks: `ui/model-card.js` already lists
+`{ key: 'server.model_id', label: 'Model' }` on the line directly above
+`{ key: 'server.model_path', label: 'Directory' }`. The identifier row has
+shipped all along. And note the caption forbids the obvious substitution — a
+field labelled `Directory` cannot host an identifier, so renaming the value under
+it produces a caption that lies. There is a second render site in
+`dashboard/system.js`, and a third copy of the value inside the same loop as the
+visible text: it is also written to `aria-label`, which the one instrument that
+finally beat thirty review findings — looking at the page — cannot see.
+
+### What the other review artefacts do not cover
+
+Volunteered by their own authors, recorded here because a document should not be
+the thing that vouches for itself:
+
+- **`FIELD-MEANING-AUDIT.md` is scoped to numeric fields.** Measured: 15 table
+  rows, **zero** mentioning `server.model_path`. The field in tonight's
+  disclosure defect is a string, so it fell outside the column headings. The
+  table is complete and honest about the set it chose; the set is the part that
+  needed review.
+- **That same table certifies `batch.capacity` as honest**, and it was scored by
+  reading the catalogue and the render path without ever querying a server that
+  structurally cannot batch. Both arms serve `batch_capacity: 4`.
+- **`READABILITY-REVIEW.md` carries a known-false line naming an agent to act.**
+  Left in place deliberately under the freeze and flagged rather than edited,
+  matching the precedent set for the other known-false line above.
+
 ### The sentence that covers F1, C1 and the router zeros at once
 
 > **At every hop we discard the reason and keep the value.** The driver reduces
