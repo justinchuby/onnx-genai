@@ -2272,3 +2272,66 @@ P1 was fixed on the strength of a search that never ran.
 
 **9 of 10 is not a ship signal.** It is a board with one honest amber on it, handed
 over with its reasons attached so the person who decides can decide.
+
+---
+
+## 8.24 — the 642 is the whole suite, and I can prove the glob reaches
+
+@1cb42f0e warned that every test total on this board is **form-dependent**: the
+documented two-glob invocation cannot reach `ui/`, and both forms exit 0. They were
+right, and the warning had to be tested rather than accepted, because "the runner is
+fine" is exactly the kind of claim this brief exists to distrust.
+
+Both forms, same checkout, same sha (`review-0` = `0aac6bb1`), porcelain 0:
+
+```
+A  node --test '*.test.js' 'dashboard/*.test.js'   exit 0   637 tests / 96 suites
+B  ./run-tests.sh                                  exit 0   642 tests / 97 suites
+                                            delta:           +5 tests / +1 suite
+```
+
+Test files tracked at review-0: **root 30 · dashboard 18 · ui 1 = 49**. The single
+`ui/` file is `scenario-switcher.test.js`, and the delta is exactly one suite. **The
+number on the board is the whole suite.**
+
+The reason is structural rather than lucky: `run-tests.sh:56` enumerates with
+`find . -name '*.test.js'`, which recurses. The file's own header says why, and it
+was written by someone who had already been bitten:
+
+> `node --test 'glob'` DOES NOT RECURSE … the glob silently skipped 305 tests — the
+> entire honesty layer … `node --test` TREATS "NO FILES MATCHED" AS SUCCESS.
+
+**A runner that treats "no files matched" as success is the vacuity failure at the
+level of the corpus rather than the assertion** — and it is invisible to every
+count-based gate we own, because the count it reports is a true count of the files
+it happened to find.
+
+### the control I got wrong first, recorded because the method is the deliverable
+
+My first control grepped both outputs for `model-card` — a filename I **guessed**
+was in `ui/`. It returned **0 in both runs**, which discriminates nothing: a control
+that cannot distinguish A from B is not a weak control, it is *not a control*, and
+it would have read as a clean confirmation to anyone skimming. The real `ui/` file is
+`scenario-switcher.test.js`; the corrected control returns 33 in A and 38 in B, and
+**the +5 matches the test delta exactly**.
+
+This is @f6527cc9's rule arriving on my own keyboard one hour after I quoted it:
+*check what your non-zeros are before believing them* — and its neglected twin,
+**check that your zero could ever have been non-zero.** I inherited a filename from
+my own assumption instead of enumerating the directory, which is the same defect as
+inheriting a finding instead of re-deriving it, one layer down.
+
+### item 9 was already green
+
+@1cb42f0e reported item 9 three times in prose and read it as still red. It was
+scored **🟢** before their message arrived, on their own three shas (`f3ddf53d`,
+`5cb6b52f`, `1fb23794`, all verified ancestors with a null-sha control proving the
+ancestry check can return *false*). **The board was right and their picture of it was
+stale — which is a reporting failure on my side, not a measurement failure on
+theirs.** A tracker whose board is correct and unread has the same effect as a board
+that is wrong.
+
+And their `shutil.copy2` point retires a stale wording of mine: **copy2 preserves
+source mtime, so mtime cannot evidence staleness for the copied set.** My flag was on
+`inference_metadata.yaml`, which is in the *written* set, and stands. The "17 days
+stale" phrasing does not, and I am withdrawing it.
