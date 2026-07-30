@@ -42,6 +42,18 @@ class FakeClassList {
     return this.tokens.has(name);
   }
 
+  /**
+   * Replace every token at once, which is what assigning `className` does.
+   * Unlike `add()` this accepts whitespace, because splitting on it IS the
+   * documented behaviour of `className` rather than a caller error.
+   *
+   * @param {string} value
+   */
+  replaceAll(value) {
+    this.tokens = new Set(String(value).split(/\s+/).filter(Boolean));
+    this.owner.attributes.class = [...this.tokens].join(' ');
+  }
+
   /** @returns {IterableIterator<string>} */
   values() {
     return this.tokens.values();
@@ -81,6 +93,16 @@ class FakeFragment extends FakeNode {
       this.children.push(node);
     }
   }
+}
+
+/** `dataset.blockTable` <-> the `data-block-table` attribute, both directions. */
+function dataAttributeName(datasetKey) {
+  return `data-${datasetKey.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
+}
+
+/** The inverse: `block-table` -> `blockTable`. */
+function datasetKeyName(attributeSuffix) {
+  return attributeSuffix.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
 }
 
 class FakeElement extends FakeNode {
@@ -129,6 +151,51 @@ class FakeElement extends FakeNode {
   /** @param {string} name */
   removeAttribute(name) {
     delete this.attributes[name];
+  }
+
+  // `className` REFLECTS `classList` and the `class` attribute, exactly as the
+  // three are tied together in a real DOM. Its absence was not cosmetic: an
+  // element built with `el.className = 'x'` -- the style this repo's shell code
+  // uses throughout -- set a plain JS field that `classList.contains()` and
+  // `findByClass()` could never see. So every such element was UNFINDABLE in
+  // tests while rendering correctly in a browser, which is the precise reason
+  // the scenario switcher shipped with no render coverage at all.
+  get className() {
+    return [...this.classList.values()].join(' ');
+  }
+
+  set className(value) {
+    this.classList.replaceAll(value);
+  }
+
+  // `dataset` REFLECTS `data-*` attributes rather than being a plain object,
+  // for the same reason `hidden` does above. A plain field would have let
+  // `el.dataset.state = 'measured'` and `[data-state='measured']` drift apart
+  // -- and the five-state field vocabulary is bound to the page through
+  // exactly that pair, so the drift would be invisible here and total in a
+  // browser. It is also why the scenario switcher had no render test until
+  // now: every notice and every tab it builds sets `dataset`, so mounting it
+  // under this DOM threw before it could assert anything.
+  get dataset() {
+    this.datasetProxy ??= new Proxy(Object.create(null), {
+      get: (_target, prop) =>
+        typeof prop === 'string' ? (this.getAttribute(dataAttributeName(prop)) ?? undefined) : undefined,
+      set: (_target, prop, value) => {
+        this.setAttribute(dataAttributeName(String(prop)), value);
+        return true;
+      },
+      has: (_target, prop) => this.hasAttribute(dataAttributeName(String(prop))),
+      deleteProperty: (_target, prop) => {
+        this.removeAttribute(dataAttributeName(String(prop)));
+        return true;
+      },
+      ownKeys: () =>
+        Object.keys(this.attributes)
+          .filter((name) => name.startsWith('data-'))
+          .map((name) => datasetKeyName(name.slice('data-'.length))),
+      getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }),
+    });
+    return this.datasetProxy;
   }
 
   // In a real DOM, `hidden` the IDL property REFLECTS the `hidden` content

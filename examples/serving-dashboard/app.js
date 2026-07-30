@@ -18,7 +18,7 @@ import { CONNECTION_STATES } from './telemetry-store.js';
 import { mountDashboard } from './dashboard/index.js';
 import {
   SERVER_MODE_BY_CLASS,
-  currentScenarioId,
+  resolveScenario,
   planScenario,
   reconcileSelfClasses,
   resolveOrigins,
@@ -100,7 +100,11 @@ async function main() {
   for (const serverClass of detection.discredited) {
     if (origins[serverClass] === location.origin) origins[serverClass] = null;
   }
-  const scenarioId = currentScenarioId(location.href, selfClasses);
+  // resolveScenario rather than currentScenarioId: we need the id AND whether
+  // we substituted it. Asking only "which scenario" is what let the page serve
+  // a visitor a different scenario than the one they clicked, in silence.
+  const scenario = resolveScenario(location.href, selfClasses);
+  const scenarioId = scenario.id;
   const plan = planScenario(scenarioId, origins, location.origin);
 
   // Panels only ever read the server that served this page. A scenario backed
@@ -123,6 +127,7 @@ async function main() {
     currentScenarioId: scenarioId,
     currentOrigin: location.origin,
     contradiction: detection.contradiction,
+    substitution: scenario.substitution,
   });
   mountConnectionIndicator(requireElement('connection-indicator'), telemetryStore);
   // The register is per-origin for the same reason the panels are: a field is

@@ -20,7 +20,7 @@
 // a launcher problem with a launcher fix. So they collapse into one note that
 // says what is missing and the command that supplies it.
 
-import { SCENARIOS, planScenario, scenarioHref } from '../scenario-origins.js';
+import { SCENARIOS, planScenario, scenarioHref, describeSubstitution } from '../scenario-origins.js';
 import { SERVERS, launchCommandFor } from './launch-command.js';
 
 /**
@@ -36,7 +36,13 @@ import { SERVERS, launchCommandFor } from './launch-command.js';
  * @returns {{ unmount: () => void, describe: () => string }}
  */
 export function mountScenarioSwitcher(rootElement, options) {
-  const { origins, currentScenarioId, currentOrigin, contradiction = null } = options;
+  const {
+    origins,
+    currentScenarioId,
+    currentOrigin,
+    contradiction = null,
+    substitution = null,
+  } = options;
 
   rootElement.className = 'scenario-switcher';
   rootElement.replaceChildren();
@@ -47,6 +53,15 @@ export function mountScenarioSwitcher(rootElement, options) {
   // leaves the visitor with a working page and a link that keeps lying.
   if (contradiction) {
     rootElement.append(buildContradictionNotice(contradiction));
+  }
+
+  // Rendered FIRST, above the tabs, and deliberately not folded into the
+  // contradiction channel. They are different facts: a contradiction says the
+  // URL misdescribes the server, this says we did not render what you asked
+  // for. One string carrying two meanings is how the next reader learns to
+  // distrust both.
+  if (substitution) {
+    rootElement.append(buildSubstitutionNotice(substitution));
   }
 
   const plans = Object.keys(SCENARIOS).map((id) => ({
@@ -98,6 +113,24 @@ function buildContradictionNotice(contradiction) {
   notice.dataset.state = 'stale';
   notice.setAttribute('role', 'status');
   notice.textContent = contradiction;
+  return notice;
+}
+
+/**
+ * The notice a visitor gets when their URL asked for a scenario we did not
+ * render. `textContent`, because the rejected id is straight off the query
+ * string and is quoted back on purpose.
+ *
+ * @param {import('../scenario-origins.js').ScenarioSubstitution} substitution
+ */
+function buildSubstitutionNotice(substitution) {
+  const notice = document.createElement('p');
+  notice.className = 'scenario-switcher__substitution';
+  notice.dataset.substitution = substitution.kind;
+  // `alert`, not `status`: this one contradicts an action the visitor just
+  // took, so it should interrupt rather than wait for a pause in speech.
+  notice.setAttribute('role', 'alert');
+  notice.textContent = describeSubstitution(substitution);
   return notice;
 }
 

@@ -397,18 +397,124 @@ export function scenarioHref(scenarioId, origins) {
 }
 
 /**
- * The scenario the current URL selects, defaulting to one this server can
- * actually serve rather than a fixed first entry — otherwise a visitor landing
- * on the dynamic server opens straight into an unavailable batching panel.
+ * The scenario this server falls back to when the URL did not choose a usable
+ * one — one this server can actually serve rather than a fixed first entry,
+ * otherwise a visitor landing on the dynamic server opens straight into an
+ * unavailable batching panel.
+ *
+ * @param {string[]} selfClasses
+ * @returns {string}
+ */
+function localDefaultScenarioId(selfClasses) {
+  const local = Object.values(SCENARIOS).find((s) => selfClasses.includes(s.serverClass));
+  return local ? local.id : 'continuous-batching';
+}
+
+/**
+ * How much of a rejected `?scenario=` value we are willing to quote back.
+ *
+ * The value is attacker-controlled and unbounded — the resolver is already
+ * tested against `?scenario=../../etc/passwd`. Rendering is `textContent`
+ * everywhere, so this is not an injection defence; it is a LAYOUT defence, so
+ * that `?scenario=<10 kB>` cannot push the panels off the page. Quoting it at
+ * all is deliberate: a visitor who mistyped needs to see WHAT we rejected.
+ */
+const MAX_QUOTED_ID = 60;
+
+/** @param {string} value */
+function quoteRejectedId(value) {
+  return value.length > MAX_QUOTED_ID ? `${value.slice(0, MAX_QUOTED_ID)}…` : value;
+}
+
+/**
+ * @typedef {object} ScenarioSubstitution
+ * @property {string} requested   What the URL asked for, truncated for display.
+ * @property {string} shown       The scenario id actually rendered instead.
+ * @property {'cut'|'unknown'} kind
+ * @property {string|null} reason Why it was cut, when we recorded one.
+ */
+
+/**
+ * Resolve `?scenario=` AND KEEP THE FACT THAT WE SUBSTITUTED.
+ *
+ * `currentScenarioId` answers "which scenario" and throws away "…instead of
+ * what you asked for". That discarded fact is the whole defect: an operator
+ * following a link to a scenario we cut is handed a DIFFERENT scenario,
+ * rendered perfectly, every field correctly badged, with nothing anywhere
+ * saying a substitution occurred. A 404 would have been kinder. It is the one
+ * failure mode this dashboard exists to refuse — a confident, beautiful answer
+ * to a question nobody asked — occurring one layer ABOVE the field-level
+ * honesty apparatus, where none of that apparatus can see it.
+ *
+ * The information could not be surfaced by any caller because it was destroyed
+ * here, at the resolver. So it is returned rather than dropped.
+ *
+ * `kind` separates the two cases because they deserve different sentences and
+ * we could not previously tell them apart: a CUT scenario is a capability we
+ * deliberately withdrew and can explain, an UNKNOWN one is very likely a typo.
+ * This is also the first consumer of `CUT_SCENARIOS` in shipping code — until
+ * now the record of the cut was enforced only against our own markup, and the
+ * application itself could not distinguish "deliberately withdrawn" from
+ * "never existed" from "misspelled".
+ *
+ * @param {string} href
+ * @param {string[]} selfClasses
+ * @returns {{ id: string, requested: string|null, substitution: ScenarioSubstitution|null }}
+ */
+export function resolveScenario(href, selfClasses = []) {
+  const requested = new URL(href).searchParams.get('scenario');
+  if (!requested) {
+    return { id: localDefaultScenarioId(selfClasses), requested: null, substitution: null };
+  }
+  if (Object.hasOwn(SCENARIOS, requested)) {
+    return { id: requested, requested, substitution: null };
+  }
+
+  const shown = localDefaultScenarioId(selfClasses);
+  const cut = Object.hasOwn(CUT_SCENARIOS, requested) ? CUT_SCENARIOS[requested] : null;
+  return {
+    id: shown,
+    requested,
+    substitution: {
+      requested: quoteRejectedId(requested),
+      shown,
+      kind: cut ? 'cut' : 'unknown',
+      reason: cut ? cut.reason : null,
+    },
+  };
+}
+
+/**
+ * The sentence a visitor reads when their URL asked for something we did not
+ * render. It names the rejected id, says which of the two things went wrong,
+ * and names what is on screen instead — because "showing you something else"
+ * is only honest if you can tell WHAT else.
+ *
+ * @param {ScenarioSubstitution} substitution
+ * @returns {string}
+ */
+export function describeSubstitution(substitution) {
+  const shownLabel = SCENARIOS[substitution.shown]?.label ?? substitution.shown;
+  const opening =
+    substitution.kind === 'cut'
+      ? `“${substitution.requested}” is not a scenario on this build — it was cut.`
+      : `“${substitution.requested}” is not a scenario on this build.`;
+  const reason = substitution.reason ? ` ${substitution.reason}` : '';
+  return `${opening}${reason} Showing ${shownLabel} instead.`;
+}
+
+/**
+ * The scenario the current URL selects.
+ *
+ * Retained as the narrow question most callers ask. It is now a projection of
+ * `resolveScenario` rather than a second implementation — two resolvers that
+ * agree today are a divergence waiting to happen, and this one decides which
+ * page a visitor sees.
  *
  * @param {string} href
  * @param {string[]} selfClasses
  * @returns {string}
  */
 export function currentScenarioId(href, selfClasses = []) {
-  const requested = new URL(href).searchParams.get('scenario');
-  if (requested && Object.hasOwn(SCENARIOS, requested)) return requested;
-
-  const local = Object.values(SCENARIOS).find((s) => selfClasses.includes(s.serverClass));
-  return local ? local.id : 'continuous-batching';
+  return resolveScenario(href, selfClasses).id;
 }

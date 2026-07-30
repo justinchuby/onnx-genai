@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import {
   SERVER_CLASSES,
   SCENARIOS,
+  resolveScenario,
+  describeSubstitution,
   parseOrigin,
   resolveOrigins,
   planScenario,
@@ -306,4 +308,102 @@ test('agreement discredits nothing', () => {
   });
 
   assert.deepEqual(result.discredited, []);
+});
+
+// ---------------------------------------------------------------------------
+// The substitution is stated, not performed in silence.
+//
+// Resolving a cut id to a real one was always CORRECT -- the page must render
+// something. The defect was that it happened invisibly: an operator following a
+// link to `prefix-cache` got paged KV, drawn perfectly, every field correctly
+// badged, with nothing saying they were looking at a different scenario. That
+// is a confident answer to a question nobody asked, which is the exact failure
+// this dashboard exists to refuse -- one layer above where the field-level
+// honesty apparatus can see it.
+// ---------------------------------------------------------------------------
+
+test('a substituted scenario reports the substitution instead of hiding it', () => {
+  const cut = resolveScenario(`${SCATTER}/demo?scenario=prefix-cache`, [SERVER_CLASSES.SCATTER]);
+
+  assert.equal(cut.id, 'continuous-batching', 'must still render something');
+  assert.equal(cut.requested, 'prefix-cache');
+  assert.ok(cut.substitution, 'the fact that we substituted must survive the resolver');
+  assert.equal(cut.substitution.kind, 'cut');
+  assert.equal(cut.substitution.shown, 'continuous-batching');
+  assert.ok(
+    cut.substitution.reason,
+    'a CUT scenario has a recorded reason and the visitor is entitled to it',
+  );
+});
+
+test('a cut scenario and a typo are told apart, because they are different mistakes', () => {
+  // Previously indistinguishable: both took the same silent fallback, so the
+  // application could not tell "we withdrew this" from "you misspelled it".
+  const cut = resolveScenario(`${SCATTER}/demo?scenario=prefix-cache`, [SERVER_CLASSES.SCATTER]);
+  const typo = resolveScenario(`${SCATTER}/demo?scenario=paged-kvv`, [SERVER_CLASSES.SCATTER]);
+
+  assert.equal(cut.substitution.kind, 'cut');
+  assert.equal(typo.substitution.kind, 'unknown');
+  assert.equal(typo.substitution.reason, null, 'we have no explanation for a typo, and say so');
+});
+
+test('a scenario we DID render reports no substitution at all', () => {
+  // The anti-vacuity control for the two tests above: if `substitution` were
+  // truthy on the happy path, every visitor would see an apology and the
+  // notice would be trained out of everyone within a day.
+  for (const href of [`${SCATTER}/demo?scenario=paged-kv`, `${SCATTER}/demo`, `${DYNAMIC}/demo`]) {
+    const resolved = resolveScenario(href, [SERVER_CLASSES.SCATTER, SERVER_CLASSES.DYNAMIC]);
+    assert.equal(resolved.substitution, null, `${href} must not claim a substitution`);
+    assert.ok(Object.hasOwn(SCENARIOS, resolved.id));
+  }
+});
+
+test('the substitution sentence names the rejected id AND what is shown instead', () => {
+  // "Showing something else" is only honest if the visitor can tell WHAT else.
+  const { substitution } = resolveScenario(
+    `${DYNAMIC}/demo?scenario=prefix-cache`,
+    [SERVER_CLASSES.DYNAMIC],
+  );
+  const sentence = describeSubstitution(substitution);
+
+  assert.match(sentence, /prefix-cache/, 'must quote what it rejected');
+  assert.match(sentence, /Paged KV block table/, 'must name the scenario by its VISIBLE label');
+  assert.match(sentence, /cut/, 'must say it was withdrawn rather than imply a typo');
+});
+
+test('an unbounded scenario id cannot push the panels off the page', () => {
+  // The value is attacker-controlled -- `?scenario=../../etc/passwd` is already
+  // a test above. Rendering is textContent everywhere, so this is a LAYOUT
+  // bound, not an injection defence.
+  const huge = 'z'.repeat(5000);
+  const { substitution } = resolveScenario(
+    `${SCATTER}/demo?scenario=${huge}`,
+    [SERVER_CLASSES.SCATTER],
+  );
+
+  assert.ok(
+    substitution.requested.length < 100,
+    `quoted ${substitution.requested.length} chars of a 5000-char id`,
+  );
+  assert.ok(describeSubstitution(substitution).length < 300);
+});
+
+test('currentScenarioId stays a projection of resolveScenario, never a second resolver', () => {
+  // Two resolvers that agree today are a divergence waiting to happen, and this
+  // one decides which page a visitor sees.
+  for (const href of [
+    `${SCATTER}/demo`,
+    `${DYNAMIC}/demo`,
+    `${SCATTER}/demo?scenario=paged-kv`,
+    `${SCATTER}/demo?scenario=prefix-cache`,
+    `${SCATTER}/demo?scenario=../../etc/passwd`,
+  ]) {
+    for (const classes of [[SERVER_CLASSES.SCATTER], [SERVER_CLASSES.DYNAMIC], []]) {
+      assert.equal(
+        currentScenarioId(href, classes),
+        resolveScenario(href, classes).id,
+        `${href} disagreed for ${JSON.stringify(classes)}`,
+      );
+    }
+  }
 });
