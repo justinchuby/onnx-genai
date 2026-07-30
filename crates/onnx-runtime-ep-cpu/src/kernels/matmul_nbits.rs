@@ -167,21 +167,27 @@ const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 #[cfg(feature = "mlas")]
 static SQNBIT_DECODE_MIN: OnceLock<usize> = OnceLock::new();
 
-/// Escape hatch: set `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` to force the MLAS
-/// SQNBit decode GEMV back to a single full-width `multithread=true` call
-/// instead of the per-N-shard, per-worker decode-pool dispatch. MLAS's SIMD
-/// column-tiling is not bit-stable across N-partition boundaries (results can
-/// differ by ~1 ULP), so this restores byte-for-byte the pre-sharding output
-/// for A/B parity checks. Off by default (the sharded path is far faster under
-/// the persistent decode pool). Parsed once.
+/// Select a single full-width MLAS SQNBit call (`multithread=true`) instead of
+/// the historical per-N-shard, per-worker decode-pool dispatch. The new
+/// `ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH` knob is parsed as an on/off override; the
+/// old `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` spelling remains as a force-on alias
+/// for existing parity tests and ad-hoc A/B scripts. Parsed once.
 #[cfg(feature = "mlas")]
 fn mlas_no_shard() -> bool {
-    static NO_SHARD: OnceLock<bool> = OnceLock::new();
-    *NO_SHARD.get_or_init(|| {
-        std::env::var("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD").is_ok_and(|value| {
+    static FULLWIDTH: OnceLock<bool> = OnceLock::new();
+    const DEFAULT_FULLWIDTH: bool = false;
+    *FULLWIDTH.get_or_init(|| {
+        if let Ok(value) = std::env::var("ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH") {
             let value = value.trim();
-            !value.is_empty() && value != "0"
-        })
+            return !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off");
+        }
+        if std::env::var("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        }) {
+            return true;
+        }
+        DEFAULT_FULLWIDTH
     })
 }
 
@@ -1259,7 +1265,10 @@ impl MatMulNBitsKernel {
             return Ok(Some(()));
         }
 
-        if can_prepack && !mlas_no_shard() && let Some(shards) = self.mlas_shards.get() {
+        if can_prepack
+            && !mlas_no_shard()
+            && let Some(shards) = self.mlas_shards.get()
+        {
             let Some(shards) = shards.as_ref() else {
                 return Ok(None);
             };
@@ -1269,7 +1278,10 @@ impl MatMulNBitsKernel {
             return Ok(Some(()));
         }
 
-        if can_prepack && mlas_no_shard() && let Some(cached) = self.mlas_packed.get() {
+        if can_prepack
+            && mlas_no_shard()
+            && let Some(cached) = self.mlas_packed.get()
+        {
             let Some(packed_weight) = cached.as_ref() else {
                 return Ok(None);
             };
@@ -1336,8 +1348,8 @@ impl MatMulNBitsKernel {
         }
 
         // Constant weights (the decode hot path) normally use the historical
-        // static-SPMD shards. `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` opts into
-        // ORT's full-width `MlasQNBitGemmBatch(..., multithread=true)` design,
+        // static-SPMD shards. `ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH=1` opts into a
+        // single full-width `MlasQNBitGemmBatch(..., multithread=true)` call,
         // where MLAS dynamically partitions N tiles across its persistent
         // work-stealing intra-op pool, for A/B profiling without changing the
         // default until correctness and throughput are proven.
@@ -7329,7 +7341,7 @@ mod tests {
                 );
                 assert!(
                     kernel.mlas_packed.get().is_none(),
-                    "{label}: bits={bits} block{block_size} should only use full-width MLAS when ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1",
+                    "{label}: bits={bits} block{block_size} should only use full-width MLAS when ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH=1",
                 );
                 assert!(
                     kernel.packed_kai_qsi4_weight.get().is_none()
@@ -11222,8 +11234,9 @@ mod tests {
             command.env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV);
         }
         if no_shard {
-            command.env("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD", "1");
+            command.env("ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH", "1");
         } else {
+            command.env_remove("ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH");
             command.env_remove("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD");
         }
         let output = command
@@ -11275,14 +11288,14 @@ mod tests {
     const MLAS_SHARD_PARITY_CONFIGS: &[(usize, usize)] =
         &[(256, 128), (512, 32), (256, 64), (256, 32), (128, 32)];
 
-    /// Isolated child so the persistent-pool and `NO_SHARD` one-time env gates
+    /// Isolated child so the persistent-pool and full-width one-time env gates
     /// are initialized independently. This exercises the actual cached
     /// `mlas_shards` + SPMD-scope route, not a manually assembled shard proxy.
     ///
     /// Sweeps every [`MLAS_SHARD_PARITY_CONFIGS`] entry at
     /// [`MLAS_SHARD_PARITY_N`] and concatenates all decode outputs into one
     /// bit-stream, so the parent bit-compares the *entire* drift matrix (the
-    /// shard route vs the `NO_SHARD` full-width route) in one shot.
+    /// shard route vs the full-width route) in one shot.
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_parity_subprocess() {
@@ -11359,7 +11372,7 @@ mod tests {
             if mlas_no_shard() {
                 assert!(
                     kernel.mlas_shards.get().is_none(),
-                    "NO_SHARD must select the full-width MLAS call (k={k} blk={block_size})"
+                    "FULLWIDTH must select the full-width MLAS call (k={k} blk={block_size})"
                 );
             } else {
                 let shards = kernel
@@ -11385,7 +11398,7 @@ mod tests {
     }
 
     /// Chew #2: the real cached SPMD MLAS-shard decode route must agree with
-    /// the `NO_SHARD=1` full-width route. The per-worker shard boundaries are
+    /// the `ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH=1` route. The per-worker shard boundaries are
     /// snapped to [`MLAS_SQNBIT_DECODE_SHARD_ALIGN`], keeping every MLAS N-tile
     /// whole inside one shard, so the sharded decode is now *bit-identical* to
     /// the full-width call (no ~1 ULP N-tile-boundary drift): assert byte-for-
@@ -11405,7 +11418,7 @@ mod tests {
         assert_eq!(
             sharded.len(),
             full_width.len(),
-            "cached SPMD MLAS shards vs NO_SHARD full-width decode: length mismatch"
+            "cached SPMD MLAS shards vs full-width decode: length mismatch"
         );
         let mismatches: Vec<_> = sharded
             .iter()
@@ -11422,7 +11435,7 @@ mod tests {
             .unwrap_or(0);
         assert!(
             mismatches.is_empty(),
-            "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width \
+            "aligned SPMD MLAS-shard decode must be bit-identical to full-width \
              (max_ulp={max_ulp}); if this fails, MLAS_SQNBIT_DECODE_SHARD_ALIGN is not \
              keeping N-tiles whole. mismatching (index, sharded_bits, full_bits): {mismatches:?}"
         );
