@@ -38,7 +38,6 @@ use ratatui::layout::Rect;
 use ratatui::prelude::{CrosstermBackend, Line, Span, Style};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
-use unicode_width::UnicodeWidthStr;
 
 /// Rows the live view occupies, including the status line.
 ///
@@ -267,21 +266,20 @@ impl Active {
 
 /// Rows `lines` occupy once wrapped to `width`.
 ///
-/// Extent is measured by Unicode display width, not scalar count: ratatui's
-/// `Paragraph` wraps by terminal cells (via `unicode-width`), where CJK/wide
-/// characters take two columns and combining marks take none. Counting `chars`
-/// undercounts wide text and desynchronizes this row math from the real layout.
+/// Count through ratatui's own wrapped-line composer rather than duplicating a
+/// display-width approximation. `Paragraph::wrap` is word-wrap aware, so a long
+/// word after a short word can occupy more rows than `ceil(total_width / width)`;
+/// undercounting here makes the inline viewport reserve too few rows and redraw
+/// over terminal scrollback.
 fn wrapped_rows(lines: &[Vec<Segment>], width: usize) -> usize {
-    lines
-        .iter()
-        .map(|line| {
-            line.iter()
-                .map(|segment| UnicodeWidthStr::width(segment.text.as_str()))
-                .sum::<usize>()
-                .div_ceil(width)
-                .max(1)
-        })
-        .sum()
+    Paragraph::new(
+        lines
+            .iter()
+            .map(|line| render_line(line))
+            .collect::<Vec<_>>(),
+    )
+    .wrap(Wrap { trim: false })
+    .line_count(width.min(u16::MAX as usize).max(1) as u16)
 }
 
 /// Style a reply line, dimming the model's thinking.
@@ -357,6 +355,21 @@ mod tests {
             },
         ];
         assert_eq!(wrapped_rows(&[mixed], 20), 2);
+    }
+
+    #[test]
+    fn row_count_matches_ratatui_word_wrap_not_total_width_ceiling() {
+        // At width 10, ratatui word-wraps this as:
+        //   "aaa "
+        //   "bbbbbbbbbb"
+        //   "bbbbb"
+        // A naive `ceil(total_display_width / width)` reservation sees only
+        // 19 columns and reserves 2 rows, which is exactly how the live viewport
+        // under-reserved and overpainted existing scrollback.
+        let text = format!("aaa {}", "b".repeat(15));
+        let old_reserved_rows = text.len().div_ceil(10);
+        assert_eq!(old_reserved_rows, 2);
+        assert_eq!(wrapped_rows(&[line(&text)], 10), 3);
     }
 
     #[test]

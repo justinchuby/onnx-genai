@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use onnx_genai::ort::{ChatMessage, ChatTemplate};
-use onnx_genai::reasoning::{ReasoningMarkers, ReasoningStream};
+use onnx_genai::reasoning::{ReasoningChunk, ReasoningMarkers, ReasoningStream};
 use onnx_genai::{GenerateToken, GenerationBudgetCap};
 
 use super::interactive::{Backend, GENERATING, INTERRUPT_REQUESTED, Interrupted, TurnInput};
@@ -25,16 +25,27 @@ pub(super) fn detect_reasoning(template: Option<&ChatTemplate>) -> Option<Reason
     let template = template?;
     let source = template.source();
     let markers = ReasoningMarkers::from_chat_template(source)?;
-    // The opener appearing after the assistant generation prompt means the
-    // template opens the span for the model.
-    let opened_by_template = source
-        .rsplit_once("assistant")
-        .map(|(_, tail)| tail.contains(&markers.start))
-        .unwrap_or(false);
+    let opened_by_template = template_opens_reasoning_for_generation(template, &markers);
     Some(ReasoningConfig {
         markers,
         opened_by_template,
     })
+}
+
+fn template_opens_reasoning_for_generation(
+    template: &ChatTemplate,
+    markers: &ReasoningMarkers,
+) -> bool {
+    let probe = [ChatMessage::user("__onnx_genai_reasoning_probe__")];
+    let Ok(rendered) = template.render(&probe, None, true) else {
+        return false;
+    };
+    let Some(last_start) = rendered.rfind(markers.start.as_str()) else {
+        return false;
+    };
+    rendered
+        .rfind(markers.end.as_str())
+        .is_none_or(|last_end| last_start > last_end)
 }
 
 /// Load the model's chat template unless `raw` is set. On a load failure this
@@ -233,43 +244,59 @@ pub(super) fn run_generation_turn(
         timings.token();
         output.push_str(&token.text);
         if stream {
-            let is_reasoning = reasoning_stream
-                .as_mut()
-                .map(|tracker| tracker.push(&token.text))
-                .unwrap_or(false);
-            if let Some(live) = live.as_deref_mut() {
-                let first = live_frames == 0;
-                live.push(&token.text, is_reasoning)?;
-                live_frames += 1;
-                // The first token draws immediately so the line is never empty
-                // while a reply is on screen; after that the numbers are
-                // throttled, since they move faster than they can be read and
-                // every update costs a frame.
-                if first || last_status.elapsed() >= STATUS_REFRESH {
-                    let mut status = timings.live_summary();
-                    if let (Some(prompt_tokens), Some(context_limit)) =
-                        (prompt_tokens, context_limit)
-                    {
-                        let context = profile::ContextUsage {
-                            used_tokens: prompt_tokens + timings.tokens(),
-                            max_tokens: context_limit,
-                        };
-                        if status.is_empty() {
-                            status = format!("ctx {context}");
-                        } else {
-                            status.push_str(&format!(" · ctx {context}"));
-                        }
-                    }
-                    live.set_status(status)?;
-                    last_status = Instant::now();
-                }
+            let segments = if let Some(tracker) = reasoning_stream.as_mut() {
+                tracker.push_segments(&token.text)
             } else {
-                if dim_reasoning && is_reasoning != dimmed {
-                    print!("{}", if is_reasoning { "\x1b[2m" } else { "\x1b[0m" });
-                    dimmed = is_reasoning;
+                vec![ReasoningChunk {
+                    text: token.text.as_str(),
+                    is_reasoning: false,
+                }]
+            };
+            for segment in segments {
+                if segment.text.is_empty() {
+                    continue;
                 }
-                print!("{}", token.text);
-                io::stdout().flush()?;
+                if let Some(live) = live.as_deref_mut() {
+                    let first = live_frames == 0;
+                    live.push(segment.text, segment.is_reasoning)?;
+                    live_frames += 1;
+                    // The first token draws immediately so the line is never empty
+                    // while a reply is on screen; after that the numbers are
+                    // throttled, since they move faster than they can be read and
+                    // every update costs a frame.
+                    if first || last_status.elapsed() >= STATUS_REFRESH {
+                        let mut status = timings.live_summary();
+                        if let (Some(prompt_tokens), Some(context_limit)) =
+                            (prompt_tokens, context_limit)
+                        {
+                            let context = profile::ContextUsage {
+                                used_tokens: prompt_tokens + timings.tokens(),
+                                max_tokens: context_limit,
+                            };
+                            if status.is_empty() {
+                                status = format!("ctx {context}");
+                            } else {
+                                status.push_str(&format!(" · ctx {context}"));
+                            }
+                        }
+                        live.set_status(status)?;
+                        last_status = Instant::now();
+                    }
+                } else {
+                    if dim_reasoning && segment.is_reasoning != dimmed {
+                        print!(
+                            "{}",
+                            if segment.is_reasoning {
+                                "\x1b[2m"
+                            } else {
+                                "\x1b[0m"
+                            }
+                        );
+                        dimmed = segment.is_reasoning;
+                    }
+                    print!("{}", segment.text);
+                    io::stdout().flush()?;
+                }
             }
         }
         Ok(())
@@ -346,6 +373,17 @@ pub(super) fn display_paths(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::current_dir().unwrap().join(format!(
+            "output-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn scheduler_budget_cap_notice_names_values_and_levers() {
@@ -458,5 +496,94 @@ mod tests {
             !case_b.contains('\n'),
             "case B: stderr=plain must give line"
         );
+    }
+
+    #[test]
+    fn qwen3_template_does_not_open_reasoning_for_current_generation() {
+        let dir = temp_dir("qwen3-reasoning-template");
+        fs::write(
+            dir.join("chat_template.jinja"),
+            r#"{%- for message in messages %}
+{%- if message.role == "user" %}
+{{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
+{%- elif message.role == "assistant" %}
+{{- '<|im_start|>assistant\n' }}
+{%- if '</think>' in message.content %}
+{{- '<think>\n' + message.content.split('</think>')[0].split('<think>')[-1] + '\n</think>\n\n' }}
+{%- endif %}
+{{- message.content.split('</think>')[-1].lstrip('\n') + '<|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' }}
+{%- if enable_thinking is defined and enable_thinking is false %}
+{{- '<think>\n\n</think>\n\n' }}
+{%- endif %}
+{%- endif %}"#,
+        )
+        .unwrap();
+
+        let template = ChatTemplate::from_model_dir(&dir).unwrap();
+        let old_source_tail_heuristic = template
+            .source()
+            .rsplit_once("assistant")
+            .map(|(_, tail)| tail.contains("<think>"))
+            .unwrap_or(false);
+        let config = detect_reasoning(Some(&template)).expect("template declares think markers");
+        let rendered = template
+            .render(&[ChatMessage::user("what's the capital?")], None, true)
+            .unwrap();
+        let split = config
+            .markers
+            .split("<think>because</think>Olympia", config.opened_by_template);
+        let mut stream = ReasoningStream::new(config.markers.clone(), config.opened_by_template);
+        let trace = stream
+            .push_segments("<think>because</think>Olympia")
+            .into_iter()
+            .map(|segment| (segment.text.to_string(), segment.is_reasoning))
+            .collect::<Vec<_>>();
+
+        assert!(
+            old_source_tail_heuristic,
+            "the old source-tail heuristic must reproduce the false positive"
+        );
+        assert!(
+            !rendered.contains("<think>"),
+            "the rendered current generation prompt must not open thinking: {rendered:?}"
+        );
+        assert!(
+            !config.opened_by_template,
+            "qwen3 opens prior assistant turns and an enable_thinking=false branch, not the current default generation turn"
+        );
+        assert!(split.complete);
+        assert_eq!(split.answer, "Olympia");
+        assert_eq!(
+            trace,
+            vec![
+                ("<think>".to_string(), true),
+                ("because".to_string(), true),
+                ("</think>".to_string(), true),
+                ("Olympia".to_string(), false),
+            ]
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn template_opening_current_generation_is_still_detected() {
+        let dir = temp_dir("template-opens-reasoning");
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"{% for m in messages %}<|{{ m.role }}|>\n{{ m.content }}\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n<think>\n{% endif %}"}"#,
+        )
+        .unwrap();
+
+        let template = ChatTemplate::from_model_dir(&dir).unwrap();
+        let config = detect_reasoning(Some(&template)).expect("template declares think markers");
+
+        assert!(config.opened_by_template);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
