@@ -2880,3 +2880,58 @@ This is D85's principle — *type size is a claim about which number matters* �
 | D114 | `MEASURED: 'measured'`; drop `sourceClass`/`origin` for `source`/`endpoint`/`server` | Name and wire value disagree; the guard fails silently while output looks right |
 | D115 | Batch occupancy renders **`3 of 4`**, never a percentage | Five reachable values presented on a 101-point scale invents precision |
 | D116 | **Any ratio over a small integer denominator renders `n of m`** | The format is a claim about how finely a quantity can be known |
+
+---
+
+## 41. 🔴 THE ENUM FORK DISSOLVES — THE SAFETY PROPERTY LIVES IN THE CONSTANT NAME, NOT THE WIRE STRING. D114 PARTIALLY REVERSED.
+
+The enum has genuinely forked and **I caused most of it** by conceding `ok`, reversing to `measured`, then ruling `MEASURED: 'measured'`. Current truth on disk:
+
+| Artifact | Says |
+|---|---|
+| `demo-spec.md` (@376a0297) | five states, **`ok`** |
+| `telemetry-field.js:90` (@bb2ee824, `baf18736`, 52/52 green) | **`MEASURED: 'ok'`** |
+| Lead's last group ruling | **`measured`** |
+
+### 41.1 The migration is NOT one line — I measured it
+
+```
+dashboard/prefix-cache.js:227    state: 'ok',            ← raw literal
+dashboard/field-state.js:46      OK: 'ok',
+dashboard/field-state.js:28      @typedef {'ok'|'pending'|'stale'|'unavailable'}   ← FOUR states
+dashboard/store-adapter.js:194   return { state: 'ok', ... }
+```
+**@bb2ee824's scope is clean (constants only); `dashboard/` carries raw string literals.** So a rename lands in the scope that uses raw strings, **during an active build, against a known silent fall-through** — and a missed literal doesn't throw, it **renders the value as a plain number.** That's a real risk for a word change.
+
+### 41.2 The dissolution: the Lead's safety argument is already satisfied
+
+The argument for `measured` was: *a reviewer seeing `state: 'ok', value: 0` reads "ok" as "fine" and is tempted to hide the zero.* **That is a claim about what a DEVELOPER READS.** And a developer reading or writing this never types the wire string — they type:
+
+```js
+FIELD_STATES.MEASURED       // ← the name is ALREADY 'MEASURED'
+```
+
+> **THE SAFETY PROPERTY LIVES IN THE IDENTIFIER DEVELOPERS TYPE, NOT IN THE WIRE STRING THEY NEVER SEE. `MEASURED: 'ok'` DELIVERS BOTH — the honest name in the code, the shipped value on the wire, and ZERO MIGRATION.**
+
+**So `MEASURED: 'ok'` is not a bug. It is the correct design, and I mis-ruled it in D114** because I read the mismatch against a spec value rather than asking *who ever reads this string.* @c0de4c2e was right that name and value disagreed; **the fix is to ratify the value, not to churn it.**
+
+### 41.3 D117 — WHAT MAKES IT SAFE: NO MODULE MAY USE A RAW STATE LITERAL
+
+The mismatch is only dangerous if someone writes `field.state === 'measured'` (or `'ok'`) by hand. **Ban it and both risks vanish at once — this fork AND the leak class @bb2ee824 flagged at `prefix-cache.js:266`.**
+
+- **D117:** every state comparison goes through `FIELD_STATES.*` or a helper (`hasValue`, `numericValueOf`). **A test asserts no module contains a raw state string.** Same tripwire pattern as `tokens_per_second`.
+- **D118:** `dashboard/field-state.js:28`'s `RenderState` typedef lists **four** states — **add `not-applicable`.** A stale typedef is the `:20` JSDoc failure again: **documentation with the authority of code and none of its guarantees.**
+
+**MY RECOMMENDATION TO @12e42da8, and it costs nothing to overrule: RATIFY `ok` AS THE WIRE VALUE.** Spec and code already agree; your safety property is delivered by the constant name; the migration risk lands in the scope least able to absorb it. **I argued for `measured` and I'm withdrawing that — the ambiguity window is now more expensive than either word, and this is the option that closes it in zero edits.**
+
+### 41.4 What I got wrong, plainly
+
+I reversed on this enum three times. **My §21 four-state line, my `ok` concession, my `measured` reversal, and D114's rename each looked locally correct and collectively produced a fork that cost two devs real time.** The lesson isn't "rule earlier" — evidence genuinely kept arriving. It's narrower:
+
+> **D119 — WHEN YOU HAVE REVERSED YOURSELF TWICE ON THE SAME QUESTION, YOU ARE NO LONGER THE RIGHT PERSON TO RULE ON IT. HAND IT TO THE OWNER WITH THE EVIDENCE AND STOP PUBLISHING.** Each of my reversals was defensible; the *sequence* was the damage, and the sequence is invisible from inside it.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D117 | No raw state literals anywhere; comparisons via `FIELD_STATES.*`/helpers, enforced by test | Kills the fork risk and the leak class together |
+| D118 | `field-state.js:28` typedef must list five states | A stale typedef is code-authority without code-guarantees |
+| D119 | **Two reversals on one question = hand it to the owner and stop ruling** | Each reversal was locally defensible; the sequence was the damage |
