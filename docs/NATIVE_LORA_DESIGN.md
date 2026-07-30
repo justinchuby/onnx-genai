@@ -1205,7 +1205,13 @@ gathering the active rows' logits back in `active_rows()` order.
 (dtype-agnostic byte zero of the `MAX_LEN * KV_DIM` region), mirroring ORT's
 `zero_rank3_row` on admit so a recycled physical slot cannot leak the previous
 sequence's cache — even though `nonpad_kv_seqlen` already bounds reads to
-`[0, row_lens)`. `deactivate_row` only clears the active flag; the slot's cache is
+`[0, row_lens)`. The zeroing is done **in place** on each buffer's backing storage
+via `Tensor::as_bytes_mut` (only the target row's `[row*row_stride ..
+(row+1)*row_stride)` byte range is filled), so admission is `O(one row)` rather
+than cloning and rebuilding the full `batch * MAX_LEN * KV_DIM` buffer for every
+key/value tensor of every layer; this also preserves each buffer's allocation
+identity, so the `TensorScatter` carry-forward binding keeps observing the same
+tensor. `deactivate_row` only clears the active flag; the slot's cache is
 reclaimed on the next `assign_row`.
 
 **Grouped LoRA threading.** Identical to the KV-free session in spirit: when the
