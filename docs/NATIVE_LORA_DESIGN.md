@@ -1177,18 +1177,30 @@ allocation on the routing/index path.
 each physical row the session binds, at axis 1 (the sequence axis):
 `write_indices[row] = row_lens[row]` (the row's current logical length = next free
 slot), and `nonpad_kv_seqlen[row] = row_lens[row] + 1` for a row that advances
-this step, else `row_lens[row]`. `row_lens[row]` is incremented only for advancing
+this step, else `max(row_lens[row], 1)`. `row_lens[row]` is incremented only for advancing
 rows, exactly as ORT's `try_run_batched_static_chunk` does. Because
 `write_indices` is a rank-1 `[batch]` per-row cursor, rows at different lengths
 scatter to different positions in the same buffer — this is the entire point of
 the static-cache contract and is what unblocks ragged continuous batching.
+
+**Idle-slot `nonpad` flooring (defensive hardening).** A never-assigned / idle
+(non-advancing) row has `row_lens[row] == 0`, so a naive `nonpad = row_lens` would
+ask the attention kernel to softmax a **zero-length** KV window, which a
+production kernel can turn into `NaN`. Batch isolation confines that to the row's
+discarded output slice on the tiny fixture, but real-model/server E2E is deferred,
+so the non-advancing branch floors `nonpad` to `max(row_lens[row], 1)`: an idle
+row reads KV slot 0, which is always zeroed on `assign_row` and never gathered
+into a real output. This never changes an **active** row's window — an advancing
+row keeps `row_lens + 1`, and a live non-advancing row always has `row_lens >= 1`,
+so the floor is a no-op for it. The flooring lives in the pure helper
+`row_nonpad_kv_seqlen` and is unit-tested directly.
 
 **Ragged prefill (`step_select`).** The `ContinuousBatchManager` prefills each
 freshly admitted row one prompt token at a time via `step_select` with a per-row
 `advance_rows` mask, so at any step some rows advance while others hold. The
 native session runs the **full physical batch** every step and honours the mask
 per row: non-advancing rows (holding rows, finished/deactivated rows, and empty
-slots) bind `write_indices = row_lens` / `nonpad = row_lens` and a dummy token, so
+slots) bind `write_indices = row_lens` / `nonpad = max(row_lens, 1)` and a dummy token, so
 their scatter lands on the free slot beyond `nonpad` (never read) and the valid
 prefix `[0, row_lens)` is untouched. This is honest but unoptimized: unlike the
 ORT batched session it does **not** compact active rows into a packed physical
