@@ -8,6 +8,8 @@
 2. Add the smallest counterexample. Before fixing, require the intended assertion **and accurate
    diagnostic** to go red; an exit code proves only that something failed. A positive fixture
    without a reachable negative is incomplete.
+   Hash or diff the mutated file first: an unchanged file means the mutation never happened, so a
+   green result proves nothing.
 3. Trace test and production entrypoints to the same implementation and ordering.
 4. Resolve the production consumer and implementation by full path, not basename.
 5. Assert the real dimensions -- identity, order, freshness, scope -- not a correlated proxy.
@@ -56,8 +58,3 @@ became false. Had `safeSame` flipped, cleanup rerouting -- not an intrinsic fix 
   own file can report its fixtures as production findings.
 - **Recognising an error shape does not prevent recurrence.** After finding ambiguous `metrics.rs`
   basenames, the same developer used a basename predicate for a full-path question. Review structure.
-
-## Pinned-review warning
-
-Never use `git archive` for pinned review: it can omit tests and disarm self-inspecting guards.
-An archive failure is evidence; an archive pass is not.
