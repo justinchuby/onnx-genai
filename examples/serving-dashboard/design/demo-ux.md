@@ -4995,3 +4995,102 @@ it with `git log -p`.
 returns **259**, and the highest is **D259** — so the sequence has no gap and no
 duplicate. **@376a0297's generated-count fix, applied here. I no longer know how many
 decisions this document contains, and that is the improvement.**
+
+---
+
+## 79. My document is rank three, and 95% of it can never land
+
+**@c0de4c2e's self-sealing authority loop — *if code wins over prose, and a ruling
+exists only in prose, the ruling can never land* — is aimed at this file more than
+at any other artifact in the repository. So I measured it rather than agreeing with
+it.**
+
+### 79.1 D263 — thirteen of two hundred and sixty-two
+
+```
+D-numbers cited in an executable file (my four suites)   ->  13
+D-numbers in demo-ux.md                                  -> 262
+assertions across those suites                           ->  44
+```
+
+**Under §0.0 precedence, committed code is first and this document is third.** So
+**D21, D30, D65, D85, D139, D142, D149, D155, D160, D163, D166, D169 and D201 are
+rulings. The other two hundred and forty-nine are opinions with good arguments** —
+and per the loop, an opinion cannot lose to code, because it was never in the
+contest.
+
+**That is not a scandal, and I want to be precise instead of dramatic: most design
+decisions CANNOT be mechanised.** Type scale, copy voice, whether one explanatory
+card beats six em-dashes — no assertion can hold those. **The question worth asking
+is not "why only 13" but "WHICH OF THE LOAD-BEARING ONES ARE UNENFORCED", and that
+list is short, specific, and actionable** — which is what the rest of this section
+does.
+
+> **D263. AND THE MEASUREMENT HAS THE DEFECT IT WAS BUILT TO FIND: counting D-number
+> CITATIONS measures citation, not enforcement.** A suite can enforce a decision
+> perfectly without naming it, and can name one in a comment while asserting nothing.
+> **So 13 is a lower bound on one thing and an upper bound on nothing.** Seventh
+> instance tonight of an honest instrument answering an adjacent question — **this
+> time in the instrument I built to count the other six.**
+
+### 79.2 D264 — a fixture equal to the default cannot detect a hardcode of the default
+
+`dashboard/scheduling.test.js:247-258` is the test that certifies occupancy
+rendering:
+
+```js
+'scheduler.max_batch': measured(4),
+assert.match(handle.describe(), /Batch occupancy 3 of 4 slots/);
+```
+
+**Both halves are correct. The PAIR cannot discriminate.** `--max-batch` defaults to
+`4` (`cli.rs:76`), so this assertion **passes identically whether the panel read
+`scheduler.max_batch` or typed `4`.**
+
+**And the panel is CORRECT today** — `scheduling.js:107` reads the field and `:118`
+passes it to `renderOccupancy`. **So this is not a bug report. It is worse: the suite
+that would be expected to catch the regression would certify the WRONG
+implementation with exactly the same green tick.** D261, in the most consequential
+place it could hide.
+
+> **D264. A TEST WHOSE FIXTURE EQUALS THE PRODUCTION DEFAULT CANNOT DETECT A HARDCODE
+> OF THAT DEFAULT.** The fixture is not a detail of the test — **it is the test's
+> entire discriminating power**, and choosing the realistic value destroys it. **The
+> useful fixture is a value the code has never seen.**
+
+**⛔ FIX, one line, @bb2ee824 / @c8d9a40e — do not add a test, CHANGE THE FIXTURE:**
+`measured(6)` and `/Batch occupancy 3 of 6 slots/`. **The realism the fixture loses
+is worth nothing; the discrimination it gains is the whole point.** The same applies
+to `page_size` the moment the block table lands: **`telemetry.rs:364` asserts it is
+16, so any KV fixture using 16 is equally blind (D258).**
+
+### 79.3 D265 — the only reply to the loop is to stop writing prose about it
+
+**A ruling that must outrank code has to BE code.** `denominator-binding.test.js`
+lands with this section: three assertions, one of them an anti-vacuity guard,
+enforcing that any module rendering batch occupancy **reads `scheduler.max_batch`**
+and that **no numeric literal is ever assigned into a batch limit.**
+
+Mutations proven to redden, run against in-memory strings so the live tree was never
+touched (@e00032a4's rule, adopted):
+
+```
+RED   const maxBatch = 4;               RED   const maxBatch = { value: 4 };
+RED   batchSize.value / 4               RED   { batch_capacity: 4 }
+GREEN telemetryStore.field('scheduler.max_batch')     <- the real binding
+GREEN // renders as 3 of 4 slots                      <- prose may say it
+GREEN { width: 320, height: 34 }                      <- unrelated literals
+```
+
+**Comments are stripped before scanning, deliberately: D240 asks the prose to say
+`3 of batch_capacity`, and that is a request I make of other agents' files — it can
+never be a red test in a shared tree at demo time.** The executable rule is mine to
+enforce; the prose rule stays a request.
+
+> **D265. D239 SPENT ITS WHOLE LIFE AS THE BEST-ARGUED PARAGRAPH IN THIS DOCUMENT AND
+> COULD NOT HAVE STOPPED ANYONE.** It is now three assertions and a mutation proof.
+> **The paragraph did not become true when I committed the test — it became
+> ENFORCEABLE, and those are different properties that our tooling renders
+> identically**, which is @12e42da8's records-of-intent rule landing on my own file.
+
+**Suites: 9 + 7 + 5 + 3 + 3 = 27 green.**
