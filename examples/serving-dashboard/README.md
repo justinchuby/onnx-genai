@@ -533,68 +533,72 @@ denominator's. **That is the two-server ruling paying for itself in a place
 nobody chose it for**, and it is worth noticing that the guarantee comes from
 the process boundary rather than from anyone remembering this caveat.
 
-**What the numbers looked like on one machine.** Full method, raw per-run
-values, hardware, binary and model SHA-256s, and the git state at capture are in
-[`perf-baseline.md`](perf-baseline.md) — measured on this repository before the
-dashboard existed, CPU execution provider, `qwen2.5-0.5b-scatter-v2`, 512-token
-generations:
+**What this scenario demonstrates — and why there is no ratio here.**
 
-| | median | spread | n |
-|---|---|---|---|
-| Single request, decode | 33.415 tok/s | CV 1.98 % | 15 |
-| 4 concurrent, aggregate decode | 82.130 tok/s | CV 2.93 % | **4** |
-| 4 concurrent, wall-clock throughput | 52.506 tok/s | CV 1.93 % | **4** |
-| Time to first token | 2141 ms | σ 137 ms | 15 |
+This section used to print a throughput speedup. **It has been withdrawn, and it
+was withdrawn for a reason stronger than "your hardware differs."**
 
-Read that honestly: four concurrent requests produced roughly **2.5×** the
-aggregate decode throughput of one — **95 % CI [2.35, 2.59]** — while
-**per-stream throughput fell to about 0.62×** of solo (~20.7 tok/s). Batching
-does not make any single request faster; it trades per-stream latency for total
-throughput. That trade *is* the lesson of the scenario, and a demo showing only
-the speedup would be telling you half of it.
+> **The model those numbers were measured against cannot be rebuilt.** The
+> artifact was assembled by accident from **two builds seventeen days apart**,
+> and its inference metadata file was edited **fifty-four minutes after the model
+> was built — inside the measurement window**, while every other file in that
+> directory carries a timestamp within a minute of the build. Nobody has
+> established that measurements taken either side of that edit are comparable.
+>
+> So the problem is not that the figure is unreproducible *by you*. **We cannot
+> show it is internally consistent with itself.** A performance claim whose
+> artifact nobody can rebuild is not a measurement; it is a rumour with a decimal
+> point — and **a decimal point is the strongest credibility signal a document
+> has.** Two decimal places asserted a precision this setup cannot support, which
+> is the same defect as rendering a 4-slot batch as `75 %`: **a format is a claim
+> about how finely a quantity can be known.**
+>
+> The raw capture is still in [`perf-baseline.md`](perf-baseline.md) as a lab
+> record — what was run, on what, in what order. **Read it as a notebook, not as
+> a result.** Deleting it would hide the evidence that the claim was unsafe.
 
-> **Why this says `~2.5×` and not `2.46×`, which is what the raw division
-> gives.** The concurrent arm is **n = 4**, so the interval around that ratio is
-> about **±0.12**. Writing `2.46×` claims the quantity is known to ±0.005 — it is
-> known to ±0.12, and **the third significant figure is arithmetic from the
-> division, not resolution from the data.** The number is not wrong; the
-> *precision* is invented. That is the same defect as rendering a 4-slot batch as
-> `75 %`: **a format is a claim about how finely a quantity can be known**, and
-> here the claim was 24× finer than the measurement.
+**What replaces it is the mechanism, because a mechanism is checkable by
+reading the code and a ratio is not.** If you try to reproduce a number and
+fail, every other claim in this document becomes suspect — including the ones
+that are true and were hard to earn.
 
-**Why the ratio survives the noise floor, when a single number would not.** The
-*byte-identical* binary, re-run on the *same* machine 75 minutes later, produced
-**30.151 tok/s instead of 33.415 — a 9.8 % drop caused entirely by background
-load** (a backup running, an indexer at 91 % CPU). That is nearly five times the
-margin anyone would treat as a meaningful regression, and it is why **no absolute
-figure in that table should be treated as reproducible.**
+**Continuous batching** (`crates/onnx-genai-engine/src/batched.rs`) keeps one
+decode batch running and edits its membership *between steps* rather than
+between batches. `submit` places a request in a FIFO queue; each `step` calls
+`admit_available_rows`, which evicts finished rows and admits queued ones in the
+same pass. The contrast is `generate_batched_static`, where a batch is formed,
+run to completion, and only then replaced.
 
-The speedup is a different kind of claim, and it is worth being precise about
-why it is sturdier rather than waving at the same caveat twice:
+- **The effect is on waiting, not on speed.** Under static batching a request
+  arriving just after a batch starts waits for the *longest* member of that
+  batch to finish — head-of-line blocking whose cost is set by the unluckiest
+  arrival time. Continuous batching removes that wait; a freed row is refilled at
+  the next token boundary.
+- **It also removes idle decode slots.** A finished sequence in a static batch
+  leaves its row computing nothing until the whole batch retires.
 
-| | |
-|---|---|
-| what the 9.8 % measures | drift of an **absolute** number **across time**, under changing load |
-| how the two arms here were captured | **within one 20-minute window**, one binary SHA-256, one model SHA-256, clean tree ([`perf-baseline.md`](perf-baseline.md) §4c) |
-| effect size of the speedup | **+147 %** |
-| **effect ÷ noise floor** | **≈ 15×** |
+**Paged attention** (`crates/onnx-genai-kv/src/page_table.rs`) stores the KV
+cache as fixed-size pages drawn from a shared pool — `allocate` hands out a page,
+`free` returns it — instead of one contiguous per-sequence buffer.
 
-Load that moves both arms together largely cancels in a ratio, and an effect
-fifteen times the drift is not something drift can manufacture. **So the honest
-split is: the speedup is real and roughly two and a half fold; the absolute
-tok/s figures are one machine's afternoon.** Applying the cross-time noise floor
-to the within-window ratio would be **a guard shaped like the incident rather
-than like the fault** — the same error, mirrored, as trusting a single number
-because it came out of a careful-looking table.
+- **It removes the need to reserve for the worst case.** A contiguous cache must
+  be sized for the longest generation the request *might* produce; pages are
+  taken as tokens are actually generated, so unused capacity stays available to
+  other sequences.
+- **It makes sharing expressible.** Identical pages can be referenced by several
+  sequences instead of copied, which is what makes prefix reuse possible at all.
 
-These are still one machine's numbers on a CPU, at a generation length chosen
-because shorter runs were too noisy to be conclusive (at 128 tokens the
-coefficient of variation was 4.95 %, and two runs of an identical binary differed
-by 1.98 % — enough to manufacture a false result). They are **not** a performance
-claim about onnx-genai, and yours will differ. The page measures your machine;
-that is the only number that should persuade you. It is also why the demo
+**The tradeoff is the part worth keeping, and it needs no number:** batching
+raises *aggregate* throughput and does not make any single request faster. Each
+stream shares a device with the others, so per-stream throughput falls even as
+total throughput rises. **A demo that showed only the aggregate would be telling
+you half of it** — and that half is the half that sells.
+
+**So the only throughput figure this project will stand behind is the one the
+page measures on your machine, while you watch.** That is also why the demo
 re-measures rather than shipping a recorded baseline: **a stored number is a
-claim about a machine that no longer exists.**
+claim about a machine that no longer exists** — and, as it turns out, sometimes
+about a model that was never deliberately built.
 
 ### Scenario B — paged KV page allocation *(dynamic profile, `:8124`)*
 
@@ -1062,8 +1066,8 @@ both:
 #### Stale values stop being numbers
 
 A greyed number with an age beside it is honest for a few seconds and dishonest
-after a few minutes, because **`20.7 tok/s · 4m old` is read by every human as
-`20.7 tok/s`.** An age suffix does not stop a number being a number.
+after a few minutes, because **`41.3 tok/s · 4m old` is read by every human as
+`41.3 tok/s`.** An age suffix does not stop a number being a number.
 
 So each panel carries a **staleness ceiling** (`dashboard/field-state.js:87`,
 per-panel overrides at `panel-kit.js:271`). Past it the **value is removed and

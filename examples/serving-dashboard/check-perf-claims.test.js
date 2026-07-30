@@ -134,102 +134,134 @@ test('the raw samples in perf-baseline.md still parse', () => {
   // rather than a false pass downstream.
 });
 
-test('the README summary table matches the raw samples it summarises', () => {
-  const single = singleRequestSamples();
-  const computed = median(single);
-  const cv = (100 * stdev(single)) / mean(single);
+// ---------------------------------------------------------------------------
+// WITHDRAWAL GATE. This file used to VERIFY the throughput ratio: it recomputed
+// the median, CV and confidence interval from perf-baseline.md and failed if the
+// README drifted from them. Those checks were correct and they are gone, because
+// the quantity they policed has been withdrawn.
+//
+// The model the samples were taken against was assembled by accident from two
+// builds seventeen days apart, and its inference metadata was edited 54 minutes
+// after the build -- inside the measurement window. So the ratio is not merely
+// unreproducible by a reader; we cannot show it is internally consistent with
+// itself. An arithmetic check against those samples would still have PASSED:
+// it verifies that the prose matches the data, never that the data means
+// anything. A checker cannot detect a poisoned input by recomputing from it.
+//
+// So the guard is inverted. It no longer confirms the figure; it forbids it.
+test('no shipping document reintroduces the withdrawn throughput ratio', () => {
+  assertShippingTree();
 
-  const row = README.match(/\|\s*Single request, decode\s*\|\s*([\d.]+) tok\/s\s*\|\s*CV ([\d.]+) %/);
-  assert.ok(row, 'README.md no longer has a "Single request, decode" row.');
+  // A guard must quote what it forbids, which is why the digits are here.
+  const RATIO = /\b2\.4[5-9]\s*×|\b2\.5\s*×|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
+  const ARMS = /\b0\.62\s*×|\b82\.\d{3}\s*tok|\b33\.\d{3}\s*tok|\+147\s*%/;
 
-  assert.ok(
-    Math.abs(Number(row[1]) - computed) < 0.0005,
-    `README.md states a single-request median of ${row[1]} tok/s; the ${single.length} ` +
-      `raw samples in perf-baseline.md give ${computed.toFixed(3)}.`,
-  );
-  assert.ok(
-    Math.abs(Number(row[2]) - cv) < 0.05,
-    `README.md states CV ${row[2]} %; the raw samples give ${cv.toFixed(2)} %.`,
-  );
-});
+  const EXEMPT = new Set([
+    // The lab notebook. It records what was run and must keep its raw samples,
+    // or we destroy the evidence that the claim was unsafe.
+    'perf-baseline.md',
+    // Not mine to edit; owned separately and read as a contract snapshot.
+    'demo-spec.md',
+  ]);
 
-test('the README speedup is the ratio the raw samples actually support', () => {
-  const single = singleRequestSamples();
-  const rounds = concurrentRounds();
-  const aggregate = rounds.map((r) => r.aggregate);
-
-  const ratio = mean(aggregate) / mean(single);
-
-  // Relative standard error of a ratio of two independent means.
-  const relSe = Math.sqrt(
-    (stdev(aggregate) / mean(aggregate) / Math.sqrt(aggregate.length)) ** 2 +
-      (stdev(single) / mean(single) / Math.sqrt(single.length)) ** 2,
-  );
-  // t for the smaller arm's df, conservatively (n=4 -> df=3 -> 3.182).
-  const T = 3.182;
-  const halfWidth = ratio * relSe * T;
-
-  const stated = README.match(/roughly \*\*([\d.]+)×\*\*\s*\n?\s*the\s*\n?\s*aggregate decode throughput/);
-  assert.ok(
-    stated,
-    'README.md no longer states the aggregate speedup in the expected form ' +
-      '("roughly **N×** the aggregate decode throughput").',
-  );
-
-  const claimed = Number(stated[1]);
-  assert.ok(
-    Math.abs(claimed - ratio) <= halfWidth,
-    `README.md claims ${claimed}× but the raw samples give ${ratio.toFixed(3)}× ` +
-      `(95% CI ±${halfWidth.toFixed(2)}). Recompute from perf-baseline.md.`,
-  );
-
-  // THE PRECISION GATE. A claim may not IMPLY finer resolution than its data
-  // supports. `2.46` asserts the quantity is pinned to ±0.005; with an n=4 arm
-  // the honest resolution is ±0.12, so the third significant figure is division
-  // residue rather than knowledge.
+  // Documents that still carry the figure and belong to someone else. The tree
+  // is frozen and both were edited minutes ago; editing them would collide with
+  // a live author, and reddening the suite on their files during a review is a
+  // worse outcome than a named deferral.
   //
-  // But a printed interval discharges that implication -- stating the interval is
-  // exactly how a number declares its own resolution. So the rule is: the digits
-  // must fit the data, OR the uncertainty must be on the page beside them.
-  //
-  // ⚠️ THIS TEST FIRED ON ITS AUTHOR'S OWN NUMBER, and I changed the RULE rather
-  // than the number. That is the move this branch has twice gotten wrong, so the
-  // reasoning is recorded here rather than buried: `2.5×` implies ±0.05 against a
-  // true ±0.12, so the strict digit rule was RIGHT to flag it -- and the README
-  // prints `95 % CI [2.35, 2.59]` in the same sentence, which is the specific
-  // remedy the rule exists to demand. The rule was incomplete, not the README:
-  // it had no way to express "uncertainty stated explicitly." The fix makes the
-  // interval MANDATORY whenever digits outrun the data, which is strictly
-  // stronger than what it replaced -- before, a number could satisfy the gate by
-  // being vague and say nothing about its spread at all.
-  const decimals = (stated[1].split('.')[1] ?? '').length;
-  const impliedResolution = 0.5 * 10 ** -decimals;
-  const nearby = README.slice(Math.max(0, README.indexOf(stated[0]) - 200), README.indexOf(stated[0]) + 400);
-  const declaresInterval = /95 % CI \[[\d.]+, [\d.]+\]/.test(nearby);
+  // The deferral EXPIRES BY ITSELF: if a listed document no longer states the
+  // figure, this test fails and tells me to delete the entry. An exemption that
+  // cannot expire is a suppression, and the direction that never gets reported
+  // is the one where the gap has quietly closed.
+  const DEFERRED = Object.freeze({
+    'REVIEWER-BRIEF.md': 'owned by the secretary; edited 02:49, live at the time of the freeze',
+    'design/demo-ux.md': 'owned by the designer; edited 02:45, live at the time of the freeze',
+  });
+
+  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
+    .toString()
+    .split('\n')
+    .filter((f) => f.endsWith('.md'))
+    .filter((f) => !EXEMPT.has(f));
+
+  const stillDirty = new Set();
+
+  let inspected = 0;
+  const offenders = [];
+  for (const doc of docs) {
+    // Strip fenced and inline code: a document may legitimately show the old
+    // figure inside a quoted diff or an example of what not to write.
+    const text = shipped(doc)
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`[^`\n]*`/g, ' ');
+    inspected += text.length;
+
+    // A retraction must be able to name the thing it retracts -- but the
+    // exemption is scoped to the VICINITY of each match, never to the document.
+    //
+    // The document-wide version of this check was wrong and shipped green for
+    // one run: README.md retracts the PREFIX figure, so a whole-file test for
+    // the word "withdrawn" excused it from the THROUGHPUT gate as well. One
+    // retraction anywhere bought silence everywhere. That is the same defect as
+    // a guard whose own source satisfies its exemption -- an exemption is a
+    // claim about a PASSAGE, and testing it against a FILE answers a broader
+    // question than the one being asked.
+    const RETRACTION = /withdraw|withdrew|withdrawn|retract|no longer claim|deleted rather than hedged|used to (?:print|state|lead)/i;
+    const WINDOW = 600;
+
+    for (const re of [RATIO, ARMS]) {
+      const m = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+      for (const hit of text.matchAll(m)) {
+        const near = text.slice(
+          Math.max(0, hit.index - WINDOW),
+          hit.index + hit[0].length + WINDOW,
+        );
+        if (RETRACTION.test(near)) continue;
+        if (doc in DEFERRED) { stillDirty.add(doc); continue; }
+        if (!offenders.includes(doc)) offenders.push(doc);
+      }
+    }
+  }
 
   assert.ok(
-    impliedResolution >= halfWidth / 2 || declaresInterval,
-    `README.md prints the speedup as ${stated[1]}×, implying it is known to ` +
-      `±${impliedResolution}, but the 95% CI is ±${halfWidth.toFixed(2)} and no ` +
-      `interval is stated beside it. Either drop a digit or print the interval: ` +
-      `the number is not wrong, the PRECISION is fabricated, and a format is a ` +
-      `claim about how finely a quantity can be known.`,
+    inspected > 5000,
+    `only ${inspected} characters of markdown inspected — the corpus scan is `
+      + 'not reaching the documents, so a green result here means nothing.',
   );
 
-  // The stated interval must also match what the samples give.
-  const ci = README.match(/95 % CI \[([\d.]+), ([\d.]+)\]/);
-  assert.ok(ci, 'README.md no longer states a 95% CI for the speedup.');
+  // Once the tree is clean, a dead matcher and a clean tree are byte-identical.
   assert.ok(
-    Math.abs(Number(ci[1]) - (ratio - halfWidth)) < 0.02 &&
-      Math.abs(Number(ci[2]) - (ratio + halfWidth)) < 0.02,
-    `README.md states a CI of [${ci[1]}, ${ci[2]}]; the raw samples give ` +
-      `[${(ratio - halfWidth).toFixed(2)}, ${(ratio + halfWidth).toFixed(2)}].`,
+    RATIO.test('aggregate was 2.46× single-request') && ARMS.test('+147 %'),
+    'the withdrawn-ratio matchers no longer fire against a synthetic positive '
+      + 'control — this guard has gone blind and would pass on any tree.',
   );
 
-  // MUTATIONS, all confirmed red:
-  //   README "roughly **2.5×**" -> "**2.46×**"  -> precision gate fires
-  //   README "roughly **2.5×**" -> "**3.5×**"   -> value gate fires
-  //   README CI [2.35, 2.59]    -> [2.40, 2.55] -> interval gate fires
+  // Anti-rot: a deferral for a document that is already clean is a lie.
+  const staleDeferrals = Object.keys(DEFERRED).filter((d) => !stillDirty.has(d));
+  assert.deepEqual(
+    staleDeferrals,
+    [],
+    `These documents are listed as DEFERRED but no longer state the withdrawn `
+      + `figure: ${staleDeferrals.join(', ')}. Their owner cleaned them. Delete `
+      + 'the entries from DEFERRED so the gate covers them for real — an '
+      + 'exemption that outlives its reason is indistinguishable from a '
+      + 'suppression, and nobody reports a gap that has closed.',
+  );
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `These documents state the withdrawn throughput ratio as a live claim: `
+      + `${offenders.join(', ')}.\n`
+      + 'The figure was withdrawn because the model it was measured against was '
+      + 'assembled from two builds seventeen days apart, with its metadata edited '
+      + 'inside the measurement window. Do not hedge it and do not footnote it — '
+      + 'a hedge is dropped in the retelling and the digits survive. State the '
+      + 'MECHANISM instead: continuous batching admits queued rows between steps '
+      + '(batched.rs, admit_available_rows); paged attention draws KV from a '
+      + 'shared page pool (page_table.rs, allocate/free). A reader can check a '
+      + 'mechanism by reading code; they cannot check a ratio they cannot rebuild.',
+  );
 });
 
 test('the README does not restate an absolute figure the baseline calls irreproducible', () => {
@@ -250,53 +282,16 @@ test('the README does not restate an absolute figure the baseline calls irreprod
   );
 });
 
-// THE TRADEOFF RULE. demo-ux.md §29.1 ratified it: the aggregate speedup NEVER
-// appears without the per-stream figure, at equal prominence. "A tradeoff
-// presented as a pure win is a lie told with true numbers."
+// The old 'speedup without the per-stream tradeoff' rule lived here. It required
+// any document stating the aggregate figure to state the per-stream cost beside
+// it. That rule is now unreachable by construction: the aggregate figure is
+// forbidden outright by the withdrawal gate above, so there is no longer a
+// permitted way to state it. Retired rather than left in place, because a rule
+// whose precondition can never be satisfied is indistinguishable from a rule
+// that works, and both are green forever.
 //
-// ⚠️ THIS CHECK EXISTS BECAUSE I BROKE THE RULE MYSELF, IN THE DOCUMENT MOST
-// REVIEWERS READ FIRST. The README states both halves in one sentence. Two
-// hours later I wrote PR-DESCRIPTION.md and led with the speedup alone -- same
-// author, same session, having already documented the rule. That is the whole
-// argument for mechanising it: I did not forget the rule, I forgot to apply it
-// to a NEW SURFACE. Prose rules bind the document their author is looking at.
-//
-// So the check is deliberately scoped by CONTENT, not by filename: any tracked
-// markdown that states the speedup is covered the moment it is written. A list
-// of files to check would have been just as blind as I was -- PR-DESCRIPTION.md
-// did not exist when the rule was ratified, and adding a file to a list is a
-// step someone has to remember, which is the failure being guarded.
-test('no document states the speedup without the per-stream tradeoff', () => {
-  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
-    .toString()
-    .split('\n')
-    .filter((f) => f.endsWith('.md'))
-    // perf-baseline.md is the raw record and demo-spec.md is the contract;
-    // both discuss the figures analytically rather than presenting them.
-    .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f));
-
-  const offenders = [];
-  for (const doc of docs) {
-    const text = shipped(doc);
-    // A PRESENTATION of the speedup: "2.5x"/"2.46x" tied to throughput prose.
-    const presents = /\b2\.[45]\d?\s*×[\s\S]{0,200}?(?:aggregate|throughput|decode)/i.test(text)
-      || /(?:aggregate|throughput)[\s\S]{0,200}?\b2\.[45]\d?\s*×/i.test(text);
-    if (!presents) continue;
-
-    const statesTradeoff = /0\.6\d\s*×/.test(text) && /per[- ]stream/i.test(text);
-    if (!statesTradeoff) offenders.push(doc);
-  }
-
-  assert.deepEqual(
-    offenders,
-    [],
-    `${offenders.join(', ')} state(s) the aggregate speedup without the ` +
-      `per-stream figure (0.62× / ~20.7 tok/s). demo-ux.md §29.1: both halves ` +
-      `ship together, everywhere. Batching does not make any single request ` +
-      `faster — it trades per-stream latency for total throughput, and a ` +
-      `tradeoff presented as a pure win is a lie told with true numbers.`,
-  );
-});
+// The TRADEOFF ITSELF is not retired -- it is stated in both documents as prose
+// with no number attached, which is the form that survived the withdrawal.
 
 test('no document presents a withdrawn prefix timing figure without its noise floor', () => {
   // The +7.0% "shared prefixes are SLOWER" result was WITHDRAWN BY ITS OWN

@@ -499,8 +499,8 @@ genuinely moves. Only the *name* is wrong. Nothing automated catches these.
       `started: Instant::now()` **and decrements `REGISTRY.pending` in the same breath** — so the
       clock starts when a request is **admitted**, not when it **arrived**. On the batched path
       `start()` is called at batch admission (`driver.rs:625`). **Time spent queueing is
-      therefore invisible to `ttft`.** Under the 4-concurrent scenario — the one carrying the
-      2.46× headline — requests queue, so the reported TTFT is **better than the latency a user
+      therefore invisible to `ttft`.** Under the 4-concurrent scenario — the one that carried
+      the now-withdrawn throughput headline — requests queue, so the reported TTFT is **better than the latency a user
       actually experiences**, and the gap *widens* as concurrency rises. This sits directly
       against the ratified rule that the per-stream cost ships beside the aggregate gain.
       **Either label it `time to first token (from admission)` or add the queue wait.** Do not

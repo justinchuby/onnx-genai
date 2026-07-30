@@ -49,53 +49,60 @@ section.
 
 ---
 
-## Measured numbers, with their conditions
+## Performance: what we are claiming, and what we withdrew
 
-**Aggregate decode throughput is roughly 2.5× single-request decode**
-— 95 % CI [2.35, 2.59] — **while per-stream throughput falls to about 0.62× of
-solo** (~20.7 tok/s).
+**We are not shipping a throughput ratio.** An earlier draft of this PR led with
+one. It has been deleted rather than hedged, and the reason is not the usual
+"results vary by hardware."
 
-**Both halves ship together, here and everywhere else.** Batching does not make
-any single request faster; it trades per-stream latency for total throughput.
-A tradeoff presented as a pure win is a lie told with true numbers, and the
-half an engineer is most likely to need is the second one.
+> **The model the numbers were measured against cannot be rebuilt.** It was
+> assembled by accident from **two builds seventeen days apart**, and its
+> inference metadata file was edited **fifty-four minutes after the model was
+> built, inside the measurement window**, while every sibling file in that
+> directory is timestamped within a minute of the build. **Nobody has established
+> that measurements taken either side of that edit are comparable.**
+>
+> That makes this worse than unreproducible. **We cannot show the figure is
+> internally consistent with itself.** A performance claim whose artifact nobody
+> can rebuild is not a measurement — it is a rumour with a decimal point, and the
+> decimal point is doing the persuading. Two decimal places asserted a resolution
+> this setup cannot support, which is the same defect as drawing a 4-slot batch
+> as `75 %`: **a format is a claim about how finely a quantity can be known.**
 
-Everything behind those numbers is in
-[`examples/serving-dashboard/perf-baseline.md`](examples/serving-dashboard/perf-baseline.md):
-raw per-run samples, hardware, load average, the exact command, and the binary
-and model SHA-256s.
+**Why deleted rather than footnoted.** A hedged number is still quoted; the hedge
+is dropped in the retelling and the digits survive. And the failure mode is
+asymmetric — if a reader tries to reproduce a figure and cannot, **every other
+claim in this PR becomes suspect, including the ones that are true and were
+expensive to get right.** The mutual-exclusivity finding above is the result
+worth having, and it is a *mechanism* claim: it is checked by reading
+`driver.rs`, not by trusting our machine.
 
-| | |
-|---|---|
-| single request, decode | n=15, mean 33.577 tok/s, CV 1.98 % |
-| aggregate, 4 concurrent | n=4 rounds, mean 82.847 tok/s, CV 2.93 % |
-| **per-stream, 4 concurrent** | **~20.7 tok/s — 0.62× of solo** |
-| ratio (aggregate ÷ single) | **2.467**, 95 % CI **[2.35, 2.59]** |
-| capture | both arms inside one 20-minute window, one binary, one model, clean tree |
+**What we claim instead, all of it checkable by reading code:**
 
-**Read the conditions before quoting the number.** This is an indicative figure
-from a loaded developer machine, not a benchmark.
+- **Continuous batching edits a running batch between steps rather than between
+  batches** (`crates/onnx-genai-engine/src/batched.rs`). `submit` queues a
+  request; each `step` calls `admit_available_rows`, which retires finished rows
+  and admits queued ones in the same pass. The static contrast is
+  `generate_batched_static`. **The effect is on waiting, not on speed:** under
+  static batching an arrival waits on the longest member of the batch in flight.
+- **Paged attention draws the KV cache from a shared pool of fixed-size pages**
+  (`crates/onnx-genai-kv/src/page_table.rs`, `allocate` / `free`) instead of one
+  contiguous per-sequence buffer, so capacity is taken as tokens are generated
+  rather than reserved for the longest generation a request might produce — and
+  identical pages can be shared instead of copied.
+- **The tradeoff, which needs no number:** batching raises *aggregate*
+  throughput and makes no single request faster. Per-stream throughput falls as
+  total throughput rises. **A tradeoff presented as a pure win is a lie told with
+  true numbers**, and the half an engineer actually needs is the second one.
 
-### Why it is `~2.5×` and not `2.46×`
+**The raw capture stays in**
+[`examples/serving-dashboard/perf-baseline.md`](examples/serving-dashboard/perf-baseline.md)
+**as a lab notebook** — commands, hardware, load average, ordering, and the
+binary and model SHA-256s. **Read it as a record of what was run, not as a
+result.** Deleting it would suppress the evidence that the claim was unsafe.
 
-We measured a **9.8 % noise floor** on this machine: a byte-identical binary
-swung that much under load. A figure printed as `2.46×` asserts it is known to
-±0.005, and the data supports ±0.12 — **the value is sound, the precision was
-fabricated.** The third significant figure was division residue, so we dropped
-it and published the interval instead.
-
-### Why the ratio survives a 9.8 % noise floor
-
-Because the floor and the claim measure different things. The floor is the drift
-of an **absolute** number **across time** — the two observations were 75 minutes
-apart under changing load. Both arms of this ratio were captured inside a single
-20-minute window against one binary and one model, and **load that moves both
-arms together largely cancels in a ratio.** The effect is **+147 %, roughly 15×
-the floor.**
-
-`check-perf-claims.test.js` recomputes the median, CV, ratio and confidence
-interval from the raw samples on every run and fails if the README drifts from
-them. The number in the prose is derived, never transcribed.
+`check-perf-claims.test.js` now enforces the withdrawal instead of the figure: it
+fails if any shipping document reintroduces the ratio.
 
 ---
 
@@ -116,7 +123,7 @@ A null result tells you nothing about *why*. The mechanism does, and it predicts
 every number we recorded. Full analysis in the README's Scenario B section.
 
 **We did not promote a faster model build.** A rebuilt variant verified fine,
-but the 2.46× baseline was measured against the original — swapping it would
+but the withdrawn baseline was measured against the original artifact — swapping it would
 have invalidated the comparison. Verified does not mean it should be shipped.
 
 ---
