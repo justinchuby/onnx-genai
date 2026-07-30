@@ -1242,3 +1242,90 @@ the reader actually needs.
 **I am not asking for the boolean to become a config knob.** The decision is
 correct; only its *explanation* is lossy. A capability that turns on the host
 should be reported as a fact about the host.
+
+---
+
+## §19 — C18: a security comment that described a branch deleted six hours earlier
+
+Measured at `4e93b97b`, fixed at `fa1fd425`. Raised by @c7a654ed, who twice
+published it as open and unowned. It is in my lane and I took it.
+
+### The defect
+
+`routes/mod.rs`, on the `path` field of the models response:
+
+> Configured directory. **Absolute on loopback; the basename otherwise**, so a
+> non-loopback deployment does not leak the operator's username and filesystem
+> layout on an endpoint with no authentication in front of it.
+
+There is no such conditional. It was deleted at `2da3e851` (03:50:55).
+
+    loopback mentions in routes/            4   ALL FOUR ARE PROSE
+    branches inside model_path_for_display  0   unconditional basename
+    CONTROL, the field is still declared    1   the grep resolves
+
+The doc did not merely go stale. It documented a **disclosure policy** and a
+**trust boundary** — "safe because of where we are bound" — on a field that is
+now unconditionally redacted.
+
+### Why the harmless direction was not harmless
+
+The code was SAFER than its documentation. That is supposed to be the direction
+that costs nothing. It cost most of the night.
+
+@bb2ee824 reported "`/v1/models` STILL RETURNS THE ABSOLUTE PATH **ON LOOPBACK**".
+That is this comment's wording, not a property of the code. Four wire
+measurements were read through a model this sentence supplied: reviewers saw a
+real absolute path on a real loopback port and had a sentence in the source
+telling them it was *by design and conditional on the bind address*. The true
+cause — a binary built from a sibling checkout where the fix is not an ancestor —
+requires noticing that the running process is not the reviewed tree, and the doc
+offered a cheaper explanation that fit every observation.
+
+**A stale comment is worst when it is plausible, not when it is wrong.** This one
+predicted the exact symptom under observation.
+
+### The matched pair, and the ruling
+
+This is the mirror of §13 (the Metal safety rationale describing a protection
+that had been lifted), and the pair is the actual finding:
+
+| | describes | fails toward |
+|---|---|---|
+| §13 Metal | a protection that no longer runs | **reassurance** |
+| §19 loopback | a disclosure that no longer happens | **alarm** |
+
+Both are one commit's prose left behind by one commit's code. The direction the
+error points is **uncorrelated with its danger**, so "we would notice the
+dangerous ones" is false — you notice neither, and here the *safe* one burned
+more hours than the unsafe one has.
+
+**The remedy was already in the tree, one file away.** `admin.rs` documents this
+same decision correctly, and the difference is structural, not editorial: the
+epitaph sits **on the function that enforces the property**, which is the field's
+only writer. `mod.rs` restated the policy at a distance from its enforcement, and
+a restatement has no reason to be updated when the enforcement changes — nothing
+links them, no test reads either, and the compiler is indifferent to both.
+
+> **A security property is documented at its enforcement point. Every other site
+> points at that one and restates nothing.** A second description of one decision
+> is not redundancy — it is an unowned copy that will diverge, and it diverges
+> silently in whichever direction the next commit happens to take.
+
+Fourth sighting this session of *two places describe one thing and nothing says
+which wins* (C16's two vocabularies; the two `run-demo.sh` binaries; the two
+`scenario-switcher.test.js`; this). It is the branch's dominant structural
+failure and it has never once announced itself.
+
+### Disposition
+
+Fixed at `fa1fd425`. Doc-only: 8 insertions, 3 deletions, **zero non-comment
+lines** in the diff, asserted mechanically. `cargo test -p onnx-genai-server`
+raw unpiped exit 0, **264 passed / 0 failed / 4 ignored** — byte-identical to the
+denominator recorded at §17, so the change is inert to behaviour. The new prose
+names the deleting SHA and points at `admin::model_path_for_display` rather than
+restating what it enforces.
+
+I did not add a note above the stale line. Per @c7a654ed's rule — a retraction
+that lives anywhere except beside the retracted string has been filed, not
+applied — the false sentence is **gone**, not annotated.
