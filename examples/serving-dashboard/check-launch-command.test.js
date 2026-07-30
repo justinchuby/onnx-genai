@@ -282,6 +282,64 @@ test('every README server invocation passes --demo-assets-dir, absolutely', () =
   }
 });
 
+/**
+ * Documented `node --test` invocations, by source document.
+ *
+ * `node --test` treats "no files matched" as SUCCESS. So a documented command
+ * that globs the wrong directory does not error -- it prints a clean green in
+ * milliseconds. CONTRACT.md shipped one glob and no working directory, which
+ * ran 279 of 582 tests from the repository root and ZERO from the directory the
+ * document itself lives in, exiting 0 both times.
+ */
+function documentedTestCommands() {
+  const found = [];
+  for (const name of ['README.md', 'CONTRACT.md']) {
+    for (const line of read(name).split('\n')) {
+      if (line.includes('node --test')) found.push({ name, line });
+    }
+  }
+  return found;
+}
+
+test('every documented full-suite test command reaches the dashboard directory', () => {
+  const commands = documentedTestCommands();
+
+  assert.ok(
+    commands.length >= 2,
+    'no documented `node --test` command found; this check is inspecting nothing',
+  );
+
+  // Only the BROAD root glob is a full-suite claim. A deliberately narrow
+  // selector like `check-*.test.js` is honest about covering a subset, so the
+  // leading delimiter here is what separates "all root tests" from "some".
+  const broadRootGlob = /(?:^|['"/])\*\.test\.js/;
+
+  // NOT `line.includes('dashboard/')`. The demo lives in `serving-dashboard/`,
+  // so that substring is already present in the very path being globbed --
+  // `examples/serving-dashboard/*.test.js` "contains dashboard/" while globbing
+  // nothing inside it. The first version of this test used that check, and a
+  // landed mutation restoring the one-glob form left it GREEN. The leading
+  // delimiter is what makes this a directory segment rather than a word ending.
+  const panelGlob = /(?:^|['"/])dashboard\/\*\.test\.js/;
+
+  let fullSuiteClaims = 0;
+  for (const { name, line } of commands) {
+    if (!broadRootGlob.test(line)) continue;
+    fullSuiteClaims += 1;
+    assert.ok(
+      panelGlob.test(line),
+      `${name} documents a full-suite command that never globs dashboard/, ` +
+        `so it silently omits roughly half the suite AND EXITS 0:\n  ${line.trim()}`,
+    );
+  }
+
+  assert.ok(
+    fullSuiteClaims >= 2,
+    `only ${fullSuiteClaims} full-suite command(s) matched the glob pattern; ` +
+      `the matcher has probably drifted and this test is passing over an empty set`,
+  );
+});
+
 test('run-demo.sh starts both servers, on distinct ports', () => {  const scatterPort = DEFAULT_SERVER_ADDRESS.split(':')[1];
   const dynamicPort = runDemoCode.match(/DYNAMIC_PORT:-(\d+)/)?.[1];
 

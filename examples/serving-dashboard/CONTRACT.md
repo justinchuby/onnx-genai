@@ -498,8 +498,36 @@ than one we made prettier.
 ## 7. Tests
 
 ```bash
-node --test 'examples/serving-dashboard/*.test.js'
+cd examples/serving-dashboard && node --test '*.test.js' 'dashboard/*.test.js'
 ```
+
+> **Three parts of that line are load-bearing, and omitting any one of them
+> produces a GREEN run that measured less than you think — or nothing at all.**
+>
+> - **The `cd`.** Globs resolve against the working directory, not against this
+>   document. This section previously gave the command without one, and it was
+>   wrong in two different ways depending on where you stood: from the
+>   repository root it ran **279 of 582 tests and exited 0**; from the directory
+>   this file lives in it ran **0 tests and exited 0**.
+> - **Both globs.** `dashboard/` is where the panel tests live — roughly half
+>   the suite. One glob silently omits all of them.
+> - **The quotes.** They hand the patterns to Node, which expands them itself.
+>   Unquoted, the shell expands them first and does not recurse.
+>
+> ⚠️ **`node --test` treats "no files matched" as success, not as an error.** A
+> vacuous run is indistinguishable from a passing one by exit code alone, which
+> is why the floor below is part of the contract and not a nicety.
+
+**Expected: 582 tests, 0 failures, on Node v25.6.1.** Treat **fewer than 500
+tests as a FAILED run even if it exits 0** — that means the command did not
+reach the whole suite, and a partial suite reporting success is the one result
+that cannot be distinguished from a good one by looking at it. The floor is a
+liveness assertion, not a quality bar: it asserts the instrument ran, and it
+gets *more* true as the suite grows, which is why it is `>=` and not `==`.
+
+📌 Bare `node --test` from this directory also works on Node v25.6.1, but
+directory recursion has changed across Node majors, so it is not the documented
+form — its coverage is a function of a runtime version that nothing here pins.
 
 Node's built-in runner. No dependencies, no install, consistent with the
 demo's no-build-step rule. `telemetry-store.test.js` locks down the behaviours
