@@ -679,20 +679,43 @@ pub(crate) struct BlockWindowQuery {
     pub(crate) count: Option<usize>,
 }
 
-/// Per-page KV block table, as parallel arrays.
+/// Per-page KV block table, as DENSE parallel arrays.
 ///
 /// Parallel arrays rather than an array of objects because this is polled at
 /// 1 Hz and every key would otherwise be repeated once per page. The four
-/// arrays are always the same length, indexed together.
+/// arrays are always the same length, indexed together, and that length is
+/// always `window.scanned`.
+///
+/// **Position is the contract.** Index `i` describes page `window.start + i`,
+/// unconditionally. `page_ids[i]` is therefore always `window.start + i` and is
+/// echoed deliberately redundantly: it lets a client assert the invariant in
+/// one line, so any future re-introduction of compaction fails loudly at the
+/// seam instead of animating a migration that never happened.
+///
+/// A `null` in `ref_counts` / `filled_slots` / `tiers` means that page has
+/// NEVER BEEN WRITTEN -- an absence of observation. It does NOT mean free: a
+/// released page reports `ref_count: 0`, which is a measurement.
 #[derive(Debug, Serialize)]
 pub(crate) struct BlockTable {
     page_ids: Vec<u32>,
-    ref_counts: Vec<u32>,
-    filled_slots: Vec<usize>,
+    ref_counts: Vec<Option<u32>>,
+    filled_slots: Vec<Option<usize>>,
     /// `0` = hot tier, `1` = cold. A page demoted to cold keeps its references,
-    /// so it is still in use -- tier is not a proxy for free.
-    tiers: Vec<u8>,
+    /// so it is still in use -- tier is not a proxy for free. The meaning of
+    /// each value is served in `tier_names` rather than assumed, because a
+    /// bare integer whose vocabulary lives in another repository is not data,
+    /// it is a citation: adding a tier in Rust would silently MISLABEL the
+    /// panel rather than break it.
+    tiers: Vec<Option<u8>>,
 }
+
+/// The tier vocabulary, in one place, served on the wire.
+///
+/// Kept beside the `BlockState::tier` producer rather than duplicated in the
+/// client: a hand-maintained copy in the dashboard would drift silently the
+/// first time a tier is added here, and a mislabelled page is worse than an
+/// unlabelled one.
+const TIER_NAMES: [(u8, &str); 2] = [(0, "hot"), (1, "cold")];
 
 /// The window a [`BlockTableResponse`] actually covers.
 #[derive(Debug, Serialize)]
@@ -701,13 +724,15 @@ pub(crate) struct BlockWindow {
     start: usize,
     /// How many page ids were EXAMINED, after clamping to `MAX_WINDOW`.
     ///
-    /// Distinct from `returned` on purpose. The query's `count` asks for a
-    /// range of page ids, not a number of results, and absent pages are
-    /// skipped -- so asking for 256 and receiving 8 is normal. Without both
-    /// numbers a client cannot tell a clamped request from a sparse pool.
+    /// This is also the length of every array in `blocks`, because the block
+    /// table is dense: asking for 256 page ids yields 256 entries, some of
+    /// which may be `null` for pages never written.
     scanned: usize,
-    /// How many pages in that range were live and are present in `blocks`.
-    returned: usize,
+    /// How many of those pages have actually been observed, i.e. are non-null
+    /// in `blocks`. `scanned - observed` is the number of pages the pool has
+    /// never touched -- which is the whole pool at startup and shrinks as the
+    /// demo runs. It is a fact about our KNOWLEDGE, not about occupancy.
+    observed: usize,
     /// Pages the mirror can describe, so a client knows when it has them all.
     total: usize,
 }
@@ -737,6 +762,18 @@ pub(crate) struct BlockTableResponse {
     hot_evictions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allocation_failures: Option<u64>,
+    /// What each value in `blocks.tiers` MEANS, served rather than assumed.
+    ///
+    /// A bare tier integer whose vocabulary lives only in the Rust source is a
+    /// citation, not data: adding a tier here would leave the panel rendering
+    /// confidently with the wrong label instead of failing. Serving the map
+    /// makes an unknown tier detectable by the client that has to draw it.
+    /// Serialised as `tiers` to match the ratified shape (D258). The Rust name
+    /// stays `tier_names` because at this level `tiers` would read as the
+    /// per-page column of the same name inside `blocks` -- which is a
+    /// different thing: that one is the values, this one is their vocabulary.
+    #[serde(rename = "tiers", skip_serializing_if = "Option::is_none")]
+    tier_names: Option<BTreeMap<u8, &'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     window: Option<BlockWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -760,6 +797,9 @@ impl BlockTableResponse {
             hot_capacity: None,
             hot_evictions: None,
             allocation_failures: None,
+            // Omitted with the rest: a tier vocabulary beside no tiers would
+            // imply a block table that this response explicitly does not carry.
+            tier_names: None,
             window: None,
             blocks: None,
         }
@@ -780,21 +820,39 @@ impl BlockTableResponse {
         model_id: Option<String>,
         snapshot: onnx_genai_engine::KvTelemetrySnapshot,
         start: usize,
-        scanned: usize,
         total: usize,
-        states: Vec<onnx_genai_engine::BlockState>,
+        states: Vec<Option<onnx_genai_engine::BlockState>>,
     ) -> Self {
+        // `scanned` is derived from what was actually examined, never from the
+        // requested count. The mirror clamps at its own end, so a request for
+        // 256 pages against a 40-page pool examines 40 -- and publishing the
+        // request instead of the result would describe 216 pages that were
+        // never looked at.
+        let scanned = states.len();
         let mut blocks = BlockTable {
-            page_ids: Vec::with_capacity(states.len()),
-            ref_counts: Vec::with_capacity(states.len()),
-            filled_slots: Vec::with_capacity(states.len()),
-            tiers: Vec::with_capacity(states.len()),
+            page_ids: Vec::with_capacity(scanned),
+            ref_counts: Vec::with_capacity(scanned),
+            filled_slots: Vec::with_capacity(scanned),
+            tiers: Vec::with_capacity(scanned),
         };
-        for state in &states {
-            blocks.page_ids.push(state.page_id);
-            blocks.ref_counts.push(state.ref_count);
-            blocks.filled_slots.push(state.filled_slots);
-            blocks.tiers.push(state.tier);
+        let mut observed = 0;
+        for (offset, state) in states.iter().enumerate() {
+            // Derived from the position, not read from the state, so the
+            // invariant holds even for pages we have never observed.
+            blocks.page_ids.push((start + offset) as u32);
+            match state {
+                Some(state) => {
+                    observed += 1;
+                    blocks.ref_counts.push(Some(state.ref_count));
+                    blocks.filled_slots.push(Some(state.filled_slots));
+                    blocks.tiers.push(Some(state.tier));
+                }
+                None => {
+                    blocks.ref_counts.push(None);
+                    blocks.filled_slots.push(None);
+                    blocks.tiers.push(None);
+                }
+            }
         }
         Self {
             model_id,
@@ -806,10 +864,11 @@ impl BlockTableResponse {
             hot_capacity: Some(snapshot.hot_capacity),
             hot_evictions: Some(snapshot.hot_evictions),
             allocation_failures: Some(snapshot.allocation_failures),
+            tier_names: Some(TIER_NAMES.iter().map(|(k, v)| (*k, *v)).collect()),
             window: Some(BlockWindow {
                 start,
                 scanned,
-                returned: states.len(),
+                observed,
                 total,
             }),
             blocks: Some(blocks),

@@ -3956,15 +3956,46 @@ async fn status_publishes_the_batch_numerator_not_just_the_ratio() {
         .as_u64()
         .expect("batch_capacity must be an integer");
 
-    // An idle fixture server: the honest reading is zero in flight. This also
-    // pins that the field is a real gauge read and not the capacity echoed
-    // back -- a bug that would render a permanently-saturated dial.
-    assert_eq!(in_flight, 0, "no generation was started in this test");
+    // WHAT THIS TEST CANNOT PROVE, AND WHY IT NO LONGER TRIES:
+    // `batch_in_flight` reads `REGISTRY.batch_size`, a PROCESS-GLOBAL static
+    // (metrics.rs:82). It is incremented by any generation anywhere in the
+    // test binary, and `cargo test` runs tests concurrently. An earlier
+    // version asserted `in_flight == 0` "because this fixture is idle" -- but
+    // that asserts the whole PROCESS is quiet, which is not a property of the
+    // fixture and is not something this test can arrange. It passed alone and
+    // failed roughly one full-suite run in three.
+    //
+    // A lock would not fix it either: the other mutators are ordinary
+    // generation tests that would have to take the same lock, so the
+    // serialisation could never be enforced, only hoped for.
+    //
+    // So the absolute reading is not asserted here. That the numerator is a
+    // real gauge rather than the capacity echoed back is proved
+    // deterministically at the arithmetic seam by
+    // `the_clamped_ratio_cannot_distinguish_full_from_overloaded` above,
+    // which drives 9 in flight against a capacity of 4.
     assert!(capacity >= 1, "capacity must be positive, got {capacity}");
-    assert_ne!(
-        in_flight, capacity,
-        "an idle server must not report a full batch"
+
+    // Deterministic, and the actual fabrication risk: the denominator must be
+    // the CONFIGURED capacity, not a plausible constant. `min(max_batch,
+    // max_queue_depth)` is the only honest reading -- a server cannot assemble
+    // a batch wider than the queue it admits from.
+    let state = tiny_state();
+    assert_eq!(
+        capacity as usize,
+        state.config.effective_batch_capacity(),
+        "batch_capacity must come from config, not from a hardcoded default \
+         that happens to match on this machine"
     );
+
+    // And the numerator must be an independent field, not the denominator
+    // under another name: a payload where they are always equal renders a
+    // permanently-saturated dial that no load can move.
+    assert!(
+        body.get("batch_in_flight").is_some() && body.get("batch_capacity").is_some(),
+        "both terms must be on the wire; a ratio alone cannot be inverted"
+    );
+    let _ = in_flight;
 }
 
 #[test]
@@ -4344,28 +4375,39 @@ fn a_prefix_miss_records_no_hit_and_no_tokens_saved() {
 
 /// No number may be rendered until the decode path is known to be paged.
 ///
-/// The fixture never reaches an applicable state, and the endpoint must say so
-/// with `pending` or `not-applicable` -- never by falling through to live
-/// numbers. `hot_capacity` is the trap: it is a truthful read of a real pool
-/// and it is NON-ZERO, so it survives any "is this hardcoded?" audit while
-/// describing a mechanism the decoder never consults.
+/// `hot_capacity` is the trap: it is a truthful read of a real pool and it is
+/// NON-ZERO, so it survives any "is this hardcoded?" audit while describing a
+/// mechanism the decoder never consults.
 ///
 /// Asserting the invariant rather than one specific code is deliberate. The
-/// first version of this test demanded `not-applicable`, which is what the
-/// buggy tri-state-less implementation happened to emit, so the test defended
-/// the bug instead of catching it.
+/// first version demanded `not-applicable`, which is what the buggy
+/// tri-state-less implementation happened to emit, so the test defended the
+/// bug instead of catching it.
+///
+/// THE SECOND VERSION WAS A TIMING ASSERTION IN DISGUISE. It claimed "the
+/// fixture never reaches an applicable state" and asserted `applicable ==
+/// false`. But this fixture loads a real model and starts a real driver
+/// thread, and that driver selects the decode path ASYNCHRONOUSLY -- so the
+/// test was not describing the fixture, it was racing its startup, and it lost
+/// roughly one full-suite run in eight. `applicable == false` meant only "the
+/// driver has not answered yet", which is not a property worth pinning.
+///
+/// So both branches are pinned instead. The claim is that the response is
+/// SELF-CONSISTENT whichever way the race lands: numbers appear if and only if
+/// applicability is settled and affirmative. That is the actual contract, it
+/// is race-free, and it now also guards the applicable branch that the timing
+/// version could never reach.
 #[tokio::test]
 async fn kv_blocks_renders_no_numbers_until_paged_kv_is_known_to_be_in_use() {
     let body = get_json(app(tiny_state_with_debug()), "/v1/debug/kv/blocks").await;
 
-    assert_eq!(body["applicable"], false);
-    let code = body["unavailable"]["code"].as_str().expect("a reason code");
-    assert!(
-        matches!(code, "pending" | "not-applicable"),
-        "expected pending or not-applicable, got {code:?}"
-    );
+    let applicable = body["applicable"]
+        .as_bool()
+        .expect("applicability is always stated");
 
-    for field in [
+    // The measured fields, plus the tier vocabulary: serving names for tiers
+    // that are not being reported is itself a claim that there are tiers.
+    let measured = [
         "page_size",
         "pages_in_use",
         "pages_shared",
@@ -4374,12 +4416,34 @@ async fn kv_blocks_renders_no_numbers_until_paged_kv_is_known_to_be_in_use() {
         "allocation_failures",
         "blocks",
         "window",
-    ] {
+        "tiers",
+    ];
+
+    if applicable {
         assert!(
-            body.get(field).is_none(),
-            "{field} must not be sent while applicable is false -- \
-             a non-zero value is not evidence of applicability"
+            body.get("unavailable").is_none(),
+            "an applicable block table must not also carry a reason it is absent"
         );
+        for field in measured {
+            assert!(
+                body.get(field).is_some(),
+                "{field} is missing while applicable is true -- the client has \
+                 no way to tell that from a field the server chose to omit"
+            );
+        }
+    } else {
+        let code = body["unavailable"]["code"].as_str().expect("a reason code");
+        assert!(
+            matches!(code, "pending" | "not-applicable"),
+            "expected pending or not-applicable, got {code:?}"
+        );
+        for field in measured {
+            assert!(
+                body.get(field).is_none(),
+                "{field} must not be sent while applicable is false -- \
+                 a non-zero value is not evidence of applicability"
+            );
+        }
     }
 }
 
@@ -4485,19 +4549,20 @@ async fn debug_kv_carries_no_unavailable_apology_strings() {
 /// another page's tier, which is worse than no data because it still renders.
 #[test]
 fn a_block_table_keeps_its_columns_the_same_length() {
-    let states: Vec<onnx_genai_engine::BlockState> = (0..7)
-        .map(|i| onnx_genai_engine::BlockState {
-            page_id: i,
-            ref_count: i + 1,
-            filled_slots: (i as usize) * 2,
-            tier: (i % 2) as u8,
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = (0..7)
+        .map(|i| {
+            Some(onnx_genai_engine::BlockState {
+                page_id: i,
+                ref_count: i + 1,
+                filled_slots: (i as usize) * 2,
+                tier: (i % 2) as u8,
+            })
         })
         .collect();
     let response = crate::routes::BlockTableResponse::live(
         Some("m".into()),
         onnx_genai_engine::KvTelemetrySnapshot::default(),
         0,
-        256,
         4096,
         states,
     );
@@ -4514,36 +4579,180 @@ fn a_block_table_keeps_its_columns_the_same_length() {
     assert_eq!(n, 7);
 }
 
-/// `scanned` and `returned` must stay distinct: a sparse pool legitimately
-/// returns far fewer blocks than the range asked for, and a client has to be
-/// able to tell that apart from having its request clamped.
+/// D256, at the seam: index IS page id, and the payload says so out loud.
+///
+/// @0837fdf9 asked for this assertion to land with the route because it is
+/// the only guard that survives someone optimising the payload later: a grid
+/// draws by POSITION, so if a future change re-compacts the arrays the panel
+/// does not break, it ANIMATES -- rendering a migration that never happened.
 #[test]
-fn a_block_window_distinguishes_pages_scanned_from_pages_returned() {
-    let states: Vec<onnx_genai_engine::BlockState> = (0..3)
-        .map(|i| onnx_genai_engine::BlockState {
-            page_id: i * 40,
-            ref_count: 1,
-            filled_slots: 0,
-            tier: 0,
+fn every_block_position_is_its_page_id_so_a_grid_can_draw_by_index() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = (0..6)
+        .map(|i| {
+            // Pages 1 and 4 have never been written.
+            (i != 1 && i != 4).then_some(onnx_genai_engine::BlockState {
+                // Deliberately NOT the page id this slot represents. The wire
+                // value must be derived from POSITION, so that it is correct
+                // even for pages we have never observed -- an echoed field
+                // cannot cover the `None` slots at all. A fixture where the
+                // two agree could not tell derivation from echo.
+                page_id: 999,
+                ref_count: 1,
+                filled_slots: 3,
+                tier: 0,
+            })
+        })
+        .collect();
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        40,
+        4096,
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    let page_ids = value["blocks"]["page_ids"].as_array().unwrap();
+    let start = value["window"]["start"].as_u64().unwrap();
+
+    for (i, id) in page_ids.iter().enumerate() {
+        assert_eq!(
+            id.as_u64().unwrap(),
+            start + i as u64,
+            "page_ids[{i}] is not start + {i}; the array has been compacted \
+             and index no longer addresses a page"
+        );
+    }
+
+    // The unwritten pages hold their cells rather than closing the gap.
+    let refs = value["blocks"]["ref_counts"].as_array().unwrap();
+    assert!(
+        refs[1].is_null() && refs[4].is_null(),
+        "unobserved pages keep their positions"
+    );
+    assert!(
+        !refs[2].is_null() && !refs[5].is_null(),
+        "observed pages did not slide left"
+    );
+    assert_eq!(page_ids.len(), 6);
+}
+
+/// `scanned` and `observed` must stay distinct.
+///
+/// `scanned` is how many page ids were examined -- and, since the window is
+/// dense, it is also the array length. `observed` is how many of those we
+/// have ever seen written. Collapsing them makes "beyond the mirror" and
+/// "never written" the same reading, which is the absent-vs-zero bug moved
+/// into the window header.
+#[test]
+fn a_block_window_distinguishes_pages_scanned_from_pages_observed() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = (0..40)
+        .map(|i| {
+            (i < 3).then_some(onnx_genai_engine::BlockState {
+                page_id: i,
+                ref_count: 1,
+                filled_slots: 0,
+                tier: 0,
+            })
         })
         .collect();
     let response = crate::routes::BlockTableResponse::live(
         Some("m".into()),
         onnx_genai_engine::KvTelemetrySnapshot::default(),
         0,
-        256,
         4096,
         states,
     );
     let value = serde_json::to_value(&response).expect("serialise");
-    assert_eq!(value["window"]["scanned"], 256, "the range examined");
-    assert_eq!(value["window"]["returned"], 3, "live pages found in it");
+    // 256 was requested, but the mirror clamped at 40 -- and `scanned`
+    // reports what was examined, never what was asked for.
+    assert_eq!(
+        value["window"]["scanned"], 40,
+        "the range actually examined"
+    );
+    assert_eq!(
+        value["window"]["observed"], 3,
+        "pages ever written within it"
+    );
+    assert_eq!(
+        value["blocks"]["page_ids"].as_array().unwrap().len(),
+        40,
+        "the array length is `scanned`, not `observed` -- that is what makes \
+         index addressable"
+    );
     assert_eq!(
         value["window"]["total"], 4096,
         "pages the mirror can describe"
     );
     assert_ne!(
-        value["window"]["scanned"], value["window"]["returned"],
+        value["window"]["scanned"], value["window"]["observed"],
         "collapsing these two into one number is the bug this test exists for"
+    );
+}
+
+/// A tier is a bare `u8` on the wire. Without a served vocabulary, adding a
+/// tier in Rust does not break the panel -- it MISLABELS it, silently and
+/// forever. A number whose meaning lives in another repository is not data.
+#[test]
+fn every_tier_on_the_wire_has_a_served_name() {
+    let states: Vec<Option<onnx_genai_engine::BlockState>> = (0..4)
+        .map(|i| {
+            Some(onnx_genai_engine::BlockState {
+                page_id: i,
+                ref_count: 1,
+                filled_slots: 1,
+                tier: (i % 2) as u8,
+            })
+        })
+        .collect();
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        onnx_genai_engine::KvTelemetrySnapshot::default(),
+        0,
+        4096,
+        states,
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    let names = value["tiers"]
+        .as_object()
+        .expect("the tier vocabulary is served with the tiers");
+    for tier in value["blocks"]["tiers"].as_array().unwrap() {
+        let Some(tier) = tier.as_u64() else { continue };
+        assert!(
+            names.contains_key(&tier.to_string()),
+            "tier {tier} is on the wire with no name; the panel would invent one"
+        );
+    }
+    assert_eq!(names["0"], "hot");
+    assert_eq!(names["1"], "cold");
+}
+
+/// The page size is the denominator for fragmentation. It happens to be 16 on
+/// every machine we demo on, so a hardcoded `filled_slots / 16` renders
+/// perfectly -- and is wrong the moment it is not 16. Ship the denominator.
+#[test]
+fn a_block_table_serves_the_denominator_for_its_own_fill_ratio() {
+    // Deliberately NOT 16. A page size of 16 is what every demo machine has,
+    // so it cannot distinguish a served denominator from a hardcoded one.
+    let snapshot = onnx_genai_engine::KvTelemetrySnapshot {
+        page_size: 32,
+        ..Default::default()
+    };
+    let response = crate::routes::BlockTableResponse::live(
+        Some("m".into()),
+        snapshot,
+        0,
+        4096,
+        vec![Some(onnx_genai_engine::BlockState {
+            page_id: 0,
+            ref_count: 1,
+            filled_slots: 12,
+            tier: 0,
+        })],
+    );
+    let value = serde_json::to_value(&response).expect("serialise");
+    assert_eq!(
+        value["page_size"], 32,
+        "filled_slots is meaningless without the slots per page, and the \
+         denominator must be the measured one rather than the usual one"
     );
 }

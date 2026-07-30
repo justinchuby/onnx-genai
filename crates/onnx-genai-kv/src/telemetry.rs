@@ -215,15 +215,30 @@ impl KvTelemetry {
         slot.store(pack_block(ref_count, filled_slots, tier), Ordering::Relaxed);
     }
 
-    /// Reads a window of the block mirror, ordered by page id.
+    /// Reads a window of the block mirror, DENSE and indexed by position.
     ///
-    /// Ordering is inherent rather than sorted: the mirror is indexed by page
-    /// id, so a block never moves between polls. That matters because a block
-    /// table that reshuffles shows motion that did not happen.
+    /// `result[i]` describes page `start + i`, always, and the returned length
+    /// is exactly the number of page ids examined (the window clamped to the
+    /// mirror). Position is therefore structural rather than conventional: a
+    /// renderer can draw `result[i]` into cell `i` and be correct by
+    /// construction.
     ///
-    /// Pages never written are skipped via the present flag, so a freshly sized
-    /// mirror reports nothing rather than a wall of empty blocks.
-    pub fn block_window(&self, start: usize, count: usize) -> Vec<BlockState> {
+    /// This density is the contract, not an implementation detail. The previous
+    /// version skipped never-written pages, which made the array SPARSE -- and
+    /// a sparse array silently breaks a grid, because the first page to be
+    /// written shifts every later block one cell along. That renders as a
+    /// hundred blocks migrating when in fact one was allocated, which is
+    /// exactly the false motion the id-indexed mirror exists to prevent. The
+    /// ordering guarantee was real and tested; it protected ORDER, and a grid
+    /// draws by POSITION. Those are the same property only in a dense array.
+    ///
+    /// `None` means the page has NEVER BEEN WRITTEN -- a genuine absence of
+    /// observation, not a state of the pool. It is NOT "free": a page that was
+    /// used and released keeps its present flag and comes back as `Some` with
+    /// `ref_count: 0`, because that is a measurement -- we looked, and it was
+    /// empty. Collapsing those two into one absence would make "we have never
+    /// seen this page" indistinguishable from "this page is free right now".
+    pub fn block_window(&self, start: usize, count: usize) -> Vec<Option<BlockState>> {
         let Some(blocks) = self.blocks.get() else {
             return Vec::new();
         };
@@ -232,7 +247,7 @@ impl KvTelemetry {
             .enumerate()
             .skip(start)
             .take(count)
-            .filter_map(|(page_id, slot)| {
+            .map(|(page_id, slot)| {
                 let packed = slot.load(Ordering::Relaxed);
                 if packed & (1 << 40) == 0 {
                     return None;
@@ -692,7 +707,9 @@ mod tests {
         let initial = telemetry.block_window(0, 8);
         assert_eq!(initial.len(), 8);
         assert!(
-            initial.iter().all(|b| b.ref_count == 0),
+            initial
+                .iter()
+                .all(|b| b.expect("preallocated pages are observed").ref_count == 0),
             "an untouched pool holds no references"
         );
 
@@ -703,16 +720,16 @@ mod tests {
         let blocks = telemetry.block_window(0, 8);
         assert_eq!(blocks.len(), 8);
         assert_eq!(
-            blocks.iter().filter(|b| b.ref_count > 0).count(),
+            blocks
+                .iter()
+                .filter(|b| b.is_some_and(|b| b.ref_count > 0))
+                .count(),
             2,
             "exactly the two allocated pages are in use"
         );
 
-        let a = blocks.iter().find(|b| b.page_id == first).expect("present");
-        let b = blocks
-            .iter()
-            .find(|b| b.page_id == second)
-            .expect("present");
+        let a = blocks[first as usize].expect("an allocated page is observed");
+        let b = blocks[second as usize].expect("an allocated page is observed");
         assert_eq!(a.ref_count, 2, "retained page is shared");
         assert_eq!(b.ref_count, 1);
         assert_eq!(a.tier, 0, "freshly allocated pages are hot");
@@ -725,11 +742,8 @@ mod tests {
         let page = table.allocate(GPU).expect("pool has capacity");
         table.free(page);
 
-        let block = telemetry
-            .block_window(0, 8)
-            .into_iter()
-            .find(|b| b.page_id == page)
-            .expect("a freed page is still a real page");
+        let block = telemetry.block_window(0, 8)[page as usize]
+            .expect("a freed page is still a real page, reported with zero refs");
         assert_eq!(block.ref_count, 0);
     }
 
@@ -742,20 +756,18 @@ mod tests {
         for _ in 0..10 {
             table.allocate(GPU).expect("pool has capacity");
         }
-        let first: Vec<_> = telemetry
-            .block_window(0, 16)
-            .iter()
-            .map(|b| b.page_id)
-            .collect();
+        let ids = |w: Vec<Option<BlockState>>| -> Vec<Option<u32>> {
+            w.iter().map(|b| b.map(|b| b.page_id)).collect()
+        };
+        let first = ids(telemetry.block_window(0, 16));
         for _ in 0..5 {
-            let again: Vec<_> = telemetry
-                .block_window(0, 16)
-                .iter()
-                .map(|b| b.page_id)
-                .collect();
-            assert_eq!(first, again);
+            assert_eq!(first, ids(telemetry.block_window(0, 16)));
         }
-        assert!(first.windows(2).all(|w| w[0] < w[1]));
+        // Position IS the page id, so the window is dense and ascending with
+        // no ordering step that could get it wrong.
+        for (offset, id) in first.iter().enumerate() {
+            assert_eq!(*id, Some(offset as u32));
+        }
     }
 
     #[test]
@@ -792,13 +804,75 @@ mod tests {
         telemetry.note_block(1, 0, 0, 0);
 
         let blocks = telemetry.block_window(0, 4);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].ref_count, u16::MAX as u32);
-        assert_eq!(blocks[0].filled_slots, u16::MAX as usize);
-        assert_eq!(blocks[0].tier, 1);
-        assert_eq!(blocks[1].ref_count, 0);
-        assert_eq!(blocks[1].filled_slots, 0);
-        assert_eq!(blocks[1].tier, 0);
+        // DENSE: four page ids examined, four entries. Two are observed and
+        // two have never been written. Before this was dense the same call
+        // returned LENGTH 2, so `blocks[1]` was page 1 only by coincidence --
+        // and had page 0 been the unwritten one, `blocks[0]` would have been
+        // page 1 while rendering into page 0's cell.
+        assert_eq!(blocks.len(), 4, "the window is dense over the ids examined");
+        let zero = blocks[0].expect("page 0 was written");
+        let one = blocks[1].expect("page 1 was written");
+        assert_eq!(zero.page_id, 0);
+        assert_eq!(one.page_id, 1);
+        assert_eq!(zero.ref_count, u16::MAX as u32);
+        assert_eq!(zero.filled_slots, u16::MAX as usize);
+        assert_eq!(zero.tier, 1);
+        assert_eq!(one.ref_count, 0);
+        assert_eq!(one.filled_slots, 0);
+        assert_eq!(one.tier, 0);
+        assert!(
+            blocks[2].is_none() && blocks[3].is_none(),
+            "a page never written is an absence of observation, and must not \
+             be reported as a page with zero references -- that would be a \
+             measurement we never took"
+        );
+    }
+
+    /// D256: a page appearing must not move the pages after it.
+    ///
+    /// This is the defect the dense window exists to prevent, driven exactly
+    /// as the demo drives it: a mirror larger than the set of pages written so
+    /// far, filling up over time. With a sparse window every later block
+    /// shifts one cell each time an earlier page is first written, so a grid
+    /// renders a hundred blocks migrating when one was allocated.
+    #[test]
+    fn a_page_becoming_observed_does_not_shift_the_pages_after_it() {
+        let telemetry = KvTelemetry::default();
+        telemetry.size_blocks(6);
+        telemetry.note_block(3, 1, 4, 0);
+        telemetry.note_block(5, 2, 8, 1);
+
+        let position_of = |w: &[Option<BlockState>], id: u32| {
+            w.iter()
+                .position(|b| b.is_some_and(|b| b.page_id == id))
+                .expect("page is observed")
+        };
+
+        let before = telemetry.block_window(0, 6);
+        assert_eq!(position_of(&before, 3), 3);
+        assert_eq!(position_of(&before, 5), 5);
+
+        // A page EARLIER in the window is written for the first time. Under a
+        // sparse window this inserts an element and pushes 3 and 5 along.
+        telemetry.note_block(0, 1, 2, 0);
+        let after = telemetry.block_window(0, 6);
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "the window length is the ids examined, not the ids observed"
+        );
+        assert_eq!(
+            position_of(&after, 3),
+            3,
+            "page 3 moved when page 0 was allocated; a block table that \
+             reshuffles renders motion that never happened"
+        );
+        assert_eq!(
+            position_of(&after, 5),
+            5,
+            "page 5 moved when page 0 was allocated"
+        );
     }
 
     #[test]

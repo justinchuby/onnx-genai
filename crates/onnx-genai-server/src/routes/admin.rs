@@ -635,7 +635,6 @@ pub(crate) async fn debug_kv_blocks(
         model_id,
         telemetry.snapshot(),
         query.start,
-        count,
         telemetry.mirrored_block_capacity(),
         states,
     )))
