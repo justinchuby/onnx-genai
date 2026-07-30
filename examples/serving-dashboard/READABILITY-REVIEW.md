@@ -8,9 +8,47 @@ duplicate their findings.
 **Provenance.** Every finding below was verified by execution or by reading the file, in the
 worktree `/Users/justinc/Documents/GitHub/onnx-genai-demo`, on branch `feat/genai-demo-dashboard`,
 first at `346763a0`, 02:11; **every status line below was re-verified at `484cda07`, 04:06.**
-Five checkouts of this repository exist on this machine and the demo exists
-in exactly one of them, so a bare path is not a citation. Findings name a **symbol** and **quote
+Findings name a **symbol** and **quote
 the text**; line numbers are a hint and may have rotted by the time you read this.
+
+> ## 📍 Where these paths resolve — read this before checking any citation
+>
+> **Every unqualified path in this document is relative to
+> `examples/serving-dashboard/` in the repository whose toplevel is
+> `/Users/justinc/Documents/GitHub/onnx-genai-demo`.**
+>
+> That single sentence is the highest-leverage fix in this review, and the reason is
+> arithmetic: **it repairs every citation in the file without editing any of them, and it
+> cannot rot, because it names no line, no symbol and no file.** Every other citation repair
+> we performed tonight had to be redone when the tree moved.
+>
+> It is necessary because **there is no second project — there is the same project twice.**
+> `onnx-genai` and `onnx-genai-demo` share one object store; `crates/admin.rs`,
+> `crates/driver.rs` and `crates/cli.rs` exist at *identical* paths in both. A
+> fully-qualified path — our most rigorous-looking citation form — resolves cleanly in the
+> tree where the defect is absent. **The reviewer gets a clean result, from the wrong tree,
+> with no error and no clue.**
+>
+> **⛔ Do not use `cd $(git rev-parse --show-toplevel)` to protect yourself.** It normalises
+> *depth* and preserves *repository*, which is the wrong half. Assert the destination:
+>
+> ```sh
+> [ "$(git rev-parse --show-toplevel)" = "/Users/justinc/Documents/GitHub/onnx-genai-demo" ] || exit 2
+> ```
+
+**Path audit of this document, run at `876a9cd7`.** 37 distinct file paths are cited here;
+**34 resolve against `git ls-files` (control: 2154 tracked files).** The three that do not are
+absent *by construction* and are named rather than hidden: `scenario-reachability.test.js` and
+`scenario-substitution-notice.test.js` are names this review **proposes**, and `ui/sparkline.js`
+is quoted **as an example of a path that does not exist**.
+
+> **⚠️ That is a limit of the audit, not a clean bill.** A path-existence scanner cannot tell a
+> *citation* from a *mention of a non-existent path*, so all three of its hits are false
+> positives — the same shape as the 147 negative-declarative assertion messages recorded below,
+> which are false by construction in a green suite. **Both belong in a presence scanner and
+> neither belongs in a truth scanner.** The audit's real result is narrower and worth stating
+> exactly: **this document contains no phantom path of the `dashboard/telemetry-store.js`
+> kind** — a plausible prefix whose parent directory resolves and whose leaf does not.
 
 <!-- Machine-checked by check-review-freshness.test.js. Raw hex, never a ref name:
      `review-0` named 6ecd9183 at 03:57 and 0aac6bb1 at 04:21 -- 60 commits apart,
@@ -965,3 +1003,75 @@ shipping-tree.test.js`. Not mine, and not a test failure at all: the runner is r
 report a number that describes this desk rather than the branch. **That refusal is the
 single most valuable line it prints**, and it is the same discipline as declining to invent
 a denominator.
+
+---
+
+## For the brief: the two laws about comments, and why this review distrusts them
+
+These are documentation findings, which is why they sit in the readability lane rather than
+the correctness one. **Both say the same thing from opposite ends of a defect's life.**
+
+### A prediction in a comment is a test that never runs
+
+`telemetry-provenance.js` contains a `reason` field, committed *before* the incident, that
+describes tonight's P1 disclosure in the **future tense** — naming the endpoint, the
+mechanism and the blast radius. It was right. It was specific. It was ignored, because
+**nothing executes a `reason` string.**
+
+### The obituary pattern: a well-fixed bug leaves a searchable description of itself
+
+The complement, and the more expensive of the two. A past-tense comment narrating a dead
+defect and a present-tense defect are **the same bytes to every grep, every scanner, every
+dashboard and every agent.** This produced a false re-dispatch loop against an item that had
+been closed for over an hour, and it is why *a rising count is a prompt to read, never
+evidence of a regression* — **the better the fix, the more prose it leaves at the scene, and
+the higher the counter climbs.**
+
+> **Together: our comments knew about the defects that were already fixed and the ones that
+> were still coming, and not one comment ever stopped a defect from shipping.** The
+> prescription is not *write fewer comments*. It is: **if a comment states a checkable
+> property, the comment is a specification and it belongs in a test. If it cannot be
+> checked, say so in the comment itself** — the way `request-deadline.js` prices its own
+> limits rather than overselling them, which is the best paragraph in this codebase.
+
+### Instrument-failure catalogue — the readability-lane entries
+
+Six classes were catalogued crew-wide tonight. **Five of the six fail toward green**, and
+that asymmetry is not chance: *a tool that errs toward red is fixed within minutes because
+somebody is blocked by it; a tool that errs toward green survives the whole project.*
+
+Three are mine and all three are naming or organisation defects wearing an instrument's
+costume:
+
+1. **`' +` concatenation boundaries defeat phrase-grep.** 96 in `telemetry-provenance.js`,
+   279 across the branch — **concentrated in exactly the honesty files everyone was
+   grepping.** A sentence split across a string concatenation is invisible to a search for
+   the sentence. **The prose is correct and unfindable, which for a reviewer is the same as
+   absent.**
+2. **A git pathspec of the form `dir/**/*.js` is NARROWER than `dir/*.js`** — 36 files
+   versus 75. In a git pathspec `*` already crosses `/`, so `**/*.js` demands an extra path
+   segment and silently drops every file sitting directly in the directory.
+3. **A repo-root pathspec issued from a subdirectory returns a confident `0` and exits `0`.**
+   This caught me three separate times, including once while stating finding 2 — **my
+   finding that a pathspec silently under-reaches was itself measured with a pathspec that
+   silently under-reached.**
+
+> **The single rule that covers all three, and the one I would put above every finding in
+> this document: never accept a zero without a control that proves the instrument could have
+> returned non-zero.** Not a rule about care — a second command. Every zero in this review
+> ships with one.
+
+### My error signature, as a crew-wide rule
+
+Both of my false claims this session were claims of **completeness**, never of **severity**.
+That distinction is the whole finding:
+
+> **A severity over-call gets argued down by the next reader. A completeness over-call stops
+> the next reader looking** — silently, because the deterred reader never files anything and
+> so never appears in any count. **A narrow red gets challenged; a narrow green closes the
+> question.**
+
+The operational form is three words: **publish the list, not the percentage.** A list can be
+checked row by row by someone who was not there. A percentage cannot be checked at all, and
+it over-credits every row it never examined. My own instrument scored me 5-of-6 when the
+truth was 3-of-6, and it flattered me precisely because it reported a ratio.
