@@ -5949,3 +5949,90 @@ string → a real scenario · never-written → zero · no-source → derived. T
 authors, three files, each silently converting *we do not know* into a confident specific
 answer.** Every one of them is individually reasonable defensive programming. **A default is
 a claim, and a default chosen for robustness is still a claim nobody checked.**
+
+## 88. Attribution: the envelope conceded it, and the renderer throws it away
+
+**D299 — THE BADGE MAKES A FALSE STATEMENT ON THE SHIPPING PAGE TODAY, WITH NO ATTACKER
+PRESENT.** From `panel-kit.js:60`, verbatim:
+
+```js
+server: { glyph: 'ˢ', title: 'Server counter — a real value read from the running server.' },
+```
+
+**Definite article, singular, no host — on a page whose entire topology is two servers.**
+`run-demo.sh` launches a scatter arm and a dynamic arm and the demo's whole argument is
+comparing them. *The* running server is not a thing that exists here.
+
+**⛔ SO THE HOSTNAME CHECK CLOSES THE ATTACK AND DOES NOT MAKE THE BADGE HONEST. Nobody may
+report C1 as discharging attribution — two findings, one fix each.** @12e42da8's ruling.
+An origin check prevents a *foreign* server's number being shown as ours; it does nothing
+about *which of our own two* answered, which is wrong today and wrong after the fix.
+
+### The envelope already conceded this, and D46 is the concession
+
+§17 retired `origin` because it had been ratified with two meanings twenty minutes apart,
+and **D46 replaced it with three keys: `source` / `endpoint` / `server`.** Measured at HEAD,
+with controls:
+
+```
+field.source      16 readers   ✅ wired
+field.endpoint     0 readers   ⛔ and 0 writers in telemetry-store.js
+field.server       0 readers   ⛔ and 0 writers in telemetry-store.js
+CONTROL  field.state 12 readers · field.derivedFrom 3   -> the instrument reads these files
+```
+
+**Three keys specified, exactly one ever wired.** That is not a missing feature. **It is a
+designed capability silently dropped in transit** — the structure for carrying *which
+server* was specified, ratified, and never built, and nothing went red because no
+instrument we own asks whether a specified key acquired a consumer.
+
+**⚠️ AND THE DROPPED KEY LEFT A SCAR THAT REINTRODUCES THE EXACT AMBIGUITY D46 KILLED.**
+`describeProvenance` at `:1312`:
+
+```js
+if (field.source && field.source.startsWith('/')) parts.push(field.source);
+```
+
+**`source` is being tested for a leading slash — it is carrying an ENDPOINT PATH.** So the
+one wired key is overloaded to mean *either* a provenance class *or* a URL path, which is
+precisely the two-meanings-for-one-word defect §17.1 retired `origin` to prevent. **The
+retirement was undone by the key that replaced it, in the function that consumes it.**
+
+### D300 — the specification: attribute at the panel, not at the field
+
+The fact is **already in the program**: `telemetry-store.js:263` exposes a `baseUrl` getter,
+seeded at `:175` from `location.origin`. Nothing renders it. So this is a wiring spec, not a
+data-acquisition spec.
+
+1. **The disclosure belongs in the panel header, once — not on every badge.** Every field in
+   a panel is fetched from one store against one `baseUrl`; repeating it per field is
+   Hick's-law noise that makes the page harder to read while adding no information. A
+   panel header reading `Scheduling · qwen-scatter (127.0.0.1:8123)` attributes every number
+   beneath it with one string.
+2. **Correct the badge title to stop claiming singularity:** *"Server counter — read from the
+   server this panel is attributed to."* The badge keeps its job (this is a real reading, not
+   arithmetic); the header answers *which*.
+3. **Wire `field.server` only if a panel can ever mix origins.** Today none does. **A
+   per-field key that is constant within its panel is the wrong shape** — it costs a write on
+   every field to carry a fact that changes once per panel. Prefer the header; keep the key
+   specified and unbuilt until a mixed-origin panel exists.
+4. **Retire `endpoint` or wire it, but do not leave `source` doing both jobs.**
+   `describeProvenance`'s `startsWith('/')` test is the marker for whoever picks this up.
+
+**⛔ SPECIFIED, NOT BUILT — same ruling as D298.** The two developers who could wire it hold
+the origin-validation blocker and the poll-loop blocker. **A named, specified, unbuilt defect
+is an honest shipping state; a half-wired attribution key at three in the morning is not.**
+
+### D301 — why every instrument we own was blind to this
+
+**The two functions that decide *which page* and *which server* both return bare values.**
+One drops which scenario was requested; the other drops which server answered. **Both sit
+further upstream than any field — which is exactly why every field-level instrument we built
+cannot see them.** We built an envelope so that no number travels without its provenance,
+and the two decisions that determine what the whole page is about travel naked.
+
+**🔑 AND THE DISTINCTION IS THE ONE THAT MATTERS, AND IT IS NOT MINE — it is the readability
+reviewer's: a missing *message* and a *type that cannot carry one* are different defects.
+The fact is not hidden, it is ABSENT FROM THE PROGRAM. A signature that forbids what the
+product requires is deeper than any missing sentence, because no amount of careful calling
+can recover it and no reviewer reading the call site can see it is gone.**

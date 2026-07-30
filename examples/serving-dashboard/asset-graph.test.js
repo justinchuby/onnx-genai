@@ -553,3 +553,64 @@ describe('a specified-not-built caveat expires with its defect', () => {
     );
   });
 });
+
+// D301. THE TEMPLATE-BLINDNESS FIX, AND THE CLOSED-SET RECONCILIATION.
+//
+// Every other check in this file matches LITERAL class names in CSS. The
+// provenance badge defeats that by construction:
+//
+//     className: ['value__src', `value__src--${sourceClass}`]   panel-kit.js:194
+//
+// The name is BUILT AT RUNTIME, so a literal scan sees zero emitters and
+// concludes the entire vocabulary is dead CSS. That is not a hypothetical:
+// scanning literally would condemn the provenance badge and the connection
+// indicator -- the honesty layer itself -- as unreachable.
+//
+// THE FIX IS TO STOP SCANNING FOR THE NAME AND RECONCILE THE CLOSED SET.
+// `SOURCE_BADGES` is a frozen object literal, so the complete set of values
+// `sourceClass` can take is DECLARED, in one place, statically. Resolving the
+// template against that enum turns an unanswerable question ("what strings
+// reach this interpolation?") into an answerable one ("do the two declared
+// sets agree?").
+//
+// ⛔ AND THE HONEST LIMIT, WHICH IS WHY D301 IS SPECIFIED AND NOT CLAIMED AS
+// SOLVED: this proves a name CAN BE BUILT and that both sides declare it. It
+// CANNOT prove a branch is ever taken. The levels are styled -> constructible
+// -> reachable; this measures the second. Only a browser load measures the
+// third, and `?? SOURCE_BADGES.derived` fires on a branch no static instrument
+// can prove is entered.
+describe('the provenance vocabulary reconciles as a closed set', () => {
+  const panelKit = read('./dashboard/panel-kit.js');
+  const panels = css['panels.css'] ?? '';
+
+  const block = panelKit.match(/SOURCE_BADGES = Object\.freeze\(\{([\s\S]*?)\n\}\)/);
+  const declared = block ? [...block[1].matchAll(/^\s{2}([a-z][a-z-]*):/gm)].map((m) => m[1]) : [];
+  const styled = [...new Set([...panels.matchAll(/\.value__src--([a-z-]+)/g)].map((m) => m[1]))];
+
+  it('actually finds both declared sets (anti-vacuity)', () => {
+    assert.ok(
+      declared.length >= 4 && styled.length >= 4,
+      `Expected both vocabularies; found ${declared.length} declared in ` +
+        `SOURCE_BADGES (${declared.join(', ') || 'none'}) and ${styled.length} ` +
+        `styled in panels.css (${styled.join(', ') || 'none'}). An empty side ` +
+        'makes the reconciliation below vacuously true -- it would agree that ' +
+        'nothing matches nothing. Fix the matcher, do not relax the threshold.',
+    );
+  });
+
+  it('styles every badge it can emit, and emits every badge it styles', () => {
+    const unstyled = declared.filter((k) => !styled.includes(k));
+    const unemittable = styled.filter((k) => !declared.includes(k));
+    assert.deepEqual(
+      { unstyled, unemittable },
+      { unstyled: [], unemittable: [] },
+      'The provenance vocabulary has drifted between JS and CSS.\n' +
+        `UNSTYLED (SOURCE_BADGES can emit it, panels.css has no rule): ${unstyled.join(', ') || 'none'}\n` +
+        `UNEMITTABLE (panels.css styles it, nothing can produce it): ${unemittable.join(', ') || 'none'}\n` +
+        'An UNSTYLED badge renders with no provenance colour and looks like a ' +
+        'rendering glitch rather than a claim. An UNEMITTABLE rule is dead CSS ' +
+        'that reads as coverage -- it makes the vocabulary look complete to the ' +
+        'next person who greps it, which is exactly how D298 stayed invisible.',
+    );
+  });
+});
