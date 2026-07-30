@@ -1029,3 +1029,49 @@
   font-weight: var(--og-weight-medium);
   text-transform: uppercase;
 }
+
+/* ── panel-level not-applicable (§31/D89) ─────────────────────────────────────
+ *
+ * A panel whose every field is not-applicable keeps its header and frame and
+ * replaces its body with this. It is deliberately NOT centred like
+ * `.capability-notice`: that notice is a short apology about a missing flag,
+ * whereas this is the most interesting paragraph on the page, and prose is read
+ * left-aligned. Nothing here uses the `--og-unavail-*` hatch — the hatch means
+ * "a gap we could close", and the whole point of this state is that there is
+ * no gap to close.
+ */
+.panel-bypass {
+  display: flex;
+  flex-direction: column;
+  gap: var(--og-space-3);
+  padding: var(--og-space-5) var(--og-space-6);
+  border-left: 3px solid var(--og-na-rule);
+  border-radius: var(--og-radius-sm);
+  background: var(--og-na-bg);
+  text-align: left;
+}
+
+.panel-bypass__title {
+  margin: 0;
+  color: var(--og-na-fg);
+  font-size: var(--og-type-xs);
+  font-weight: var(--og-weight-medium);
+  letter-spacing: var(--og-tracking-caps);
+  text-transform: uppercase;
+  line-height: var(--og-leading-tight);
+}
+
+.panel-bypass__reason {
+  margin: 0;
+  color: var(--og-na-note);
+  font-size: var(--og-type-sm);
+  line-height: var(--og-leading-body);
+  /* The reasons carry file:line citations. Breaking `batched.rs:101-110`
+   * across a line makes it unquotable from a screenshot. */
+  overflow-wrap: break-word;
+}
+
+.panel-bypass__reason + .panel-bypass__reason {
+  padding-top: var(--og-space-3);
+  border-top: 1px solid var(--og-border-subtle);
+}
