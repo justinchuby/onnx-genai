@@ -148,7 +148,7 @@ impl<'a> ContinuousBatchManager<'a> {
         )
     }
 
-    fn with_lora_adapter_routes(
+    pub(crate) fn with_lora_adapter_routes(
         mut decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
         tokenizer: &'a Tokenizer,
         metadata_max_context: Option<usize>,
@@ -831,6 +831,72 @@ impl Engine {
         collect_batch_results(results)
     }
 
+    /// Run requests to completion through a **native** continuous batch that can
+    /// carry mixed LoRA adapters per row (design §J.4/§J.5 P2e).
+    ///
+    /// Unlike [`Self::run_continuous_batch`] (ORT `BatchedStaticCacheDecodeSession`,
+    /// no grouped op), this drives a [`NativeBatchedDecodeSession`] over the
+    /// engine's native grouped `InferenceSession`, so each row's logits carry that
+    /// row's own adapter delta. Per-request adapter names are resolved to their
+    /// `lora.segments` ids from the loaded grouped pool; an unknown name fails
+    /// loud at admission.
+    #[cfg(feature = "native-backend")]
+    pub fn run_native_continuous_batch(
+        &mut self,
+        requests: Vec<GenerateRequest>,
+        max_batch: usize,
+    ) -> anyhow::Result<Vec<GenerateResult>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
+        }
+        let expected_results = requests.len();
+        let metadata_max_context = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length);
+        let max_len = metadata_max_context.unwrap_or(4096).max(1);
+        // Borrow the native session and tokenizer as disjoint fields so the
+        // manager can hold the mutable session borrow alongside the shared
+        // tokenizer borrow for its whole lifetime.
+        let native_session = self.native_session.as_mut().context(
+            "native continuous batching requires a native decoder session; load the engine with \
+             ONNX_GENAI_BACKEND=native",
+        )?;
+        let lora_adapter_routes = native_session.lora_adapter_routes();
+        let inference_session = native_session.inference_session_mut();
+        let decode = crate::native_decode::NativeBatchedDecodeSession::new(
+            inference_session,
+            max_batch,
+            max_len,
+        )
+        .context("build native batched decode session")?;
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(decode),
+            &self.tokenizer,
+            metadata_max_context,
+            max_batch,
+            lora_adapter_routes,
+        )?;
+
+        let mut results = vec![None; expected_results];
+        for request in requests {
+            manager.submit(request)?;
+            collect_finished_events(manager.poll(), &mut results)?;
+        }
+        while results.iter().any(|result| result.is_none()) {
+            if !manager.has_pending_work() {
+                break;
+            }
+            manager.step()?;
+            collect_finished_events(manager.poll(), &mut results)?;
+        }
+        collect_batch_results(results)
+    }
+
     fn batched_max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
         let configured = self
             .metadata
@@ -1018,6 +1084,7 @@ mod lora_continuous_batch_tests {
     use onnx_runtime_loader::encoder::{Model, write_model};
     use onnx_runtime_session::lora_inject::{LoraAdapterSpec, LoraModuleSpec};
     use onnx_runtime_session::{InferenceSession, Tensor};
+    use crate::native_decode::NativeBatchedDecodeSession;
 
     const K: usize = 16;
     const N: usize = 3;
@@ -1427,6 +1494,291 @@ mod lora_continuous_batch_tests {
             "unexpected error: {message}"
         );
         // Base-only still admits fine.
+        manager.submit(base_request(None)).expect("base-only admits");
+    }
+
+    fn i64_le(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// A token-driven sibling of [`write_zero_base_batch_model`]: the same
+    /// zero-dequantizing `q_proj` int4 projection, but fed by
+    /// `input_ids -> Gather(embedding) -> Reshape[-1, K] -> x` so the graph is
+    /// driven by real token ids (a decoder-shaped, KV-free step) instead of a
+    /// pre-baked activation. Token id 1 embeds to `ones(K)` so `x == fixed_x`,
+    /// isolating the grouped-LoRA delta exactly like the probe model. The single
+    /// output is named `logits` so the native batched session resolves it.
+    fn write_zero_base_token_model(path: &std::path::Path) {
+        const BITS: usize = 4;
+        const BLOCK_SIZE: usize = 16;
+        const VOCAB_EMBED: usize = 8;
+        let k_blocks = K / BLOCK_SIZE;
+        let blob_size = BLOCK_SIZE * BITS / 8;
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert("com.microsoft".to_string(), 1);
+
+        let batch = graph.intern_symbol("batch");
+        let input_ids = graph.create_named_value(
+            "input_ids",
+            IrDataType::Int64,
+            vec![Dim::from(batch), Dim::from(1usize)],
+        );
+        graph.add_input(input_ids);
+
+        // Embedding table: row for token id 1 is ones(K); every other row is
+        // zero, so a driven token 1 reproduces the probe's fixed activation.
+        let mut embedding_data = vec![0.0f32; VOCAB_EMBED * K];
+        for column in 0..K {
+            embedding_data[K + column] = 1.0;
+        }
+        let embedding = graph.create_named_value(
+            "model.embed_tokens.weight",
+            IrDataType::Float32,
+            static_shape([VOCAB_EMBED, K]),
+        );
+        graph.set_initializer(
+            embedding,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Float32,
+                vec![VOCAB_EMBED, K],
+                f32_le(&embedding_data),
+            )),
+        );
+        let gathered = graph.create_named_value(
+            "gathered",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(1usize), Dim::from(K)],
+        );
+        let mut gather = Node::new(
+            NodeId(0),
+            "Gather",
+            vec![Some(embedding), Some(input_ids)],
+            vec![gathered],
+        );
+        gather.name = "/model/embed_tokens/Gather".to_string();
+        gather.attributes.insert("axis".to_string(), Attribute::Int(0));
+        graph.insert_node(gather);
+
+        // Reshape [batch, 1, K] -> [batch, K] so the base MatMulNBits (and the
+        // injected GroupedLoraDelta that shadows it) sees a rank-2 activation.
+        let reshape_shape = graph.create_named_value(
+            "reshape_shape",
+            IrDataType::Int64,
+            static_shape([2]),
+        );
+        graph.set_initializer(
+            reshape_shape,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Int64,
+                vec![2],
+                i64_le(&[-1, K as i64]),
+            )),
+        );
+        let x = graph.create_named_value(
+            "x",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(K)],
+        );
+        let mut reshape = Node::new(
+            NodeId(1),
+            "Reshape",
+            vec![Some(gathered), Some(reshape_shape)],
+            vec![x],
+        );
+        reshape.name = "/model/embed_tokens/Reshape".to_string();
+        graph.insert_node(reshape);
+
+        let weight = graph.create_named_value(
+            "model.layers.0.attn.q_proj.MatMulNBits.qweight",
+            IrDataType::Uint8,
+            static_shape([N, k_blocks, blob_size]),
+        );
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Uint8,
+                vec![N, k_blocks, blob_size],
+                vec![0x88u8; N * k_blocks * blob_size],
+            )),
+        );
+        let scales = graph.create_named_value(
+            "model.layers.0.attn.q_proj.MatMulNBits.scales",
+            IrDataType::Float32,
+            static_shape([N, k_blocks]),
+        );
+        graph.set_initializer(
+            scales,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Float32,
+                vec![N, k_blocks],
+                f32_le(&vec![1.0f32; N * k_blocks]),
+            )),
+        );
+        let logits = graph.create_named_value(
+            "logits",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(N)],
+        );
+        let mut node = Node::new(
+            NodeId(2),
+            "MatMulNBits",
+            vec![Some(x), Some(weight), Some(scales)],
+            vec![logits],
+        );
+        node.name = "/model/layers.0/attn/q_proj/MatMulNBits".to_string();
+        node.domain = "com.microsoft".to_string();
+        node.attributes.insert("K".to_string(), Attribute::Int(K as i64));
+        node.attributes.insert("N".to_string(), Attribute::Int(N as i64));
+        node.attributes.insert("bits".to_string(), Attribute::Int(BITS as i64));
+        node.attributes
+            .insert("block_size".to_string(), Attribute::Int(BLOCK_SIZE as i64));
+        graph.insert_node(node);
+        graph.add_output(logits);
+
+        write_model(&Model::new(&graph), path).unwrap();
+    }
+
+    /// THE gap-closing acceptance test (design §J.9): drive the REAL
+    /// [`NativeBatchedDecodeSession`] — not a decode-session double — through the
+    /// production [`ContinuousBatchManager`], carrying three sequences bound to
+    /// adapter A, adapter B, and base within ONE native continuous batch, and
+    /// assert each row emits its own adapter's argmax token. Non-tautological: a
+    /// whole-batch-to-base session collapses rows A and B to token 0 and fails.
+    #[test]
+    fn native_continuous_batch_routes_mixed_adapters_per_row() {
+        let fixed_x: Vec<f32> = vec![1.0; K];
+        let scale = 1.0f32;
+        let mut a_t = vec![0.0f32; K * RANK];
+        for p in 0..K {
+            a_t[p * RANK] = 0.1;
+        }
+        let mut b_t_a = vec![0.0f32; RANK * N];
+        b_t_a[1] = 1.0; // adapter A -> vocab 1
+        let mut b_t_b = vec![0.0f32; RANK * N];
+        b_t_b[2] = 1.0; // adapter B -> vocab 2
+
+        let token_a = argmax(&reference_delta(&fixed_x, &a_t, &b_t_a, scale));
+        let token_b = argmax(&reference_delta(&fixed_x, &a_t, &b_t_b, scale));
+        assert_ne!(token_a, 0, "adapter A must route off the base argmax");
+        assert_ne!(token_b, 0, "adapter B must route off the base argmax");
+        assert_ne!(token_a, token_b, "adapters A and B must be distinguishable");
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        write_zero_base_token_model(&model_path);
+
+        let mut session = InferenceSession::builder()
+            .model(&model_path)
+            .lora_adapters(vec![
+                lora_spec("adapter_a", &a_t, &b_t_a, scale),
+                lora_spec("adapter_b", &a_t, &b_t_b, scale),
+            ])
+            .build()
+            .expect("build grouped multi-adapter native session");
+        let route_a = session.resolve_lora_adapter("adapter_a").expect("resolve A").0 as i32;
+        let route_b = session.resolve_lora_adapter("adapter_b").expect("resolve B").0 as i32;
+
+        let max_batch = 3;
+        let decode = NativeBatchedDecodeSession::new(&mut session, max_batch, 1 << 16)
+            .expect("build native batched decode session");
+
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(decode),
+            &tokenizer,
+            None,
+            max_batch,
+            vec![
+                ("adapter_a".to_string(), route_a),
+                ("adapter_b".to_string(), route_b),
+            ],
+        )
+        .expect("build native continuous-batch manager");
+
+        let handle_a = manager.submit(base_request(Some("adapter_a"))).unwrap();
+        let handle_b = manager.submit(base_request(Some("adapter_b"))).unwrap();
+        let handle_base = manager.submit(base_request(None)).unwrap();
+
+        let mut first_token = std::collections::HashMap::new();
+        let record = |events: Vec<ContinuousBatchEvent>,
+                      sink: &mut std::collections::HashMap<usize, u32>| {
+            for event in events {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    sink.entry(handle.id).or_insert(token.token_id);
+                }
+            }
+        };
+        record(manager.poll(), &mut first_token);
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            record(manager.poll(), &mut first_token);
+            guard += 1;
+            assert!(guard < 64, "native continuous batch failed to drain");
+        }
+
+        assert_eq!(
+            first_token.get(&handle_a.id).copied(),
+            Some(token_a as u32),
+            "native row bound to adapter A must emit A's argmax token"
+        );
+        assert_eq!(
+            first_token.get(&handle_b.id).copied(),
+            Some(token_b as u32),
+            "native row bound to adapter B must emit B's argmax token"
+        );
+        assert_eq!(
+            first_token.get(&handle_base.id).copied(),
+            Some(0u32),
+            "native base row must emit the zero-base argmax token"
+        );
+    }
+
+    /// The native production path rejects an unknown adapter loud at admission
+    /// (never a silent base fallback), mirroring the probe path.
+    #[test]
+    fn native_continuous_batch_unknown_adapter_fails_loud() {
+        let scale = 1.0f32;
+        let mut a_t = vec![0.0f32; K * RANK];
+        for p in 0..K {
+            a_t[p * RANK] = 0.1;
+        }
+        let mut b_t_a = vec![0.0f32; RANK * N];
+        b_t_a[1] = 1.0;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        write_zero_base_token_model(&model_path);
+        let mut session = InferenceSession::builder()
+            .model(&model_path)
+            .lora_adapters(vec![lora_spec("adapter_a", &a_t, &b_t_a, scale)])
+            .build()
+            .expect("build grouped native session");
+        let route_a = session.resolve_lora_adapter("adapter_a").unwrap().0 as i32;
+
+        let max_batch = 2;
+        let decode = NativeBatchedDecodeSession::new(&mut session, max_batch, 1 << 16)
+            .expect("build native batched decode session");
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(decode),
+            &tokenizer,
+            None,
+            max_batch,
+            vec![("adapter_a".to_string(), route_a)],
+        )
+        .expect("build native manager");
+
+        let error = manager
+            .submit(base_request(Some("nope")))
+            .expect_err("unknown adapter must fail loud at admission");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unknown LoRA adapter"),
+            "unexpected error: {message}"
+        );
         manager.submit(base_request(None)).expect("base-only admits");
     }
 }
