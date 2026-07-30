@@ -7,9 +7,24 @@ duplicate their findings.
 
 **Provenance.** Every finding below was verified by execution or by reading the file, in the
 worktree `/Users/justinc/Documents/GitHub/onnx-genai-demo`, on branch `feat/genai-demo-dashboard`,
-at `346763a0`, 02:11. Five checkouts of this repository exist on this machine and the demo exists
+first at `346763a0`, 02:11; **every status line below was re-verified at `484cda07`, 04:06.**
+Five checkouts of this repository exist on this machine and the demo exists
 in exactly one of them, so a bare path is not a citation. Findings name a **symbol** and **quote
 the text**; line numbers are a hint and may have rotted by the time you read this.
+
+> ⚠️ **A review is a measurement, not a document, and it decays at the rate the tree moves.**
+> This file spent roughly ninety minutes asserting five findings in the present tense after
+> the crew had fixed all five. That is worse than the findings were: a stale *open* finding
+> sends someone to repair something already repaired, or convinces them the repair never
+> landed. Every heading below now carries its status and the commit that closed it. **If you
+> are reading this at a SHA later than `484cda07`, treat every 🔴 as unverified — the 🟢 rows
+> name a commit and can be checked; the red ones only name a moment.**
+
+**Reading the status column.** 🔴 LIVE = re-measured open at `484cda07`. 🟢 FIXED = re-measured
+closed at `484cda07`, with the closing commit named. Each status was taken with a **positive
+control** (an expression that must return non-zero if the instrument reaches the file) and a
+**negative control** (a string that must return zero), because a search that matches nothing and
+a tree with no defects are byte-identical from here.
 
 ---
 
@@ -41,7 +56,11 @@ tree.
 
 ## Live findings
 
-### R1 — `mount` typedef in `dashboard/index.js` promises a method that does not exist
+### R1 — 🔴 LIVE at `484cda07` — `mount` typedef in `dashboard/index.js` promises a method that does not exist
+
+> **Re-verified:** `destroy: () => void` → **2**; control `unmount` → **7**. The typedef promises
+> `destroy`, the code returns `unmount`. **One word, and the signature is the only thing a caller
+> reads.** Cheapest finding on this board and it has survived every sweep tonight.
 
 ```js
  * @property {(root, store) => {destroy: () => void}} mount     // the contract
@@ -57,7 +76,17 @@ it. One-word fix.
 *Signature-level lesson: what would a new team member assume from the type alone? Here the type
 forbids the only method the runtime calls.*
 
-### R6 — `SERVER_CLASSES.DYNAMIC` docstring asserts a feature that was cut
+### R6 — 🟢 FIXED — `SERVER_CLASSES.DYNAMIC` docstring asserted a feature that was cut
+
+> **Status re-verified at `484cda07`, and this row nearly went the wrong way.** A keyword search
+> for the offending phrase still returns **1** hit — and the hit is the *fix*:
+> `"Deliberately does NOT say the prefix cache engages here."` The replacement comment names the
+> old error, negates it, and explains why it was dangerous. **A grep cannot see a negation, so it
+> scored an exemplary fix identically to the defect.** The law this produced is the most
+> load-bearing thing in this review: **the better the fix, the more likely it trips the keyword
+> guard** — a lazy fix deletes the sentence and greps clean; a good fix quotes the bug it killed.
+> Every keyword instrument on this branch systematically penalises the documentation we say we
+> want. The control that saved it: `"deliberately does not"` → 1.
 
 ```js
 /** Dynamic model. Paged KV and the prefix cache engage; batching does not. */
@@ -71,7 +100,10 @@ agrees with this docstring, and both disagree with the measurement. Fix the clas
 and the next reader re-derives `MEASURED` from the prose, correctly, forever. **Fix both in one
 commit.**
 
-### R9 — `ui/model-card.js` writes `data-state` raw, bypassing the normaliser
+### R9 — 🔴 LIVE at `484cda07` — `ui/model-card.js` writes `data-state` raw, bypassing the normaliser
+
+> **Re-verified:** `dataset.state = ` → **1**; control `dataset` → **4**. The normaliser exists
+> and this one site goes around it, so the invariant is discipline rather than construction.
 
 ```js
 element.dataset.state = field.state;   // renderCardField — not normalised
@@ -84,7 +116,21 @@ untested — no test asserts model-card's `data-state` at all. Independently fou
 Reviewer, who owns the severity call; listed here because it is the one place the two-vocabulary
 split is physically visible.
 
-### R10 — a withdrawn measurement propagated faster than its retraction
+### R10 — 🔴 LIVE at `484cda07`, and the count has grown from 5 files to 9 — a withdrawn measurement propagated faster than its retraction
+
+> **Re-verified from the repository root with no pathspec: `7.0%` appears in 9 tracked files.**
+> An earlier pass reported 5. **The denominator moved and the conclusion did not**, which is the
+> strongest form this finding can take.
+>
+> ⚠️ **The first re-measurement of this row returned `0`, and it was wrong.** The pathspec
+> `-- 'examples/serving-dashboard'` was supplied from *inside* `examples/serving-dashboard`, so
+> git resolved it relative to the current directory, matched nothing, and exited **0** with no
+> output. **A confident, clean, false zero, deterministically reproducible.** The only reason it
+> was caught is that a zero on a figure known to be widespread is an asymmetry that should not
+> exist, and the rule is now: **when a negative surprises you, widen the corpus before you
+> believe it.** Dropping the pathspec took nine seconds and changed 0 into 9. *Note that this
+> document is itself one of the nine, and that is the correct state — a retraction has to name
+> what it retracts.*
 
 The `7.0% slower` prefix result was withdrawn by its author (the re-run came back with the
 opposite sign, on a machine where a byte-identical binary swung 9.8% from ambient load). The
@@ -127,7 +173,7 @@ quotes what it forbids. A blind substitution breaks the only two sites that were
 to name what it retracts. The distinction that matters is quoted-as-history versus
 asserted-as-finding, which is the same distinction R11 turns on.*
 
-### R11 — ✅ FIXED by @0837fdf9 (D278) — the design record described the enum in the present tense
+### R11 — 🟢 FIXED by @0837fdf9 (D278) — the design record described the enum in the present tense
 
 `design/demo-ux.md` §53 (D159/D160) still reads, as statements about the code *now*:
 
@@ -193,13 +239,35 @@ JS doc comments — code comments sit beside their referent and never need to po
 unowned prose surface is *cleaner* on this axis than every owned document, including this one,
 which shipped with one.
 
-### R12 — the provenance catalogue defines one field twice, and the weaker entry is the live one
+### R12 — 🟢 FIXED at `185d6720` — the provenance catalogue defined one field twice, and the weaker entry was the live one
 
-`PROVENANCE` in `telemetry-provenance.js` contains **two** `'batch.capacity'` entries, out of 37
+> **⚠️ Correction, and it runs against this reviewer.** This finding was **true**, and for most of
+> the session it was recorded as *withdrawn as my own error*. It was not an error. The duplicate
+> genuinely existed: `'batch.capacity'` appears **twice** at `13ba68a7` and `13d9214b`, and
+> **once** from `185d6720` — *"make the provenance register agree with the page it certifies"*
+> — onward. Verified at `484cda07`: 1 occurrence, and **0** duplicate keys anywhere in the
+> catalogue.
+>
+> **How the false retraction happened, because the mechanism matters more than the row.** I
+> re-measured after the fix landed, found one key where I had reported two, and concluded *I
+> was wrong* instead of *it was fixed*. That is precisely the rule this crew ratified tonight in
+> someone else's words — **a clean zero has two explanations: my instrument was narrow, or I
+> measured after the fix, and they are indistinguishable from the result.** I applied that rule
+> to other people's findings all night and never once applied it to my own withdrawal.
+>
+> **And the direction is the dangerous part.** Measure a defect gone and call it *fixed*, and
+> you credit the person who fixed it. Measure it gone and call it *my mistake*, and you delete
+> the evidence that the fix was ever needed — while collecting credit for candour. This session
+> built enormous social reward for retracting your own findings. **I harvested that reward for
+> retracting a finding that was right.** A retraction is a claim like any other and needs the
+> same control: before withdrawing a finding, check whether the tree changed under it.
+> `git log -S'<the thing>' -- <file>` answers it in one command and I did not run it for hours.
+
+`PROVENANCE` in `telemetry-provenance.js` contained **two** `'batch.capacity'` entries, out of 37
 keys. A duplicate key in a JavaScript object literal is not an error: no syntax error, no
-warning, no lint. The last definition silently wins.
+warning, no lint. The last definition silently won.
 
-Confirmed by executing the module rather than reading it:
+Confirmed at the time by executing the module rather than reading it:
 
 ```
 import('./telemetry-provenance.js') -> PROVENANCE['batch.capacity']
@@ -216,6 +284,25 @@ DEAD  '...admin.rs — `batch_capacity` is serialised from AppConfig::effective_
        configuration; no stub.'
 LIVE  '...admin.rs:178 (batch_capacity, from state.config.effective_batch_capacity()).'
 ```
+
+**What actually shipped, verified at `484cda07` — the fix was the merge, and it was better than the
+one recommended here.** The surviving entry keeps the symbol-anchored evidence
+(`routes/admin.rs — \`batch_capacity\` is serialised from AppConfig::effective_batch_capacity()`)
+and the denominator comment, and it **renames the label from `'Batch limit'` to
+`'Effective batch capacity'`** — which closes a *separate* caption finding filed independently by
+another reviewer, because `batch limit` is the name of raw `max_batch`, not of the clamped
+minimum actually served. The bare `admin.rs:178` string that this section quotes twice above no
+longer exists anywhere in the catalogue (`grep -c 'admin.rs:178'` → **0**; control `admin.rs`
+→ 28). *Those two quotations are left unedited on purpose: they are quotations of a historical
+state, and rewriting a number inside a quotation to satisfy a citation checker falsifies the
+quote.*
+
+**And the guard recommended below was built, with a control I did not think to ask for.**
+`provenance-expiry.test.js` extracts the key literals and asserts the list equals its own `Set`
+— and it carries an **anti-vacuity** assertion, because a regex that matched nothing would
+report zero duplicates and pass. Mutation-proven this session: raw exit **0** clean, raw exit
+**1** with a duplicate injected, file restored, 0 dirty paths.
+
 
 The `min(max_batch, max_queue_depth)` explanation is the one the crew explicitly decided must not
 be un-learned — raw `max_batch` overstates the ceiling, so a saturated server can draw as 25%
@@ -246,7 +333,10 @@ I tried it, and the two numbers are drawn from different populations — the pat
 a subset of the object's keys, so the counts agree while a duplicate is present and the check
 proves nothing. Compare a list against its own deduplication, in one population.
 
-### R13 — the launcher advertises, as a clickable URL, the one scenario the code says must not be addressable
+### R13 — 🟢 FIXED — the launcher advertised, as a clickable URL, the one scenario the code says must not be addressable
+
+> **Re-verified at `484cda07`:** the `run-demo.sh` banner now emits exactly two scenario links —
+> `scenario=continuous-batching` and `scenario=paged-kv`. Prefix-cache links: **0**.
 
 This is the first prose an operator ever reads — before the page loads, before any panel renders,
 outside every honesty mechanism this project built. `run-demo.sh`'s success banner prints three
@@ -297,7 +387,16 @@ The fix is one line of deletion and one line of coverage: drop the third URL and
 claims, and add `run-demo.sh` to the claim guard's path list so the operator-facing surface is
 scanned by the same rule as the visitor-facing one.
 
-### R14 — the silent substitution is not a policy choice; the signature makes honesty unrepresentable
+### R14 — 🟢 FIXED at the type level — the silent substitution was not a policy choice; the signature made honesty unrepresentable
+
+> **Re-verified at `484cda07`.** This finding's complaint was that the return type could not
+> express *what was asked for* beside *what was shown*, so a caller had no way to be honest even
+> if it wanted to be. The fix is in the **signature**, which is the right place: the documented
+> return now carries `requested` and `substitution` alongside the resolved id (`requested` → 12
+> occurrences in `scenario-origins.js`). The whole chain was walked rather than spot-checked —
+> exported, imported by `ui/scenario-switcher.js`, called, and plumbed into `app.js`. **A fix
+> verified only at its definition is a fix verified nowhere; the interesting failure is always
+> the caller that never adopted it.**
 
 @376a0297 executed the shipping resolver on the launcher's own URL and found `prefix-cache`
 resolves to `paged-kv` with no notice. They asked whether an unrecognised `scenario=` should fall
@@ -343,7 +442,20 @@ That is also why R13 and R14 must be fixed together: deleting the launcher URL r
 one known bad link, but any typo, stale bookmark, or README edit re-creates a silent substitution
 tomorrow. R13 is the instance; R14 is the reason instances are silent.
 
-### R15 — the QA plan instructs the tester to perform the silent substitution and record it as a pass
+### R15 — 🟢 FIXED, and inverted — the QA plan instructed the tester to perform the silent substitution and record it as a pass
+
+> **Re-verified at `484cda07`.** The plan no longer merely omits the hazard — it **warns about
+> the false pass it once invited**. That is the strongest shape a documentation fix can take:
+> the document that caused the error is the document that now prevents it, so the correction is
+> co-located with the instruction that needed it rather than filed in a separate errata nobody
+> opens.
+>
+> *A caveat on this reviewer's own instrument, disclosed because it changes how the row should be
+> read:* an earlier keyword pass over this plan returned **0** and was wrong — the search was
+> case-sensitive and the word is sentence-initial (`Substitution`). The zero was refused rather
+> than banked, and only because a zero on a document known to discuss the topic is the asymmetry
+> that should not exist. **Case is the sixth thing a grep cannot see, after arrays, tense, line
+> breaks inside an expression, negation, and string-concatenation boundaries.**
 
 `QA-PLAN.md`, item **B1**, already ticked `[x]` and marked **RESOLVED**:
 
