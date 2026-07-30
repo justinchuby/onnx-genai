@@ -2203,22 +2203,25 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 >
 > **This is D158 landing on my own document for the third time tonight** — after the `<meta>` description and the Profile D hero slot. All three were **cut or qualified fields still bound in PROSE THAT INSTRUCTS**, and **none of the five test files I own can see any of them.** `page-claims.test.js` reads shipped HTML; the tripwire reads module identifiers; **nothing reads the design document, which is the file developers actually build from.**
 
-**Corrected sketch — satisfies AC50 and D85. ⛔ It does NOT satisfy D341: the `TOTAL` figure below is a five-significant-figure point value, and the caveat inside the fence says so. A compliance badge names the rulings it was checked against and is silent on every other one, which is why this line now names the ruling it FAILS. This is the only benchmark form in this document:**
+**Corrected sketch — checked against AC50, D85, D308, D341, D342 and D349, and against nothing else. ⛔ A compliance badge certifies only what it was checked against and reads as though it certifies everything; treat every ruling not named on this line as UNCHECKED, not as passed. The box below specifies FIELDS, NOT VALUES — no measured figure appears in it, because a sketch that carries one is a fixture the builder will copy. The withdrawn figures are described BELOW the fence, outside the build instruction, which is where an argument belongs (D308). This is the only benchmark form in this document:**
 
 ```
       4 concurrent requests vs 1
 
-      TOTAL  82.130 tok/s   2.46–2.72× faster
-      EACH   20.7   tok/s   0.62× as fast
+      TOTAL  <total_tok_s> tok/s   <ratio_lo>–<ratio_hi>× faster
+      EACH   <each_tok_s>  tok/s   <each_ratio>× as fast
 
       Batching does not make any single request faster.
       Range spans 2 occasions · CPU EP · max_batch from payload · one machine
-      TOTAL was measured ONCE and never re-run. Its five figures are the
-      ABSENCE OF A SECOND OCCASION, not a demonstrated resolution (D341).
-      The interval is the DENOMINATOR arm moving 9.77%; the numerator was
-      held constant because nobody re-measured it, not because it is stable.
-      The INTERVAL is the claim. `2.46×` alone is withdrawn (§101): it is
-      the low end of two occasions, never the result.
+      FIELDS, NOT VALUES. No literal figure may be typed into this panel;
+      every figure renders from the run that produced it. A sketch carrying a
+      measured number is indistinguishable from a fixture, and the builder
+      cannot tell which figures are illustrative and which are contractual —
+      so this one carries none (D349).
+      The ratio renders as an INTERVAL or it does not render (D341).
+      A point value here is the ABSENCE OF A SECOND OCCASION wearing the
+      costume of a resolution.
+      EACH renders at TOTAL's type size or neither renders (§29.1).
 ```
 
 > 🔴 **THE SKETCH ABOVE PREVIOUSLY READ `2.46× faster` AND `n=15 · CV 1.98%`. BOTH WERE STRUCK IN §101 AND THE CORRECTION IS SHOWN RATHER THAN SILENTLY APPLIED.** A byte-identical binary put the denominator **9.77% lower** 75 minutes later, moving the ratio to **2.72×**. `2.46` asserts ±0.203% resolution against **9.77% observed — a 48.1× shortfall**. **And `CV 1.98%` was the within-run spread of ONE ARM, not the dispersion of the RATIO — a correct statistic attached to the wrong quantity, which manufactures support rather than reporting it (D342).**
@@ -2457,18 +2460,21 @@ Same principle as D83 (*layout space is a claim about significance*), one level 
 ```
         4 concurrent requests vs 1
 
-  TOTAL    82.130 tok/s     2.46–2.72× faster
-  EACH     20.7   tok/s     0.62× as fast
+  TOTAL    <total_tok_s> tok/s     <ratio_lo>–<ratio_hi>× faster
+  EACH     <each_tok_s>  tok/s     <each_ratio>× as fast
 
   Batching does not make any single request faster.
   It trades per-stream latency for total throughput.
   Range spans 2 occasions · CPU EP · max_batch from payload · not a performance claim
-  TOTAL was measured ONCE and never re-run. Its five figures are the ABSENCE
-  OF A SECOND OCCASION, not a demonstrated resolution (D341). The interval is
-  the DENOMINATOR arm moving 9.77%; the numerator was held constant because
-  nobody re-measured it, not because it is stable.
-  The INTERVAL is the claim. `2.46×` alone is withdrawn (§101): it is
-  the low end of two occasions, never the result.
+  FIELDS, NOT VALUES. No literal figure may be typed into this panel; every
+  figure renders from the run that produced it. A sketch carrying a measured
+  number is indistinguishable from a fixture, and the builder cannot tell which
+  figures are illustrative and which are contractual — so this one carries
+  none (D349).
+  The ratio renders as an INTERVAL or it does not render (D341).
+  A point value here is the ABSENCE OF A SECOND OCCASION wearing the costume
+  of a resolution.
+  EACH renders at TOTAL's type size or neither renders (§29.1).
 ```
 
 > 🔴 **THIS SKETCH READ `2.46× faster`, `n=15 · CV 1.98%` AND `max_batch=4` UNTIL §101. ALL THREE WERE WRONG AND EACH WAS FORBIDDEN BY A RULE ALREADY WRITTEN IN §24.2** — the point figure by D341, the misattributed dispersion by D342, and the literal `max_batch=4` by §24.2's own closing note that *a compile-time constant may not pose as a measured run parameter* on the one line whose job is to say how the measurement was taken.
@@ -7409,3 +7415,4 @@ a bare file:line citation        27 ->  27   ** IDENTITY **
 | D346 | A sentence-shaped bound is a no-op on machine-shaped strings | `headlineSentence` is identity on a path, a URL, an id and a citation — it vanishes on exactly the content that overflows, while still reading as a bound |
 | D347 | A declaration that is right in one region and wrong in another must be CLASSIFIED where written, not grepped for | `overflow-wrap: anywhere` is correct on quoted server text and a defect on a value slot; only the author knows which |
 | D348 | Look for a declaration in the declaration stream, never in the prose | My own classifying comment named its property and propped the anti-vacuity floor at 1 with both declarations deleted |
+| D349 | A sketch specifies FIELDS, never VALUES — a mockup carrying a measured number is a fixture the builder will copy | Prose inside a build instruction is the part that does not get built. My own four-line caveat sat beside `82.130` and would have been dropped by anyone rendering the box; only removing the literal removes the claim |
