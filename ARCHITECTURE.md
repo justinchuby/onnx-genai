@@ -6,6 +6,10 @@
 
 Line numbers are accurate as of the commit this document was added. Structure changes slowly; if a line has drifted, the symbol name will still find it.
 
+**Verification.** All 87 distinct `file:line` citations in this document were checked mechanically against the tree — every one resolves to an existing file with that line present. The load-bearing claims were additionally verified by reading the code at each cited location, not by trusting the recon notes they came from.
+
+**How to read §5.** Each invariant is tagged **ENFORCED** (the code prevents violation) or **ASSUMED** (nothing stops you; violation compiles, runs, and corrupts or degrades silently). The ASSUMED ones — §5.3, §5.8, §5.10 — are the highest-risk sections in this document. §5.12 is tagged **CURRENTLY VIOLATED**, because documenting it as true would be exactly the kind of intent-as-behaviour this document forbids.
+
 ---
 
 ## 1. Orientation
