@@ -78,11 +78,8 @@ describe('renderField — a measured zero and an unmeasurable value must look di
       label: 'Feature enabled',
     }));
 
-    const valueNode = node.findByClass('value__num');
-    assert.ok(valueNode, 'measured false must render a value node');
-    assert.equal(typeof valueNode.textContent, 'string');
     assert.equal(node.getAttribute('data-state'), 'measured');
-    assert.match(valueNode.textContent, /false/);
+    assert.equal(node.findByClass('value__num').textContent, 'false');
     assert.equal(node.findByClass('value__num--unavailable'), null);
     assert.doesNotMatch(node.textContent, /—/);
   });

@@ -46,8 +46,7 @@ test('a measured zero renders as a stark 0, never as absence', () => {
 
 test('a measured false renders as literal false, never as absence', () => {
   const out = formatField(measuredField(false, { source: '/v1/status' }));
-  assert.equal(typeof out.text, 'string');
-  assert.match(out.text, /false/);
+  assert.equal(out.text, 'false');
   assert.notEqual(out.text, ABSENT_TEXT);
   assert.doesNotMatch(out.text, /—/);
 });
