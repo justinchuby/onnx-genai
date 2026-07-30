@@ -502,8 +502,16 @@ nodes = [helper.make_node("Cast", ["input_ids"], ["logits"], to=TensorProto.FLOA
 if kind != "plain":
     inputs += [i64("write_indices"), i64("nonpad_kv_seqlen")]
 
+# TWELVE layers, not two, and the count is load-bearing. The runtime pairs the
+# four cache lists POSITIONALLY, so a lexical sort mis-binds every buffer past
+# layer 9 ("key_cache.10" sorts before "key_cache.2") with no crash and no
+# wrong-looking output. Below ten layers, lexical and numeric order are
+# IDENTICAL - an ordering assertion over two layers cannot fail on the very
+# defect it exists to catch.
+LAYERS = list(range(12)) if kind == "complete" else [0, 1]
+
 if kind in ("mispaired", "complete"):
-    for layer in (0, 1):
+    for layer in LAYERS:
         inputs += [f32("key_cache.%d" % layer), f32("value_cache.%d" % layer)]
         for role in ("key", "value"):
             # "mispaired" omits updated_key_cache.1, so the four lists no longer
@@ -552,8 +560,10 @@ PY
     "a graph missing one layer's cache output is rejected before it mis-pairs" \
     mispaired "mis-pair"
 
-  # Positive control: the same machinery must ACCEPT a well-formed graph, or the
-  # three rejections above would prove nothing.
+  # Positive control, and the ordering guard. The expected list is spelled out to
+  # layer 11 on purpose: it is only past layer 9 that a lexical sort diverges
+  # from a numeric one, so this is the assertion that can actually go red on the
+  # silent mis-pairing bug.
   TESTS_RUN=$((TESTS_RUN + 1))
   complete_dir="$synth_tmp/complete"
   mkdir -p "$complete_dir"
@@ -562,21 +572,26 @@ PY
     if printf '%s' "$complete_out" | "$GENERATOR_PYTHON" -c '
 import sys, yaml
 spec = yaml.safe_load(sys.stdin)["io"]["static_cache"]
+expected = ["key_cache.%d" % i for i in range(12)]
 ok = (
     spec["write_indices_input"] == "write_indices"
     and spec["kv_sequence_length_input"] == "nonpad_kv_seqlen"
-    and spec["key_cache_inputs"] == ["key_cache.0", "key_cache.1"]
-    and spec["key_cache_outputs"] == ["updated_key_cache.0", "updated_key_cache.1"]
+    and spec["key_cache_inputs"] == expected
+    and spec["value_cache_inputs"] == ["value_cache.%d" % i for i in range(12)]
+    and spec["key_cache_outputs"] == ["updated_key_cache.%d" % i for i in range(12)]
+    and spec["value_cache_outputs"] == ["updated_value_cache.%d" % i for i in range(12)]
 )
+if not ok:
+    print("got key_cache_inputs=%r" % (spec.get("key_cache_inputs"),), file=sys.stderr)
 sys.exit(0 if ok else 1)
-'; then
-      pass "a well-formed scatter graph is accepted and paired in layer order"
+' 2>"$synth_tmp/order.err"; then
+      pass "cache ports pair by NUMERIC layer index, not lexically (12 layers)"
     else
-      fail "a well-formed scatter graph is accepted and paired in layer order" \
-        "derived an unexpected block: $complete_out"
+      fail "cache ports pair by NUMERIC layer index, not lexically (12 layers)" \
+        "$(cat "$synth_tmp/order.err" 2>/dev/null)"
     fi
   else
-    fail "a well-formed scatter graph is accepted and paired in layer order" \
+    fail "cache ports pair by NUMERIC layer index, not lexically (12 layers)" \
       "generator rejected a valid graph: ${complete_out:-<build failed>}"
   fi
 
