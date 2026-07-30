@@ -155,8 +155,17 @@ before it can route on this field honestly. Same applies to `kv_pages_used`,
 
 ## Tests
 
-**136 Rust tests** in the server crate; **59 documentation-drift checks** plus
-the dashboard's own suites in `examples/serving-dashboard/`.
+**136 Rust tests** in the server crate; **67 documentation-drift checks**
+(`node --test check-*.test.js`) plus the dashboard's own suites in
+`examples/serving-dashboard/`.
+
+> **Counts in this section are anchored, because a test count is a claim with a
+> shelf life.** The canonical suite is a *command*, not a number:
+> `cd examples/serving-dashboard && node --test`. Any total quoted here without
+> a commit and a Node version beside it should be re-run rather than believed —
+> including these. Measured at `e6dd848e`, Node v25.6.1. **Note that `node --test`
+> only recurses into `dashboard/` on Node ≥ 22; on older Node the same command
+> silently runs a fraction of the suite and reports success.**
 
 The drift checks exist because **documentation rots faster than code and nothing
 tells you.** They bind the README to the repository: every cited file and line
@@ -194,6 +203,34 @@ into the suite: a check that repairs its own subject can never fail.
   the denominator is one configuration's ceiling, so the numerator can
   legitimately exceed it. The value is clamped, which hides a scope mismatch
   rather than a bug. Documented in the README rather than silently corrected.
+- **Most fields on the page are `—`, and the two headline panels are the
+  emptiest.** Measured two independent ways that agree: a live `data-state`
+  census of the rendered page (**40 of 51** field states `unavailable`), and a
+  static count of keys `dashboard/kv-memory.js` passes to `field()` that have no
+  catalogue entry (**10 of 13, 77 %**). One counts pixels, one counts bindings.
+  Every dash is a metric no endpoint publishes, and the page saying so is the
+  point — **but a dashboard that degrades honestly is still a dashboard not
+  showing you much yet.** The degradation machinery is complete and tested; the
+  telemetry coverage behind it is early. Those are two different maturity
+  levels and the page's calm presentation can blur them. Quantified in the
+  README under *How much of the page is actually populated*, and gated there so
+  it cannot drift — **including upward**, since a figure that improves silently
+  is one nobody reports.
+- **`dashboard/field-keys.test.js` verifies only field keys written as string
+  literals.** Its extractor requires a quoted argument, so the 15 keys
+  `dashboard/throughput.js:274` builds by template interpolation
+  (`` `${definition.prefix}_${percentile}` ``) are invisible to it; none of the
+  15 has a producer anywhere in the tree. **The subtle part is the allowlist:
+  `NOT_YET_PUBLISHED` contains exactly two of those 15 — precisely the two that
+  also appear as literals — each with a written rationale that applies equally
+  to the other 13.** It reads as a surveyed exemption and is actually the
+  extractor's visible subset. The guard is sound and narrower than it looks;
+  treat it as covering the literal half of the field-key class.
+- **A green gate is not a satisfied reviewer.** The mechanical gate reached 6/6,
+  and the code reviewer's standing verdict is still REQUEST CHANGES on findings
+  the gate does not encode. These are different instruments measuring different
+  things, and reporting the gate alone would be the *all-clear-terminates-inquiry*
+  failure this PR spends its length arguing against.
 - **`demo-spec.md` is committed as a snapshot** at 159 acceptance criteria. Its
   authoritative count lives in the file's own header and is machine-generated;
   do not quote a total from anywhere else.
