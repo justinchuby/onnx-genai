@@ -13,12 +13,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
 const indexHtml = readFileSync(join(demoDir, 'index.html'), 'utf8');
+const readmeText = readFileSync(join(demoDir, 'README.md'), 'utf8');
 
 const IGNORED_DIRS = new Set(['node_modules', '.git', 'design']);
 
@@ -77,3 +78,43 @@ for (const css of stylesheetsOnDisk()) {
     );
   });
 }
+
+// The Layout section names files and directories. Nothing enforced that they
+// exist, and for a while it documented `css/` after every stylesheet had moved
+// to `styles/` -- the pre-D63 layout, described in the present tense.
+//
+// That single stale path cost the crew about forty minutes. Two agents went
+// looking for `css/shell.css`, concluded from the mismatch that `panels.css`
+// was unlinked, and escalated an orphaned-stylesheet alarm twice. The
+// stylesheet had been correctly linked the whole time; the map was wrong, not
+// the territory. A wrong path in a file tree is worse than an absent one,
+// because a reader who cannot find the file blames their checkout before they
+// blame the README -- and the README looks right, because it is well written.
+test('every path named in the Layout tree exists', () => {
+  const layout = readmeText.slice(
+    readmeText.indexOf('## Layout'),
+    readmeText.indexOf('Two seams keep this navigable'),
+  );
+
+  assert.ok(layout.length > 0, 'The Layout section moved; this check is inspecting nothing.');
+
+  // Tree lines look like: "├── name    description"
+  const named = [...layout.matchAll(/^[├└]──\s+(\S+)/gm)].map((m) => m[1]);
+
+  assert.ok(
+    named.length >= 8,
+    `Only ${named.length} entries parsed from the Layout tree. The tree format ` +
+      `changed and this check would silently pass over an empty list.`,
+  );
+
+  for (const entry of named) {
+    // Directories are written with a trailing slash.
+    const target = entry.endsWith('/') ? entry.slice(0, -1) : entry;
+    assert.ok(
+      existsSync(join(demoDir, target)),
+      `README.md's Layout tree names '${entry}', which does not exist in ` +
+        `examples/serving-dashboard/. It was renamed or moved. A reader who ` +
+        `cannot find it will assume their checkout is wrong, not the README.`,
+    );
+  }
+});

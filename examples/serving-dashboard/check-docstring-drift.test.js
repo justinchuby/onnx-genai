@@ -79,3 +79,38 @@ test('every FIELD_STATES value is explained in the typedef body, not just listed
     );
   }
 });
+
+// The README now DOCUMENTS the staleness ceiling as shipped behaviour: past the
+// ceiling the value is removed and the age remains. That claim is the whole
+// reason a stale number is safe to show at all -- "20.7 tok/s . 4m old" reads
+// to every human as "20.7 tok/s", so the ceiling is what stops an age suffix
+// being decoration on a fabricated-feeling number.
+//
+// If the ceiling is ever removed or renamed, nothing breaks and nothing fails.
+// The panels keep rendering, the ages keep appearing, and the README keeps
+// promising a safeguard that no longer runs -- documentation describing a
+// mechanism that was deleted, which is the exact failure this file exists for.
+test('README staleness-ceiling claim is backed by shipping code', () => {
+  const readme = readFileSync(join(demoDir, 'README.md'), 'utf8');
+  if (!readme.includes('staleness ceiling')) return;
+
+  const fieldState = readFileSync(join(demoDir, 'dashboard/field-state.js'), 'utf8');
+  const panelKit = readFileSync(join(demoDir, 'dashboard/panel-kit.js'), 'utf8');
+
+  assert.ok(
+    fieldState.includes('DEFAULT_STALE_CEILING_MS') && fieldState.includes('isPastStaleCeiling'),
+    'README documents a staleness ceiling, but dashboard/field-state.js no ' +
+      'longer exports DEFAULT_STALE_CEILING_MS / isPastStaleCeiling.',
+  );
+
+  // Exporting the check is not the same as USING it. A ceiling nothing calls is
+  // an existence check standing in for behaviour -- the defect class that has
+  // bitten this project repeatedly.
+  assert.ok(
+    panelKit.includes('isPastStaleCeiling('),
+    'dashboard/panel-kit.js no longer CALLS isPastStaleCeiling. The ceiling ' +
+      'would still exist and still be exported, and every stale value would ' +
+      'render as an unbounded number with an age suffix -- exactly what the ' +
+      'README promises cannot happen.',
+  );
+});

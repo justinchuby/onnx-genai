@@ -395,6 +395,7 @@ const FOREIGN_FLAGS = new Map([
   ['--fail', 'curl'],
   ['--silent', 'curl'],
   ['--max-time', 'curl'],
+  ['--show-toplevel', 'git rev-parse'],
 ]);
 
 const flagBearingDocuments = {

@@ -2,14 +2,25 @@
 
 # Serving dashboard
 
-A live, browser-based demonstration of three things the onnx-genai runtime
-actually does: **continuous batching**, **paged KV block allocation**, and
-**prefix caching**.
+A live, browser-based demonstration of two things the onnx-genai runtime
+actually does — **continuous batching** and **paged KV block allocation** — and
+one thing it turns out **not** to do, measured and published rather than
+quietly dropped.
 
 Every number on the page is measured on your machine, while you watch. Nothing
 is simulated, pre-recorded, or hardcoded — including the comparison baselines.
 Where the runtime cannot measure something, the page says so in that field's
 place rather than showing you a zero.
+
+That third result is not an apology. We expected prefix caching to be the
+headline, measured it against a control arm that shared nothing from token 0,
+and **could not detect any reuse**. What we can say precisely is what the
+counter proves: it scores a hit for prompts that share nothing, so it cannot
+tell reuse from no-reuse. What we deliberately do **not** yet say is that reuse
+is absent — repeated timing runs disagree with each other by more than the
+effect they were looking for, so the honest word today is **unverified**. Both
+arms and the detection floor ship on screen, because a result you can check is
+worth more than one you must take on faith.
 
 **One constraint, stated here rather than discovered later:** batching and paged
 KV run on **different execution paths** in this runtime today, so they cannot be
@@ -47,7 +58,7 @@ needs two, and they are not interchangeable — see
 | Directory | Kind | Drives |
 |---|---|---|
 | `models/qwen2.5-0.5b-scatter-v2` | static cache | continuous batching |
-| `models/qwen2.5-0.5b` | dynamic cache | paged KV, prefix caching |
+| `models/qwen2.5-0.5b` | dynamic cache | paged KV block allocation |
 
 If you already have them somewhere else, point the script at that checkout
 instead of copying anything:
@@ -137,12 +148,34 @@ the command that actually works.
 Under the hood it runs, per server:
 
 ```bash
+# Every path below is relative to the repo root, so start there.
+cd "$(git rev-parse --show-toplevel)"
+
 ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
   --model models/qwen2.5-0.5b-scatter-v2 \
   --model-id qwen-scatter \
   --addr 127.0.0.1:8123 \
   --demo-assets-dir examples/serving-dashboard \
   --enable-debug-endpoints
+```
+
+Run it from anywhere else and you get the demo's most confusing failure mode:
+**the API works perfectly and only `/demo` is broken.** `--model` and
+`--demo-assets-dir` are both resolved against the working directory, and
+`resolve_demo_assets_dir` (`demo_assets.rs:54-59`) treats a directory that isn't
+there as *no assets configured* rather than as an error — so the server boots
+happily, `/v1/status` answers, and `/demo` serves an explanatory 404. Nothing in
+the log says the word "directory". `run-demo.sh` sidesteps this entirely by
+passing an **absolute** path derived from its own location, which is why it
+works from any directory.
+
+This also means **`/demo` working on one server is not evidence it works on the
+other.** The two are separate processes and can be started from different
+working directories, so verify both:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8123/demo/
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8124/demo/
 ```
 
 | Flag | Why |
@@ -231,8 +264,9 @@ the design prevents the continuous-batch path from using the paged KV manager;
 it simply does not today. Stated as a design tradeoff rather than a defect:
 
 > Continuous batching buys throughput by taking KV out of the pageable pool and
-> putting it in fixed in-place rows. Paged KV buys sharing, prefix reuse and
-> eviction by keeping KV in a managed page table. This runtime implements both,
+> putting it in fixed in-place rows. Paged KV buys sharing and tiering by keeping
+> KV in a managed page table — it also *computes* an eviction order, but nothing
+> consumes it yet, so no eviction occurs. This runtime implements both paths,
 > and today they are alternatives rather than a composition.
 
 That sentence sounds abstract until you watch it collect victims. It is one
@@ -263,8 +297,8 @@ what you actually control.
 |---|---|---|
 | Continuous batching | live, `max_batch=4` | per-request path |
 | KV panel | decode **row** occupancy | paged **block** table |
-| Prefix caching | `—` unavailable | genuine measurement |
-| Scenarios present | batching | paged KV, prefix caching |
+| Prefix caching | `—` not applicable | `—` not applicable |
+| Scenarios present | batching | paged KV allocation, block table |
 
 A banner names both halves in one sentence — what is live *and* what is bypassed
 — because naming only the live half is what leads a visitor to conclude
@@ -350,6 +384,35 @@ that never appears is indistinguishable from a bug.**
 baseline is never simulated. Whatever the delta turns out to be on your machine
 is what the page reports — including an unflattering one.
 
+#### The demo never says "batch size", and the reason is worth reading
+
+The most convincing wrong number available to this project is
+`onnx_genai_batch_size_current`. It is `fetch_add(1)` when a generation starts
+and decremented on drop (`metrics.rs:112`, `:145`), so it counts **generation
+requests in flight at the HTTP layer** — it has no connection to
+`ContinuousBatchManager` and cannot see the engine's real batch. With
+`--max-batch 4`, eight concurrent requests make it read **8** while the engine
+is decoding **4**.
+
+Every other trap in this project was a static zero, which looks suspicious. This
+one is real, live, and moves beautifully under load — and it is named after the
+exact thing the demo exists to prove. **A gauge reading 8 labelled *batch size*
+would teach the precise opposite of the truth**, which is that eight
+simultaneous requests are not eight simultaneous decodes.
+
+So the page reports `batch.in_flight` (measured) and `batch.queued` (derived),
+and the engine's true batch size as **unavailable**, because nothing exposes it.
+
+⚠️ **Do not derive queueing from `/v1/status`'s `batch_utilization`.** It is a
+genuine measurement — `current_batch_size / effective_batch_capacity()`, where
+the capacity is `max_batch.min(max_queue_depth)` (`state.rs:201-206`), which is
+correctly *tighter* than `max_batch` alone. But it is **clamped to `1.0`**
+(`admin.rs:85`). The clamp is well-reasoned for a multi-model node, where
+in-flight work legitimately exceeds any single batch. It also means the value
+saturates at exactly the moment queueing begins, and the overflow — the entire
+queueing signal — is discarded before it reaches the wire. `max(0, in_flight -
+max_batch)` cannot be recovered from it. Read `current_batch_size` directly.
+
 **What the numbers looked like on one machine.** Measured on this repository
 before the dashboard existed, CPU execution provider, `qwen2.5-0.5b-scatter-v2`,
 512-token generations, median of 15 iterations:
@@ -398,45 +461,85 @@ directly against a running dynamic server, against a pool of ~14,600 pages. That
 is the payoff this scenario shows.
 
 > **This scenario used to be "prefix caching", and it was re-scoped after the
-> feature failed verification.** The material below is kept because how it
+> feature failed to survive verification.** The material below is kept because how it
 > failed is considerably more instructive than the feature would have been, and
 > because a re-scope that leaves no trace is indistinguishable from a feature
 > that never existed.
 
 #### Why this is no longer a prefix-caching scenario
 
-🔴 **Prefix reuse does not measurably happen.**
+⚠️ **Prefix reuse is unverified — and the counter that claims it is provably
+not evidence.**
 
-An early check fired one identical long prefix twice, saw
-`prefix_cache_hits_total` move 0 → 1 and latency fall 1.53 s → 1.22 s, and
-concluded the cache worked. A later controlled run **contradicted it**:
+Those are two separate findings with very different strengths, and collapsing
+them is how this section was wrong twice.
 
-| Arm | What was sent | Warm TTFT (median, n=6) |
-| --- | --- | --- |
-| A | One identical ~900-token prefix, repeated | 1341 ms |
-| B *(control)* | Six prefixes **differing from token 0** — no real sharing possible | 1254 ms |
+**The counter finding is airtight, because it involves no timing at all.** On a
+warm server, two prompts sharing nothing with anything sent before still scored
+a hit each:
 
-**Shared-prefix requests were 7 % *slower* than requests that shared nothing.**
+| | hits / lookups |
+| --- | --- |
+| before | 15 / 16 |
+| after a unique prompt | 16 / 17 |
+| after a second unique prompt | 17 / 18 |
 
-The reason the second result wins is not that it is newer — it is that it has a
-**control arm**. A single repeated request getting faster is fully explained by
-ordinary warm-up: allocators, page cache, thread pools. Without an arm that
-repeats *without* sharing, a warm-up effect and a cache hit are the same
-observation. The first run had no such arm, and n=2 cannot separate them.
+Twelve requests — six repeated, six deliberately unique — produced **+12 hits,
+a 0.9375 "hit rate"**. Every completed generation scores a hit, including
+prompts differing from token 0. **So `hits 0 → 1` is exactly what an unrelated
+prompt produces, and the counter cannot distinguish reuse from no-reuse.** That
+is a counting fact: no sample size, no load, no noise.
 
-It also carried a **sensitivity control**, which is what turns this from *not
-observed* into **proven absent**: a ~10-token prompt takes 140 ms to first
-token, a ~900-token prompt takes 1380 ms, so prefill is ~90 % of TTFT. A cache
-genuinely reusing that prefill would collapse TTFT toward ~140 ms — a ~90 %
-drop, impossible to miss. The measured effect was **+7 %**.
+**The timing finding is not airtight, and we are not going to pretend it is.**
+An early check fired one identical long prefix twice, saw the counter move and
+latency fall 1.53 s → 1.22 s, and concluded the cache worked — with no control
+arm, so warm-up and a cache hit were the same observation. A later controlled
+run put the shared-prefix arm **7 % slower** than a control sharing nothing. A
+third run, warm and interleaved, put it **17 % faster**.
+
+**Those two results contradict each other, so the instrument is not resolving
+the effect.** The measurements were taken on a machine at load average 22 on ten
+cores, where a *byte-identical* binary has been observed to swing 9.8 %. A
+control arm rules out warm-up; it does not rule out noise larger than the signal.
+
+> **Spread greater than effect size means inconclusive — not a pass, and not a
+> failure either.** It was tempting to keep the earlier "proven absent" wording,
+> because understating a capability feels like the safe direction. It is not:
+> **an honesty process that only ever ratchets toward understating is not
+> calibrated, it is just a differently-biased claim**, and "proven absent" is a
+> strong claim that this evidence does not support.
+
+What *would* settle it is stated here so it can be run and the section closed:
+prefill is ~90 % of TTFT (~10-token prompt → 140 ms; ~900-token prompt →
+1380 ms), so a genuine full-prefix hit should collapse TTFT toward ~140 ms.
+That is far too large to hide in noise **on a quiet machine**. The open
+measurement is an interleaved TTFT comparison, n ≥ 15 per arm, medians with
+confidence intervals, taken while the machine is idle. Overlapping intervals
+would settle it as absent.
 
 **And both hit-rate counters are unusable, in opposite directions.** On the
 scatter profile the counter records nothing — `prefix_cache_hit_len` is a
-hardcoded literal `0` (`batched.rs:262`, `:486`). On the dynamic profile it
-records *everything*: it counts any nonzero match, so the few shared tokens of
-the chat template make it read ~95 % from the very first request, including for
-prefixes that differ from token 0. One counter is pinned low, the other pinned
-high, and **neither is measuring prefix reuse.**
+hardcoded literal `0` (`batched.rs:262`, `:486`), passed as the *first*
+positional argument of a call named `with_rng` and read back 300 lines later, so
+the branch that increments hits (`metrics.rs:136`) is **statically dead**. Not
+"did not fire" — *cannot*. On the dynamic profile it records *everything*: it
+counts any nonzero match, so the few shared tokens of the chat template make it
+read ~95 % from the very first request, including for prefixes that differ from
+token 0. One counter is pinned low, the other pinned high, and **neither is
+measuring prefix reuse.**
+
+The denominator is independently broken, and that is the part worth
+generalising. `prefix_cache_lookups` (`metrics.rs:130-132`) increments
+**unconditionally on every completed generation**, outside any predicate — it
+counts generations, not lookups. **It would read 135 with the prefix cache
+deleted from the codebase.**
+
+> **A ratio has two halves and they usually have different provenance. Audit
+> them separately.** Ours was a real count over a compile-time constant. The
+> obvious guard — *"suppress the rate when `lookups == 0`"* — never fires,
+> because the denominator is the half that works: 135 is a true count of true
+> generations. **A safeguard derived from an incident tends to be shaped like
+> the incident rather than like the fault.**
 
 > **So the demo displays no prefix cache hit rate, in any form, on either
 > profile.** A precisely-computed 95 % would have been the most convincing
@@ -444,9 +547,11 @@ high, and **neither is measuring prefix reuse.**
 > to catch, caught — and caught *before* the panel was built rather than at
 > sign-off.
 
-What remains real and reportable here is the **cold-versus-warm TTFT pair
-itself**. It is a genuine measurement; it simply shows no improvement. Reporting
-that is the whole point.
+What remains real and reportable here is the **counter's behaviour**, which is
+what the panel shows: a hit scored for prompts that share nothing. That is a
+finding about the instrument, and it stands regardless of how the timing
+question resolves. The timing result itself is reported as **unverified**, with
+the measurement that would close it named above.
 
 > **This scenario cannot be driven by concurrency.** The dynamic server
 > serialises generations — one engine, one driver thread — so concurrent
@@ -629,9 +734,28 @@ differs in each:
 | You see | Meaning | What it tells you |
 |---|---|---|
 | **`—`** *unavailable* | We cannot measure this here. Stubbed, not plumbed, or structurally fabricated on this profile. | The runtime may well do this; the telemetry does not report it. Hover for the specific reason. |
-| **greyed number + age** *stale* | We measured it, but the most recent poll did not refresh it. | The number is real but old. The age is shown so you can judge it. |
+| **greyed number + age** *stale* | We measured it, but the most recent poll did not refresh it. | The number is real but old. The age is shown **in words**, so you can judge it — and it stops being a number entirely once it is too old (below). |
 | **`···`** *pending* | Measurable; no sample has arrived yet. | Wait a moment. This one resolves on its own. |
 | **`—` + a visible caption** *not applicable* | Meaningless on this execution path — the question was never asked. | Not a gap in our work. This is the architecture, and the caption says which part. |
+
+#### Stale values stop being numbers
+
+A greyed number with an age beside it is honest for a few seconds and dishonest
+after a few minutes, because **`20.7 tok/s · 4m old` is read by every human as
+`20.7 tok/s`.** An age suffix does not stop a number being a number.
+
+So each panel carries a **staleness ceiling** (`dashboard/field-state.js:87`,
+per-panel overrides at `panel-kit.js:271`). Past it the **value is removed and
+the age remains** — because *why* it disappeared is the useful half. A field
+whose age cannot be determined at all counts as past the ceiling immediately: if
+we cannot say how old it is, we cannot claim it is fresh.
+
+The block grid is deliberately **exempt from a wall-clock ceiling**. It is
+event-sampled on request completion rather than polled, so it legitimately does
+not change during a generation, and an elapsed-time rule would mark a
+**correct** panel stale. Its staleness test is *no sample since the last
+completed request*. A false stale badge on the most technical panel on the page
+costs more credibility than a missing one.
 
 `pending` and `unavailable` are deliberately different states: telling you to
 wait for a number that is never coming would be its own small dishonesty. And
@@ -750,8 +874,15 @@ examples/serving-dashboard/
 ├── CONTRACT.md              The store/panel interface. Read before writing a panel.
 ├── ui/                      Model card, failure states, launch command.
 ├── dashboard/               Telemetry panels. One mount() per file.
-├── css/                     Design tokens and the page shell.
+├── styles/                  `tokens.css` (design tokens), `shell.css` (page
+                             shell), `panels.css` (panel treatments). One CSS
+                             tree, deliberately — two invite a second
+                             `tokens.css`, and a forked design system announces
+                             itself with no error.
+├── QA-PLAN.md               Normative for naming traps and known-absent fields.
 └── design/                  Design reference. Does not ship.
+                             `demo-ux.md` is normative: it governs what each
+                             panel is ALLOWED to render.
 ```
 
 Two seams keep this navigable:
