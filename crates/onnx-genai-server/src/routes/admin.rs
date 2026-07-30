@@ -682,10 +682,7 @@ pub(crate) async fn debug_kv_blocks(
         onnx_genai_engine::Applicability::Applicable => {}
     }
 
-    let count = query
-        .count
-        .unwrap_or(BlockTableResponse::DEFAULT_WINDOW)
-        .min(BlockTableResponse::MAX_WINDOW);
+    let count = BlockTableResponse::window_size(query.count);
     // `None` means no per-page mirror exists at all, which is NOT an empty
     // window. Rendering it as `live` with zero pages would draw a legitimately
     // empty grid for a pool we cannot see, and an empty grid is what a fully

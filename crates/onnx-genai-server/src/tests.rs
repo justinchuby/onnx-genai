@@ -4300,6 +4300,97 @@ fn no_configuration_can_re_enable_full_path_disclosure() {
     }
 }
 
+/// No type a route can serialise may carry a filesystem path, whatever it is
+/// named.
+///
+/// [`model_listing_carries_no_filesystem_path`] pins the VALUE on one endpoint
+/// and [`no_configuration_can_re_enable_full_path_disclosure`] bans two
+/// deleted SYMBOLS. Both are evaded by the same move: add a path to a
+/// different response, or to the same one under a different field name. The
+/// defect actually shipped here -- `ModelObject.path` -- would have survived
+/// any guard that named `path`, because the name was never the problem.
+///
+/// So this guard is structural: it walks every `Serialize`-deriving type in
+/// every route module and refuses a path-typed field in any of them. Renaming
+/// cannot evade it, and it cannot decay into a tombstone, because it quotes no
+/// defect string -- it describes a shape.
+#[test]
+fn no_route_response_type_can_carry_a_filesystem_path() {
+    // Every route module, not the ones that happen to have serialisable types
+    // today: a response added to `sessions.rs` tomorrow must be covered
+    // without anyone remembering to widen this list.
+    let route_sources = [
+        ("routes/mod.rs", include_str!("routes/mod.rs")),
+        ("routes/admin.rs", include_str!("routes/admin.rs")),
+        (
+            "routes/completions.rs",
+            include_str!("routes/completions.rs"),
+        ),
+        ("routes/multimodal.rs", include_str!("routes/multimodal.rs")),
+        ("routes/sessions.rs", include_str!("routes/sessions.rs")),
+    ];
+
+    let mut serialisable_types = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+
+    for (file, source) in route_sources {
+        for chunk in source.split("#[derive(").skip(1) {
+            let Some((derives, rest)) = chunk.split_once(')') else {
+                continue;
+            };
+            if !derives.contains("Serialize") {
+                continue;
+            }
+            serialisable_types += 1;
+
+            // The item body ends at the first brace in column zero.
+            let body = rest.split("\n}").next().unwrap_or(rest);
+            let type_name = body
+                .split_whitespace()
+                .skip_while(|word| !matches!(*word, "struct" | "enum"))
+                .nth(1)
+                .unwrap_or("<unnamed>")
+                .trim_end_matches(['{', '('])
+                .to_string();
+
+            // Doc comments legitimately discuss paths; only real field types
+            // count. Stripping them keeps the guard from failing on prose.
+            let fields: String = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for path_type in ["PathBuf", "&Path", ": Path", "&std::path::Path"] {
+                if fields.contains(path_type) {
+                    offenders.push(format!("{file}::{type_name} holds {path_type}"));
+                }
+            }
+        }
+    }
+
+    // POSITIVE CONTROL, FIRST. A scanner that matches nothing cannot fail, and
+    // would report a clean bill of health for a crate full of paths. This floor
+    // is what makes the assertion below evidence rather than silence: it fails
+    // if the derive syntax changes, if a module is renamed, or if the split
+    // heuristic stops finding item bodies.
+    assert!(
+        serialisable_types >= 20,
+        "the scan found only {serialisable_types} serialisable types across the \
+         route modules, so it is not reading them; a guard that inspects \
+         nothing passes for the wrong reason"
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "a route response type carries a filesystem path: {offenders:?}. The \
+         model directory is chosen by whoever launched the process, not \
+         authored for publication, and its ancestors can name a user, a \
+         customer or an unreleased project. Publish an operator-chosen `id` \
+         instead."
+    );
+}
+
 /// Walks a JSON value and collects every string with the path that reached it.
 fn collect_strings(value: &Value, at: &str, found: &mut Vec<(String, String)>) {
     match value {
@@ -4738,13 +4829,85 @@ fn pending_and_not_applicable_are_distinct_codes() {
 
 /// A caller must always be told which window it received, so it never has to
 /// assume the request was honoured verbatim.
+///
+/// This addresses [`BlockTableResponse::window_size`] -- the production clamp
+/// -- rather than recomputing `min(100_000, MAX_WINDOW)` in the test, which is
+/// what this test used to do. That version asserted a relationship between two
+/// compile-time constants: it issued no request, called no handler, and stayed
+/// green if the clamp were deleted outright. `clippy::assertions_on_constants`
+/// had been reporting it since it was written.
+///
+/// Driving the HTTP endpoint instead is NOT sufficient here and would have
+/// reintroduced vacuity in a new form: `/v1/debug/kv/blocks` answers `pending`
+/// with no `window` key at all until a driver has selected a decode path, so
+/// `assert_ne!(body["window"]["scanned"], 100_000)` passes on `null` -- an
+/// assertion satisfied by the ABSENCE of its subject.
 #[test]
 fn a_block_window_request_is_clamped_to_a_legible_size() {
-    let capped = usize::min(100_000, crate::routes::BlockTableResponse::MAX_WINDOW);
-    assert_eq!(capped, crate::routes::BlockTableResponse::MAX_WINDOW);
+    use crate::routes::BlockTableResponse as B;
+
+    // POSITIVE CONTROL, FIRST: a modest request is honoured VERBATIM.
+    // Without this arm, a `window_size` that ignored its argument and returned
+    // a constant -- MAX_WINDOW, DEFAULT_WINDOW, or anything else -- would
+    // satisfy every clamp assertion below while silently overriding callers.
+    assert_eq!(
+        B::window_size(Some(8)),
+        8,
+        "a window the server can honour must be passed through untouched, or \
+         the clamp is not a clamp but a fixed window wearing one's name"
+    );
+
+    // No preference is not the same as a preference for zero.
+    assert_eq!(
+        B::window_size(None),
+        B::DEFAULT_WINDOW,
+        "an absent `count` means the caller expressed no preference"
+    );
+
+    // THE CLAMP ITSELF, stated as an outcome rather than as arithmetic.
+    assert_eq!(
+        B::window_size(Some(100_000)),
+        B::MAX_WINDOW,
+        "an unbounded ask must come back as the bound, not as itself"
+    );
+    assert_ne!(
+        B::window_size(Some(100_000)),
+        100_000,
+        "returning the request verbatim would let one poll scan the pool"
+    );
+
+    // The boundary is inclusive: exactly MAX_WINDOW is a legal ask, not an
+    // off-by-one that silently loses a page.
+    assert_eq!(B::window_size(Some(B::MAX_WINDOW)), B::MAX_WINDOW);
+
+    // The two arms must stay distinguishable. If DEFAULT and MAX ever collapse
+    // to one value, every assertion above passes for a `window_size` that
+    // ignores its argument entirely -- so this guards the guards.
+    assert_ne!(
+        B::DEFAULT_WINDOW,
+        B::MAX_WINDOW,
+        "the default and the ceiling must differ or this test cannot tell a \
+         working clamp from a constant"
+    );
+}
+
+/// The clamp must remain the handler's ONLY way to size a window.
+///
+/// [`a_block_window_request_is_clamped_to_a_legible_size`] proves the policy is
+/// correct; it cannot prove the handler still calls it. Re-inlining
+/// `unwrap_or(..).min(..)` at the call site would leave that test green while
+/// the shipped path drifted away from the tested one.
+#[test]
+fn the_block_window_handler_sizes_its_window_through_the_clamp() {
+    let source = include_str!("routes/admin.rs");
     assert!(
-        crate::routes::BlockTableResponse::DEFAULT_WINDOW
-            <= crate::routes::BlockTableResponse::MAX_WINDOW
+        source.contains("BlockTableResponse::window_size(query.count)"),
+        "the block handler must size its window through the published clamp"
+    );
+    assert!(
+        !source.contains(".unwrap_or(BlockTableResponse::DEFAULT_WINDOW)"),
+        "the window policy was re-inlined at the call site; the clamp test now \
+         describes code the handler no longer runs"
     );
 }
 

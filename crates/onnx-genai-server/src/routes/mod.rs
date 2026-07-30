@@ -913,6 +913,26 @@ impl BlockTableResponse {
     pub(crate) const DEFAULT_WINDOW: usize = 256;
     pub(crate) const MAX_WINDOW: usize = 1024;
 
+    /// How many page ids a request actually gets to examine.
+    ///
+    /// `None` means the caller expressed no preference and receives
+    /// [`Self::DEFAULT_WINDOW`]; anything above [`Self::MAX_WINDOW`] is clamped
+    /// so one poll cannot ask the mirror for an unbounded scan. The result is
+    /// echoed back as `window.scanned`, which is why a caller never has to
+    /// assume its request was honoured verbatim.
+    ///
+    /// Named rather than inlined at the call site so the policy has a SUBJECT a
+    /// test can address. An inline `unwrap_or(..).min(..)` can only be checked
+    /// by recomputing it in the test -- and a test that recomputes its subject
+    /// keeps passing after the subject is deleted, which is precisely what the
+    /// previous version of `a_block_window_request_is_clamped_to_a_legible_size`
+    /// did.
+    pub(crate) fn window_size(requested: Option<usize>) -> usize {
+        requested
+            .unwrap_or(Self::DEFAULT_WINDOW)
+            .min(Self::MAX_WINDOW)
+    }
+
     pub(crate) fn not_applicable(model_id: Option<String>, detail: &'static str) -> Self {
         Self {
             model_id,

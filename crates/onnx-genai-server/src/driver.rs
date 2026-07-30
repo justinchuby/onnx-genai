@@ -141,11 +141,14 @@ impl EngineDriver {
         // means the width published below is the width that will actually run,
         // so there is one publisher and one decision rather than a fast wrong
         // answer racing a slow right one.
-        // The probe's `Err` is KEPT, not discarded. `.is_ok()` here used to
-        // throw away the only description of why the headline capability was
-        // switched off, leaving the question unanswerable from logs, from
-        // `/v1/status`, or from a debugger attached afterwards -- the engine
-        // never records it, so nothing downstream can reconstruct it.
+        // The probe's `Err` is KEPT, not discarded. Collapsing this match into a
+        // boolean throws away the only description of why the headline
+        // capability was switched off, leaving the question unanswerable from
+        // logs, from `/v1/status`, or from a debugger attached afterwards -- the
+        // engine never records it, so nothing downstream can reconstruct it.
+        // That collapse is banned at COMPILE time by the `const` assertion at
+        // the foot of this file. This comment explains the decision; the guard
+        // is what enforces it.
         let batch_driver = Arc::new(match engine.continuous_batch_manager(max_batch) {
             Ok(_) => BatchDriver::Continuous {
                 capacity: max_batch,
@@ -1213,3 +1216,71 @@ fn run_fim_generation(
         }
     }
 }
+
+/// A COMPILE-TIME ban on collapsing the engine's batching refusal into a bool.
+///
+/// `1e1b2a82` replaced `continuous_batch_manager(max_batch)` + a boolean test
+/// with the `match` above, which keeps the `Err` and publishes it as
+/// `batch_driver_detail`. The boolean form still compiles, is one keystroke
+/// away, and destroys the ONLY description of why the demo's headline
+/// capability is off -- a value the engine does not record, so it cannot be
+/// recovered from logs, from `/v1/status`, or from a debugger attached later.
+/// The information is gone in-process before anyone can look for it.
+///
+/// This fails the BUILD, not a test. A test guard is only as good as someone
+/// running it, and this defect's whole signature is that it looks fine.
+///
+/// The needle is assembled byte-by-byte instead of written as a string
+/// literal, deliberately: a guard that spells its own defect makes
+/// `git grep <defect>` report "still broken" when it means "fixed and fenced".
+/// Several false orders tonight were composed from exactly that confusion, so
+/// this guard refuses to become another tombstone.
+const _: () = {
+    const NEEDLE: &[u8] = &[b'.', b'i', b's', b'_', b'o', b'k', b'(', b')'];
+    const HAYSTACK: &[u8] = include_str!("driver.rs").as_bytes();
+
+    const fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.len() > haystack.len() {
+            return false;
+        }
+        let mut start = 0;
+        while start <= haystack.len() - needle.len() {
+            let mut offset = 0;
+            let mut matched = true;
+            while offset < needle.len() {
+                if haystack[start + offset] != needle[offset] {
+                    matched = false;
+                    break;
+                }
+                offset += 1;
+            }
+            if matched {
+                return true;
+            }
+            start += 1;
+        }
+        false
+    }
+
+    // POSITIVE CONTROL: the scan must be able to find something. A const fn
+    // that always returned `false` would satisfy the ban below while inspecting
+    // nothing, which is the vacuity this file has already shipped once.
+    assert!(
+        contains(
+            HAYSTACK,
+            &[
+                b'B', b'a', b't', b'c', b'h', b'D', b'r', b'i', b'v', b'e', b'r'
+            ]
+        ),
+        "the compile-time scan cannot see its own source; the ban below proves \
+         nothing until this control passes"
+    );
+
+    assert!(
+        !contains(HAYSTACK, NEEDLE),
+        "driver.rs collapsed the engine's batching refusal into a boolean. Keep \
+         the `Err` and publish it as `batch_driver_detail`: it is the only \
+         record of why continuous batching is off, and nothing downstream can \
+         reconstruct it."
+    );
+};
