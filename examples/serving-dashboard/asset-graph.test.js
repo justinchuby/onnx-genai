@@ -559,7 +559,7 @@ describe('a specified-not-built caveat expires with its defect', () => {
 // Every other check in this file matches LITERAL class names in CSS. The
 // provenance badge defeats that by construction:
 //
-//     className: ['value__src', `value__src--${sourceClass}`]   panel-kit.js:194
+//     className: ['value__src', `value__src--${sourceClass}`]   sourceBadge()
 //
 // The name is BUILT AT RUNTIME, so a literal scan sees zero emitters and
 // concludes the entire vocabulary is dead CSS. That is not a hypothetical:
@@ -611,6 +611,164 @@ describe('the provenance vocabulary reconciles as a closed set', () => {
         'rendering glitch rather than a claim. An UNEMITTABLE rule is dead CSS ' +
         'that reads as coverage -- it makes the vocabulary look complete to the ' +
         'next person who greps it, which is exactly how D298 stayed invisible.',
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D302-D304  ONE CONCEPT, THREE DECLARATIONS, TWO ANSWERS.
+//
+// The block above reconciles `SOURCE_BADGES` against `panels.css` and proves
+// they agree. It passes. It has always passed. AND IT WAS BLIND TO THE FACT
+// THAT `SOURCE_BADGES` IS NOT THE ONLY PROVENANCE VOCABULARY IN THE TREE.
+//
+// There are THREE declarations of the same concept:
+//
+//   SOURCE_BADGES        dashboard/panel-kit.js   5 keys, incl. `simulated`
+//   SOURCE_CLASS_BADGES  format.js                4 keys, no `simulated`
+//   SOURCE_CLASSES       telemetry-field.js       4 values -- THE CANONICAL ENUM
+//
+// ⛔ THIS GUARD IS THE SEVENTH INSTRUMENT TONIGHT CARRYING THE DEFECT IT HUNTS,
+// AND IT IS MINE FOR THE SECOND TIME. I built a closed-set reconciliation to
+// kill the "does this name reach the screen?" question, published its honest
+// limit (styled -> constructible -> reachable), and never asked whether the
+// SET I closed over was the only one. A reconciliation between two declarations
+// proves those two agree. IT SAYS NOTHING ABOUT A THIRD, and its green is read
+// as a statement about the vocabulary rather than about the pair it compared.
+// That is @e00032a4's `0 positional` exactly: a guard's green is a claim about
+// the subset it can see, and mine never said which subset that was.
+//
+// ☠️ AND THE DIVERGENCE IS NOT COSMETIC -- THE FALLBACKS DISAGREE ON WHETHER
+// AN UNKNOWN PROVENANCE IS A CLAIM OR AN ABSENCE:
+//
+//   panel-kit.js  sourceBadge()           SOURCE_BADGES[sourceClass] ?? SOURCE_BADGES.derived
+//   panel-kit.js  normaliseSourceClass()  trailing `return 'derived';`
+//   format.js     badge lookup            SOURCE_CLASS_BADGES[field.sourceClass] ?? null   ✅
+//
+// Two sites answer "we don't know" with a confident DERIVED badge -- a claim
+// that we computed the number ourselves. One answers with `null`, an honest
+// absence. THE HONEST ANSWER ALREADY EXISTS IN THIS REPOSITORY. D302 is
+// therefore not a design demand; it is a request that the fix TRAVEL to the
+// two sites that never heard it.
+//
+// ✅ THE `simulated` ASYMMETRY IS REAL AND IS DECLARED HERE RATHER THAN
+// SILENTLY TOLERATED. It is styled, and it is constructible only via the
+// `source in SOURCE_BADGES` branch -- it is absent from the canonical enum, so
+// no writer of `sourceClass` can ever produce it. Recording it as a dated
+// exemption means the guard passes today, goes RED if a SECOND asymmetry
+// appears, AND goes RED when this one is resolved -- so the note cannot outlive
+// the condition it describes.
+const PROVENANCE_ASYMMETRIES = Object.freeze({
+  simulated: Object.freeze({
+    recordedAt: '2026-07-30',
+    absentFrom: Object.freeze(['SOURCE_CLASS_BADGES', 'SOURCE_CLASSES']),
+    reason:
+      'Declared in SOURCE_BADGES and styled in panels.css, but absent from the ' +
+      'canonical SOURCE_CLASSES enum, so no writer of field.sourceClass can ' +
+      'produce it. Constructible only if a field.source is literally the ' +
+      'string "simulated". Tracked by D303 -- resolve by adding it to the enum ' +
+      'or removing it from the badge map, then delete this entry.',
+  }),
+});
+
+describe('one provenance concept has one vocabulary', () => {
+  const panelKit = read('./dashboard/panel-kit.js');
+  const format = read('./format.js');
+  const telemetryField = read('./telemetry-field.js');
+
+  // Keys of a frozen badge map. Handles both the literal form (`derived:`) and
+  // the computed form (`[SOURCE_CLASSES.DERIVED]:`) so the two maps are read by
+  // ONE instrument -- a per-map matcher would let a spelling difference read as
+  // a vocabulary difference.
+  const badgeKeys = (src, name) => {
+    const block = src.match(
+      new RegExp(`${name} = Object\\.freeze\\(\\{([\\s\\S]*?)\\n\\}\\)`),
+    );
+    if (!block) return [];
+    return [
+      ...block[1].matchAll(/^\s{2}(?:\[SOURCE_CLASSES\.([A-Z_]+)\]|([a-z][a-z-]*)):/gm),
+    ].map((m) => (m[1] ? m[1].toLowerCase() : m[2]));
+  };
+
+  // The canonical enum declares VALUES, not keys: `SERVER: 'server'`.
+  const enumValues = (src, name) => {
+    const block = src.match(
+      new RegExp(`${name} = Object\\.freeze\\(\\{([\\s\\S]*?)\\n\\}\\)`),
+    );
+    if (!block) return [];
+    return [...block[1].matchAll(/^\s{2}[A-Z_]+:\s*'([a-z-]+)'/gm)].map((m) => m[1]);
+  };
+
+  const sets = {
+    SOURCE_BADGES: badgeKeys(panelKit, 'SOURCE_BADGES'),
+    SOURCE_CLASS_BADGES: badgeKeys(format, 'SOURCE_CLASS_BADGES'),
+    SOURCE_CLASSES: enumValues(telemetryField, 'SOURCE_CLASSES'),
+  };
+
+  it('actually finds all three declarations (anti-vacuity)', () => {
+    const found = Object.entries(sets).map(([k, v]) => `${k}=${v.length}`);
+    assert.ok(
+      Object.values(sets).every((v) => v.length >= 4),
+      `Expected three provenance declarations of >=4 entries; found ${found.join(', ')}.\n` +
+        'A set that reads EMPTY makes every comparison below vacuously true -- ' +
+        'it would agree that nothing differs from nothing, and report GREEN for ' +
+        'a vocabulary it never located. This is the arm that distinguishes ' +
+        '"the vocabularies agree" from "my matcher broke". FIX THE MATCHER, ' +
+        'DO NOT RELAX THE THRESHOLD.',
+    );
+  });
+
+  it('declares every divergence between the three, and no more', () => {
+    const union = [...new Set(Object.values(sets).flat())].sort();
+    const undeclared = [];
+    for (const name of union) {
+      const absentFrom = Object.keys(sets).filter((s) => !sets[s].includes(name));
+      if (absentFrom.length === 0) continue;
+      const known = PROVENANCE_ASYMMETRIES[name];
+      if (!known) {
+        undeclared.push(`${name} (absent from ${absentFrom.join(', ')})`);
+        continue;
+      }
+      const expected = [...known.absentFrom].sort().join(', ');
+      const actual = [...absentFrom].sort().join(', ');
+      if (expected !== actual) {
+        undeclared.push(`${name} (declared absent from ${expected}; ACTUALLY ${actual})`);
+      }
+    }
+    assert.deepEqual(
+      undeclared,
+      [],
+      'The provenance vocabularies have diverged in a way nobody wrote down.\n' +
+        `${undeclared.join('\n')}\n\n` +
+        'One concept is declared three times -- SOURCE_BADGES (panel-kit.js), ' +
+        'SOURCE_CLASS_BADGES (format.js) and the canonical SOURCE_CLASSES enum ' +
+        '(telemetry-field.js). A name present in one and missing from another ' +
+        'is either a badge that can never be produced or a class that can never ' +
+        'be painted, and BOTH render as a confident DERIVED via the `??` ' +
+        'fallbacks in sourceBadge() and normaliseSourceClass(). Add it everywhere, remove it ' +
+        'everywhere, or record it in PROVENANCE_ASYMMETRIES with a reason.',
+    );
+  });
+
+  it('retires an asymmetry note once the asymmetry is gone', () => {
+    const union = [...new Set(Object.values(sets).flat())];
+    const stale = Object.keys(PROVENANCE_ASYMMETRIES).filter((name) => {
+      const absentFrom = Object.keys(sets).filter((s) => !sets[s].includes(name));
+      return absentFrom.length === 0 && union.includes(name);
+    });
+    const orphaned = Object.keys(PROVENANCE_ASYMMETRIES).filter(
+      (name) => !union.includes(name),
+    );
+    assert.deepEqual(
+      { stale, orphaned },
+      { stale: [], orphaned: [] },
+      'A declared asymmetry no longer describes the tree.\n' +
+        `RESOLVED but still noted: ${stale.join(', ') || 'none'}\n` +
+        `NOTED but absent from every vocabulary: ${orphaned.join(', ') || 'none'}\n` +
+        'A caveat that outlives its defect is worse than no caveat: it tells ' +
+        'the next reader that a known problem is still open, and they will ' +
+        'either re-investigate a corpse or treat the whole list as noise. ' +
+        'Delete the entry in the SAME commit that closes the asymmetry.',
     );
   });
 });

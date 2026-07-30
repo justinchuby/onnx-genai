@@ -6036,3 +6036,130 @@ reviewer's: a missing *message* and a *type that cannot carry one* are different
 The fact is not hidden, it is ABSENT FROM THE PROGRAM. A signature that forbids what the
 product requires is deeper than any missing sentence, because no amount of careful calling
 can recover it and no reviewer reading the call site can see it is gone.**
+
+---
+
+## 89. 🔴 ONE PROVENANCE CONCEPT, THREE DECLARATIONS, TWO ANSWERS (D302–D304)
+
+**RATIFIED BY @12e42da8 AS A DESIGN DEFECT IN ITS OWN RIGHT, INDEPENDENT OF C1.**
+Specified here; **implemented by @bb2ee824 or @c8d9a40e**. I do not write `panel-kit.js`.
+
+### The ruling I was given, and the one thing in it I could not confirm
+
+The ratification named `normaliseSourceClass` as the funnel. **I checked that the symbol
+exists before writing it into this document** — a Lead's paraphrased symbol, transcribed
+into the highest-authority design file, is exactly the fabricated coordinate @e00032a4
+found in `docs/ARCHITECTURE.md`. It exists (`dashboard/panel-kit.js`, one definition,
+one caller). **The ratification is accurate and the measurement below sharpens it.**
+
+I also expected to find that the guard branch was dead — that nothing writes
+`field.sourceClass`, so the "authoritative" first check never fires. **That hypothesis was
+WRONG and I am recording it because it was the interesting part of the pass:**
+`sourceClass` is written at **ten sites across three files**. The branch is fuelled. Had I
+specified against my expectation instead of my measurement, I would have prescribed a fix
+for a defect that does not exist and left the real one in place.
+
+### D302 — 🔴 THE FALLBACK IS NOT ONE DECISION. IT IS THREE SITES WITH TWO ANSWERS.
+
+```
+panel-kit.js  sourceBadge()          SOURCE_BADGES[sourceClass] ?? SOURCE_BADGES.derived  ⛔ a CLAIM
+panel-kit.js  normaliseSourceClass() trailing `return 'derived';`                         ⛔ a CLAIM
+format.js     badge lookup           SOURCE_CLASS_BADGES[field.sourceClass] ?? null       ✅ an ABSENCE
+```
+
+**Cited by symbol, not by line, deliberately.** All three coordinates were re-derived and
+were correct when this was written — and `panel-kit.js` grew twice tonight while people
+were measuring it. **@732c7548 landed a line-anchored → symbol-anchored defusal for this
+exact shape an hour ago, and @e00032a4 found nine-of-nine diagram coordinates stale in
+`docs/ARCHITECTURE.md` under a guard that scored it perfect.** A correct line number is a
+landmine with a timer; the symbols above are unique in their files and cannot rot silently.
+
+Two sites answer *"we do not know where this came from"* with a confident **Derived**
+badge — whose shipped description is *"Computed by arithmetic on other measured values."*
+**That is a positive claim about how a number was produced, emitted precisely when we have
+no idea how it was produced.** The third site answers `null`.
+
+**⛔ AND THE FUNNEL HAS THREE MOUTHS, NOT ONE.** `normaliseSourceClass` returns `derived`
+for an **absent** source, and again for an **unrecognised** source, and correctly for a
+**genuinely derived** one — and then `sourceBadge` applies a **second, independent**
+`?? derived` on top. **Fixing either one alone leaves the other.** This is @d7cf9b84's rule
+arriving in JavaScript: *two sites agreeing today is a divergence waiting to happen, not
+defence in depth.*
+
+**✅ THE FIX IS NOT A DESIGN DEMAND — IT IS A REQUEST THAT AN EXISTING FIX TRAVEL.**
+**`format.js`'s badge lookup** already answers this correctly, in this repository, today. The honest
+default is written, reviewed and shipping. **@73e77d95's C2 shape exactly: one call site
+learned the lesson and the others never heard.** Copy `format.js`'s answer to both
+`panel-kit.js` sites; do not invent a third.
+
+**The rendering rule, which is the only part that is mine to set:** an unknown provenance
+renders as the **provenance-unknown badge of §87/D298** — the styled absence that already
+has a token — and **never** as a member of the claim vocabulary. *Absent must not be
+spelled with the same glyph as measured.*
+
+### D303 — ⛔ THE CONCEPT IS DECLARED THREE TIMES AND THE DECLARATIONS DISAGREE
+
+```
+SOURCE_BADGES        dashboard/panel-kit.js    client derived estimated server simulated
+SOURCE_CLASS_BADGES  format.js                 client derived estimated server
+SOURCE_CLASSES       telemetry-field.js        client derived estimated server   ⬅ CANONICAL
+                                                                    ^^^^^^^^^
+                     simulated is in the BADGE MAP and in NEITHER of the other two.
+```
+
+`simulated` is **styled**, and **constructible only** through the `source in SOURCE_BADGES`
+branch — it is absent from the canonical enum, so **no writer of `sourceClass` can ever
+produce it.** Two badge vocabularies also carry **different glyph sets** for one concept.
+
+**This is the duplicate-vocabulary blocker this crew has named all night, sitting inside
+the honesty layer, in the one module whose job is to say where a number came from.**
+
+### D304 — 🔻 MY OWN GUARD WAS BLIND TO THIS, AND IT IS THE SEVENTH INSTRUMENT TONIGHT
+
+§88/D301 shipped a closed-set reconciliation proving `SOURCE_BADGES` and `panels.css`
+agree. **It passes. It has always passed. It never asked whether `SOURCE_BADGES` was the
+only vocabulary.** A reconciliation between two declarations proves *those two* agree and
+**says nothing about a third** — but its green is read as a statement about *the
+vocabulary*, not about *the pair it compared*.
+
+**⚖️ THAT IS @e00032a4's `179 anchored / 0 positional` EXACTLY, AND I FILED IT ADMIRINGLY
+AT THEM AN HOUR BEFORE COMMITTING IT MYSELF: a guard's green is a claim about the subset it
+can see, and mine never said which subset that was.** I published an honest limit on the
+*depth* axis — styled → constructible → reachable — and had no limit at all on the
+**breadth** axis. **I declared the axis I knew about. The blind spot was the axis I did
+not know existed, which is the only kind there is.**
+
+**✅ EXTENDED IN THE SAME COMMIT** (`asset-graph.test.js`, now **21 tests**): all three
+declarations are reconciled pairwise, and **the `simulated` asymmetry is recorded as a
+DATED, SELF-EXPIRING EXEMPTION rather than silently tolerated** — @e00032a4's rule that an
+undeclared scope is worse than a declared hole, and @732c7548's that a guard's message is
+shipped prose.
+
+**Mutation-proved in a detached worktree** (`worktree add` exit code checked and
+`porcelain == 0` **asserted, not read** — @e00032a4's warning), because two of the three
+files are not mine to touch:
+
+| mutation | result | the guard's own words |
+|---|---|---|
+| new key in `SOURCE_CLASS_BADGES` | **RED** 20/1 | `ghost (absent from SOURCE_BADGES, SOURCE_CLASSES)` |
+| `simulated` added to the canonical enum | **RED** 20/1 | `declared absent from SOURCE_CLASSES, SOURCE_CLASS_BADGES; ACTUALLY SOURCE_CLASS_BADGES` |
+| enum renamed (matcher blinded) | **RED** 19/2 | `Expected three declarations of >=4; found … SOURCE_CLASSES=` |
+
+**🔑 THE SECOND ROW IS BETTER THAN THE TEST I SET OUT TO WRITE, AND I DID NOT DESIGN IT:**
+resolving the asymmetry *partially* — adding `simulated` to the enum but not to the second
+badge map — is caught by the **divergence** arm naming exactly which half of the exemption
+went stale, while the **retirement** arm covers total resolution. **A partially-discharged
+caveat is the shape that would actually occur, and it reports as a specific correction
+rather than as a bare red.**
+
+**⛔ THE BLINDING MUTATION FIRES TWO REDS BY DESIGN.** The anti-vacuity arm exists so that
+*my matcher broke* and *the vocabularies drifted* are never the same colour — @c7a654ed's
+*a clean zero has two explanations and they are indistinguishable from the result.*
+
+### The limit of this guard, stated because the last one's limit is why D304 exists
+
+**It reconciles three declarations I went and found. It cannot prove there is no fourth.**
+No static instrument can. **The retirement arm is the mitigation: an exemption that stops
+describing the tree turns red, so the list cannot quietly become fiction** — but a
+vocabulary declared in a file nobody thought to read stays invisible to it, exactly as
+`format.js` was invisible to §88 until tonight.
