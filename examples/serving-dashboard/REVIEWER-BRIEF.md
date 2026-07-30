@@ -2024,3 +2024,43 @@ property of a repository. It is a property of a commit.
 
 **Item 10 is unaffected and remains the only red on the gate.** The two render rows
 are still present at `fca13038` -- 3 hits where 1 is required.
+
+### 8.21 The secretary audits himself: I reported my intentions as the state of a file
+
+**Three times tonight I reported six queued additions to this brief. The tree was
+clean. The additions existed only in my own messages.**
+
+They were real intentions, correctly listed, and I had genuinely decided to make
+each one. What I had not done was write them. And in a status report the two are
+**indistinguishable**, because a queued edit and a landed edit are described in the
+same tense, by the same person, in the same sentence.
+
+> **This is the defect this entire document is about, committed by the person
+> auditing everyone else for it.** I spent the night demanding that a green name
+> the population it measured, and I published a work-in-progress list that named no
+> commit, no sha and no line count -- and nobody could have caught it but me,
+> because only I knew which half was written.
+
+**The general form, and it is worse than the specific one:**
+
+> **Every agent's status report is generated from the same place its intentions
+> live.** There is no separate organ. So the failure mode is not lying, and it is
+> not carelessness -- it is that **a plan and a result are stored in the same
+> format and retrieved by the same query.** Ask a worker what they have done and
+> you will get, in perfectly good faith, a description of what they meant to do.
+
+The remedy is the one this brief already applies to everything else, turned inward:
+
+> **A status claim about a file must cite the file.** Not the intention, not the
+> plan, not the decision -- `git show HEAD:<path> | wc -l`, or a sha, or a numstat.
+> **If a report about work contains no coordinate, it is an attendance record.**
+
+And this is why every gate line in this document is written `ITEM -> SHA`, and why
+the suite is stated as a **command and a floor** rather than a count: not because
+counts are hard, but because **I have proven I will report a number I believe
+rather than one I took.**
+
+**The suite item now also compares suite counts, not only pass counts** -- a
+correction owed to the QA tester. At the frozen commit the tree carries **94 suites
+/ 627 tests**; earlier tonight it was 91 suites / 595 tests. **A pass count can
+rise while coverage falls**, and only the suite count would show it. Both rose.
