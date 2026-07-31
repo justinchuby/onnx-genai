@@ -6,6 +6,29 @@
 use super::paged_decode::{PagedMirror, PipelineDecodeLoopBackend};
 use super::*;
 impl PipelineEngine {
+    /// Resolve which components a flat autoregressive decode drives natively,
+    /// unifying the pure-native backend and the hybrid env-flag injection so both
+    /// funnel through the same component / decoder builders (DRY). A `Native`
+    /// backend selects every component; an `Ort` backend consults the env flags,
+    /// leaving the default ORT decode path byte-for-byte unchanged.
+    fn native_component_selection(
+        &self,
+        decoder: &str,
+        step_components: &[String],
+    ) -> NativeComponentSelection {
+        if self.decode_backend == EngineDecodeBackend::Native {
+            NativeComponentSelection {
+                decoder: true,
+                step_components: step_components.iter().cloned().collect(),
+            }
+        } else {
+            NativeComponentSelection {
+                decoder: native_decoder_selected(decoder),
+                step_components: native_step_component_set(),
+            }
+        }
+    }
+
     /// Core autoregressive execution shared by [`generate_with_callback`] and
     /// [`synthesize`]: run the prompt-phase components, drive the decode loop,
     /// and return the generated tokens alongside the shared tensor pool (external
@@ -61,7 +84,12 @@ impl PipelineEngine {
         // fresh-decode path: no paged mirroring and no cross-request KV carry-over
         // (that reuse is Inc3). This changes cross-request KV reuse only, never
         // the tokens produced within a generation.
-        let use_native_decoder = native_decoder_selected(&ar.decoder);
+        //
+        // Native selection is resolved once here (GAP-3 Inc-A): a `Native`
+        // backend drives every component natively, while an `Ort` backend keeps
+        // the hybrid env-flag behaviour — both through the same builders below.
+        let native_selection = self.native_component_selection(&ar.decoder, &ar.step_components);
+        let use_native_decoder = native_selection.decoder;
         // The paged cache supersedes the single retained context wherever it is
         // available: it holds many prefixes rather than only the last one.
         let paged_enabled = self.paged.is_some() && inputs_digest.is_some() && !use_native_decoder;
@@ -161,11 +189,12 @@ impl PipelineEngine {
             .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
         // Pair every `every_step` binding with a backend-neutral component
         // session. By default this borrows the already-loaded ORT session
-        // (behaviour unchanged); components named in
-        // `ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS` are instead loaded and
-        // driven through the native nxrt backend, proving the value-type seam
-        // (native multi-component inc1) while the decoder stays on ORT.
-        let native_step_components = native_step_component_set();
+        // (behaviour unchanged); components selected natively — every component
+        // under a `Native` backend, or those named in
+        // `ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS` under `Ort` — are instead
+        // loaded and driven through the native nxrt backend, so the same decode
+        // loop drives both backends through the trait with no forked code path.
+        let native_step_components = &native_selection.step_components;
         let step_components = step_bindings
             .into_iter()
             .map(|binding| {
@@ -173,7 +202,7 @@ impl PipelineEngine {
                     build_step_component_session(
                         &self.models,
                         &binding.component,
-                        &native_step_components,
+                        native_step_components,
                     )?;
                 Ok((binding, component))
             })
