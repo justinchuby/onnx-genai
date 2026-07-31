@@ -124,6 +124,10 @@ pub(crate) struct DecodeCudaState {
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
+    /// Coordinate rank of the `position_ids` device binding (`1` = `[1, 1]`
+    /// conventional; `N > 1` = `[N, 1, 1]` multi-axis mrope). The captured step
+    /// writes `position_rank` copies of the current position, one per axis.
+    position_rank: usize,
     /// Persistent per-step input bindings (embeds + routed ports) written each
     /// step then replayed by the captured decode graph (Inc3c). Empty unless the
     /// capture-step-inputs path is active.
@@ -292,12 +296,9 @@ impl NativeDecodeSession {
         let mut owned = Vec::with_capacity(2);
         owned.push((token_input.to_owned(), input_ids));
         if let Some(position_ids_name) = position_input {
-            let positions = (past_len..total_len)
-                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
-                .collect::<anyhow::Result<Vec<_>>>()?;
             owned.push((
                 position_ids_name.to_owned(),
-                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
+                self.build_step_positions(past_len, total_len)?,
             ));
         }
         self.run_cuda_eager_rows_owned(owned, total_len, error_context)
@@ -622,12 +623,7 @@ impl NativeDecodeSession {
                     Tensor::from_i64(&[1, token_ids.len()], &ids)?
                 }
                 NativeStepInputSource::PositionIds => {
-                    let positions = (past_len..total_len)
-                        .map(|position| {
-                            i64::try_from(position).context("position id exceeds i64 range")
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    Tensor::from_i64(&[1, token_ids.len()], &positions)?
+                    self.build_step_positions(past_len, total_len)?
                 }
                 NativeStepInputSource::InputsEmbeds => supplied_map
                     .remove(binding.name.as_str())
@@ -1040,6 +1036,7 @@ impl DecodeCudaState {
         fixed_state_inputs: &HashSet<String>,
         capacity: CudaKvCapacity,
         graph_enabled: bool,
+        position_rank: usize,
     ) -> anyhow::Result<Self> {
         let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
         let mut mask = session.allocate_device_binding(
@@ -1277,12 +1274,20 @@ impl DecodeCudaState {
         }
         let position_ids_binding = if let Some(position_ids) = io.position_ids {
             let index = bindings.len();
+            // A rank-N mrope decoder declares `position_ids [N, B, S]`; the single
+            // decode step collapses batch/sequence to 1 → `[N, 1, 1]`. Rank 1 is
+            // the conventional `[1, 1]`, byte-identical to before.
+            let shape = if position_rank == 1 {
+                vec![1, 1]
+            } else {
+                vec![position_rank, 1, 1]
+            };
             bindings.push(session.allocate_device_binding(
                 position_ids,
                 None::<String>,
                 DataType::Int64,
-                vec![1, 1],
-                vec![1, 1],
+                shape.clone(),
+                shape,
             )?);
             Some(index)
         } else {
@@ -1398,6 +1403,7 @@ impl DecodeCudaState {
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
+            position_rank,
             captured_step_inputs,
             capture_step_inputs,
             logits_binding,
@@ -1482,9 +1488,22 @@ impl DecodeCudaState {
 
     fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {
         self.bindings[self.input_ids_binding].write_bytes(0, &i64::from(token_id).to_le_bytes())?;
+        self.write_position_binding(position)
+    }
+
+    /// Write the current position into the persistent `position_ids` device
+    /// binding, replicated across every declared coordinate axis (`position_rank`
+    /// copies). For a rank-1 decoder this is a single `i64` at offset 0, identical
+    /// to before; a rank-N mrope decoder gets `[position; N]` — the one-token
+    /// `linear_increment` coordinate for all axes.
+    fn write_position_binding(&mut self, position: usize) -> anyhow::Result<()> {
         if let Some(index) = self.position_ids_binding {
             let position = i64::try_from(position).context("position id exceeds i64 range")?;
-            self.bindings[index].write_bytes(0, &position.to_le_bytes())?;
+            let bytes = position.to_le_bytes();
+            let axis_bytes = std::mem::size_of::<i64>();
+            for axis in 0..self.position_rank {
+                self.bindings[index].write_bytes(axis * axis_bytes, &bytes)?;
+            }
         }
         Ok(())
     }
@@ -1531,11 +1550,7 @@ impl DecodeCudaState {
                 "captured native CUDA decode received routed step inputs that are not declared graph ports: {unknown:?}"
             );
         }
-        if let Some(index) = self.position_ids_binding {
-            let position = i64::try_from(position).context("position id exceeds i64 range")?;
-            self.bindings[index].write_bytes(0, &position.to_le_bytes())?;
-        }
-        Ok(())
+        self.write_position_binding(position)
     }
 
     fn run_one_token(

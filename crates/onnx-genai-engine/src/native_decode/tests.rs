@@ -2160,3 +2160,46 @@ fn env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
+
+/// The native position rank is derived from the graph's declared `position_ids`
+/// shape: a conventional rank-2 `[batch, seq]` input maps to 1 coordinate axis,
+/// while a rank-3 mrope `[N, batch, seq]` input maps to its static leading dim.
+/// A non-static leading dim (or an absent input) is handled without inventing an
+/// axis count.
+#[test]
+fn declared_position_rank_maps_graph_shape() {
+    use onnx_genai_ort::{DataType, TensorInfo};
+
+    let inputs = vec![
+        TensorInfo {
+            name: "position_ids_2d".to_string(),
+            dtype: DataType::Int64,
+            shape: vec![1, -1],
+        },
+        TensorInfo {
+            name: "position_ids_mrope".to_string(),
+            dtype: DataType::Int64,
+            shape: vec![3, -1, -1],
+        },
+        TensorInfo {
+            name: "position_ids_dynamic_lead".to_string(),
+            dtype: DataType::Int64,
+            shape: vec![-1, -1, -1],
+        },
+    ];
+
+    // Rank-2 conventional → 1 axis (the legacy `[1, S]` layout).
+    assert_eq!(
+        declared_position_rank(&inputs, Some("position_ids_2d")).unwrap(),
+        1
+    );
+    // Rank-3 mrope with a static leading dim → that dim (3 coordinate streams).
+    assert_eq!(
+        declared_position_rank(&inputs, Some("position_ids_mrope")).unwrap(),
+        3
+    );
+    // No declared position input → 1 (unused, harmless).
+    assert_eq!(declared_position_rank(&inputs, None).unwrap(), 1);
+    // A rank-3 input with a non-static leading dim cannot be resolved.
+    assert!(declared_position_rank(&inputs, Some("position_ids_dynamic_lead")).is_err());
+}

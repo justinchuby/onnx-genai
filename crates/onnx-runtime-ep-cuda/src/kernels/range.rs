@@ -122,14 +122,18 @@ impl Kernel for RangeKernel {
                 "Range during CUDA graph capture because its scalar inputs determine output shape",
             ));
         }
+        // ONNX `Range` declares scalar start/limit/delta. Real exports (e.g. the
+        // Qwen mrope rotary range) emit these as single-element `[1]` tensors
+        // rather than rank-0 scalars; both are semantically scalar, so accept any
+        // contiguous single-element input (the launch reads the first element).
         if inputs.iter().any(|input| {
-            !input.is_contiguous() || !input.shape.is_empty() || input.dtype != inputs[0].dtype
+            !input.is_contiguous() || input.numel() != 1 || input.dtype != inputs[0].dtype
         }) || !outputs[0].is_contiguous()
             || outputs[0].dtype != inputs[0].dtype
             || outputs[0].shape.len() != 1
         {
             return Err(EpError::KernelFailed(
-                "cuda_ep Range: inputs must be same-dtype contiguous scalars and output a matching vector"
+                "cuda_ep Range: inputs must be same-dtype contiguous scalars (rank-0 or single-element) and output a matching vector"
                     .into(),
             ));
         }

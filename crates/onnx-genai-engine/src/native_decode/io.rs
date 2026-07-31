@@ -124,3 +124,48 @@ pub(crate) fn optional_declared_or_detected_output(
     .map_err(anyhow::Error::msg)
     .map(|resolved| resolved.map(|resolved| resolved.name))
 }
+
+/// Coordinate rank of the declared `position_ids` input, derived from the
+/// graph's physical shape — the authoritative source (it is exactly what raises
+/// the native "position_ids: rank mismatch" error). Physical rank 2 → `1`
+/// coordinate axis (the conventional `[1, S]` linear layout); physical rank 3 →
+/// the declared **static** leading dim (the multi-axis mrope coordinate-stream
+/// count, e.g. `3` for `[3, B, S]`). A non-static leading dim or any other
+/// physical rank cannot be resolved from the graph alone and is a loud error. A
+/// decoder with no position input returns `1` (unused).
+///
+/// This keeps the native position layout metadata-driven and general: a rank-2
+/// decoder still builds `[1, S]`, a rank-3 mrope decoder builds `[rank, 1, S]`,
+/// with no model-name gate and no hardcoded rank.
+pub(crate) fn declared_position_rank(
+    inputs: &[onnx_genai_ort::TensorInfo],
+    position_ids: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(name) = position_ids else {
+        return Ok(1);
+    };
+    let Some(info) = inputs.iter().find(|info| info.name == name) else {
+        return Ok(1);
+    };
+    match info.shape.len() {
+        2 => Ok(1),
+        3 => {
+            let leading = info.shape[0];
+            if leading >= 1 {
+                Ok(leading as usize)
+            } else {
+                anyhow::bail!(
+                    "native decoder position input '{}' declares a rank-3 shape {:?} with a non-static leading (coordinate) dim; the multi-axis position count must be a concrete dimension",
+                    name,
+                    info.shape
+                )
+            }
+        }
+        other => anyhow::bail!(
+            "native decoder position input '{}' has unsupported physical rank {} (shape {:?}); expected rank 2 (linear) or rank 3 (multi-axis mrope)",
+            name,
+            other,
+            info.shape
+        ),
+    }
+}

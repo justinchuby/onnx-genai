@@ -43,6 +43,8 @@ pub(crate) use metadata::{
     sliding_window_from_metadata,
 };
 pub(crate) use state::DecodeState;
+#[cfg(feature = "native-backend")]
+pub(crate) use step::position_ids_from_starts;
 pub(crate) use step::{run_decode_session_logits, run_decode_step, run_decode_step_with_extra};
 pub(crate) use token_sampling::{
     DraftProposalRequest, apply_paged_sliding_window, next_session_token_argmax,

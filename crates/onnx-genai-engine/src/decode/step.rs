@@ -391,19 +391,7 @@ pub(super) fn build_position_step(
         );
     }
 
-    let mut data = Vec::with_capacity(
-        rank.checked_mul(input_len)
-            .context("position tensor element count overflow")?,
-    );
-    for start in &starts {
-        for offset in 0..input_len {
-            data.push(
-                start
-                    .checked_add(i64::try_from(offset).context("position offset exceeds i64")?)
-                    .context("position id overflow")?,
-            );
-        }
-    }
+    let (mut data, shape) = position_ids_from_starts(&starts, input_len)?;
     if rank == 1 && continuation == "linear_increment" {
         data.copy_from_slice(legacy_positions);
     }
@@ -415,16 +403,46 @@ pub(super) fn build_position_step(
                 .context("next position id overflow")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let shape = if rank == 1 {
-        vec![1, input_len as i64]
-    } else {
-        vec![rank as i64, 1, input_len as i64]
-    };
     Ok(PositionStep {
         value: Value::from_vec_i64(data, &shape)
             .with_context(|| format!("failed to build position input '{}'", info.name))?,
         next,
     })
+}
+
+/// Build the flat `i64` position-id values and physical tensor shape for one
+/// decode step from the per-axis start positions. Each of the `starts.len()`
+/// coordinate axes advances linearly across `input_len` sequence offsets. A
+/// single axis yields a conventional `[1, input_len]` rank-2 tensor; multiple
+/// axes yield a `[rank, 1, input_len]` rank-3 multi-axis (mrope) tensor.
+///
+/// Shared by the ORT step driver ([`build_position_step`]) and the native decode
+/// drivers so both backends build byte-identical positions from one code path —
+/// only the surrounding tensor type differs (`Value` vs native `Tensor`).
+pub(crate) fn position_ids_from_starts(
+    starts: &[i64],
+    input_len: usize,
+) -> anyhow::Result<(Vec<i64>, Vec<i64>)> {
+    let rank = starts.len();
+    let mut data = Vec::with_capacity(
+        rank.checked_mul(input_len)
+            .context("position tensor element count overflow")?,
+    );
+    for start in starts {
+        for offset in 0..input_len {
+            data.push(
+                start
+                    .checked_add(i64::try_from(offset).context("position offset exceeds i64")?)
+                    .context("position id overflow")?,
+            );
+        }
+    }
+    let shape = if rank == 1 {
+        vec![1, input_len as i64]
+    } else {
+        vec![rank as i64, 1, input_len as i64]
+    };
+    Ok((data, shape))
 }
 
 fn validate_position_value_shape(
@@ -496,5 +514,37 @@ fn build_int_input(values: &[i64], shape: &[i64], info: &TensorInfo) -> anyhow::
             "input '{}' must be Int64 or Int32, got {other:?}",
             info.name
         ),
+    }
+}
+
+#[cfg(test)]
+mod position_helper_tests {
+    use super::position_ids_from_starts;
+
+    #[test]
+    fn rank_one_builds_linear_row() {
+        // A conventional decoder: single axis, one decode step at absolute
+        // position 5 over 3 input positions → `[1, 3]` with `[5, 6, 7]`.
+        let (data, shape) = position_ids_from_starts(&[5], 3).unwrap();
+        assert_eq!(shape, vec![1, 3]);
+        assert_eq!(data, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn rank_three_single_token_replicates_across_axes() {
+        // Rank-3 mrope, one token at absolute position 5: every coordinate axis
+        // carries the same linear position → `[3, 1, 1]` with `[5, 5, 5]`.
+        let (data, shape) = position_ids_from_starts(&[5, 5, 5], 1).unwrap();
+        assert_eq!(shape, vec![3, 1, 1]);
+        assert_eq!(data, vec![5, 5, 5]);
+    }
+
+    #[test]
+    fn rank_three_multi_token_advances_each_axis() {
+        // Rank-3 mrope prefill of 2 positions from absolute start 5: each axis
+        // advances linearly → `[3, 1, 2]` with three `[5, 6]` streams.
+        let (data, shape) = position_ids_from_starts(&[5, 5, 5], 2).unwrap();
+        assert_eq!(shape, vec![3, 1, 2]);
+        assert_eq!(data, vec![5, 6, 5, 6, 5, 6]);
     }
 }

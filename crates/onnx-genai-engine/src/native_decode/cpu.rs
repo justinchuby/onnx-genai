@@ -195,12 +195,7 @@ impl NativeDecodeSession {
                     Tensor::from_i64(&[1, total_len], &vec![1; total_len])?
                 }
                 NativeStepInputSource::PositionIds => {
-                    let positions = (past_len..total_len)
-                        .map(|position| {
-                            i64::try_from(position).context("position id exceeds i64 range")
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    Tensor::from_i64(&[1, token_ids.len()], &positions)?
+                    self.build_step_positions(past_len, total_len)?
                 }
                 NativeStepInputSource::InputsEmbeds => supplied
                     .remove(binding.name.as_str())

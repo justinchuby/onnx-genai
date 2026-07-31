@@ -84,12 +84,54 @@ because they are one seam:
    reported honestly with the counter. If it declines, the hybrid still proves native decode CORRECTNESS
    on real weights; capture engagement remains a GQA-decoder property (35B-A3B).
 
-## Risks
+## Result — it RUNS and is TOKEN-IDENTICAL to ORT (real weights, on-GPU)
 
-- Rank-1 path MUST stay byte-identical (anti-regression). Mitigated: `position_rank` defaults to 1;
-  the helper's rank-1 branch emits exactly `[1, S]` with the same linear values; ORT extraction is
-  mechanical.
-- Symbolic leading dim on a rank-3 position input would be undeterminable from the graph alone —
-  handled as a loud error, not a silent guess.
-- Captured-path rank-3 binding is untested by any runnable fixture (no rank-3 GQA-capacity model on
-  hand); kept correct-by-construction (rank copies) and covered by the rank-1 byte-identity guarantee.
+Implemented and PROVEN on device 4 (release, ORT 1.27.0 CUDA). The auto-activating harness
+`qwen35_0_8b_hybrid_native_cuda_e2e` now RUNS native (no longer skips the rank-3 gap) and locks
+native-CUDA ↔ ORT token-for-token:
+
+```
+qwen3.5-0.8b hybrid ORT reference : [11751, 11, 321, 279, 6511, 314, 9564, 369, 19241, 13, 198, 760, 6511, 314, 9338, 369]
+qwen3.5-0.8b hybrid native CUDA    : [11751, 11, 321, 279, 6511, 314, 9564, 369, 19241, 13, 198, 760, 6511, 314, 9338, 369]  ✅ IDENTICAL
+```
+
+This is the first real-weights `inputs_embeds` split-package native-CUDA decode == ORT proof.
+
+### Second gap found + fixed (native-CUDA `Range` kernel, NOT position-driver)
+
+With rank-3 positions correct, the native forward reached a **deeper** native-CUDA op gap: the
+mrope rotary `Range` (`/model/layers.*/attn/k_mrope/range/Range`) supplies its start/limit/delta
+as single-element `[1]` tensors, but `onnx-runtime-ep-cuda/src/kernels/range.rs` required strict
+rank-0 scalars and errored: *"cuda_ep Range: inputs must be same-dtype contiguous scalars…"*.
+ONNX `Range` is scalar-valued, and real exports commonly emit `[1]`-shaped scalars (ORT's CPU/CUDA
+accept both); the kernel already reads only the first element. Fix: accept any contiguous
+**single-element** (`numel() == 1`) input — rank-0 or `[1]` — a small, general, spec-correct
+relaxation. This is the last-mile op gap; without it the composition claim ("100% native placement")
+placed but could not execute the mrope range.
+
+### Regression — rank-2 unchanged
+
+`position_rank` defaults to `1`; the shared helper's rank-1 branch emits exactly `[1, S]` with the
+same linear values, and the captured binding stays `[1, 1]` with one write — byte-identical to
+before. Proof: 349 engine lib tests green (incl. every existing ORT multi-axis / rank-2 position
+test — the shared-helper extraction kept the ORT path byte-identical); new deterministic unit tests
+(`position_helper_tests::*`, `declared_position_rank_maps_graph_shape`) lock rank-1 → `[1, S]` and
+rank-3 → `[3, 1, S]`; the full `cuda,native-backend` failing-set stayed **17** (documented
+pre-existing: native_engine 10 / gemma4_assistant 3 / glm_tiny_qmoe 2 / native_prompt_lookup 2),
+byte-identical to base.
+
+### Bonus — capture-step-inputs on the hybrid: DECLINES (no-op), token-identical
+
+With `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS=1` the hybrid decodes to the **identical** 16
+tokens (flag ON == OFF == ORT). Expected: the hybrid's `conv_state`/`recurrent_state` are
+wholesale-replaced fixed-state inputs, not GQA capacity-aware appendable KV, so `graph_enabled =
+false` and the capture-step-inputs path stays dormant — the flag is a no-op. Native decode
+CORRECTNESS on real weights is proven regardless; capture engagement remains a GQA-decoder property
+(the 35B-A3B path), consistent with the qwen3-0.6b decline finding.
+
+## Out of scope (unchanged rank-2)
+
+The speculative proposer draft path (`native_decode/proposer.rs`) still builds rank-2 positions —
+it is a distinct `NativeProposerSession` and no rank-3 proposer exists; deferred with the rest of
+speculative-native work.
+
