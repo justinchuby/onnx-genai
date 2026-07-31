@@ -373,6 +373,7 @@ mod pty_tty {
         let mut first_sent = false;
         let mut second_sent = false;
         let mut exit_sent = false;
+        let mut dsr_answered = 0usize;
         let mut buf = [0u8; 4096];
         loop {
             let ready = {
@@ -394,6 +395,18 @@ mod pty_tty {
                 Ok(0) => break,
                 Ok(n) => bytes.extend_from_slice(&buf[..n]),
                 Err(_) => break,
+            }
+
+            // reedline probes the cursor position (DSR, `ESC[6n`) while setting
+            // up its line editor; a real terminal answers with `ESC[<row>;<col>R`.
+            // This headless PTY has no emulator behind it, so the harness must
+            // answer or reedline aborts the turn with "The cursor position could
+            // not be read within a normal duration". Reply once per query.
+            const DSR_QUERY: &[u8] = b"\x1b[6n";
+            let dsr_seen = bytes.windows(DSR_QUERY.len()).filter(|w| *w == DSR_QUERY).count();
+            while dsr_answered < dsr_seen {
+                master.write_all(b"\x1b[1;1R").expect("answer cursor-position query");
+                dsr_answered += 1;
             }
 
             let transcript = strip_terminal_controls(&String::from_utf8_lossy(&bytes));
