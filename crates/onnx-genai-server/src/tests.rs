@@ -3518,11 +3518,11 @@ async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
         .expect("the snapshot itself failed");
 }
 
-/// The complement: commands that need `&mut Engine` cannot be served while the
-/// batch manager holds its borrow, so they must still be parked. This pins the
-/// helper's contract to "answer read-only observability", not "answer anything".
+/// The complement: commands that *reconfigure* the engine must still be parked until the
+/// batch drains. This pins the helper's contract to "answer read-only observability",
+/// not "answer anything".
 #[tokio::test]
-async fn commands_needing_mutable_engine_access_are_still_deferred() {
+async fn mutating_commands_are_still_deferred() {
     let model_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
