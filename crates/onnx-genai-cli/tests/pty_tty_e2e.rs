@@ -55,15 +55,12 @@ mod pty_tty {
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
             if ch == '\x1b' {
-                match chars.next() {
-                    Some('[') => {
-                        for next in chars.by_ref() {
-                            if next.is_ascii_alphabetic() {
-                                break;
-                            }
+                if let Some('[') = chars.next() {
+                    for next in chars.by_ref() {
+                        if next.is_ascii_alphabetic() {
+                            break;
                         }
                     }
-                    Some(_) | None => {}
                 }
             } else if ch != '\r' {
                 out.push(ch);
@@ -403,9 +400,14 @@ mod pty_tty {
             // answer or reedline aborts the turn with "The cursor position could
             // not be read within a normal duration". Reply once per query.
             const DSR_QUERY: &[u8] = b"\x1b[6n";
-            let dsr_seen = bytes.windows(DSR_QUERY.len()).filter(|w| *w == DSR_QUERY).count();
+            let dsr_seen = bytes
+                .windows(DSR_QUERY.len())
+                .filter(|w| *w == DSR_QUERY)
+                .count();
             while dsr_answered < dsr_seen {
-                master.write_all(b"\x1b[1;1R").expect("answer cursor-position query");
+                master
+                    .write_all(b"\x1b[1;1R")
+                    .expect("answer cursor-position query");
                 dsr_answered += 1;
             }
 
