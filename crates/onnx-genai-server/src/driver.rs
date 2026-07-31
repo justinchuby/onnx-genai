@@ -623,8 +623,8 @@ fn run_static_batch_until_idle(
 /// when there is no batch left to report on -- the request appears to hang for
 /// the entire duration of every in-flight generation.
 ///
-/// Commands needing `&mut Engine` cannot be served while `ContinuousBatchManager`
-/// holds its borrow, so they stay deferred by design.
+/// Commands that *reconfigure* engine state are deferred until the batch drains by design.
+/// Only read-only observability is answered immediately here.
 pub(crate) fn handle_or_defer_during_batch(
     engine: &Engine,
     command: DriverCommand,
