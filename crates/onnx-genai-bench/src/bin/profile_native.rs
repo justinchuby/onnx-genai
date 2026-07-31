@@ -629,7 +629,7 @@ fn main() -> Result<()> {
             .context("build synthetic native session")?;
         NativeDecodeSession::from_session(native).context("wrap synthetic native decoder")?
     } else {
-        NativeDecodeSession::load(&model, device)
+        NativeDecodeSession::load_with_resolved_io(&model, device)
             .with_context(|| format!("load native decoder {}", model.display()))?
     };
 
