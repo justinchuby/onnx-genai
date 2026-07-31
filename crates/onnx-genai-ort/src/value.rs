@@ -702,9 +702,13 @@ impl Value {
             DataType::Float16 => Value::from_vec_f16_bits(self.to_vec_f16_bits()?, &self.shape),
             DataType::BFloat16 => Value::from_vec_bf16_bits(self.to_vec_bf16_bits()?, &self.shape),
             DataType::Int64 => Value::from_vec_i64(self.to_vec_i64()?, &self.shape),
-            other => Err(OrtError::InvalidArgument(format!(
-                "cannot clone tensor with dtype {other:?}"
-            ))),
+            // General, dtype-agnostic deep copy: round-trip the raw little-endian
+            // element bytes for every remaining POD dtype (Bool, Int32, Int8,
+            // Uint8/16/32/64, Int16, Float8*) rather than rejecting them per
+            // dtype. `as_raw_bytes` errors precisely on a device-resident tensor
+            // instead of reading a device pointer as host memory, so this never
+            // silently corrupts a stray device value.
+            other => Value::from_raw_bytes(self.as_raw_bytes()?.to_vec(), &self.shape, other),
         }
     }
 
@@ -1153,6 +1157,80 @@ mod host_residency_tests {
             value.as_raw_bytes().expect("host bytes"),
             &value.to_raw_bytes().expect("copied bytes")[..]
         );
+    }
+}
+
+#[cfg(test)]
+mod clone_owned_tests {
+    use super::*;
+
+    /// `clone_owned` must deep-copy EVERY POD dtype, not just the typed fast
+    /// paths (f32/f16/bf16/i64). Before generalization it returned
+    /// `InvalidArgument("cannot clone tensor with dtype ...")` for Bool, Int32,
+    /// Uint8, etc., which is exactly the blocker gemma-3n's Bool audio mask hit.
+    /// Dtype + shape + raw bytes must round-trip identically, and the clone must
+    /// own an independent buffer.
+    fn assert_clone_owned_round_trips(bytes: Vec<u8>, shape: &[i64], dtype: DataType) {
+        let original = Value::from_raw_bytes(bytes.clone(), shape, dtype)
+            .unwrap_or_else(|e| panic!("build {dtype:?} tensor: {e}"));
+        let cloned = original
+            .clone_owned()
+            .unwrap_or_else(|e| panic!("clone_owned {dtype:?}: {e}"));
+
+        assert_eq!(cloned.dtype(), dtype, "{dtype:?}: dtype must round-trip");
+        assert_eq!(cloned.shape(), shape, "{dtype:?}: shape must round-trip");
+        assert_eq!(
+            cloned.to_raw_bytes().expect("cloned bytes"),
+            bytes,
+            "{dtype:?}: raw bytes must round-trip identically"
+        );
+        // The clone owns a distinct buffer, not an alias over the original's.
+        assert_ne!(
+            original.as_ptr() as usize,
+            cloned.as_ptr() as usize,
+            "{dtype:?}: clone must be an independent OrtValue"
+        );
+    }
+
+    #[test]
+    fn clone_owned_round_trips_bool() {
+        // 1 byte per Bool element; ORT stores false/true as 0/1.
+        assert_clone_owned_round_trips(vec![1, 0, 1, 1], &[4], DataType::Bool);
+    }
+
+    #[test]
+    fn clone_owned_round_trips_int32() {
+        let bytes: Vec<u8> = [1i32, -2, 3, -4]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_clone_owned_round_trips(bytes, &[2, 2], DataType::Int32);
+    }
+
+    #[test]
+    fn clone_owned_round_trips_uint8() {
+        assert_clone_owned_round_trips(vec![0, 255, 7, 128], &[2, 2], DataType::Uint8);
+    }
+
+    #[test]
+    fn clone_owned_round_trips_empty_bool_tensor() {
+        // An empty tensor is a legitimate zero-element window and must clone.
+        assert_clone_owned_round_trips(Vec::new(), &[0], DataType::Bool);
+    }
+
+    #[test]
+    fn clone_owned_round_trips_multidim_bool() {
+        // 2x3 Bool mask, exercising a multi-dimensional shape.
+        assert_clone_owned_round_trips(vec![1, 0, 1, 0, 1, 1], &[2, 3], DataType::Bool);
+    }
+
+    #[test]
+    fn clone_owned_still_round_trips_the_typed_fast_path() {
+        // The generalization must not regress the existing typed dtypes.
+        let original = Value::from_slice_i64(&[7, -3, 0, 42], &[4]).expect("i64 tensor");
+        let cloned = original.clone_owned().expect("clone i64");
+        assert_eq!(cloned.dtype(), DataType::Int64);
+        assert_eq!(cloned.to_vec_i64().expect("i64 out"), vec![7, -3, 0, 42]);
     }
 }
 
