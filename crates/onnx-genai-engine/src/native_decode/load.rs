@@ -478,6 +478,36 @@ impl NativeDecodeSession {
             } else {
                 None
             };
+            // Inc3c: resolve every routed (non-KV, non-generated) port to a fixed
+            // single-token device binding so the capture path can replay the step.
+            // Dynamic dims (batch / sequence) collapse to 1; static feature dims
+            // are kept. The eager path (default) ignores these bindings.
+            let routed = step_inputs
+                .iter()
+                .filter(|binding| binding.source == NativeStepInputSource::Routed)
+                .map(|binding| {
+                    let meta = session
+                        .inputs()
+                        .iter()
+                        .find(|meta| meta.name == binding.name)
+                        .with_context(|| {
+                            format!("missing CUDA routed input metadata for '{}'", binding.name)
+                        })?;
+                    let shape = meta
+                        .shape
+                        .iter()
+                        .map(|dim| match dim {
+                            Dim::Static(value) => *value,
+                            _ => 1,
+                        })
+                        .collect::<Vec<usize>>();
+                    Ok(CudaRoutedBinding {
+                        name: binding.name.as_str(),
+                        dtype: meta.dtype,
+                        shape,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let token_input = if inputs_embeds.is_some() {
                 ""
             } else {
@@ -539,6 +569,7 @@ impl NativeDecodeSession {
                     attention_mask,
                     position_ids: position_ids.as_deref(),
                     logits: &logits,
+                    routed,
                 },
                 &present_to_past,
                 &fixed_state_inputs,
