@@ -33,3 +33,9 @@
 - PR #529 merged: qwen3.5-0.8b hybrid places 100% on CUDA — split package embedding.onnx 24 nodes + text.onnx 1265 = 1289 nodes, 0 declines (after #480/#484/#525). Regression lock `qwen35_0_8b_placement_lock`.
 - E2e decode still BLOCKED on the loader: `Engine::from_dir` rejects the 3-onnx split; `from_pipeline_dir` refuses during vision `smart_resize` admission. Parity harness `qwen35_0_8b_hybrid_native_cuda_e2e` graceful-skips until fixed.
 - In flight (cohaagen-4): loader-unblock — admit the text-only split hybrid for decode, flip the e2e parity harness active.
+
+## 2026-07-31T03:03:15Z — PR #535 merged: text-only decode pipeline synthesis (hybrid loader unblock)
+
+- PR #535 merged: unblocks the split VLM package whose image preprocessing is unrepresentable (`smart_resize`). New `GenAiConfigError::UnrepresentablePreprocessing` (distinct from `IncompletePipeline`) → `to_strict_text_only_pipeline_metadata` synthesizes an embedding→decoder AR pipeline with NO vision component (positions rank-3 `linear_increment`, decoder `inputs_embeds`). Modality-driven, NOT a model-name case. Resolves the symbolic leading (batch) axis in `decode/values.rs`. Flips the `qwen35_0_8b_hybrid_native_cuda_e2e` parity harness active (paved the way for Mary's #543 landmark).
+- Weight-offload chain (#63): #444 first increment merged — `page_lazy_weight` dispatch-layer seam + `CudaWeightResidency` LRU, gated behind `ONNX_GENAI_WEIGHT_OFFLOAD=1`, token-identical, ~1.21× slowdown at 2 MiB. NEXT LEVER: #87 async page-in (PLAN-ONLY, awaiting Justin green-light).
+- Guardrail proven: o_proj 2-way split-K (K_SPLIT=2) REGRESSES the 7B o_proj GEMV (−0.59%, repeatable) — do NOT re-try; reduction tax > sub-wave grid-fill. A K_SPLIT>2 new kernel with its own A/B is the future candidate.
