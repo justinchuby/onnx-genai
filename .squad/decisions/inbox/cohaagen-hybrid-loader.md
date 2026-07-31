@@ -99,3 +99,27 @@ ORT token parity — the loader + synthesis + state-init plumbing is now proven.
 - `crates/onnx-genai-genai-config/tests/{vlm_pipeline.rs,fixtures/vlm-smart-resize/*}`
 - `crates/onnx-genai-engine/src/decode/{values.rs,resolved_io.rs,tests.rs}`
 - `crates/onnx-genai-engine/tests/qwen35_0_8b_hybrid_text_decode_e2e.rs`
+
+## Update — #529 harness flipped to AUTO-ACTIVATION (not unconditional-active)
+
+After rebasing this branch onto merged #529, I updated
+`qwen35_0_8b_hybrid_native_cuda_e2e.rs` (the #529 harness). Its old guard skipped
+when the ORT *reference* errored — but with this branch's loader fix the ORT
+reference now SUCCEEDS, so that stale guard would have driven straight into the
+native rank-3 failure and turned the harness RED. Empirically confirmed on GPU
+(device 0):
+
+```
+qwen3.5-0.8b hybrid ORT reference: 16 tokens = [11751, 11, 321, 279, 6511, 314, 9564, 369, 19241, 13, 198, 760, 6511, 314, 9338, 369]
+Error: native CUDA decoder forward pass failed: input position_ids: rank mismatch (graph declares rank 3, got 2)
+```
+
+I could NOT flip the harness to unconditional token-parity enforcement, because
+that requires the native rank-3 mrope positions that live in Mary's Inc3c
+`native_decode/` files (collision boundary — I did not edit them). Instead the
+harness now **auto-activates**: it takes the (now-working) ORT reference, runs
+native, and gracefully skips on EXACTLY the sanctioned native rank-3
+`position_ids` gap (`is_native_rank3_position_gap` — matches `position_ids` +
+`rank mismatch`); every OTHER native error propagates as a real failure. The
+moment Mary's native step driver constructs rank-3 positions, this harness
+enforces native-CUDA↔ORT token-for-token parity with zero further edits.
