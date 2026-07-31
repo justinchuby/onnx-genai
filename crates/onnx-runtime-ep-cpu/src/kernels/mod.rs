@@ -1700,8 +1700,10 @@ mod tests {
         // Conv is always registered, using the pure-Rust reference kernel without
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
+        // `com.microsoft::FusedSiluMul` (fused SiLU-multiply) adds one contrib
+        // entry.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 100 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 101 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
