@@ -50,8 +50,7 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
     ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMut, TensorView, ViewOutput,
-    WeightHandle,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMut, TensorView, WeightHandle,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -170,13 +169,6 @@ mod phase_profile {
         rows
     }
 
-    /// Clear accumulated phase statistics.
-    pub fn reset() {
-        if let Ok(mut reg) = registry().lock() {
-            reg.clear();
-        }
-    }
-
     /// Scoped timer that records its lifetime to `phase` on drop.
     pub struct PhaseSpan {
         phase: &'static str,
@@ -278,10 +270,6 @@ pub fn exec_phase_stats() -> Vec<(&'static str, u128, u64)> {
     phase_profile::all_stats()
 }
 
-pub fn reset_exec_phase_profile() {
-    phase_profile::reset();
-}
-
 pub fn print_exec_phase_profile() {
     phase_profile::report_to_stderr();
 }
@@ -335,21 +323,6 @@ pub(crate) struct NodePlan {
     /// Inputs consumed for the final time by this node and therefore eligible for
     /// a kernel-authorized in-place overwrite after additional runtime guards.
     pub inplace_dead_inputs: Vec<bool>,
-    /// Executor-owned pure metadata op. These nodes stay in the structural plan
-    /// so data-dependent output shapes are resolved at the right topological
-    /// point, but they never dispatch through `get_kernel`.
-    pub static_view: Option<StaticViewKind>,
-    /// All outputs have load-time-known symbolic/static shapes and are sized by
-    /// the run setup pass. Hot decode compute nodes can skip redundant per-node
-    /// output allocation checks unless an output is externally bound.
-    pub outputs_pre_sized: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum StaticViewKind {
-    Reshape,
-    Squeeze,
-    Unsqueeze,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.

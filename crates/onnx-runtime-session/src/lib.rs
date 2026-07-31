@@ -32,7 +32,7 @@ pub use executor::{
     CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
     DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
     ExecutionProviderFallbackReport, PrefetchStep, SeamReason, drive_double_buffer,
-    exec_phase_stats, plan_double_buffer, print_exec_phase_profile, reset_exec_phase_profile,
+    exec_phase_stats, plan_double_buffer, print_exec_phase_profile,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -1053,6 +1053,16 @@ impl InferenceSession {
     /// alongside [`Self::decode_memo_counts`].
     pub fn decode_view_plan_counts(&self) -> (u64, u64) {
         self.exec.decode_view_plan_counts()
+    }
+
+    /// How many times the single-trip `Scan` inline dual-path
+    /// (`ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP`) engaged over this session's
+    /// lifetime. `> 0` after a decode run proves the runtime `trip_count == 1`
+    /// inline path actually fired (not a silently gated-out pass); an on-model
+    /// flag-on/flag-off A/B reads this alongside the token stream to prove the
+    /// dual-path is both engaged and byte-exact.
+    pub fn scan_inline_single_trip_count(&self) -> u64 {
+        self.exec.scan_inline_single_trip_count()
     }
 
     /// Run with persistent device allocations supplying graph inputs and,

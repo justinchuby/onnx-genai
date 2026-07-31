@@ -2,7 +2,7 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
-    OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult, ShapeNoOpElimination,
+    OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
 
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
@@ -82,7 +82,6 @@ pub(crate) struct CudaSiluFusion;
 
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
-        Box::new(ShapeNoOpElimination),
         Box::new(CudaSiluFusion),
         Box::new(CudaFoldConstantTranspose),
         // Runs before the fusions so they see the fp16-native normalization

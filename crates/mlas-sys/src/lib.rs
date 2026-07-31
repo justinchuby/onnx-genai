@@ -2614,9 +2614,7 @@ mod tests {
 
     #[test]
     fn nchwc_block_size_is_supported() {
-        if !nchwc_supported_for_tests() {
-            return;
-        }
+        let _ = nchwc_supported_for_tests();
     }
 
     #[test]
