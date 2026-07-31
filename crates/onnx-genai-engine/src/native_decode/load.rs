@@ -14,7 +14,64 @@ fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
     .and_then(|metadata| metadata.model.and_then(|model| model.max_sequence_length))
 }
 
+/// Resolve a model directory's [`InferenceMetadata`] using the same precedence
+/// as the engine's directory loader: a native `inference_metadata.{yaml,yml,json}`
+/// sidecar first, then onnxruntime-genai `genai_config.json` compatibility
+/// synthesis. Returns `None` when neither is present so callers fall back to
+/// shape-based I/O inference exactly as before.
+fn resolve_io_metadata_from_model_path(
+    path: &Path,
+) -> Option<onnx_genai_metadata::InferenceMetadata> {
+    let root = if path.is_dir() { path } else { path.parent()? };
+    if let Some(metadata) = [
+        "inference_metadata.yaml",
+        "inference_metadata.yml",
+        "inference_metadata.json",
+    ]
+    .iter()
+    .map(|name| root.join(name))
+    .find(|path| path.is_file())
+    .and_then(|path| onnx_genai_metadata::load_metadata(&path).ok())
+    {
+        return Some(metadata);
+    }
+    let genai_config = root.join("genai_config.json");
+    if genai_config.is_file() {
+        return crate::engine::genai_config_compat_metadata_from_model_path(
+            Some(genai_config.as_path()),
+            path,
+        )
+        .ok()
+        .flatten();
+    }
+    None
+}
+
 impl NativeDecodeSession {
+    /// Load a decoder-with-past model, resolving its [`ModelIoSpec`] from an
+    /// adjacent `inference_metadata.{yaml,yml,json}` sidecar or (for
+    /// onnxruntime-genai packages) `genai_config.json`, so genai_config decoders
+    /// bind their token input from metadata instead of guessing from ambiguous
+    /// tensor shapes. This is the observability entry point used by measurement
+    /// tools so CUDA-graph capture counters and `--trace` reject reasons surface
+    /// for genai_config decoders. Capture semantics are identical to [`load`]:
+    /// `graph_capture` stays auto-decided and no defaults change; only I/O
+    /// resolution is threaded.
+    ///
+    /// [`load`]: NativeDecodeSession::load
+    pub fn load_with_resolved_io(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let metadata = resolve_io_metadata_from_model_path(path);
+        let io = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.as_ref())
+            .and_then(|model| model.io.as_ref());
+        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+    }
+
     pub(crate) fn load_with_weight_offload_host_cache(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
