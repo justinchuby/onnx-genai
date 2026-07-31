@@ -10667,6 +10667,10 @@ mod tests {
         assert!(format!("{error}").contains("must be 0"));
     }
 
+    // Test helper used only by MLAS/aarch64-gated tests; unused in the default
+    // (non-mlas) build, so suppress dead_code there rather than duplicating the
+    // callers' cfg matrix on the helper.
+    #[allow(dead_code)]
     fn mlas_close(actual: &[f32], expected: &[f32], tol: f32, ctx: &str) {
         assert_eq!(actual.len(), expected.len());
         for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
