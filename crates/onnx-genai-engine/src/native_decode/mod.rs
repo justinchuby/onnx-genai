@@ -133,6 +133,69 @@ impl NativeDecodeSession {
         self.kv_inputs.len() / 2
     }
 
+    /// Whether this session keeps its self-attention KV as plain host tensors
+    /// that can be read out for paged present-KV mirroring and re-seeded from a
+    /// materialized paged prefix (GAP-3 Inc-C).
+    ///
+    /// True only for the host-resident *growable* CPU path: the CUDA
+    /// (device-resident) and in-place CPU-KV (`GroupQueryAttention` append)
+    /// stores do not expose a host present tensor here, and f16 / non-rank-4
+    /// caches would not round-trip losslessly through the f32 paged store — both
+    /// are deferred to Inc-D. Every declared KV past input must be a rank-4 f32
+    /// cache (`[1, num_kv_heads, seq, head_dim]`).
+    pub(crate) fn supports_host_kv_mirror(&self) -> bool {
+        if self.cuda.is_some() || self.cpu_kv.is_some() || self.kv_inputs.is_empty() {
+            return false;
+        }
+        self.kv_inputs.iter().all(|name| {
+            self.session
+                .inputs()
+                .iter()
+                .find(|meta| &meta.name == name)
+                .is_some_and(|meta| meta.dtype == DataType::Float32 && meta.shape.len() == 4)
+        })
+    }
+
+    /// The most recent step's accumulated present KV for one self-attention past
+    /// input, as a host f32 buffer plus its `[1, num_kv_heads, total_len,
+    /// head_dim]` shape, or `None` before any step ran. Reads the growable host
+    /// cache the CPU decode path leaves in `self.past` keyed by the past-input
+    /// name; the caller slices out the freshly-decoded tokens with the same
+    /// `extract_present_token` geometry the ORT decoder uses.
+    pub(crate) fn host_present_kv(&self, past_name: &str) -> Option<(Vec<f32>, Vec<usize>)> {
+        self.past
+            .get(past_name)
+            .map(|tensor| (tensor.to_vec_f32(), tensor.shape.clone()))
+    }
+
+    /// Seed the growable host KV cache from a materialized paged prefix so a
+    /// later request that shares a prompt prefix resumes without recomputing it.
+    ///
+    /// `entries` are `(past_input_name, row_major_f32, shape)` triples the caller
+    /// built from the paged cache with the same `[1, num_kv_heads, seq, head_dim]`
+    /// layout the ORT decoder injects (`kv_bridge::past_shape`), so native and
+    /// ORT prefix reuse are byte-identical. Only valid on the host-growable path
+    /// (`supports_host_kv_mirror`).
+    pub(crate) fn seed_growable_kv(
+        &mut self,
+        entries: Vec<(String, Vec<f32>, Vec<usize>)>,
+        current_len: usize,
+    ) -> anyhow::Result<()> {
+        if self.cuda.is_some() || self.cpu_kv.is_some() {
+            bail!(
+                "native paged prefix reuse requires the host-growable KV path; this session keeps \
+                 KV device-resident or in-place (Inc-D)"
+            );
+        }
+        for (name, data, shape) in entries {
+            let tensor = Tensor::from_f32(&shape, &data)
+                .with_context(|| format!("seed native paged prefix KV '{name}'"))?;
+            self.past.insert(name, tensor);
+        }
+        self.current_len = current_len;
+        Ok(())
+    }
+
     /// Build the per-step `position_ids` tensor for the half-open sequence range
     /// `[past_len, total_len)`, honoring the decoder's declared coordinate rank.
     ///

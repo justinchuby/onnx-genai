@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use onnx_genai_engine::pipeline::PipelineGenerateRequest;
+use onnx_genai_engine::pipeline::{PipelineEngine, PipelineGenerateRequest};
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
 };
@@ -203,4 +203,138 @@ fn pure_native_pipeline_selection_matches_ort_and_hybrid() -> anyhow::Result<()>
 
 fn cuda_device_visible() -> bool {
     std::env::var_os("CUDA_VISIBLE_DEVICES").is_some()
+}
+
+/// One decode turn over `fixture` on an already-built engine, with an explicit
+/// prompt and token budget. Used to drive two prefix-sharing requests through
+/// the *same* engine so the paged prefix cache persists between them.
+fn run_turn(
+    engine: &mut PipelineEngine,
+    prompt: Vec<u32>,
+    max_new_tokens: usize,
+) -> anyhow::Result<Vec<u32>> {
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));
+    request.options = GenerateOptions {
+        max_new_tokens,
+        temperature: 0.0,
+        stop_on_eos: false,
+        ..GenerateOptions::default()
+    };
+    let pipeline_request = PipelineGenerateRequest::new(request)
+        .with_input("vision_encoder.pixel_values", tiny_pixels()?);
+    Ok(engine
+        .generate_with_pipeline_request(pipeline_request)?
+        .token_ids)
+}
+
+/// A single cold decode of `prompt` under `selection` on a fresh engine — no
+/// prior turn, so nothing is reused. Serves as the reuse-independent oracle for
+/// the warm run below.
+fn cold_tokens(
+    fixture: &str,
+    selection: Selection,
+    prompt: Vec<u32>,
+    max_new_tokens: usize,
+) -> anyhow::Result<Vec<u32>> {
+    clear_env();
+    let mut config = EngineConfig {
+        page_size: 2,
+        ..EngineConfig::default()
+    };
+    match selection {
+        Selection::Ort => config.decode_backend = EngineDecodeBackend::Ort,
+        Selection::PureNative => config.decode_backend = EngineDecodeBackend::Native,
+        Selection::HybridEnv => {
+            config.decode_backend = EngineDecodeBackend::Ort;
+            unsafe {
+                std::env::set_var(NATIVE_DECODER_ENV, "decoder");
+                std::env::set_var(NATIVE_STEP_COMPONENTS_ENV, "embedding");
+            }
+        }
+    }
+    let result = (|| {
+        let mut engine = Engine::from_pipeline_dir(&fixture_dir(fixture), config)?;
+        run_turn(&mut engine, prompt, max_new_tokens)
+    })();
+    clear_env();
+    result
+}
+
+/// GAP-3 Inc-C — paged native pipeline decode with cross-request KV reuse.
+///
+/// Inc-A drove the pure-native pipeline through the *non-paged* flat-AR path.
+/// Inc-C closes the S2 present-KV mirror bail
+/// (`pipeline/decoder_component.rs` `NativePipelineDecoder::mirror_last_present_kv`)
+/// and adds `load_paged_prefix`, so the native decoder now pages its KV: it
+/// mirrors each step's present KV into the shared paged cache **and** seeds a
+/// materialized prefix back out of it, through the same `kv_bridge` geometry the
+/// ORT decoder uses.
+///
+/// Two prefix-sharing requests run through ONE pure-native engine over
+/// `tiny-gemma4-vlm` (naive/Concat-KV decoder → host-growable f32 KV →
+/// `supports_paged_kv`). The test asserts, together:
+///   * **reuse engaged** — the warm request reuses `> 0` prefix tokens, proving
+///     the mirror-write actually populated the pages and the seed-read consumed
+///     them (a silent full-prefill fallback would report zero);
+///   * **geometry correct** — the warm tokens equal both a cold pure-native run
+///     and the ORT oracle; a wrong head/page/seq-offset layout in the mirror or
+///     seed would diverge the tokens here.
+///
+/// Non-vacuity: if construction reverts to the S2 bail the paged native run
+/// `?`-errors; if the mirror/seed geometry is wrong the token asserts fire; if
+/// reuse silently no-ops the `reused > 0` assert fires.
+#[test]
+fn native_paged_prefix_reuse_matches_fresh_and_ort() -> anyhow::Result<()> {
+    const FIXTURE: &str = "tiny-gemma4-vlm";
+    // Shared prefix, then a continuation that shares it — the second request must
+    // reuse the first's mirrored KV rather than re-prefilling the whole prompt.
+    let shared_prompt = vec![3u32, 7, 0, 5];
+    let warm_prompt = vec![3u32, 7, 0, 5, 6];
+
+    // Reuse-independent oracles for the warm prompt.
+    let ort_cold = cold_tokens(FIXTURE, Selection::Ort, warm_prompt.clone(), 3)?;
+    let native_cold = cold_tokens(FIXTURE, Selection::PureNative, warm_prompt.clone(), 3)?;
+    assert_eq!(
+        native_cold, ort_cold,
+        "cold pure-native paged decode diverged from the ORT oracle"
+    );
+
+    // One pure-native engine, two turns: the first primes the prefix cache via
+    // the native present-KV mirror; the second reuses it via load_paged_prefix.
+    clear_env();
+    let mut config = EngineConfig {
+        page_size: 2,
+        ..EngineConfig::default()
+    };
+    config.decode_backend = EngineDecodeBackend::Native;
+    let outcome = (|| -> anyhow::Result<(Vec<u32>, usize)> {
+        let mut engine = Engine::from_pipeline_dir(&fixture_dir(FIXTURE), config)?;
+        let _first = run_turn(&mut engine, shared_prompt.clone(), 2)?;
+        engine.reset_cache_stats();
+        let warm = run_turn(&mut engine, warm_prompt.clone(), 3)?;
+        let reused = engine.cache_stats().prefix_reused_tokens as usize;
+        Ok((warm, reused))
+    })();
+    clear_env();
+    let (warm, reused) = outcome?;
+
+    assert!(
+        reused > 0,
+        "paged native decode must reuse the shared prefix (reused {reused} tokens); \
+         zero reuse means the present-KV mirror never populated the pages"
+    );
+    assert_eq!(
+        warm, native_cold,
+        "warm native prefix reuse diverged from a cold native run — the mirrored/seeded \
+         present-KV geometry is wrong"
+    );
+    assert_eq!(
+        warm, ort_cold,
+        "warm native prefix reuse diverged from the ORT oracle"
+    );
+    eprintln!(
+        "gap3 inc-c paged native reuse: reused={reused} warm={warm:?} native_cold={native_cold:?} \
+         ort_cold={ort_cold:?}"
+    );
+    Ok(())
 }
