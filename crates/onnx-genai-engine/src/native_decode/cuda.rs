@@ -1487,6 +1487,131 @@ impl DecodeCudaState {
         Ok(())
     }
 
+    /// Whether every self-attention KV binding is a rank-4 f32 device cache
+    /// (`[1, num_kv_heads, max_len, head_dim]`), the only device-resident layout
+    /// GAP-3 Inc-D lifts onto the paged path. f16 / non-rank-4 caches stay gated
+    /// to the non-paged fallback (they would not round-trip losslessly through
+    /// the f32 paged store, and their geometry is a later increment).
+    pub(crate) fn kv_bindings_f32_rank4(&self) -> bool {
+        let range = self.kv_binding_range.clone();
+        if range.is_empty() {
+            return false;
+        }
+        self.bindings[range].iter().all(|binding| {
+            binding.dtype == DataType::Float32 && binding.physical_shape().len() == 4
+        })
+    }
+
+    /// Read the most recent step's accumulated present KV out of the device
+    /// binding whose past-input port is `past_name`, as a host f32 buffer plus
+    /// the shape whose row-major strides address it (GAP-3 Inc-D).
+    ///
+    /// The buffer returned is the FULL capacity-padded allocation
+    /// (`[1, H, max_len, head_dim]`), and the shape returned is the matching
+    /// **physical/capacity** shape — see [`device_present_kv_view`] for why the
+    /// physical (not logical valid) shape is the one that correctly strides the
+    /// padded buffer. The caller slices out the freshly-decoded tokens with the
+    /// same `extract_present_token` geometry the host-growable and ORT paths use,
+    /// so all three mirror byte-identical pages.
+    ///
+    /// Runs after the decode step's own device→host sync (the KV bindings hold
+    /// the committed present KV once the step returns), so no extra
+    /// synchronization is required here — this is a pure post-step reader,
+    /// mirroring the per-step logits read in [`Self::read_logits`].
+    pub(crate) fn read_present_kv(
+        &mut self,
+        past_name: &str,
+    ) -> anyhow::Result<Option<(Vec<f32>, Vec<usize>)>> {
+        let Some(index) = self
+            .kv_binding_range
+            .clone()
+            .find(|&idx| self.bindings[idx].input_name() == past_name)
+        else {
+            return Ok(None);
+        };
+        let binding = &mut self.bindings[index];
+        let physical_shape = binding.physical_shape().to_vec();
+        let bytes = binding
+            .read_bytes()
+            .with_context(|| format!("read device present KV for '{past_name}'"))?;
+        let tensor = Tensor::from_raw(DataType::Float32, physical_shape.clone(), &bytes)
+            .with_context(|| format!("interpret device present KV bytes for '{past_name}'"))?;
+        Ok(Some(device_present_kv_view(
+            tensor.to_vec_f32(),
+            &physical_shape,
+            binding.logical_shape(),
+        )))
+    }
+
+    /// Seed a materialized paged prefix into the device KV bindings so a request
+    /// that shares a prompt prefix resumes without recomputing it (GAP-3 Inc-D
+    /// device counterpart of the host-growable [`NativeDecodeSession::seed_growable_kv`]).
+    ///
+    /// `entries` are `(past_input_name, row_major_f32, [1, H, seq_len, head_dim])`
+    /// triples — the same compact prefix layout the host path seeds. Because the
+    /// device buffer is capacity-strided (`max_len`) while the prefix is compact
+    /// (`seq_len`), each head is written into its own capacity-offset slot rather
+    /// than as one contiguous blob. The attention-mask prefix `[0, seq_len)` is
+    /// marked attendable (the per-step decode only extends `[seq_len, total)`),
+    /// and the KV logical length is advanced so the next step appends at
+    /// `seq_len`.
+    pub(crate) fn seed_prefix(
+        &mut self,
+        session: &mut InferenceSession,
+        entries: &[(String, Vec<f32>, Vec<usize>)],
+        seq_len: usize,
+    ) -> anyhow::Result<()> {
+        if seq_len == 0 {
+            bail!("device paged prefix reuse requires a non-empty prefix");
+        }
+        self.ensure_capacity(session, seq_len)?;
+        for (name, data, shape) in entries {
+            let Some(index) = self
+                .kv_binding_range
+                .clone()
+                .find(|&idx| self.bindings[idx].input_name() == name)
+            else {
+                bail!("device paged prefix names unknown KV past input '{name}'");
+            };
+            let binding = &mut self.bindings[index];
+            let physical = binding.physical_shape().to_vec();
+            let heads = physical[1];
+            let head_dim = physical[3];
+            let max_len = physical[2];
+            let expected = vec![1_usize, heads, seq_len, head_dim];
+            if shape != &expected {
+                bail!(
+                    "device paged prefix KV '{name}' shape {shape:?} does not match the binding's \
+                     [1, {heads}, {seq_len}, {head_dim}] capacity layout"
+                );
+            }
+            if data.len() != heads * seq_len * head_dim {
+                bail!(
+                    "device paged prefix KV '{name}' has {} values, expected {}",
+                    data.len(),
+                    heads * seq_len * head_dim
+                );
+            }
+            let compact_head_stride = seq_len * head_dim;
+            let capacity_head_stride = max_len * head_dim;
+            for head in 0..heads {
+                let compact = &data[head * compact_head_stride..(head + 1) * compact_head_stride];
+                let bytes = compact
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>();
+                binding.write_bytes(
+                    head * capacity_head_stride * std::mem::size_of::<f32>(),
+                    &bytes,
+                )?;
+            }
+        }
+        self.set_logical_len(seq_len)?;
+        let expose = self.decode_mask_expose_len(seq_len);
+        self.extend_mask(0, seq_len, expose)?;
+        Ok(())
+    }
+
     pub(crate) fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len < self.logical_len {
             let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
@@ -2098,4 +2223,85 @@ pub(crate) fn cuda_device_memory_snapshot(
     _device_id: i32,
 ) -> anyhow::Result<CudaDeviceMemorySnapshot> {
     bail!("CUDA free-memory query requires the onnx-genai-engine `cuda` feature")
+}
+
+/// Pair a capacity-padded device KV read-out with the shape whose row-major
+/// strides address it. Returns the **physical/capacity** shape
+/// (`[1, H, max_len, head_dim]`), NOT the logical valid shape
+/// (`[1, H, valid_len, head_dim]`).
+///
+/// The device buffer is allocated at `max_len` in the sequence axis and never
+/// re-packed, so the head-axis stride is `max_len * head_dim`. Feeding the
+/// logical valid shape to [`extract_present_token`] would instead compute a head
+/// stride of `valid_len * head_dim` and, whenever `max_len > valid_len` and
+/// `H > 1`, silently read the wrong head rows (the sequence and head-dim strides
+/// coincide at `H == 1`, so the bug is invisible for single-head caches). This is
+/// the one device-specific geometry decision Inc-D adds on top of the Inc-C host
+/// mirror; [`device_kv_view_uses_physical_stride`] pins it at `H == 2`.
+fn device_present_kv_view(
+    buffer: Vec<f32>,
+    physical_shape: &[usize],
+    _logical_shape: &[usize],
+) -> (Vec<f32>, Vec<usize>) {
+    (buffer, physical_shape.to_vec())
+}
+
+#[cfg(test)]
+mod device_kv_view_tests {
+    use super::device_present_kv_view;
+    use crate::kv_bridge::extract_present_token;
+    use onnx_genai_kv::{KvDType, PageTensorConfig};
+
+    /// A capacity-padded KV buffer read from a device binding must be addressed by
+    /// its **physical** shape, not its logical valid length. This reproduces the
+    /// exact production read+extract composition at `H == 2, max_len=4, valid=2`
+    /// (the geometry is invisible at the `H == 1` integration fixture) and proves
+    /// the physical stride recovers the two valid heads while the logical stride —
+    /// the Inc-D-specific "max_len wrinkle" bug — reads the padding instead.
+    #[test]
+    fn device_kv_view_uses_physical_stride() {
+        let heads = 2usize;
+        let max_len = 4usize;
+        let valid = 2usize;
+        let head_dim = 2usize;
+        // Row-major [1, H, max_len, head_dim]; valid tokens carry distinctive
+        // values, padded tail carries a sentinel that must never be read back.
+        let mut buffer = vec![-999.0f32; heads * max_len * head_dim];
+        for head in 0..heads {
+            for seq in 0..valid {
+                for dim in 0..head_dim {
+                    let value = (head as f32 + 1.0) * 100.0 + seq as f32 * 10.0 + dim as f32;
+                    buffer[head * max_len * head_dim + seq * head_dim + dim] = value;
+                }
+            }
+        }
+        let physical = vec![1usize, heads, max_len, head_dim];
+        let logical = vec![1usize, heads, valid, head_dim];
+        let config = PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: heads,
+            head_dim,
+            page_size: 1,
+            dtype: KvDType::F32,
+        };
+
+        // Production view: physical shape.
+        let (data, shape) = device_present_kv_view(buffer.clone(), &physical, &logical);
+        assert_eq!(shape, physical, "device view must carry the physical shape");
+        let shape_i64 = shape.iter().map(|&d| d as i64).collect::<Vec<_>>();
+        let token0 = extract_present_token(&data, &shape_i64, config, 0).unwrap();
+        let token1 = extract_present_token(&data, &shape_i64, config, 1).unwrap();
+        assert_eq!(token0, vec![100.0, 101.0, 200.0, 201.0]);
+        assert_eq!(token1, vec![110.0, 111.0, 210.0, 211.0]);
+
+        // The logical valid shape (the max_len wrinkle bug) reads padding for the
+        // second head — so a physical→logical mutation of the production view
+        // diverges here, keeping the reader non-vacuous at H >= 2.
+        let logical_i64 = logical.iter().map(|&d| d as i64).collect::<Vec<_>>();
+        let wrong0 = extract_present_token(&buffer, &logical_i64, config, 0).unwrap();
+        assert_ne!(
+            wrong0, token0,
+            "logical-stride read must diverge from the physical-stride read at H >= 2"
+        );
+    }
 }
