@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::{GenAiConfigError, GenAiVision, GraphTensorInfo, incomplete, required_str};
+use crate::{
+    GenAiConfigError, GenAiVision, GraphTensorInfo, incomplete, required_str,
+    unrepresentable_preprocessing,
+};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProcessorConfig {
@@ -49,8 +52,8 @@ pub(crate) fn processor_program_json(
                 let height = required_attr_u32(&operation.attrs, "height", "Resize")?;
                 let smart_resize = required_attr_flag(&operation.attrs, "smart_resize", "Resize")?;
                 if smart_resize {
-                    return Err(incomplete(
-                        "processor Resize.attrs.smart_resize=false; smart resize is not representable by the runtime's stretch/crop/pad resize modes",
+                    return Err(unrepresentable_preprocessing(
+                        "processor Resize.attrs.smart_resize=true; smart resize is not representable by the runtime's stretch/crop/pad resize modes",
                     ));
                 }
                 transforms.push(json!({
