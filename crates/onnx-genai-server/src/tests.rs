@@ -3596,3 +3596,58 @@ async fn the_trace_endpoint_points_at_the_aggregate_profile() {
         "body: {body}"
     );
 }
+
+/// `/v1/resources` reports on a running batch, so parking its snapshot until the
+/// batch drains makes it readable only when there is nothing to report. This is
+/// asserted against `handle_or_defer_during_batch` rather than through the HTTP
+/// stack on purpose: the test fixtures generate in under a millisecond, so a
+/// racing integration test cannot land a request inside the batch window and
+/// passes whether or not the bug is present.
+#[tokio::test]
+async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let deferred = crate::driver::handle_or_defer_during_batch(
+        &engine,
+        crate::driver::DriverCommand::ResourceSnapshot(reply),
+    );
+
+    assert!(
+        deferred.is_none(),
+        "a resource snapshot was pushed to the deferred queue; /v1/resources will \
+         appear to hang until every in-flight generation completes"
+    );
+    rx.await
+        .expect("the snapshot reply channel was dropped without an answer")
+        .expect("the snapshot itself failed");
+}
+
+/// The complement: commands that *reconfigure* the engine must still be parked until the
+/// batch drains. This pins the helper's contract to "answer read-only observability",
+/// not "answer anything".
+#[tokio::test]
+async fn mutating_commands_are_still_deferred() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    let deferred = crate::driver::handle_or_defer_during_batch(
+        &engine,
+        crate::driver::DriverCommand::SetVramLimit {
+            limit: onnx_genai_engine::ResourceLimit::Auto,
+            reply,
+        },
+    );
+
+    assert!(
+        matches!(
+            deferred,
+            Some(crate::driver::DriverCommand::SetVramLimit { .. })
+        ),
+        "a command requiring &mut Engine must stay deferred"
+    );
+}
