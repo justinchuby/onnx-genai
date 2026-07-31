@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-07-31T03:03:15Z (Scribe round 7 — rank-3 mrope native-CUDA hybrid decode == ORT landmark #543, hybrid loader-unblock #535, POD value-clone #540, capture-flag class finding #541, device weight offload #444/#63; round-6 narrative in archive)
+Last consolidated: 2026-07-31T08:48:28Z (Scribe round 8 — #544 async page-in inc1, #552 observability, #554 session-reuse fix, 27B offload A/B, GQA capture; round-7+MoE in archive)
 
 Standing governance rules and constraints. Dated wave records and historical ledger updates
 are archived to `.squad/decisions-archive/2026-07.md`.
@@ -260,22 +260,14 @@ NEVER `to_raw_bytes()`. Unblocked the gemma-3n Bool audio mask.
   repeatable). Do NOT re-try that lever** (reduction tax > sub-wave grid-fill); a K_SPLIT>2 new
   kernel with its own A/B is the future candidate.
 
-## MoE / large-model native-CUDA status (Mary) — standing note
+## 2026-07-31 — Scribe consolidation (round 8)
 
-- **Qwen3.6-27B int4 native-CUDA == ORT-CPU** for the first 16 greedy tokens (real weights), via
-  general fixes: rank-3 Conv1D CUDA (#438), `com.microsoft::Silu` unary shape inference, and
-  **persistent device state through control flow** (bound CF inputs made readable + CF outputs reuse
-  the external-output-aware storage so `present.*.recurrent_state` replaces `past.*`; general across
-  If/Loop/Scan). CUDA `TopK` supports fp16/bf16 router scores.
-- **Qwen3.6-35B-A3B** exports `mixture_of_experts.representation: dense_fallback` (256 experts →
-  117k decoder nodes), so it does NOT exercise the #82 routed-expert contract or #63 expert
-  offload. Efficient MoE needs a Mobius routed-expert representation + the #82 kernel contract.
+**By:** Scribe. Merged: #544 #552 #554. Wave narrative in archive.
 
-## 2026-07-31 — Scribe consolidation (round 7)
-
-**By:** Scribe. Wave folded into the directives above (per-PR narrative in the archive): #543/#535/
-#540/#541 plus context merges #444(#63)/#484/#480/#438 and Möbius **mobius#434** (inference-metadata
-for #377; native side complete via #382/#412). Held: **#534** (Harry, server contracts #481/#482,
-Melina APPROVED) targets Justin's branch `feat/genai-demo-dashboard` (PR #476), not on main.
-In flight: gemma-3n vision-optional text-only decode; #87 async weight prefetch (awaiting
-green-light); 35B-A3B routed-expert MoE representation.
+- **#544 async page-in inc1** (Cohaagen; Harry test fix; Melina RC→APPROVE): `cuMemcpyHtoDAsync`+`compute_wait_fence`; eviction re-serializes (WAR). ~1% at 2 MiB; byte-identical all budgets. `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` default ON.
+- **#552 profile_native observability** (Cohaagen; Lori APPROVE): `load_with_resolved_io` — genai_config decoders print `cuda_graph captures/fallbacks/fallback_report` + `--trace` capture-reject reasons.
+- **GQA capture validated** (Cohaagen): Qwen2.5-0.5B int4 GQA ON 2.14× eager, byte-identical, zero declines. Gemma-4-E2B: stale export (vision fn 2 vs 4 outputs) + GAP-3 (native pipeline unimplemented).
+- **27B offload A/B** (Mary, H200): Qwen3.6-27B int4, 2 GiB → 6.2 GiB peak VRAM (2.9× vs 17.7 GiB), byte-exact. Cliff: ≤12 GiB → 0.11 tok/s. cuda_graph off under offload.
+- **#553/#554 session-reuse fix** (Mary; Harry APPROVED): conv_state/recurrent_state not zeroed between generates in `NativeDecodeSession`. Not graph-capture related.
+- **Native pipeline keystone** (Mary): `native_full_pipeline_parity` — native embedding + native decoder → `[0,5,6,7] == ORT` (`tiny-gemma4-vlm`).
+In flight: #87 inc2 double-buffer; native paged-KV; 35B-A3B MoE; gemma-3n text-only.

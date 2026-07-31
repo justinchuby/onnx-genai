@@ -1,37 +1,9 @@
 # mary — History
 
-## 2026-07-30T04:10:00Z — Reduction and shape-aware CUDA claim-gate work
+## Role
+Lead engineer, large-model memory and multi-component pipeline decode. Owns the native pipeline seam (#384 increments), weight-offload A/B on 27B+ models, and 35B-A3B bring-up.
 
-- Authored PR #420 to widen extended reductions to f16/bf16 with f32 accumulation; merged as `6610f86f`, clearing the native 27B FP16 `ReduceSumSquare` CUDA fallback.
-- Revised PR #424 at `93d9e7b8` with `require_input_rank`, making CUDA claim gates shape-aware so deferred ranks retain CPU fallback instead of being treated as unsupported static shapes.
-
-## 2026-07-27T09:00:00Z — DeepSeek/GLM native-CUDA bring-up and R1 GQA resolution
-
-- Established native-CUDA viability for DeepSeek-Coder and DeepSeek-V2-Lite with ORT token-exact greedy decode; GLM native CUDA is coherent but lacks an ORT-CUDA oracle because ORT rejects its authored GQA rotary attribute.
-- Confirmed DeepSeek-V2-Lite QMoE resident CUDA correctness, while documenting that advertised weight-offload knobs do not yet activate CUDA expert paging for this path.
-- Resolved the R1-Distill divergence as an ORT-CUDA fp16 near-tie outlier: native token 374 is correct/more accurate than ORT-CUDA token 315. Landed PR #430 (`5c49c891`) with GQA 6:1 non-interleaved-rotary decode regressions at head_dim 64 and 128.
-
-## 2026-07-30T07:20:00Z — Qwen3.6-27B persistent recurrent-state bindings
-
-- Confirmed the Qwen 27B Unsqueeze blocker was already resolved, then generalized native CUDA persistent state allocation so metadata-declared fixed rank-3 `conv_state`/recurrent state uses static replace semantics instead of rank-4 KV capacity growth. The graph now reaches the next blocker: unsupported rank-3/1-D CUDA Conv.
-
-## 2026-07-30T09:16:00Z — 27B Conv and Silu blocker chain
-
-- PR #438 merged native CUDA rank-3 Conv1D support, advancing the Qwen3.6-27B probe past `__fn0_Conv_node_12`.
-- PR #440 supplies `com.microsoft::Silu` unary shape inference and is in review; the next observed blocker is `value#1414 not produced`.
-
-## 2026-07-30T13:36:00Z — Issue #445 delivered; #35B-A3B unblocked; #384 scoped
-
-- PR #445 merged (TopK fp16/bf16 CUDA parity). Independently conducted native-CUDA correctness bring-up on DeepSeek-Coder, DeepSeek-V2-Lite (26-QMoE), DeepSeek-R1, GLM-4: exact token parity on Coder/V2-Lite, R1 isolated to GQA/KV parity gap, GLM-4 native coherent.
-- Cleared three 35B-A3B blockers: (1) generalized CUDA persistent-state binding to rank-3 `conv_state`; (2) added CUDA Conv rank-3 NCL with depthwise causal; (3) registered `com.microsoft::Silu` v1 unary shape inference (PRs #437, #438, #440 all merged).
-- Status: 35B-A3B now unblocked from empirical decode measurement; next blocker is `value#1414` executor error at graph lowering.
-- Issue #384 scoped: three increments to make `PipelineDecodeLoopBackend` drive native components. Inc1 routes `every_step` through `ComponentSession` trait; value seam is backend-neutral host-resident `ComponentTensor`. Proving native embedding in hybrid loop (embedding native, decoder ORT) with token parity as Inc1 deliverable.
-
-## 2026-07-30T15:20:00Z — Native pipeline Inc2a + Inc2b merged (#478, #479)
-
-- PR #478 merged (Melina APPROVED): Inc2a pure refactor — stateful `PipelineDecoderComponent` trait + `OrtPipelineDecoder`; `PipelineDecodeLoopBackend` drives the decoder through the trait. Behaviour-identical (e2e token output unchanged + explicit equivalence assertion).
-- PR #479 merged (Lori APPROVED, instrumented proof): Inc2b `NativePipelineDecoder` device-KV decoder — KV stays device-resident, one embedding uploaded/step, static cross-KV uploaded once. Token parity `[0,5,6,7] == ORT` on a small CPU model. Native step extended for routed/`inputs_embeds` inputs.
-- In flight: Inc3 (CUDA native decoder — device-KV paged mirroring + cross-component/vision, full 35B-A3B on native), PR pending.
+_Entries before 2026-07-30T21:15 archived to `history-archive.md` (Scribe round 8). Archived: CUDA reduction/claim-gate, DeepSeek/GLM bring-up, 27B persistent-state, Conv/Silu blockers, #445 TopK, Inc1/Inc2a/Inc2b pipeline._
 
 ## 2026-07-30T21:15:00Z — Native pipeline Inc3a + Inc3b merged (#485, #487)
 
@@ -51,3 +23,9 @@
 - DRY pattern (reuse this): shared `decode::position_ids_from_starts(starts, input_len)` factored from ORT `build_position_step`, called by BOTH ORT and native drivers. Coordinate rank comes from the declared `position_ids` shape via `declared_position_rank` (rank 2 → 1 legacy `[1,S]`; rank 3 → static leading dim; symbolic → loud error) — NO hardcode-to-3, NO model-name gate; stored once on `NativeDecodeSession`+`DecodeCudaState`.
 - Execution gap fixed: ep-cuda `range.rs` rejected `[1]`-shaped single-element scalars (the mrope `k_mrope/range/Range` gap). Lesson: 100% CUDA placement is NOT execution — a covered op can still reject a real graph's tensor shape (#529 placement != #543 execution).
 - PR #541 merged (validation-only): capture-step-inputs flag only engages for multi-component `inputs_embeds` decoders; qwen3-0.6b is the wrong class (single-component, `Engine::from_dir`, counter=0 DECLINE proven GREEN via `qwen3_0_6b_capture_step_inputs_decline`). Its 614/206/433 tok/s beats-ORT-1.42× is the token-id CUDA-graph lever, not the capture flag. Keep default-off until a real-weights `inputs_embeds` model runs it e2e.
+
+## 2026-07-31T08:48:28Z — 27B offload A/B proven; session-reuse fix #554; pipeline keystone test
+
+- **27B offload A/B (H200):** Qwen3.6-27B int4 (497 MatMulNBits). 2 GiB budget → 6.2 GiB peak VRAM (2.9× vs 17.7 GiB resident), byte-exact at all budgets. Cliff: ≤12 GiB → 0.11 tok/s (bandwidth-bound, whole working set evicted/token). cuda_graph auto-off under offload. Action item: add `model.io` block to canonical int4-cuda package.
+- **#553 bug found (#554 MERGED, Harry APPROVED):** `NativeDecodeSession` 2nd+ generation returns garbage — conv_state/recurrent_state not zeroed between generates. Not graph-capture related. Fixed.
+- **Native pipeline keystone test:** `native_full_pipeline_parity` drives `tiny-gemma4-vlm` with native embedding + native decoder simultaneously → `[0,5,6,7] == ORT`. Closes composite-native safety gap ahead of 35B-A3B wiring.
