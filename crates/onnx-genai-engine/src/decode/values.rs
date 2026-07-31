@@ -163,7 +163,15 @@ pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
             .map_err(|e| anyhow::anyhow!("Failed to clone BFloat16 ORT value: {e}")),
         DataType::Int64 => Value::from_slice_i64(&value.to_vec_i64()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Int64 ORT value: {e}")),
-        dtype => anyhow::bail!("unsupported cached ORT value dtype: {dtype:?}"),
+        // General, dtype-agnostic fallback: deep-copy the raw little-endian
+        // element bytes for every remaining POD dtype (Bool, Int32, Int8,
+        // Uint8/16/32/64, Int16, Float8*) instead of bailing per dtype. This is
+        // what unblocks e.g. gemma-3n's Bool audio mask. `as_raw_bytes` returns a
+        // precise error for a device-resident tensor rather than misreading a
+        // device pointer as host memory, so a stray device value fails loudly
+        // instead of corrupting silently.
+        dtype => Value::from_raw_bytes(value.as_raw_bytes()?.to_vec(), value.shape(), dtype)
+            .map_err(|e| anyhow::anyhow!("Failed to clone {dtype:?} ORT value: {e}")),
     }
 }
 
@@ -339,4 +347,62 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
     lower.contains("gather")
         && (lower.contains("indices element out of data bounds")
             || lower.contains("idx=") && lower.contains("out of"))
+}
+
+#[cfg(test)]
+mod clone_value_tests {
+    use super::*;
+
+    /// `clone_value` deep-copies a cached decode input. Before generalization it
+    /// bailed with "unsupported cached ORT value dtype: Bool" (and likewise for
+    /// Int32/Uint8/...), which blocked gemma-3n's Bool audio mask. It must now
+    /// round-trip dtype + shape + raw bytes for every POD dtype.
+    fn assert_clone_value_round_trips(bytes: Vec<u8>, shape: &[i64], dtype: DataType) {
+        let original = Value::from_raw_bytes(bytes.clone(), shape, dtype)
+            .unwrap_or_else(|e| panic!("build {dtype:?} cached input: {e}"));
+        let cloned =
+            clone_value(&original).unwrap_or_else(|e| panic!("clone_value {dtype:?}: {e}"));
+
+        assert_eq!(cloned.dtype(), dtype, "{dtype:?}: dtype must round-trip");
+        assert_eq!(cloned.shape(), shape, "{dtype:?}: shape must round-trip");
+        assert_eq!(
+            cloned.to_raw_bytes().expect("cloned bytes"),
+            bytes,
+            "{dtype:?}: raw bytes must round-trip identically"
+        );
+    }
+
+    #[test]
+    fn clone_value_round_trips_a_bool_cached_input() {
+        // The gemma-3n audio-mask case: a Bool cached input that used to bail.
+        assert_clone_value_round_trips(vec![1, 0, 1, 1, 0], &[5], DataType::Bool);
+    }
+
+    #[test]
+    fn clone_value_round_trips_int32() {
+        let bytes: Vec<u8> = [10i32, -20, 30]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_clone_value_round_trips(bytes, &[3], DataType::Int32);
+    }
+
+    #[test]
+    fn clone_value_round_trips_an_empty_bool_input() {
+        assert_clone_value_round_trips(Vec::new(), &[0], DataType::Bool);
+    }
+
+    #[test]
+    fn clone_value_round_trips_a_multidim_bool_mask() {
+        assert_clone_value_round_trips(vec![1, 0, 0, 1, 1, 0], &[2, 3], DataType::Bool);
+    }
+
+    #[test]
+    fn clone_value_still_round_trips_the_typed_i64_fast_path() {
+        // The generalization must not regress the existing typed dtypes.
+        let original = Value::from_slice_i64(&[9, 8, 7], &[3]).expect("i64 cached input");
+        let cloned = clone_value(&original).expect("clone i64");
+        assert_eq!(cloned.dtype(), DataType::Int64);
+        assert_eq!(cloned.to_vec_i64().expect("i64 out"), vec![9, 8, 7]);
+    }
 }
