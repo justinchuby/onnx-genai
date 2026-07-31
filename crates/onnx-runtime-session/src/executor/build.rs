@@ -516,6 +516,8 @@ impl Executor {
             decode_view_plan_disabled: false,
             compute_in_place_enabled: compute_in_place_env_enabled(),
             compute_in_place_alias_count: 0,
+            scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
+            scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
         };
 
@@ -1351,6 +1353,15 @@ impl Executor {
             self.decode_views_reused_count,
             self.decode_dispatch_elided_count,
         )
+    }
+
+    /// How many times the single-trip `Scan` inline path engaged over this
+    /// executor's lifetime. `> 0` after a decode run proves the dual-path is
+    /// non-vacuously firing (an on-model A/B reads this to reject a silently
+    /// gated-out pass); stays 0 whenever the flag is OFF or every `Scan` runs at
+    /// `trip_count != 1`.
+    pub(crate) fn scan_inline_single_trip_count(&self) -> u64 {
+        self.scan_inline_single_trip_count
     }
 
     /// F5 Stage 2 replay guard: every retained view's source buffer must still be
