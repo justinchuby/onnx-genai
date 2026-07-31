@@ -156,6 +156,48 @@ impl NativeDecodeSession {
         })
     }
 
+    /// Whether this session keeps its self-attention KV **device-resident** in
+    /// rank-4 f32 CUDA bindings that can be read out for paged present-KV
+    /// mirroring and re-seeded from a materialized paged prefix (GAP-3 Inc-D).
+    ///
+    /// This is the device-resident counterpart of
+    /// [`supports_host_kv_mirror`](Self::supports_host_kv_mirror): it lifts the
+    /// Inc-C gate for a native CUDA decoder whose present-KV lives in device
+    /// buffers, landing that KV in the *same* host f32 paged store via the same
+    /// `extract_present_token` / `append_token_kv` geometry (a mechanical device
+    /// read-out, [`DecodeCudaState::read_present_kv`]). f16 / non-rank-4 device
+    /// caches stay gated to the non-paged fallback — no silent-wrong paged run.
+    pub(crate) fn supports_device_kv_mirror(&self) -> bool {
+        if self.kv_inputs.is_empty() {
+            return false;
+        }
+        self.cuda
+            .as_ref()
+            .is_some_and(DecodeCudaState::kv_bindings_f32_rank4)
+    }
+
+    /// The most recent step's accumulated present KV for one self-attention past
+    /// input, as a host f32 buffer plus the shape whose row-major strides address
+    /// it, or `None` before any step ran / when the past input is unknown.
+    ///
+    /// Unifies the host-growable path (GAP-3 Inc-C — the growable host cache the
+    /// CPU decode path leaves in `self.past`, returned with its compact
+    /// `[1, num_kv_heads, total_len, head_dim]` shape) and the device-resident
+    /// path (GAP-3 Inc-D — the capacity-padded CUDA binding, returned with its
+    /// physical `[1, num_kv_heads, max_len, head_dim]` shape). In both cases the
+    /// caller slices out the freshly-decoded tokens with the same
+    /// `extract_present_token` geometry the ORT decoder uses, so all three paths
+    /// mirror byte-identical pages.
+    pub(crate) fn present_kv(
+        &mut self,
+        past_name: &str,
+    ) -> anyhow::Result<Option<(Vec<f32>, Vec<usize>)>> {
+        if let Some(cuda) = self.cuda.as_mut() {
+            return cuda.read_present_kv(past_name);
+        }
+        Ok(self.host_present_kv(past_name))
+    }
+
     /// The most recent step's accumulated present KV for one self-attention past
     /// input, as a host f32 buffer plus its `[1, num_kv_heads, total_len,
     /// head_dim]` shape, or `None` before any step ran. Reads the growable host
@@ -192,6 +234,42 @@ impl NativeDecodeSession {
                 .with_context(|| format!("seed native paged prefix KV '{name}'"))?;
             self.past.insert(name, tensor);
         }
+        self.current_len = current_len;
+        Ok(())
+    }
+
+    /// Seed a materialized paged prefix into this session's KV state, dispatching
+    /// to the host-growable path (GAP-3 Inc-C) or the device-resident CUDA path
+    /// (GAP-3 Inc-D) by how the session keeps its KV. `entries` carry the same
+    /// compact `[1, num_kv_heads, seq, head_dim]` layout for both paths, so
+    /// native (host or device) and ORT prefix reuse stay byte-identical.
+    pub(crate) fn seed_kv(
+        &mut self,
+        entries: Vec<(String, Vec<f32>, Vec<usize>)>,
+        current_len: usize,
+    ) -> anyhow::Result<()> {
+        if self.cuda.is_some() {
+            return self.seed_device_kv(entries, current_len);
+        }
+        self.seed_growable_kv(entries, current_len)
+    }
+
+    /// Device-resident counterpart of [`seed_growable_kv`](Self::seed_growable_kv):
+    /// write the shared prefix into the CUDA KV bindings, advance the mask/KV
+    /// logical length, and commit `current_len` so the next step appends after it
+    /// (GAP-3 Inc-D). The `&mut self.session` / `&mut self.cuda` split borrow lets
+    /// the device seed grow the KV bucket if the prefix exceeds the current
+    /// capacity, exactly as a decode step would.
+    fn seed_device_kv(
+        &mut self,
+        entries: Vec<(String, Vec<f32>, Vec<usize>)>,
+        current_len: usize,
+    ) -> anyhow::Result<()> {
+        let cuda = self
+            .cuda
+            .as_mut()
+            .context("device paged prefix reuse requires a CUDA decode session")?;
+        cuda.seed_prefix(&mut self.session, &entries, current_len)?;
         self.current_len = current_len;
         Ok(())
     }

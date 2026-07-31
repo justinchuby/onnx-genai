@@ -49,9 +49,12 @@ pub(crate) trait PipelineDecoderComponent {
     fn next_token_logits(&self) -> anyhow::Result<Vec<f32>>;
 
     /// Mirror the most recent step's present KV into the paged cache so a later
-    /// request opening with the same prefix can attach the pages.
+    /// request opening with the same prefix can attach the pages. Takes `&mut
+    /// self` because a device-resident native decoder (GAP-3 Inc-D) reads its
+    /// present KV out of a device binding, which mutates transfer bookkeeping;
+    /// the ORT and host-growable paths remain read-only in effect.
     fn mirror_last_present_kv(
-        &self,
+        &mut self,
         kv_model: &KvModelInfo,
         cache: &mut PagedKvCache,
         seq: SequenceId,
@@ -75,8 +78,9 @@ pub(crate) trait PipelineDecoderComponent {
     /// re-seeded from a materialized paged prefix, so the pipeline may drive it
     /// on the paged (cross-request KV reuse) path rather than the fresh-decode
     /// path. ORT decoders always can; a native decoder can only when its KV is
-    /// host-resident and f32 (GAP-3 Inc-C) — otherwise the pipeline keeps it on
-    /// the non-paged path (Inc-A behaviour) with no regression.
+    /// host-resident and f32 (GAP-3 Inc-C) or device-resident CUDA f32 rank-4
+    /// (GAP-3 Inc-D) — otherwise (f16 / in-place / non-rank-4) the pipeline keeps
+    /// it on the non-paged path (Inc-A behaviour) with no regression.
     fn supports_paged_kv(&self) -> bool {
         true
     }
@@ -147,7 +151,7 @@ impl PipelineDecoderComponent for OrtPipelineDecoder<'_> {
     }
 
     fn mirror_last_present_kv(
-        &self,
+        &mut self,
         kv_model: &KvModelInfo,
         cache: &mut PagedKvCache,
         seq: SequenceId,
@@ -270,7 +274,7 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
     }
 
     fn mirror_last_present_kv(
-        &self,
+        &mut self,
         kv_model: &KvModelInfo,
         cache: &mut PagedKvCache,
         seq: SequenceId,
@@ -278,28 +282,29 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
         input_len: usize,
     ) -> anyhow::Result<()> {
         // Read the most recent step's accumulated present KV out of the native
-        // decoder's growable host cache, then publish the freshly-decoded tokens
-        // into pages through the *same* geometry the ORT decoder uses
+        // decoder — the growable host cache (Inc-C) or the device-resident CUDA
+        // binding (Inc-D) — then publish the freshly-decoded tokens into pages
+        // through the *same* geometry the ORT decoder uses
         // (`extract_present_token` + `append_token_kv`), so native and ORT
-        // mirror byte-identical pages. Only reached for host-growable f32
-        // decoders (`supports_paged_kv`); device-resident / in-place / f16 KV is
-        // Inc-D.
+        // mirror byte-identical pages. The device read carries the physical
+        // capacity shape so strides address the padded buffer; the host read
+        // carries its compact shape. f16 / in-place / non-rank-4 KV stays gated
+        // off the paged path (`supports_paged_kv`).
         let layer_data = kv_model
             .layers
             .iter()
             .map(|layer| {
-                let (key, key_shape) = self.session.host_present_kv(&layer.key_past).with_context(
-                    || {
+                let (key, key_shape) =
+                    self.session.present_kv(&layer.key_past)?.with_context(|| {
                         format!(
                             "native decoder produced no present KV for '{}'; a decode step must \
                              run before mirroring",
                             layer.key_past
                         )
-                    },
-                )?;
+                    })?;
                 let (value, value_shape) = self
                     .session
-                    .host_present_kv(&layer.value_past)
+                    .present_kv(&layer.value_past)?
                     .with_context(|| {
                         format!(
                             "native decoder produced no present KV for '{}'",
@@ -359,7 +364,7 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
     }
 
     fn supports_paged_kv(&self) -> bool {
-        self.session.supports_host_kv_mirror()
+        self.session.supports_host_kv_mirror() || self.session.supports_device_kv_mirror()
     }
 
     fn load_paged_prefix(
@@ -400,7 +405,7 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
                 shape,
             ));
         }
-        self.session.seed_growable_kv(entries, seq_len)
+        self.session.seed_kv(entries, seq_len)
     }
 }
 
