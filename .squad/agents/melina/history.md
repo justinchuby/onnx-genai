@@ -15,3 +15,7 @@
 ## 2026-07-31T00:25:00Z — PR #534 server-contracts review (approved, held)
 
 - Reviewed and APPROVED Harry's PR #534 for server contracts #481/#482 (`build_dirty` Option<bool> present-as-null; truncated predicate uses actual scan size). HELD from main because it targets Justin's active branch `feat/genai-demo-dashboard` (PR #476); the described code exists only there.
+
+## 2026-07-31T03:03:15Z — Reviewed #535 + #543 (both merged)
+
+- Reviewed #535 (hybrid loader / text-only decode synthesis) and #543 (rank-3 mrope native positions). For #543 ran the e2e parity suite: 1 passed / 0 failed, 309 conformance cases; rank-2 byte-identical; native-CUDA hybrid decode == ORT token-for-token on real qwen3.5-0.8b. Both APPROVED and MERGED this wave.
