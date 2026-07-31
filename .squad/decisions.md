@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-07-30T21:15:00Z (Scribe round 5 — native-CUDA pipeline decode + Qwen3.5 hybrid coverage wave; dated drops archived per Task-D, kernels distilled below)
+Last consolidated: 2026-07-31T00:25:00Z (Scribe round 6 — native-CUDA decode beats-ORT landmark #533, qwen3.5-0.8b 100% CUDA #529, #449 closed #531; standing kernels folded, round-5 narrative in archive)
 
 Standing governance rules and constraints. Dated wave records and historical ledger updates
 are archived to `.squad/decisions-archive/2026-07.md`.
@@ -116,19 +116,15 @@ fetch-measure-delete and restored the disk baseline).
 ## Active historical pointers
 
 For detailed per-PR narrative, use `.squad/decisions-archive/2026-07.md` rather than
-expanding this live file. Compaction/consolidation checkpoints archived there:
-- Size-gate snapshots 2026-07-28T11:30:55Z (full pre-compaction ledger) and 11:35:49Z
-  (post-rebase additions); narrative compactions 2026-07-29T21:19:00Z / 23:30:00Z (two runs)
-  and 2026-07-30T04:30:00Z (round 2); consolidations round 3 (2026-07-30T13:36:00Z:
-  CUDA/native/MoE wave, 35B-A3B blocker, #87 prefetch plan) and rounds 4–5 (2026-07-30:
-  native-pipeline + CUDA-hybrid wave records and design drops).
-- Prior active-ledger archives: `.squad/decisions/archive/`.
-- Mac CPU EP load-bearing topics archived: PR #227 roofline lessons, load-adaptive opt-in,
-  Apple Silicon portability, BNNS prefill/deprecation, benchmark-CI informational-only rule,
-  dispatch-manifest lint, Sebastian/Deckard 1x1 Conv correction, Iran SDPA model-ratio
-  correction, negative-result GEMV notes.
-- Wave 8/9 topics archived: CUDA coverage batches 8/9, shape-inference catalog batches 3/4,
-  NCHWc minimal-build gating, strict reviewer-lockout correction cycle.
+expanding this live file. Archived there:
+- Consolidation checkpoints: size-gate snapshots 2026-07-28; narrative compactions 2026-07-29;
+  rounds 2–6 (2026-07-30…07-31: CUDA/native/MoE + native-pipeline + CUDA-hybrid wave records).
+  Prior active-ledger archives: `.squad/decisions/archive/`.
+- Mac CPU EP load-bearing topics: PR #227 roofline lessons, load-adaptive opt-in, Apple Silicon
+  portability, BNNS prefill/deprecation, benchmark-CI informational-only rule, dispatch-manifest
+  lint, Sebastian/Deckard 1x1 Conv correction, Iran SDPA model-ratio correction, GEMV notes.
+- Wave 8/9 topics: CUDA coverage batches 8/9, shape-inference catalog batches 3/4, NCHWc
+  minimal-build gating, strict reviewer-lockout correction cycle.
 
 ## CLI charter — standing directives
 
@@ -187,9 +183,6 @@ Platform execution is the signal; instrumentation is the cost. Critical path:
   both the per-model setting and `POST /v1/admin/models/{id}/warm` — one deterministic token,
   idempotent, retryable. Return typed errors mapped 404/500/500; a loaded model's failed
   warmup must not report 404.
-- **Decision inbox is a git-tracked durable queue** (Scribe), not gitignored scratch: drops
-  survive worktree deletion, are visible across machines pre-merge, and concurrent Scribes add
-  distinct files. Scribe deletes drops after merge.
 
 ### All inference/pipeline metadata must be explicit; name guessing is forbidden
 **By:** Justin Chu directive #377; Cohaagen/Benny/Melina/Matthias (PRs #380/#382/#377/#412)
@@ -240,6 +233,11 @@ per-node `supports_op`, recursing subgraph bodies) over the real decode models.
 - **Numerics rule for these hybrid kernels:** accumulate in f32 (matching the ORT/CPU EP
   oracle); widen f16/bf16 on read, narrow on write ⇒ dtype-invariant (RULES.md §2); the claim
   gate must reject configs the kernel cannot run (e.g. `d_k > 256`). Full design archived.
+- **#529:** qwen3.5-0.8b hybrid places 100% on CUDA (split package, 1289 nodes, 0 declines);
+  regression-locked `qwen35_0_8b_placement_lock`. E2e decode is still BLOCKED on the loader
+  (`Engine::from_dir` rejects the 3-onnx split; `from_pipeline_dir` refuses during vision
+  `smart_resize` admission); parity harness `qwen35_0_8b_hybrid_native_cuda_e2e` graceful-skips
+  until the loader is fixed.
 
 ## Native multi-component pipeline decoder seam — standing directive
 
@@ -265,7 +263,12 @@ via a **stateful** seam, distinct from Inc1's stateless `ComponentSession`.
   on main, and **real qwen3-0.6b native-CUDA e2e matches ORT-CUDA for 32 tokens** — landmark
   real-model validation of native CUDA decode. The mask/ReduceSum finding (#487, Lori
   APPROVED) is an ARTIFACT, not a blocker: proven by a real mask-consuming decoder locking 32
-  tokens to ORT-CUDA. In flight: Inc3c perf.
+  tokens to ORT-CUDA. **Inc3c (#533, Lori APPROVED) LANDED — native CUDA decode now BEATS
+  ORT:** default-off `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` writes a persistent
+  `[1,1,width]` device binding per routed port each step and reuses the captured `run_one_token`
+  (mask frozen, KV device-resident) ⇒ 1.38x ORT-CUDA on real qwen3-0.6b. Metadata-driven from
+  `session.inputs()`; generalizes to 35B-A3B GQA. Engagement proven non-tautologically via
+  counter `NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES` (OFF=0/ON=3, tokens byte-identical).
 
 ## Shape-inference sequence/container ops — standing directive
 
@@ -273,21 +276,25 @@ via a **stateful** seam, distinct from Inc1's stateless `ComponentSession`.
 
 - `#477` laid the IR container-type + Sequence foundation. `#486` added
   `SequenceInsert`/`SequenceErase`/`SplitToSequence`/`ConcatFromSequence` plus seq↔tensor
-  conversion; op catalog 213→217, shape-inference 258→262. Container propagation that was
-  previously blocked on the tensor-only `TypeInfo` model is now unblocked for these ops.
+  conversion. `#531` (inc4) added `SequenceMap` + `Scan` container support + cross-subgraph
+  capture and **CLOSED #449**. Container-type shape inference is COMPLETE: additive
+  `ValueType{Tensor|Sequence|Optional|Map}`, byte-identical tensor path guaranteed (gated on a
+  non-empty container map). Catalog now 217 ops/262 entries. Deferred (non-load-bearing):
+  Optional/Map handlers, IR-persistence of `ValueType`.
 
-## 2026-07-30 — Scribe consolidation (rounds 4–5)
+## 2026-07-31 — Scribe consolidation (round 6)
 
 **By:** Scribe
 
-Per the **Task-D policy**, dated wave/design/assessment drops are filed straight into
-`.squad/decisions-archive/2026-07.md`; only distilled standing kernels enter this ledger.
-Round-4 recorded #477/#478/#479/#480. **Round-5** recorded #484 (CUDA LinearAttention), #485
-(native pipeline Inc3a), #486 (#449 inc2 Sequence ops), #487 (native pipeline Inc3b), #525
-(#67 coverage-polish) — all folded into the standing directives above, and distilled the
-verbose 2026-07-29 dated entries to bullets to bring this file back under the size gate.
-In flight: Mary Inc3c perf; Cohaagen hybrid-e2e; Harry #449 inc3/inc4.
+Merges since round 5 (kernels folded into the directives above; per-PR narrative in
+`.squad/decisions-archive/2026-07.md`):
+- **#533 — Mary — native pipeline Inc3c** — LANDMARK: native CUDA decode beats ORT.
+- **#529 — Cohaagen — qwen3.5-0.8b hybrid 100% CUDA** (e2e still loader-blocked).
+- **#531 — Harry — #449 inc4** — SequenceMap + Scan; closed #449.
+- **#532 — Scribe round 5** — decisions.md re-distilled under the 20 KB gate.
 
-Carry-forward: keep dated records out of the live file (route to archive, distil only standing
-rules); dedupe against both the live file and the archive (drops carry no attribution — match
-prose); sweep histories against the chronicle gate; do not archive agent directories (fail closed).
+Held (not merged): **#534** (Harry, server contracts #481/#482, Melina APPROVED) targets Justin's
+active branch `feat/genai-demo-dashboard` (PR #476); that code is not on main.
+
+In flight: mary-2 real-model capture-engagement + default-on rec; cohaagen-4 loader-unblock;
+harry-5 generalize ORT `clone_value` to all POD dtypes (Bool / gemma-3n).

@@ -22,3 +22,7 @@
 
 - Independent review of Cohaagen's PR #446 mutual exclusion constraints between weight offload and graph capture; approved and merged.
 - Critical correctness gate for native CUDA live weight-offload path (#63).
+
+## 2026-07-31T00:25:00Z — PR #533 native pipeline Inc3c review (native CUDA decode beats ORT)
+
+- Approved Mary's PR #533 (Inc3c): native CUDA decode flips to 1.38x ORT WIN on real qwen3-0.6b via default-off captured step-input binding. Verified byte-identical tokens to eager, real ORT-CUDA baseline (not CPU-fallback), zero regressions, and non-tautological engagement counter (OFF=0/ON=3). Landmark real-model validation.

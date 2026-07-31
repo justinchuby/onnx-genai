@@ -18,3 +18,9 @@
 
 - PR #486 merged: #449 inc2 — SequenceInsert/SequenceErase/SplitToSequence/ConcatFromSequence + seq↔tensor conversion; op catalog 213→217, shape-inference 258→262.
 - In flight: #449 inc3 (#527 in review) and inc4.
+
+## 2026-07-31T00:25:00Z — PR #531 merged (#449 inc4); #534 held
+
+- PR #531 merged: #449 inc4 — SequenceMap + Scan container support + cross-subgraph capture. CLOSED issue #449. Container-type shape inference COMPLETE: additive `ValueType{Tensor|Sequence|Optional|Map}`, byte-identical tensor path guaranteed (gated on non-empty container map). Catalog 217 ops/262 entries. Deferred non-load-bearing: Optional/Map handlers, IR-persistence of `ValueType`.
+- PR #534 (server contracts #481/#482 — `build_dirty` Option<bool> present-as-null; truncated predicate uses actual scan size): Melina APPROVED but HELD — targets Justin's active branch `feat/genai-demo-dashboard` (PR #476); code exists only there, not main.
+- In flight (harry-5): generalize ORT `clone_value`/`clone_owned` to all POD dtypes (unblocks Bool / gemma-3n audio mask).
