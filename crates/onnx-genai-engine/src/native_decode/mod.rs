@@ -94,6 +94,12 @@ pub struct NativeDecodeSession {
     last_hidden: Option<Vec<f32>>,
     uses_decode_pool: bool,
     has_plugin_fused: bool,
+    /// Coordinate rank of the `position_ids` input, derived from the graph's
+    /// declared physical shape (`1` = conventional `[1, S]`; `N > 1` = multi-axis
+    /// mrope `[N, 1, S]`). All position tensors this session builds honor it, so
+    /// a rank-3 mrope decoder gets rank-3 coordinates while a rank-2 decoder is
+    /// byte-identical to before.
+    position_rank: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +131,25 @@ impl NativeDecodeSession {
 
     pub fn kv_layer_count(&self) -> usize {
         self.kv_inputs.len() / 2
+    }
+
+    /// Build the per-step `position_ids` tensor for the half-open sequence range
+    /// `[past_len, total_len)`, honoring the decoder's declared coordinate rank.
+    ///
+    /// A rank-1 (conventional) decoder yields `[1, S]`; a rank-N mrope decoder
+    /// yields `[N, 1, S]` with every coordinate axis advancing linearly with the
+    /// sequence position (the pure-text `linear_increment` continuation). The
+    /// flat values + shape come from the shared [`crate::decode::position_ids_from_starts`]
+    /// helper, so native and ORT build byte-identical positions.
+    fn build_step_positions(&self, past_len: usize, total_len: usize) -> anyhow::Result<Tensor> {
+        let input_len = total_len
+            .checked_sub(past_len)
+            .context("position range end precedes its start")?;
+        let absolute_start = i64::try_from(past_len).context("position id exceeds i64 range")?;
+        let starts = vec![absolute_start; self.position_rank];
+        let (data, shape) = crate::decode::position_ids_from_starts(&starts, input_len)?;
+        let dims = shape.iter().map(|&dim| dim as usize).collect::<Vec<_>>();
+        Ok(Tensor::from_i64(&dims, &data)?)
     }
 
     /// Last target hidden-state row produced by the most recent forward.

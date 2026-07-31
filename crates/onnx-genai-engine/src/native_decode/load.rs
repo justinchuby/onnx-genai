@@ -298,6 +298,7 @@ impl NativeDecodeSession {
             "model.io",
             "position_ids_input",
         )?;
+        let position_rank = declared_position_rank(&role_inputs, position_ids.as_deref())?;
         let logits = declared_or_detected_output(
             &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
@@ -575,6 +576,7 @@ impl NativeDecodeSession {
                 &fixed_state_inputs,
                 capacity,
                 graph_enabled,
+                position_rank,
             )?)
         } else {
             None
@@ -617,6 +619,7 @@ impl NativeDecodeSession {
             last_hidden: None,
             uses_decode_pool,
             has_plugin_fused,
+            position_rank,
         })
     }
 }
