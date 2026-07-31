@@ -232,6 +232,23 @@ pub(crate) struct Executor {
     pub(super) compute_in_place_enabled: bool,
     /// Successful dead-input buffer aliases, retained for parity/safety tests.
     pub(super) compute_in_place_alias_count: u64,
+    /// Opt-in (default OFF) master switch for the single-trip `Scan` inline
+    /// dual-path (`ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP`). When ON, a `Scan` whose
+    /// runtime scan-axis length is exactly 1 (a single decode step) runs its body
+    /// once straight-line instead of the generic `exec_scan` loop; any other
+    /// trip count — including prefill at `prompt_len > 1` — keeps the unchanged
+    /// loop. The selection is at RUNTIME, keyed on the observed trip count, never
+    /// baked into the graph: prefill and decode share one executor/plan, so a
+    /// static single-trip rewrite would corrupt prefill. Flag OFF ⇒ every trip
+    /// count uses the loop (zero behavior change). Slice 1a is host-execution
+    /// only; it does not interact with device-graph capture.
+    pub(super) scan_inline_single_trip_enabled: bool,
+    /// Diagnostic: how many times the single-trip `Scan` inline path actually
+    /// engaged over this executor's lifetime. `> 0` after a decode run proves the
+    /// dual-path is non-vacuously firing (an on-model A/B and the CUDA-gated
+    /// regression test read it to reject a silently-gated-out pass); it stays 0
+    /// whenever the flag is OFF or every `Scan` runs at `trip_count != 1`.
+    pub(super) scan_inline_single_trip_count: u64,
     /// Per-plan-node kernel pre-binding (Stage 3). Each slot stores the
     /// [`KernelKey`] from the most recent successful kernel lookup for that plan
     /// node. On subsequent dispatch, if the current input shapes match the stored
@@ -520,6 +537,24 @@ pub(super) fn decode_memo_verify_env_enabled() -> bool {
     matches!(
         std::env::var("ONNX_GENAI_DECODE_MEMO_VERIFY")
             .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Whether the single-trip `Scan` inline dual-path is enabled
+/// (`ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP`). Default OFF: this is an opt-in
+/// correctness-foundation path, so it engages only on an explicit ON value
+/// (`1`/`true`/`on`, case-insensitive, whitespace-trimmed). Every other state —
+/// unset, empty, `0`, or unrecognized — leaves it OFF, so the executor keeps
+/// running the unchanged `exec_scan` loop for every trip count.
+pub(super) fn scan_inline_single_trip_env_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("1") | Some("true") | Some("on")
     )

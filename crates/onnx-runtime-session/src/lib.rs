@@ -1055,6 +1055,16 @@ impl InferenceSession {
         self.exec.decode_view_plan_counts()
     }
 
+    /// How many times the single-trip `Scan` inline dual-path
+    /// (`ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP`) engaged over this session's
+    /// lifetime. `> 0` after a decode run proves the runtime `trip_count == 1`
+    /// inline path actually fired (not a silently gated-out pass); an on-model
+    /// flag-on/flag-off A/B reads this alongside the token stream to prove the
+    /// dual-path is both engaged and byte-exact.
+    pub fn scan_inline_single_trip_count(&self) -> u64 {
+        self.exec.scan_inline_single_trip_count()
+    }
+
     /// Run with persistent device allocations supplying graph inputs and,
     /// optionally, aliasing graph outputs. Bound outputs are returned as `None`
     /// because their bytes remain resident in the caller-owned allocation.
