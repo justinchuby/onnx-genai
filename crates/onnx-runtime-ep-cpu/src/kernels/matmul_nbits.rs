@@ -6,8 +6,9 @@
 //! first within each byte. For M=1 decode, constant quantized weights are
 //! prepacked once and reused by a N-parallel GEMV. For symmetric block-32
 //! int4 M=1, `accuracy_level=4` streams the packed weights directly into a VNNI
-//! dot product. Other int4 accuracy-level-4 shapes keep the weights in int8 and
-//! quantize each activation into int8 per K-block (matching ORT/MLAS CompInt8).
+//! dot product on x86, or an opt-in ARM dot-product int4 GEMV on aarch64. Other
+//! int4 accuracy-level-4 shapes keep the weights in int8 and quantize each
+//! activation into int8 per K-block (matching ORT/MLAS CompInt8).
 //! `weight_prepacked=1` accepts the host-specific buffer produced by
 //! `MlasQNBitGemmPackQuantBData`, avoiding the standard-layout-to-MLAS repack.
 //! The 2-bit path decodes packed weights directly inside its f32 GEMV/GEMM,
@@ -17,6 +18,8 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+#[cfg(feature = "mlas")]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -182,6 +185,37 @@ fn mlas_no_shard() -> bool {
     })
 }
 
+/// Override for the MLAS QNBit MatMulNBits route. `0`/`off` disables all MLAS
+/// QNBit calls; unset or `1`/`on` enables it. On non-Apple ARM64 this makes the
+/// KleidiAI-backed MLAS QNBit shard path the default for Qwen-style bits4/bits8
+/// block-128 decode; set `0` to A/B against the native KAI fallback.
+#[cfg(feature = "mlas")]
+fn mlas_qnbit_env_override() -> Option<bool> {
+    std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        })
+}
+
+#[cfg(feature = "mlas")]
+fn mlas_qnbit_enabled() -> bool {
+    mlas_qnbit_env_override().unwrap_or(true)
+}
+
+#[cfg(feature = "mlas")]
+fn arm64_mlas_qnbit_decode_opted_in() -> bool {
+    mlas_qnbit_env_override().unwrap_or(true)
+}
+
+#[cfg(feature = "mlas")]
+fn sqnbit_backend_forced_mlas() -> bool {
+    std::env::var("NXRT_CPU_GEMM_BACKEND")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("mlas"))
+}
+
 /// Force the prefill (`m > 1`) MLAS SQNBit path back to the pre-fix serial
 /// loop (each per-worker shard run with MLAS `multithread=true`, one after
 /// another). The default parallel `(shard x m-row-block)` dispatch is
@@ -232,12 +266,16 @@ pub struct MatMulNBitsKernel {
     weight_nk: OnceLock<Vec<f32>>,
     int8_weight: OnceLock<Int8Weight>,
     packed_int4_weight: OnceLock<PackedInt4Weight>,
+    packed_int4_n16_weight: OnceLock<PackedN16SdotWeight>,
+    packed_kai_qsi4_weight: OnceLock<PackedKaiSdotWeight>,
     packed_nbits_weight: OnceLock<PackedNBitsWeight>,
     packed_u8_weight: OnceLock<PackedU8Weight>,
+    packed_u8_n16_weight: OnceLock<PackedN16SdotWeight>,
+    packed_kai_qsi8_weight: OnceLock<PackedKaiSdotWeight>,
     #[cfg(feature = "mlas")]
     mlas_shards: OnceLock<Option<Vec<Option<MlasShard>>>>,
     #[cfg(feature = "mlas")]
-    mlas_packed: OnceLock<Option<mlas_sys::SQNBitPackedB>>,
+    mlas_packed: OnceLock<Option<MlasPreparedPacked>>,
 }
 
 /// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
@@ -247,7 +285,25 @@ pub struct MatMulNBitsKernel {
 struct MlasShard {
     start: usize,
     len: usize,
+    prepared: MlasPreparedPacked,
+}
+
+#[cfg(feature = "mlas")]
+struct MlasPreparedPacked {
     packed: mlas_sys::SQNBitPackedB,
+    workspace: Mutex<mlas_sys::SQNBitGemmWorkspace>,
+}
+
+#[cfg(feature = "mlas")]
+impl MlasPreparedPacked {
+    fn new(packed: mlas_sys::SQNBitPackedB) -> Self {
+        let mut workspace = mlas_sys::SQNBitGemmWorkspace::new();
+        workspace.reserve_for(&packed, 1);
+        Self {
+            packed,
+            workspace: Mutex::new(workspace),
+        }
+    }
 }
 
 /// N-tile alignment for the persistent-pool MLAS SQNBit decode shards.
@@ -279,6 +335,44 @@ struct PackedInt4Weight {
     values: Vec<u8>,
     scales: Vec<f32>,
 }
+
+const N16_SDOT_OUTPUTS: usize = 16;
+const N16_SDOT_K_GROUP: usize = 4;
+
+/// Tile-major signed weights for ARM dot-product decode.
+///
+/// Layout: `[ceil(N/16), k_blocks, block_size/4, 16 outputs, 4 K lanes]`.
+/// Each four-output group can be loaded as one 16-byte vector and consumed by
+/// one `sdot`, leaving the four int32 lanes as four output columns.
+struct PackedN16SdotWeight {
+    values: Vec<i8>,
+    scales: Vec<f32>,
+    zero_point_offsets: Vec<i16>,
+}
+
+const KAI_SDOT_OUTPUTS: usize = 16;
+const KAI_SDOT_K_GROUP: usize = 4;
+
+/// KleidiAI-inspired ARM decode prepack. Int4 weights stay packed (two
+/// nibbles per byte); int8 weights stay one byte per weight centered around
+/// 128. Layout: `[ceil(N/16), k_blocks, block_size/4, 16 outputs, payload]`,
+/// where payload is 2 bytes for qsi4 and 4 bytes for qsi8.
+struct PackedKaiSdotWeight {
+    bits: usize,
+    values: Vec<u8>,
+    scales: Vec<f32>,
+    rhs_sums: Vec<i32>,
+    zero_point_offsets: Vec<i16>,
+}
+
+#[cfg(test)]
+static INT4_DIRECT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "mlas"))]
+static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
@@ -473,8 +567,12 @@ impl KernelFactory for MatMulNBitsFactory {
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
+            packed_int4_n16_weight: OnceLock::new(),
+            packed_kai_qsi4_weight: OnceLock::new(),
             packed_nbits_weight: OnceLock::new(),
             packed_u8_weight: OnceLock::new(),
+            packed_u8_n16_weight: OnceLock::new(),
+            packed_kai_qsi8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
             #[cfg(feature = "mlas")]
@@ -611,7 +709,6 @@ impl Kernel for MatMulNBitsKernel {
             owned_result = vec![0.0f32; result_len];
             &mut owned_result
         };
-        let dot_kernel = selected_dot_kernel();
         #[cfg(feature = "mlas")]
         {
             if let Some(()) = self.try_mlas_sqnbit(
@@ -634,6 +731,7 @@ impl Kernel for MatMulNBitsKernel {
                 return out;
             }
         }
+        let dot_kernel = selected_dot_kernel();
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -679,44 +777,107 @@ impl Kernel for MatMulNBitsKernel {
         } else if self.bits == 4
             && self.accuracy_level == 4
             && m == 1
-            && self.block_size == 32
-            && zero_points.is_none()
             && group_indices.is_none()
-            && dot_kernel.uses_vnni_int4_direct()
+            && dot_kernel.supports_int4_direct(self.block_size, zero_points.is_some())
         {
-            let owned_weight;
-            let packed_weight = if can_prepack {
-                if let Some(weight) = self.packed_int4_weight.get() {
-                    weight
+            if dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
+                let owned_weight;
+                let packed_weight = if can_prepack {
+                    if let Some(weight) = self.packed_kai_qsi4_weight.get() {
+                        weight
+                    } else {
+                        let weight =
+                            self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                        let weight = numa_place_kai_sdot(weight, self.n);
+                        let _ = self.packed_kai_qsi4_weight.set(weight);
+                        self.packed_kai_qsi4_weight
+                            .get()
+                            .expect("constant MatMulNBits KAI qsi4 weight was just initialized")
+                    }
                 } else {
-                    let weight = PackedInt4Weight {
+                    let built =
+                        self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                    owned_weight = numa_place_kai_sdot(built, self.n);
+                    &owned_weight
+                };
+                with_decode_pool(|| {
+                    kai_sdot_matmul_m1(
+                        &activations,
+                        packed_weight,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                })?;
+            } else if dot_kernel.uses_n16_sdot_direct() {
+                let owned_weight;
+                let packed_weight = if can_prepack {
+                    if let Some(weight) = self.packed_int4_n16_weight.get() {
+                        weight
+                    } else {
+                        let weight =
+                            self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                        let weight = numa_place_n16_sdot(weight, self.n);
+                        let _ = self.packed_int4_n16_weight.set(weight);
+                        self.packed_int4_n16_weight
+                            .get()
+                            .expect("constant MatMulNBits N16 int4 weight was just initialized")
+                    }
+                } else {
+                    let built =
+                        self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                    owned_weight = numa_place_n16_sdot(built, self.n);
+                    &owned_weight
+                };
+                with_decode_pool(|| {
+                    n16_sdot_matmul_m1(
+                        &activations,
+                        packed_weight,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                })?;
+            } else {
+                let owned_weight;
+                let packed_weight = if can_prepack {
+                    if let Some(weight) = self.packed_int4_weight.get() {
+                        weight
+                    } else {
+                        let weight = PackedInt4Weight {
+                            values: to_dense_bytes(&inputs[1])?,
+                            scales: to_dense_compute_f32(&inputs[2])?,
+                        };
+                        let weight = numa_place_int4(weight, self.n);
+                        let _ = self.packed_int4_weight.set(weight);
+                        self.packed_int4_weight
+                            .get()
+                            .expect("constant MatMulNBits packed int4 weight was just initialized")
+                    }
+                } else {
+                    let built = PackedInt4Weight {
                         values: to_dense_bytes(&inputs[1])?,
                         scales: to_dense_compute_f32(&inputs[2])?,
                     };
-                    let weight = numa_place_int4(weight, self.n);
-                    let _ = self.packed_int4_weight.set(weight);
-                    self.packed_int4_weight
-                        .get()
-                        .expect("constant MatMulNBits packed int4 weight was just initialized")
-                }
-            } else {
-                let built = PackedInt4Weight {
-                    values: to_dense_bytes(&inputs[1])?,
-                    scales: to_dense_compute_f32(&inputs[2])?,
+                    owned_weight = numa_place_int4(built, self.n);
+                    &owned_weight
                 };
-                owned_weight = numa_place_int4(built, self.n);
-                &owned_weight
-            };
-            with_decode_pool(|| {
-                int4_matmul_m1(
-                    &activations,
-                    packed_weight,
-                    result,
-                    self.k,
-                    self.n,
-                    dot_kernel,
-                );
-            })?;
+                with_decode_pool(|| {
+                    int4_matmul_m1(
+                        &activations,
+                        packed_weight,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                })?;
+            }
         } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
             let owned_weight;
             let int8_weight = if can_prepack {
@@ -797,54 +958,121 @@ impl Kernel for MatMulNBitsKernel {
             // pre-expanding it to f32 (4x the memory traffic) as the generic
             // `weight_nk` path below does. Activations stay f32 so the result is
             // full-precision (unlike int8-activation kernels).
-            let owned_weight;
-            let weight_u8 = if can_prepack {
-                if let Some(weight) = self.packed_u8_weight.get() {
-                    weight
+            if dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
+                let owned_weight;
+                let packed_weight = if can_prepack {
+                    if let Some(weight) = self.packed_kai_qsi8_weight.get() {
+                        weight
+                    } else {
+                        let weight =
+                            self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                        let weight = numa_place_kai_sdot(weight, self.n);
+                        let _ = self.packed_kai_qsi8_weight.set(weight);
+                        self.packed_kai_qsi8_weight
+                            .get()
+                            .expect("constant MatMulNBits KAI qsi8 weight was just initialized")
+                    }
                 } else {
-                    let weight = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
-                    let weight = numa_place_u8(weight, self.n);
-                    let _ = self.packed_u8_weight.set(weight);
-                    self.packed_u8_weight
-                        .get()
-                        .expect("constant MatMulNBits u8 prepack was just initialized")
-                }
+                    let built =
+                        self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                    owned_weight = numa_place_kai_sdot(built, self.n);
+                    &owned_weight
+                };
+                with_decode_pool(|| {
+                    kai_sdot_matmul_m1(
+                        &activations,
+                        packed_weight,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                })?;
+            } else if dot_kernel.uses_n16_sdot_direct()
+                && self.block_size == 128
+                && activation_quant_group() == 32
+            {
+                let owned_weight;
+                let packed_weight = if can_prepack {
+                    if let Some(weight) = self.packed_u8_n16_weight.get() {
+                        weight
+                    } else {
+                        let weight =
+                            self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                        let weight = numa_place_n16_sdot(weight, self.n);
+                        let _ = self.packed_u8_n16_weight.set(weight);
+                        self.packed_u8_n16_weight
+                            .get()
+                            .expect("constant MatMulNBits N16 bits8 weight was just initialized")
+                    }
+                } else {
+                    let built =
+                        self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
+                    owned_weight = numa_place_n16_sdot(built, self.n);
+                    &owned_weight
+                };
+                with_decode_pool(|| {
+                    n16_sdot_u8_i16_matmul_m1(
+                        &activations,
+                        packed_weight,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                })?;
             } else {
-                let built = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
-                owned_weight = numa_place_u8(built, self.n);
-                &owned_weight
-            };
-            with_decode_pool(|| {
-                if eight_bit_int16_activation() {
-                    // int16-activation fast path: quantize the activation to
-                    // int16 per K-block and reduce against the u8 weight with a
-                    // SIMD int16 dot product. int16 keeps enough precision to
-                    // match the fp32 result (unlike int8-activation, which is
-                    // ORT's fast-but-wrong path), while replacing the widening
-                    // u8->f32 FMA with a denser int16 madd.
-                    gemv_nk_u8_i16(
-                        &activations,
-                        &weight_u8.values,
-                        &weight_u8.scales,
-                        &weight_u8.scaled_zero_points,
-                        result,
-                        self.k,
-                        self.n,
-                        self.block_size,
-                    );
+                let owned_weight;
+                let weight_u8 = if can_prepack {
+                    if let Some(weight) = self.packed_u8_weight.get() {
+                        weight
+                    } else {
+                        let weight = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
+                        let weight = numa_place_u8(weight, self.n);
+                        let _ = self.packed_u8_weight.set(weight);
+                        self.packed_u8_weight
+                            .get()
+                            .expect("constant MatMulNBits u8 prepack was just initialized")
+                    }
                 } else {
-                    gemv_nk_u8(
-                        &activations,
-                        &weight_u8.values,
-                        &weight_u8.scales,
-                        &weight_u8.scaled_zero_points,
-                        result,
-                        self.k,
-                        self.n,
-                        self.block_size,
-                    );
-                }
-            })?;
+                    let built = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
+                    owned_weight = numa_place_u8(built, self.n);
+                    &owned_weight
+                };
+                with_decode_pool(|| {
+                    if eight_bit_int16_activation() {
+                        // int16-activation fast path: quantize the activation to
+                        // int16 per K-block and reduce against the u8 weight with a
+                        // SIMD int16 dot product. int16 keeps enough precision to
+                        // match the fp32 result (unlike int8-activation, which is
+                        // ORT's fast-but-wrong path), while replacing the widening
+                        // u8->f32 FMA with a denser int16 madd.
+                        gemv_nk_u8_i16(
+                            &activations,
+                            &weight_u8.values,
+                            &weight_u8.scales,
+                            &weight_u8.scaled_zero_points,
+                            result,
+                            self.k,
+                            self.n,
+                            self.block_size,
+                        );
+                    } else {
+                        gemv_nk_u8(
+                            &activations,
+                            &weight_u8.values,
+                            &weight_u8.scales,
+                            &weight_u8.scaled_zero_points,
+                            result,
+                            self.k,
+                            self.n,
+                            self.block_size,
+                        );
+                    }
+                })?;
+            }
         } else if m == 1 {
             let owned_weight;
             let weight_nk = if can_prepack {
@@ -985,15 +1213,20 @@ impl MatMulNBitsKernel {
     ) -> Result<Option<()>> {
         use crate::backend::CpuBackend;
 
+        if !mlas_qnbit_enabled() {
+            return Ok(None);
+        }
+
+        let comp = self.mlas_compute_type();
+
         if self.weight_prepacked {
-            let comp = self.mlas_compute_type();
             if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
                 && m == 1
                 && zero_points.is_some()
-                && !host_has_mlas_sqnbit_avx512()
+                && !host_supports_mlas_sqnbit_m1_asym_int8()
             {
                 return Err(error(
-                    "weight_prepacked=1 asymmetric CompInt8 M=1 is unavailable on this CPU because the MLAS AVX2 kernel is not numerically correct",
+                    "weight_prepacked=1 asymmetric CompInt8 M=1 is unavailable on this CPU because its MLAS kernel is not numerically correct",
                 ));
             }
 
@@ -1018,18 +1251,57 @@ impl MatMulNBitsKernel {
                     self.bits, self.block_size, self.accuracy_level
                 ))
             })?;
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-            });
+                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+            })?;
             return Ok(Some(()));
         }
 
-        // Cheapest gate first: in the decode regime (small `m`), keep the fast
-        // hand int4/int8 path -- it ties MLAS on the bandwidth-bound M=1 GEMV
-        // and avoids int8 activation rounding -- so fall back before any weight
-        // packing. A slow-hand-path case (`accuracy_level != 4`, which would
-        // dequantize to f32 and run a dense GEMV) is left for MLAS below.
-        let hand_decode_is_fast = self.bits == 4 && self.accuracy_level == 4;
+        if can_prepack
+            && !mlas_no_shard()
+            && let Some(shards) = self.mlas_shards.get()
+        {
+            let Some(shards) = shards.as_ref() else {
+                return Ok(None);
+            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
+            return Ok(Some(()));
+        }
+
+        if can_prepack
+            && mlas_no_shard()
+            && let Some(cached) = self.mlas_packed.get()
+        {
+            let Some(packed_weight) = cached.as_ref() else {
+                return Ok(None);
+            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| {
+                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+            })?;
+            return Ok(Some(()));
+        }
+
+        let prefer_arm64_mlas_decode = prefer_arm64_mlas_qnbit_decode(
+            self.bits,
+            self.block_size,
+            self.accuracy_level,
+            m,
+            group_indices.is_none(),
+        );
+
+        // Cheapest gate first: outside the ARM64 QNBit/KleidiAI route, keep the
+        // fast hand int4 decode path for small `m` and avoid MLAS packing. When
+        // explicitly opted in on non-Apple ARM64, the vendored MLAS QNBit path
+        // can serve accuracy-4 qsi4/qsi8 decode with the same KleidiAI kernels
+        // ORT uses.
+        let hand_decode_is_fast =
+            self.bits == 4 && self.accuracy_level == 4 && !prefer_arm64_mlas_decode;
         if m < sqnbit_decode_min() && hand_decode_is_fast {
             return Ok(None);
         }
@@ -1043,13 +1315,13 @@ impl MatMulNBitsKernel {
         // prefer MLAS SQNBit (CompFp32) whenever MLAS actually has a kernel --
         // this matches ORT/onnxruntime-genai, which treat `accuracy_level` 0/1 as
         // CompFp32 rather than dequantizing the whole weight.
-        let backend_is_mlas = CpuBackend::auto_detect() == CpuBackend::Mlas;
-        let use_mlas = backend_is_mlas || self.accuracy_level != 4;
-        if self.bits != 4 || group_indices.is_some() || !use_mlas {
+        let backend_is_mlas =
+            CpuBackend::auto_detect() == CpuBackend::Mlas || sqnbit_backend_forced_mlas();
+        let use_mlas = backend_is_mlas || self.accuracy_level != 4 || prefer_arm64_mlas_decode;
+        let supports_bits = self.bits == 4 || (prefer_arm64_mlas_decode && self.bits == 8);
+        if !supports_bits || group_indices.is_some() || !use_mlas {
             return Ok(None);
         }
-
-        let comp = self.mlas_compute_type();
 
         // Cross-CPU correctness guard: MLAS's AVX2 M=1 CompInt8 SQNBit kernel
         // with a zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes)
@@ -1064,26 +1336,19 @@ impl MatMulNBitsKernel {
         if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
             && m == 1
             && zero_points.is_some()
-            && !host_has_mlas_sqnbit_avx512()
+            && !host_supports_mlas_sqnbit_m1_asym_int8()
         {
             return Ok(None);
         }
 
-        // Constant weights (the decode hot path) are packed once into per-N-shard
-        // MLAS weights and cached. This lets each M=1 decode projection fan its
-        // output columns across the *persistent SPMD decode workers* (each worker
-        // runs its shard's GEMV serially), instead of one `multithread=true` call
-        // that forks MLAS across the global Rayon pool -- which, under the
-        // default persistent decode pool, oversubscribes the machine against the
-        // pool's resident spinning workers and collapses f16 decode (measured
-        // 6->28 tok/s on Qwen2.5-0.5B, Xeon 8480C). Non-constant weights keep the
-        // single owned `multithread=true` path (they are never the decode hot
-        // path and re-sharding per call is not worth it). The `NO_SHARD` escape
-        // hatch forces that single full-width call too: MLAS's SIMD column-tiling
-        // is not bit-stable across N-partition boundaries (it can differ by ~1
-        // ULP), so this hatch restores byte-for-byte the pre-sharding output for
-        // A/B parity checks or a host where the reordering ever matters.
-        if can_prepack && !mlas_no_shard() {
+        // Constant weights (the decode hot path) normally use the historical
+        // static-SPMD shards. `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` opts into
+        // ORT's full-width `MlasQNBitGemmBatch(..., multithread=true)` design,
+        // where MLAS dynamically partitions N tiles across its persistent
+        // work-stealing intra-op pool, for A/B profiling without changing the
+        // default until correctness and throughput are proven.
+        let use_static_shards = can_prepack && !mlas_no_shard();
+        if use_static_shards {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
@@ -1096,7 +1361,30 @@ impl MatMulNBitsKernel {
             let Some(shards) = shards.as_ref() else {
                 return Ok(None);
             };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
+            return Ok(Some(()));
+        }
+
+        if can_prepack {
+            let cached = if let Some(cached) = self.mlas_packed.get() {
+                cached
+            } else {
+                let built = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+                let _ = self.mlas_packed.set(built);
+                self.mlas_packed
+                    .get()
+                    .expect("constant MatMulNBits MLAS full-width weight was just initialized")
+            };
+            let Some(packed_weight) = cached.as_ref() else {
+                return Ok(None);
+            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| {
+                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+            })?;
             return Ok(Some(()));
         }
 
@@ -1104,9 +1392,11 @@ impl MatMulNBitsKernel {
         let Some(packed_weight) = owned.as_ref() else {
             return Ok(None);
         };
+        #[cfg(all(test, feature = "mlas"))]
+        MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
         mm_profile::time_gemv(|| {
-            mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-        });
+            self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+        })?;
         Ok(Some(()))
     }
 
@@ -1245,7 +1535,8 @@ impl MatMulNBitsKernel {
                     debug_assert_eq!(shard.len, outputs.len());
                     let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
                     // m == 1: `outputs` is this shard's contiguous output row.
-                    mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
+                    self.run_mlas_prepared(&shard.prepared, 1, activations, bias, outputs, false)
+                        .expect("MLAS SQNBit shard GEMV must not fail");
                 },
             );
             return;
@@ -1317,7 +1608,7 @@ impl MatMulNBitsKernel {
                     let dst = unsafe { out.0.add(row_start * n + shard.start) };
                     unsafe {
                         mlas_sys::sqnbit_gemm_into(
-                            &shard.packed,
+                            &shard.prepared.packed,
                             rows,
                             activations,
                             bias,
@@ -1342,17 +1633,75 @@ impl MatMulNBitsKernel {
             // element of this shard's columns and `(m - 1) * self.n + shard.len`
             // stays within `result` (shard.start + shard.len <= self.n).
             unsafe {
-                mlas_sys::sqnbit_gemm_into(
-                    &shard.packed,
+                self.run_mlas_prepared_into(
+                    &shard.prepared,
                     m,
                     activations,
                     bias,
                     base.add(shard.start),
                     self.n,
                     true,
-                );
+                )
+                .expect("MLAS SQNBit shard GEMM must not fail");
             }
         }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn run_mlas_prepared(
+        &self,
+        prepared: &MlasPreparedPacked,
+        m: usize,
+        activations: &[f32],
+        bias: Option<&[f32]>,
+        result: &mut [f32],
+        multithread: bool,
+    ) -> Result<()> {
+        let mut workspace = prepared
+            .workspace
+            .lock()
+            .expect("MLAS SQNBit workspace lock poisoned");
+        mlas_sys::sqnbit_gemm_with_workspace(
+            &prepared.packed,
+            m,
+            activations,
+            bias,
+            result,
+            &mut workspace,
+            multithread,
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "mlas")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_mlas_prepared_into(
+        &self,
+        prepared: &MlasPreparedPacked,
+        m: usize,
+        activations: &[f32],
+        bias: Option<&[f32]>,
+        result: *mut f32,
+        ldc: usize,
+        multithread: bool,
+    ) -> Result<()> {
+        let mut workspace = prepared
+            .workspace
+            .lock()
+            .expect("MLAS SQNBit workspace lock poisoned");
+        unsafe {
+            mlas_sys::sqnbit_gemm_into_with_workspace(
+                &prepared.packed,
+                m,
+                activations,
+                bias,
+                result,
+                ldc,
+                &mut workspace,
+                multithread,
+            );
+        }
+        Ok(())
     }
 
     /// The contiguous output-column shards `self.n` is split into for the MLAS
@@ -1410,7 +1759,11 @@ impl MatMulNBitsKernel {
                 scales_shard,
                 zero_points_shard,
             ) {
-                Some(packed) => shards.push(Some(MlasShard { start, len, packed })),
+                Some(packed) => shards.push(Some(MlasShard {
+                    start,
+                    len,
+                    prepared: MlasPreparedPacked::new(packed),
+                })),
                 None => return Ok(None),
             }
         }
@@ -1428,7 +1781,7 @@ impl MatMulNBitsKernel {
         scales: &TensorView,
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
-    ) -> Result<Option<mlas_sys::SQNBitPackedB>> {
+    ) -> Result<Option<MlasPreparedPacked>> {
         let packed = to_dense_bytes(packed)?;
         let scales = to_dense_compute_f32(scales)?;
         let zero_points = zero_points.map(to_dense_bytes).transpose()?;
@@ -1441,7 +1794,8 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        ))
+        )
+        .map(MlasPreparedPacked::new))
     }
 
     #[cfg(feature = "mlas")]
@@ -1463,7 +1817,7 @@ impl MatMulNBitsKernel {
         scales: &TensorView,
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
-    ) -> Result<Option<mlas_sys::SQNBitPackedB>> {
+    ) -> Result<Option<MlasPreparedPacked>> {
         let packed = to_dense_bytes(packed)?;
         let scales = to_dense_compute_f32(scales)?;
         let zero_points = zero_points.map(to_dense_bytes).transpose()?;
@@ -1476,7 +1830,8 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        ))
+        )
+        .map(MlasPreparedPacked::new))
     }
 
     fn prepack_int8_weight(
@@ -1531,6 +1886,50 @@ impl MatMulNBitsKernel {
             scales,
             block_sums,
         })
+    }
+
+    fn prepack_n16_sdot_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<PackedN16SdotWeight> {
+        debug_assert!(matches!(self.bits, 4 | 8));
+        debug_assert!(self.block_size.is_multiple_of(N16_SDOT_K_GROUP));
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_compute_f32(scales)?;
+        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        Ok(prepack_n16_sdot_from_bytes(
+            &packed,
+            scales,
+            packed_zero_points.as_deref(),
+            self.n,
+            self.k,
+            self.bits,
+            self.block_size,
+        ))
+    }
+
+    fn prepack_kai_sdot_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<PackedKaiSdotWeight> {
+        debug_assert!(matches!(self.bits, 4 | 8));
+        debug_assert!(self.block_size.is_multiple_of(KAI_SDOT_K_GROUP));
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_compute_f32(scales)?;
+        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        Ok(prepack_kai_sdot_from_bytes(
+            &packed,
+            scales,
+            packed_zero_points.as_deref(),
+            self.n,
+            self.k,
+            self.bits,
+            self.block_size,
+        ))
     }
 
     /// Prepack an 8-bit `MatMulNBits` weight into a dense `[N, K]` `u8` buffer
@@ -1760,6 +2159,23 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         value.as_deref(),
         available,
     );
+    // Snapdragon/X Elite style ARM64 hosts have measured their decode roofline
+    // at 6--8 workers, and the KAI-style packed SDOT path still scales from the
+    // generic `available/2` default (6 on a 12-way Oryon) to 8 workers. Keep the
+    // generic half-machine rule for other platforms, but use the measured ARM64
+    // topology ceiling when no explicit budget was provided.
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    if decode_threads_override().is_none()
+        && value
+            .as_deref()
+            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err())
+        && available >= MAX_TOPOLOGY_DECODE_THREADS
+    {
+        return Some(MAX_TOPOLOGY_DECODE_THREADS.min(available));
+    }
     // On Apple Silicon, when no explicit thread count was set, override the
     // generic `available/2` default with `P_cores - 1`. The SPMD dispatcher
     // thread spin-waits on completion counters, occupying one P-core; using
@@ -2386,6 +2802,47 @@ fn numa_place_int4(weight: PackedInt4Weight, n: usize) -> PackedInt4Weight {
     weight
 }
 
+fn numa_place_n16_sdot(weight: PackedN16SdotWeight, n: usize) -> PackedN16SdotWeight {
+    if let Some(numa) = numa_decode_active() {
+        return PackedN16SdotWeight {
+            values: numa.place_rows(&weight.values, n.div_ceil(N16_SDOT_OUTPUTS)),
+            scales: numa.place_rows(&weight.scales, n),
+            zero_point_offsets: numa.place_rows(&weight.zero_point_offsets, n),
+        };
+    }
+    if let Some(spmd) = spmd_decode_active() {
+        return PackedN16SdotWeight {
+            values: spmd.place_rows(&weight.values, n.div_ceil(N16_SDOT_OUTPUTS)),
+            scales: spmd.place_rows(&weight.scales, n),
+            zero_point_offsets: spmd.place_rows(&weight.zero_point_offsets, n),
+        };
+    }
+    weight
+}
+
+fn numa_place_kai_sdot(weight: PackedKaiSdotWeight, n: usize) -> PackedKaiSdotWeight {
+    let tiles = n.div_ceil(KAI_SDOT_OUTPUTS);
+    if let Some(numa) = numa_decode_active() {
+        return PackedKaiSdotWeight {
+            bits: weight.bits,
+            values: numa.place_rows(&weight.values, tiles),
+            scales: numa.place_rows(&weight.scales, tiles),
+            rhs_sums: numa.place_rows(&weight.rhs_sums, tiles),
+            zero_point_offsets: numa.place_rows(&weight.zero_point_offsets, tiles),
+        };
+    }
+    if let Some(spmd) = spmd_decode_active() {
+        return PackedKaiSdotWeight {
+            bits: weight.bits,
+            values: spmd.place_rows(&weight.values, tiles),
+            scales: spmd.place_rows(&weight.scales, tiles),
+            rhs_sums: spmd.place_rows(&weight.rhs_sums, tiles),
+            zero_point_offsets: spmd.place_rows(&weight.zero_point_offsets, tiles),
+        };
+    }
+    weight
+}
+
 /// Node-local first-touch for a standard packed NBits weight.
 fn numa_place_nbits(weight: PackedNBitsWeight, n: usize) -> PackedNBitsWeight {
     let place =
@@ -2566,10 +3023,9 @@ pub fn with_decode_pool_scope<R: Send>(
     model_uses_spmd_pool: bool,
     f: impl FnOnce() -> R + Send,
 ) -> R {
-    // The persistent SPMD pool benefits both quantized and dense-f32 models when
-    // the NEON GEMV kernel dispatches to it (aarch64 without MLAS). With MLAS the
-    // SPMD workers contend with the MLAS GEMM's own Rayon workers, so the pool
-    // is skipped. Without MLAS, the pool is built and used by default.
+    // The persistent SPMD pool benefits quantized models whose decode kernels
+    // dispatch output shards through it, including the MLAS QNBit shard route.
+    // Keep the existing default/forced SPMD policy for all other callers.
     #[cfg(not(feature = "mlas"))]
     let spmd_pool_eligible = model_uses_spmd_pool
         || crate::decode_spmd::is_forced()
@@ -2738,6 +3194,12 @@ enum DotKernel {
     /// AdvSIMD) that is bit-exact vs scalar.
     #[cfg(target_arch = "aarch64")]
     Neon,
+    /// ARMv8.2-A dot-product int4 decode kernel. This consumes signed int8
+    /// activations and signed int4 weights (`q - 8`), so it uses signed `sdot`
+    /// via inline asm rather than the unavailable mixed unsigned/signed
+    /// dot-product intrinsic.
+    #[cfg(target_arch = "aarch64")]
+    NeonDot,
 }
 
 impl DotKernel {
@@ -2745,6 +3207,7 @@ impl DotKernel {
     /// activation layout and may take the int4-direct decode path. `Scalar`
     /// and `Avx2` use the natural layout / int8 route, so they must NOT enter
     /// that path (a wrong classification silently corrupts decode).
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     fn uses_vnni_int4_direct(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
@@ -2753,6 +3216,105 @@ impl DotKernel {
         #[cfg(not(target_arch = "x86_64"))]
         {
             false
+        }
+    }
+
+    /// Whether this host kernel can consume the packed int4 weight directly for
+    /// M=1 decode. x86 VNNI currently supports only block-32 because its
+    /// deinterleaved activation layout is hard-coded at that granularity; the
+    /// aarch64 dot-product kernel handles any quantization block that is a
+    /// multiple of 32, including the Foundry Qwen3 block-128 graph.
+    fn supports_int4_direct(self, block_size: usize, _has_zero_points: bool) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            !_has_zero_points && self.uses_vnni_int4_direct() && block_size == 32
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            matches!(self, DotKernel::NeonDot)
+                && block_size.is_multiple_of(32)
+                && Self::arm64_kai_sdot_direct_enabled()
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = block_size;
+            false
+        }
+    }
+
+    fn uses_n16_sdot_direct(self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            matches!(self, DotKernel::NeonDot) && Self::arm64_int4_direct_enabled()
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    }
+
+    fn uses_kai_sdot_direct(self, bits: usize, block_size: usize) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            matches!(self, DotKernel::NeonDot)
+                && matches!(bits, 4 | 8)
+                && block_size.is_multiple_of(32)
+                && Self::arm64_kai_sdot_direct_enabled()
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = bits;
+            let _ = block_size;
+            false
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn arm64_int4_direct_enabled() -> bool {
+        #[cfg(test)]
+        {
+            true
+        }
+        #[cfg(not(test))]
+        {
+            // The asymmetric N16 SDOT kernels are correctness-locked, but the
+            // first full-model Qwen3 measurement regressed decode throughput.
+            // Keep them opt-in while the microkernel is tightened.
+            //
+            // Resolved once: this gate is read from the per-token decode path,
+            // where `std::env::var` would take the process-wide environment
+            // lock and allocate on every generated token.
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value != "0"
+                })
+            })
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn arm64_kai_sdot_direct_enabled() -> bool {
+        #[cfg(test)]
+        {
+            true
+        }
+        #[cfg(not(test))]
+        {
+            // Resolved once: see the note in `arm64_int4_direct_enabled`.
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
+                    let value = value.trim();
+                    return !value.is_empty() && value != "0";
+                }
+                // Validated against the f32 reference for the asymmetric block128
+                // shapes Qwen3 actually emits, so this path is on by default.
+                // Apple silicon keeps the existing route pending its own
+                // measurement pass.
+                !cfg!(any(target_os = "macos", target_os = "ios"))
+            })
         }
     }
 }
@@ -2782,6 +3344,9 @@ fn selected_dot_kernel() -> DotKernel {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return DotKernel::NeonDot;
+        }
         // NEON/AdvSIMD is baseline on aarch64, so the SIMD int8 dot is always
         // available — never fall back to the slow scalar path on ARM. The
         // kernel uses the widen-`vmlal` baseline, bit-exact vs scalar.
@@ -2803,6 +3368,42 @@ fn selected_dot_kernel() -> DotKernel {
 /// hosts (Xeon Phi KNL/KNM). On non-x86-64 targets no such kernel exists so this
 /// is always `false`.
 #[cfg(feature = "mlas")]
+fn prefer_arm64_mlas_qnbit_decode(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    m: usize,
+    no_group_indices: bool,
+) -> bool {
+    cfg!(all(
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    )) && arm64_mlas_qnbit_decode_opted_in()
+        && matches!(bits, 4 | 8)
+        && block_size == 128
+        && accuracy_level == 4
+        && m == 1
+        && no_group_indices
+}
+
+#[cfg(feature = "mlas")]
+fn host_supports_mlas_sqnbit_m1_asym_int8() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        host_has_mlas_sqnbit_avx512()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "mlas")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn host_has_mlas_sqnbit_avx512() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2854,20 +3455,22 @@ fn int4_matmul_m1(
     result: &mut [f32],
     k: usize,
     n: usize,
+    block_size: usize,
     dot_kernel: DotKernel,
 ) {
-    const BLOCK_SIZE: usize = 32;
-    const PACKED_BLOCK_SIZE: usize = BLOCK_SIZE / 2;
-
-    let k_blocks = k.div_ceil(BLOCK_SIZE);
-    let padded_k = k_blocks * BLOCK_SIZE;
+    debug_assert!(block_size.is_multiple_of(32));
+    #[cfg(target_arch = "x86_64")]
+    debug_assert!(!dot_kernel.uses_vnni_int4_direct() || block_size == 32);
+    let packed_block_size = block_size / 2;
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
     debug_assert_eq!(activation.len(), k);
-    debug_assert_eq!(weight.values.len(), n * k_blocks * PACKED_BLOCK_SIZE);
+    debug_assert_eq!(weight.values.len(), n * k_blocks * packed_block_size);
     debug_assert_eq!(weight.scales.len(), n * k_blocks);
     debug_assert_eq!(result.len(), n);
 
     let (activation, activation_scales) =
-        quantize_activation_signed(activation, padded_k, BLOCK_SIZE);
+        quantize_activation_signed(activation, padded_k, block_size);
     // The SIMD int4 kernels consume a deinterleaved activation layout (evens
     // then odds per 32-block) so they can skip the per-block nibble
     // deinterleave; the scalar reference keeps natural order. Deinterleave once
@@ -2900,11 +3503,13 @@ fn int4_matmul_m1(
     } else {
         Vec::new()
     };
+    #[cfg(test)]
+    INT4_DIRECT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
     let compute = |output_start: usize, outputs: &mut [f32]| {
         for (offset, output) in outputs.iter_mut().enumerate() {
             let output_index = output_start + offset;
-            let packed_start = output_index * k_blocks * PACKED_BLOCK_SIZE;
-            let packed_end = packed_start + k_blocks * PACKED_BLOCK_SIZE;
+            let packed_start = output_index * k_blocks * packed_block_size;
+            let packed_end = packed_start + k_blocks * packed_block_size;
             let scale_start = output_index * k_blocks;
             let scale_end = scale_start + k_blocks;
             *output = int4_dot_row(
@@ -2913,12 +3518,1212 @@ fn int4_matmul_m1(
                 &weight.scales[scale_start..scale_end],
                 &activation_scales,
                 &act_sum8,
+                block_size,
                 dot_kernel,
             );
         }
     };
 
     parallel_output_rows(result, padded_k, compute);
+}
+
+fn prepack_kai_sdot_from_bytes(
+    packed: &[u8],
+    scales: Vec<f32>,
+    zero_points: Option<&[u8]>,
+    n: usize,
+    k: usize,
+    bits: usize,
+    block_size: usize,
+) -> PackedKaiSdotWeight {
+    debug_assert!(matches!(bits, 4 | 8));
+    debug_assert!(block_size.is_multiple_of(KAI_SDOT_K_GROUP));
+    let layout = NBitsLayout { bits, block_size };
+    let k_blocks = k.div_ceil(block_size);
+    let groups_per_block = block_size / KAI_SDOT_K_GROUP;
+    let payload = if bits == 4 { 2 } else { KAI_SDOT_K_GROUP };
+    let tile_count = n.div_ceil(KAI_SDOT_OUTPUTS);
+    let group_stride = KAI_SDOT_OUTPUTS * payload;
+    let tile_stride = k_blocks * groups_per_block * group_stride;
+    let packed_block_size = layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(k_blocks);
+    let midpoint = 1i16 << (bits - 1);
+    let mut values = vec![0u8; tile_count * tile_stride];
+    let meta_stride = k_blocks * KAI_SDOT_OUTPUTS;
+    let mut packed_scales = vec![0.0f32; tile_count * meta_stride];
+    let mut rhs_sums = vec![0i32; tile_count * meta_stride];
+    let mut zero_point_offsets = vec![0i16; tile_count * meta_stride];
+
+    for output in 0..n {
+        let tile = output / KAI_SDOT_OUTPUTS;
+        let lane = output % KAI_SDOT_OUTPUTS;
+        for block in 0..k_blocks {
+            let meta = tile * meta_stride + block * KAI_SDOT_OUTPUTS + lane;
+            let zero_point = zero_points.map_or(midpoint as u8, |points| {
+                layout.zero_point(
+                    Some(
+                        &points[output * zero_point_row_size
+                            ..output * zero_point_row_size + zero_point_row_size],
+                    ),
+                    block,
+                )
+            });
+            packed_scales[meta] = scales[output * k_blocks + block];
+            zero_point_offsets[meta] = midpoint - zero_point as i16;
+            let mut sum = 0i32;
+            for group in 0..groups_per_block {
+                let base = tile * tile_stride
+                    + (block * groups_per_block + group) * group_stride
+                    + lane * payload;
+                let mut centered_group = [0i8; KAI_SDOT_K_GROUP];
+                for (kk, centered_slot) in centered_group.iter_mut().enumerate() {
+                    let within_block = group * KAI_SDOT_K_GROUP + kk;
+                    let depth = block * block_size + within_block;
+                    let centered = if depth < k {
+                        let block_start = (output * k_blocks + block) * packed_block_size;
+                        let q = layout.unpack(
+                            &packed[block_start..block_start + packed_block_size],
+                            within_block,
+                        );
+                        q as i16 - midpoint
+                    } else {
+                        0
+                    };
+                    *centered_slot = centered as i8;
+                    sum += centered as i32;
+                }
+                if bits == 4 {
+                    values[base] = ((centered_group[0] + 8) as u8 & 0x0f)
+                        | (((centered_group[1] + 8) as u8 & 0x0f) << 4);
+                    values[base + 1] = ((centered_group[2] + 8) as u8 & 0x0f)
+                        | (((centered_group[3] + 8) as u8 & 0x0f) << 4);
+                } else {
+                    for (kk, centered) in centered_group.iter().enumerate() {
+                        values[base + kk] = *centered as u8;
+                    }
+                }
+            }
+            rhs_sums[meta] = sum;
+        }
+    }
+
+    PackedKaiSdotWeight {
+        bits,
+        values,
+        scales: packed_scales,
+        rhs_sums,
+        zero_point_offsets,
+    }
+}
+
+struct Qai8dxpActivation {
+    values: Vec<i8>,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    group_words: Vec<u32>,
+    scale: f32,
+    zero_point: i32,
+    block_sums: Vec<i32>,
+    block_counts: Vec<i32>,
+}
+
+fn quantize_activation_qai8dxp(
+    activation: &[f32],
+    padded_k: usize,
+    block_size: usize,
+) -> Qai8dxpActivation {
+    let k_blocks = padded_k / block_size;
+    let mut min = 0.0f32;
+    let mut max = 0.0f32;
+    for &value in activation {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    let qmin = i8::MIN as f32;
+    let qmax = i8::MAX as f32;
+    let qscale = if min == max {
+        1.0
+    } else {
+        (qmax - qmin) / (max - min)
+    };
+    let scale = if qscale == 0.0 { 1.0 } else { 1.0 / qscale };
+    let zero_from_min = qmin - min * qscale;
+    let zero_from_max = qmax - max * qscale;
+    let zero_point = if zero_from_min + zero_from_max > 0.0 {
+        zero_from_min
+    } else {
+        zero_from_max
+    }
+    .round()
+    .clamp(qmin, qmax) as i32;
+    let mut values = vec![zero_point as i8; padded_k];
+    let mut block_sums = vec![0i32; k_blocks];
+    let mut block_counts = vec![0i32; k_blocks];
+    for (idx, &value) in activation.iter().enumerate() {
+        let q = (value * qscale).round() as i32 + zero_point;
+        let q = q.clamp(i8::MIN as i32, i8::MAX as i32);
+        values[idx] = q as i8;
+        let block = idx / block_size;
+        block_sums[block] += q;
+        block_counts[block] += 1;
+    }
+    let group_words = values
+        .chunks_exact(KAI_SDOT_K_GROUP)
+        .map(|group| {
+            u32::from_le_bytes([
+                group[0] as u8,
+                group[1] as u8,
+                group[2] as u8,
+                group[3] as u8,
+            ])
+        })
+        .collect();
+    Qai8dxpActivation {
+        values,
+        group_words,
+        scale,
+        zero_point,
+        block_sums,
+        block_counts,
+    }
+}
+
+fn kai_sdot_matmul_m1(
+    activation: &[f32],
+    weight: &PackedKaiSdotWeight,
+    result: &mut [f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert!(matches!(weight.bits, 4 | 8));
+    debug_assert!(block_size.is_multiple_of(KAI_SDOT_K_GROUP));
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
+    let packed_meta_len = n.div_ceil(KAI_SDOT_OUTPUTS) * k_blocks * KAI_SDOT_OUTPUTS;
+    debug_assert_eq!(activation.len(), k);
+    debug_assert_eq!(weight.scales.len(), packed_meta_len);
+    debug_assert_eq!(weight.rhs_sums.len(), packed_meta_len);
+    debug_assert_eq!(weight.zero_point_offsets.len(), packed_meta_len);
+    debug_assert_eq!(result.len(), n);
+
+    let activation = quantize_activation_qai8dxp(activation, padded_k, block_size);
+    #[cfg(test)]
+    KAI_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        #[cfg(target_arch = "aarch64")]
+        if matches!(dot_kernel, DotKernel::NeonDot) {
+            // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
+            // detection; the prepack layout is validated by debug assertions.
+            unsafe {
+                kai_sdot_matmul_m1_neon_dot(
+                    &activation,
+                    weight,
+                    output_start,
+                    outputs,
+                    n,
+                    k_blocks,
+                    block_size,
+                );
+            }
+            return;
+        }
+
+        let _ = dot_kernel;
+        kai_sdot_matmul_m1_scalar(
+            &activation,
+            weight,
+            output_start,
+            outputs,
+            k_blocks,
+            block_size,
+        );
+    };
+    parallel_kai_output_rows(result, padded_k, compute);
+}
+
+fn parallel_kai_output_rows<F>(result: &mut [f32], k: usize, compute: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_output_rows_indexed(result, KAI_SDOT_OUTPUTS, &|_, start, outputs| {
+            compute(start, outputs)
+        });
+        return;
+    }
+    if let Some(numa) = numa_decode_active() {
+        numa.dispatch_output_rows(result, k, &compute);
+        return;
+    }
+    let chunk = output_chunk_len(result.len(), k);
+    let chunk = if chunk < result.len() {
+        chunk.div_ceil(KAI_SDOT_OUTPUTS) * KAI_SDOT_OUTPUTS
+    } else {
+        chunk
+    };
+    if chunk < result.len() {
+        result
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+    } else {
+        compute(0, result);
+    }
+}
+
+fn kai_group_payload(bits: usize) -> usize {
+    if bits == 4 { 2 } else { KAI_SDOT_K_GROUP }
+}
+
+#[inline]
+fn kai_meta_index(output: usize, block: usize, k_blocks: usize) -> usize {
+    let tile = output / KAI_SDOT_OUTPUTS;
+    let lane = output % KAI_SDOT_OUTPUTS;
+    tile * k_blocks * KAI_SDOT_OUTPUTS + block * KAI_SDOT_OUTPUTS + lane
+}
+
+fn kai_centered_weight(
+    weight: &PackedKaiSdotWeight,
+    output: usize,
+    block: usize,
+    group: usize,
+    kk: usize,
+    k_blocks: usize,
+    groups_per_block: usize,
+) -> i32 {
+    let payload = kai_group_payload(weight.bits);
+    let group_stride = KAI_SDOT_OUTPUTS * payload;
+    let tile_stride = k_blocks * groups_per_block * group_stride;
+    let tile = output / KAI_SDOT_OUTPUTS;
+    let lane = output % KAI_SDOT_OUTPUTS;
+    let base =
+        tile * tile_stride + (block * groups_per_block + group) * group_stride + lane * payload;
+    if weight.bits == 4 {
+        let byte = weight.values[base + kk / 2];
+        let q = if kk.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        q as i32 - 8
+    } else {
+        weight.values[base + kk] as i8 as i32
+    }
+}
+
+fn kai_sdot_matmul_m1_scalar(
+    activation: &Qai8dxpActivation,
+    weight: &PackedKaiSdotWeight,
+    output_start: usize,
+    result: &mut [f32],
+    k_blocks: usize,
+    block_size: usize,
+) {
+    let groups_per_block = block_size / KAI_SDOT_K_GROUP;
+    for (offset, output_value) in result.iter_mut().enumerate() {
+        let output = output_start + offset;
+        let mut total = 0.0f32;
+        for block in 0..k_blocks {
+            let mut acc = 0i32;
+            for group in 0..groups_per_block {
+                let activation_base = block * block_size + group * KAI_SDOT_K_GROUP;
+                for kk in 0..KAI_SDOT_K_GROUP {
+                    let a = activation.values[activation_base + kk] as i32;
+                    let w = kai_centered_weight(
+                        weight,
+                        output,
+                        block,
+                        group,
+                        kk,
+                        k_blocks,
+                        groups_per_block,
+                    );
+                    acc += a * w;
+                }
+            }
+            let idx = kai_meta_index(output, block, k_blocks);
+            let correction = kai_qai8_correction(
+                activation,
+                weight.rhs_sums[idx],
+                weight.zero_point_offsets[idx] as i32,
+                block,
+            );
+            total += (acc + correction) as f32 * (activation.scale * weight.scales[idx]);
+        }
+        *output_value = total;
+    }
+}
+
+#[inline]
+fn kai_qai8_correction(
+    activation: &Qai8dxpActivation,
+    rhs_sum: i32,
+    zp_offset: i32,
+    block: usize,
+) -> i32 {
+    let a_zp = activation.zero_point;
+    -a_zp * rhs_sum
+        + zp_offset * (activation.block_sums[block] - a_zp * activation.block_counts[block])
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn kai_sdot_matmul_m1_neon_dot(
+    activation: &Qai8dxpActivation,
+    weight: &PackedKaiSdotWeight,
+    output_start: usize,
+    result: &mut [f32],
+    n: usize,
+    k_blocks: usize,
+    block_size: usize,
+) {
+    let mut offset = 0usize;
+    while offset < result.len() {
+        let output = output_start + offset;
+        if output.is_multiple_of(KAI_SDOT_OUTPUTS)
+            && output + KAI_SDOT_OUTPUTS <= n
+            && offset + KAI_SDOT_OUTPUTS <= result.len()
+        {
+            let out =
+                unsafe { kai_sdot_tile_neon(activation, weight, output, k_blocks, block_size) };
+            result[offset..offset + KAI_SDOT_OUTPUTS].copy_from_slice(&out);
+            offset += KAI_SDOT_OUTPUTS;
+        } else {
+            kai_sdot_matmul_m1_scalar(
+                activation,
+                weight,
+                output,
+                &mut result[offset..offset + 1],
+                k_blocks,
+                block_size,
+            );
+            offset += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn kai_sdot_tile_neon(
+    activation: &Qai8dxpActivation,
+    weight: &PackedKaiSdotWeight,
+    output_start: usize,
+    k_blocks: usize,
+    block_size: usize,
+) -> [f32; KAI_SDOT_OUTPUTS] {
+    use std::arch::aarch64::*;
+
+    let groups_per_block = block_size / KAI_SDOT_K_GROUP;
+    let payload = kai_group_payload(weight.bits);
+    let group_stride = KAI_SDOT_OUTPUTS * payload;
+    let tile_stride = k_blocks * groups_per_block * group_stride;
+    let tile = output_start / KAI_SDOT_OUTPUTS;
+    let meta_tile_base = tile * k_blocks * KAI_SDOT_OUTPUTS;
+    let mut total0 = vdupq_n_f32(0.0);
+    let mut total1 = vdupq_n_f32(0.0);
+    let mut total2 = vdupq_n_f32(0.0);
+    let mut total3 = vdupq_n_f32(0.0);
+    for block in 0..k_blocks {
+        let mut acc0_even = vdupq_n_s32(0);
+        let mut acc1_even = vdupq_n_s32(0);
+        let mut acc2_even = vdupq_n_s32(0);
+        let mut acc3_even = vdupq_n_s32(0);
+        let mut acc0_odd = vdupq_n_s32(0);
+        let mut acc1_odd = vdupq_n_s32(0);
+        let mut acc2_odd = vdupq_n_s32(0);
+        let mut acc3_odd = vdupq_n_s32(0);
+        for group in 0..groups_per_block {
+            let word = activation.group_words[block * groups_per_block + group];
+            let act = vreinterpretq_s8_u32(vdupq_n_u32(word));
+            let weight_base =
+                tile * tile_stride + (block * groups_per_block + group) * group_stride;
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                let ahead = if weight.bits == 4 { 16 } else { 8 };
+                if group + ahead < groups_per_block {
+                    let prefetch_base = tile * tile_stride
+                        + (block * groups_per_block + group + ahead) * group_stride;
+                    unsafe {
+                        kai_prefetch_l1(weight.values.as_ptr().wrapping_add(prefetch_base));
+                    }
+                }
+            }
+            let (acc0, acc1, acc2, acc3) = if group.is_multiple_of(2) {
+                (
+                    &mut acc0_even,
+                    &mut acc1_even,
+                    &mut acc2_even,
+                    &mut acc3_even,
+                )
+            } else {
+                (&mut acc0_odd, &mut acc1_odd, &mut acc2_odd, &mut acc3_odd)
+            };
+            if weight.bits == 4 {
+                let packed0 = unsafe { vld1q_u8(weight.values.as_ptr().add(weight_base)) };
+                let low0 = vandq_u8(packed0, vdupq_n_u8(0x0f));
+                let high0 = vshrq_n_u8::<4>(packed0);
+                let w0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low0, high0)), vdupq_n_s8(8));
+                let w1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low0, high0)), vdupq_n_s8(8));
+                let packed1 = unsafe { vld1q_u8(weight.values.as_ptr().add(weight_base + 16)) };
+                let low1 = vandq_u8(packed1, vdupq_n_u8(0x0f));
+                let high1 = vshrq_n_u8::<4>(packed1);
+                let w2 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low1, high1)), vdupq_n_s8(8));
+                let w3 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low1, high1)), vdupq_n_s8(8));
+                *acc0 = unsafe { sdot_i8x16(*acc0, act, w0) };
+                *acc1 = unsafe { sdot_i8x16(*acc1, act, w1) };
+                *acc2 = unsafe { sdot_i8x16(*acc2, act, w2) };
+                *acc3 = unsafe { sdot_i8x16(*acc3, act, w3) };
+            } else {
+                let ptr = unsafe { weight.values.as_ptr().add(weight_base) as *const i8 };
+                let w0 = unsafe { vld1q_s8(ptr) };
+                let w1 = unsafe { vld1q_s8(ptr.add(16)) };
+                let w2 = unsafe { vld1q_s8(ptr.add(32)) };
+                let w3 = unsafe { vld1q_s8(ptr.add(48)) };
+                *acc0 = unsafe { sdot_i8x16(*acc0, act, w0) };
+                *acc1 = unsafe { sdot_i8x16(*acc1, act, w1) };
+                *acc2 = unsafe { sdot_i8x16(*acc2, act, w2) };
+                *acc3 = unsafe { sdot_i8x16(*acc3, act, w3) };
+            }
+        }
+        let acc0 = vaddq_s32(acc0_even, acc0_odd);
+        let acc1 = vaddq_s32(acc1_even, acc1_odd);
+        let acc2 = vaddq_s32(acc2_even, acc2_odd);
+        let acc3 = vaddq_s32(acc3_even, acc3_odd);
+        let meta = meta_tile_base + block * KAI_SDOT_OUTPUTS;
+        let rhs = unsafe { weight.rhs_sums.as_ptr().add(meta) };
+        let zp = unsafe { weight.zero_point_offsets.as_ptr().add(meta) };
+        let scale = unsafe { weight.scales.as_ptr().add(meta) };
+        let centered_activation_sum =
+            activation.block_sums[block] - activation.zero_point * activation.block_counts[block];
+        let corr0 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs),
+                vmovl_s16(vld1_s16(zp)),
+            )
+        };
+        let corr1 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs.add(4)),
+                vmovl_s16(vld1_s16(zp.add(4))),
+            )
+        };
+        let corr2 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs.add(8)),
+                vmovl_s16(vld1_s16(zp.add(8))),
+            )
+        };
+        let corr3 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs.add(12)),
+                vmovl_s16(vld1_s16(zp.add(12))),
+            )
+        };
+        total0 = unsafe { kai_accumulate_block_neon(acc0, corr0, scale, activation.scale, total0) };
+        total1 = unsafe {
+            kai_accumulate_block_neon(acc1, corr1, scale.add(4), activation.scale, total1)
+        };
+        total2 = unsafe {
+            kai_accumulate_block_neon(acc2, corr2, scale.add(8), activation.scale, total2)
+        };
+        total3 = unsafe {
+            kai_accumulate_block_neon(acc3, corr3, scale.add(12), activation.scale, total3)
+        };
+    }
+    let mut out = [0.0f32; KAI_SDOT_OUTPUTS];
+    unsafe {
+        vst1q_f32(out.as_mut_ptr(), total0);
+        vst1q_f32(out.as_mut_ptr().add(4), total1);
+        vst1q_f32(out.as_mut_ptr().add(8), total2);
+        vst1q_f32(out.as_mut_ptr().add(12), total3);
+    };
+    out
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+#[inline(always)]
+unsafe fn kai_prefetch_l1(ptr: *const u8) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn kai_qai8_correction_vec_neon(
+    activation_zero_point: i32,
+    centered_activation_sum: i32,
+    rhs_sum: std::arch::aarch64::int32x4_t,
+    zero_point_offset: std::arch::aarch64::int32x4_t,
+) -> std::arch::aarch64::int32x4_t {
+    use std::arch::aarch64::*;
+
+    vaddq_s32(
+        vmulq_n_s32(rhs_sum, -activation_zero_point),
+        vmulq_n_s32(zero_point_offset, centered_activation_sum),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn kai_accumulate_block_neon(
+    acc: std::arch::aarch64::int32x4_t,
+    correction: std::arch::aarch64::int32x4_t,
+    scale: *const f32,
+    activation_scale: f32,
+    total: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    let block_i32 = vaddq_s32(acc, correction);
+    let block_f32 = vcvtq_f32_s32(block_i32);
+    let scale = vmulq_n_f32(unsafe { vld1q_f32(scale) }, activation_scale);
+    vaddq_f32(total, vmulq_f32(block_f32, scale))
+}
+
+fn prepack_n16_sdot_from_bytes(
+    packed: &[u8],
+    scales: Vec<f32>,
+    zero_points: Option<&[u8]>,
+    n: usize,
+    k: usize,
+    bits: usize,
+    block_size: usize,
+) -> PackedN16SdotWeight {
+    debug_assert!(matches!(bits, 4 | 8));
+    debug_assert!(block_size.is_multiple_of(N16_SDOT_K_GROUP));
+    let k_blocks = k.div_ceil(block_size);
+    let packed_block_size = block_size * bits / 8;
+    let groups_per_block = block_size / N16_SDOT_K_GROUP;
+    let tile_count = n.div_ceil(N16_SDOT_OUTPUTS);
+    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let zero_point_row_size = (k_blocks * bits).div_ceil(8);
+    let midpoint = 1i16 << (bits - 1);
+    let mut values = vec![0i8; tile_count * tile_stride];
+    let mut zero_point_offsets = vec![0i16; n * k_blocks];
+
+    for output in 0..n {
+        let tile = output / N16_SDOT_OUTPUTS;
+        let lane = output % N16_SDOT_OUTPUTS;
+        for block in 0..k_blocks {
+            let zero_point = zero_points.map_or(midpoint as u8, |points| {
+                unpack_nbits(
+                    &points[output * zero_point_row_size
+                        ..output * zero_point_row_size + zero_point_row_size],
+                    block,
+                    bits,
+                )
+            });
+            zero_point_offsets[output * k_blocks + block] = midpoint - zero_point as i16;
+            for group in 0..groups_per_block {
+                for kk in 0..N16_SDOT_K_GROUP {
+                    let within_block = group * N16_SDOT_K_GROUP + kk;
+                    let depth = block * block_size + within_block;
+                    let centered = if depth < k {
+                        let block_start = (output * k_blocks + block) * packed_block_size;
+                        let q = unpack_nbits(
+                            &packed[block_start..block_start + packed_block_size],
+                            within_block,
+                            bits,
+                        );
+                        q as i16 - midpoint
+                    } else {
+                        0
+                    };
+                    let index = tile * tile_stride
+                        + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
+                        + lane * N16_SDOT_K_GROUP
+                        + kk;
+                    values[index] = centered as i8;
+                }
+            }
+        }
+    }
+
+    PackedN16SdotWeight {
+        values,
+        scales,
+        zero_point_offsets,
+    }
+}
+
+#[inline]
+fn unpack_nbits(packed: &[u8], index: usize, bits: usize) -> u8 {
+    if bits == 8 {
+        packed[index]
+    } else {
+        let values_per_byte = 8 / bits;
+        let mask = (1u8 << bits) - 1;
+        (packed[index / values_per_byte] >> ((index % values_per_byte) * bits)) & mask
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn n16_sdot_matmul_m1(
+    activation: &[f32],
+    weight: &PackedN16SdotWeight,
+    result: &mut [f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert!(block_size.is_multiple_of(N16_SDOT_K_GROUP));
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
+    let groups_per_block = block_size / N16_SDOT_K_GROUP;
+    debug_assert_eq!(activation.len(), k);
+    debug_assert_eq!(weight.scales.len(), n * k_blocks);
+    debug_assert_eq!(weight.zero_point_offsets.len(), n * k_blocks);
+    debug_assert_eq!(result.len(), n);
+
+    let (activation, activation_scales) =
+        quantize_activation_signed(activation, padded_k, block_size);
+    let activation_sums = activation_signed_block_sums(&activation, k_blocks, block_size);
+    #[cfg(test)]
+    N16_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        #[cfg(target_arch = "aarch64")]
+        if matches!(dot_kernel, DotKernel::NeonDot) {
+            // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
+            // detection; the prepack layout is validated by the debug assertions.
+            unsafe {
+                n16_sdot_matmul_m1_neon_dot(
+                    &activation,
+                    &activation_scales,
+                    &activation_sums,
+                    weight,
+                    output_start,
+                    outputs,
+                    n,
+                    k_blocks,
+                    groups_per_block,
+                );
+            }
+            return;
+        }
+
+        let _ = dot_kernel;
+        n16_sdot_matmul_m1_scalar(
+            &activation,
+            &activation_scales,
+            &activation_sums,
+            weight,
+            output_start,
+            outputs,
+            k_blocks,
+            groups_per_block,
+        );
+    };
+    parallel_n16_output_rows(result, padded_k, compute);
+}
+
+fn parallel_n16_output_rows<F>(result: &mut [f32], k: usize, compute: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_output_rows_indexed(result, N16_SDOT_OUTPUTS, &|_, start, outputs| {
+            compute(start, outputs)
+        });
+        return;
+    }
+    if let Some(numa) = numa_decode_active() {
+        numa.dispatch_output_rows(result, k, &compute);
+        return;
+    }
+    let chunk = output_chunk_len(result.len(), k);
+    let chunk = if chunk < result.len() {
+        chunk.div_ceil(N16_SDOT_OUTPUTS) * N16_SDOT_OUTPUTS
+    } else {
+        chunk
+    };
+    if chunk < result.len() {
+        result
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+    } else {
+        compute(0, result);
+    }
+}
+
+fn activation_signed_block_sums(activation: &[i8], k_blocks: usize, block_size: usize) -> Vec<i32> {
+    let mut sums = vec![0i32; k_blocks];
+    for (block, sum) in sums.iter_mut().enumerate() {
+        let start = block * block_size;
+        let end = start + block_size;
+        *sum = activation[start..end]
+            .iter()
+            .map(|&value| value as i32)
+            .sum();
+    }
+    sums
+}
+
+#[allow(clippy::too_many_arguments)]
+fn n16_sdot_matmul_m1_scalar(
+    activation: &[i8],
+    activation_scales: &[f32],
+    activation_sums: &[i32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    result: &mut [f32],
+    k_blocks: usize,
+    groups_per_block: usize,
+) {
+    for (offset, output_value) in result.iter_mut().enumerate() {
+        let output = output_start + offset;
+        *output_value = n16_sdot_int4_output_scalar(
+            activation,
+            activation_scales,
+            activation_sums,
+            weight,
+            output,
+            k_blocks,
+            groups_per_block,
+        );
+    }
+}
+
+fn n16_sdot_int4_output_scalar(
+    activation: &[i8],
+    activation_scales: &[f32],
+    activation_sums: &[i32],
+    weight: &PackedN16SdotWeight,
+    output: usize,
+    k_blocks: usize,
+    groups_per_block: usize,
+) -> f32 {
+    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let tile = output / N16_SDOT_OUTPUTS;
+    let lane = output % N16_SDOT_OUTPUTS;
+    let mut total = 0.0f32;
+    for block in 0..k_blocks {
+        let mut dot =
+            weight.zero_point_offsets[output * k_blocks + block] as i32 * activation_sums[block];
+        for group in 0..groups_per_block {
+            let base = tile * tile_stride
+                + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
+                + lane * N16_SDOT_K_GROUP;
+            let activation_base =
+                block * groups_per_block * N16_SDOT_K_GROUP + group * N16_SDOT_K_GROUP;
+            for kk in 0..N16_SDOT_K_GROUP {
+                dot += weight.values[base + kk] as i32 * activation[activation_base + kk] as i32;
+            }
+        }
+        total += dot as f32 * (weight.scales[output * k_blocks + block] * activation_scales[block]);
+    }
+    total
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn n16_sdot_u8_i16_matmul_m1(
+    activation: &[f32],
+    weight: &PackedN16SdotWeight,
+    result: &mut [f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert_eq!(block_size, 128);
+    debug_assert_eq!(activation_quant_group(), 32);
+    let k_blocks = k.div_ceil(block_size);
+    let k_groups_32 = k.div_ceil(32);
+    debug_assert_eq!(activation.len(), k);
+    debug_assert_eq!(weight.scales.len(), n * k_blocks);
+    debug_assert_eq!(weight.zero_point_offsets.len(), n * k_blocks);
+    debug_assert_eq!(result.len(), n);
+
+    let mut quantized = vec![0i16; k];
+    let mut group_scales = vec![0.0f32; k_groups_32];
+    let mut group_sums = vec![0i32; k_groups_32];
+    let mut block_activation_sums = vec![0.0f32; k_blocks];
+    for group in 0..k_groups_32 {
+        let start = group * 32;
+        let end = (start + 32).min(k);
+        group_scales[group] =
+            quantize_block_i16(&activation[start..end], &mut quantized[start..end]);
+        group_sums[group] = quantized[start..end]
+            .iter()
+            .map(|&value| value as i32)
+            .sum();
+    }
+    for block in 0..k_blocks {
+        let start = block * block_size;
+        let end = (start + block_size).min(k);
+        block_activation_sums[block] = activation[start..end].iter().sum();
+    }
+    #[cfg(test)]
+    N16_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        #[cfg(target_arch = "aarch64")]
+        if matches!(dot_kernel, DotKernel::NeonDot) {
+            // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
+            // detection; block/group sizes are fixed by the guards above.
+            unsafe {
+                n16_sdot_u8_i16_matmul_m1_neon_dot(
+                    &quantized,
+                    &group_scales,
+                    &group_sums,
+                    &block_activation_sums,
+                    weight,
+                    output_start,
+                    outputs,
+                    n,
+                    k_blocks,
+                );
+            }
+            return;
+        }
+
+        let _ = dot_kernel;
+        n16_sdot_u8_i16_matmul_m1_scalar(
+            &quantized,
+            &group_scales,
+            &group_sums,
+            &block_activation_sums,
+            weight,
+            output_start,
+            outputs,
+            k_blocks,
+        );
+    };
+    parallel_n16_output_rows(result, k, compute);
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn n16_sdot_u8_i16_matmul_m1_scalar(
+    activation: &[i16],
+    group_scales: &[f32],
+    group_sums: &[i32],
+    block_activation_sums: &[f32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    result: &mut [f32],
+    k_blocks: usize,
+) {
+    for (offset, output_value) in result.iter_mut().enumerate() {
+        let output = output_start + offset;
+        *output_value = n16_sdot_bits8_output_scalar(
+            activation,
+            group_scales,
+            group_sums,
+            block_activation_sums,
+            weight,
+            output,
+            k_blocks,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn n16_sdot_bits8_output_scalar(
+    activation: &[i16],
+    group_scales: &[f32],
+    group_sums: &[i32],
+    block_activation_sums: &[f32],
+    weight: &PackedN16SdotWeight,
+    output: usize,
+    k_blocks: usize,
+) -> f32 {
+    let groups_per_block = 4usize;
+    let groups_per_block_4 = 32 / N16_SDOT_K_GROUP;
+    let tile_stride = k_blocks * 128 / N16_SDOT_K_GROUP * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let tile = output / N16_SDOT_OUTPUTS;
+    let lane = output % N16_SDOT_OUTPUTS;
+    let mut total = 0.0f32;
+    for (block, &block_sum) in block_activation_sums.iter().enumerate().take(k_blocks) {
+        let mut product = 0.0f32;
+        for group_in_block in 0..groups_per_block {
+            let group = block * groups_per_block + group_in_block;
+            let mut centered_dot = 0i32;
+            for sub in 0..groups_per_block_4 {
+                let group4 = group_in_block * groups_per_block_4 + sub;
+                let base = tile * tile_stride
+                    + (block * 128 / N16_SDOT_K_GROUP + group4)
+                        * N16_SDOT_OUTPUTS
+                        * N16_SDOT_K_GROUP
+                    + lane * N16_SDOT_K_GROUP;
+                let activation_base = group * 32 + sub * N16_SDOT_K_GROUP;
+                for kk in 0..N16_SDOT_K_GROUP {
+                    if activation_base + kk < activation.len() {
+                        centered_dot += weight.values[base + kk] as i32
+                            * activation[activation_base + kk] as i32;
+                    }
+                }
+            }
+            let q_dot = centered_dot + 128 * group_sums[group];
+            product += group_scales[group] * q_dot as f32;
+        }
+        let scale = weight.scales[output * k_blocks + block];
+        let zero_point = 128i32 - weight.zero_point_offsets[output * k_blocks + block] as i32;
+        total += scale * product - scale * zero_point as f32 * block_sum;
+    }
+    total
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn n16_sdot_matmul_m1_neon_dot(
+    activation: &[i8],
+    activation_scales: &[f32],
+    activation_sums: &[i32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    result: &mut [f32],
+    n: usize,
+    k_blocks: usize,
+    groups_per_block: usize,
+) {
+    let mut offset = 0usize;
+    while offset < result.len() {
+        let output = output_start + offset;
+        if output.is_multiple_of(4) && output + 4 <= n && offset + 4 <= result.len() {
+            let out = unsafe {
+                n16_sdot_int4_quad_neon(
+                    activation,
+                    activation_scales,
+                    activation_sums,
+                    weight,
+                    output,
+                    k_blocks,
+                    groups_per_block,
+                )
+            };
+            result[offset..offset + 4].copy_from_slice(&out);
+            offset += 4;
+        } else {
+            result[offset] = n16_sdot_int4_output_scalar(
+                activation,
+                activation_scales,
+                activation_sums,
+                weight,
+                output,
+                k_blocks,
+                groups_per_block,
+            );
+            offset += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn n16_sdot_int4_quad_neon(
+    activation: &[i8],
+    activation_scales: &[f32],
+    activation_sums: &[i32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    k_blocks: usize,
+    groups_per_block: usize,
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+
+    debug_assert!(output_start.is_multiple_of(4));
+    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let tile = output_start / N16_SDOT_OUTPUTS;
+    let quad = (output_start % N16_SDOT_OUTPUTS) / 4;
+    let mut acc_f32 = vdupq_n_f32(0.0);
+    for block in 0..k_blocks {
+        let mut acc_i32 = vdupq_n_s32(0);
+        for group in 0..groups_per_block {
+            let activation_base =
+                block * groups_per_block * N16_SDOT_K_GROUP + group * N16_SDOT_K_GROUP;
+            let word = u32::from_le_bytes([
+                activation[activation_base] as u8,
+                activation[activation_base + 1] as u8,
+                activation[activation_base + 2] as u8,
+                activation[activation_base + 3] as u8,
+            ]);
+            let act = vreinterpretq_s8_u32(vdupq_n_u32(word));
+            let weight_base = tile * tile_stride
+                + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
+                + quad * 4 * N16_SDOT_K_GROUP;
+            let weights = unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base)) };
+            acc_i32 = unsafe { sdot_i8x16(acc_i32, act, weights) };
+        }
+        let mut correction = [0i32; 4];
+        let mut scale = [0.0f32; 4];
+        for lane in 0..4 {
+            let output = output_start + lane;
+            correction[lane] = weight.zero_point_offsets[output * k_blocks + block] as i32
+                * activation_sums[block];
+            scale[lane] = weight.scales[output * k_blocks + block];
+        }
+        let corr = unsafe { vld1q_s32(correction.as_ptr()) };
+        let block_i32 = vaddq_s32(acc_i32, corr);
+        let block_f32 = vcvtq_f32_s32(block_i32);
+        let scales = vmulq_n_f32(
+            unsafe { vld1q_f32(scale.as_ptr()) },
+            activation_scales[block],
+        );
+        acc_f32 = vaddq_f32(acc_f32, vmulq_f32(block_f32, scales));
+    }
+    let mut out = [0.0f32; 4];
+    unsafe { vst1q_f32(out.as_mut_ptr(), acc_f32) };
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn n16_sdot_u8_i16_matmul_m1_neon_dot(
+    activation: &[i16],
+    group_scales: &[f32],
+    group_sums: &[i32],
+    block_activation_sums: &[f32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    result: &mut [f32],
+    n: usize,
+    k_blocks: usize,
+) {
+    let mut offset = 0usize;
+    while offset < result.len() {
+        let output = output_start + offset;
+        if output.is_multiple_of(4) && output + 4 <= n && offset + 4 <= result.len() {
+            let out = unsafe {
+                n16_sdot_bits8_quad_neon(
+                    activation,
+                    group_scales,
+                    group_sums,
+                    block_activation_sums,
+                    weight,
+                    output,
+                    k_blocks,
+                )
+            };
+            result[offset..offset + 4].copy_from_slice(&out);
+            offset += 4;
+        } else {
+            result[offset] = n16_sdot_bits8_output_scalar(
+                activation,
+                group_scales,
+                group_sums,
+                block_activation_sums,
+                weight,
+                output,
+                k_blocks,
+            );
+            offset += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn n16_sdot_bits8_quad_neon(
+    activation: &[i16],
+    group_scales: &[f32],
+    group_sums: &[i32],
+    block_activation_sums: &[f32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    k_blocks: usize,
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+
+    debug_assert!(output_start.is_multiple_of(4));
+    let groups_per_block = 4usize;
+    let groups_per_block_4 = 32 / N16_SDOT_K_GROUP;
+    let tile_stride = k_blocks * 128 / N16_SDOT_K_GROUP * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let tile = output_start / N16_SDOT_OUTPUTS;
+    let quad = (output_start % N16_SDOT_OUTPUTS) / 4;
+    let mut total = vdupq_n_f32(0.0);
+    for block in 0..k_blocks {
+        let mut product = vdupq_n_f32(0.0);
+        for group_in_block in 0..groups_per_block {
+            let group = block * groups_per_block + group_in_block;
+            let mut acc_hi = vdupq_n_s32(0);
+            let mut acc_lo = vdupq_n_s32(0);
+            for sub in 0..groups_per_block_4 {
+                let group4 = group_in_block * groups_per_block_4 + sub;
+                let activation_base = group * 32 + sub * N16_SDOT_K_GROUP;
+                let mut hi_bytes = [0i8; 4];
+                let mut lo_bytes = [0i8; 4];
+                for kk in 0..N16_SDOT_K_GROUP {
+                    let value = activation.get(activation_base + kk).copied().unwrap_or(0);
+                    let hi = value.div_euclid(256) as i8;
+                    let lo_center = (value - i16::from(hi) * 256 - 128) as i8;
+                    hi_bytes[kk] = hi;
+                    lo_bytes[kk] = lo_center;
+                }
+                let hi_word = u32::from_le_bytes([
+                    hi_bytes[0] as u8,
+                    hi_bytes[1] as u8,
+                    hi_bytes[2] as u8,
+                    hi_bytes[3] as u8,
+                ]);
+                let lo_word = u32::from_le_bytes([
+                    lo_bytes[0] as u8,
+                    lo_bytes[1] as u8,
+                    lo_bytes[2] as u8,
+                    lo_bytes[3] as u8,
+                ]);
+                let hi_vec = vreinterpretq_s8_u32(vdupq_n_u32(hi_word));
+                let lo_vec = vreinterpretq_s8_u32(vdupq_n_u32(lo_word));
+                let weight_base = tile * tile_stride
+                    + (block * 128 / N16_SDOT_K_GROUP + group4)
+                        * N16_SDOT_OUTPUTS
+                        * N16_SDOT_K_GROUP
+                    + quad * 4 * N16_SDOT_K_GROUP;
+                let weights = unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base)) };
+                acc_hi = unsafe { sdot_i8x16(acc_hi, hi_vec, weights) };
+                acc_lo = unsafe { sdot_i8x16(acc_lo, lo_vec, weights) };
+            }
+            let q_dot = vaddq_s32(
+                vaddq_s32(acc_lo, vmulq_n_s32(acc_hi, 256)),
+                vdupq_n_s32(128 * group_sums[group]),
+            );
+            product = vaddq_f32(
+                product,
+                vmulq_n_f32(vcvtq_f32_s32(q_dot), group_scales[group]),
+            );
+        }
+        let mut scales = [0.0f32; 4];
+        let mut zero_points = [0.0f32; 4];
+        for lane in 0..4 {
+            let output = output_start + lane;
+            scales[lane] = weight.scales[output * k_blocks + block];
+            zero_points[lane] =
+                (128i32 - weight.zero_point_offsets[output * k_blocks + block] as i32) as f32;
+        }
+        let scale_vec = unsafe { vld1q_f32(scales.as_ptr()) };
+        let zp_vec = unsafe { vld1q_f32(zero_points.as_ptr()) };
+        let block_sum = vdupq_n_f32(block_activation_sums[block]);
+        let contribution = vsubq_f32(product, vmulq_f32(zp_vec, block_sum));
+        total = vaddq_f32(total, vmulq_f32(scale_vec, contribution));
+    }
+    let mut out = [0.0f32; 4];
+    unsafe { vst1q_f32(out.as_mut_ptr(), total) };
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3074,6 +4879,7 @@ fn int4_dot_row(
     scales: &[f32],
     activation_scales: &[f32],
     act_sum8: &[i32],
+    block_size: usize,
     _kernel: DotKernel,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -3105,24 +4911,57 @@ fn int4_dot_row(
             DotKernel::Scalar => {}
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(_kernel, DotKernel::NeonDot) {
+            // SAFETY: selected_dot_kernel checked FEAT_DotProd and the caller
+            // provides block_size as a multiple of 32.
+            return unsafe {
+                int4_dot_row_neon_dot(
+                    activation,
+                    packed_weight,
+                    scales,
+                    activation_scales,
+                    block_size,
+                )
+            };
+        }
+    }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = act_sum8;
-    int4_dot_row_scalar(activation, packed_weight, scales, activation_scales)
+    int4_dot_row_scalar_block(
+        activation,
+        packed_weight,
+        scales,
+        activation_scales,
+        block_size,
+    )
 }
 
+#[allow(dead_code)]
 fn int4_dot_row_scalar(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
     activation_scales: &[f32],
 ) -> f32 {
-    debug_assert_eq!(activation.len(), scales.len() * 32);
-    debug_assert_eq!(packed_weight.len(), scales.len() * 16);
+    int4_dot_row_scalar_block(activation, packed_weight, scales, activation_scales, 32)
+}
+
+fn int4_dot_row_scalar_block(
+    activation: &[i8],
+    packed_weight: &[u8],
+    scales: &[f32],
+    activation_scales: &[f32],
+    block_size: usize,
+) -> f32 {
+    debug_assert_eq!(activation.len(), scales.len() * block_size);
+    debug_assert_eq!(packed_weight.len(), scales.len() * (block_size / 2));
     debug_assert_eq!(activation_scales.len(), scales.len());
     let mut value = 0.0f32;
     for (block, &scale) in scales.iter().enumerate() {
-        let activation = &activation[block * 32..(block + 1) * 32];
-        let packed = &packed_weight[block * 16..(block + 1) * 16];
+        let activation = &activation[block * block_size..(block + 1) * block_size];
+        let packed = &packed_weight[block * (block_size / 2)..(block + 1) * (block_size / 2)];
         let mut dot = 0i32;
         for (pair, &byte) in packed.iter().enumerate() {
             dot += activation[pair * 2] as i32 * (i32::from(byte & 0x0f) - 8);
@@ -3131,6 +4970,75 @@ fn int4_dot_row_scalar(
         value += dot as f32 * (scale * activation_scales[block]);
     }
     value
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn int4_dot_row_neon_dot(
+    activation: &[i8],
+    packed_weight: &[u8],
+    scales: &[f32],
+    activation_scales: &[f32],
+    block_size: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    debug_assert!(block_size.is_multiple_of(32));
+    debug_assert_eq!(activation.len(), scales.len() * block_size);
+    debug_assert_eq!(packed_weight.len(), scales.len() * (block_size / 2));
+    debug_assert_eq!(activation_scales.len(), scales.len());
+
+    let low_mask = vdupq_n_u8(0x0f);
+    let zp = vdupq_n_s8(8);
+    let mut value = 0.0f32;
+    for (block, &scale) in scales.iter().enumerate() {
+        let mut block_acc = vdupq_n_s32(0);
+        let activation_base = block * block_size;
+        let packed_base = block * (block_size / 2);
+        for sub in 0..(block_size / 32) {
+            // SAFETY: slice lengths are validated above; each sub-block owns
+            // 16 packed bytes and 32 activation bytes.
+            let packed_ptr = unsafe { packed_weight.as_ptr().add(packed_base + sub * 16) };
+            let act_ptr = unsafe { activation.as_ptr().add(activation_base + sub * 32) };
+
+            // SAFETY: pointers above are in bounds for one vector load.
+            let packed = unsafe { vld1q_u8(packed_ptr) };
+            let low = vandq_u8(packed, low_mask);
+            let high = vshrq_n_u8::<4>(packed);
+            let w0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low, high)), zp);
+            let w1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low, high)), zp);
+            // SAFETY: pointers above are in bounds for two vector loads.
+            let a0 = unsafe { vld1q_s8(act_ptr) };
+            let a1 = unsafe { vld1q_s8(act_ptr.add(16)) };
+            block_acc = unsafe { sdot_i8x16(block_acc, a0, w0) };
+            block_acc = unsafe { sdot_i8x16(block_acc, a1, w1) };
+        }
+        let block_dot = vaddvq_s32(block_acc);
+        value += block_dot as f32 * (scale * activation_scales[block]);
+    }
+    value
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_i8x16(
+    acc: std::arch::aarch64::int32x4_t,
+    lhs: std::arch::aarch64::int8x16_t,
+    rhs: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut out = acc;
+    // SAFETY: `sdot` is available because callers are `target_feature =
+    // "dotprod"` and runtime-gated by `is_aarch64_feature_detected!("dotprod")`.
+    unsafe {
+        std::arch::asm!(
+            "sdot {out:v}.4s, {lhs:v}.16b, {rhs:v}.16b",
+            out = inout(vreg) out,
+            lhs = in(vreg) lhs,
+            rhs = in(vreg) rhs,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    out
 }
 
 /// 256-bit VNNI int4 block dot. `activation` MUST be in the deinterleaved
@@ -3865,7 +5773,7 @@ fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     #[cfg(target_arch = "aarch64")]
     {
         match _kernel {
-            DotKernel::Neon => {
+            DotKernel::Neon | DotKernel::NeonDot => {
                 // SAFETY: NEON/AdvSIMD is baseline on aarch64; the `i8mm` fast
                 // path inside is runtime-gated by `is_aarch64_feature_detected!`.
                 return unsafe { dot_u8_i8_neon(activation, weight) };
@@ -4688,7 +6596,11 @@ mod tests {
             int8_weight: OnceLock::new(),
             packed_u8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
+            packed_int4_n16_weight: OnceLock::new(),
+            packed_kai_qsi4_weight: OnceLock::new(),
             packed_nbits_weight: OnceLock::new(),
+            packed_u8_n16_weight: OnceLock::new(),
+            packed_kai_qsi8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
             #[cfg(feature = "mlas")]
@@ -4720,7 +6632,19 @@ mod tests {
         if let Some(w) = kernel.packed_int4_weight.get() {
             return Some(w as *const _ as *const ());
         }
+        if let Some(w) = kernel.packed_int4_n16_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
+        if let Some(w) = kernel.packed_kai_qsi4_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
         if let Some(w) = kernel.packed_nbits_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
+        if let Some(w) = kernel.packed_u8_n16_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
+        if let Some(w) = kernel.packed_kai_qsi8_weight.get() {
             return Some(w as *const _ as *const ());
         }
         #[cfg(feature = "mlas")]
@@ -5002,6 +6926,17 @@ mod tests {
         }
     }
 
+    fn assert_qai8dxp_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = 0.12 + 0.10 * expected.abs();
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "index {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
+    }
+
     fn run_decode_case(
         activations: &[f32],
         packed: &[u8],
@@ -5231,7 +7166,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_fp32_activation_is_more_accurate_than_accuracy4() {
-        let (k, n, block_size) = (128, 2, 128);
+        let (k, n, block_size) = (16, 2, 16);
         let mut weights_nk = vec![0i8; n * k];
         weights_nk[0] = 1;
         weights_nk[1] = 7;
@@ -5310,35 +7245,457 @@ mod tests {
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
-        let direct_int4 = selected_dot_kernel().uses_vnni_int4_direct();
-        let cached = if direct_int4 {
-            kernel
-                .packed_int4_weight
-                .get()
-                .expect("packed int4 weight must be cached")
-                .values
-                .as_ptr()
-        } else {
-            kernel
-                .int8_weight
-                .get()
-                .expect("int8 weight must be cached")
-                .values
-                .as_ptr()
-                .cast()
-        };
+        let direct_int4 = selected_dot_kernel().supports_int4_direct(block_size, false);
+        let cached =
+            prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be populated");
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
-        let reused = if direct_int4 {
-            kernel.packed_int4_weight.get().unwrap().values.as_ptr()
-        } else {
-            kernel.int8_weight.get().unwrap().values.as_ptr().cast()
-        };
+        let reused =
+            prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be reused");
         assert_eq!(reused, cached);
         assert!(kernel.weight_nk.get().is_none());
-        assert_eq!(kernel.packed_int4_weight.get().is_some(), direct_int4);
+        assert_eq!(
+            kernel.packed_int4_weight.get().is_some()
+                || kernel.packed_int4_n16_weight.get().is_some()
+                || kernel.packed_kai_qsi4_weight.get().is_some()
+                || {
+                    #[cfg(feature = "mlas")]
+                    {
+                        kernel.mlas_shards.get().is_some()
+                    }
+                    #[cfg(not(feature = "mlas"))]
+                    {
+                        false
+                    }
+                },
+            direct_int4
+        );
         assert_eq!(kernel.int8_weight.get().is_some(), !direct_int4);
+    }
+
+    #[cfg(all(
+        feature = "mlas",
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    #[test]
+    fn matmulnbits_arm64_mlas_qnbit_reaches_qwen_decode_bits4_and_bits8() {
+        let (k, n) = (128usize, 256usize);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT").ok();
+        for (label, override_value) in [("default", None), ("explicit", Some("1"))] {
+            // SAFETY: the backend env lock serializes readers/writers of this var in tests.
+            unsafe {
+                match override_value {
+                    Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                    None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+                }
+            }
+            for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
+                let weights: Vec<f32> = (0..n * k)
+                    .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+                    .collect();
+                let (packed, scales, zps, _) = if bits == 4 {
+                    quantize(&weights, n, k, block_size, true)
+                } else {
+                    quantize_8bit(&weights, n, k, block_size, true)
+                };
+                let zps = zps.expect("asymmetric quantization must emit qzeros");
+                if mlas_sys::SQNBitPackedB::new(
+                    n,
+                    k,
+                    bits,
+                    block_size,
+                    mlas_sys::SQNBitComputeType::Int8,
+                    &packed,
+                    &scales,
+                    Some(&zps),
+                )
+                .is_none()
+                {
+                    eprintln!("MLAS QNBit bits={bits} CompInt8 unavailable; skipping reachability");
+                    continue;
+                }
+
+                let mut kernel = accuracy4_kernel(k, n, block_size);
+                kernel.bits = bits;
+                kernel.set_constant_inputs(&[false, true, true, true]);
+                let blocks = k.div_ceil(block_size);
+                let blob = block_size * bits / 8;
+                let zp_blob = (blocks * bits).div_ceil(8);
+                let a = Owned::f32(&[1, k], &activations);
+                let b = Owned::u8(&[n, blocks, blob], &packed);
+                let scales = Owned::f32(&[n, blocks], &scales);
+                let zero_points = Owned::u8(&[n, zp_blob], &zps);
+                let mut y = Owned::zeros_f32(&[1, n]);
+
+                let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+                kernel
+                    .execute(
+                        &[a.view(), b.view(), scales.view(), zero_points.view()],
+                        &mut [y.view_mut()],
+                    )
+                    .unwrap();
+                assert!(
+                    MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before,
+                    "{label}: bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
+                );
+                assert!(
+                    kernel.mlas_shards.get().and_then(Option::as_ref).is_some(),
+                    "{label}: bits={bits} block{block_size} must prepack MLAS QNBit shards for decode by default",
+                );
+                assert!(
+                    kernel.mlas_packed.get().is_none(),
+                    "{label}: bits={bits} block{block_size} should only use full-width MLAS when ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1",
+                );
+                assert!(
+                    kernel.packed_kai_qsi4_weight.get().is_none()
+                        && kernel.packed_kai_qsi8_weight.get().is_none(),
+                    "{label}: bits={bits} block{block_size} must prefer MLAS over the native KAI fallback",
+                );
+            }
+        }
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference() {
+        #[cfg(feature = "mlas")]
+        let _guard = backend_env_lock().lock().unwrap();
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let block_size = 128usize;
+        assert!(selected_dot_kernel().supports_int4_direct(block_size, false));
+        for &(k, n) in &[
+            (1000usize, 257usize), // K and N tails.
+            (1024, 1024),          // attention/output projection.
+            (1024, 3072),          // gate/up projection.
+            (2048, 1024),          // grouped attention projection.
+            (3072, 1024),          // FFN down projection.
+        ] {
+            let activations: Vec<f32> = (0..k)
+                .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+                .collect();
+            let (packed, scales, _, dequantized) = quantize(&weights, n, k, block_size, false);
+            let kai_weight =
+                prepack_kai_sdot_from_bytes(&packed, scales.clone(), None, n, k, 4, block_size);
+            let mut scalar = vec![0.0f32; n];
+            let mut dot = vec![0.0f32; n];
+            kai_sdot_matmul_m1(
+                &activations,
+                &kai_weight,
+                &mut scalar,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+            kai_sdot_matmul_m1(
+                &activations,
+                &kai_weight,
+                &mut dot,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+            assert_close(&dot, &scalar);
+            let expected = reference(&activations, &dequantized, 1, k, n);
+            assert_qai8dxp_close(&dot, &expected);
+
+            let blocks = k.div_ceil(block_size);
+            let mut kernel = accuracy4_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let a = Owned::f32(&[1, k], &activations);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+                .unwrap();
+            let used_kai = kernel.packed_kai_qsi4_weight.get().is_some();
+            #[cfg(feature = "mlas")]
+            let used_mlas = kernel.mlas_shards.get().is_some();
+            #[cfg(not(feature = "mlas"))]
+            let used_mlas = false;
+            assert!(
+                used_kai || used_mlas,
+                "aarch64 bits=4/block128 decode reached neither MLAS QNBit nor KAI SDOT for K={k} N={n}",
+            );
+            assert!(
+                used_kai || {
+                    #[cfg(feature = "mlas")]
+                    {
+                        used_mlas
+                    }
+                    #[cfg(not(feature = "mlas"))]
+                    {
+                        false
+                    }
+                },
+                "block-128 direct int4 path must cache packed KAI or MLAS QNBit weight",
+            );
+            assert!(
+                kernel.int8_weight.get().is_none(),
+                "block-128 direct int4 path must bypass the int8 prepack fallback"
+            );
+            if used_kai {
+                assert_close(&y.to_f32(), &dot);
+            } else {
+                mlas_close(&y.to_f32(), &dot, 2e-1, "aarch64 MLAS qsi4 decode");
+            }
+        }
+    }
+
+    #[test]
+    fn n16_sdot_int4_block128_asymmetric_matches_int8_and_f32_reference() {
+        for &(k, n) in &[
+            (1024usize, 1024usize),
+            (1024, 3072),
+            (1000, 257), // K and N tails.
+        ] {
+            let block_size = 128usize;
+            let blocks = k.div_ceil(block_size);
+            let blob = block_size / 2;
+            let mut packed = vec![0u8; n * blocks * blob];
+            let mut scales = vec![0.0f32; n * blocks];
+            let mut zero_points = vec![0u8; n * blocks.div_ceil(2)];
+            for output in 0..n {
+                for packed_block in 0..blocks.div_ceil(2) {
+                    zero_points[output * blocks.div_ceil(2) + packed_block] =
+                        if (output + packed_block).is_multiple_of(2) {
+                            39
+                        } else {
+                            217
+                        };
+                }
+                for block in 0..blocks {
+                    scales[output * blocks + block] =
+                        0.003 + ((output * 17 + block * 13) % 19) as f32 * 0.0007;
+                    for offset in 0..block_size {
+                        let byte = &mut packed[(output * blocks + block) * blob + offset / 2];
+                        let q = ((output * 31 + block * 17 + offset * 7) & 0x0f) as u8;
+                        if offset.is_multiple_of(2) {
+                            *byte = (*byte & 0xf0) | q;
+                        } else {
+                            *byte = (*byte & 0x0f) | (q << 4);
+                        }
+                    }
+                }
+            }
+            assert!(
+                zero_points.contains(&39) && zero_points.contains(&217),
+                "fixture must cover real Qwen-style packed qzero bytes 39..217"
+            );
+            let activations: Vec<f32> = (0..k)
+                .map(|i| ((i * 19 % 251) as f32 - 125.0) / 80.0)
+                .collect();
+            let n16 = prepack_n16_sdot_from_bytes(
+                &packed,
+                scales.clone(),
+                Some(&zero_points),
+                n,
+                k,
+                4,
+                block_size,
+            );
+            let mut n16_out = vec![0.0f32; n];
+            n16_sdot_matmul_m1(
+                &activations,
+                &n16,
+                &mut n16_out,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let b = Owned::u8(&[n, blocks, blob], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let zps_t = Owned::u8(&[n, blocks.div_ceil(2)], &zero_points);
+            let int8_weight = kernel
+                .prepack_int8_weight(&b.view(), &scales_t.view(), Some(&zps_t.view()))
+                .unwrap();
+            let mut int8_out = vec![0.0f32; n];
+            int8_matmul(
+                &activations,
+                &int8_weight,
+                &mut int8_out,
+                1,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+            assert_close(&n16_out, &int8_out);
+
+            let dequantized =
+                dequantize_reference(&packed, &scales, Some(&zero_points), n, k, block_size);
+            let f32_reference = reference(&activations, &dequantized, 1, k, n);
+            assert_int8_close(&n16_out, &f32_reference);
+        }
+    }
+
+    #[test]
+    fn kai_sdot_qsi4_block128_asymmetric_qwen_shapes_match_reference() {
+        for &(k, n) in &[
+            (1024usize, 1024usize),
+            (1024, 3072),
+            (1000, 257), // K and N tails.
+        ] {
+            let block_size = 128usize;
+            let blocks = k.div_ceil(block_size);
+            let blob = block_size / 2;
+            let mut packed = vec![0u8; n * blocks * blob];
+            let mut scales = vec![0.0f32; n * blocks];
+            let mut zero_points = vec![0u8; n * blocks.div_ceil(2)];
+            let mut dequantized = vec![0.0f32; n * k];
+            for output in 0..n {
+                for packed_block in 0..blocks.div_ceil(2) {
+                    zero_points[output * blocks.div_ceil(2) + packed_block] =
+                        if (output + packed_block).is_multiple_of(2) {
+                            39
+                        } else {
+                            217
+                        };
+                }
+                for block in 0..blocks {
+                    scales[output * blocks + block] =
+                        0.003 + ((output * 17 + block * 13) % 19) as f32 * 0.0007;
+                    let zp_byte = zero_points[output * blocks.div_ceil(2) + block / 2];
+                    let zp = if block.is_multiple_of(2) {
+                        zp_byte & 0x0f
+                    } else {
+                        zp_byte >> 4
+                    };
+                    for offset in 0..block_size {
+                        let byte = &mut packed[(output * blocks + block) * blob + offset / 2];
+                        let q = ((output * 31 + block * 17 + offset * 7) & 0x0f) as u8;
+                        if offset.is_multiple_of(2) {
+                            *byte = (*byte & 0xf0) | q;
+                        } else {
+                            *byte = (*byte & 0x0f) | (q << 4);
+                        }
+                        let depth = block * block_size + offset;
+                        if depth < k {
+                            dequantized[output * k + depth] =
+                                (q as f32 - zp as f32) * scales[output * blocks + block];
+                        }
+                    }
+                }
+            }
+            assert!(zero_points.contains(&39) && zero_points.contains(&217));
+            let activations: Vec<f32> = (0..k)
+                .map(|i| ((i * 19 % 251) as f32 - 125.0) / 80.0)
+                .collect();
+            let kai = prepack_kai_sdot_from_bytes(
+                &packed,
+                scales.clone(),
+                Some(&zero_points),
+                n,
+                k,
+                4,
+                block_size,
+            );
+            let mut scalar = vec![0.0f32; n];
+            let mut selected = vec![0.0f32; n];
+            kai_sdot_matmul_m1(
+                &activations,
+                &kai,
+                &mut scalar,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+            kai_sdot_matmul_m1(
+                &activations,
+                &kai,
+                &mut selected,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+            assert_close(&selected, &scalar);
+            let expected = reference(&activations, &dequantized, 1, k, n);
+            assert_qai8dxp_close(&selected, &expected);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn matmulnbits_arm64_kai_qsi4_asymmetric_qwen_shape_is_reachable() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let (k, n, block_size) = (1024usize, 1024usize, 128usize);
+        assert!(selected_dot_kernel().supports_int4_direct(block_size, true));
+        let blocks = k.div_ceil(block_size);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        let (packed, scales, zero_points, dequantized) = quantize(&weights, n, k, block_size, true);
+        let zero_points = zero_points.expect("asymmetric quantization emits qzeros");
+        let expected = reference(&activations, &dequantized, 1, k, n);
+        let mut kernel = accuracy4_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true, true]);
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales);
+        let zps = Owned::u8(&[n, blocks.div_ceil(2)], &zero_points);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        #[cfg(feature = "mlas")]
+        let before_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view(), zps.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        let reached_kai = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before;
+        #[cfg(feature = "mlas")]
+        let reached_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before_mlas;
+        #[cfg(not(feature = "mlas"))]
+        let reached_mlas = false;
+        assert!(
+            reached_kai || reached_mlas,
+            "real Qwen bits=4/block128/asymmetric shape reached neither MLAS QNBit nor KAI SDOT",
+        );
+        assert!(
+            kernel.packed_kai_qsi4_weight.get().is_some() || {
+                #[cfg(feature = "mlas")]
+                {
+                    kernel.mlas_shards.get().is_some()
+                }
+                #[cfg(not(feature = "mlas"))]
+                {
+                    false
+                }
+            }
+        );
+        assert!(kernel.int8_weight.get().is_none());
+        assert_qai8dxp_close(&y.to_f32(), &expected);
     }
 
     #[test]
@@ -5548,6 +7905,7 @@ mod tests {
             &mut scalar,
             k,
             n,
+            block_size,
             DotKernel::Scalar,
         );
         int4_matmul_m1(
@@ -5556,6 +7914,7 @@ mod tests {
             &mut actual,
             k,
             n,
+            block_size,
             selected_dot_kernel(),
         );
         assert_eq!(
@@ -5669,6 +8028,7 @@ mod tests {
             &mut int4_out,
             k,
             n,
+            block_size,
             DotKernel::Scalar,
         );
 
@@ -5759,6 +8119,7 @@ mod tests {
                 &mut native,
                 k,
                 n,
+                block_size,
                 selected_dot_kernel(),
             );
             let case_rel = rmse(&native, &oracle) / oracle_rms;
@@ -5859,7 +8220,15 @@ mod tests {
             }
             for kernel in kernels {
                 let mut native = vec![0.0; n];
-                int4_matmul_m1(&activations, &packed_weight, &mut native, k, n, kernel);
+                int4_matmul_m1(
+                    &activations,
+                    &packed_weight,
+                    &mut native,
+                    k,
+                    n,
+                    block_size,
+                    kernel,
+                );
                 assert_eq!(
                     usize::from(native[1] > native[0]),
                     oracle_argmax,
@@ -5923,6 +8292,259 @@ mod tests {
             }
         }
         (packed, scales, asymmetric.then_some(zps), dequantized)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn bits8_n16_i16_reference(
+        activation: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: Option<&[u8]>,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Vec<f32> {
+        let blocks = k.div_ceil(block_size);
+        let group = 32usize;
+        let groups = k.div_ceil(group);
+        let mut quantized = vec![0i16; k];
+        let mut group_scales = vec![0.0f32; groups];
+        for g in 0..groups {
+            let start = g * group;
+            let end = (start + group).min(k);
+            group_scales[g] =
+                quantize_block_i16(&activation[start..end], &mut quantized[start..end]);
+        }
+        let mut output = vec![0.0f32; n];
+        for column in 0..n {
+            for block in 0..blocks {
+                let block_start = block * block_size;
+                let block_end = (block_start + block_size).min(k);
+                let zp = zero_points.map_or(128u8, |points| points[column * blocks + block]);
+                let scale = scales[column * blocks + block];
+                let block_sum: f32 = activation[block_start..block_end].iter().sum();
+                let mut product = 0.0f32;
+                for g in block_start / group..block_end.div_ceil(group) {
+                    let start = (g * group).max(block_start);
+                    let end = ((g + 1) * group).min(block_end);
+                    let dot: i32 = (start..end)
+                        .map(|depth| {
+                            let q = packed
+                                [(column * blocks + block) * block_size + (depth - block_start)];
+                            q as i32 * quantized[depth] as i32
+                        })
+                        .sum();
+                    product += group_scales[g] * dot as f32;
+                }
+                output[column] += scale * product - scale * zp as f32 * block_sum;
+            }
+        }
+        output
+    }
+
+    fn bits8_n16_sdot_active_for_test() -> bool {
+        selected_dot_kernel().uses_n16_sdot_direct() && activation_quant_group() == 32
+    }
+
+    #[test]
+    fn n16_sdot_bits8_block128_asymmetric_matches_i16_and_f32_reference() {
+        for &(k, n) in &[
+            (1024usize, 1024usize),
+            (1024, 3072),
+            (1000, 257), // K and N tails.
+        ] {
+            let block_size = 128usize;
+            let weights_nk: Vec<f32> = (0..n * k)
+                .map(|i| (i as f32 * 0.011).sin() * 0.9 + (i as f32 * 0.0003).cos() * 0.25)
+                .collect();
+            let activations: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.019 + 0.4).cos() * 0.7)
+                .collect();
+            let (mut packed, scales, mut zero_points, mut dequantized) =
+                quantize_8bit(&weights_nk, n, k, block_size, true);
+            let zero_points = zero_points.as_mut().expect("asymmetric bits8 emits qzeros");
+            let blocks = k.div_ceil(block_size);
+            for output in 0..n {
+                for block in 0..blocks {
+                    zero_points[output * blocks + block] = if (output + block).is_multiple_of(2) {
+                        39
+                    } else {
+                        217
+                    };
+                    for offset in 0..block_size {
+                        let q = ((output * 37 + block * 19 + offset * 11) & 0xff) as u8;
+                        packed[(output * blocks + block) * block_size + offset] = q;
+                        let depth = block * block_size + offset;
+                        if depth < k {
+                            dequantized[output * k + depth] = (q as f32
+                                - zero_points[output * blocks + block] as f32)
+                                * scales[output * blocks + block];
+                        }
+                    }
+                }
+            }
+            assert!(zero_points.contains(&39) && zero_points.contains(&217));
+            let n16 = prepack_n16_sdot_from_bytes(
+                &packed,
+                scales.clone(),
+                Some(zero_points),
+                n,
+                k,
+                8,
+                block_size,
+            );
+            let mut n16_out = vec![0.0f32; n];
+            n16_sdot_u8_i16_matmul_m1(
+                &activations,
+                &n16,
+                &mut n16_out,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+            let i16_reference = bits8_n16_i16_reference(
+                &activations,
+                &packed,
+                &scales,
+                Some(zero_points),
+                n,
+                k,
+                block_size,
+            );
+            assert_close(&n16_out, &i16_reference);
+
+            let f32_reference = reference(&activations, &dequantized, 1, k, n);
+            assert_int8_close(&n16_out, &f32_reference);
+        }
+    }
+
+    #[test]
+    fn kai_sdot_qsi8_block128_asymmetric_qwen_shapes_match_reference() {
+        for &(k, n) in &[
+            (1024usize, 1024usize),
+            (1024, 3072),
+            (1000, 257), // K and N tails.
+        ] {
+            let block_size = 128usize;
+            let weights_nk: Vec<f32> = (0..n * k)
+                .map(|i| (i as f32 * 0.011).sin() * 0.9 + (i as f32 * 0.0003).cos() * 0.25)
+                .collect();
+            let activations: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.019 + 0.4).cos() * 0.7)
+                .collect();
+            let (mut packed, scales, mut zero_points, mut dequantized) =
+                quantize_8bit(&weights_nk, n, k, block_size, true);
+            let zero_points = zero_points.as_mut().expect("asymmetric bits8 emits qzeros");
+            let blocks = k.div_ceil(block_size);
+            for output in 0..n {
+                for block in 0..blocks {
+                    zero_points[output * blocks + block] = if (output + block).is_multiple_of(2) {
+                        39
+                    } else {
+                        217
+                    };
+                    for offset in 0..block_size {
+                        let q = ((output * 37 + block * 19 + offset * 11) & 0xff) as u8;
+                        packed[(output * blocks + block) * block_size + offset] = q;
+                        let depth = block * block_size + offset;
+                        if depth < k {
+                            dequantized[output * k + depth] = (q as f32
+                                - zero_points[output * blocks + block] as f32)
+                                * scales[output * blocks + block];
+                        }
+                    }
+                }
+            }
+            assert!(zero_points.contains(&39) && zero_points.contains(&217));
+            let kai = prepack_kai_sdot_from_bytes(
+                &packed,
+                scales.clone(),
+                Some(zero_points),
+                n,
+                k,
+                8,
+                block_size,
+            );
+            let mut scalar = vec![0.0f32; n];
+            let mut selected = vec![0.0f32; n];
+            kai_sdot_matmul_m1(
+                &activations,
+                &kai,
+                &mut scalar,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+            kai_sdot_matmul_m1(
+                &activations,
+                &kai,
+                &mut selected,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+            assert_close(&selected, &scalar);
+            let expected = reference(&activations, &dequantized, 1, k, n);
+            assert_qai8dxp_close(&selected, &expected);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let (k, n, block_size) = (1024usize, 1024usize, 128usize);
+        let blocks = k.div_ceil(block_size);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| (i as f32 * 0.017 + 0.2).sin() * 0.8)
+            .collect();
+        let weights_nk: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).cos() * 1.1).collect();
+        let (packed, scales, zero_points, dequantized) =
+            quantize_8bit(&weights_nk, n, k, block_size, true);
+        let zero_points = zero_points.expect("asymmetric bits8 emits qzeros");
+        let expected = reference(&activations, &dequantized, 1, k, n);
+        let (mut graph, node) = model_node(
+            &[1, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            Some(&[n, blocks]),
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales);
+        let zps = Owned::u8(&[n, blocks], &zero_points);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view(), zps.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert!(
+            KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before,
+            "real Qwen bits=8/block128/asymmetric shape did not reach KAI SDOT"
+        );
+        // Downcast to the concrete kernel type is not available through the EP
+        // trait object; the counter above is the dispatch proof.
+        assert_qai8dxp_close(&y.to_f32(), &expected);
     }
 
     /// Run the real end-to-end `MatMulNBits` kernel (`execute`) for an 8-bit,
@@ -6004,9 +8626,14 @@ mod tests {
                     run_8bit_execute(n, k, block_size, m, asymmetric, &activations, &weights_nk);
                 let oracle_rms = rmse(&oracle, &vec![0.0; oracle.len()]).max(1e-6);
                 let rel = rmse(&out, &oracle) / oracle_rms;
+                let tolerance = if m == 1 && bits8_n16_sdot_active_for_test() {
+                    1e-3
+                } else {
+                    1e-5
+                };
                 assert!(
-                    rel <= 1e-5,
-                    "asymmetric={asymmetric} m={m}: 8-bit execute relative RMSE {rel} exceeds float-reconstruction tolerance 1e-5",
+                    rel <= tolerance,
+                    "asymmetric={asymmetric} m={m}: 8-bit execute relative RMSE {rel} exceeds tolerance {tolerance}",
                 );
                 for row in 0..m {
                     let winner = |v: &[f32]| {
@@ -7009,14 +9636,14 @@ mod tests {
     }
 
     /// aarch64 must never fall back to the scalar dot: `selected_dot_kernel`
-    /// picks `Neon`, and the forced `Neon` int8 dot stays bit-exact vs scalar.
+    /// picks a NEON-family kernel, and the forced `Neon` int8 dot stays
+    /// bit-exact vs scalar.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn selected_dot_kernel_is_neon_on_aarch64() {
-        assert_eq!(
-            selected_dot_kernel(),
-            DotKernel::Neon,
-            "aarch64 must select the NEON int8 dot, never Scalar"
+        assert!(
+            matches!(selected_dot_kernel(), DotKernel::Neon | DotKernel::NeonDot),
+            "aarch64 must select a NEON-family dot, never Scalar"
         );
         let activation: Vec<u8> = (0..128).map(|i| ((i * 29 + 7) % 255) as u8).collect();
         let weight: Vec<i8> = (0..128).map(|i| ((i * 17 % 31) as i8) - 15).collect();
@@ -7217,7 +9844,15 @@ mod tests {
             .build()
             .unwrap()
             .install(|| {
-                int4_matmul_m1(&activations, &packed_weight, &mut serial, k, n, dot_kernel);
+                int4_matmul_m1(
+                    &activations,
+                    &packed_weight,
+                    &mut serial,
+                    k,
+                    n,
+                    block_size,
+                    dot_kernel,
+                );
             });
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
@@ -7230,6 +9865,7 @@ mod tests {
                     &mut parallel,
                     k,
                     n,
+                    block_size,
                     dot_kernel,
                 );
             });
@@ -8199,7 +10835,7 @@ mod tests {
                         for bias in [None, Some(pseudo(n, 0.1))] {
                             let mut out = vec![0.0f32; m * n];
                             mlas_sys::sqnbit_gemm(
-                                &packed_weight,
+                                &packed_weight.packed,
                                 m,
                                 &a,
                                 bias.as_deref(),
@@ -8216,7 +10852,18 @@ mod tests {
                             }
                             // CompInt8 quantizes A to int8, so it needs a looser
                             // tolerance than the near-exact CompFp32 dequant.
-                            let tol = if accuracy_level == 4 { 6e-2 } else { 2e-3 };
+                            let tol = if accuracy_level == 4 {
+                                #[cfg(target_arch = "aarch64")]
+                                {
+                                    2e-1
+                                }
+                                #[cfg(not(target_arch = "aarch64"))]
+                                {
+                                    6e-2
+                                }
+                            } else {
+                                2e-3
+                            };
                             mlas_close(
                                 &out,
                                 &expected,
@@ -8349,7 +10996,15 @@ mod tests {
         with_decode_pool_scope(true, || {
             for op in 0..6usize {
                 let mut output = vec![0.0f32; n];
-                int4_matmul_m1(&activation, &packed, &mut output, k, n, dot_kernel);
+                int4_matmul_m1(
+                    &activation,
+                    &packed,
+                    &mut output,
+                    k,
+                    n,
+                    block_size,
+                    dot_kernel,
+                );
                 for value in &output {
                     bytes.extend_from_slice(&value.to_bits().to_le_bytes());
                 }
@@ -8569,7 +11224,7 @@ mod tests {
     const MLAS_SHARD_PARITY_MARKER: &str = "NXRT_MLAS_SHARD_PARITY_BYTES=";
 
     #[cfg(feature = "mlas")]
-    fn mlas_shard_parity_child_output(no_shard: bool) -> Vec<f32> {
+    fn mlas_shard_parity_child_output(no_shard: bool, work_stealing: bool) -> Vec<f32> {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
@@ -8581,6 +11236,13 @@ mod tests {
             .env("RAYON_NUM_THREADS", "3")
             .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if work_stealing {
+            command.env(crate::decode_spmd::DECODE_SCHEDULE_ENV, "steal");
+            command.env("ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER", "2");
+        } else {
+            command.env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV);
+            command.env_remove("ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER");
+        }
         if no_shard {
             command.env("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD", "1");
         } else {
@@ -8653,16 +11315,25 @@ mod tests {
         let n = MLAS_SHARD_PARITY_N;
         let pool = crate::decode_spmd::pools().expect("forced persistent SPMD pool");
         let segments = pool.output_column_segments(n, MLAS_SQNBIT_DECODE_SHARD_ALIGN);
-        assert_eq!(
-            segments.len(),
-            3,
-            "child requested three persistent workers"
-        );
+        let work_stealing = std::env::var(crate::decode_spmd::DECODE_SCHEDULE_ENV)
+            .is_ok_and(|value| value.trim() == "steal");
+        if work_stealing {
+            assert!(
+                segments.len() > 3,
+                "work-stealing child should create extra dynamic MLAS tiles"
+            );
+        } else {
+            assert_eq!(
+                segments.len(),
+                3,
+                "child requested three persistent workers"
+            );
+            assert!(
+                segments.windows(2).any(|pair| pair[0].1 != pair[1].1),
+                "N={n} must create uneven worker output-column segments: {segments:?}"
+            );
+        }
         assert_eq!(segments.iter().map(|&(_, len)| len).sum::<usize>(), n);
-        assert!(
-            segments.windows(2).any(|pair| pair[0].1 != pair[1].1),
-            "N={n} must create uneven worker output-column segments: {segments:?}"
-        );
 
         let activation = pseudo(
             MLAS_SHARD_PARITY_CONFIGS
@@ -8751,8 +11422,8 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_matches_no_shard_full_width() {
-        let sharded = mlas_shard_parity_child_output(false);
-        let full_width = mlas_shard_parity_child_output(true);
+        let sharded = mlas_shard_parity_child_output(false, false);
+        let full_width = mlas_shard_parity_child_output(true, false);
         assert_eq!(
             sharded.len(),
             full_width.len(),
@@ -8776,6 +11447,26 @@ mod tests {
             "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width \
              (max_ulp={max_ulp}); if this fails, MLAS_SQNBIT_DECODE_SHARD_ALIGN is not \
              keeping N-tiles whole. mismatching (index, sharded_bits, full_bits): {mismatches:?}"
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_work_stealing_decode_matches_no_shard_full_width() {
+        let sharded = mlas_shard_parity_child_output(false, true);
+        let full_width = mlas_shard_parity_child_output(true, true);
+        assert_eq!(sharded.len(), full_width.len());
+        let mismatches: Vec<_> = sharded
+            .iter()
+            .zip(&full_width)
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, (a, b))| (i, a.to_bits(), b.to_bits()))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "work-stealing MLAS decode shards must stay bit-identical to full-width; \
+             mismatching (index, sharded_bits, full_bits): {mismatches:?}"
         );
     }
 
@@ -9656,7 +12347,15 @@ mod tests {
                     let hand_us = if m == 1 {
                         time(threads, || {
                             let mut out = vec![0.0f32; n];
-                            int4_matmul_m1(&a, &int4_weight, &mut out, k, n, dot_kernel);
+                            int4_matmul_m1(
+                                &a,
+                                &int4_weight,
+                                &mut out,
+                                k,
+                                n,
+                                block_size,
+                                dot_kernel,
+                            );
                         })
                     } else {
                         time(threads, || {
@@ -9687,13 +12386,12 @@ mod tests {
         }
     }
 
-    /// Focused int4 M=1 GEMV micro-bench at 0.6B (Qwen3-0.6B) decode shapes,
-    /// reporting ns/call, GB/s (int4 weight bytes streamed = N*K/2) and GFLOP/s
-    /// (2*N*K) for the hand VNNI GEMV vs MLAS SQNBit CompInt8, at 1 and 32
-    /// threads, median-of-5. This is the Phase-1 gating probe for the int4 GEMV
-    /// decode kernel: the ratio hand_ns/mlas_ns is "how much slower than MLAS we
-    /// are" (>1 = slower). Shapes are a probe fixture; production never hardcodes
-    /// them. Run with:
+    /// Focused int4 M=1 GEMV micro-bench at Foundry Qwen3-0.6B block-128 decode
+    /// shapes, reporting ns/call, GB/s (int4 weight bytes streamed = N*K/2) and
+    /// GFLOP/s (2*N*K) for the direct int4 GEMV, the old native int8-prepack
+    /// fallback, and MLAS SQNBit CompInt8. This is the Phase-1 gating probe for
+    /// the ARM64 int4 GEMV decode kernel: direct/mlas >1 means slower than MLAS.
+    /// Shapes are a probe fixture; production never hardcodes them. Run with:
     ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
     ///     int4_gemv_decode_microbench -- --ignored --nocapture
     #[cfg(feature = "mlas")]
@@ -9726,21 +12424,22 @@ mod tests {
             })
         }
 
-        let block_size = 32usize;
+        let block_size = 128usize;
         let dot_kernel = selected_dot_kernel();
-        // (label, K, N) for one Qwen3-0.6B (hidden=1024, intermediate=3072,
-        // vocab=151936) decode token. qkv is the fused q(2048)+k(1024)+v(1024).
+        // (label, K, N) for exact int4 MatMulNBits shapes observed in the
+        // Foundry qwen3-0.6b-generic-cpu-4/v4 graph (hidden=1024,
+        // intermediate=3072, grouped q/k/v widths).
         let shapes: &[(&str, usize, usize)] = &[
-            ("qkv_proj", 1024, 4096),
+            ("q_proj", 1024, 2048),
+            ("kv/o_proj", 1024, 1024),
             ("o_proj", 2048, 1024),
             ("gate_proj", 1024, 3072),
             ("up_proj", 1024, 3072),
             ("down_proj", 3072, 1024),
-            ("lm_head", 1024, 151936),
         ];
 
         eprintln!(
-            "int4 GEMV M=1 microbench (Qwen3-0.6B shapes), dot_kernel={dot_kernel:?}, median-of-5"
+            "int4 GEMV M=1 microbench (Foundry Qwen3-0.6B block-128 shapes), dot_kernel={dot_kernel:?}, median-of-5"
         );
         for &(label, k, n) in shapes {
             let weights_nk = pseudo(n * k, 0.3);
@@ -9749,6 +12448,13 @@ mod tests {
                 values: packed_bytes.clone(),
                 scales: scales.clone(),
             };
+            let blocks = k.div_ceil(block_size);
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed_bytes);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let int8_weight = kernel
+                .prepack_int8_weight(&b.view(), &scales_t.view(), None)
+                .unwrap();
             let mlas_packed = mlas_sys::SQNBitPackedB::new(
                 n,
                 k,
@@ -9765,24 +12471,32 @@ mod tests {
             let flops = 2.0 * (n as f64) * (k as f64);
 
             for threads in [1usize, 32] {
-                let hand_ns = median_ns(threads, || {
+                let direct_ns = median_ns(threads, || {
                     let mut out = vec![0.0f32; n];
-                    int4_matmul_m1(&a, &int4_weight, &mut out, k, n, dot_kernel);
+                    int4_matmul_m1(&a, &int4_weight, &mut out, k, n, block_size, dot_kernel);
+                });
+                let old_native_ns = median_ns(threads, || {
+                    let mut out = vec![0.0f32; n];
+                    int8_matmul(&a, &int8_weight, &mut out, 1, k, n, block_size, dot_kernel);
                 });
                 let mlas_ns = median_ns(threads, || {
                     let mut out = vec![0.0f32; n];
                     mlas_sys::sqnbit_gemm(&mlas_packed, 1, &a, None, &mut out, true);
                 });
-                let hand_gbs = weight_bytes / hand_ns;
+                let direct_gbs = weight_bytes / direct_ns;
+                let old_native_gbs = weight_bytes / old_native_ns;
                 let mlas_gbs = weight_bytes / mlas_ns;
-                let hand_gflops = flops / hand_ns;
+                let direct_gflops = flops / direct_ns;
+                let old_native_gflops = flops / old_native_ns;
                 let mlas_gflops = flops / mlas_ns;
                 eprintln!(
                     "{label:10} K={k:6} N={n:6} {threads:2}t: \
-                     hand {hand_ns:8.0}ns {hand_gbs:6.1}GB/s {hand_gflops:6.1}GF | \
+                     direct {direct_ns:8.0}ns {direct_gbs:6.1}GB/s {direct_gflops:6.1}GF | \
+                     old {old_native_ns:8.0}ns {old_native_gbs:6.1}GB/s {old_native_gflops:6.1}GF | \
                      mlas {mlas_ns:8.0}ns {mlas_gbs:6.1}GB/s {mlas_gflops:6.1}GF | \
-                     ratio(hand/mlas)={:.2}x",
-                    hand_ns / mlas_ns
+                     ratio(direct/old)={:.2}x ratio(direct/mlas)={:.2}x",
+                    direct_ns / old_native_ns,
+                    direct_ns / mlas_ns
                 );
             }
         }
@@ -9883,7 +12597,7 @@ mod tests {
             for w in &built {
                 let a = vec![0.03f32; w.k];
                 let mut out = vec![0.0f32; w.n];
-                int4_matmul_m1(&a, &w.int4, &mut out, w.k, w.n, dot_kernel);
+                int4_matmul_m1(&a, &w.int4, &mut out, w.k, w.n, block_size, dot_kernel);
             }
         };
         let run_mlas_int8 = || {
@@ -9922,10 +12636,7 @@ mod tests {
             });
         };
 
-        eprintln!(
-            "decode-step probe: {} weight bytes/token, {threads} decode threads",
-            weight_bytes
-        );
+        eprintln!("decode-step probe: {weight_bytes} weight bytes/token, {threads} decode threads");
         step("hand", &run_hand);
         step("mlas-int8", &run_mlas_int8);
         step("mlas-fp32", &run_mlas_fp32);

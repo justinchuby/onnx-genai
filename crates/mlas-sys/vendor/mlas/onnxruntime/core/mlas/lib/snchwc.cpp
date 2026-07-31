@@ -80,12 +80,7 @@ struct MLAS_NCHWC_POOL_WORK_BLOCK : MLAS_NCHWC_WORK_BLOCK
 
 //
 // nxrt-mlas-mt: cap the NCHWc convolution/pooling thread fan-out by the amount
-// of work. `MlasGetMaximumThreadCount` reports the whole pool, but splitting a
-// small or depthwise op into that many row tiles costs more in thread dispatch
-// and barrier synchronization than the parallelism saves (and oversubscribes
-// the machine below a serial run). Allowing at least this many multiply-adds
-// per worker keeps tiny ops serial while large dense convolutions still fan out
-// to the full pool. The threshold is a coarse, shape-derived heuristic â€” not a
+// of work. The threshold is a coarse, shape-derived heuristic — not a
 // per-model or per-target tuning knob.
 //
 #define MLAS_NCHWC_MIN_WORK_PER_THREAD 0x2000000  // ~32M multiply-adds
@@ -1431,15 +1426,10 @@ Return Value:
     //
     // Schedule the operation across a set of worker threads.
     //
-    // Cap the degree of parallelism by the amount of work so that small and
-    // depthwise convolutions (common in mobile CNNs) are not split into more
-    // tiles than they can amortize: the per-tile thread-dispatch and barrier
-    // cost otherwise exceeds the compute saved, and over-subscription slows the
-    // op below a serial run. This is a general, shape-derived heuristic (scaled
-    // by the multiply-accumulate count) with no model- or target-specific
-    // special-casing; large dense convolutions still fan out to the full pool.
-    //
 
+    //
+    // Cap the degree of parallelism by the amount of work.
+    //
     WorkBlock.tids = MlasNchwcClampThreadCount(
         MlasGetMaximumThreadCount(ThreadPool),
         WorkBlock.BatchCount * GroupCount * WorkBlock.OutputChannels * WorkBlock.OutputSize *
@@ -1518,9 +1508,10 @@ Return Value:
     //
     // Schedule the operation across a set of worker threads.
     //
+
+    //
     // Cap the degree of parallelism by the amount of work (see MlasNchwcConv).
     //
-
     WorkBlock.tids = MlasNchwcClampThreadCount(
         MlasGetMaximumThreadCount(ThreadPool),
         WorkBlock.BatchCount * WorkBlock.OutputChannels * WorkBlock.OutputSize *

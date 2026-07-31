@@ -104,6 +104,12 @@ use crate::kernels::matmul_nbits::output_chunk_len;
 /// default prioritises predictability over adaptation.
 /// See `.squad/decisions.md` (Voight 2026-07-24; Chu 2026-07-27 opt-in adaptive).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
+/// Selects how the persistent decode pool assigns output-column work inside an
+/// op. Unset / `fixed` keeps the existing deterministic one-shard-per-worker
+/// SPMD split; `steal` decomposes the op into coarser tiles and lets resident
+/// workers claim tiles dynamically, so a delayed worker does not strand a whole
+/// static shard behind the per-op barrier.
+pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
 
 /// Bounded active-spin window before a worker parks, mirroring the
 /// **LLVM/Intel OpenMP runtime `KMP_BLOCKTIME`** design: after a fork/join the
@@ -163,6 +169,17 @@ fn decode_blocktime() -> Duration {
 /// parks; the yield after the budget only lets a descheduled straggler worker get
 /// a core under oversubscription.
 const DISPATCHER_SPIN_BEFORE_YIELD: u32 = 1 << 12;
+
+/// Default number of dynamic tiles per resident worker in work-stealing mode.
+/// One tile per worker preserves the coarse MLAS QNBit shard size that made
+/// fixed-SPMD fast, while Deckard's pool can still steal a not-yet-claimed tile
+/// from a delayed worker. Finer 2x/3x tiling improved theoretical steal
+/// opportunities but split Qwen3 projection shards too narrowly and regressed
+/// measured throughput.
+const DEFAULT_STEAL_TILES_PER_WORKER: usize = 1;
+/// Minimum output columns in one dynamic tile. Keeps MLAS/KAI/hand GEMV calls
+/// coarse enough that the extra atomic `fetch_add` scheduling is amortized.
+const MIN_STEAL_OUTPUTS_PER_TASK: usize = 32;
 
 /// Cache-line pad so per-node completion counters and per-worker park flags do
 /// not false-share (which would reintroduce cross-socket coherency traffic).
@@ -332,16 +349,56 @@ impl SharedState {
 /// A persistent SPMD decode pool: hot worker threads plus the shared barrier
 /// state that drives them.
 pub struct SpmdDecodePools {
-    shared: Arc<SharedState>,
+    shared: Option<Arc<SharedState>>,
     /// Owned join handles, held behind a `Mutex` so [`SpmdDecodePools::shutdown`]
     /// can join the workers through a shared `&self` (the pool is reached as a
     /// `&'static` through [`pools`]). Only touched at teardown, never on the hot
     /// path. Drained on the first shutdown so the operation is idempotent.
     join_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Deckard's Eigen-style persistent work-stealing pool. In `Steal` mode this
+    /// is the only resident worker set: decode ops publish coarse MLAS/KAI tiles
+    /// directly to this pool so delayed workers do not strand a static SPMD
+    /// shard behind a hard barrier.
+    #[cfg(feature = "mlas")]
+    work_stealing_pool: Option<mlas_sys::WorkStealingThreadPool>,
     /// Workers assigned to each node, node-major, matching global worker index
     /// order (workers `0..counts[0]` are node 0, and so on).
     node_worker_counts: Vec<usize>,
     total_workers: usize,
+    schedule: DecodeSchedule,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeSchedule {
+    Fixed,
+    Steal,
+}
+
+fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
+    match raw.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
+        Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
+        #[cfg(feature = "mlas")]
+        Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
+        #[cfg(feature = "mlas")]
+        Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
+        _ => DecodeSchedule::Fixed,
+    }
+}
+
+fn decode_schedule() -> DecodeSchedule {
+    decode_schedule_from_raw(std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref())
+}
+
+fn steal_tiles_per_worker() -> usize {
+    static TILES: OnceLock<usize> = OnceLock::new();
+    *TILES.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_STEAL_TILES_PER_WORKER)
+    })
 }
 
 impl SpmdDecodePools {
@@ -349,6 +406,10 @@ impl SpmdDecodePools {
     /// laid out node-major (node 0's workers first) so row segments and weight
     /// placement line up with the node assignment.
     fn build(shards: &[NodeShard]) -> Self {
+        Self::build_with_schedule(shards, decode_schedule())
+    }
+
+    fn build_with_schedule(shards: &[NodeShard], schedule: DecodeSchedule) -> Self {
         let node_count = shards.len();
         let mut worker_node = Vec::new();
         let mut node_worker_counts = Vec::with_capacity(node_count);
@@ -363,6 +424,21 @@ impl SpmdDecodePools {
             }
         }
         let total_workers = assignment.len();
+
+        #[cfg(feature = "mlas")]
+        if schedule == DecodeSchedule::Steal {
+            return Self {
+                shared: None,
+                join_handles: Mutex::new(Vec::new()),
+                work_stealing_pool: Some(
+                    mlas_sys::WorkStealingThreadPool::new(total_workers)
+                        .expect("spawn persistent work-stealing decode pool"),
+                ),
+                node_worker_counts,
+                total_workers,
+                schedule,
+            };
+        }
 
         let shared = Arc::new(SharedState {
             node_sense: (0..node_count).map(|_| Padded(AtomicU32::new(0))).collect(),
@@ -407,10 +483,13 @@ impl SpmdDecodePools {
         // Snapshot the worker `Thread`s for teardown join only; the hot dispatch
         // path wakes workers via the per-node futex, not per-thread `unpark`.
         Self {
-            shared,
+            shared: Some(shared),
             join_handles: Mutex::new(handles),
+            #[cfg(feature = "mlas")]
+            work_stealing_pool: None,
             node_worker_counts,
             total_workers,
+            schedule,
         }
     }
 
@@ -424,6 +503,10 @@ impl SpmdDecodePools {
         self.node_worker_counts.len()
     }
 
+    fn uses_work_stealing(&self) -> bool {
+        self.schedule == DecodeSchedule::Steal
+    }
+
     /// Signal every worker to stop and **join** them. Idempotent: the join
     /// handles are drained on the first call, so a second call (e.g. `Drop`
     /// after an explicit [`shutdown_pools`]) is a no-op.
@@ -434,6 +517,12 @@ impl SpmdDecodePools {
     /// must not race a live decode dispatch -- after it returns the workers are
     /// gone and the pool must not be dispatched to again.
     pub fn shutdown(&self) {
+        if self.shared.is_none() {
+            return;
+        }
+        let Some(shared) = self.shared.as_ref() else {
+            return;
+        };
         // Take the handles first so concurrent callers can't double-join; if
         // another thread already drained them, there is nothing to do.
         let handles: Vec<JoinHandle<()>> = {
@@ -451,8 +540,8 @@ impl SpmdDecodePools {
         // worker so it leaves the park. The bump-then-wake ordering (mirroring the
         // dispatch path) wakes a worker that raced into parking: it either sees
         // the advanced sense under the futex guard or is woken by `wake_all`.
-        self.shared.shutdown.store(true, Ordering::SeqCst);
-        for sense in &self.shared.node_sense {
+        shared.shutdown.store(true, Ordering::SeqCst);
+        for sense in &shared.node_sense {
             sense.0.fetch_add(1, Ordering::Release);
             atomic_wait::wake_all(&sense.0);
         }
@@ -470,7 +559,20 @@ impl SpmdDecodePools {
     where
         F: Fn(usize) + Sync,
     {
-        self.shared.panic_if_poisoned();
+        #[cfg(feature = "mlas")]
+        if let Some(pool) = &self.work_stealing_pool {
+            pool.parallel_for(0, self.total_workers, 1, |begin, end| {
+                for global_index in begin..end {
+                    job(global_index);
+                }
+            });
+            return;
+        }
+        let shared = self
+            .shared
+            .as_ref()
+            .expect("fixed SPMD dispatch requires shared worker state");
+        shared.panic_if_poisoned();
         unsafe fn call<F>(data: *const (), global_index: usize)
         where
             F: Fn(usize) + Sync,
@@ -484,9 +586,9 @@ impl SpmdDecodePools {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
         };
-        self.shared.publish(job, &self.node_worker_counts);
-        self.shared.wait();
-        self.shared.panic_if_poisoned();
+        shared.publish(job, &self.node_worker_counts);
+        shared.wait();
+        shared.panic_if_poisoned();
     }
 
     /// Split `n` output rows across the node groups proportionally to their
@@ -568,6 +670,46 @@ impl SpmdDecodePools {
         segments
     }
 
+    fn work_stealing_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        if n == 0 {
+            return vec![(0, 0)];
+        }
+        let align = align.max(1);
+        let min_tile = MIN_STEAL_OUTPUTS_PER_TASK.div_ceil(align) * align;
+        let max_by_size = n.div_ceil(min_tile).max(1);
+        let target = self
+            .total_workers
+            .saturating_mul(steal_tiles_per_worker())
+            .max(1)
+            .min(max_by_size)
+            .min(n);
+        if target <= self.total_workers {
+            return self.worker_row_segments_aligned(n, align);
+        }
+        let mut segments = Vec::with_capacity(target);
+        let mut prev = 0usize;
+        for index in 0..target {
+            let boundary = if index + 1 == target {
+                n
+            } else {
+                let ideal = n.saturating_mul(index + 1).div_ceil(target);
+                let rounded = ((ideal + align / 2) / align) * align;
+                rounded.clamp(prev, n)
+            };
+            segments.push((prev, boundary - prev));
+            prev = boundary;
+        }
+        segments
+    }
+
+    fn output_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        if self.uses_work_stealing() {
+            self.work_stealing_segments_aligned(n, align)
+        } else {
+            self.worker_row_segments_aligned(n, align)
+        }
+    }
+
     /// Shard `result`'s output rows across the workers and run `compute` on each
     /// worker's contiguous slice under one lightweight barrier.
     ///
@@ -583,6 +725,10 @@ impl SpmdDecodePools {
         let n = result.len();
         if self.total_workers <= 1 || output_chunk_len(n, k) >= n {
             compute(0, result);
+            return;
+        }
+        if self.uses_work_stealing() {
+            self.dispatch_rows_work_stealing(result, 1, compute);
             return;
         }
         self.dispatch_rows_across_workers(result, &compute);
@@ -607,7 +753,7 @@ impl SpmdDecodePools {
     /// `align = 1` for kernels whose per-column result is already
     /// partition-independent (e.g. the hand int4/int8 GEMV).
     pub fn output_column_segments(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
-        self.worker_row_segments_aligned(n, align)
+        self.output_segments_aligned(n, align)
     }
 
     /// Like [`Self::dispatch_output_rows`], but hands each worker its global
@@ -624,12 +770,49 @@ impl SpmdDecodePools {
         F: Fn(usize, usize, &mut [f32]) + Sync,
     {
         let n = result.len();
-        let segments = self.worker_row_segments_aligned(n, align);
+        let segments = self.output_segments_aligned(n, align);
         let table = RowTable {
             base: result.as_mut_ptr(),
             segments: &segments,
         };
         let table = &table;
+        if self.uses_work_stealing() {
+            let next = AtomicUsize::new(0);
+            let next = &next;
+            #[cfg(feature = "mlas")]
+            if let Some(pool) = &self.work_stealing_pool {
+                pool.parallel_for(0, segments.len(), 1, |begin, end| {
+                    for task_index in begin..end {
+                        let (start, len) = table.segments[task_index];
+                        if len == 0 {
+                            continue;
+                        }
+                        // SAFETY: dynamic segments are disjoint, in-bounds
+                        // column ranges; each task index is claimed once by
+                        // exactly one work-stealing chunk.
+                        let outputs =
+                            unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+                        compute(task_index, start, outputs);
+                    }
+                });
+                return;
+            }
+            let job = move |_global_index: usize| loop {
+                let task_index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(start, len)) = table.segments.get(task_index) else {
+                    break;
+                };
+                if len == 0 {
+                    continue;
+                }
+                // SAFETY: dynamic segments are disjoint, in-bounds column ranges;
+                // each task index is claimed once by exactly one worker.
+                let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+                compute(task_index, start, outputs);
+            };
+            self.dispatch(&job);
+            return;
+        }
         let job = move |global_index: usize| {
             let (start, len) = table.segments[global_index];
             if len == 0 {
@@ -755,6 +938,52 @@ impl SpmdDecodePools {
             // SAFETY: `worker_row_segments` produces disjoint, in-bounds row
             // ranges covering `0..n` exactly once, and each worker touches only
             // its own segment, so these mutable slices never alias.
+            let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+            compute(start, outputs);
+        };
+        self.dispatch(&job);
+    }
+
+    fn dispatch_rows_work_stealing<F>(&self, result: &mut [f32], align: usize, compute: &F)
+    where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        let segments = self.work_stealing_segments_aligned(result.len(), align);
+        let table = RowTable {
+            base: result.as_mut_ptr(),
+            segments: &segments,
+        };
+        let table = &table;
+        #[cfg(feature = "mlas")]
+        if let Some(pool) = &self.work_stealing_pool {
+            pool.parallel_for(0, segments.len(), 1, |begin, end| {
+                for task_index in begin..end {
+                    let (start, len) = table.segments[task_index];
+                    if len == 0 {
+                        continue;
+                    }
+                    // SAFETY: each dynamic tile is a disjoint, in-bounds row
+                    // range, and the work-stealing pool hands every tile chunk
+                    // to exactly one worker.
+                    let outputs =
+                        unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+                    compute(start, outputs);
+                }
+            });
+            return;
+        }
+        let next = AtomicUsize::new(0);
+        let next = &next;
+        let job = move |_global_index: usize| loop {
+            let task_index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(start, len)) = table.segments.get(task_index) else {
+                break;
+            };
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: each dynamic tile is a disjoint, in-bounds row range, and
+            // the atomic cursor hands every tile to exactly one worker.
             let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
             compute(start, outputs);
         };
@@ -1221,6 +1450,7 @@ fn report_spmd_fallback(message: &str) {
 /// otherwise. See `docs/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
+        PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "work-stealing-pool",
         PersistenceMode::On => "spmd-pool",
         PersistenceMode::Adaptive => "adaptive",
         PersistenceMode::Off => "flat",
@@ -1598,16 +1828,45 @@ mod tests {
                 workers: 2,
             },
         ];
-        SpmdDecodePools::build(&shards)
+        SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed)
     }
 
     fn single_group_pool(workers: usize) -> SpmdDecodePools {
+        single_group_pool_with_schedule(workers, DecodeSchedule::Fixed)
+    }
+
+    fn single_group_pool_with_schedule(
+        workers: usize,
+        schedule: DecodeSchedule,
+    ) -> SpmdDecodePools {
         let shards = vec![NodeShard {
             index: 0,
             cpus: vec![],
             workers,
         }];
-        SpmdDecodePools::build(&shards)
+        SpmdDecodePools::build_with_schedule(&shards, schedule)
+    }
+
+    #[test]
+    fn decode_schedule_parses_env_values() {
+        assert_eq!(decode_schedule_from_raw(None), DecodeSchedule::Fixed);
+        assert_eq!(decode_schedule_from_raw(Some("")), DecodeSchedule::Fixed);
+        assert_eq!(
+            decode_schedule_from_raw(Some("fixed")),
+            DecodeSchedule::Fixed
+        );
+        assert_eq!(
+            decode_schedule_from_raw(Some("steal")),
+            DecodeSchedule::Steal
+        );
+        assert_eq!(
+            decode_schedule_from_raw(Some(" work-stealing ")),
+            DecodeSchedule::Steal
+        );
+        assert_eq!(
+            decode_schedule_from_raw(Some("bogus")),
+            DecodeSchedule::Fixed
+        );
     }
 
     #[test]
@@ -1737,6 +1996,24 @@ mod tests {
     }
 
     #[test]
+    fn work_stealing_segments_preserve_coarse_default_tiles() {
+        let pool = single_group_pool_with_schedule(4, DecodeSchedule::Steal);
+        let segments = pool.output_column_segments(2048, 16);
+        assert!(
+            segments.len() >= pool.total_workers(),
+            "work-stealing mode must expose at least one stealable tile per worker"
+        );
+        let mut expected_start = 0;
+        for (start, len) in segments {
+            assert_eq!(start, expected_start);
+            assert_eq!(start % 16, 0);
+            assert!(len >= MIN_STEAL_OUTPUTS_PER_TASK || start + len == 2048);
+            expected_start += len;
+        }
+        assert_eq!(expected_start, 2048);
+    }
+
+    #[test]
     fn dispatch_output_rows_matches_flat_computation() {
         let pool = two_group_pool();
         let n = 101usize;
@@ -1747,6 +2024,23 @@ mod tests {
         };
         let mut sharded = vec![0.0f32; n];
         pool.dispatch_rows_across_workers(&mut sharded, &compute);
+        let mut flat = vec![0.0f32; n];
+        compute(0, &mut flat);
+        assert_eq!(sharded, flat);
+    }
+
+    #[test]
+    fn work_stealing_dispatch_output_rows_matches_flat_computation() {
+        let pool = single_group_pool_with_schedule(4, DecodeSchedule::Steal);
+        let n = 2048usize;
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            for (offset, out) in outputs.iter_mut().enumerate() {
+                let row = output_start + offset;
+                *out = row as f32 * 1.25 - 7.0;
+            }
+        };
+        let mut sharded = vec![0.0f32; n];
+        pool.dispatch_output_rows(&mut sharded, 1024, &compute);
         let mut flat = vec![0.0f32; n];
         compute(0, &mut flat);
         assert_eq!(sharded, flat);

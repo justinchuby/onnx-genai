@@ -919,6 +919,7 @@ impl Executor {
         let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
         let mut skipped_epcontext = 0_u64;
+        let mut static_view_nodes = 0_u64;
         for &nid in order {
             let node = graph.node(nid);
             // EPContext nodes are pre-compiled: they bypass placement and were
@@ -931,6 +932,10 @@ impl Executor {
                     skipped_epcontext += 1;
                 }
                 continue;
+            }
+            let static_view = static_view_kind(graph, node, value_dtypes);
+            if static_view.is_some() && plan_span.is_some() {
+                static_view_nodes += 1;
             }
             // Preserve positional input arity: keep interior `None` (omitted
             // optional) slots so a later present input is not misread as the
@@ -957,6 +962,11 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
+                static_view,
+                outputs_pre_sized: node
+                    .outputs
+                    .iter()
+                    .all(|&vid| graph.value_shape_is_known(vid)),
             });
         }
         let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
@@ -996,6 +1006,7 @@ impl Executor {
                     .with("topological_nodes", order.len() as u64)
                     .with("plan_len", plan.len() as u64)
                     .with("skipped_epcontext_nodes", skipped_epcontext)
+                    .with("static_view_nodes", static_view_nodes)
                     .with("values", graph.values.len() as u64)
                     .with("inputs", graph.inputs.len() as u64)
                     .with("outputs", graph.outputs.len() as u64)
@@ -1737,4 +1748,29 @@ impl Executor {
         let resolved = self.resolve_all(&empty)?;
         self.compile_all(&resolved)
     }
+}
+
+fn static_view_kind(
+    graph: &Graph,
+    node: &Node,
+    value_dtypes: &HashMap<ValueId, DataType>,
+) -> Option<StaticViewKind> {
+    if !node.is_default_domain() || node.outputs.len() != 1 {
+        return None;
+    }
+    let kind = match node.op_type.as_str() {
+        "Reshape" => StaticViewKind::Reshape,
+        "Squeeze" => StaticViewKind::Squeeze,
+        "Unsqueeze" => StaticViewKind::Unsqueeze,
+        _ => return None,
+    };
+    let input = node.inputs.first().copied().flatten()?;
+    let output = node.outputs[0];
+    if input == output
+        || graph.initializers.contains_key(&output)
+        || value_dtypes.get(&input) != value_dtypes.get(&output)
+    {
+        return None;
+    }
+    Some(kind)
 }

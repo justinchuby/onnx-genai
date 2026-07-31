@@ -40,12 +40,14 @@ mod dead_node;
 mod error;
 mod fusion;
 mod pass;
+mod shape_noop_elimination;
 
 pub use constant_folding::ConstantFolding;
 pub use dead_node::DeadNodeElimination;
 pub use error::{OptimizerError, Result};
 pub use fusion::{CONTRIB_DOMAIN, FusionPattern, OpFusion, PatternMatch, default_fusion_patterns};
 pub use pass::{InitializerResolver, OptimizationPass, PassContext, run_passes};
+pub use shape_noop_elimination::ShapeNoOpElimination;
 
 /// The device-independent Phase-1 pass pipeline, in run order.
 ///

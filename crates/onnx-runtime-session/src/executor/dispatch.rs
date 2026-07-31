@@ -6,6 +6,58 @@ use onnx_runtime_ep_api::ExecutionProviderCapabilities;
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
+fn dispatch_value_name(value: &onnx_runtime_ir::Value) -> String {
+    value
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("value#{}", value.id.0))
+}
+
+fn node_may_produce_view_outputs(node: &Node) -> bool {
+    node.is_default_domain()
+        && matches!(
+            node.op_type.as_str(),
+            "Identity" | "Reshape" | "Slice" | "Transpose"
+        )
+}
+
+fn build_tensor_views<'a>(
+    in_infos: &'a [InInfo],
+    materialized: Option<&'a MaterializedInputs>,
+) -> Vec<TensorView<'a>> {
+    let mut views = Vec::with_capacity(in_infos.len());
+    for (i, info) in in_infos.iter().enumerate() {
+        if !info.present {
+            views.push(TensorView::absent(info.dtype));
+            continue;
+        }
+        match materialized
+            .and_then(|mat| mat.get(i))
+            .and_then(|entry| entry.as_ref())
+        {
+            Some((buf, strides)) => views.push(TensorView::new(
+                DevicePtr(buf.as_ptr() as *const std::ffi::c_void),
+                info.dtype,
+                &info.shape,
+                strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            )),
+            None => views.push(
+                TensorView::new(
+                    DevicePtr(info.base_ptr),
+                    info.dtype,
+                    &info.shape,
+                    &info.strides,
+                    info.device,
+                )
+                .with_byte_offset(info.byte_offset)
+                .with_backing(info.backing),
+            ),
+        }
+    }
+    views
+}
+
 impl Executor {
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
     /// leaf kernel). Shared by the eager loop and the segmented runner.
@@ -85,13 +137,127 @@ impl Executor {
             });
             (is_control_flow, is_sequence, span)
         };
-        if is_control_flow {
+        if self.plan[pi].static_view.is_some() {
+            self.exec_static_view_node(pi, resolved, external)
+        } else if is_control_flow {
             self.exec_control_flow(pi, resolved, outer_scope, external)
         } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {
             self.exec_kernel_node(pi, resolved, external)
         }
+    }
+
+    fn exec_static_view_node(
+        &mut self,
+        pi: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        let node_id = self.plan[pi].node_id;
+        let kind = self.plan[pi]
+            .static_view
+            .expect("exec_static_view_node called for non-view node");
+        self.refill_input_shapes(pi, resolved);
+        let inputs = self.plan[pi].inputs.clone();
+        let outputs = self.plan[pi].outputs.clone();
+        let input_dtypes = self.plan[pi].input_dtypes.clone();
+        let output_dtypes = self.plan[pi].output_dtypes.clone();
+        let input_shapes = self.scratch_input_shapes.clone();
+        let node = self.graph.node(node_id);
+        let output_shapes = self.resolve_node_outputs(
+            node_id,
+            &inputs,
+            &outputs,
+            &input_dtypes,
+            &input_shapes,
+            resolved,
+            external,
+        )?;
+        if outputs.len() != 1 || inputs.is_empty() {
+            return Err(SessionError::Internal(format!(
+                "static view op '{}' must have one data input and one output",
+                node.op_type
+            )));
+        }
+        let output = outputs[0];
+        if external.outputs.contains_key(&output) {
+            return Err(SessionError::Internal(format!(
+                "op '{}' cannot bind a load-time zero-copy view output to external storage",
+                node.op_type
+            )));
+        }
+        let Some(input) = inputs[0] else {
+            return Err(SessionError::Internal(format!(
+                "static view op '{}' has absent data input",
+                node.op_type
+            )));
+        };
+        let capabilities = self.ep.capabilities();
+        let in_infos = self.build_input_bindings(
+            &inputs,
+            &input_dtypes,
+            &input_shapes,
+            external,
+            false,
+            &capabilities,
+        )?;
+        let info = &in_infos[0];
+        if !info.present {
+            return Err(SessionError::Internal(format!(
+                "static view op '{}' has no present data input",
+                node.op_type
+            )));
+        }
+        let input_numel =
+            checked_numel(&info.shape, || dispatch_value_name(self.graph.value(input)))?;
+        let output_numel = checked_numel(&output_shapes[0], || {
+            dispatch_value_name(self.graph.value(output))
+        })?;
+        if input_numel != output_numel {
+            return Err(SessionError::Internal(format!(
+                "load-time {} view for value#{} changes element count: {:?} ({}) -> {:?} ({})",
+                node.op_type, output.0, info.shape, input_numel, output_shapes[0], output_numel
+            )));
+        }
+        if !onnx_runtime_ir::is_contiguous(&info.shape, &info.strides) {
+            return Err(SessionError::Internal(format!(
+                "load-time {} view for value#{} requires a contiguous input; got shape {:?} \
+                 strides {:?}",
+                node.op_type, output.0, info.shape, info.strides
+            )));
+        }
+        let shape = match kind {
+            StaticViewKind::Reshape | StaticViewKind::Squeeze | StaticViewKind::Unsqueeze => {
+                output_shapes[0].clone()
+            }
+        };
+        let strides = compute_contiguous_strides(&shape);
+        view_bounds(
+            &shape,
+            &strides,
+            info.byte_offset,
+            output_dtypes[0],
+            info.root_len,
+        )?;
+        if let Some(old) = self.buffers.remove(&output) {
+            self.ep.deallocate(old)?;
+        }
+        self.shared_buffers.remove(&output);
+        self.buffer_shapes.remove(&output);
+        let root = self.root_of(input);
+        self.views.insert(
+            output,
+            ValueView {
+                source: root,
+                shape: shape.clone(),
+                strides,
+                byte_offset: info.byte_offset,
+            },
+        );
+        self.pinned.insert(root);
+        resolved.insert(output, shape);
+        Ok(())
     }
 
     /// Execute every plan node eagerly on the stream (no capture).
@@ -114,6 +280,16 @@ impl Executor {
             let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
             for pi in 0..self.plan.len() {
                 if elided.is_some_and(|set| set.contains(&pi)) {
+                    continue;
+                }
+                if self.plan[pi].static_view.is_some() {
+                    self.exec_plan_node(
+                        pi,
+                        resolved,
+                        outer_scope,
+                        external,
+                        OpCaptureTrace::Eager,
+                    )?;
                     continue;
                 }
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
@@ -313,6 +489,7 @@ impl Executor {
         let inputs = &self.plan[pi].inputs;
         let outputs = &self.plan[pi].outputs;
         let inplace_dead_inputs = &self.plan[pi].inplace_dead_inputs;
+        let outputs_pre_sized = self.plan[pi].outputs_pre_sized;
         let input_dtypes = &self.plan[pi].input_dtypes;
         let output_dtypes = &self.plan[pi].output_dtypes;
         let input_shapes = &self.scratch_input_shapes;
@@ -322,15 +499,18 @@ impl Executor {
         // Resolve every output's concrete shape: static elementwise broadcast,
         // then data-dependent just-in-time sizing, then the Attention present-KV
         // capacity widening. Mutates `resolved`; returns the final shapes.
-        let output_shapes = self.resolve_node_outputs(
-            node_id,
-            inputs,
-            outputs,
-            input_dtypes,
-            input_shapes,
-            resolved,
-            external,
-        )?;
+        let output_shapes = {
+            let _s = phase_span!("exec_kernel.resolve_outputs");
+            self.resolve_node_outputs(
+                node_id,
+                inputs,
+                outputs,
+                input_dtypes,
+                input_shapes,
+                resolved,
+                external,
+            )?
+        };
 
         let capabilities = self.ep.capabilities();
         let accepts_lazy_weights = LazyWeightBoundary::matches_any(&node.domain, &node.op_type);
@@ -371,25 +551,39 @@ impl Executor {
             pinned: &mut self.pinned,
         };
 
-        // Build the (possibly strided) input views once; they feed both the
-        // view-output probe and, on the compute path, the kernel itself.
-        let mut views: Vec<TensorView> = Vec::with_capacity(in_infos.len());
-        for info in &in_infos {
-            if !info.present {
-                views.push(TensorView::absent(info.dtype));
-                continue;
+        let may_produce_view_output = node_may_produce_view_outputs(node);
+        let mut prebuilt_views: Option<Vec<TensorView>> = None;
+
+        // Executor-owned metadata-only ops: short-circuit common layout/alias
+        // nodes before kernel-cache lookup and compute dispatch. ORT erases
+        // these at graph-optimization time; the native executor can safely
+        // represent them as views directly because SSA values are immutable and
+        // `install_view_outputs` pins the aliased source for the rest of the run.
+        if may_produce_view_output && !has_lazy_inputs {
+            let views = prebuilt_views.get_or_insert_with(|| {
+                let _s = phase_span!("exec_kernel.build_views");
+                build_tensor_views(&in_infos, None)
+            });
+            if let Some(specs) = direct_view_outputs(
+                node,
+                inputs,
+                ctx.graph,
+                views,
+                &output_shapes,
+                outputs.len(),
+            ) {
+                if outputs
+                    .iter()
+                    .any(|output| external.outputs.contains_key(output))
+                {
+                    return Err(SessionError::Internal(format!(
+                        "op '{}' cannot bind a zero-copy view output to external storage",
+                        node.op_type
+                    )));
+                }
+                ctx.install_view_outputs(node, inputs, outputs, output_dtypes, resolved, specs)?;
+                return Ok(());
             }
-            views.push(
-                TensorView::new(
-                    DevicePtr(info.base_ptr),
-                    info.dtype,
-                    &info.shape,
-                    &info.strides,
-                    info.device,
-                )
-                .with_byte_offset(info.byte_offset)
-                .with_backing(info.backing),
-            );
         }
 
         let opset = effective_opset(ctx.graph, node);
@@ -460,20 +654,52 @@ impl Executor {
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
         // aliasing the source buffer and skip compute + allocation entirely.
-        if !has_lazy_inputs && let Some(specs) = kernel.view_outputs(&views, outputs.len()) {
-            if outputs
-                .iter()
-                .any(|output| external.outputs.contains_key(output))
-            {
-                return Err(SessionError::Internal(format!(
-                    "op '{}' cannot bind a zero-copy view output to external storage",
-                    node.op_type
-                )));
+        if may_produce_view_output && !has_lazy_inputs {
+            let views = prebuilt_views.get_or_insert_with(|| {
+                let _s = phase_span!("exec_kernel.build_views");
+                build_tensor_views(&in_infos, None)
+            });
+            if let Some(specs) = kernel.view_outputs(views, outputs.len()) {
+                if outputs
+                    .iter()
+                    .any(|output| external.outputs.contains_key(output))
+                {
+                    return Err(SessionError::Internal(format!(
+                        "op '{}' cannot bind a zero-copy view output to external storage",
+                        node.op_type
+                    )));
+                }
+                ctx.install_view_outputs(node, inputs, outputs, output_dtypes, resolved, specs)?;
+                return Ok(());
             }
-            drop(views);
-            ctx.install_view_outputs(node, inputs, outputs, output_dtypes, resolved, specs)?;
-            return Ok(());
         }
+
+        // If no input is strided (the decode hot path), skip the materialization
+        // helper entirely so the common path pays no per-node Vec allocation.
+        let needs_materialization = in_infos.iter().enumerate().any(|(index, info)| {
+            info.present
+                && !onnx_runtime_ir::is_contiguous(&info.shape, &info.strides)
+                && !kernel.supports_strided_input(index)
+        });
+        let mat = if needs_materialization {
+            let _s = phase_span!("exec_kernel.materialize_inputs");
+            materialize_strided_inputs(kernel, &in_infos, node)?
+        } else {
+            Vec::new()
+        };
+
+        let views = if mat.is_empty() {
+            match prebuilt_views {
+                Some(views) => views,
+                None => {
+                    let _s = phase_span!("exec_kernel.build_views");
+                    build_tensor_views(&in_infos, None)
+                }
+            }
+        } else {
+            let _s = phase_span!("exec_kernel.build_views");
+            build_tensor_views(&in_infos, Some(&mat))
+        };
 
         // --- Compute path ----------------------------------------------------
         // Size (allocate or reuse) each output's contiguous buffer, JIT-sizing
@@ -507,59 +733,38 @@ impl Executor {
         if let Some(input) = inplace_input {
             ctx.alias_input_as_output(input, outputs[0], &output_shapes[0])?;
             self.compute_in_place_alias_count += 1;
+        } else if outputs_pre_sized
+            && outputs.iter().all(|output| {
+                !external.outputs.contains_key(output) && ctx.buffers.contains_key(output)
+            })
+        {
+            // `prepare_run_buffers` already sized every load-time-known output
+            // before the plan loop. Avoid repeating byte-size math and buffer
+            // map mutation checks on the steady decode hot path.
         } else {
+            let _s = phase_span!("exec_kernel.output_backings");
             ctx.ensure_output_backings(outputs, &output_shapes, output_dtypes, external)?;
-        }
-
-        // Auto-materialization gate: strided (view) inputs feeding a kernel that
-        // does not accept them on that slot are gathered into private contiguous
-        // temps. Temps must outlive the views that borrow them.
-        let mat = materialize_strided_inputs(kernel, &in_infos, node)?;
-
-        // Rebuild input views, swapping any materialized slot to its contiguous
-        // temp (offset 0, contiguous strides over the fresh buffer).
-        drop(views);
-        let mut views: Vec<TensorView> = Vec::with_capacity(in_infos.len());
-        for (i, info) in in_infos.iter().enumerate() {
-            if !info.present {
-                views.push(TensorView::absent(info.dtype));
-                continue;
-            }
-            match &mat[i] {
-                Some((buf, strides)) => views.push(TensorView::new(
-                    DevicePtr(buf.as_ptr() as *const std::ffi::c_void),
-                    info.dtype,
-                    &info.shape,
-                    strides,
-                    onnx_runtime_ir::DeviceId::cpu(),
-                )),
-                None => views.push(
-                    TensorView::new(
-                        DevicePtr(info.base_ptr),
-                        info.dtype,
-                        &info.shape,
-                        &info.strides,
-                        info.device,
-                    )
-                    .with_byte_offset(info.byte_offset)
-                    .with_backing(info.backing),
-                ),
-            }
         }
 
         // Take output buffers out so they can be borrowed `&mut` disjointly from
         // the input reads (SSA guarantees outputs are disjoint from inputs).
-        let out_strides: Vec<Vec<i64>> = output_shapes
-            .iter()
-            .map(|s| compute_contiguous_strides(s))
-            .collect();
-        let (out_bufs, mut outs) = ctx.build_output_bindings(
-            outputs,
-            &output_shapes,
-            &out_strides,
-            output_dtypes,
-            external,
-        )?;
+        let out_strides: Vec<Vec<i64>> = {
+            let _s = phase_span!("exec_kernel.output_strides");
+            output_shapes
+                .iter()
+                .map(|s| compute_contiguous_strides(s))
+                .collect()
+        };
+        let mut outs = {
+            let _s = phase_span!("exec_kernel.output_bindings");
+            ctx.build_output_bindings(
+                outputs,
+                &output_shapes,
+                &out_strides,
+                output_dtypes,
+                external,
+            )?
+        };
 
         ctx.execute_kernel(
             kernel,
@@ -570,7 +775,6 @@ impl Executor {
             has_lazy_inputs,
             &views,
             &mut outs,
-            out_bufs,
         )?;
         Ok(())
     }
@@ -1019,16 +1223,59 @@ impl Executor {
     }
 }
 
-/// Owned backing for one kernel output: either an internal [`DeviceBuffer`]
-/// taken out of the executor's buffer map (to be reinserted after compute) or
-/// an external binding written in place. Holds the raw pointer and length used
-/// to build the mutable [`TensorMut`] the kernel writes through.
-struct OutBacking {
-    vid: ValueId,
-    internal: Option<DeviceBuffer>,
-    ptr: *mut std::ffi::c_void,
-    len: usize,
-    device: onnx_runtime_ir::DeviceId,
+fn direct_view_outputs(
+    node: &Node,
+    plan_inputs: &[Option<ValueId>],
+    graph: &Graph,
+    inputs: &[TensorView<'_>],
+    output_shapes: &[Vec<usize>],
+    num_outputs: usize,
+) -> Option<Vec<ViewOutput>> {
+    if !node.is_default_domain() || num_outputs != 1 {
+        return None;
+    }
+    match node.op_type.as_str() {
+        "Identity" if inputs.len() == 1 => {
+            let input_vid = plan_inputs.first().copied().flatten()?;
+            if graph.initializers.contains_key(&input_vid) {
+                return None;
+            }
+            let input = &inputs[0];
+            (input.dtype.byte_size() > 0).then(|| {
+                vec![ViewOutput {
+                    input_index: 0,
+                    shape: input.shape.to_vec(),
+                    strides: input.strides.to_vec(),
+                    byte_offset: input.byte_offset,
+                }]
+            })
+        }
+        "Reshape" if inputs.len() == 2 => {
+            let data = &inputs[0];
+            let shape = output_shapes.first()?;
+            if data.dtype.byte_size() == 0
+                || !onnx_runtime_ir::is_contiguous(data.shape, data.strides)
+            {
+                return None;
+            }
+            let input_numel = data
+                .shape
+                .iter()
+                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+            let output_numel = shape
+                .iter()
+                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+            (input_numel == output_numel).then(|| {
+                vec![ViewOutput {
+                    input_index: 0,
+                    shape: shape.clone(),
+                    strides: compute_contiguous_strides(shape),
+                    byte_offset: data.byte_offset,
+                }]
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Auto-materialization gate: a strided (view) input feeding a kernel that does
@@ -1256,11 +1503,10 @@ impl KernelDispatchContext<'_> {
         Ok(())
     }
 
-    /// Take each output buffer out (internal buffers removed from the map,
-    /// external bindings aliased in place), bounds-check the contiguous output
-    /// window, and build the [`TensorMut`] the kernel writes through. The
-    /// returned views borrow `output_shapes`/`out_strides`; the returned
-    /// backings must outlive them.
+    /// Bounds-check each output window and build the [`TensorMut`] the kernel
+    /// writes through. Internal buffers stay resident in the executor map; the
+    /// returned views carry raw pointers, so no per-node HashMap remove/reinsert
+    /// is needed on the hot path.
     fn build_output_bindings<'o>(
         &mut self,
         outputs: &[ValueId],
@@ -1268,49 +1514,27 @@ impl KernelDispatchContext<'_> {
         out_strides: &'o [Vec<i64>],
         output_dtypes: &[DataType],
         external: &ExternalBindings,
-    ) -> Result<(Vec<OutBacking>, Vec<TensorMut<'o>>)> {
-        let mut out_bufs: Vec<OutBacking> = Vec::with_capacity(outputs.len());
-        for &vid in outputs {
-            if let Some(value) = external.outputs.get(&vid) {
-                out_bufs.push(OutBacking {
-                    vid,
-                    internal: None,
-                    ptr: value.ptr,
-                    len: value.len,
-                    device: value.device,
-                });
+    ) -> Result<Vec<TensorMut<'o>>> {
+        let mut outs: Vec<TensorMut> = Vec::with_capacity(outputs.len());
+        for (i, &vid) in outputs.iter().enumerate() {
+            let (ptr, len, device) = if let Some(value) = external.outputs.get(&vid) {
+                (value.ptr, value.len, value.device)
             } else {
-                let mut buf = self.buffers.remove(&vid).ok_or_else(|| {
+                let buf = self.buffers.get_mut(&vid).ok_or_else(|| {
                     SessionError::Internal(format!("missing buffer for output value#{}", vid.0))
                 })?;
-                let ptr = buf.as_mut_ptr();
-                out_bufs.push(OutBacking {
-                    vid,
-                    ptr,
-                    len: buf.len(),
-                    device: buf.device(),
-                    internal: Some(buf),
-                });
-            }
-        }
-        let mut outs: Vec<TensorMut> = Vec::with_capacity(out_bufs.len());
-        for (i, backing) in out_bufs.iter_mut().enumerate() {
-            view_bounds(
-                &output_shapes[i],
-                &out_strides[i],
-                0,
-                output_dtypes[i],
-                backing.len,
-            )?;
+                (buf.as_mut_ptr(), buf.len(), buf.device())
+            };
+            view_bounds(&output_shapes[i], &out_strides[i], 0, output_dtypes[i], len)?;
             outs.push(TensorMut::new(
-                DevicePtrMut(backing.ptr),
+                DevicePtrMut(ptr),
                 output_dtypes[i],
                 &output_shapes[i],
                 &out_strides[i],
-                backing.device,
+                device,
             ));
         }
-        Ok((out_bufs, outs))
+        Ok(outs)
     }
 
     /// Run the kernel over the bound input/output views (routing lazy-weight
@@ -1328,7 +1552,6 @@ impl KernelDispatchContext<'_> {
         has_lazy_inputs: bool,
         views: &[TensorView],
         outs: &mut Vec<TensorMut>,
-        out_bufs: Vec<OutBacking>,
     ) -> Result<()> {
         let kernel_inputs = has_lazy_inputs.then(|| {
             inputs
@@ -1389,12 +1612,6 @@ impl KernelDispatchContext<'_> {
                 ))
             })?;
 
-        drop(kernel_inputs);
-        for backing in out_bufs {
-            if let Some(buf) = backing.internal {
-                self.buffers.insert(backing.vid, buf);
-            }
-        }
         Ok(())
     }
 }
