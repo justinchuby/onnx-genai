@@ -39,3 +39,8 @@
 - PR #487 merged (Lori APPROVED): Inc3b — generic routed CUDA ports; `decode_cuda_eager_step_inputs`/`prepare_cuda_owned_step_inputs` metadata-driven; removed `load.rs` CUDA Routed refusal; captured fast path byte-identical; KV device-resident. mask/ReduceSum finding = ARTIFACT not blocker, proven by real qwen3-0.6b native-CUDA e2e locking 32 tokens to ORT-CUDA on a mask-consuming decoder.
 - MILESTONE: native multi-component pipeline CUDA decode path (Inc2a→Inc3b) fully on main; real qwen3-0.6b native-CUDA matches ORT-CUDA for 32 tokens.
 - In flight: Inc3c (perf).
+
+## 2026-07-31T00:25:00Z — Native pipeline Inc3c merged (#533) — native CUDA decode BEATS ORT
+
+- PR #533 merged (Lori APPROVED): Inc3c — THE landmark. Real qwen3-0.6b, device 4, real ORT-CUDA: captured ceiling 612 tok/s, eager pipeline 220, ORT-CUDA 443. Default-off `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` writes a persistent `[1,1,width]` device binding per routed port each step, reusing captured `run_one_token` (mask frozen, KV device-resident) ⇒ 1.38x ORT WIN. Metadata-driven from `session.inputs()` (load.rs:481-508); generalizes to 35B-A3B GQA. Engagement proven non-tautologically via counter `NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES` (OFF=0/ON=3, tokens byte-identical).
+- In flight (mary-2): real-model capture-engagement validation (does real qwen3-0.6b ENGAGE capture & beat ORT, or DECLINE via Concat-KV) + default-on recommendation.

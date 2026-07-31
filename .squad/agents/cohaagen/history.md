@@ -27,3 +27,9 @@
 - PR #525 merged (Melina APPROVED): #67 coverage-polish — RotaryEmbedding com.microsoft + fixed dtype-check bug (Int64 position_ids compared vs float); Bool NonZero on both EPs via `to_dense_bool`; GatherBlockQuantized odd-blocks-per-row LOUD fail-closed gate + honest doc softening. Op counts unchanged (no new op names).
 - Qwen3.5 hybrid recurrent op set now fully CUDA-covered (CausalConvWithState #480 + LinearAttention #484 + RoPE-contrib/NonZero #525).
 - In flight: hybrid-e2e.
+
+## 2026-07-31T00:25:00Z — PR #529 merged (qwen3.5-0.8b hybrid 100% CUDA placement)
+
+- PR #529 merged: qwen3.5-0.8b hybrid places 100% on CUDA — split package embedding.onnx 24 nodes + text.onnx 1265 = 1289 nodes, 0 declines (after #480/#484/#525). Regression lock `qwen35_0_8b_placement_lock`.
+- E2e decode still BLOCKED on the loader: `Engine::from_dir` rejects the 3-onnx split; `from_pipeline_dir` refuses during vision `smart_resize` admission. Parity harness `qwen35_0_8b_hybrid_native_cuda_e2e` graceful-skips until fixed.
+- In flight (cohaagen-4): loader-unblock — admit the text-only split hybrid for decode, flip the e2e parity harness active.

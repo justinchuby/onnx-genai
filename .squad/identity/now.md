@@ -1,13 +1,25 @@
 # Team Focus — now
 
-**Current focus:** CUDA op-parity is at 161 covered standard-domain ops after #423/#424. Native large-model 27B decode remains gated on explicit token metadata (#377 / Möbius #434, awaiting Justin merge). ORT-CUDA 27B basic-opt baseline is established at 17.38 tok/s / 18.1 GiB.
+**Current focus:** Native multi-component pipeline CUDA decode is the active frontier. As of
+#533 (Mary, Lori APPROVED), native CUDA decode now BEATS ORT — 1.38x ORT-CUDA on real qwen3-0.6b
+via the default-off `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` captured step-input binding
+(mask frozen, KV device-resident), byte-identical tokens. CUDA op-coverage of the Qwen3.5 hybrid
+(Mamba + linear-attention) family is complete; #529 (Cohaagen) placed qwen3.5-0.8b 100% on CUDA
+(1289 nodes, 0 declines). Shape-inference container types are COMPLETE and issue #449 is CLOSED
+(#531, Harry).
 
-**MERGED THIS WAVE:** PR #423 (`eed2fbf2`) added CUDA `QLinearMatMul` and common nearest/linear `Resize`, raising coverage 157→159. PR #424 (`1574e87a`, Mary revision `93d9e7b8`) added CUDA `ConvTranspose` and `GridSample`, raising coverage 159→161. PR #420 (`6610f86f`) widened extended reductions to f16/bf16 with f32 accumulation, clearing the native reduce fallback for Qwen3.6-27B INT4.
+**IN FLIGHT:**
+- **mary-2:** real-model capture-engagement validation — does the real qwen3-0.6b pipeline ENGAGE
+  the captured fast path & beat ORT, or DECLINE via Concat-KV — plus a default-on recommendation.
+- **cohaagen-4:** loader-unblock — admit the text-only split hybrid package for decode and flip
+  the `qwen35_0_8b_hybrid_native_cuda_e2e` parity harness from graceful-skip to active.
+- **harry-5:** generalize ORT `clone_value`/`clone_owned` to all POD dtypes (unblocks Bool /
+  gemma-3n audio mask).
 
-**GAP REGISTER:** #67 remaining heavy CUDA gaps are `NonMaxSuppression` and Resize cubic/advanced modes. Native 27B remains blocked on explicit token metadata (#377 / Möbius #434, awaiting Justin merge). MoE 35B still needs `BlockQuantizedMoE` support (#82). ORT-CUDA extended/all graph optimization still aborts on the 27B artifact in upstream ORT CUDA Level2 behavior; basic-opt is only a workaround reference.
+**HELD:** #534 (Harry, server contracts #481/#482, Melina APPROVED) targets Justin's active
+branch `feat/genai-demo-dashboard` (PR #476); that code is not on main.
 
-**ORT-CUDA BASELINE:** Doug established ORT-CUDA 1.28 basic-optimization Qwen3.6-27B INT4 at 17.38 tok/s, 57.527 ms/token, and 18,127 MiB peak H200 VRAM. ORT 1.27 and 1.28 both abort with extended/all graph optimization.
+**OFF-LIMITS:** #54 model-package and #299 LoRA belong to another team; #106 is under Justin's
+study. Do not touch resting other-squad open PRs (#314, #315, #317, #318, #291, #99).
 
-**OFF-LIMITS:** #54 model-package and #299 LoRA belong to another team; #106 is under Justin's study. Do not touch resting other-squad open PRs (#314, #315, #317, #318, #291, #99).
-
-**Updated:** 2026-07-30T04:10:00Z
+**Updated:** 2026-07-31T00:25:00Z
