@@ -89,8 +89,8 @@ pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_wit
 pub use provider::CudaExecutionProvider;
 pub use weight_paging::{
     CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,
-    GlobalOffloadStats, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV, global_offload_stats,
-    reset_global_offload_stats,
+    GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV,
+    WEIGHT_OFFLOAD_ENV, global_offload_stats, reset_global_offload_stats,
 };
 
 /// Number of additional u32 words required by the CUDA device argmax result buffer.
