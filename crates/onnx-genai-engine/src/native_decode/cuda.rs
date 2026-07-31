@@ -121,6 +121,14 @@ pub(crate) struct DecodeCudaState {
     pub(crate) bindings: Vec<DeviceIoBinding>,
     pub(crate) base_binding_count: usize,
     pub(crate) kv_binding_range: std::ops::Range<usize>,
+    /// Bindings for fixed-size recurrent/conv states (hybrid linear-attention
+    /// `conv_state`/`recurrent_state`). Unlike growable KV — which is masked and
+    /// tracked by `logical_len`, so stale slots are inert — these are wholesale
+    /// rolling caches with no masking. They are zero-initialized once in `new()`;
+    /// `rewind(0)` must re-zero them so a reused session starts every generation
+    /// from the declared `init: zeros` state (see `rewind`). Empty for pure-KV
+    /// decoders.
+    pub(crate) fixed_state_binding_range: std::ops::Range<usize>,
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
@@ -1105,6 +1113,7 @@ impl DecodeCudaState {
             )?;
             bindings.push(binding);
         }
+        let fixed_state_end = bindings.len();
 
         let logits_meta = session
             .outputs()
@@ -1400,6 +1409,7 @@ impl DecodeCudaState {
             bindings,
             base_binding_count,
             kv_binding_range: kv_start..kv_end,
+            fixed_state_binding_range: kv_end..fixed_state_end,
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
@@ -1483,6 +1493,25 @@ impl DecodeCudaState {
             self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
         }
         self.bindings[0].set_logical_shape(vec![1, target_len])?;
+        if target_len == 0 {
+            // Fixed-size recurrent/conv states are unmasked rolling caches: a
+            // reused session would otherwise inherit the previous generation's
+            // terminal state, corrupting generation #2+. A full reset restores
+            // the declared `init: zeros`. Speculative recurrent rewind to a
+            // non-zero length is unsupported (mirrors the CPU path), so only the
+            // reset boundary re-zeros here.
+            for index in self.fixed_state_binding_range.clone() {
+                let binding = &self.bindings[index];
+                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                    .with_context(|| {
+                        format!(
+                            "fixed CUDA decoder state re-zero size overflow for binding {index} shape {:?}",
+                            binding.physical_shape()
+                        )
+                    })?;
+                native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            }
+        }
         self.set_logical_len(target_len)
     }
 
