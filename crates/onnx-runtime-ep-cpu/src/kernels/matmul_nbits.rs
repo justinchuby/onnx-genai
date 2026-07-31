@@ -3280,9 +3280,16 @@ impl DotKernel {
             // The asymmetric N16 SDOT kernels are correctness-locked, but the
             // first full-model Qwen3 measurement regressed decode throughput.
             // Keep them opt-in while the microkernel is tightened.
-            std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
-                let value = value.trim();
-                !value.is_empty() && value != "0"
+            //
+            // Resolved once: this gate is read from the per-token decode path,
+            // where `std::env::var` would take the process-wide environment
+            // lock and allocate on every generated token.
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value != "0"
+                })
             })
         }
     }
@@ -3295,11 +3302,19 @@ impl DotKernel {
         }
         #[cfg(not(test))]
         {
-            if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
-                let value = value.trim();
-                return !value.is_empty() && value != "0";
-            }
-            !cfg!(any(target_os = "macos", target_os = "ios"))
+            // Resolved once: see the note in `arm64_int4_direct_enabled`.
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
+                    let value = value.trim();
+                    return !value.is_empty() && value != "0";
+                }
+                // Validated against the f32 reference for the asymmetric block128
+                // shapes Qwen3 actually emits, so this path is on by default.
+                // Apple silicon keeps the existing route pending its own
+                // measurement pass.
+                !cfg!(any(target_os = "macos", target_os = "ios"))
+            })
         }
     }
 }
