@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-07-31T08:48:28Z (Scribe round 8 — #544 async page-in inc1, #552 observability, #554 session-reuse fix, 27B offload A/B, GQA capture; round-7+MoE in archive)
+Last consolidated: 2026-07-31T10:24:07Z (Scribe round 9 — 27B decode profile Scan=56.5%, Scan-capture scoping PENDING JUSTIN, #554 session-reuse merged; round-8 in archive)
 
 Standing governance rules and constraints. Dated wave records and historical ledger updates
 are archived to `.squad/decisions-archive/2026-07.md`.
@@ -260,14 +260,21 @@ NEVER `to_raw_bytes()`. Unblocked the gemma-3n Bool audio mask.
   repeatable). Do NOT re-try that lever** (reduction tax > sub-wave grid-fill); a K_SPLIT>2 new
   kernel with its own A/B is the future candidate.
 
-## 2026-07-31 — Scribe consolidation (round 8)
+## 2026-07-31 — 27B decode profile + Scan-capture scoping (round 9)
 
-**By:** Scribe. Merged: #544 #552 #554. Wave narrative in archive.
+**By:** Scribe. Round-8 (#544/#552/#554/27B-A/B/GQA) → archive.
 
-- **#544 async page-in inc1** (Cohaagen; Harry test fix; Melina RC→APPROVE): `cuMemcpyHtoDAsync`+`compute_wait_fence`; eviction re-serializes (WAR). ~1% at 2 MiB; byte-identical all budgets. `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` default ON.
-- **#552 profile_native observability** (Cohaagen; Lori APPROVE): `load_with_resolved_io` — genai_config decoders print `cuda_graph captures/fallbacks/fallback_report` + `--trace` capture-reject reasons.
-- **GQA capture validated** (Cohaagen): Qwen2.5-0.5B int4 GQA ON 2.14× eager, byte-identical, zero declines. Gemma-4-E2B: stale export (vision fn 2 vs 4 outputs) + GAP-3 (native pipeline unimplemented).
-- **27B offload A/B** (Mary, H200): Qwen3.6-27B int4, 2 GiB → 6.2 GiB peak VRAM (2.9× vs 17.7 GiB), byte-exact. Cliff: ≤12 GiB → 0.11 tok/s. cuda_graph off under offload.
-- **#553/#554 session-reuse fix** (Mary; Harry APPROVED): conv_state/recurrent_state not zeroed between generates in `NativeDecodeSession`. Not graph-capture related.
-- **Native pipeline keystone** (Mary): `native_full_pipeline_parity` — native embedding + native decoder → `[0,5,6,7] == ORT` (`tiny-gemma4-vlm`).
+- **27B native-CUDA decode: Scan is bottleneck** (Cohaagen; profile-only): 168 ms/tok (~35× off roofline). `Scan` (48 LinearAttention blocks/step) = **56.5%**, structurally un-capturable. MatMulNBits at roofline (4.4 ms, 2%). Ceiling: **~15–30× speedup** if Scan enters capture/fuse. NOT a kernel fix.
+- **#554 MERGED** (Mary; Harry APPROVED): `DecodeCudaState.rewind(0)` re-zeroes `fixed_state_binding_range`; pure-KV models unaffected (empty range).
+
+## ⚑ PENDING JUSTIN: 27B Scan→CUDA-capture (Mary; no code changed, awaiting go-ahead)
+
+Structurally larger than an increment — blockers: (1) shared prefill+decode plan; seq=1 inline corrupts prefill. (2) Control-flow declined at `provider.rs:458`, no trip_count exemption. (3) Child bodies never fold into parent plan.
+
+**Approach 1 — runtime dual-path** (only correct+feasible path):
+- **1a** (flag-gated): inline body into parent plan alongside Scan; runtime trip_count==1 picks body. Correctness-only, no capture.
+- **1b**: body enters capture; validate captures/replays rise; assert 27B tokens byte-identical to locked reference.
+- Blast radius: #443/#543 core. Prefill MUST be validated (shared-plan is the correctness tripwire).
+
+**Baseline + locked reference tokens ready.** Awaiting Justin go-ahead.
 In flight: #87 inc2 double-buffer; native paged-KV; 35B-A3B MoE; gemma-3n text-only.

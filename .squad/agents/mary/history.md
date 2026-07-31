@@ -29,3 +29,10 @@ _Entries before 2026-07-30T21:15 archived to `history-archive.md` (Scribe round 
 - **27B offload A/B (H200):** Qwen3.6-27B int4 (497 MatMulNBits). 2 GiB budget → 6.2 GiB peak VRAM (2.9× vs 17.7 GiB resident), byte-exact at all budgets. Cliff: ≤12 GiB → 0.11 tok/s (bandwidth-bound, whole working set evicted/token). cuda_graph auto-off under offload. Action item: add `model.io` block to canonical int4-cuda package.
 - **#553 bug found (#554 MERGED, Harry APPROVED):** `NativeDecodeSession` 2nd+ generation returns garbage — conv_state/recurrent_state not zeroed between generates. Not graph-capture related. Fixed.
 - **Native pipeline keystone test:** `native_full_pipeline_parity` drives `tiny-gemma4-vlm` with native embedding + native decoder simultaneously → `[0,5,6,7] == ORT`. Closes composite-native safety gap ahead of 35B-A3B wiring.
+
+## 2026-07-31T10:24:07Z — Scan-capture increment assessed: STOP+report; right-sized workstream proposed
+
+- Reproduced 176.7 ms/tok baseline (matches Cohaagen ±5%). Confirmed `--trace` Scan seam.
+- Single-trip Scan inline is NOT an increment: (1) shared prefill+decode plan — static inline corrupts prefill; (2) control-flow structurally declined at `provider.rs:458`; (3) no child-body-fold machinery.
+- **Right-sized: Approach 1 (runtime dual-path)** — 1a correctness behind flag, 1b body enters capture. Blast radius: #443/#543 core. Reference decode tokens locked. **Awaiting Justin go-ahead.**
+- No code changed; worktree `wt-mary-scan` removed.
