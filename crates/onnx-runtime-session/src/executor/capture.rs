@@ -38,6 +38,12 @@ pub struct ControlFlowStats {
     pub subgraph_builds: u64,
     /// Child subgraph invocations served by those executors.
     pub subgraph_runs: u64,
+    /// Slice 1b: single-trip `Scan` body device graphs successfully recorded.
+    pub scan_body_captures: u64,
+    /// Slice 1b: decode steps served by replaying a recorded body device graph.
+    pub scan_body_replays: u64,
+    /// Slice 1b: single-trip body runs that fell back to host-eager execution.
+    pub scan_body_fallbacks: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

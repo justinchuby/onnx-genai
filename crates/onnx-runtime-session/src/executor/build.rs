@@ -518,6 +518,7 @@ impl Executor {
             compute_in_place_alias_count: 0,
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
+            scan_body_capture_enabled: scan_body_capture_env_enabled(),
             kernel_bindings: vec![None; plan_len],
         };
 

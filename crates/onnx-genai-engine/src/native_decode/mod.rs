@@ -219,6 +219,19 @@ impl NativeDecodeSession {
             .map(|state| state.debug_stats(&self.session))
     }
 
+    /// Slice 1a/1b observability: control-flow subgraph build/run counts plus the
+    /// single-trip `Scan` body nested-capture counters (captures / replays /
+    /// fallbacks). Lets a profiler prove the capture path engaged on decode.
+    pub fn control_flow_stats(&self) -> onnx_runtime_session::ControlFlowStats {
+        self.session.control_flow_stats()
+    }
+
+    /// Slice 1a observability: how many times the single-trip `Scan` inline path
+    /// engaged over this session's lifetime (`> 0` proves the dual-path fired).
+    pub fn scan_inline_single_trip_count(&self) -> u64 {
+        self.session.scan_inline_single_trip_count()
+    }
+
     pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
         self.cuda
             .as_ref()

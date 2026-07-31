@@ -57,6 +57,9 @@ impl ChildExecutor {
             compiled: Vec::new(),
             builds: 0,
             runs: 0,
+            body_captures: 0,
+            body_replays: 0,
+            body_fallbacks: 0,
             trace: TraceContext::noop(),
         })
     }
@@ -65,6 +68,9 @@ impl ChildExecutor {
         ChildExecutorStats {
             builds: self.builds,
             runs: self.runs,
+            body_captures: self.body_captures,
+            body_replays: self.body_replays,
+            body_fallbacks: self.body_fallbacks,
         }
     }
 
@@ -133,6 +139,7 @@ impl ChildExecutor {
                     shape: tensor.shape.clone(),
                 })
                 .collect(),
+            capture: None,
         })
     }
 
@@ -218,9 +225,323 @@ impl ChildExecutor {
             })
             .collect()
     }
+
+    /// Body graph-output value names, in declared order — the names the device
+    /// output bindings must reference. Preserved from the loader-ordered template
+    /// (compilation keeps output order and names).
+    fn output_names(&self) -> Result<Vec<String>> {
+        self.template
+            .outputs
+            .iter()
+            .map(|&vid| {
+                self.template.value(vid).name.clone().ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "subgraph '{}' has an unnamed output value#{}",
+                        self.name, vid.0
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// Slice 1b: run the single-trip `Scan` body through nested device-graph
+    /// capture/replay instead of host-eager dispatch. Byte-for-byte equivalent to
+    /// [`Self::run`] — same host inputs are copied into persistent device
+    /// bindings, the body's own device kernels compute the result, and the same
+    /// host outputs are read back; capture only changes *how* those kernels are
+    /// launched (recorded once, replayed each step) not *what* they compute.
+    ///
+    /// Per selected plan the state machine is: host-run once to learn output
+    /// geometry and allocate persistent bindings (`NeedBindings`), a device warmup
+    /// run (`NeedDeviceWarmup`), one recording pass (`NeedCapture`), then replay
+    /// every step (`Captured`). A declined capture or a retired replay falls back
+    /// to a correct host-eager run. Only ever reached from the `trip_count == 1`
+    /// inline branch, so prefill can never capture or replay this graph.
+    pub(crate) fn run_capturing(
+        &mut self,
+        formal_inputs: &[&Tensor],
+        outer_scope: &HashMap<String, Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        if self.formal_names.len() != formal_inputs.len() {
+            return Err(SessionError::Internal(format!(
+                "subgraph '{}' expects {} formal input(s) but {} were supplied",
+                self.name,
+                self.formal_names.len(),
+                formal_inputs.len()
+            )));
+        }
+
+        let mut externals = Vec::with_capacity(formal_inputs.len() + self.capture_names.len());
+        externals.extend_from_slice(formal_inputs);
+        for name in &self.capture_names {
+            externals.push(
+                outer_scope
+                    .get(name)
+                    .ok_or_else(|| missing_capture_error(&self.name, name))?,
+            );
+        }
+
+        let signature = externals
+            .iter()
+            .map(|tensor| ChildInputSignature {
+                dtype: tensor.dtype,
+                shape: tensor.shape.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cache_index = if let Some(index) = self
+            .compiled
+            .iter()
+            .position(|compiled| compiled.signature == signature)
+        {
+            let compiled = self.compiled.remove(index);
+            self.compiled.push(compiled);
+            self.compiled.len() - 1
+        } else {
+            let compiled = self.compile(&externals)?;
+            if self.compiled.len() == CHILD_EXECUTOR_CACHE_CAPACITY {
+                self.compiled.remove(0);
+            }
+            self.compiled.push(compiled);
+            self.builds += 1;
+            self.compiled.len() - 1
+        };
+        self.runs += 1;
+
+        let inputs: Vec<(&str, &Tensor)> = self
+            .input_names
+            .iter()
+            .map(String::as_str)
+            .zip(externals.iter().copied())
+            .collect();
+        let output_names = self.output_names()?;
+
+        let (outputs, event) =
+            self.compiled[cache_index].run_body_step(&inputs, outer_scope, &output_names)?;
+
+        match event {
+            BodyCaptureEvent::Capture => self.body_captures += 1,
+            BodyCaptureEvent::Replay => self.body_replays += 1,
+            BodyCaptureEvent::Fallback => self.body_fallbacks += 1,
+            BodyCaptureEvent::None => {}
+        }
+        if !matches!(event, BodyCaptureEvent::None | BodyCaptureEvent::Replay)
+            && std::env::var("ONNX_GENAI_SCAN_BODY_CAPTURE_TRACE").is_ok()
+        {
+            eprintln!(
+                "SCAN_BODY_CAPTURE {} event={:?} totals: captures={} replays={} fallbacks={}",
+                self.name, event, self.body_captures, self.body_replays, self.body_fallbacks
+            );
+        }
+        Ok(outputs)
+    }
 }
 
-// === Control-flow (subgraph-executing) ops: If / Loop / Scan ===
+/// Which nested-capture transition a body step took, for the observable counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyCaptureEvent {
+    None,
+    Capture,
+    Replay,
+    Fallback,
+}
+
+impl CompiledChildPlan {
+    /// Drive one nested device-graph capture/replay step for this plan, returning
+    /// the body outputs as host tensors plus the transition taken. `inputs` are
+    /// the by-name host inputs (formal + captures) in `input_names` order.
+    fn run_body_step(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        outer_scope: &HashMap<String, Tensor>,
+        output_names: &[String],
+    ) -> Result<(Vec<Tensor>, BodyCaptureEvent)> {
+        // First selection: run host-eagerly to learn output geometry, then
+        // allocate the persistent device I/O bindings the graph will bake in.
+        if self.capture.is_none() {
+            let outputs = self.host_run(inputs, outer_scope)?;
+            let capture = self.allocate_capture(inputs, output_names, &outputs)?;
+            self.capture = Some(capture);
+            return Ok((outputs, BodyCaptureEvent::None));
+        }
+
+        let CompiledChildPlan { exec, capture, .. } = self;
+        let cap = capture.as_mut().expect("capture present");
+
+        // CORRECTNESS GUARD (slice 1b STOP). The device-graph facility is a
+        // per-EP singleton segment list shared by all 48 LinearAttention child
+        // bodies (each is built with one cloned `Arc<dyn ExecutionProvider>`), so
+        // installing a per-node captured graph pollutes that single slot and
+        // whole-graph replay replays every layer's graph — silently corrupting
+        // output (identical body shapes surface no error). Until the EP gains a
+        // handle-keyed multi-graph registry (or each child owns an isolated EP),
+        // the install/replay path is disabled and the body runs eagerly, keeping
+        // the flag-ON single-trip decode byte-exact with slice 1a. The state
+        // machine below is retained, behind the explicit unsafe spike flag, as
+        // the basis for that follow-up. See .squad/decisions/inbox/mary-scan-1b.md.
+        if !scan_body_capture_unsafe_env_enabled() {
+            cap.phase = ScanBodyCapturePhase::EagerFallback;
+            let outputs = Self::host_run_on(exec, inputs, outer_scope, "scan body")?;
+            return Ok((outputs, BodyCaptureEvent::Fallback));
+        }
+
+        // Refresh the per-step input bytes into their persistent bindings for
+        // every device path (skipped only for the pure host-eager fallback).
+        if !matches!(cap.phase, ScanBodyCapturePhase::EagerFallback) {
+            for (binding, (_, tensor)) in cap.bindings[..cap.n_inputs].iter_mut().zip(inputs) {
+                binding.write_bytes(0, tensor.as_bytes())?;
+            }
+        }
+
+        match cap.phase {
+            ScanBodyCapturePhase::NeedDeviceWarmup => {
+                exec.run_with_device_bindings(&[], &mut cap.bindings)?;
+                let outputs = read_body_outputs(cap)?;
+                cap.phase = ScanBodyCapturePhase::NeedCapture;
+                Ok((outputs, BodyCaptureEvent::None))
+            }
+            ScanBodyCapturePhase::NeedCapture => {
+                match exec.try_capture_with_device_bindings(&[], &mut cap.bindings)? {
+                    DeviceGraphCaptureResult::Captured(_) => {
+                        let outputs = read_body_outputs(cap)?;
+                        cap.phase = ScanBodyCapturePhase::Captured;
+                        Ok((outputs, BodyCaptureEvent::Capture))
+                    }
+                    DeviceGraphCaptureResult::NotCapturable(_) => {
+                        // The all-kernel audit rejected the run *before* stream
+                        // capture began, so no compute happened: run host-eagerly.
+                        cap.phase = ScanBodyCapturePhase::EagerFallback;
+                        let outputs = Self::host_run_on(exec, inputs, outer_scope, "scan body")?;
+                        Ok((outputs, BodyCaptureEvent::Fallback))
+                    }
+                }
+            }
+            ScanBodyCapturePhase::Captured => match exec.replay_device_graph(&mut cap.bindings) {
+                Ok(true) => {
+                    let outputs = read_body_outputs(cap)?;
+                    Ok((outputs, BodyCaptureEvent::Replay))
+                }
+                Ok(false) => {
+                    // A control-flow branch flip retired the graph mid-step; the
+                    // step's outputs were still produced correctly in the bindings.
+                    let outputs = read_body_outputs(cap)?;
+                    cap.phase = ScanBodyCapturePhase::NeedDeviceWarmup;
+                    Ok((outputs, BodyCaptureEvent::Fallback))
+                }
+                Err(_) => {
+                    let _ = exec.reset_device_graph();
+                    cap.phase = ScanBodyCapturePhase::NeedDeviceWarmup;
+                    let outputs = Self::host_run_on(exec, inputs, outer_scope, "scan body")?;
+                    Ok((outputs, BodyCaptureEvent::Fallback))
+                }
+            },
+            ScanBodyCapturePhase::EagerFallback => {
+                let outputs = Self::host_run_on(exec, inputs, outer_scope, "scan body")?;
+                Ok((outputs, BodyCaptureEvent::None))
+            }
+        }
+    }
+
+    fn host_run(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        outer_scope: &HashMap<String, Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        Self::host_run_on(&mut self.exec, inputs, outer_scope, "scan body")
+    }
+
+    fn host_run_on(
+        exec: &mut Executor,
+        inputs: &[(&str, &Tensor)],
+        outer_scope: &HashMap<String, Tensor>,
+        name: &str,
+    ) -> Result<Vec<Tensor>> {
+        exec.run_scoped(inputs, outer_scope, &ExternalBindings::default())?
+            .into_iter()
+            .map(|output| {
+                let output = output.ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "subgraph '{name}' unexpectedly suppressed an output"
+                    ))
+                })?;
+                match output {
+                    SessionOutput::Tensor(tensor) => Ok(tensor),
+                    SessionOutput::Sequence(_) => Err(SessionError::SequenceOp {
+                        op: "<control-flow output>".to_string(),
+                        reason: format!(
+                            "subgraph '{name}' produced a Sequence output where this control-flow path requires a tensor"
+                        ),
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// Allocate the persistent input + output device bindings for this plan,
+    /// sized from the discovered input/output host tensors.
+    fn allocate_capture(
+        &self,
+        inputs: &[(&str, &Tensor)],
+        output_names: &[String],
+        outputs: &[Tensor],
+    ) -> Result<ScanBodyCapture> {
+        if outputs.len() != output_names.len() {
+            return Err(SessionError::Internal(format!(
+                "body produced {} outputs but graph declares {}",
+                outputs.len(),
+                output_names.len()
+            )));
+        }
+        let n_inputs = inputs.len();
+        let mut bindings = Vec::with_capacity(n_inputs + outputs.len());
+        for (name, tensor) in inputs {
+            bindings.push(self.exec.allocate_device_binding(
+                (*name).to_string(),
+                None,
+                tensor.dtype,
+                tensor.shape.clone(),
+                tensor.shape.clone(),
+            )?);
+        }
+        let mut output_specs = Vec::with_capacity(outputs.len());
+        for (name, tensor) in output_names.iter().zip(outputs) {
+            bindings.push(self.exec.allocate_device_output_binding(
+                name.clone(),
+                tensor.dtype,
+                tensor.shape.clone(),
+                tensor.shape.clone(),
+            )?);
+            output_specs.push((tensor.dtype, tensor.shape.clone()));
+        }
+        Ok(ScanBodyCapture {
+            phase: ScanBodyCapturePhase::NeedDeviceWarmup,
+            bindings,
+            n_inputs,
+            output_specs,
+        })
+    }
+}
+
+/// Read the body's device output bindings back into owned host tensors, in the
+/// body graph-output order the caller expects.
+fn read_body_outputs(cap: &mut ScanBodyCapture) -> Result<Vec<Tensor>> {
+    let n_inputs = cap.n_inputs;
+    let ScanBodyCapture {
+        bindings,
+        output_specs,
+        ..
+    } = cap;
+    bindings[n_inputs..]
+        .iter_mut()
+        .zip(output_specs.iter())
+        .map(|(binding, (dtype, shape))| {
+            let bytes = binding.read_bytes()?;
+            let want =
+                dtype.storage_bytes(checked_numel(shape, || "scan body output".to_string())?);
+            Tensor::from_raw(*dtype, shape.clone(), &bytes[..want])
+        })
+        .collect()
+}
+
 //
 // These are handled at the executor level rather than as leaf kernels because
 // they must recursively execute a nested ONNX [`Graph`] with the enclosing
@@ -517,6 +838,39 @@ impl Executor {
         prepared: &PreparedSubgraph,
         formal_inputs: &[&Tensor],
     ) -> Result<Vec<Tensor>> {
+        self.ensure_child(prepared)?;
+        let child = self
+            .subgraph_execs
+            .get_mut(&prepared.key)
+            .expect("child present");
+        let before = child.stats();
+        let result = child.run(formal_inputs, &prepared.captures);
+        let after = child.stats();
+        self.aggregate_child_stats(before, after);
+        result
+    }
+
+    /// Slice 1b: like [`Self::run_subgraph`], but drives the body through nested
+    /// device-graph capture/replay. Reached only from the single-trip inline
+    /// `Scan` path when `ONNX_GENAI_SCAN_BODY_CAPTURE` is on.
+    pub(super) fn run_subgraph_capturing(
+        &mut self,
+        prepared: &PreparedSubgraph,
+        formal_inputs: &[&Tensor],
+    ) -> Result<Vec<Tensor>> {
+        self.ensure_child(prepared)?;
+        let child = self
+            .subgraph_execs
+            .get_mut(&prepared.key)
+            .expect("child present");
+        let before = child.stats();
+        let result = child.run_capturing(formal_inputs, &prepared.captures);
+        let after = child.stats();
+        self.aggregate_child_stats(before, after);
+        result
+    }
+
+    fn ensure_child(&mut self, prepared: &PreparedSubgraph) -> Result<()> {
         if !self.subgraph_execs.contains_key(&prepared.key) {
             let body = self
                 .graph
@@ -539,17 +893,15 @@ impl Executor {
             child.set_trace_context(self.trace.clone());
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
+        Ok(())
+    }
 
-        let child = self
-            .subgraph_execs
-            .get_mut(&prepared.key)
-            .expect("child present");
-        let before = child.stats();
-        let result = child.run(formal_inputs, &prepared.captures);
-        let after = child.stats();
+    fn aggregate_child_stats(&mut self, before: ChildExecutorStats, after: ChildExecutorStats) {
         self.control_flow_stats.subgraph_builds += after.builds - before.builds;
         self.control_flow_stats.subgraph_runs += after.runs - before.runs;
-        result
+        self.control_flow_stats.scan_body_captures += after.body_captures - before.body_captures;
+        self.control_flow_stats.scan_body_replays += after.body_replays - before.body_replays;
+        self.control_flow_stats.scan_body_fallbacks += after.body_fallbacks - before.body_fallbacks;
     }
 
     /// Dispatch a control-flow plan node to its op-specific handler.
@@ -1299,6 +1651,7 @@ impl Executor {
         // inline path is byte-exact with a one-iteration loop by construction.
         if self.scan_inline_single_trip_enabled && trip_count == 1 {
             self.scan_inline_single_trip_count += 1;
+            let capture = self.scan_body_capture_enabled;
             let (next_state, scan_outs) = self.run_scan_body_step(
                 &prepared,
                 &state,
@@ -1306,6 +1659,7 @@ impl Executor {
                 num_state,
                 num_scan_outputs,
                 &state_specs,
+                capture,
             )?;
             state = next_state;
             for (acc, tensor) in scan_acc.iter_mut().zip(scan_outs) {
@@ -1337,6 +1691,7 @@ impl Executor {
                     num_state,
                     num_scan_outputs,
                     &state_specs,
+                    false,
                 )?;
                 state = next_state;
                 for (acc, tensor) in scan_acc.iter_mut().zip(scan_outs) {
@@ -1382,12 +1737,17 @@ impl Executor {
         num_state: usize,
         num_scan_outputs: usize,
         state_specs: &[(DataType, Vec<usize>)],
+        capture: bool,
     ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         let mut formal: Vec<&Tensor> = Vec::with_capacity(state.len() + scan_slices.len());
         formal.extend(state.iter());
         formal.extend(scan_slices.iter());
 
-        let outs = self.run_subgraph(prepared, &formal)?;
+        let outs = if capture {
+            self.run_subgraph_capturing(prepared, &formal)?
+        } else {
+            self.run_subgraph(prepared, &formal)?
+        };
         drop(formal);
         let expected = num_state + num_scan_outputs;
         if outs.len() != expected {

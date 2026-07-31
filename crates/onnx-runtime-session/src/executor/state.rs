@@ -249,6 +249,15 @@ pub(crate) struct Executor {
     /// regression test read it to reject a silently-gated-out pass); it stays 0
     /// whenever the flag is OFF or every `Scan` runs at `trip_count != 1`.
     pub(super) scan_inline_single_trip_count: u64,
+    /// Slice 1b. When the single-trip `Scan` inline path is active (flag ON,
+    /// `trip_count == 1`) AND this flag is ON, the inlined body is driven through
+    /// nested device-graph capture: the child body executor captures its own
+    /// device graph once and replays it every subsequent decode step, instead of
+    /// dispatching the body eagerly op-by-op. Gated separately from the 1a inline
+    /// flag so the proven host-only inline path (1a) stays available for A/B. The
+    /// generic loop path (prefill, `trip_count > 1`) never reaches this code, so
+    /// prefill can never capture or replay a single-trip body graph.
+    pub(super) scan_body_capture_enabled: bool,
     /// Per-plan-node kernel pre-binding (Stage 3). Each slot stores the
     /// [`KernelKey`] from the most recent successful kernel lookup for that plan
     /// node. On subsequent dispatch, if the current input shapes match the stored
@@ -560,6 +569,51 @@ pub(super) fn scan_inline_single_trip_env_enabled() -> bool {
     )
 }
 
+/// Slice 1b opt-in: nested device-graph capture of the single-trip `Scan` body.
+/// Only meaningful when [`scan_inline_single_trip_env_enabled`] is also ON — the
+/// capture path lives entirely inside the `trip_count == 1` inline branch.
+///
+/// NOTE (slice 1b STOP): with this flag alone the body still runs eagerly. The
+/// actual capture install/replay is additionally gated behind
+/// [`scan_body_capture_unsafe_env_enabled`] because it is currently known to be
+/// incorrect on this model — see that function's docs and
+/// `.squad/decisions/inbox/mary-scan-1b.md`.
+pub(super) fn scan_body_capture_env_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_SCAN_BODY_CAPTURE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Slice 1b spike escape hatch — **known-incorrect, do not enable in production**.
+///
+/// The device-graph facility (`CudaGraphLifecycle`) is a per-EP singleton with a
+/// single ordered `segments` list, and all 48 LinearAttention child bodies share
+/// one `Arc<dyn ExecutionProvider>` (they are built with `self.ep.clone()`).
+/// Installing a per-node captured graph therefore pollutes that one shared slot;
+/// whole-graph `replay_device_graph` replays every installed segment, and because
+/// all bodies have identical shapes the mismatch surfaces no error — it silently
+/// corrupts decode output. The nested capture-once/replay state machine is
+/// retained (behind this flag) only as a spike for the follow-up that adds a
+/// handle-keyed multi-graph registry to the EP (or an isolated per-child EP).
+/// Default OFF: the flag-ON single-trip body runs eagerly (byte-exact with 1a).
+pub(super) fn scan_body_capture_unsafe_env_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_SCAN_BODY_CAPTURE_UNSAFE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 /// Per-input geometry the run loop resolves once per node: the raw base pointer
 /// of the backing (root) buffer plus the real view (shape, element strides —
 /// possibly non-contiguous or negative — and byte offset) to read it through.
@@ -698,6 +752,41 @@ impl ExternalBindings {
 pub(super) struct CompiledChildPlan {
     pub(super) exec: Executor,
     pub(super) signature: Vec<ChildInputSignature>,
+    /// Slice 1b nested device-graph capture state for the single-trip inline
+    /// `Scan` body. `None` until the capturing inline path first selects this
+    /// plan; then it drives a warmup → capture → replay lifecycle over persistent
+    /// device I/O bindings owned here. Never populated by the host-only loop path.
+    pub(super) capture: Option<ScanBodyCapture>,
+}
+
+/// Lifecycle phase of a single-trip `Scan` body's nested device graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScanBodyCapturePhase {
+    /// Bindings exist; warm the device kernels for their exact shapes/addresses
+    /// (a prerequisite of the capture audit) before recording.
+    NeedDeviceWarmup,
+    /// Warmed; record the body's kernel launches into a device graph.
+    NeedCapture,
+    /// A device graph is installed; replay it each step.
+    Captured,
+    /// The body declined capture; run host-eagerly forever (no retries).
+    EagerFallback,
+}
+
+/// Persistent nested-capture state for one single-trip `Scan` body plan. Owns the
+/// device I/O bindings whose stable addresses the recorded graph bakes in, so
+/// every decode step only refreshes input bytes and replays.
+pub(super) struct ScanBodyCapture {
+    pub(super) phase: ScanBodyCapturePhase,
+    /// All device bindings in one slice (the capture/replay API takes one slice):
+    /// the first `n_inputs` are inputs in `input_names` order (formal state + scan
+    /// slices, then lexical captures), the rest are outputs in body graph-output
+    /// order (carried state, then scan outputs).
+    pub(super) bindings: Vec<DeviceIoBinding>,
+    /// Split point in `bindings` between inputs and outputs.
+    pub(super) n_inputs: usize,
+    /// dtype + shape of each output, to rebuild host tensors from read-back bytes.
+    pub(super) output_specs: Vec<(DataType, Vec<usize>)>,
 }
 
 /// Control-flow bodies commonly alternate among a handful of stable shapes.
@@ -728,6 +817,10 @@ pub(crate) struct ChildExecutor {
     pub(super) compiled: Vec<CompiledChildPlan>,
     pub(super) builds: u64,
     pub(super) runs: u64,
+    /// Slice 1b nested-capture counters (see [`ChildExecutorStats`]).
+    pub(super) body_captures: u64,
+    pub(super) body_replays: u64,
+    pub(super) body_fallbacks: u64,
     /// Shared trace context, propagated to every compiled child plan's executor.
     pub(super) trace: TraceContext,
 }
@@ -736,6 +829,13 @@ pub(crate) struct ChildExecutor {
 pub(crate) struct ChildExecutorStats {
     pub builds: u64,
     pub runs: u64,
+    /// Slice 1b: single-trip body device graphs successfully recorded.
+    pub body_captures: u64,
+    /// Slice 1b: decode steps served by replaying a recorded body graph.
+    pub body_replays: u64,
+    /// Slice 1b: single-trip body runs that fell back to host-eager execution
+    /// (capture declined, or a replay retired mid-step and re-armed).
+    pub body_fallbacks: u64,
 }
 
 /// Invocation-invariant binding metadata for one selected subgraph. Loop/Scan
