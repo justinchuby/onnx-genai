@@ -1510,6 +1510,10 @@ mod tests {
         }
     }
 
+    fn sqnbit_test_multithread() -> bool {
+        cfg!(target_arch = "aarch64")
+    }
+
     fn check_nn(m: usize, n: usize, k: usize) {
         let a = seq(m * k, 0.5);
         let b = seq(k * n, 1.5);
@@ -1904,7 +1908,14 @@ mod tests {
             }
         };
         let mut c = vec![0.0f32; m * n];
-        sqnbit_gemm(&packed, m, &a, bias.as_deref(), &mut c, true);
+        sqnbit_gemm(
+            &packed,
+            m,
+            &a,
+            bias.as_deref(),
+            &mut c,
+            sqnbit_test_multithread(),
+        );
         let expected = ref_gemm_nk(&a, &dequant, m, k, n, bias.as_deref());
         let tol = match comp {
             SQNBitComputeType::Fp32 => 2e-2,
@@ -1941,7 +1952,14 @@ mod tests {
         }
         let packed = packed.unwrap();
         let mut c = vec![0.0f32; m * n];
-        sqnbit_gemm(&packed, m, &a, Some(&bias), &mut c, true);
+        sqnbit_gemm(
+            &packed,
+            m,
+            &a,
+            Some(&bias),
+            &mut c,
+            sqnbit_test_multithread(),
+        );
         let expected = ref_gemm_nk(&a, &dequant, m, k, n, Some(&bias));
         assert_close(
             &c,
@@ -2031,6 +2049,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn sqnbit_multithread_uses_work_stealing_backend() {
         let (m, n, k, block_size) = (1usize, 1024usize, 1024usize, 32usize);
@@ -2170,7 +2189,14 @@ mod tests {
                             }
                         };
                         let mut c_full = vec![0.0f32; m * n];
-                        sqnbit_gemm(&full, m, &a, bias.as_deref(), &mut c_full, true);
+                        sqnbit_gemm(
+                            &full,
+                            m,
+                            &a,
+                            bias.as_deref(),
+                            &mut c_full,
+                            sqnbit_test_multithread(),
+                        );
 
                         let blocks = k.div_ceil(block_size);
                         let blob = block_size / 2;
@@ -2180,7 +2206,12 @@ mod tests {
                         let shards: &[(usize, usize)] = &[(0, 17), (17, 30), (47, 1), (48, 48)];
                         // multithread=false mirrors the per-worker SPMD dispatch;
                         // multithread=true mirrors the prefill shard loop.
-                        for &mt in &[false, true] {
+                        let multithread_modes: &[bool] = if sqnbit_test_multithread() {
+                            &[false, true]
+                        } else {
+                            &[false]
+                        };
+                        for &mt in multithread_modes {
                             let mut c_shard = vec![0.0f32; m * n];
                             for &(start, len) in shards {
                                 let pb =

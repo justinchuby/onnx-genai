@@ -442,6 +442,6 @@ mod tests {
             });
         }
 
-        assert_eq!(calls.load(Ordering::Relaxed), 8000);
+        assert_eq!(calls.load(Ordering::Relaxed), 1000 * 8);
     }
 }

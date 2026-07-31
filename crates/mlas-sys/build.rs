@@ -239,6 +239,12 @@ fn main() {
     );
 
     p.compile_cpp(
+        "mlas_sse41_cpp",
+        &["-msse4.1"],
+        &[p.lib.join("qgemm_kernel_sse41.cpp")],
+    );
+
+    p.compile_cpp(
         "mlas_avx_cpp",
         &["-mavx"],
         &[p.lib.join("intrinsics/avx/min_max_elements.cpp")],
@@ -492,7 +498,7 @@ impl Paths {
             let mut arch_level = 0u8;
             for f in flags {
                 match *f {
-                    "-msse2" => {}
+                    "-msse2" | "-msse4.1" => {}
                     "-mavx" => arch_level = arch_level.max(1),
                     "-mavx2" | "-mfma" | "-mf16c" | "-mavxvnni" => arch_level = arch_level.max(2),
                     "-mavx512f" | "-mavx512vnni" | "-mavx512bw" | "-mavx512dq" | "-mavx512vl" => {

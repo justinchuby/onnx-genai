@@ -21,7 +21,7 @@ Abstract:
 // When a backend is registered (via mlas_set_threading from Rust) these route
 // MLAS's own tile partitioning onto a persistent Rust work-stealing pool; otherwise they
 // run serially. `work` points to the std::function<void(ptrdiff_t)> closure.
-extern "C" void MlasStandaloneParallelFor(std::ptrdiff_t Iterations, void* work);
+extern "C" void MlasStandaloneParallelFor(std::ptrdiff_t Iterations, void* work, bool EnableBackend);
 #endif
 
 void
@@ -58,7 +58,10 @@ MlasExecuteThreaded(
     std::function<void(std::ptrdiff_t)> work = [ThreadedRoutine, Context](std::ptrdiff_t tid) {
         ThreadedRoutine(Context, tid);
     };
-    MlasStandaloneParallelFor(Iterations, const_cast<void*>(static_cast<const void*>(&work)));
+    MlasStandaloneParallelFor(
+        Iterations,
+        const_cast<void*>(static_cast<const void*>(&work)),
+        ThreadPool != nullptr);
 #else
     //
     // Schedule the threaded iterations using the thread pool object.
@@ -93,7 +96,10 @@ MlasTrySimpleParallel(
     // parallel-for backend, falling back to a serial loop if none is
     // registered.
     //
-    MlasStandaloneParallelFor(Iterations, const_cast<void*>(static_cast<const void*>(&Work)));
+    MlasStandaloneParallelFor(
+        Iterations,
+        const_cast<void*>(static_cast<const void*>(&Work)),
+        ThreadPool != nullptr);
 #else
     //
     // Schedule the threaded iterations using the thread pool object.
@@ -126,7 +132,10 @@ MlasTryBatchParallel(
     // parallel-for backend, falling back to a serial loop if none is
     // registered.
     //
-    MlasStandaloneParallelFor(Iterations, const_cast<void*>(static_cast<const void*>(&Work)));
+    MlasStandaloneParallelFor(
+        Iterations,
+        const_cast<void*>(static_cast<const void*>(&Work)),
+        ThreadPool != nullptr);
 #else
     //
     // Schedule the threaded iterations using the thread pool object.

@@ -17,12 +17,67 @@
 // Licensed under the MIT License.
 
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/inc/mlas_float16.h"
 #include "core/mlas/inc/mlas_qnbit.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <functional>
 #include <new>
+
+namespace onnxruntime {
+struct MLFloat16 {
+    uint16_t val;
+};
+
+std::atomic<int> saturation_count{0};
+}  // namespace onnxruntime
+
+void MLASCALL MlasConvertHalfToFloatBuffer(
+    const MLAS_FP16* Source,
+    float* Destination,
+    size_t Count)
+{
+    for (size_t i = 0; i < Count; ++i) {
+        Destination[i] = MLAS_Half2Float(Source[i].val);
+    }
+}
+
+void MLASCALL MlasConvertHalfToFloatBufferInParallel(
+    const MLAS_FP16* Source,
+    float* Destination,
+    size_t Count,
+    MLAS_THREADPOOL*)
+{
+    MlasConvertHalfToFloatBuffer(Source, Destination, Count);
+}
+
+void MLASCALL MlasConvertFloatToHalfBuffer(
+    const float* Source,
+    MLAS_FP16* Destination,
+    size_t Count)
+{
+    for (size_t i = 0; i < Count; ++i) {
+        Destination[i].val = MLAS_Float2Half(Source[i]);
+    }
+}
+
+void MLASCALL MlasConvertFloatToHalfBufferInParallel(
+    const float* Source,
+    MLAS_FP16* Destination,
+    size_t Count,
+    MLAS_THREADPOOL*)
+{
+    MlasConvertFloatToHalfBuffer(Source, Destination, Count);
+}
+
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+bool MLASCALL MlasHGemmSupported(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE)
+{
+    return false;
+}
+#endif
 
 // ---- Pluggable parallel-for backend (driven from Rust) ----------------------
 
@@ -83,11 +138,15 @@ void mlas_std_function_trampoline(void* task_ctx, std::ptrdiff_t tid)
 }  // namespace
 
 // Hook called by the vendored standalone `MlasTrySimpleParallel`. Forwards the
-// parallel-for onto the registered backend, or runs serially if none is set.
-extern "C" void MlasStandaloneParallelFor(std::ptrdiff_t iterations, void* work)
+// parallel-for onto the registered backend when the caller passed a non-null
+// MLAS_THREADPOOL sentinel, or runs serially otherwise.
+extern "C" void MlasStandaloneParallelFor(
+    std::ptrdiff_t iterations,
+    void* work,
+    bool enable_backend)
 {
     const auto& fn = *static_cast<const std::function<void(std::ptrdiff_t)>*>(work);
-    if (g_parallel_for != nullptr && iterations > 1) {
+    if (enable_backend && g_parallel_for != nullptr && iterations > 1) {
         g_parallel_for(
             g_rust_ctx,
             iterations,

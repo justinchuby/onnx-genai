@@ -172,16 +172,16 @@ fn qnbit_internal_pool_bench() {
         stats.serial_fallback_calls
     );
 
-    let static_bench = StaticQnbitBench::new(
-        threads_for_static(),
+    let static_bench = StaticQnbitBench::new(StaticQnbitInputs {
+        threads: threads_for_static(),
         n,
         k,
         block_size,
-        &packed_b,
-        &scales,
-        zps.as_deref(),
+        packed_b: &packed_b,
+        scales: &scales,
+        zps: zps.as_deref(),
         comp,
-    );
+    });
     if let Some(static_bench) = static_bench {
         let mut c_static = vec![0.0f32; m * n];
         for _ in 0..5 {
@@ -219,17 +219,29 @@ struct StaticQnbitBench {
     ldc: usize,
 }
 
+struct StaticQnbitInputs<'a> {
+    threads: usize,
+    n: usize,
+    k: usize,
+    block_size: usize,
+    packed_b: &'a [u8],
+    scales: &'a [f32],
+    zps: Option<&'a [u8]>,
+    comp: SQNBitComputeType,
+}
+
 impl StaticQnbitBench {
-    fn new(
-        threads: usize,
-        n: usize,
-        k: usize,
-        block_size: usize,
-        packed_b: &[u8],
-        scales: &[f32],
-        zps: Option<&[u8]>,
-        comp: SQNBitComputeType,
-    ) -> Option<Self> {
+    fn new(inputs: StaticQnbitInputs<'_>) -> Option<Self> {
+        let StaticQnbitInputs {
+            threads,
+            n,
+            k,
+            block_size,
+            packed_b,
+            scales,
+            zps,
+            comp,
+        } = inputs;
         let blocks = k.div_ceil(block_size);
         let blob = block_size / 2;
         let zp_row = blocks.div_ceil(2);
@@ -280,7 +292,7 @@ impl StaticQnbitBench {
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>();
         self.pool.parallel_for(0, self.shards.len(), |begin, end| {
-            for shard_id in begin..end {
+            for (shard_id, timing) in timings.iter().enumerate().take(end).skip(begin) {
                 let shard = &self.shards[shard_id];
                 let start = Instant::now();
                 unsafe {
@@ -295,7 +307,7 @@ impl StaticQnbitBench {
                         false,
                     );
                 }
-                timings[shard_id].store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                timing.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         });
         timings
@@ -324,7 +336,7 @@ fn aligned_ranges(n: usize, parts: usize, align: usize) -> Vec<(usize, usize)> {
 }
 
 fn simulated_contention(iter: usize, begin: usize) {
-    if begin == 0 && iter % 4 == 0 {
+    if begin == 0 && iter.is_multiple_of(4) {
         thread::sleep(Duration::from_micros(100));
     }
 }
