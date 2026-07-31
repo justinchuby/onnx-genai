@@ -450,7 +450,11 @@ fn list_enumerates_model_directories() {
     assert!(output.status.success(), "list failed: {}", stderr(&output));
     let listing = stdout(&output);
     assert!(listing.contains("tiny-llm"), "{listing}");
-    assert!(listing.contains("tiny-txt2img"), "{listing}");
+    // tiny-txt2img is a multi-graph diffusion model (denoiser + text_encoder + vae);
+    // the loader rejects it because it has multiple ONNX files and no decoder.onnx,
+    // so it correctly does not appear in the listing.
+    assert!(!listing.contains("tiny-txt2img"), "{listing}");
+    assert!(listing.contains("tiny-llm-explicit-io"), "{listing}");
 }
 
 #[test]
