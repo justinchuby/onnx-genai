@@ -468,16 +468,62 @@ fn native_paged_prefix_reuse_matches_ort_on_cuda_device() -> anyhow::Result<()> 
         eprintln!("gap3 inc-d: no CUDA device visible; skipping device paged reuse test");
         return Ok(());
     }
-    const FIXTURE: &str = "tiny-gemma4-vlm-cuda";
+    // f32 device-resident KV (Inc-D).
+    run_device_paged_reuse_parity("tiny-gemma4-vlm-cuda", "inc-d f32")
+}
+
+/// GAP-3 Inc-D.1 — the Inc-D device paged-reuse parity, but on a decoder whose KV
+/// cache is **FLOAT16** (`tiny-gemma4-vlm-cuda-f16`), the dtype real exports
+/// (gemma4-e2b, likely qwen3-30b-a3b) use.
+///
+/// Inc-D gated `supports_device_kv_mirror` to f32-only, so an f16 device cache
+/// fell back to the Inc-A non-paged path. Inc-D.1 lifts the dtype half of that
+/// gate: the device read-out widens the f16 present KV to f32 with the same
+/// `half` convert ORT uses, and the reuse-seed narrows f32 back to f16 with the
+/// same `half` convert ORT injects with, so the mirrored pages are byte-identical
+/// to ORT's despite the f16 device buffer. The same three-way token parity +
+/// byte-equality asserts prove it; a revert of the Inc-D.1 gate to f32-only sends
+/// this fixture to non-paged and fires the `reused > 0` assert, and a wrong f16
+/// convert fires the byte-equality assert.
+#[test]
+fn native_paged_prefix_reuse_matches_ort_on_cuda_device_f16() -> anyhow::Result<()> {
+    if !cuda_device_visible() {
+        eprintln!("gap3 inc-d.1: no CUDA device visible; skipping f16 device paged reuse test");
+        return Ok(());
+    }
+    // f16 device-resident KV (Inc-D.1).
+    run_device_paged_reuse_parity("tiny-gemma4-vlm-cuda-f16", "inc-d.1 f16")
+}
+
+/// Shared body for the Inc-D (f32) and Inc-D.1 (f16) device paged-reuse parity:
+/// two prefix-sharing requests through ONE pure-native CUDA engine over `fixture`
+/// with the native decoder pinned to `cuda:0`. Together the asserts prove, on the
+/// device path:
+///   * **reuse engaged** — the warm request reuses `> 0` prefix tokens, proving
+///     the device mirror-write populated the pages and the device seed-read
+///     consumed them (a gate revert to non-paged reports zero reuse);
+///   * **geometry correct (tokens)** — the warm tokens equal a cold pure-native
+///     CUDA run, the ORT oracle, and the fixture's closed-form ids;
+///   * **geometry correct (bytes)** — the CUDA-mirrored paged KV for the shared
+///     prefix is byte-identical to the ORT-mirrored KV (both land f32 in the
+///     shared host paged store), catching any device read/seed value error — for
+///     the f16 fixture, specifically an f16<->f32 convert that diverges from ORT.
+///     The physical-vs-logical *stride* error is invisible at this fixture's
+///     single KV head and is proven separately by the `H == 2` unit test
+///     `device_kv_view_uses_physical_stride`.
+fn run_device_paged_reuse_parity(fixture: &str, label: &str) -> anyhow::Result<()> {
     const DEVICE: &str = "cuda:0";
     let shared_prompt = vec![3u32, 7, 0, 5];
     let warm_prompt = vec![3u32, 7, 0, 5, 6];
 
     // Reuse-independent oracles for the warm prompt: ORT decode of the same
-    // fixture, and a cold pure-native CUDA decode (no prior turn to reuse).
-    let ort_cold = cold_tokens(FIXTURE, Selection::Ort, warm_prompt.clone(), 3, None)?;
+    // fixture, and a cold pure-native CUDA decode (no prior turn to reuse). The
+    // cold-prompt closed-form ids ([3, 7] -> [0, 5, 6, 7]) are asserted by the
+    // base `pure_native_pipeline_selection_matches_ort_and_hybrid` test; here the
+    // warm prompt continues past them, so ORT is the token oracle.
+    let ort_cold = cold_tokens(fixture, Selection::Ort, warm_prompt.clone(), 3, None)?;
     let native_cold = cold_tokens(
-        FIXTURE,
+        fixture,
         Selection::PureNative,
         warm_prompt.clone(),
         3,
@@ -485,7 +531,7 @@ fn native_paged_prefix_reuse_matches_ort_on_cuda_device() -> anyhow::Result<()> 
     )?;
     assert_eq!(
         native_cold, ort_cold,
-        "cold pure-native CUDA paged decode diverged from the ORT oracle"
+        "[{label}] cold pure-native CUDA paged decode diverged from the ORT oracle"
     );
 
     // One pure-native CUDA engine, two turns: the first primes the prefix cache
@@ -500,7 +546,7 @@ fn native_paged_prefix_reuse_matches_ort_on_cuda_device() -> anyhow::Result<()> 
     config.decode_backend = EngineDecodeBackend::Native;
     let native_probe = prefix_probe_request(shared_prompt.clone())?;
     let outcome = (|| -> anyhow::Result<(Vec<u32>, usize, Option<MaterializedKv>)> {
-        let mut engine = Engine::from_pipeline_dir(&fixture_dir(FIXTURE), config)?;
+        let mut engine = Engine::from_pipeline_dir(&fixture_dir(fixture), config)?;
         let _first = run_turn(&mut engine, shared_prompt.clone(), 2)?;
         engine.reset_cache_stats();
         let warm = run_turn(&mut engine, warm_prompt.clone(), 3)?;
@@ -513,18 +559,18 @@ fn native_paged_prefix_reuse_matches_ort_on_cuda_device() -> anyhow::Result<()> 
 
     assert!(
         reused > 0,
-        "paged native CUDA decode must reuse the shared prefix (reused {reused} tokens); \
+        "[{label}] paged native CUDA decode must reuse the shared prefix (reused {reused} tokens); \
          zero reuse means the device present-KV mirror/seed never populated the pages \
-         (or the device paged gate reverted to non-paged)"
+         (or the device paged gate reverted — for f16, back to f32-only)"
     );
     assert_eq!(
         warm, native_cold,
-        "warm native CUDA prefix reuse diverged from a cold CUDA run — the device \
+        "[{label}] warm native CUDA prefix reuse diverged from a cold CUDA run — the device \
          mirrored/seeded present-KV geometry is wrong"
     );
     assert_eq!(
         warm, ort_cold,
-        "warm native CUDA prefix reuse diverged from the ORT oracle"
+        "[{label}] warm native CUDA prefix reuse diverged from the ORT oracle"
     );
 
     // Geometry, byte-exact: the device-mirrored paged KV for the shared prefix
@@ -536,16 +582,16 @@ fn native_paged_prefix_reuse_matches_ort_on_cuda_device() -> anyhow::Result<()> 
         "native CUDA paged decode published no shared-prefix KV to read back — the device \
          present-KV mirror never populated the pages",
     );
-    let ort_prefix_kv = published_prefix_kv(FIXTURE, Selection::Ort, shared_prompt.clone(), None)?
+    let ort_prefix_kv = published_prefix_kv(fixture, Selection::Ort, shared_prompt.clone(), None)?
         .expect("ORT paged decode published no shared-prefix KV reference");
     assert_eq!(
         native_prefix_kv, ort_prefix_kv,
-        "device-mirrored paged KV for the shared prefix diverged byte-for-byte from the \
-         ORT-mirrored KV — the device present-KV mirror/seed geometry is wrong even though \
-         the argmax tokens matched"
+        "[{label}] device-mirrored paged KV for the shared prefix diverged byte-for-byte from the \
+         ORT-mirrored KV — the device present-KV mirror/seed geometry (or, for f16, the \
+         f16<->f32 convert) is wrong even though the argmax tokens matched"
     );
     eprintln!(
-        "gap3 inc-d device paged reuse: reused={reused} warm={warm:?} native_cold={native_cold:?} \
+        "gap3 {label} device paged reuse: reused={reused} warm={warm:?} native_cold={native_cold:?} \
          ort_cold={ort_cold:?} prefix_kv_len={} layers={}",
         native_prefix_kv.sequence_len,
         native_prefix_kv.layers.len()

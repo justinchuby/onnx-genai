@@ -157,23 +157,26 @@ impl NativeDecodeSession {
     }
 
     /// Whether this session keeps its self-attention KV **device-resident** in
-    /// rank-4 f32 CUDA bindings that can be read out for paged present-KV
-    /// mirroring and re-seeded from a materialized paged prefix (GAP-3 Inc-D).
+    /// rank-4 CUDA bindings that can be read out for paged present-KV mirroring
+    /// and re-seeded from a materialized paged prefix — `f32` (GAP-3 Inc-D) or
+    /// `f16` (GAP-3 Inc-D.1).
     ///
     /// This is the device-resident counterpart of
     /// [`supports_host_kv_mirror`](Self::supports_host_kv_mirror): it lifts the
     /// Inc-C gate for a native CUDA decoder whose present-KV lives in device
     /// buffers, landing that KV in the *same* host f32 paged store via the same
     /// `extract_present_token` / `append_token_kv` geometry (a mechanical device
-    /// read-out, [`DecodeCudaState::read_present_kv`]). f16 / non-rank-4 device
-    /// caches stay gated to the non-paged fallback — no silent-wrong paged run.
+    /// read-out, [`DecodeCudaState::read_present_kv`]). f16 caches are widened to
+    /// f32 with the same `half` convert ORT uses (bit-exact round-trip); `bf16`,
+    /// non-rank-4, and in-place / CPU-resident caches stay gated to the non-paged
+    /// fallback — no silent-wrong paged run.
     pub(crate) fn supports_device_kv_mirror(&self) -> bool {
         if self.kv_inputs.is_empty() {
             return false;
         }
         self.cuda
             .as_ref()
-            .is_some_and(DecodeCudaState::kv_bindings_f32_rank4)
+            .is_some_and(DecodeCudaState::kv_bindings_paged_rank4)
     }
 
     /// The most recent step's accumulated present KV for one self-attention past

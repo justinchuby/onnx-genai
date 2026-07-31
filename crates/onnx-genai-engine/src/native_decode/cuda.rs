@@ -1487,18 +1487,25 @@ impl DecodeCudaState {
         Ok(())
     }
 
-    /// Whether every self-attention KV binding is a rank-4 f32 device cache
-    /// (`[1, num_kv_heads, max_len, head_dim]`), the only device-resident layout
-    /// GAP-3 Inc-D lifts onto the paged path. f16 / non-rank-4 caches stay gated
-    /// to the non-paged fallback (they would not round-trip losslessly through
-    /// the f32 paged store, and their geometry is a later increment).
-    pub(crate) fn kv_bindings_f32_rank4(&self) -> bool {
+    /// Whether every self-attention KV binding is a rank-4 CUDA cache
+    /// (`[1, num_kv_heads, max_len, head_dim]`) in a dtype the paged store can
+    /// round-trip losslessly — `f32` (GAP-3 Inc-D) or `f16` (GAP-3 Inc-D.1). The
+    /// host paged store is `f32`; ORT already widens `f16` present-KV to `f32`
+    /// when mirroring and narrows back on inject (`kv_bridge::mirror_present_kv_to_pages`
+    /// / `load_materialized_past`), and the native read/seed use the same `half`
+    /// convert ([`kv_dtype_to_f32`] / [`f32_slice_to_dtype_bytes`]), so the
+    /// f16→f32→f16 round-trip is bit-exact and byte-comparable against ORT.
+    ///
+    /// `bf16`, non-rank-4, and in-place / CPU-resident caches stay gated to the
+    /// non-paged fallback (Inc-D.2 and later) — no silent-wrong paged run.
+    pub(crate) fn kv_bindings_paged_rank4(&self) -> bool {
         let range = self.kv_binding_range.clone();
         if range.is_empty() {
             return false;
         }
         self.bindings[range].iter().all(|binding| {
-            binding.dtype == DataType::Float32 && binding.physical_shape().len() == 4
+            matches!(binding.dtype, DataType::Float32 | DataType::Float16)
+                && binding.physical_shape().len() == 4
         })
     }
 
@@ -1518,6 +1525,10 @@ impl DecodeCudaState {
     /// the committed present KV once the step returns), so no extra
     /// synchronization is required here — this is a pure post-step reader,
     /// mirroring the per-step logits read in [`Self::read_logits`].
+    ///
+    /// The binding may be `f32` (Inc-D) or `f16` (Inc-D.1); the raw device bytes
+    /// are widened to `f32` with the same `half` convert ORT uses
+    /// ([`kv_dtype_to_f32`]) so the mirrored pages are byte-identical to ORT's.
     pub(crate) fn read_present_kv(
         &mut self,
         past_name: &str,
@@ -1530,14 +1541,17 @@ impl DecodeCudaState {
             return Ok(None);
         };
         let binding = &mut self.bindings[index];
+        let dtype = binding.dtype;
         let physical_shape = binding.physical_shape().to_vec();
         let bytes = binding
             .read_bytes()
             .with_context(|| format!("read device present KV for '{past_name}'"))?;
-        let tensor = Tensor::from_raw(DataType::Float32, physical_shape.clone(), &bytes)
+        let tensor = Tensor::from_raw(dtype, physical_shape.clone(), &bytes)
             .with_context(|| format!("interpret device present KV bytes for '{past_name}'"))?;
+        let values = kv_dtype_to_f32(&tensor)
+            .with_context(|| format!("widen device present KV for '{past_name}' to f32"))?;
         Ok(Some(device_present_kv_view(
-            tensor.to_vec_f32(),
+            values,
             &physical_shape,
             binding.logical_shape(),
         )))
@@ -1574,6 +1588,10 @@ impl DecodeCudaState {
                 bail!("device paged prefix names unknown KV past input '{name}'");
             };
             let binding = &mut self.bindings[index];
+            let dtype = binding.dtype;
+            let elem_size = dtype.checked_storage_bytes(1).with_context(|| {
+                format!("device paged prefix KV '{name}' has unsized dtype {dtype:?}")
+            })?;
             let physical = binding.physical_shape().to_vec();
             let heads = physical[1];
             let head_dim = physical[3];
@@ -1596,14 +1614,11 @@ impl DecodeCudaState {
             let capacity_head_stride = max_len * head_dim;
             for head in 0..heads {
                 let compact = &data[head * compact_head_stride..(head + 1) * compact_head_stride];
-                let bytes = compact
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>();
-                binding.write_bytes(
-                    head * capacity_head_stride * std::mem::size_of::<f32>(),
-                    &bytes,
-                )?;
+                // Narrow the f32 paged prefix back to the binding's dtype with the
+                // same `half` convert ORT injects with, so f16 seed bytes are the
+                // exact inverse of the f16→f32 read-out (bit-exact round-trip).
+                let bytes = f32_slice_to_dtype_bytes(dtype, compact)?;
+                binding.write_bytes(head * capacity_head_stride * elem_size, &bytes)?;
             }
         }
         self.set_logical_len(seq_len)?;
