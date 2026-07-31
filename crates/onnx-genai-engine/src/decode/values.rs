@@ -163,7 +163,12 @@ pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
             .map_err(|e| anyhow::anyhow!("Failed to clone BFloat16 ORT value: {e}")),
         DataType::Int64 => Value::from_slice_i64(&value.to_vec_i64()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Int64 ORT value: {e}")),
-        dtype => anyhow::bail!("unsupported cached ORT value dtype: {dtype:?}"),
+        // Generic byte-exact fallback for host-resident dtypes without a typed
+        // accessor above (e.g. `Bool` modality masks, `Int32`). `to_raw_bytes`
+        // copies the row-major allocation and `from_raw_bytes` reconstructs it
+        // for the same shape/dtype, so the clone is bit-identical.
+        dtype => Value::from_raw_bytes(value.to_raw_bytes()?, value.shape(), dtype)
+            .map_err(|e| anyhow::anyhow!("Failed to clone {dtype:?} ORT value: {e}")),
     }
 }
 
@@ -339,4 +344,23 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
     lower.contains("gather")
         && (lower.contains("indices element out of data bounds")
             || lower.contains("idx=") && lower.contains("out of"))
+}
+
+#[cfg(test)]
+mod clone_value_tests {
+    use super::clone_value;
+    use onnx_genai_ort::{DataType, Value};
+
+    #[test]
+    fn clone_value_round_trips_bool_via_generic_fallback() {
+        // `Bool` modality masks (e.g. gemma-3n audio `input_features_mask`) have
+        // no typed clone accessor; the generic raw-bytes fallback must clone them
+        // bit-exactly rather than erroring `unsupported cached ORT value dtype`.
+        let bytes = vec![1u8, 0, 1, 1];
+        let value = Value::from_raw_bytes(bytes.clone(), &[1, 4], DataType::Bool).unwrap();
+        let cloned = clone_value(&value).expect("Bool clone must succeed via generic fallback");
+        assert_eq!(cloned.dtype(), DataType::Bool);
+        assert_eq!(cloned.shape(), value.shape());
+        assert_eq!(cloned.to_raw_bytes().unwrap(), bytes);
+    }
 }
