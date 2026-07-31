@@ -166,16 +166,18 @@ pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
     specs.sort_by(|a, b| a.id.cmp(&b.id));
     if specs.is_empty() {
         rejected.sort();
-        let detail = if rejected.is_empty() {
-            "  (no subdirectories were present)".to_string()
+        if rejected.is_empty() {
+            anyhow::bail!(
+                "no model directories found in '{}': no subdirectories were present",
+                dir.display(),
+            );
         } else {
-            rejected.join("\n")
-        };
-        anyhow::bail!(
-            "no model directories found in '{}'. Each candidate was rejected by the model loader:\n{}",
-            dir.display(),
-            detail
-        );
+            anyhow::bail!(
+                "no model directories found in '{}'. Each candidate was rejected by the model loader:\n{}",
+                dir.display(),
+                rejected.join("\n")
+            );
+        }
     }
     Ok(specs)
 }
