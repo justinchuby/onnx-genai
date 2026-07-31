@@ -313,9 +313,47 @@ pub(crate) fn encode_prometheus() -> String {
     output
 }
 
+/// Name of the gauge that says whether the governor family below is real.
+///
+/// Exported so the handler can emit the `0` case without duplicating the
+/// string; a typo here would split one series into two and neither would
+/// alarm.
+#[cfg(feature = "metrics")]
+pub(crate) const RESOURCE_GOVERNOR_AVAILABLE: &str = "onnxgenai_resource_governor_available";
+
+#[cfg(feature = "metrics")]
+const RESOURCE_GOVERNOR_AVAILABLE_HELP: &str = "1 when the resource governor was readable for this scrape and the \
+     onnxgenai_vram_*/host_ram_*/kv_* gauges below are present; 0 when it was \
+     not and those gauges are absent for that reason.";
+
+/// Emits the availability marker alone, for scrapes where the governor could
+/// not be read.
+///
+/// A Prometheus series that simply STOPS is indistinguishable from a scrape
+/// gap, a restart, or a relabel: the graph just ends. Omitting the governor
+/// family on error therefore hides the failure in the one shape an operator
+/// reads as "nothing to see". This publishes the absence instead.
+#[cfg(feature = "metrics")]
+pub(crate) fn encode_resource_governor_unavailable() -> String {
+    let mut output = String::new();
+    gauge(
+        &mut output,
+        RESOURCE_GOVERNOR_AVAILABLE,
+        RESOURCE_GOVERNOR_AVAILABLE_HELP,
+        0,
+    );
+    output
+}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn encode_resource_governor(snapshot: &GovernorSnapshot) -> String {
     let mut output = String::new();
+    gauge(
+        &mut output,
+        RESOURCE_GOVERNOR_AVAILABLE,
+        RESOURCE_GOVERNOR_AVAILABLE_HELP,
+        1,
+    );
     gauge(
         &mut output,
         "onnxgenai_vram_used_bytes",
