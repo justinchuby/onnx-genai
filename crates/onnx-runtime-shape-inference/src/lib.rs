@@ -62,15 +62,14 @@
 //!
 //! The **Sequence** family (`SequenceEmpty`/`Construct`/`Insert`/`Erase`/`At`/
 //! `Length`/`ConcatFromSequence`/`SplitToSequence`), **Optional**
-//! (`Optional`/`OptionalHasElement`/`OptionalGetElement`), and **Map** ops are
-//! deliberately **deferred**: an SSA [`Value`](onnx_runtime_ir::Value) and this
-//! crate's [`TypeInfo`] carry only a tensor `dtype` + `shape`, with no way to
-//! represent a *container element type*. Correctly propagating, say, the
-//! element shape produced by `SequenceAt` would require an IR/type-model
-//! extension (a sum type over tensor/sequence/optional/map element types).
-//! Rather than fabricate a bogus tensor shape for a sequence-typed edge, these
-//! ops are left unregistered — their outputs stay *unresolved* (the permissive
-//! outcome) instead of *wrong*. See issue #355.
+//! (`Optional`/`OptionalHasElement`/`OptionalGetElement`), and **Map** ops need
+//! a *container element type* that a plain tensor [`TypeInfo`] cannot express.
+//! [`ValueType`] adds that additively: it wraps (never replaces) [`TypeInfo`],
+//! so a value with no recorded `ValueType` is a plain tensor and the tensor-only
+//! path is byte-identical. The first proven slice — `SequenceEmpty`,
+//! `SequenceConstruct`, `SequenceLength`, `SequenceAt` — is registered; the
+//! remaining Sequence mutations, `Optional`, `Map`, and IR-level persistence of
+//! container edges are staged follow-ups. See issues #355 and #449.
 
 #![forbid(unsafe_code)]
 
@@ -84,7 +83,8 @@ mod report;
 pub mod shape_data;
 
 pub use context::{
-    InferenceContext, MergePolicy, NodeIo, SymbolInterner, TypeInfo, TypedShape, merge_shapes,
+    InferenceContext, MergePolicy, NodeIo, SymbolInterner, TensorType, TypeInfo, TypedShape,
+    ValueType, merge_shapes,
 };
 pub use dim_expr::DimExpr;
 pub use error::ShapeInferError;

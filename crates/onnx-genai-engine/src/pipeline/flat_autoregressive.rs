@@ -56,10 +56,16 @@ impl PipelineEngine {
         // keep before anything is rebuilt, because the answer decides whether
         // the decode state is recreated or carried over.
         let inputs_digest = Self::digest_request_identity(&pipeline_request);
+        // The native device-KV decoder (inc2b) keeps its KV session-resident and
+        // does not expose host present tensors, so it runs the non-paged,
+        // fresh-decode path: no paged mirroring and no cross-request KV carry-over
+        // (that reuse is Inc3). This changes cross-request KV reuse only, never
+        // the tokens produced within a generation.
+        let use_native_decoder = native_decoder_selected(&ar.decoder);
         // The paged cache supersedes the single retained context wherever it is
         // available: it holds many prefixes rather than only the last one.
-        let paged_enabled = self.paged.is_some() && inputs_digest.is_some();
-        let reused = if paged_enabled {
+        let paged_enabled = self.paged.is_some() && inputs_digest.is_some() && !use_native_decoder;
+        let reused = if paged_enabled || use_native_decoder {
             0
         } else {
             self.reusable_prefix_len(inputs_digest, &prompt_tokens)
@@ -189,12 +195,18 @@ impl PipelineEngine {
             }),
             _ => None,
         };
+        let decoder_component: Box<dyn PipelineDecoderComponent + '_> = if use_native_decoder {
+            build_native_pipeline_decoder(&self.models, &ar.decoder)?
+        } else {
+            Box::new(OrtPipelineDecoder::new(
+                decoder,
+                self.decoder_state
+                    .as_mut()
+                    .expect("autoregressive pipeline has decode state"),
+            ))
+        };
         let mut backend = PipelineDecodeLoopBackend {
-            decoder,
-            decoder_state: self
-                .decoder_state
-                .as_mut()
-                .expect("autoregressive pipeline has decode state"),
+            decoder: decoder_component,
             paged: paged_mirror,
             pool: &mut tensors,
             step_components,
@@ -228,7 +240,7 @@ impl PipelineEngine {
         // and the next turn must prefill it.
         let mut final_context = backend.context_tokens.clone();
         final_context.truncate(backend.kv_len);
-        let retains_kv = backend.decoder_state.use_kv;
+        let retains_kv = backend.decoder.use_kv();
         // How far mirroring actually got. Equal to the context length unless
         // the page pool ran dry, in which case only this prefix may be
         // published for reuse.

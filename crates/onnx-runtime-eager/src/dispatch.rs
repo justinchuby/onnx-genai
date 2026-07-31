@@ -242,6 +242,7 @@ impl EagerContext {
                     shape_data: (t.device() == onnx_runtime_ir::DeviceId::cpu())
                         .then(|| ShapeData::from_tensor(t.dtype(), t.shape(), t.as_bytes()))
                         .flatten(),
+                    value_type: None,
                 }
             })
             .collect();

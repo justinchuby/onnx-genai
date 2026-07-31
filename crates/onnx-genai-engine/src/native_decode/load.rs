@@ -139,7 +139,29 @@ impl NativeDecodeSession {
     pub fn load_with_cuda_options(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
+        options: NativeDecodeCudaOptions,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options_and_io(path, device, options, None)
+    }
+
+    /// Load a decoder-with-past model, threading the pipeline-declared
+    /// [`ModelIoSpec`] so `sequence_source` (e.g. `inputs_embeds`), the KV pairs,
+    /// and routed step inputs are bound from metadata rather than guessed from
+    /// tensor shapes. The pipeline's native device-KV decoder (inc2b) uses this so
+    /// an `inputs_embeds` decoder with no token input loads correctly.
+    pub(crate) fn load_with_io(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        io: Option<&ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+    }
+
+    fn load_with_cuda_options_and_io(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
         mut options: NativeDecodeCudaOptions,
+        io: Option<&ModelIoSpec>,
     ) -> anyhow::Result<Self> {
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
@@ -166,7 +188,7 @@ impl NativeDecodeSession {
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
-        Self::from_session_with_cuda_options(session, options)
+        Self::from_session_with_cuda_options_and_io(session, options, io)
     }
 
     /// Wrap an already-built native session, validating its decoder-with-past I/O.

@@ -24,6 +24,10 @@ required-features = ["cuda", "native-backend"]
 name = "native_step_component_parity"
 required-features = ["native-backend"]
 
+[[test]]
+name = "native_pipeline_decoder_parity"
+required-features = ["native-backend"]
+
 [features]
 default = []
 native-backend = [

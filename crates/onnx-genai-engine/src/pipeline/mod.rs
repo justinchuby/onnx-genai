@@ -1,8 +1,7 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, apply_paged_sliding_window, clone_value, extract_next_token_logits_with_io,
-    run_decode_step_with_extra,
+    DecodeState, apply_paged_sliding_window, clone_value, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -11,7 +10,7 @@ use crate::engine::{
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
-    mirror_present_kv_to_pages, sequence_pages_for_len,
+    sequence_pages_for_len,
 };
 use crate::logits::TokenId;
 use crate::pipeline_cache::{
@@ -36,12 +35,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
+mod decoder_component;
 mod flat_autoregressive;
 mod iterative;
 mod nested_autoregressive;
 mod paged_decode;
 mod routing;
 mod schedulers;
+#[cfg(feature = "native-backend")]
+pub(crate) use decoder_component::NativePipelineDecoder;
+pub(crate) use decoder_component::{OrtPipelineDecoder, PipelineDecoderComponent};
 pub use schedulers::{Scheduler, SchedulerFactory, SchedulerRegistry};
 
 /// Named tensors supplied to or produced by pipeline components.
@@ -385,6 +388,29 @@ fn native_step_component_set() -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Whether the flat autoregressive pipeline should drive `decoder` through the
+/// native nxrt backend instead of ONNX Runtime, from
+/// `ONNX_GENAI_PIPELINE_NATIVE_DECODER`. The value may name the decoder component
+/// exactly, or be a truthy token (`1`/`true`/`yes`/`on`/`all`) selecting whatever
+/// decoder the pipeline declares. Unset/empty keeps the ORT decoder (default, so
+/// the ORT decode path is unchanged). This mirrors the Inc1 every_step selection
+/// flag `ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS`: it is the injection seam for
+/// the native device-KV decoder (inc2b), driving the decoder natively inside an
+/// otherwise-ORT pipeline decode loop while keeping its KV session-resident.
+fn native_decoder_selected(decoder: &str) -> bool {
+    let Ok(value) = std::env::var("ONNX_GENAI_PIPELINE_NATIVE_DECODER") else {
+        return false;
+    };
+    value.split(',').map(str::trim).any(|entry| {
+        !entry.is_empty()
+            && (entry == decoder
+                || matches!(
+                    entry.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "all"
+                ))
+    })
+}
+
 /// Build the backend-neutral [`ComponentSession`](onnx_genai_metadata::ComponentSession)
 /// for one every_step component.
 ///
@@ -433,6 +459,54 @@ fn build_step_component_session<'a>(
     Ok(Box::new(onnx_genai_ort::OrtComponentSessionRef::new(
         session,
     )))
+}
+
+/// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
+/// its ONNX model as a [`NativeDecodeSession`](crate::native_decode::NativeDecodeSession)
+/// on the native backend so its KV cache stays session-resident across steps.
+///
+/// Returns an owned (`'static`) boxed decoder — unlike the ORT decoder it borrows
+/// nothing from the pipeline decode state. Requesting the native decoder in a
+/// build without the `native-backend` feature is a clear error, mirroring
+/// [`build_step_component_session`].
+fn build_native_pipeline_decoder(
+    models: &PipelineModels,
+    decoder: &str,
+) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
+    #[cfg(feature = "native-backend")]
+    {
+        let path =
+            models.directory.model_paths.get(decoder).with_context(|| {
+                format!("native pipeline decoder '{decoder}' has no model path")
+            })?;
+        // Thread the pipeline-declared io spec so an inputs_embeds decoder binds
+        // its sequence source / KV pairs from metadata rather than guessing.
+        let io = models
+            .directory
+            .spec
+            .models
+            .get(decoder)
+            .and_then(|component| component.io.as_ref());
+        // The deterministic parity fixture runs on CPU; CUDA target decode with
+        // routed host step inputs is refused today (see native_decode), so CPU is
+        // the correct native target for this text-decoder slice. Device placement
+        // onto GPU is later (inc3) work.
+        let native = crate::pipeline::NativePipelineDecoder::load(
+            path,
+            crate::native_decode::NativeDecodeDevice::Cpu,
+            io,
+        )?;
+        Ok(Box::new(native))
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        let _ = models;
+        anyhow::bail!(
+            "decoder '{decoder}' was requested on the native backend via \
+             ONNX_GENAI_PIPELINE_NATIVE_DECODER, but this build was compiled without the \
+             'native-backend' feature. Rebuild with `--features native-backend`."
+        )
+    }
 }
 
 ///
