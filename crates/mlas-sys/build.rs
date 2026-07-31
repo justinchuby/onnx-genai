@@ -228,9 +228,7 @@ fn main() {
                 ],
             );
         }
-        if target_env != "msvc" {
-            println!("cargo:rustc-link-lib=stdc++");
-        }
+        emit_cpp_stdlib_link(&target_env, is_apple_target);
         return;
     }
 
@@ -412,7 +410,16 @@ fn main() {
         &["QgemmU8S8KernelAmxCommon.S", "QgemmU8S8KernelAmx.S"],
     );
 
-    if target_env != "msvc" {
+    emit_cpp_stdlib_link(&target_env, is_apple_target);
+}
+
+fn emit_cpp_stdlib_link(target_env: &str, is_apple_target: bool) {
+    if target_env == "msvc" {
+        return;
+    }
+    if is_apple_target {
+        println!("cargo:rustc-link-lib=dylib=c++");
+    } else {
         println!("cargo:rustc-link-lib=stdc++");
     }
 }
@@ -471,7 +478,7 @@ impl Paths {
         // Headers ORT normally supplies transitively across its include graph.
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             for h in ["cstring", "cstdlib", "cstdint"] {
-                b.flag(&format!("/FI{h}"));
+                b.flag(format!("/FI{h}"));
             }
         } else {
             for h in ["cstring", "cstdlib", "cstdint", "unistd.h"] {

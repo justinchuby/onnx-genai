@@ -9,7 +9,7 @@ keywords = ["onnx", "cpu", "execution-provider", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
 [features]
-default = ["full", "mlas"]
+default = ["full"]
 # Default-on compatibility umbrella. Minimal builds disable defaults and select
 # only the capability groups emitted by the operator-selection manifest.
 full = [
@@ -29,8 +29,8 @@ ops-transformer = []
 ops-cnn = []
 ops-quantized = []
 ops-sequence = []
-# Vendored MLAS f32/quantized kernels. Disable default features for a pure-Rust
-# fallback build on hosts without a working C++/asm toolchain.
+# Opt-in vendored MLAS f32/quantized kernels. Kept off by default so the
+# default elementwise dispatch/tests keep exercising the pure-Rust SIMD path.
 mlas = ["dep:mlas-sys"]
 # Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
 # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no

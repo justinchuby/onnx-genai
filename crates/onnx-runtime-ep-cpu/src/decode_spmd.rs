@@ -1855,13 +1855,15 @@ mod tests {
             decode_schedule_from_raw(Some("fixed")),
             DecodeSchedule::Fixed
         );
-        assert_eq!(
-            decode_schedule_from_raw(Some("steal")),
+        let expected_steal = if cfg!(feature = "mlas") {
             DecodeSchedule::Steal
-        );
+        } else {
+            DecodeSchedule::Fixed
+        };
+        assert_eq!(decode_schedule_from_raw(Some("steal")), expected_steal);
         assert_eq!(
             decode_schedule_from_raw(Some(" work-stealing ")),
-            DecodeSchedule::Steal
+            expected_steal
         );
         assert_eq!(
             decode_schedule_from_raw(Some("bogus")),
