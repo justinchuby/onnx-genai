@@ -89,7 +89,19 @@ pub fn pipeline_inference_metadata_from_dir(
     if config.shape() != ModelShape::Multimodal {
         return Ok(None);
     }
-    Ok(Some(config.to_strict_pipeline_metadata(model_dir, graphs)?))
+    match config.to_strict_pipeline_metadata(model_dir, graphs) {
+        Ok(metadata) => Ok(Some(metadata)),
+        // A split embedding+decoder package whose image preprocessing is not
+        // representable cannot drive the vision path, but text decode never
+        // touches vision: fall back to the text-only decode pipeline so the
+        // package still loads for text generation. This is modality-driven, not
+        // model-specific — any image-unusable multimodal package synthesizes
+        // text decode the same way.
+        Err(GenAiConfigError::UnrepresentablePreprocessing { .. }) => {
+            Ok(Some(config.to_strict_text_only_pipeline_metadata(graphs)?))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Strict compatibility conversion for an existing encoder-decoder ORT-GenAI

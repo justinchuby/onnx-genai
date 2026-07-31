@@ -970,6 +970,260 @@ impl GenAiConfig {
         Ok(metadata)
     }
 
+    /// Strict **text-only** decode-pipeline synthesis for a multimodal
+    /// (embedding + decoder) compatibility package whose image path is unusable.
+    ///
+    /// A split VLM package pairs an `embedding` graph (token ids [+ optional
+    /// image features] → `inputs_embeds`) with an `inputs_embeds`-driven
+    /// `decoder`. When the package's declared image preprocessing is not
+    /// representable by the runtime (see
+    /// [`GenAiConfigError::UnrepresentablePreprocessing`]), the vision path
+    /// cannot be honored — but text decode never touches vision. This synthesis
+    /// produces the same embedding→decoder autoregressive pipeline with the
+    /// vision component, image preprocessing, image dataflow, and grid-derived
+    /// positions removed. It is driven purely by the package's declared modality
+    /// shape (a split embedding+decoder package that can accept token ids
+    /// without image features), never by a model name: any such package that is
+    /// image-unusable synthesizes text decode the same way.
+    ///
+    /// Positions are declared with `linear_increment` continuation instead of
+    /// the VLM `from_grid` program: for a pure-text sequence every multi-axis
+    /// (mrope) coordinate stream advances identically with the sequence
+    /// position, which `linear_increment` produces for any rank (`[t, t, …]`),
+    /// so no processor grid summary is required. All decoder KV / loop-carried
+    /// state facts are validated against the authoritative ONNX decoder graph
+    /// exactly as the multimodal path does.
+    pub(crate) fn to_strict_text_only_pipeline_metadata(
+        &self,
+        graphs: &PipelineGraphInfo,
+    ) -> Result<InferenceMetadata, GenAiConfigError> {
+        let embedding = required_ref(self.model.embedding.as_ref(), "model.embedding")?;
+        let embedding_filename =
+            required_str(embedding.filename.as_deref(), "model.embedding.filename")?;
+        let decoder_filename = required_str(
+            self.model.decoder.filename.as_deref(),
+            "model.decoder.filename",
+        )?;
+
+        let embedding_tokens = required_str(
+            embedding.inputs.input_ids.as_deref(),
+            "model.embedding.inputs.input_ids",
+        )?;
+        let embedding_output = required_str(
+            embedding.outputs.inputs_embeds.as_deref(),
+            "model.embedding.outputs.inputs_embeds",
+        )?;
+        let decoder_embeds = required_str(
+            self.model.decoder.inputs.inputs_embeds.as_deref(),
+            "model.decoder.inputs.inputs_embeds",
+        )?;
+        let decoder_mask = required_str(
+            self.model.decoder.inputs.attention_mask.as_deref(),
+            "model.decoder.inputs.attention_mask",
+        )?;
+        let decoder_position = required_str(
+            self.model.decoder.inputs.position_ids.as_deref(),
+            "model.decoder.inputs.position_ids",
+        )?;
+        let decoder_logits = required_str(
+            self.model.decoder.outputs.logits.as_deref(),
+            "model.decoder.outputs.logits",
+        )?;
+        let past_present_share_buffer = required_copy(
+            self.search.past_present_share_buffer,
+            "search.past_present_share_buffer",
+        )?;
+
+        require_graph_input(&graphs.embedding, embedding_tokens, "embedding")?;
+        let embedding_output_info =
+            require_graph_output(&graphs.embedding, embedding_output, "embedding")?;
+        let decoder_embeds_info = require_graph_input(&graphs.decoder, decoder_embeds, "decoder")?;
+        require_graph_input(&graphs.decoder, decoder_mask, "decoder")?;
+        let position_info = require_graph_input(&graphs.decoder, decoder_position, "decoder")?;
+        require_graph_output(&graphs.decoder, decoder_logits, "decoder")?;
+
+        require_same_dtype(
+            embedding_output_info,
+            decoder_embeds_info,
+            "embedding-to-decoder dataflow",
+        )?;
+
+        let position_rank = position_info.dimensions.len();
+        if position_rank == 0 {
+            return Err(incomplete(format!(
+                "decoder position input '{decoder_position}' declares a positive rank"
+            )));
+        }
+
+        let DecoderStateMetadata {
+            kv_inputs,
+            kv_outputs,
+            state_pairs,
+            kv_dtype,
+        } = self.strict_decoder_state(&graphs.decoder)?;
+        let has_state_pairs = !state_pairs.is_empty();
+        let multi_axis = position_rank > 1;
+
+        let mut decoder_io = Map::new();
+        // The decoder is driven by `inputs_embeds` produced by the embedding
+        // component (text.onnx declares no token-id input); declare the sequence
+        // source explicitly so decode resolves the embeds input rather than
+        // defaulting to a (non-existent) token input.
+        decoder_io.insert("sequence_source".into(), json!("inputs_embeds"));
+        if let Some(token) = self.model.decoder.inputs.input_ids.as_deref() {
+            require_graph_input(&graphs.decoder, token, "decoder")?;
+            decoder_io.insert("token_input".into(), json!(token));
+        }
+        decoder_io.insert("inputs_embeds_input".into(), json!(decoder_embeds));
+        decoder_io.insert("attention_mask_input".into(), json!(decoder_mask));
+        decoder_io.insert("position_ids_input".into(), json!(decoder_position));
+        decoder_io.insert("logits_output".into(), json!(decoder_logits));
+        decoder_io.insert("kv_inputs".into(), json!(kv_inputs));
+        decoder_io.insert("kv_outputs".into(), json!(kv_outputs));
+        decoder_io.insert(
+            "kv_update".into(),
+            json!(if past_present_share_buffer {
+                "shared_buffer"
+            } else {
+                "append"
+            }),
+        );
+        if has_state_pairs {
+            decoder_io.insert("state_pairs".into(), Value::Array(state_pairs));
+        }
+
+        // Text decode drives the embedding with token ids only. A split VLM
+        // embedding graph also declares an `image_features` input that the
+        // vision path would supply; with no vision component it has no dataflow
+        // edge, so it is declared as an optional input whose absent value is an
+        // empty (zero image-token) tensor. The image-token axis collapses to 0
+        // and any fixed feature width is preserved, so a pure-text prompt (no
+        // image placeholder tokens) never gathers from it.
+        let mut embedding_io = Map::new();
+        embedding_io.insert("token_input".into(), json!(embedding_tokens));
+        if let Some(image_features) = embedding.inputs.image_features.as_deref() {
+            let image_info = require_graph_input(&graphs.embedding, image_features, "embedding")?;
+            let absent_shape = image_info
+                .dimensions
+                .iter()
+                .map(|dimension| json!(dimension.unwrap_or(0)))
+                .collect::<Vec<_>>();
+            let mut optional_inputs = Map::new();
+            optional_inputs.insert(
+                image_features.to_owned(),
+                json!({
+                    "presence": "image_features",
+                    "absent": { "kind": "zeros", "shape": absent_shape }
+                }),
+            );
+            embedding_io.insert("optional_inputs".into(), Value::Object(optional_inputs));
+        }
+
+        let mut models = Map::new();
+        models.insert(
+            "embedding".into(),
+            component_json(
+                embedding_filename.to_owned(),
+                "embedding",
+                Some(Value::Object(embedding_io)),
+            ),
+        );
+        models.insert(
+            "decoder".into(),
+            component_json(
+                decoder_filename.to_owned(),
+                "decoder",
+                Some(Value::Object(decoder_io)),
+            ),
+        );
+
+        let dataflow = vec![edge_with_dtype(
+            &format!("embedding.{embedding_output}"),
+            &format!("decoder.{decoder_embeds}"),
+            &embedding_output_info.dtype,
+        )];
+        let mut phases = Map::new();
+        phases.insert("embedding".into(), run_on("every_step"));
+        phases.insert("decoder".into(), run_on("every_step"));
+
+        let strategy = json!({
+            "kind": "composite",
+            "stages": [
+                {
+                    "name": "embed_tokens",
+                    "run_on": "every_step",
+                    "strategy": { "kind": "single_pass", "model": "embedding" }
+                },
+                {
+                    "name": "decode",
+                    "run_on": "every_step",
+                    "strategy": { "kind": "autoregressive", "decoder": "decoder" }
+                }
+            ]
+        });
+
+        // Pure-text positions: every coordinate stream advances with the
+        // sequence position, which `linear_increment` yields for any rank. No
+        // processor grid summary is read, and no section widths are needed
+        // because there is no grid-derived coordinate program.
+        let mut positions = Map::new();
+        positions.insert("input".into(), json!(decoder_position));
+        positions.insert("rank".into(), json!(position_rank));
+        if multi_axis {
+            positions.insert(
+                "axes".into(),
+                json!(
+                    (0..position_rank)
+                        .map(|axis| format!("axis_{axis}"))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        positions.insert("dtype".into(), json!(position_info.dtype));
+        positions.insert("continuation".into(), json!("linear_increment"));
+
+        let mut pipeline = Map::new();
+        pipeline.insert("models".into(), Value::Object(models));
+        pipeline.insert("dataflow".into(), Value::Array(dataflow));
+        pipeline.insert("strategy".into(), strategy);
+        pipeline.insert("phases".into(), Value::Object(phases));
+        pipeline.insert("positions".into(), Value::Object(positions));
+
+        let mut required_capabilities = vec![capabilities::POSITION_PROGRAM];
+        if multi_axis {
+            required_capabilities.push(capabilities::MULTI_AXIS_POSITIONS);
+        }
+        if has_state_pairs {
+            required_capabilities.push(capabilities::LOOP_CARRIED_STATE);
+        }
+
+        let mut model = Map::new();
+        model.insert("attention".into(), self.attention_json());
+        insert_usize(
+            &mut model,
+            "max_sequence_length",
+            self.max_sequence_length(),
+        );
+        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
+
+        let mut root = Map::new();
+        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+        root.insert("required_capabilities".into(), json!(required_capabilities));
+        root.insert("model".into(), Value::Object(model));
+        root.insert("pipeline".into(), Value::Object(pipeline));
+        if let Some(generation) = self.generation_json() {
+            root.insert("generation".into(), generation);
+        }
+        if let Some(tokens) = self.tokens_json() {
+            root.insert("tokens".into(), tokens);
+        }
+        if past_present_share_buffer && is_share_buffer_kv_dtype(&kv_dtype) {
+            root.insert("kv_cache".into(), json!({ "native_dtype": kv_dtype }));
+        }
+
+        Ok(serde_json::from_value(Value::Object(root))?)
+    }
+
     /// Strict encoder-decoder pipeline synth (audio/text sequence-to-sequence).
     ///
     /// Recognized purely from the encoder-decoder SHAPE of `genai_config.json`
@@ -1362,6 +1616,16 @@ impl GenAiConfig {
 pub(crate) fn incomplete(missing: impl Into<String>) -> GenAiConfigError {
     GenAiConfigError::IncompletePipeline {
         missing: missing.into(),
+    }
+}
+
+/// Honest decline for a multimodal package whose declared image preprocessing
+/// has no lossless runtime encoding (e.g. Qwen-style `smart_resize`). The image
+/// path is refused rather than approximated, but the caller may fall back to
+/// text-only decode via [`GenAiConfig::to_strict_text_only_pipeline_metadata`].
+pub(crate) fn unrepresentable_preprocessing(detail: impl Into<String>) -> GenAiConfigError {
+    GenAiConfigError::UnrepresentablePreprocessing {
+        detail: detail.into(),
     }
 }
 

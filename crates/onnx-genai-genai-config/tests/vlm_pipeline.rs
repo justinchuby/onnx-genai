@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use onnx_genai_genai_config::{
     GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo, pipeline_inference_metadata_from_dir,
 };
-use onnx_genai_metadata::{PhaseRunOn, PipelineStrategyKind};
+use onnx_genai_metadata::{PhaseRunOn, PipelineStrategyKind, SequenceInputKind};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -161,4 +161,66 @@ fn mixed_sparse_kv_dtypes_fail_loudly() {
     assert!(error.contains("one dtype"));
     assert!(error.contains("past_key_values.31.key"));
     assert!(error.contains("float16"));
+}
+
+#[test]
+fn unrepresentable_preprocessing_falls_back_to_text_only_pipeline() {
+    // vlm-smart-resize declares `smart_resize=1`, which has no lossless runtime
+    // encoding. Rather than refusing the whole package, the loader synthesizes a
+    // text-only decode pipeline (embedding + decoder, no vision) so the model
+    // still decodes text.
+    let metadata =
+        pipeline_inference_metadata_from_dir(&fixture("vlm-smart-resize"), &graph_inventory())
+            .expect("smart-resize package falls back to text-only synthesis")
+            .expect("compatibility metadata exists");
+
+    // No image path: no preprocessing program, and no vision component.
+    assert!(
+        metadata.preprocessing.is_none(),
+        "text-only pipeline must not synthesize image preprocessing"
+    );
+    let pipeline = metadata.pipeline.expect("pipeline");
+    assert!(
+        !pipeline.models.contains_key("vision_encoder"),
+        "text-only pipeline must drop the vision component"
+    );
+    assert!(pipeline.models.contains_key("embedding"));
+    assert!(pipeline.models.contains_key("decoder"));
+
+    // Only the embedding -> decoder embeds edge remains (no vision -> embedding).
+    assert_eq!(pipeline.dataflow.len(), 1);
+    assert_eq!(pipeline.strategy.kind, PipelineStrategyKind::Composite);
+    assert_eq!(pipeline.strategy.stages.len(), 2);
+    assert_eq!(pipeline.strategy.stages[0].name, "embed_tokens");
+    assert_eq!(pipeline.strategy.stages[1].name, "decode");
+
+    // Pure-text positions advance every mrope axis with the sequence position.
+    let positions = pipeline.positions.as_ref().expect("position program");
+    assert_eq!(positions.rank, 3);
+    assert_eq!(positions.continuation.as_deref(), Some("linear_increment"));
+    assert!(
+        positions.processor_summaries.is_none(),
+        "text-only positions read no processor grid summary"
+    );
+
+    // The decoder consumes inputs_embeds and carries the hybrid loop state.
+    let decoder_io = pipeline.models["decoder"].io.as_ref().expect("decoder io");
+    assert_eq!(
+        decoder_io.sequence_source,
+        Some(SequenceInputKind::InputsEmbeds)
+    );
+    assert_eq!(decoder_io.kv_inputs.as_ref().map(Vec::len), Some(16));
+    assert_eq!(decoder_io.state_pairs.as_ref().map(Vec::len), Some(48));
+
+    // The embedding's vision-fed image_features input becomes optional with an
+    // empty (zero image-token) absent value so text prompts never gather it.
+    let embedding_io = pipeline.models["embedding"]
+        .io
+        .as_ref()
+        .expect("embedding io");
+    let optional = embedding_io
+        .optional_inputs
+        .get("image_features")
+        .expect("image_features declared optional");
+    assert_eq!(optional.presence, "image_features");
 }

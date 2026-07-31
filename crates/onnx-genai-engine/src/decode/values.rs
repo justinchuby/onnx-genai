@@ -6,20 +6,19 @@
 use super::*;
 
 pub(super) fn zero_state_value(info: &TensorInfo) -> anyhow::Result<Value> {
+    let shape = concrete_fixed_state_shape(info)?;
     let element_count = fixed_state_element_count(info)?;
     match info.dtype {
         DataType::Float32 => {
-            Value::from_vec_f32(fallible_zeroed(element_count, 0.0, info)?, &info.shape)
+            Value::from_vec_f32(fallible_zeroed(element_count, 0.0, info)?, &shape)
         }
         DataType::Float16 => {
-            Value::from_vec_f16_bits(fallible_zeroed(element_count, 0, info)?, &info.shape)
+            Value::from_vec_f16_bits(fallible_zeroed(element_count, 0, info)?, &shape)
         }
         DataType::BFloat16 => {
-            Value::from_vec_bf16_bits(fallible_zeroed(element_count, 0, info)?, &info.shape)
+            Value::from_vec_bf16_bits(fallible_zeroed(element_count, 0, info)?, &shape)
         }
-        DataType::Int64 => {
-            Value::from_vec_i64(fallible_zeroed(element_count, 0, info)?, &info.shape)
-        }
+        DataType::Int64 => Value::from_vec_i64(fallible_zeroed(element_count, 0, info)?, &shape),
         dtype => anyhow::bail!(
             "state input '{}' has unsupported zero-initialization dtype {:?}",
             info.name,
@@ -29,18 +28,54 @@ pub(super) fn zero_state_value(info: &TensorInfo) -> anyhow::Result<Value> {
     .with_context(|| format!("failed to zero-initialize loop-state input '{}'", info.name))
 }
 
+/// Concrete shape for zero-initializing a loop-carried fixed-state input.
+///
+/// The leading (batch) axis is commonly symbolic in exported decoder graphs;
+/// single-sequence decode resolves it to `1`, mirroring the empty-KV convention
+/// in [`empty_past_value`]. Every non-leading dimension must be concrete and
+/// positive — a symbolic inner extent (e.g. a state channel count) cannot be
+/// zero-initialized without guessing model DATA, so it is refused.
+pub(super) fn concrete_fixed_state_shape(info: &TensorInfo) -> anyhow::Result<Vec<i64>> {
+    if info.shape.is_empty() {
+        anyhow::bail!(
+            "state input '{}' has scalar shape; loop-carried state requires at least a batch axis",
+            info.name
+        );
+    }
+    info.shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| {
+            if axis == 0 && dim <= 0 {
+                Ok(1)
+            } else if dim > 0 {
+                Ok(dim)
+            } else {
+                anyhow::bail!(
+                    "state input '{}' has dynamic or invalid non-batch dimension {axis} in shape {:?}; \
+                     zero initialization requires every non-batch fixed-state dimension to be concrete and positive",
+                    info.name,
+                    info.shape
+                )
+            }
+        })
+        .collect()
+}
+
 fn fixed_state_element_count(info: &TensorInfo) -> anyhow::Result<usize> {
-    info.shape.iter().try_fold(1_usize, |count, dimension| {
-        let dimension = usize::try_from(*dimension).with_context(|| {
-            format!(
-                "state input '{}' has non-concrete dimension {}",
-                info.name, dimension
-            )
-        })?;
-        count
-            .checked_mul(dimension)
-            .context("state tensor element count overflow")
-    })
+    concrete_fixed_state_shape(info)?
+        .iter()
+        .try_fold(1_usize, |count, &dimension| {
+            let dimension = usize::try_from(dimension).with_context(|| {
+                format!(
+                    "state input '{}' has non-concrete dimension {dimension}",
+                    info.name
+                )
+            })?;
+            count
+                .checked_mul(dimension)
+                .context("state tensor element count overflow")
+        })
 }
 
 fn fixed_state_bytes(info: &TensorInfo) -> anyhow::Result<u64> {

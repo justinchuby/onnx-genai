@@ -99,6 +99,32 @@ fn fixed_state_zero_initialization_is_fallible_and_supports_half_types() {
     assert!(error.to_string().contains("failed to allocate"), "{error}");
 }
 
+#[test]
+fn fixed_state_zero_initialization_resolves_symbolic_batch_axis() {
+    // A hybrid recurrent state such as `conv_state [batch, 6144, 3]` exports its
+    // leading batch axis as symbolic (-1). Single-sequence decode resolves it to
+    // 1, mirroring the empty-KV convention, and preserves the concrete extents.
+    let conv_state = TensorInfo {
+        name: "past_key_values.0.conv_state".to_string(),
+        dtype: DataType::Float32,
+        shape: vec![-1, 6144, 3],
+    };
+    let value = zero_state_value(&conv_state).expect("symbolic-batch state initializes");
+    assert_eq!(value.shape(), [1, 6144, 3]);
+
+    // A symbolic NON-batch dimension cannot be zero-initialized without guessing
+    // model data, so it is refused loudly.
+    let inner_symbolic = TensorInfo {
+        name: "past_key_values.0.recurrent_state".to_string(),
+        dtype: DataType::Float32,
+        shape: vec![-1, 16, -1, 128],
+    };
+    let error = zero_state_value(&inner_symbolic)
+        .err()
+        .expect("symbolic non-batch dimension must fail");
+    assert!(error.to_string().contains("non-batch"), "{error}");
+}
+
 fn empty_metadata() -> InferenceMetadata {
     InferenceMetadata {
         required_capabilities: vec![],

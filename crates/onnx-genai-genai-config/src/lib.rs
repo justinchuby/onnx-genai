@@ -33,7 +33,9 @@ mod json_builders;
 mod loading;
 mod wire_types;
 
-pub(crate) use compatibility::{ModelShape, incomplete, required_str, transducer_unsupported};
+pub(crate) use compatibility::{
+    ModelShape, incomplete, required_str, transducer_unsupported, unrepresentable_preprocessing,
+};
 pub(crate) use graph_io::*;
 pub use graph_io::{EncoderDecoderGraphInfo, GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo};
 pub(crate) use json_builders::*;
@@ -91,6 +93,27 @@ pub enum GenAiConfigError {
         family: String,
         /// What makes it unexecutable and what it would take to support it.
         reason: String,
+    },
+    /// A multimodal package declares an image-preprocessing program that the
+    /// runtime cannot represent losslessly (e.g. Qwen-style `smart_resize`,
+    /// which has no faithful stretch/crop/pad equivalent). The vision path is
+    /// therefore unusable, but the same package can still drive a text-only
+    /// decode pipeline (embedding + decoder). Callers that want text decode
+    /// should fall back to the text-only synthesis; callers that require the
+    /// image path must treat this as fatal. This is distinct from
+    /// [`GenAiConfigError::IncompletePipeline`], which signals genuinely
+    /// missing facts rather than a representable-but-unsupported transform.
+    #[error(
+        "image preprocessing is not representable by the runtime: {detail}. \
+         Why: the declared vision preprocessing has no lossless runtime encoding, so \
+         substituting an approximation would silently corrupt image inputs. How to fix: \
+         run this package for text-only decode (the embedding+decoder path is unaffected), \
+         or supply a native inference_metadata.json that declares a representable \
+         preprocessing program for the image path"
+    )]
+    UnrepresentablePreprocessing {
+        /// What preprocessing behavior could not be represented.
+        detail: String,
     },
 }
 

@@ -105,17 +105,20 @@ fn processor_requires_numeric_smart_resize_flag() {
 }
 
 #[test]
-fn processor_rejects_unexecutable_smart_resize() {
+fn processor_signals_unrepresentable_smart_resize_for_text_only_fallback() {
     let error = processor_program_json(
         &processor_config(json!(1), json!(1)),
         &processor_vision(),
         &processor_tensor("pixel_values", "float32"),
         &processor_tensor("image_grid_thw", "int64"),
     )
-    .expect_err("smart resize must fail until executable")
+    .expect_err("smart resize has no lossless runtime encoding")
     .to_string();
-    assert!(error.contains("smart_resize=false"));
+    // Signalled as the distinct unrepresentable-preprocessing decline so the
+    // loader can fall back to a text-only decode pipeline.
+    assert!(error.contains("not representable by the runtime"));
     assert!(error.contains("stretch/crop/pad"));
+    assert!(error.contains("text-only decode"));
 }
 
 #[test]

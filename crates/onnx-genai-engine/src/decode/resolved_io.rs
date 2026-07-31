@@ -135,9 +135,20 @@ fn resolve_state_pairs(
                 output.shape
             );
         }
-        if input.shape.iter().any(|dimension| *dimension <= 0) {
+        if input.shape.is_empty() {
             anyhow::bail!(
-                "state input '{}' has dynamic or invalid shape {:?}; zero initialization requires every fixed-state dimension to be concrete and positive",
+                "state input '{}' has scalar shape; loop-carried state requires at least a batch axis",
+                pair.input,
+            );
+        }
+        if input
+            .shape
+            .iter()
+            .enumerate()
+            .any(|(axis, dimension)| *dimension <= 0 && axis != 0)
+        {
+            anyhow::bail!(
+                "state input '{}' has dynamic or invalid non-batch shape {:?}; zero initialization requires every non-batch fixed-state dimension to be concrete and positive (the leading batch axis may be symbolic and resolves to the decode batch)",
                 pair.input,
                 input.shape
             );
