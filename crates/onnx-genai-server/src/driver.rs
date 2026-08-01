@@ -657,20 +657,35 @@ fn run_static_batch_until_idle(
         let in_flight = admission
             .max_queue_depth
             .saturating_sub(admission.generation_capacity.available_permits());
-        let deferred_generations = deferred_generation_count(deferred);
+        let deferred_permit_holders = deferred_permit_holder_count(deferred);
         let expected_this_batch = in_flight
-            .saturating_sub(deferred_generations)
+            .saturating_sub(deferred_permit_holders)
             .min(max_batch);
-        if expected_this_batch > initial.len() {
-            saw_pending_sibling = true;
+        // Re-evaluated every iteration rather than latched: a sibling that was
+        // expected and then drained (or was never batchable to begin with)
+        // must stop holding this request at the hard deadline. Latching meant
+        // one transient over-count pinned a lone request to the slow path for
+        // the rest of the window.
+        saw_pending_sibling = expected_this_batch > initial.len();
+        if saw_pending_sibling {
             soft_deadline = hard_deadline;
         }
 
         let now = Instant::now();
-        if now >= hard_deadline || (now >= soft_deadline && expected_this_batch <= initial.len()) {
+        if now >= hard_deadline {
             break;
         }
-        let deadline = if expected_this_batch > initial.len() {
+        let step = admission_step(
+            initial.len(),
+            expected_this_batch,
+            accepted,
+            deferred.is_empty(),
+            now >= soft_deadline,
+        );
+        if step == AdmissionStep::Admit {
+            break;
+        }
+        let deadline = if step == AdmissionStep::WaitForSibling {
             hard_deadline
         } else {
             soft_deadline
@@ -798,7 +813,63 @@ fn run_static_batch_until_idle(
     }
 }
 
-fn deferred_generation_count(deferred: &VecDeque<DriverCommand>) -> usize {
+/// What the admission loop should do this iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionStep {
+    /// Stop collecting and run what has been gathered.
+    Admit,
+    /// A sibling is outstanding; keep waiting until the hard deadline.
+    WaitForSibling,
+    /// Nothing is outstanding but the settle window has not closed.
+    WaitToSettle,
+}
+
+/// Decide whether to keep collecting arrivals or admit what we have.
+///
+/// Extracted from the loop so the decision is testable without a live engine:
+/// the loop needs a real driver thread, but this is a pure function of the
+/// counts, and it is where both scheduling regressions lived.
+fn admission_step(
+    collected: usize,
+    expected_this_batch: usize,
+    accepted_this_iteration: usize,
+    deferred_is_empty: bool,
+    settled: bool,
+) -> AdmissionStep {
+    // Re-derived every iteration rather than latched. A sibling that was
+    // expected and then drained (or was never batchable) must stop holding this
+    // request, otherwise one transient over-count pins a lone request to the
+    // slow path for the rest of the window.
+    if expected_this_batch > collected {
+        return AdmissionStep::WaitForSibling;
+    }
+    // Nothing arriving, nothing outstanding: genuinely solo, so admit now
+    // rather than sleeping out the settle window. Waiting here added that delay
+    // to the first token of every solo generation on a batching-capable engine,
+    // which is the opposite of what a solo fast path is for.
+    if accepted_this_iteration == 0 && deferred_is_empty {
+        return AdmissionStep::Admit;
+    }
+    if settled {
+        AdmissionStep::Admit
+    } else {
+        AdmissionStep::WaitToSettle
+    }
+}
+
+/// How many deferred commands are holding a `generation_capacity` permit.
+///
+/// This is subtracted from the in-flight count to estimate how many *other*
+/// requests are still arriving, so it must match the set of commands that
+/// actually take a permit — every one of `generate`, `generate_pipeline`,
+/// `generate_fim`, `render_images`, and `synthesize_speech` does.
+///
+/// Counting only the text-generation commands understated the deferred total,
+/// which inflated `expected_this_batch` and latched `saw_pending_sibling` for a
+/// sibling that did not exist. A lone request then waited out the hard deadline
+/// and ran through the continuous-batch path by itself — the slow path this
+/// admission logic exists to avoid.
+fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
     deferred
         .iter()
         .filter(|command| {
@@ -807,6 +878,8 @@ fn deferred_generation_count(deferred: &VecDeque<DriverCommand>) -> usize {
                 DriverCommand::Generate { .. }
                     | DriverCommand::GeneratePipeline { .. }
                     | DriverCommand::GenerateFim { .. }
+                    | DriverCommand::RenderImages { .. }
+                    | DriverCommand::SynthesizeSpeech { .. }
             )
         })
         .count()
@@ -1031,5 +1104,150 @@ fn run_fim_generation(
         Err(err) => {
             let _ = events.try_send(DriverEvent::Error(err.to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    /// A lone request with nothing else outstanding must be admitted at once.
+    ///
+    /// This is the regression that made the "solo fast path" not fast: the loop
+    /// had no exit for this case except the settle deadline, so every solo
+    /// generation on a batching-capable engine paid MICROBATCH_MIN_WAIT of
+    /// first-token latency before taking a path that was supposed to skip the
+    /// batching machinery entirely.
+    #[test]
+    fn a_solo_request_is_admitted_without_waiting_to_settle() {
+        assert_eq!(
+            admission_step(1, 1, 0, true, false),
+            AdmissionStep::Admit,
+            "a solo request must not wait out the settle window"
+        );
+    }
+
+    /// The same request must still be admitted once the window has closed.
+    #[test]
+    fn a_solo_request_is_admitted_after_the_settle_window_too() {
+        assert_eq!(admission_step(1, 1, 0, true, true), AdmissionStep::Admit);
+    }
+
+    /// An outstanding sibling holds the batch open to the hard deadline.
+    #[test]
+    fn an_outstanding_sibling_holds_the_batch_open() {
+        assert_eq!(
+            admission_step(1, 2, 0, true, false),
+            AdmissionStep::WaitForSibling
+        );
+        assert_eq!(
+            admission_step(1, 2, 0, true, true),
+            AdmissionStep::WaitForSibling,
+            "a sibling outranks the settle deadline"
+        );
+    }
+
+    /// A sibling that stops being outstanding must release the request.
+    ///
+    /// `saw_pending_sibling` used to latch, so a single transient over-count
+    /// pinned a lone request to the slow continuous-batch path for the rest of
+    /// the admission window even after the supposed sibling had drained.
+    #[test]
+    fn a_sibling_that_drains_stops_holding_the_batch() {
+        assert_eq!(
+            admission_step(1, 2, 0, true, false),
+            AdmissionStep::WaitForSibling
+        );
+        // Next iteration: the sibling is gone.
+        assert_eq!(
+            admission_step(1, 1, 0, true, false),
+            AdmissionStep::Admit,
+            "the decision must be re-derived, not latched"
+        );
+    }
+
+    /// Having just accepted an arrival, wait briefly for its neighbours.
+    #[test]
+    fn a_fresh_arrival_waits_out_the_settle_window() {
+        assert_eq!(
+            admission_step(2, 2, 1, true, false),
+            AdmissionStep::WaitToSettle,
+            "an arrival suggests more may be in flight"
+        );
+        assert_eq!(
+            admission_step(2, 2, 1, true, true),
+            AdmissionStep::Admit,
+            "but only until the window closes"
+        );
+    }
+
+    /// Queued commands mean more work is available, so do not admit early.
+    #[test]
+    fn queued_commands_prevent_the_early_solo_exit() {
+        assert_eq!(
+            admission_step(1, 1, 0, false, false),
+            AdmissionStep::WaitToSettle,
+            "a non-empty deferred queue is not a solo request"
+        );
+    }
+
+    /// Every command that takes a `generation_capacity` permit must be counted.
+    ///
+    /// `in_flight` is derived from that semaphore, and this count is subtracted
+    /// from it to estimate arrivals. Missing a permit-holding variant here
+    /// understates the deferred total, inflates the estimate, and forces a lone
+    /// request onto the slow path -- which is exactly what happened when only
+    /// the three text-generation commands were counted.
+    #[test]
+    fn image_commands_are_counted_as_permit_holders() {
+        let (image_reply, _image_rx) = tokio::sync::oneshot::channel();
+        let mut deferred: VecDeque<DriverCommand> = VecDeque::new();
+        deferred.push_back(DriverCommand::RenderImages {
+            pipeline_dir: PathBuf::new(),
+            request: Box::new(TextToImageRequest::default()),
+            reply: image_reply,
+        });
+
+        assert_eq!(
+            deferred_permit_holder_count(&deferred),
+            1,
+            "RenderImages holds a generation_capacity permit and must be \
+             subtracted from the in-flight estimate"
+        );
+    }
+
+    /// A deferred permit holder must not be mistaken for an incoming sibling.
+    ///
+    /// This is the end-to-end shape of the bug: one image request queued behind
+    /// a lone generation used to make `expected_this_batch` exceed `collected`,
+    /// which held the generation to the hard deadline and then ran it through
+    /// the continuous-batch path by itself.
+    #[test]
+    fn a_deferred_image_request_does_not_force_a_lone_generation_onto_the_slow_path() {
+        let (image_reply, _image_rx) = tokio::sync::oneshot::channel();
+        let mut deferred: VecDeque<DriverCommand> = VecDeque::new();
+        deferred.push_back(DriverCommand::RenderImages {
+            pipeline_dir: PathBuf::new(),
+            request: Box::new(TextToImageRequest::default()),
+            reply: image_reply,
+        });
+
+        // Two permits are held: our lone generation, and the queued image.
+        let in_flight = 2usize;
+        let max_batch = 4usize;
+        let expected_this_batch = in_flight
+            .saturating_sub(deferred_permit_holder_count(&deferred))
+            .min(max_batch);
+
+        assert_eq!(
+            expected_this_batch, 1,
+            "the queued image is accounted for, not counted as an arrival"
+        );
+        assert_ne!(
+            admission_step(1, expected_this_batch, 0, deferred.is_empty(), false),
+            AdmissionStep::WaitForSibling,
+            "a lone generation must not wait for a sibling that is really a \
+             queued image request"
+        );
     }
 }
