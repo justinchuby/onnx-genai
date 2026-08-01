@@ -405,7 +405,22 @@ pub(crate) async fn prometheus_metrics(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let mut output = crate::metrics::encode_prometheus();
-    let snapshot = match state.registry.resolve("").map_err(map_registry_error)? {
+    let handle = state.registry.resolve("").map_err(map_registry_error)?;
+
+    // Read the KV mirror before awaiting the governor snapshot. The mirror is a
+    // handful of relaxed loads and never touches the driver thread, so it
+    // answers even while a generation is inline -- which is exactly when the
+    // pool is worth reading, and exactly when the governor command below may
+    // have to wait.
+    if let Some(handle) = handle.as_ref() {
+        let telemetry = handle.engine.kv_telemetry();
+        output.push_str(&crate::metrics::encode_kv_telemetry(
+            telemetry.applicability(),
+            &telemetry.snapshot(),
+        ));
+    }
+
+    let snapshot = match handle {
         Some(handle) => handle.engine.resource_snapshot().await.ok(),
         None => None,
     };

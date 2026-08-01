@@ -345,6 +345,103 @@ pub(crate) fn encode_resource_governor_unavailable() -> String {
     output
 }
 
+const KV_PAGING_APPLICABLE: &str = "onnxgenai_kv_paging_applicable";
+const KV_PAGING_APPLICABLE_HELP: &str = concat!(
+    "Whether paged KV is the mechanism the decoder uses: ",
+    "1 applicable, 0 not applicable, -1 not yet determined. ",
+    "Every other kv_pages_* series is a truthful reading of a real pool even ",
+    "when this is 0, so a non-zero capacity is not evidence the pool is in use."
+);
+
+/// Publish the KV page pool's aggregate state.
+///
+/// `applicable` is emitted first and deliberately, because the counters below
+/// it are honest reads of a real structure even on a model that never consults
+/// the pool. `onnxgenai_kv_pages_capacity` is *non-zero* on a continuous-batching
+/// model, so a consumer that charted utilisation without checking applicability
+/// would be charting a mechanism that is not running -- and nothing in the
+/// numbers themselves would reveal it.
+///
+/// The pending state is `-1` rather than an omitted series: the decode path is
+/// chosen asynchronously at startup, so a scrape can genuinely arrive before
+/// the answer exists, and reporting `0` then would state "not applicable" with
+/// full confidence about a pool that may well be paged.
+#[cfg(feature = "metrics")]
+pub(crate) fn encode_kv_telemetry(
+    applicability: onnx_genai_engine::Applicability,
+    snapshot: &onnx_genai_engine::KvTelemetrySnapshot,
+) -> String {
+    use onnx_genai_engine::Applicability;
+
+    let mut output = String::new();
+    let applicable = match applicability {
+        Applicability::Applicable => 1i64,
+        Applicability::NotApplicable => 0,
+        Applicability::Unknown => -1,
+    };
+    signed_gauge(
+        &mut output,
+        KV_PAGING_APPLICABLE,
+        KV_PAGING_APPLICABLE_HELP,
+        applicable,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_kv_pages_in_use",
+        "KV pages with at least one reference, on any tier. May exceed capacity: eviction demotes a page to the cold tier without dropping its reference.",
+        snapshot.pages_in_use as u64,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_kv_pages_shared",
+        "KV pages with more than one reference, i.e. shared by copy-on-write or prefix reuse.",
+        snapshot.pages_shared as u64,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_kv_pages_capacity",
+        "Hot-tier live KV page capacity.",
+        snapshot.hot_capacity as u64,
+    );
+    gauge(
+        &mut output,
+        "onnxgenai_kv_page_size_tokens",
+        "Token slots per KV page.",
+        snapshot.page_size as u64,
+    );
+    counter(
+        &mut output,
+        "onnxgenai_kv_page_allocations_total",
+        "KV pages handed out.",
+        snapshot.allocations,
+    );
+    counter(
+        &mut output,
+        "onnxgenai_kv_page_allocation_failures_total",
+        "KV page allocations that found no page. The honest signal that the pool is under real pressure.",
+        snapshot.allocation_failures,
+    );
+    counter(
+        &mut output,
+        "onnxgenai_kv_page_frees_total",
+        "KV pages returned to the free list.",
+        snapshot.frees,
+    );
+    counter(
+        &mut output,
+        "onnxgenai_kv_hot_evictions_total",
+        "KV pages demoted from the hot tier.",
+        snapshot.hot_evictions,
+    );
+    counter(
+        &mut output,
+        "onnxgenai_kv_prefix_evictions_total",
+        "KV pages dropped from the prefix cache.",
+        snapshot.prefix_evictions,
+    );
+    output
+}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn encode_resource_governor(snapshot: &GovernorSnapshot) -> String {
     let mut output = String::new();
@@ -433,6 +530,15 @@ fn gauge(output: &mut String, name: &str, help: &str, value: u64) {
     writeln!(output, "{name} {value}").expect("String write");
 }
 
+/// A gauge that can go negative, for tri-state values where the third state is
+/// "not yet known" and must not be reported as either of the other two.
+#[cfg(feature = "metrics")]
+fn signed_gauge(output: &mut String, name: &str, help: &str, value: i64) {
+    writeln!(output, "# HELP {name} {help}").expect("String write");
+    writeln!(output, "# TYPE {name} gauge").expect("String write");
+    writeln!(output, "{name} {value}").expect("String write");
+}
+
 #[cfg(feature = "metrics")]
 fn histogram(output: &mut String, name: &str, help: &str, histogram: &Histogram) {
     writeln!(output, "# HELP {name} {help}").expect("String write");
@@ -480,4 +586,94 @@ fn decrement(value: &AtomicU64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(1))
     });
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use super::*;
+    use onnx_genai_engine::{Applicability, KvTelemetrySnapshot};
+
+    fn sample() -> KvTelemetrySnapshot {
+        KvTelemetrySnapshot {
+            pages_in_use: 12,
+            pages_shared: 3,
+            hot_capacity: 64,
+            page_size: 16,
+            allocations: 100,
+            allocation_failures: 2,
+            frees: 88,
+            hot_evictions: 5,
+            prefix_evictions: 1,
+        }
+    }
+
+    #[test]
+    fn every_snapshot_field_reaches_the_exposition() {
+        // A field added to the snapshot but never emitted would be invisible
+        // with no symptom at the point of the omission, so pin all of them.
+        let output = encode_kv_telemetry(Applicability::Applicable, &sample());
+        for expected in [
+            "onnxgenai_kv_pages_in_use 12",
+            "onnxgenai_kv_pages_shared 3",
+            "onnxgenai_kv_pages_capacity 64",
+            "onnxgenai_kv_page_size_tokens 16",
+            "onnxgenai_kv_page_allocations_total 100",
+            "onnxgenai_kv_page_allocation_failures_total 2",
+            "onnxgenai_kv_page_frees_total 88",
+            "onnxgenai_kv_hot_evictions_total 5",
+            "onnxgenai_kv_prefix_evictions_total 1",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected} in:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn applicability_is_tri_state_and_never_omitted() {
+        // The pending state must be reported, not dropped. A series that simply
+        // stops is read as a scrape gap; and reporting 0 while the decode path
+        // is still being chosen would assert "not applicable" about a pool that
+        // may well be paged.
+        for (state, expected) in [
+            (
+                Applicability::Applicable,
+                "onnxgenai_kv_paging_applicable 1",
+            ),
+            (
+                Applicability::NotApplicable,
+                "onnxgenai_kv_paging_applicable 0",
+            ),
+            (Applicability::Unknown, "onnxgenai_kv_paging_applicable -1"),
+        ] {
+            let output = encode_kv_telemetry(state, &sample());
+            assert!(
+                output.contains(expected),
+                "expected {expected} for {state:?} in:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn counters_and_gauges_are_typed_correctly() {
+        // Cumulative totals must be counters, live readings gauges: Prometheus
+        // rate() on a gauge, or a counter reset alarm on a gauge, are both
+        // silent misreadings rather than errors.
+        let output = encode_kv_telemetry(Applicability::Applicable, &sample());
+        assert!(output.contains("# TYPE onnxgenai_kv_page_allocations_total counter"));
+        assert!(output.contains("# TYPE onnxgenai_kv_page_allocation_failures_total counter"));
+        assert!(output.contains("# TYPE onnxgenai_kv_pages_in_use gauge"));
+        assert!(output.contains("# TYPE onnxgenai_kv_paging_applicable gauge"));
+    }
+
+    #[test]
+    fn counters_are_still_published_when_not_applicable() {
+        // The numbers stay truthful readings of a real pool; what changes is
+        // that the applicability flag tells a consumer not to chart them as a
+        // live mechanism. Dropping them instead would look like a scrape gap.
+        let output = encode_kv_telemetry(Applicability::NotApplicable, &sample());
+        assert!(output.contains("onnxgenai_kv_pages_capacity 64"));
+        assert!(output.contains("onnxgenai_kv_paging_applicable 0"));
+    }
 }
