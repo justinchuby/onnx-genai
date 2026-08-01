@@ -2581,3 +2581,78 @@ fn declared_position_rank_maps_graph_shape() {
     // A rank-3 input with a non-static leading dim cannot be resolved.
     assert!(declared_position_rank(&inputs, Some("position_ids_dynamic_lead")).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Inc-1b PR-2: decode-inline routing decision (Harry guard #2 — runtime
+// scan-axis extent==1 fallback) and the default-off feature flag.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decode_inline_routes_only_single_token_when_enabled() {
+    // Enabled + sibling ready + single token → route to the decode-inline exec.
+    assert!(route_decode_inline_decision(
+        DecodeInlineState::Enabled,
+        true,
+        1
+    ));
+    // Guard #2: a multi-token (extent≠1) step must fall back to the main Scan
+    // executor even when the sibling is ready — never run a collapsed graph.
+    assert!(!route_decode_inline_decision(
+        DecodeInlineState::Enabled,
+        true,
+        2
+    ));
+    assert!(!route_decode_inline_decision(
+        DecodeInlineState::Enabled,
+        true,
+        8
+    ));
+    // A zero-token step is not a decode step.
+    assert!(!route_decode_inline_decision(
+        DecodeInlineState::Enabled,
+        true,
+        0
+    ));
+}
+
+#[test]
+fn decode_inline_never_routes_when_disabled_or_unbuilt() {
+    // Untried / Disabled never route, regardless of token count.
+    for state in [DecodeInlineState::Untried, DecodeInlineState::Disabled] {
+        assert!(!route_decode_inline_decision(state, true, 1));
+        assert!(!route_decode_inline_decision(state, false, 1));
+    }
+    // Enabled but no sibling actually built (defensive): never route.
+    assert!(!route_decode_inline_decision(
+        DecodeInlineState::Enabled,
+        false,
+        1
+    ));
+}
+
+#[test]
+fn decode_inline_flag_defaults_off_and_parses_truthy() {
+    // The flag is process-global env; serialize the mutation so parallel tests
+    // do not observe each other's writes.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap();
+    let key = "ONNX_GENAI_DECODE_INLINE_SCAN";
+    let previous = std::env::var_os(key);
+
+    // SAFETY: single-threaded within this test's lock; restored before return.
+    unsafe { std::env::remove_var(key) };
+    assert!(!decode_inline_scan_enabled(), "unset must default OFF");
+    for falsy in ["0", "false", "no", "off", "", "  ", "nonsense"] {
+        unsafe { std::env::set_var(key, falsy) };
+        assert!(!decode_inline_scan_enabled(), "'{falsy}' must be OFF");
+    }
+    for truthy in ["1", "true", "yes", "on", " ON ", "True"] {
+        unsafe { std::env::set_var(key, truthy) };
+        assert!(decode_inline_scan_enabled(), "'{truthy}' must be ON");
+    }
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var(key, value) },
+        None => unsafe { std::env::remove_var(key) },
+    }
+}

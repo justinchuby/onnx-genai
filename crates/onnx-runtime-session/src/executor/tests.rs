@@ -3458,3 +3458,278 @@ fn scan_single_trip_inline_is_byte_exact_and_runtime_keyed() {
         "prefill output must be identical flag-on vs flag-off"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Inc-1b PR-2: decode-inline sibling executor. These are fast, CPU-only,
+// non-ignored guards covering Harry's mandatory review points:
+//   * guard #1 — byte-identical per-token outputs AND final recurrent state
+//     between the Scan child-session plan and the decode-inline plan;
+//   * guard #3 — the decode-inline exec binds the identical persistent state
+//     device buffer the main exec wrote at the prefill→decode hand-off;
+//   * guard #4 — the first `num_state` sibling outputs stay present-state in
+//     `state_pairs` order and inlined interior shapes resolve (Permissive).
+// ---------------------------------------------------------------------------
+
+/// A tiny hybrid decoder graph: a recurrent single-state `Scan` whose state is a
+/// real graph input/output pair (`past_state` → `present_state`, the #573
+/// `state_pairs` contract) so it can be bound to a persistent device buffer, and
+/// whose scan axis is **symbolic** (`seq`) so one executor handles both a
+/// multi-token prefill and single-token decode steps — exactly the shape the
+/// decode-inline transform specializes.
+///
+/// Body: `present = Add(state, scan_in)` (recurrent accumulate, the state
+/// output); `y = Mul(present, scan_in)` (per-iteration scan output).
+fn recurrent_state_graph() -> Graph {
+    use onnx_runtime_ir::{Dim, static_shape};
+    const W: usize = 3;
+
+    let mut body = Graph::new();
+    body.opset_imports.insert(String::new(), 17);
+    let state = body.create_named_value("state", DataType::Float32, static_shape([W]));
+    let scan_in = body.create_named_value("scan_in", DataType::Float32, static_shape([W]));
+    body.add_input(state);
+    body.add_input(scan_in);
+    let present = body.create_named_value("present", DataType::Float32, static_shape([W]));
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(state), Some(scan_in)],
+        vec![present],
+    ));
+    let y = body.create_named_value("y", DataType::Float32, static_shape([W]));
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Mul",
+        vec![Some(present), Some(scan_in)],
+        vec![y],
+    ));
+    body.add_output(present);
+    body.add_output(y);
+
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let seq = g.intern_symbol("seq");
+    let past_state = g.create_named_value("past_state", DataType::Float32, static_shape([W]));
+    g.add_input(past_state);
+    let x = g.create_named_value("x", DataType::Float32, vec![Dim::from(seq), Dim::Static(W)]);
+    g.add_input(x);
+    let present_state = g.create_named_value("present_state", DataType::Float32, static_shape([W]));
+    let scan_out = g.create_named_value(
+        "scan_out",
+        DataType::Float32,
+        vec![Dim::from(seq), Dim::Static(W)],
+    );
+    let mut scan = Node::new(
+        NodeId(0),
+        "Scan",
+        vec![Some(past_state), Some(x)],
+        vec![present_state, scan_out],
+    );
+    scan.attributes
+        .insert("num_scan_inputs".to_string(), Attribute::Int(1));
+    let scan_id = g.insert_node(scan);
+    g.subgraphs.insert((scan_id, "body".to_string()), body);
+    g.add_output(present_state);
+    g.add_output(scan_out);
+    g
+}
+
+fn build_main_exec(graph: Graph) -> Executor {
+    Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap()
+}
+
+/// Guard #1: N single-token decode steps through the Scan child-session plan
+/// vs. the decode-inline plan produce byte-identical per-token outputs AND an
+/// identical final recurrent state — the primary semantics-preservation proof.
+#[test]
+fn decode_inline_sibling_is_byte_exact_with_scan_and_preserves_state() {
+    const W: usize = 3;
+    let mut main = build_main_exec(recurrent_state_graph());
+    let mut sib = main
+        .build_decode_inline_sibling()
+        .unwrap()
+        .expect("recurrent single-trip Scan must yield a decode-inline sibling");
+
+    // The sibling is a distinct plan with the Scan lowered away.
+    assert!(
+        !sib.graph.nodes.iter().any(|(_, n)| n.op_type == "Scan"),
+        "decode-inline sibling must have no Scan node"
+    );
+
+    let mut state_main = vec![0f32; W];
+    let mut state_sib = vec![0f32; W];
+    for step in 0..6usize {
+        let xk: Vec<f32> = (0..W).map(|i| (step * W + i) as f32 + 1.0).collect();
+        let x = Tensor::from_f32(&[1, W], &xk).unwrap();
+
+        let past_m = Tensor::from_f32(&[W], &state_main).unwrap();
+        let out_m = main.run(&[("past_state", &past_m), ("x", &x)]).unwrap();
+        let past_s = Tensor::from_f32(&[W], &state_sib).unwrap();
+        let out_s = sib.run(&[("past_state", &past_s), ("x", &x)]).unwrap();
+
+        assert_eq!(out_m.len(), out_s.len());
+        for (idx, (tm, ts)) in out_m.iter().zip(&out_s).enumerate() {
+            assert_eq!(
+                tm.as_bytes(),
+                ts.as_bytes(),
+                "output #{idx} diverged at decode step {step}"
+            );
+        }
+        state_main = out_m[0].to_vec_f32();
+        state_sib = out_s[0].to_vec_f32();
+    }
+    assert_eq!(
+        state_main, state_sib,
+        "final recurrent state must be identical across the two plans"
+    );
+}
+
+/// Guard #3: the decode-inline exec binds the identical persistent state device
+/// buffer the main exec wrote at the prefill→decode hand-off. A multi-token
+/// prefill runs on the main (Scan) exec into an in-place `past_state ==
+/// present_state` device binding; single-token decode steps then run on the
+/// decode-inline sibling against that same binding. The result must match an
+/// all-main-exec reference bit-for-bit, proving continuity (design §3).
+#[test]
+fn decode_inline_sibling_preserves_persistent_state_across_prefill_handoff() {
+    const W: usize = 3;
+    let prefill: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 tokens × W
+    let decode_steps: [[f32; W]; 4] = [
+        [0.5, 1.5, 2.5],
+        [1.0, 1.0, 1.0],
+        [2.0, 0.0, -1.0],
+        [3.5, 2.5, 1.5],
+    ];
+
+    // Reference: every step on the main (Scan) exec, in-place device state.
+    let reference_states = {
+        let mut main = build_main_exec(recurrent_state_graph());
+        let mut binding = main
+            .allocate_device_binding(
+                "past_state".into(),
+                Some("present_state".into()),
+                DataType::Float32,
+                vec![W],
+                vec![W],
+            )
+            .unwrap();
+        binding.write_bytes(0, &[0u8; W * 4]).unwrap();
+        let x0 = Tensor::from_f32(&[prefill.len() / W, W], &prefill).unwrap();
+        main.run_with_device_bindings(&[("x", &x0)], std::slice::from_mut(&mut binding))
+            .unwrap();
+        let mut states = Vec::new();
+        for step in &decode_steps {
+            let x = Tensor::from_f32(&[1, W], step).unwrap();
+            main.run_with_device_bindings(&[("x", &x)], std::slice::from_mut(&mut binding))
+                .unwrap();
+            states.push(binding.read_bytes().unwrap());
+        }
+        states
+    };
+
+    // Handoff: prefill on main, decode on the sibling — same persistent buffer.
+    let mut main = build_main_exec(recurrent_state_graph());
+    let mut sib = main.build_decode_inline_sibling().unwrap().unwrap();
+    let mut binding = main
+        .allocate_device_binding(
+            "past_state".into(),
+            Some("present_state".into()),
+            DataType::Float32,
+            vec![W],
+            vec![W],
+        )
+        .unwrap();
+    binding.write_bytes(0, &[0u8; W * 4]).unwrap();
+    let ptr_before = binding.device_ptr();
+    let x0 = Tensor::from_f32(&[prefill.len() / W, W], &prefill).unwrap();
+    main.run_with_device_bindings(&[("x", &x0)], std::slice::from_mut(&mut binding))
+        .unwrap();
+
+    for (step, expected) in decode_steps.iter().zip(&reference_states) {
+        let x = Tensor::from_f32(&[1, W], step).unwrap();
+        sib.run_with_device_bindings(&[("x", &x)], std::slice::from_mut(&mut binding))
+            .unwrap();
+        assert_eq!(
+            &binding.read_bytes().unwrap(),
+            expected,
+            "decode-inline step state diverged from the all-main reference — state buffer continuity broken"
+        );
+    }
+    assert_eq!(
+        binding.device_ptr(),
+        ptr_before,
+        "the persistent state buffer must be the identical allocation across the handoff"
+    );
+}
+
+/// Guard #4: the sibling preserves graph-output order (the first `num_state`
+/// outputs remain the present-state values in `state_pairs` order) and its
+/// inlined interior shapes resolve under Permissive inference (the build itself
+/// runs that inference, so a converged build is the proof).
+#[test]
+fn decode_inline_sibling_preserves_state_output_order_and_resolves_shapes() {
+    let main = build_main_exec(recurrent_state_graph());
+    let sib = main.build_decode_inline_sibling().unwrap().unwrap();
+
+    let main_out_names: Vec<_> = main
+        .graph
+        .outputs
+        .iter()
+        .map(|&v| main.graph.value(v).name.clone())
+        .collect();
+    let sib_out_names: Vec<_> = sib
+        .graph
+        .outputs
+        .iter()
+        .map(|&v| sib.graph.value(v).name.clone())
+        .collect();
+    assert_eq!(
+        main_out_names, sib_out_names,
+        "decode-inline sibling must preserve graph-output identity + order (present-state first)"
+    );
+    assert_eq!(
+        sib_out_names.first().unwrap().as_deref(),
+        Some("present_state"),
+        "the first output must be the present recurrent state"
+    );
+
+    // The present-state output resolves to a concrete static shape after the
+    // Permissive re-inference the sibling build performed.
+    let present = sib.graph.outputs[0];
+    let dims: Option<Vec<usize>> = sib
+        .graph
+        .value(present)
+        .shape
+        .iter()
+        .map(|d| match d {
+            Dim::Static(n) => Some(*n),
+            Dim::Symbolic(_) => None,
+        })
+        .collect();
+    assert_eq!(dims, Some(vec![3]), "present-state shape must resolve");
+}
+
+/// A dense (Scan-free) decoder yields no decode-inline sibling — the feature is
+/// a strict no-op off the hybrid single-trip path.
+#[test]
+fn decode_inline_sibling_none_for_dense_graph() {
+    use onnx_runtime_ir::static_shape;
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let x = g.create_named_value("x", DataType::Float32, static_shape([2, 4]));
+    g.add_input(x);
+    let y = g.create_named_value("y", DataType::Float32, static_shape([2, 4]));
+    g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+    g.add_output(y);
+
+    let main = build_main_exec(g);
+    assert!(
+        main.build_decode_inline_sibling().unwrap().is_none(),
+        "a dense decoder must not build a decode-inline sibling"
+    );
+}

@@ -886,6 +886,14 @@ pub struct InferenceSession {
     outputs: Vec<IoMeta>,
     model_metadata: ModelMetadata,
     exec: executor::Executor,
+    /// Decode-specialized sibling executor whose single-trip recurrent `Scan`
+    /// bodies are inlined into the parent graph (Inc-1b PR-2). Built lazily and
+    /// only when [`InferenceSession::enable_decode_inline`] is called on a model
+    /// that is on the hybrid single-trip Scan path; `None` otherwise (the
+    /// default), so an ordinary session is byte-identical and pays nothing. It
+    /// shares `exec`'s `Arc<WeightStore>` and `Arc<dyn ExecutionProvider>`, so a
+    /// decode step routed to it binds the identical persistent state buffers.
+    decode_inline_exec: Option<executor::Executor>,
     /// EPContext dump config parsed from the `ep.context_*` session options
     /// (§21.4). Drives [`InferenceSession::export_ep_context`]; disabled by
     /// default so an ordinary session never touches the dump path.
@@ -1011,6 +1019,7 @@ impl InferenceSession {
             outputs,
             model_metadata,
             exec,
+            decode_inline_exec: None,
             ep_context_config,
         })
     }
@@ -1074,6 +1083,52 @@ impl InferenceSession {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         self.exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Lazily build the decode-specialized inlined-body sibling executor
+    /// (Inc-1b PR-2, `cohaagen-27b-inc1b-design.md` §1). Idempotent: a second
+    /// call is a no-op. Returns `true` when a decode-inline plan is now
+    /// available (the model is on the hybrid single-trip recurrent `Scan`
+    /// path), or `false` when the model has no such `Scan` and the caller must
+    /// keep today's Scan child-session path. The main/prefill executor is left
+    /// byte-identical either way.
+    ///
+    /// Callers gate this behind their own default-off feature flag
+    /// (`ONNX_GENAI_DECODE_INLINE_SCAN`); the session itself reads no env.
+    pub fn enable_decode_inline(&mut self) -> Result<bool> {
+        if self.decode_inline_exec.is_none() {
+            self.decode_inline_exec = self.exec.build_decode_inline_sibling()?;
+        }
+        Ok(self.decode_inline_exec.is_some())
+    }
+
+    /// Whether a decode-inline sibling executor is built and ready to run.
+    pub fn decode_inline_ready(&self) -> bool {
+        self.decode_inline_exec.is_some()
+    }
+
+    /// Run one decode step through the decode-inline sibling executor (eager),
+    /// binding the identical persistent device buffers `bindings` supplies so
+    /// recurrent-state continuity across the prefill→decode boundary is
+    /// preserved (design §3). Only valid for a **single-trip** (scan-axis
+    /// extent 1) decode step: the caller must route any extent≠1 step to
+    /// [`Self::run_with_device_bindings`] (the main exec) instead — the
+    /// decode-inline graph is specialized to one iteration and would otherwise
+    /// run a wrongly-collapsed graph.
+    ///
+    /// Errors if [`Self::enable_decode_inline`] has not built a sibling.
+    pub fn run_decode_inline_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<Vec<Option<Tensor>>> {
+        let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "decode-inline executor requested but not built; call enable_decode_inline first"
+                    .into(),
+            )
+        })?;
+        exec.run_with_device_bindings(inputs, bindings)
     }
 
     /// Allocate a persistent buffer on this session's execution device.

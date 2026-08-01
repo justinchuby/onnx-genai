@@ -19,6 +19,7 @@ impl DecodeBackend for NativeDecodeSession {
                 self.current_len
             );
         }
+        self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
             if token_ids.len() == 1 {
                 return self.decode_cuda_greedy(token_ids[0], past_len).map(Some);
