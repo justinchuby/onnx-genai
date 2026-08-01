@@ -693,13 +693,24 @@ impl KernelFactory for TransposeFactory {
         Ok(Box::new(TransposeKernel {
             runtime: self.runtime.clone(),
             perm,
+            metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TransposeCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    perm: Vec<i64>,
 }
 #[derive(Debug)]
 struct TransposeKernel {
     runtime: Arc<CudaRuntime>,
     perm: Option<Vec<i64>>,
+    metadata: Mutex<PersistentMetadata>,
+    warmed_signature: Mutex<Option<TransposeCaptureSignature>>,
 }
 impl Kernel for TransposeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -747,21 +758,53 @@ impl Kernel for TransposeKernel {
                 outputs[0].shape
             )));
         }
-        launch_metadata(
+        let capturing = self.runtime.is_capturing()?;
+        let signature = TransposeCaptureSignature {
+            dtype: inputs[0].dtype,
+            input_shape: inputs[0].shape.to_vec(),
+            output_shape: outputs[0].shape.to_vec(),
+            perm: perm.clone(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Transpose: capture signature lock was poisoned".into())
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Transpose: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
+            ));
+        }
+        let metadata_ptr = self
+            .metadata
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep Transpose: metadata lock was poisoned".into())
+            })?
+            .prepare(&metadata, "Transpose")?;
+        launch_persistent_metadata(
             &self.runtime,
             "transpose_bytes",
             &inputs[0],
             &mut outputs[0],
-            &metadata,
-        )
+            metadata_ptr,
+        )?;
+        if !capturing {
+            *warmed_signature = Some(signature);
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Transpose allocates/uploads/frees per-call permutation metadata and synchronizes the stream",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Transpose must warm its exact shape/dtype signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Transpose capture signature lock was poisoned",
+            ),
+        }
     }
 }
 

@@ -1069,3 +1069,77 @@ fn expand_warmed_metadata_captures_and_matches_eager() {
     ep.deallocate(shape_buffer).unwrap();
     ep.deallocate(output_buffer).unwrap();
 }
+
+#[test]
+fn transpose_warmed_metadata_captures_and_matches_eager() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // LinearAttention decode transposes carry a fixed perm on a fixed decode
+    // shape, so the permutation metadata is stable and must survive capture.
+    let input_shape = [2usize, 1, 3];
+    let output_shape = [3usize, 2, 1];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Transpose",
+        &[input_shape.to_vec()],
+        &[output_shape.to_vec()],
+        &[("perm", Attribute::Ints(vec![2, 0, 1]))],
+    );
+
+    let data = vec![1_f32, 2., 3., 4., 5., 6.];
+    let data_bytes = raw(&data);
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let inputs = [TensorView::new(
+        DevicePtr(data_buffer.as_ptr()),
+        DataType::Float32,
+        &input_shape,
+        &input_strides,
+        device,
+    )];
+    let mut output_buffer = ep.allocate(6 * std::mem::size_of::<f32>(), 256).unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut execute = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )];
+        kernel.execute(&inputs, &mut output).unwrap();
+    };
+    // Unwarmed: the kernel must decline capture until a fixed shape is seen.
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+    // First eager run warms the fixed shape/perm signature.
+    execute();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    // Re-running eagerly reuses the cached metadata (no realloc/sync) and must
+    // still produce identical bytes.
+    execute();
+    // Capture + replay must equal the eager result byte-for-byte.
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+
+    let mut actual = vec![0; 6 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(actual, raw(&[1_f32, 4., 2., 5., 3., 6.]));
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(output_buffer).unwrap();
+}
