@@ -53,6 +53,7 @@ mod graph;
 mod graph_view;
 mod layout;
 mod node;
+mod scan_inline;
 mod shape;
 mod tensor;
 mod value;
@@ -69,6 +70,7 @@ pub use layout::{
     is_dense,
 };
 pub use node::{Attribute, Node, NodeId, RUNTIME_DOMAIN};
+pub use scan_inline::inline_single_trip_scan_bodies;
 pub use shape::{
     Dim, Shape, SymbolConstraints, SymbolId, as_static_shape, is_fully_static, static_shape,
 };
