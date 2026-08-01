@@ -102,7 +102,7 @@ pub(crate) fn async_pagein_from_env_value(value: Option<&str>) -> bool {
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DeviceOffloadPolicy {
     pub enabled: bool,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
@@ -112,16 +112,6 @@ pub struct DeviceOffloadPolicy {
     /// truthy value (`1`/`true`/`yes`/`on`); otherwise the synchronous page-in
     /// is used, which is faster in the eviction/thrash regime (measured A/B).
     pub async_pagein: bool,
-}
-
-impl Default for DeviceOffloadPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            device_budget_bytes: None,
-            async_pagein: false,
-        }
-    }
 }
 
 impl DeviceOffloadPolicy {
