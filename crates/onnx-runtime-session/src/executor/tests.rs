@@ -3312,3 +3312,149 @@ fn kernel_prebinding_fallback_fires_on_shape_change() {
         "after shape change, the updated binding must serve the fast path"
     );
 }
+
+/// Build a parent graph with a single `Scan` over a **multi-node** body so the
+/// single-trip inline dual-path and the generic loop are exercised on identical
+/// non-trivial work. `steps` is the scan-axis length (`1` = a decode step; `>1`
+/// = a prefill-shaped run). The body threads carried state through two scan
+/// inputs across three ops and emits one carried-state output plus one
+/// per-iteration scan output:
+///
+///   `state_x  = Add(state, x)`
+///   `state_out = Mul(state_x, y)`   (next carried state)
+///   `scan_out  = Sub(state_out, x)` (stacked on the scan axis)
+fn scan_inline_test_graph(steps: usize) -> Graph {
+    const W: usize = 3;
+
+    let mut body = Graph::new();
+    body.opset_imports.insert(String::new(), 17);
+    let state = body.create_named_value("state", DataType::Float32, static_shape([W]));
+    let x = body.create_named_value("x", DataType::Float32, static_shape([W]));
+    let y = body.create_named_value("y", DataType::Float32, static_shape([W]));
+    body.add_input(state);
+    body.add_input(x);
+    body.add_input(y);
+    let state_x = body.create_named_value("state_x", DataType::Float32, static_shape([W]));
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(state), Some(x)],
+        vec![state_x],
+    ));
+    let state_out = body.create_named_value("state_out", DataType::Float32, static_shape([W]));
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Mul",
+        vec![Some(state_x), Some(y)],
+        vec![state_out],
+    ));
+    let scan_out = body.create_named_value("scan_out", DataType::Float32, static_shape([W]));
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Sub",
+        vec![Some(state_out), Some(x)],
+        vec![scan_out],
+    ));
+    body.add_output(state_out);
+    body.add_output(scan_out);
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let initial = init_inline(&mut graph, "initial", &[W], vec![0.0; W]);
+    let x_in = graph.create_named_value("X", DataType::Float32, static_shape([steps, W]));
+    let y_in = graph.create_named_value("Y", DataType::Float32, static_shape([steps, W]));
+    graph.add_input(x_in);
+    graph.add_input(y_in);
+    let final_state = graph.create_named_value("final_state", DataType::Float32, static_shape([W]));
+    let scan_output =
+        graph.create_named_value("scan_output", DataType::Float32, static_shape([steps, W]));
+    let mut scan = Node::new(
+        NodeId(0),
+        "Scan",
+        vec![Some(initial), Some(x_in), Some(y_in)],
+        vec![final_state, scan_output],
+    );
+    scan.attributes
+        .insert("num_scan_inputs".to_string(), Attribute::Int(2));
+    let scan_id = graph.insert_node(scan);
+    graph.subgraphs.insert((scan_id, "body".to_string()), body);
+    graph.add_output(final_state);
+    graph.add_output(scan_output);
+    graph
+}
+
+fn init_inline(graph: &mut Graph, name: &str, dims: &[usize], data: Vec<f32>) -> ValueId {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let value =
+        graph.create_named_value(name, DataType::Float32, static_shape(dims.iter().copied()));
+    graph.set_initializer(
+        value,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            dims.to_vec(),
+            bytes,
+        )),
+    );
+    value
+}
+
+fn run_scan_inline_graph(steps: usize, inline: bool) -> (Vec<Vec<u8>>, u64) {
+    let mut exec = Executor::build(
+        scan_inline_test_graph(steps),
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+    exec.scan_inline_single_trip_enabled = inline;
+
+    let n = steps * 3;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32) + 1.0).collect();
+    let y: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 + 2.0).collect();
+    let x_t = Tensor::from_f32(&[steps, 3], &x).unwrap();
+    let y_t = Tensor::from_f32(&[steps, 3], &y).unwrap();
+    let outputs = exec.run(&[("X", &x_t), ("Y", &y_t)]).unwrap();
+    let bytes = outputs.iter().map(|t| t.as_bytes().to_vec()).collect();
+    (bytes, exec.scan_inline_single_trip_count())
+}
+
+/// Slice-1a correctness gate. Proves the flag-gated single-trip `Scan` inline
+/// dual-path is (1) **byte-exact** with the generic `exec_scan` loop, and (2)
+/// **non-vacuously engaged** and **runtime-keyed** — engaging only at
+/// `trip_count == 1` and never on a prefill-shaped (`trip_count > 1`) run, even
+/// with the flag ON. The shared-plan tripwire: a static single-trip rewrite
+/// would fire on prefill too; this asserts it does not. Byte-equality is checked
+/// over BOTH the carried `final_state` and the stacked `scan_output`, so a wrong
+/// inline path (dropped/duplicated body run, mis-stacked scan axis, or skipped
+/// state thread) makes the test FAIL.
+#[test]
+fn scan_single_trip_inline_is_byte_exact_and_runtime_keyed() {
+    // Decode regime (trip_count == 1): inline path engages exactly once and is
+    // byte-identical to the loop over every output.
+    let (loop_out, loop_count) = run_scan_inline_graph(1, false);
+    let (inline_out, inline_count) = run_scan_inline_graph(1, true);
+    assert_eq!(loop_count, 0, "flag OFF must never engage the inline path");
+    assert_eq!(
+        inline_count, 1,
+        "flag ON at trip_count==1 must engage the inline path exactly once"
+    );
+    assert_eq!(
+        inline_out, loop_out,
+        "single-trip inline output must be byte-exact with the loop path"
+    );
+
+    // Prefill regime (trip_count == 3): even with the flag ON the inline path
+    // must NOT engage (runtime-keyed, not a static rewrite), and the output must
+    // still match the loop.
+    let (prefill_loop, prefill_loop_count) = run_scan_inline_graph(3, false);
+    let (prefill_inline, prefill_inline_count) = run_scan_inline_graph(3, true);
+    assert_eq!(prefill_loop_count, 0, "loop path never counts");
+    assert_eq!(
+        prefill_inline_count, 0,
+        "flag ON must NOT inline a prefill (trip_count>1) Scan — the shared-plan tripwire"
+    );
+    assert_eq!(
+        prefill_inline, prefill_loop,
+        "prefill output must be identical flag-on vs flag-off"
+    );
+}

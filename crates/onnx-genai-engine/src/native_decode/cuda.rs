@@ -121,6 +121,14 @@ pub(crate) struct DecodeCudaState {
     pub(crate) bindings: Vec<DeviceIoBinding>,
     pub(crate) base_binding_count: usize,
     pub(crate) kv_binding_range: std::ops::Range<usize>,
+    /// Bindings for fixed-size recurrent/conv states (hybrid linear-attention
+    /// `conv_state`/`recurrent_state`). Unlike growable KV — which is masked and
+    /// tracked by `logical_len`, so stale slots are inert — these are wholesale
+    /// rolling caches with no masking. They are zero-initialized once in `new()`;
+    /// `rewind(0)` must re-zero them so a reused session starts every generation
+    /// from the declared `init: zeros` state (see `rewind`). Empty for pure-KV
+    /// decoders.
+    pub(crate) fixed_state_binding_range: std::ops::Range<usize>,
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
@@ -235,17 +243,36 @@ struct CapturedStepInputBinding {
     byte_len: usize,
 }
 
-/// Whether the Inc3c captured per-step-input path is opted in via
-/// `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`. Default off keeps the eager
-/// owned path byte-identical; truthy (`1`/`true`/`yes`/`on`) enables capture of
-/// the `inputs_embeds`/routed decode step.
+/// Whether the Inc3c captured per-step-input path is enabled. It is now
+/// **default-on** (the CUDA-graph capture perf win for multi-component/routed
+/// decoders): a capture-eligible `inputs_embeds`/routed decode step reuses the
+/// persistent bindings + `run_one_token` graph instead of paying the eager
+/// per-step kernel-launch cost. The env var
+/// `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` is an **opt-out** escape
+/// hatch: a falsy value (`0`/`false`/`no`/`off`) forces the eager owned path.
+/// Any other value (including unset or truthy) keeps capture on. Structural
+/// eligibility gates (`graph_enabled`, non-empty `captured_step_inputs`) still
+/// decide whether an individual decoder actually captures, so an ineligible
+/// decoder auto-declines to eager regardless of this flag.
 fn capture_step_inputs_enabled() -> bool {
-    match std::env::var("ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS") {
-        Ok(value) => matches!(
+    capture_step_inputs_from_env_value(
+        std::env::var("ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure opt-out parse for `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`.
+/// Capture is **default-on**: only an explicit falsy value
+/// (`0`/`false`/`no`/`off`, case/whitespace-insensitive) opts out to eager;
+/// unset (`None`) or any other value keeps capture enabled.
+fn capture_step_inputs_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+            "0" | "false" | "no" | "off"
         ),
-        Err(_) => false,
+        None => true,
     }
 }
 
@@ -384,11 +411,13 @@ impl NativeDecodeSession {
         // keeps that byte-identical path. Inc3a introduced this for embeds; Inc3b
         // generalizes it to arbitrary routed ports via one shared owned build.
         if self.has_eager_step_inputs() {
-            // Inc3c: when opted in and this is a single-token decode step, drive
-            // the per-step ports through their persistent device bindings + the
-            // captured `run_one_token` state machine (recovering the graph-capture
-            // fast path lost to the eager owned uploads). Otherwise (default, or
-            // multi-token prefill) use the eager owned path.
+            // Inc3c: for a single-token decode step, drive the per-step ports
+            // through their persistent device bindings + the captured
+            // `run_one_token` state machine (recovering the graph-capture fast
+            // path lost to the eager owned uploads). This is default-on for
+            // capture-eligible decoders (`state.capture_step_inputs`); multi-token
+            // prefill, an ineligible decoder, or the `…CAPTURE_STEP_INPUTS=0`
+            // opt-out use the eager owned path.
             let capture = token_ids.len() == 1
                 && self
                     .cuda
@@ -1105,6 +1134,7 @@ impl DecodeCudaState {
             )?;
             bindings.push(binding);
         }
+        let fixed_state_end = bindings.len();
 
         let logits_meta = session
             .outputs()
@@ -1386,11 +1416,16 @@ impl DecodeCudaState {
         }
         let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
 
-        // Inc3c: enable the captured per-step-input path only when (a) the
-        // operator opted in via `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`,
-        // (b) the decoder actually has per-step supplied ports (embeds/routed),
-        // and (c) graph capture is structurally available. Off by default keeps
-        // the eager owned path byte-identical.
+        // Inc3c: enable the captured per-step-input path when (a) graph capture
+        // is structurally available (`graph_enabled`), (b) the decoder actually
+        // has per-step supplied ports (embeds/routed), and (c) the opt-out env
+        // `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` is not falsy. This is
+        // now **default-on**: a capture-eligible multi-component decoder reuses
+        // the `run_one_token` graph instead of the eager owned uploads. The
+        // structural gates (a)/(b) still auto-decline ineligible decoders (a
+        // growing-logical binding or a mask exposed to a non-capacity-aware
+        // consumer clears `graph_enabled`), so default-on never captures a wrong
+        // decoder; the eager owned path stays as the byte-identical fallback.
         let capture_step_inputs =
             graph_enabled && !captured_step_inputs.is_empty() && capture_step_inputs_enabled();
 
@@ -1400,6 +1435,7 @@ impl DecodeCudaState {
             bindings,
             base_binding_count,
             kv_binding_range: kv_start..kv_end,
+            fixed_state_binding_range: kv_end..fixed_state_end,
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
@@ -1477,12 +1513,171 @@ impl DecodeCudaState {
         Ok(())
     }
 
+    /// Whether every self-attention KV binding is a rank-4 CUDA cache
+    /// (`[1, num_kv_heads, max_len, head_dim]`) in a dtype the paged store can
+    /// round-trip losslessly — `f32` (GAP-3 Inc-D) or `f16` (GAP-3 Inc-D.1). The
+    /// host paged store is `f32`; ORT already widens `f16` present-KV to `f32`
+    /// when mirroring and narrows back on inject (`kv_bridge::mirror_present_kv_to_pages`
+    /// / `load_materialized_past`), and the native read/seed use the same `half`
+    /// convert ([`kv_dtype_to_f32`] / [`f32_slice_to_dtype_bytes`]), so the
+    /// f16→f32→f16 round-trip is bit-exact and byte-comparable against ORT.
+    ///
+    /// `bf16`, non-rank-4, and in-place / CPU-resident caches stay gated to the
+    /// non-paged fallback (Inc-D.2 and later) — no silent-wrong paged run.
+    pub(crate) fn kv_bindings_paged_rank4(&self) -> bool {
+        let range = self.kv_binding_range.clone();
+        if range.is_empty() {
+            return false;
+        }
+        self.bindings[range].iter().all(|binding| {
+            matches!(binding.dtype, DataType::Float32 | DataType::Float16)
+                && binding.physical_shape().len() == 4
+        })
+    }
+
+    /// Read the most recent step's accumulated present KV out of the device
+    /// binding whose past-input port is `past_name`, as a host f32 buffer plus
+    /// the shape whose row-major strides address it (GAP-3 Inc-D).
+    ///
+    /// The buffer returned is the FULL capacity-padded allocation
+    /// (`[1, H, max_len, head_dim]`), and the shape returned is the matching
+    /// **physical/capacity** shape — see [`device_present_kv_view`] for why the
+    /// physical (not logical valid) shape is the one that correctly strides the
+    /// padded buffer. The caller slices out the freshly-decoded tokens with the
+    /// same `extract_present_token` geometry the host-growable and ORT paths use,
+    /// so all three mirror byte-identical pages.
+    ///
+    /// Runs after the decode step's own device→host sync (the KV bindings hold
+    /// the committed present KV once the step returns), so no extra
+    /// synchronization is required here — this is a pure post-step reader,
+    /// mirroring the per-step logits read in [`Self::read_logits`].
+    ///
+    /// The binding may be `f32` (Inc-D) or `f16` (Inc-D.1); the raw device bytes
+    /// are widened to `f32` with the same `half` convert ORT uses
+    /// ([`kv_dtype_to_f32`]) so the mirrored pages are byte-identical to ORT's.
+    pub(crate) fn read_present_kv(
+        &mut self,
+        past_name: &str,
+    ) -> anyhow::Result<Option<(Vec<f32>, Vec<usize>)>> {
+        let Some(index) = self
+            .kv_binding_range
+            .clone()
+            .find(|&idx| self.bindings[idx].input_name() == past_name)
+        else {
+            return Ok(None);
+        };
+        let binding = &mut self.bindings[index];
+        let dtype = binding.dtype;
+        let physical_shape = binding.physical_shape().to_vec();
+        let bytes = binding
+            .read_bytes()
+            .with_context(|| format!("read device present KV for '{past_name}'"))?;
+        let tensor = Tensor::from_raw(dtype, physical_shape.clone(), &bytes)
+            .with_context(|| format!("interpret device present KV bytes for '{past_name}'"))?;
+        let values = kv_dtype_to_f32(&tensor)
+            .with_context(|| format!("widen device present KV for '{past_name}' to f32"))?;
+        Ok(Some(device_present_kv_view(
+            values,
+            &physical_shape,
+            binding.logical_shape(),
+        )))
+    }
+
+    /// Seed a materialized paged prefix into the device KV bindings so a request
+    /// that shares a prompt prefix resumes without recomputing it (GAP-3 Inc-D
+    /// device counterpart of the host-growable [`NativeDecodeSession::seed_growable_kv`]).
+    ///
+    /// `entries` are `(past_input_name, row_major_f32, [1, H, seq_len, head_dim])`
+    /// triples — the same compact prefix layout the host path seeds. Because the
+    /// device buffer is capacity-strided (`max_len`) while the prefix is compact
+    /// (`seq_len`), each head is written into its own capacity-offset slot rather
+    /// than as one contiguous blob. The attention-mask prefix `[0, seq_len)` is
+    /// marked attendable (the per-step decode only extends `[seq_len, total)`),
+    /// and the KV logical length is advanced so the next step appends at
+    /// `seq_len`.
+    pub(crate) fn seed_prefix(
+        &mut self,
+        session: &mut InferenceSession,
+        entries: &[(String, Vec<f32>, Vec<usize>)],
+        seq_len: usize,
+    ) -> anyhow::Result<()> {
+        if seq_len == 0 {
+            bail!("device paged prefix reuse requires a non-empty prefix");
+        }
+        self.ensure_capacity(session, seq_len)?;
+        for (name, data, shape) in entries {
+            let Some(index) = self
+                .kv_binding_range
+                .clone()
+                .find(|&idx| self.bindings[idx].input_name() == name)
+            else {
+                bail!("device paged prefix names unknown KV past input '{name}'");
+            };
+            let binding = &mut self.bindings[index];
+            let dtype = binding.dtype;
+            let elem_size = dtype.checked_storage_bytes(1).with_context(|| {
+                format!("device paged prefix KV '{name}' has unsized dtype {dtype:?}")
+            })?;
+            let physical = binding.physical_shape().to_vec();
+            let heads = physical[1];
+            let head_dim = physical[3];
+            let max_len = physical[2];
+            let expected = vec![1_usize, heads, seq_len, head_dim];
+            if shape != &expected {
+                bail!(
+                    "device paged prefix KV '{name}' shape {shape:?} does not match the binding's \
+                     [1, {heads}, {seq_len}, {head_dim}] capacity layout"
+                );
+            }
+            if data.len() != heads * seq_len * head_dim {
+                bail!(
+                    "device paged prefix KV '{name}' has {} values, expected {}",
+                    data.len(),
+                    heads * seq_len * head_dim
+                );
+            }
+            let compact_head_stride = seq_len * head_dim;
+            let capacity_head_stride = max_len * head_dim;
+            for head in 0..heads {
+                let compact = &data[head * compact_head_stride..(head + 1) * compact_head_stride];
+                // Narrow the f32 paged prefix back to the binding's dtype with the
+                // same `half` convert ORT injects with, so f16 seed bytes are the
+                // exact inverse of the f16→f32 read-out (bit-exact round-trip).
+                let bytes = f32_slice_to_dtype_bytes(dtype, compact)?;
+                binding.write_bytes(head * capacity_head_stride * elem_size, &bytes)?;
+            }
+        }
+        self.set_logical_len(seq_len)?;
+        let expose = self.decode_mask_expose_len(seq_len);
+        self.extend_mask(0, seq_len, expose)?;
+        Ok(())
+    }
+
     pub(crate) fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len < self.logical_len {
             let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
             self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
         }
         self.bindings[0].set_logical_shape(vec![1, target_len])?;
+        if target_len == 0 {
+            // Fixed-size recurrent/conv states are unmasked rolling caches: a
+            // reused session would otherwise inherit the previous generation's
+            // terminal state, corrupting generation #2+. A full reset restores
+            // the declared `init: zeros`. Speculative recurrent rewind to a
+            // non-zero length is unsupported (mirrors the CPU path), so only the
+            // reset boundary re-zeros here.
+            for index in self.fixed_state_binding_range.clone() {
+                let binding = &self.bindings[index];
+                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                    .with_context(|| {
+                        format!(
+                            "fixed CUDA decoder state re-zero size overflow for binding {index} shape {:?}",
+                            binding.physical_shape()
+                        )
+                    })?;
+                native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            }
+        }
         self.set_logical_len(target_len)
     }
 
@@ -2069,4 +2264,118 @@ pub(crate) fn cuda_device_memory_snapshot(
     _device_id: i32,
 ) -> anyhow::Result<CudaDeviceMemorySnapshot> {
     bail!("CUDA free-memory query requires the onnx-genai-engine `cuda` feature")
+}
+
+/// Pair a capacity-padded device KV read-out with the shape whose row-major
+/// strides address it. Returns the **physical/capacity** shape
+/// (`[1, H, max_len, head_dim]`), NOT the logical valid shape
+/// (`[1, H, valid_len, head_dim]`).
+///
+/// The device buffer is allocated at `max_len` in the sequence axis and never
+/// re-packed, so the head-axis stride is `max_len * head_dim`. Feeding the
+/// logical valid shape to [`extract_present_token`] would instead compute a head
+/// stride of `valid_len * head_dim` and, whenever `max_len > valid_len` and
+/// `H > 1`, silently read the wrong head rows (the sequence and head-dim strides
+/// coincide at `H == 1`, so the bug is invisible for single-head caches). This is
+/// the one device-specific geometry decision Inc-D adds on top of the Inc-C host
+/// mirror; [`device_kv_view_uses_physical_stride`] pins it at `H == 2`.
+fn device_present_kv_view(
+    buffer: Vec<f32>,
+    physical_shape: &[usize],
+    _logical_shape: &[usize],
+) -> (Vec<f32>, Vec<usize>) {
+    (buffer, physical_shape.to_vec())
+}
+
+#[cfg(test)]
+mod device_kv_view_tests {
+    use super::device_present_kv_view;
+    use crate::kv_bridge::extract_present_token;
+    use onnx_genai_kv::{KvDType, PageTensorConfig};
+
+    /// A capacity-padded KV buffer read from a device binding must be addressed by
+    /// its **physical** shape, not its logical valid length. This reproduces the
+    /// exact production read+extract composition at `H == 2, max_len=4, valid=2`
+    /// (the geometry is invisible at the `H == 1` integration fixture) and proves
+    /// the physical stride recovers the two valid heads while the logical stride —
+    /// the Inc-D-specific "max_len wrinkle" bug — reads the padding instead.
+    #[test]
+    fn device_kv_view_uses_physical_stride() {
+        let heads = 2usize;
+        let max_len = 4usize;
+        let valid = 2usize;
+        let head_dim = 2usize;
+        // Row-major [1, H, max_len, head_dim]; valid tokens carry distinctive
+        // values, padded tail carries a sentinel that must never be read back.
+        let mut buffer = vec![-999.0f32; heads * max_len * head_dim];
+        for head in 0..heads {
+            for seq in 0..valid {
+                for dim in 0..head_dim {
+                    let value = (head as f32 + 1.0) * 100.0 + seq as f32 * 10.0 + dim as f32;
+                    buffer[head * max_len * head_dim + seq * head_dim + dim] = value;
+                }
+            }
+        }
+        let physical = vec![1usize, heads, max_len, head_dim];
+        let logical = vec![1usize, heads, valid, head_dim];
+        let config = PageTensorConfig {
+            num_layers: 1,
+            num_kv_heads: heads,
+            head_dim,
+            page_size: 1,
+            dtype: KvDType::F32,
+        };
+
+        // Production view: physical shape.
+        let (data, shape) = device_present_kv_view(buffer.clone(), &physical, &logical);
+        assert_eq!(shape, physical, "device view must carry the physical shape");
+        let shape_i64 = shape.iter().map(|&d| d as i64).collect::<Vec<_>>();
+        let token0 = extract_present_token(&data, &shape_i64, config, 0).unwrap();
+        let token1 = extract_present_token(&data, &shape_i64, config, 1).unwrap();
+        assert_eq!(token0, vec![100.0, 101.0, 200.0, 201.0]);
+        assert_eq!(token1, vec![110.0, 111.0, 210.0, 211.0]);
+
+        // The logical valid shape (the max_len wrinkle bug) reads padding for the
+        // second head — so a physical→logical mutation of the production view
+        // diverges here, keeping the reader non-vacuous at H >= 2.
+        let logical_i64 = logical.iter().map(|&d| d as i64).collect::<Vec<_>>();
+        let wrong0 = extract_present_token(&buffer, &logical_i64, config, 0).unwrap();
+        assert_ne!(
+            wrong0, token0,
+            "logical-stride read must diverge from the physical-stride read at H >= 2"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_step_inputs_gate_tests {
+    use super::capture_step_inputs_from_env_value;
+
+    /// Capture is default-on: an unset env keeps the graph-capture perf path.
+    #[test]
+    fn unset_env_defaults_to_capture_on() {
+        assert!(capture_step_inputs_from_env_value(None));
+    }
+
+    /// The opt-out escape hatch: only explicit falsy values force eager.
+    #[test]
+    fn falsy_values_opt_out_to_eager() {
+        for value in ["0", "false", "no", "off", " OFF ", "False", "No"] {
+            assert!(
+                !capture_step_inputs_from_env_value(Some(value)),
+                "{value:?} must opt out to the eager owned path"
+            );
+        }
+    }
+
+    /// Truthy or unrecognized values keep capture on (default-on, opt-out only).
+    #[test]
+    fn truthy_and_unknown_values_keep_capture_on() {
+        for value in ["1", "true", "yes", "on", "", "anything"] {
+            assert!(
+                capture_step_inputs_from_env_value(Some(value)),
+                "{value:?} must keep capture on"
+            );
+        }
+    }
 }

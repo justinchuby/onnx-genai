@@ -76,11 +76,67 @@ impl NodeStatusFetcher for HttpStatusFetcher {
             })?
             .to_bytes();
 
-        serde_json::from_slice(&body).map_err(|source| FetchError::Decode {
+        parse_status(address, &body)
+    }
+}
+
+/// Parses one `/v1/status` body, refusing a status that omits a field the
+/// router steers on.
+///
+/// Separate from [`HttpStatusFetcher::fetch`] so it can be tested on raw bytes.
+/// Testing the omission rule through a hand-built `NodeStatus` would prove
+/// nothing: by the time a `NodeStatus` exists, serde has ALREADY substituted
+/// the zero this function exists to prevent.
+fn parse_status(address: &str, body: &[u8]) -> Result<NodeStatus, FetchError> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(body).map_err(|source| FetchError::Decode {
             address: address.to_string(),
             source,
-        })
+        })?;
+
+    // An omitted load-bearing field is a MISSING MEASUREMENT, and serde's
+    // `default` turns it into `0` -- the single most attractive value the
+    // scorer can see. Treated as a miss instead, reusing the health machinery
+    // that already exists for a node that did not answer at all.
+    if let Some(field) = missing_load_bearing_field(&raw) {
+        return Err(FetchError::Decode {
+            address: address.to_string(),
+            source: serde::de::Error::custom(format!(
+                "`{field}` is absent from /v1/status; a node that cannot \
+                 measure itself is counted as a missed poll, because \
+                 defaulting it to zero would make it the most attractive \
+                 routing target on the fleet"
+            )),
+        });
     }
+
+    serde_json::from_value(raw).map_err(|source| FetchError::Decode {
+        address: address.to_string(),
+        source,
+    })
+}
+
+/// Status fields the router actually STEERS ON.
+///
+/// Deliberately NOT every field. `tokens_per_second`, `batch_utilization` and
+/// the session arrays are observability: losing them costs a graph, and
+/// refusing a whole status over one of them would take a node out of service
+/// for a field no routing decision reads. These two are different --
+/// `kv_usage` gates the overload check AND prefix affinity, `queue_depth` is
+/// the other scoring term -- so a zero in either does not degrade routing, it
+/// INVERTS it.
+const LOAD_BEARING_STATUS_FIELDS: [&str; 2] = ["kv_usage", "queue_depth"];
+
+/// The first load-bearing field this status does not actually report.
+///
+/// `null` counts as absent: it deserialises to the same default as omission,
+/// so treating it differently here would leave the identical hole open under a
+/// different spelling.
+fn missing_load_bearing_field(raw: &serde_json::Value) -> Option<&'static str> {
+    let object = raw.as_object()?;
+    LOAD_BEARING_STATUS_FIELDS
+        .into_iter()
+        .find(|field| !object.get(*field).is_some_and(|value| !value.is_null()))
 }
 
 /// Run a single poll pass over every configured node. Exposed (not just used by
@@ -421,5 +477,116 @@ mod tests {
         assert_eq!(by_id("10.0.0.3-8000").consecutive_misses, 0);
         // The failing node recorded a miss.
         assert_eq!(by_id("10.0.0.2-8000").consecutive_misses, 1);
+    }
+
+    /// A status that omits `kv_usage` must NOT be accepted as `kv_usage: 0.0`.
+    ///
+    /// Zero is below every overload threshold and is the minimum of any
+    /// candidate set, so the defaulted value does not merely lose information
+    /// -- it makes the node that cannot measure itself the most attractive
+    /// target on the fleet. Losing telemetry would attract load.
+    #[test]
+    fn an_omitted_load_bearing_field_is_not_a_zero_reading() {
+        for field in ["kv_usage", "queue_depth"] {
+            let mut body = serde_json::json!({
+                "node_id": "n1",
+                "healthy": true,
+                "kv_usage": 0.9,
+                "queue_depth": 40,
+            });
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                missing_load_bearing_field(&body),
+                Some(field),
+                "omitting {field} must be reported as a missing measurement"
+            );
+        }
+    }
+
+    /// `null` deserialises to the same default as omission.
+    #[test]
+    fn a_null_load_bearing_field_is_also_missing() {
+        let body = serde_json::json!({
+            "node_id": "n1",
+            "kv_usage": serde_json::Value::Null,
+            "queue_depth": 0,
+        });
+        assert_eq!(missing_load_bearing_field(&body), Some("kv_usage"));
+    }
+
+    /// The control that keeps this fix from becoming an outage.
+    ///
+    /// Observability fields are NOT load-bearing: refusing a whole status
+    /// because a graph is missing would take a healthy node out of service
+    /// over a field no routing decision reads.
+    #[test]
+    fn a_status_missing_only_observability_fields_is_still_accepted() {
+        let body = serde_json::json!({
+            "node_id": "n1",
+            "kv_usage": 0.5,
+            "queue_depth": 2,
+        });
+        assert_eq!(
+            missing_load_bearing_field(&body),
+            None,
+            "tokens_per_second, batch_utilization and the session arrays are \
+             absent here and none of them steer routing"
+        );
+        let status: NodeStatus =
+            serde_json::from_value(body).expect("the status still deserialises");
+        assert!((status.kv_usage - 0.5).abs() < 1e-6);
+        assert_eq!(status.queue_depth, 2);
+    }
+
+    /// End-to-end over the REAL parse path, on raw bytes.
+    ///
+    /// The unit tests above call the predicate directly, which cannot see
+    /// whether it is wired into anything. This one goes through the function
+    /// `fetch` actually calls, so deleting the check reddens it.
+    #[test]
+    fn a_body_omitting_kv_usage_is_refused_by_the_parser() {
+        let body = br#"{"node_id":"n1","healthy":true,"queue_depth":3}"#;
+        let error = parse_status("10.0.0.1:8000", body)
+            .expect_err("a status with no kv_usage must not parse into kv_usage: 0.0");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("kv_usage"),
+            "the refusal must name the field: {rendered}"
+        );
+
+        // The whole point: serde WOULD have accepted it, silently, as the most
+        // attractive score on the fleet.
+        let defaulted: NodeStatus =
+            serde_json::from_slice(body).expect("serde accepts it by design");
+        assert_eq!(
+            defaulted.kv_usage, 0.0,
+            "this is the value the router would have steered on"
+        );
+    }
+
+    /// The control at the same level: a complete body still parses.
+    #[test]
+    fn a_complete_body_still_parses() {
+        let body = br#"{"node_id":"n1","kv_usage":0.75,"queue_depth":9}"#;
+        let status = parse_status("10.0.0.1:8000", body).expect("a complete status is accepted");
+        assert_eq!(status.node_id, "n1");
+        assert!((status.kv_usage - 0.75).abs() < 1e-6);
+        assert_eq!(status.queue_depth, 9);
+    }
+
+    /// A zero that the node ACTUALLY REPORTED is a measurement and must be
+    /// honoured -- an idle node is genuinely the best target.
+    #[test]
+    fn an_explicit_zero_is_a_measurement_not_a_miss() {
+        let body = serde_json::json!({
+            "node_id": "n1",
+            "kv_usage": 0.0,
+            "queue_depth": 0,
+        });
+        assert_eq!(
+            missing_load_bearing_field(&body),
+            None,
+            "the node said zero; that is the honest best score, not an absence"
+        );
     }
 }

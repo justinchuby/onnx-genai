@@ -27,3 +27,31 @@ before its referenced buffers. Reset, rewind, multi-token/prefill shape changes,
 binding address/shape changes, and session drop invalidate it. A later
 generation warms and captures a fresh executable; a live executable is never
 reused across generations or incompatible bindings.
+
+## Multi-component / routed decoders (step-inputs capture, default-on)
+
+A multi-component pipeline decoder (e.g. gemma-3n / gemma4-e2b, and the
+GQA layers of the 35B-A3B class) consumes per-step `inputs_embeds` and/or routed
+ports supplied by upstream components (the embedding model) each decode step.
+The captured single-token fast path (`run_one_token`) writes those one-token
+tensors into **persistent** device bindings instead of rebuilding owned uploads,
+so the routed decode step reuses the captured graph exactly like a plain
+token-id decode — recovering the graph-capture perf that the eager owned-input
+path forfeits.
+
+This path is **on by default** for capture-eligible decoders. The environment
+variable `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` is an **opt-out escape
+hatch**:
+
+- unset (or any truthy/unrecognized value) — capture-on (the default);
+- `0` / `false` / `no` / `off` — force the eager owned-input path.
+
+The structural eligibility gates still apply: a decoder whose bindings expose a
+growing logical prefix, or whose attention mask is exposed to a non-capacity-aware
+consumer (e.g. a GLM-style indexer), clears `graph_enabled` and **auto-declines
+to the eager path** regardless of this flag, so default-on never captures an
+ineligible decoder and never changes tokens. Recurrent Scan / LinearAttention
+hybrids decline through the same structural gate until their capture lane lands.
+The process-global counter `NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES`
+increments once per captured routed decode step, providing a non-vacuous
+capture-hit signal for tests.

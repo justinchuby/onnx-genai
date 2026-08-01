@@ -14,7 +14,64 @@ fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
     .and_then(|metadata| metadata.model.and_then(|model| model.max_sequence_length))
 }
 
+/// Resolve a model directory's [`InferenceMetadata`] using the same precedence
+/// as the engine's directory loader: a native `inference_metadata.{yaml,yml,json}`
+/// sidecar first, then onnxruntime-genai `genai_config.json` compatibility
+/// synthesis. Returns `None` when neither is present so callers fall back to
+/// shape-based I/O inference exactly as before.
+fn resolve_io_metadata_from_model_path(
+    path: &Path,
+) -> Option<onnx_genai_metadata::InferenceMetadata> {
+    let root = if path.is_dir() { path } else { path.parent()? };
+    if let Some(metadata) = [
+        "inference_metadata.yaml",
+        "inference_metadata.yml",
+        "inference_metadata.json",
+    ]
+    .iter()
+    .map(|name| root.join(name))
+    .find(|path| path.is_file())
+    .and_then(|path| onnx_genai_metadata::load_metadata(&path).ok())
+    {
+        return Some(metadata);
+    }
+    let genai_config = root.join("genai_config.json");
+    if genai_config.is_file() {
+        return crate::engine::genai_config_compat_metadata_from_model_path(
+            Some(genai_config.as_path()),
+            path,
+        )
+        .ok()
+        .flatten();
+    }
+    None
+}
+
 impl NativeDecodeSession {
+    /// Load a decoder-with-past model, resolving its [`ModelIoSpec`] from an
+    /// adjacent `inference_metadata.{yaml,yml,json}` sidecar or (for
+    /// onnxruntime-genai packages) `genai_config.json`, so genai_config decoders
+    /// bind their token input from metadata instead of guessing from ambiguous
+    /// tensor shapes. This is the observability entry point used by measurement
+    /// tools so CUDA-graph capture counters and `--trace` reject reasons surface
+    /// for genai_config decoders. Capture semantics are identical to [`load`]:
+    /// `graph_capture` stays auto-decided and no defaults change; only I/O
+    /// resolution is threaded.
+    ///
+    /// [`load`]: NativeDecodeSession::load
+    pub fn load_with_resolved_io(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let metadata = resolve_io_metadata_from_model_path(path);
+        let io = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.model.as_ref())
+            .and_then(|model| model.io.as_ref());
+        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+    }
+
     pub(crate) fn load_with_weight_offload_host_cache(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
@@ -220,11 +277,103 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options_and_io(session, cuda_options, None)
     }
 
+    /// Best-effort auto-derived [`ModelIoSpec`] for a stock export whose sidecar
+    /// declares no `io` block, built purely from the session's graph ports.
+    ///
+    /// Reuses the guarded genai-config derivation
+    /// ([`GenAiConfig::derive_decoder_io_from_graph`]) so recurrent
+    /// `conv_state`/`recurrent_state` ports are classified as loop-carried
+    /// `state_pairs` and never confused with growable KV. Returns `None` (leaving
+    /// the caller's `io = None` shape-inference path untouched) unless the
+    /// derivation yields at least one recurrent state pair — the exact case the
+    /// shape-inference path cannot resolve. Non-KV ports (token/mask/position/
+    /// logits) are bound by conventional-name presence in the graph interface.
+    fn derive_fallback_io(session: &InferenceSession) -> Option<ModelIoSpec> {
+        let to_graph_tensor =
+            |meta: &onnx_runtime_session::IoMeta| onnx_genai_genai_config::GraphTensorInfo {
+                name: meta.name.clone(),
+                dtype: crate::engine::ir_dtype_name(meta.dtype).to_owned(),
+                dimensions: meta
+                    .shape
+                    .iter()
+                    .map(|dim| match dim {
+                        Dim::Static(value) => Some(*value),
+                        Dim::Symbolic(_) => None,
+                    })
+                    .collect(),
+            };
+        let graph = onnx_genai_genai_config::ModelGraphInfo {
+            inputs: session.inputs().iter().map(to_graph_tensor).collect(),
+            outputs: session.outputs().iter().map(to_graph_tensor).collect(),
+        };
+        let derived = onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph)?;
+        // Safety gate: only the recurrent-hybrid case the shape-inference path
+        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
+        if derived.state_pairs.is_empty() {
+            return None;
+        }
+        let input_names: HashSet<&str> = session
+            .inputs()
+            .iter()
+            .map(|meta| meta.name.as_str())
+            .collect();
+        let output_names: HashSet<&str> = session
+            .outputs()
+            .iter()
+            .map(|meta| meta.name.as_str())
+            .collect();
+        let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
+        let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
+        let state_pairs = derived
+            .state_pairs
+            .into_iter()
+            .map(|pair| LoopStatePair {
+                input: pair.input,
+                output: pair.output,
+                init: Some("zeros".to_owned()),
+                update: Some("replace".to_owned()),
+            })
+            .collect::<Vec<_>>();
+        Some(ModelIoSpec {
+            sequence_source: None,
+            kv_ownership: None,
+            token_input: present_input("input_ids"),
+            inputs_embeds_input: None,
+            attention_mask_input: present_input("attention_mask"),
+            position_ids_input: present_input("position_ids"),
+            logits_output: present_output("logits"),
+            hidden_output: None,
+            kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
+            kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
+            encoder_hidden_states_input: None,
+            audio_features_input: None,
+            cross_kv_inputs: None,
+            cross_kv_outputs: None,
+            kv_update: None,
+            state_pairs: Some(state_pairs),
+            optional_inputs: BTreeMap::new(),
+            static_cache: None,
+        })
+    }
+
     fn from_session_with_cuda_options_and_io(
         mut session: InferenceSession,
         cuda_options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
     ) -> anyhow::Result<Self> {
+        // Auto-derive a decoder I/O spec from the graph ports when the model
+        // package declares none. Declared `io` always wins; this fallback is
+        // additive and engages ONLY for hybrid linear-attention decoders (models
+        // exposing recurrent `conv_state`/`recurrent_state` state pairs the
+        // shape-inference path cannot classify). Pure-dense decoders derive no
+        // state pairs and keep their existing `io = None` load path unchanged, so
+        // no currently-loadable model changes behavior. See #384.
+        let derived_io: Option<ModelIoSpec> = if io.is_none() {
+            Self::derive_fallback_io(&session)
+        } else {
+            None
+        };
+        let io = io.or(derived_io.as_ref());
         let mut io_span = onnx_genai_ort::prof_span!("native.inspect_decode_io");
         let input_names = session
             .inputs()

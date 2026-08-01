@@ -1287,65 +1287,61 @@ impl Executor {
                 scan_slices.push(Tensor::from_raw(input.dtype, shape, &bytes)?);
             }
         }
-        for step in 0..trip_count {
-            if step != 0 {
-                for (index, (((input, &axis), &direction), slice)) in scan_inputs
-                    .iter()
-                    .zip(&input_axes)
-                    .zip(&input_directions)
-                    .zip(scan_slices.iter_mut())
-                    .enumerate()
-                {
-                    let source_index = if direction == 0 {
-                        step
-                    } else {
-                        trip_count - 1 - step
-                    };
-                    let (_, bytes) = scan_slice(input, axis, source_index, index)?;
-                    slice.overwrite_bytes(&bytes)?;
-                }
-            }
-            let mut formal: Vec<&Tensor> = Vec::with_capacity(num_state + num_scan_inputs);
-            formal.extend(state.iter());
-            formal.extend(scan_slices.iter());
-
-            let outs = self.run_subgraph(&prepared, &formal)?;
-            drop(formal);
-            let expected = num_state + num_scan_outputs;
-            if outs.len() != expected {
-                return Err(SessionError::OutputShapeCountMismatch {
-                    op: "Scan/body".to_string(),
-                    expected,
-                    got: outs.len(),
-                });
-            }
-            let mut it = outs.into_iter();
-            let next_state: Vec<Tensor> = (&mut it).take(num_state).collect();
-            for (index, (tensor, (expected_dtype, expected_shape))) in
-                next_state.iter().zip(&state_specs).enumerate()
-            {
-                if tensor.dtype != *expected_dtype {
-                    return Err(SessionError::ControlFlow {
-                        op: "Scan".to_string(),
-                        reason: format!(
-                            "state output {index} dtype mismatch: expected {expected_dtype:?}, got {:?}",
-                            tensor.dtype
-                        ),
-                    });
-                }
-                if tensor.shape != *expected_shape {
-                    return Err(SessionError::ControlFlow {
-                        op: "Scan".to_string(),
-                        reason: format!(
-                            "state output {index} shape mismatch: expected {expected_shape:?}, got {:?}",
-                            tensor.shape
-                        ),
-                    });
-                }
-            }
+        // Runtime dual-path (slice 1a). A single-trip Scan — trip_count == 1, the
+        // per-token decode regime — runs its body ONCE straight-line under the
+        // opt-in `scan_inline_single_trip_enabled` flag, instead of the generic
+        // loop. The selection is keyed on the RUNTIME trip_count, never the graph:
+        // prefill (trip_count = prompt_len > 1) and decode (trip_count == 1) share
+        // this same executor/plan, so a static single-trip rewrite would corrupt
+        // prefill. Flag OFF, or any trip_count other than 1, takes the unchanged
+        // loop path below. Both regimes drive the body through the identical
+        // `run_scan_body_step` and share the finishing code that follows, so the
+        // inline path is byte-exact with a one-iteration loop by construction.
+        if self.scan_inline_single_trip_enabled && trip_count == 1 {
+            self.scan_inline_single_trip_count += 1;
+            let (next_state, scan_outs) = self.run_scan_body_step(
+                &prepared,
+                &state,
+                &scan_slices,
+                num_state,
+                num_scan_outputs,
+                &state_specs,
+            )?;
             state = next_state;
-            for acc in scan_acc.iter_mut() {
-                acc.push(it.next().expect("scan output present"))?;
+            for (acc, tensor) in scan_acc.iter_mut().zip(scan_outs) {
+                acc.push(tensor)?;
+            }
+        } else {
+            for step in 0..trip_count {
+                if step != 0 {
+                    for (index, (((input, &axis), &direction), slice)) in scan_inputs
+                        .iter()
+                        .zip(&input_axes)
+                        .zip(&input_directions)
+                        .zip(scan_slices.iter_mut())
+                        .enumerate()
+                    {
+                        let source_index = if direction == 0 {
+                            step
+                        } else {
+                            trip_count - 1 - step
+                        };
+                        let (_, bytes) = scan_slice(input, axis, source_index, index)?;
+                        slice.overwrite_bytes(&bytes)?;
+                    }
+                }
+                let (next_state, scan_outs) = self.run_scan_body_step(
+                    &prepared,
+                    &state,
+                    &scan_slices,
+                    num_state,
+                    num_scan_outputs,
+                    &state_specs,
+                )?;
+                state = next_state;
+                for (acc, tensor) in scan_acc.iter_mut().zip(scan_outs) {
+                    acc.push(tensor)?;
+                }
             }
         }
 
@@ -1369,6 +1365,64 @@ impl Executor {
             )?;
         }
         Ok(())
+    }
+
+    /// Run the `Scan` body once for the current formal inputs (carried state
+    /// followed by this step's scan-input slices), validate the body's output
+    /// count and the carried-state dtype/shape invariants, and split the result
+    /// into the next carried state and this step's scan outputs. Shared verbatim
+    /// by the generic multi-trip loop and the single-trip inline dual-path so the
+    /// two body-execution regimes can never diverge — the sole guarantee behind
+    /// slice 1a's byte-exactness.
+    fn run_scan_body_step(
+        &mut self,
+        prepared: &PreparedSubgraph,
+        state: &[Tensor],
+        scan_slices: &[Tensor],
+        num_state: usize,
+        num_scan_outputs: usize,
+        state_specs: &[(DataType, Vec<usize>)],
+    ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let mut formal: Vec<&Tensor> = Vec::with_capacity(state.len() + scan_slices.len());
+        formal.extend(state.iter());
+        formal.extend(scan_slices.iter());
+
+        let outs = self.run_subgraph(prepared, &formal)?;
+        drop(formal);
+        let expected = num_state + num_scan_outputs;
+        if outs.len() != expected {
+            return Err(SessionError::OutputShapeCountMismatch {
+                op: "Scan/body".to_string(),
+                expected,
+                got: outs.len(),
+            });
+        }
+        let mut it = outs.into_iter();
+        let next_state: Vec<Tensor> = (&mut it).take(num_state).collect();
+        for (index, (tensor, (expected_dtype, expected_shape))) in
+            next_state.iter().zip(state_specs).enumerate()
+        {
+            if tensor.dtype != *expected_dtype {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "state output {index} dtype mismatch: expected {expected_dtype:?}, got {:?}",
+                        tensor.dtype
+                    ),
+                });
+            }
+            if tensor.shape != *expected_shape {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "state output {index} shape mismatch: expected {expected_shape:?}, got {:?}",
+                        tensor.shape
+                    ),
+                });
+            }
+        }
+        let scan_outs: Vec<Tensor> = it.collect();
+        Ok((next_state, scan_outs))
     }
 }
 

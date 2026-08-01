@@ -26,7 +26,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::DataType;
 
-use crate::runtime::{CudaRuntime, raw_ptr};
+use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 
 /// Process-global weight-offload activity counters. Every [`CudaWeightResidency`]
 /// updates these in addition to its own instance stats, so an end-to-end decode
@@ -71,14 +71,47 @@ pub const WEIGHT_OFFLOAD_ENV: &str = onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV;
 /// manager is constructed with a caller-chosen default.
 pub const WEIGHT_OFFLOAD_DEVICE_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES";
 
+/// Sub-knob (default OFF / opt-IN) selecting the asynchronous, fence-ordered
+/// residency page-in over the synchronous `cuMemcpyHtoD`. Set to a truthy value
+/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to enable async page-in;
+/// unset or any other value uses the synchronous page-in. Async is opt-in because
+/// a measured A/B (qwen3-0.6b-int4, 96MiB budget, eviction/thrash regime) showed
+/// sync is FASTER (15.84 vs 12.16 tok/s): when every admit evicts, the async path
+/// cannot overlap and still pays a non-overlappable pinned-staging alloc+copy. The
+/// async path stays fully intact behind this flag (the A/B "after" arm) and is
+/// expected to become a net win once a warm-host materialize cache lands. This
+/// knob only has any effect when weight offload itself is enabled
+/// (`ONNX_GENAI_WEIGHT_OFFLOAD=1`); with offload off the resident fast path is
+/// untouched and byte-identical regardless.
+pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN";
+
+/// Pure opt-in parse for [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is
+/// **default-off**: only an explicit truthy value (`1`/`true`/`yes`/`on`,
+/// case/whitespace-insensitive) enables it; unset (`None`) or any other value
+/// keeps the synchronous page-in.
+pub(crate) fn async_pagein_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DeviceOffloadPolicy {
     pub enabled: bool,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
     pub device_budget_bytes: Option<u64>,
+    /// Use the asynchronous, fence-ordered page-in (default `false` / opt-IN).
+    /// Enabled only when `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is set to a
+    /// truthy value (`1`/`true`/`yes`/`on`); otherwise the synchronous page-in
+    /// is used, which is faster in the eviction/thrash regime (measured A/B).
+    pub async_pagein: bool,
 }
 
 impl DeviceOffloadPolicy {
@@ -88,9 +121,16 @@ impl DeviceOffloadPolicy {
         let device_budget_bytes = std::env::var(WEIGHT_OFFLOAD_DEVICE_BYTES_ENV)
             .ok()
             .and_then(|value| parse_budget_bytes(&value));
+        // Async page-in defaults OFF (opt-in); only an explicit truthy value enables it.
+        let async_pagein = async_pagein_from_env_value(
+            std::env::var(WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV)
+                .ok()
+                .as_deref(),
+        );
         Self {
             enabled,
             device_budget_bytes,
+            async_pagein,
         }
     }
 }
@@ -134,6 +174,11 @@ pub struct CudaWeightPage {
     len: usize,
     dtype: DataType,
     shape: Vec<usize>,
+    /// Owned pinned host staging that backed an asynchronous page-in, kept alive
+    /// so an in-flight `cuMemcpyHtoDAsync` never reads freed host memory. `None`
+    /// for pages uploaded synchronously (the source is fully consumed before
+    /// `htod` returns). Freed on drop — long after the copy has completed.
+    staging: Option<PinnedStaging>,
 }
 
 impl CudaWeightPage {
@@ -158,12 +203,66 @@ impl CudaWeightPage {
             len: bytes.len(),
             dtype,
             shape,
+            staging: None,
         };
         // SAFETY: `ptr` owns `bytes.len()` bytes; `page`'s Drop frees it if the
         // copy below fails.
         unsafe { runtime.htod(bytes, ptr) }
             .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
         Ok(page)
+    }
+
+    /// Asynchronous, overlap-friendly variant of [`Self::upload`]: allocate a
+    /// VRAM page and enqueue a host→device copy of `bytes` on the runtime's
+    /// dedicated transfer stream, returning the page plus a **copy fence** the
+    /// caller MUST order the consuming compute work after (via
+    /// [`CudaRuntime::compute_wait_fence`]). Because the copy is asynchronous,
+    /// the source bytes are first staged into a page-locked buffer that the
+    /// returned [`CudaWeightPage`] owns, so the transfer keeps reading valid host
+    /// memory until it completes — the staging outlives the page's whole life,
+    /// which itself outlives any consumer ordered after the fence. Frees the VRAM
+    /// (and staging) on any failure.
+    pub fn upload_async(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+    ) -> Result<(Self, u64), WeightHandleError> {
+        if bytes.is_empty() {
+            return Err(WeightHandleError::MissingRegions);
+        }
+        let ptr = runtime
+            .alloc_raw(bytes.len())
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        let mut staging = runtime
+            .alloc_pinned(bytes.len())
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
+        staging.as_mut_slice().copy_from_slice(bytes);
+        // Own both the VRAM `ptr` and the pinned `staging` before enqueuing the
+        // copy, so any error below drops `page` and frees both exactly once.
+        let page = Self {
+            runtime: Arc::clone(runtime),
+            ptr,
+            len: bytes.len(),
+            dtype,
+            shape,
+            staging: Some(staging),
+        };
+        // SAFETY: `dst` (`ptr`) owns `len` bytes; the async source is the pinned
+        // staging `page` owns, which outlives the transfer (freed only on the
+        // page's Drop, well after the copy fence has been awaited).
+        let staged = page
+            .staging
+            .as_ref()
+            .expect("staging was just set")
+            .as_slice();
+        unsafe { runtime.htod_async(staged, ptr) }.map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("async H2D copy: {error}"))
+        })?;
+        let fence = runtime
+            .record_copy_fence()
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("copy fence: {error}")))?;
+        Ok((page, fence))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -251,6 +350,7 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
             len: total,
             dtype: weight.dtype,
             shape: weight.shape.clone(),
+            staging: None,
         };
 
         let mut offset: usize = 0;
@@ -292,8 +392,21 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
 ///
 /// A single weight larger than the whole budget is still paged in (correctness
 /// beats the budget); the cache simply runs transiently over budget for it.
+///
+/// Page-in defaults to the asynchronous, fence-ordered path
+/// ([`CudaWeightPage::upload_async`]): the H2D copy is enqueued on the runtime's
+/// dedicated transfer stream so it overlaps the in-flight compute, and the
+/// consuming compute stream is ordered after it with a completion fence. The
+/// full compute-stream drain is now taken **only when admitting must evict** (so
+/// eviction never frees a page a prior kernel still reads); a page-in that fits
+/// the budget no longer host-blocks, which is what lets the transfer overlap.
+/// Set `async_pagein = true` (env `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1`) to
+/// opt into the asynchronous page-in for A/B comparison; the synchronous page-in
+/// is the default (faster in the eviction/thrash regime, measured A/B).
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
+    /// Whether misses page in asynchronously (see [`CudaWeightPage::upload_async`]).
+    async_pagein: bool,
     inner: Mutex<ResidencyInner>,
 }
 
@@ -310,10 +423,12 @@ struct ResidencyInner {
 }
 
 impl CudaWeightResidency {
-    /// Build a residency cache with an explicit VRAM `budget_bytes`.
+    /// Build a residency cache with an explicit VRAM `budget_bytes`. Page-in is
+    /// synchronous by default; chain [`Self::with_async_pagein`] to opt into async.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         Self {
             runtime,
+            async_pagein: false,
             inner: Mutex::new(ResidencyInner {
                 budget: budget_bytes,
                 resident_bytes: 0,
@@ -325,6 +440,12 @@ impl CudaWeightResidency {
                 pages: HashMap::new(),
             }),
         }
+    }
+
+    /// Select the asynchronous (default `true`) vs synchronous page-in path.
+    pub fn with_async_pagein(mut self, async_pagein: bool) -> Self {
+        self.async_pagein = async_pagein;
+        self
     }
 
     /// Return the device page for `key`, paging it in from `source` on a miss and
@@ -360,62 +481,107 @@ impl CudaWeightResidency {
             return Ok(hit);
         }
         let resident = weight.materialize()?;
-        let page = Arc::new(CudaWeightPage::upload(
-            &self.runtime,
-            resident.dtype,
-            resident.shape.clone(),
-            resident.bytes(),
-        )?);
-        self.admit(key, page)
+        if self.async_pagein {
+            // Async, fence-ordered page-in: enqueue the H2D on the transfer stream
+            // (overlapping the in-flight compute), admit, then order the compute
+            // stream after the transfer's completion event so the consuming kernel
+            // waits only on the copy — never a full host sync.
+            let (page, copy_fence) = CudaWeightPage::upload_async(
+                &self.runtime,
+                resident.dtype,
+                resident.shape.clone(),
+                resident.bytes(),
+            )?;
+            let admitted = self.admit(key, Arc::new(page))?;
+            self.runtime
+                .compute_wait_fence(copy_fence)
+                .map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!("copy fence wait: {error}"))
+                })?;
+            Ok(admitted)
+        } else {
+            // Legacy synchronous page-in (A/B "before" arm / kill-switch): the
+            // blocking `htod` serializes the transfer with compute.
+            let page = Arc::new(CudaWeightPage::upload(
+                &self.runtime,
+                resident.dtype,
+                resident.shape.clone(),
+                resident.bytes(),
+            )?);
+            self.admit(key, page)
+        }
     }
 
     /// Look up `key`, marking it most-recently-used and counting a hit.
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
         if let Some(page) = inner.pages.get(&key).cloned() {
-            inner.touch(key);
-            inner.hits += 1;
-            GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+            inner.record_hit(key);
             Some(page)
         } else {
             None
         }
     }
 
+    /// Drain the transfer stream so a just-uploaded page we are about to drop
+    /// cannot have an in-flight async copy still reading its (freeing) VRAM or
+    /// pinned staging. A no-op for synchronously-uploaded pages (idle copy stream).
+    fn drain_copy_stream(&self) -> Result<(), WeightHandleError> {
+        self.runtime.sync_copy_stream().map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("transfer stream sync: {error}"))
+        })
+    }
+
     /// Insert a freshly paged-in `page` under `key`, evicting LRU pages to fit the
-    /// budget. Synchronizes the compute stream first so no in-flight kernel still
-    /// references an about-to-be-freed page's VRAM. (Offload is mutually exclusive
-    /// with CUDA graph capture, so this sync is never capture-illegal.)
+    /// budget.
+    ///
+    /// The compute stream is drained **only when admitting must evict**, so no
+    /// in-flight kernel still references an about-to-be-freed page's VRAM (the
+    /// original WAR/reuse guarantee). A page-in that fits the budget frees nothing
+    /// and therefore skips the sync, letting its async transfer overlap the
+    /// current compute. (Offload is mutually exclusive with CUDA graph capture, so
+    /// this sync is never capture-illegal.)
     fn admit(
         &self,
         key: u64,
         page: Arc<CudaWeightPage>,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
         let bytes = page.len() as u64;
-        // Weight offload and CUDA graph capture are mutually exclusive: the decode
-        // session declines capture whenever offload is enabled (see
-        // `resolve_graph_capture_enabled`), so paging never runs during capture.
-        // The synchronize below — and the alloc/copy/free it guards against — are
-        // themselves capture-illegal, so we can unconditionally sync here.
+        {
+            let mut inner = self.lock();
+            // A concurrent caller may have populated `key` while we paged in;
+            // prefer the already-resident page and drop ours (its Drop frees the
+            // VRAM + staging — drained first so it never races an in-flight copy).
+            if let Some(existing) = inner.pages.get(&key).cloned() {
+                inner.record_hit(key);
+                drop(inner);
+                self.drain_copy_stream()?;
+                return Ok(existing);
+            }
+            // Fits without eviction: nothing is freed, so no consumer drain is
+            // needed. Admit directly so the async transfer keeps overlapping.
+            if inner.resident_bytes.saturating_add(bytes) <= inner.budget {
+                inner.insert_page(key, Arc::clone(&page), bytes);
+                return Ok(page);
+            }
+        }
+        // Eviction required: drain in-flight consumers before freeing any page.
+        // Weight offload and CUDA graph capture are mutually exclusive (the decode
+        // session declines capture whenever offload is enabled), so this
+        // synchronize is never capture-illegal.
         self.runtime
             .synchronize()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
         let mut inner = self.lock();
-        // A concurrent caller may have populated `key` while we paged in; prefer
-        // the already-resident page and drop ours (its Drop frees the VRAM).
+        // Re-check after releasing the lock for the sync.
         if let Some(existing) = inner.pages.get(&key).cloned() {
-            inner.touch(key);
-            inner.hits += 1;
-            GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+            inner.record_hit(key);
+            drop(inner);
+            self.drain_copy_stream()?;
             return Ok(existing);
         }
         inner.evict_to_fit(bytes);
-        inner.pages.insert(key, Arc::clone(&page));
-        inner.order.push(key);
-        inner.resident_bytes += bytes;
-        inner.peak_resident_bytes = inner.peak_resident_bytes.max(inner.resident_bytes);
-        inner.page_ins += 1;
-        GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+        inner.insert_page(key, Arc::clone(&page), bytes);
         Ok(page)
     }
 
@@ -458,6 +624,25 @@ impl ResidencyInner {
         }
     }
 
+    /// Record a cache hit for `key`: mark it most-recently-used and bump the
+    /// per-instance and process-global hit counters.
+    fn record_hit(&mut self, key: u64) {
+        self.touch(key);
+        self.hits += 1;
+        GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the LRU
+    /// order, residency accounting, and the page-in counters.
+    fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64) {
+        self.pages.insert(key, page);
+        self.order.push(key);
+        self.resident_bytes += bytes;
+        self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
+        self.page_ins += 1;
+        GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Evict least-recently-used, currently-unreferenced pages until admitting
     /// `incoming` bytes fits the budget (best effort; stops when nothing more is
     /// evictable).
@@ -495,6 +680,24 @@ mod tests {
         let policy = DeviceOffloadPolicy::default();
         assert!(!policy.enabled);
         assert_eq!(policy.device_budget_bytes, None);
+        // Async page-in is opt-in: the default policy uses the synchronous path.
+        assert!(!policy.async_pagein);
+    }
+
+    #[test]
+    fn async_pagein_env_is_opt_in() {
+        // Unset => synchronous (default off).
+        assert!(!async_pagein_from_env_value(None));
+        // Truthy spellings enable async, case/whitespace-insensitive.
+        assert!(async_pagein_from_env_value(Some("1")));
+        assert!(async_pagein_from_env_value(Some("true")));
+        assert!(async_pagein_from_env_value(Some("YES")));
+        assert!(async_pagein_from_env_value(Some("  On ")));
+        // Explicit falsey / anything else stays synchronous.
+        assert!(!async_pagein_from_env_value(Some("0")));
+        assert!(!async_pagein_from_env_value(Some("false")));
+        assert!(!async_pagein_from_env_value(Some("")));
+        assert!(!async_pagein_from_env_value(Some("maybe")));
     }
 
     #[test]

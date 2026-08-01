@@ -795,7 +795,14 @@ fn run_static_batch_until_idle(
                         });
                     }
                 }
-                command => deferred.push_back(command),
+                // MUST stay above the catch-all: anything this returns `None`
+                // for has been answered, and anything it hands back is parked
+                // until the batch drains.
+                command => {
+                    if let Some(deferred_command) = handle_or_defer_during_batch(engine, command) {
+                        deferred.push_back(deferred_command);
+                    }
+                }
             }
         }
 
@@ -883,6 +890,30 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
             )
         })
         .count()
+}
+
+/// Decides what the static-batch loop does with a command that is not a new
+/// generation: `None` means it was answered here and now, `Some` means it is
+/// parked until the batch drains.
+///
+/// Read-only observability must be answered here. `/v1/resources` exists to
+/// report on a running batch, so deferring its snapshot makes it readable only
+/// when there is no batch left to report on -- the request appears to hang for
+/// the entire duration of every in-flight generation.
+///
+/// Commands that *reconfigure* engine state are deferred until the batch drains by design.
+/// Only read-only observability is answered immediately here.
+pub(crate) fn handle_or_defer_during_batch(
+    engine: &Engine,
+    command: DriverCommand,
+) -> Option<DriverCommand> {
+    match command {
+        DriverCommand::ResourceSnapshot(reply) => {
+            let _ = reply.send(Ok(engine.resource_snapshot()));
+            None
+        }
+        other => Some(other),
+    }
 }
 
 fn submit_to_continuous_manager(

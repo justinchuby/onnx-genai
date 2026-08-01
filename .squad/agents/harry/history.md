@@ -29,3 +29,8 @@
 
 - PR #540 merged (requested by Justin): cloning an ORT cached `Value` now covers ALL POD dtypes via one dtype-agnostic raw-byte fallback — do not re-add per-dtype bail arms. `decode/values.rs::clone_value` and `onnx-genai-ort::value.rs::clone_owned` terminal arms use `Value::from_raw_bytes(value.as_raw_bytes()?.to_vec(), shape, dtype)` (typed f32/f16/bf16/i64 fast paths kept). 11 tests.
 - Rule: use `as_raw_bytes()` (host-guarded — precise `InvalidArgument` on a device tensor), NEVER `to_raw_bytes()` (reads the data pointer blind). Unblocks the gemma-3n Bool audio mask.
+
+## 2026-07-31T08:48:28Z — #544 test deterministic fix; independent APPROVE #554
+
+- Revised #544 flaky `async_pagein_fence_orders_weight_page_in_consumer` test (bf345904): root cause was the NEGATIVE poison-arm — pure wall-clock race. Fix: event-orders negative transfer after consumer via `record_compute_fence`+`copy_wait_fence`. Test green 5/5 parallel, fails 3/3 without the fix. Production code unchanged.
+- Independent APPROVE for PR #554 (Mary's session-reuse recurrent-state fix). MERGED.

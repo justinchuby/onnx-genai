@@ -189,22 +189,75 @@ pub(crate) fn tensor_from_f32_as(
 ) -> anyhow::Result<Tensor> {
     match dtype {
         DataType::Float32 => Ok(Tensor::from_f32(shape, values)?),
-        DataType::Float16 => {
-            let bytes = values
-                .iter()
-                .flat_map(|value| half::f16::from_f32(*value).to_bits().to_le_bytes())
-                .collect::<Vec<_>>();
-            Ok(Tensor::from_raw(dtype, shape.to_vec(), &bytes)?)
-        }
-        DataType::BFloat16 => {
-            let bytes = values
-                .iter()
-                .flat_map(|value| half::bf16::from_f32(*value).to_bits().to_le_bytes())
-                .collect::<Vec<_>>();
+        DataType::Float16 | DataType::BFloat16 => {
+            let bytes = f32_slice_to_dtype_bytes(dtype, values)?;
             Ok(Tensor::from_raw(dtype, shape.to_vec(), &bytes)?)
         }
         other => bail!(
             "native embeddings input must be Float32, Float16, or BFloat16, got {other:?}; fix io.inputs_embeds_input or export a floating tensor"
+        ),
+    }
+}
+
+/// Encode `values` as the little-endian storage bytes for `dtype`, using the
+/// `half` crate for the 16-bit narrowing so the result is bit-identical to the
+/// ORT KV-inject path (`onnx_genai_ort::Value::from_f32_slice_as`,
+/// `crates/onnx-genai-ort/src/value.rs`). Sharing this one encoder keeps the
+/// native embedding-input path (`tensor_from_f32_as`) and the device paged
+/// present-KV seed (`DecodeCudaState::seed_prefix`, GAP-3 Inc-D.1) byte-for-byte
+/// aligned with ORT — the whole basis of the paged-KV byte-equality oracle.
+pub(crate) fn f32_slice_to_dtype_bytes(dtype: DataType, values: &[f32]) -> anyhow::Result<Vec<u8>> {
+    match dtype {
+        DataType::Float32 => Ok(values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()),
+        DataType::Float16 => Ok(values
+            .iter()
+            .flat_map(|value| half::f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()),
+        DataType::BFloat16 => Ok(values
+            .iter()
+            .flat_map(|value| half::bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()),
+        other => bail!(
+            "cannot encode f32 values as {other:?} storage bytes; expected Float32, Float16, or BFloat16"
+        ),
+    }
+}
+
+/// Widen a device-resident KV read-out to `f32` using the `half` crate's
+/// vectorized slice conversion (hardware F16C when available), matching ORT's
+/// present-KV mirror path (`onnx_genai_ort::Value::to_vec_f32_lossy`,
+/// `crates/onnx-genai-ort/src/value.rs`) bit-for-bit. IEEE f16→f32 is an exact
+/// widening, so both paths land identical `f32` bits in the shared host paged
+/// store — the paged-KV byte-equality oracle (GAP-3 Inc-C/D/D.1) depends on this
+/// convert being the *same* routine ORT uses, not a hand-rolled bit-twiddle.
+///
+/// Only `f32` (Inc-D) and `f16` (Inc-D.1) rank-4 CUDA GQA caches reach here;
+/// `bf16` and other dtypes stay gated to the non-paged fallback
+/// ([`DecodeCudaState::kv_bindings_paged_rank4`]) and are rejected defensively.
+pub(crate) fn kv_dtype_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+    match tensor.dtype {
+        DataType::Float32 => Ok(tensor.to_vec_f32()),
+        DataType::Float16 => {
+            use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+            if let Some(bits) = tensor.try_as_slice_u16() {
+                let halves: &[half::f16] = bits.reinterpret_cast();
+                Ok(halves.to_f32_vec())
+            } else {
+                Ok(tensor
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+                    })
+                    .collect())
+            }
+        }
+        other => bail!(
+            "device present KV must be Float32 or Float16 to mirror into the f32 paged store \
+             (bf16 / non-rank-4 stay gated to the non-paged path), got {other:?}"
         ),
     }
 }
@@ -364,4 +417,87 @@ pub(crate) fn diagnose_native_failure(session: &InferenceSession, error: &str) -
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod kv_convert_tests {
+    use super::{f32_slice_to_dtype_bytes, kv_dtype_to_f32};
+    use onnx_runtime_ir::DataType;
+    use onnx_runtime_session::Tensor;
+
+    fn f16_tensor(bits: &[u16]) -> Tensor {
+        let bytes: Vec<u8> = bits.iter().flat_map(|bit| bit.to_le_bytes()).collect();
+        Tensor::from_raw(DataType::Float16, vec![bits.len()], &bytes)
+            .expect("build f16 tensor from bits")
+    }
+
+    /// The device f16 present-KV read-out ([`kv_dtype_to_f32`]) must widen with
+    /// the exact same `half` routine ORT's paged mirror uses
+    /// (`onnx_genai_ort::Value::to_vec_f32_lossy`,
+    /// `crates/onnx-genai-ort/src/value.rs`, whose Float16 arm calls
+    /// `half::slice::HalfFloatSliceExt::to_f32_vec`). Asserting equality against
+    /// the reference `half::f16::to_f32` pins the native read-out to ORT's exact
+    /// rounding — the whole basis of the paged-KV byte-equality oracle. A
+    /// hand-rolled bit-twiddle that diverged on a subnormal / max-normal would
+    /// fail here.
+    #[test]
+    fn kv_f16_widen_matches_half_reference() {
+        // 0, ±small dyadics, a subnormal, and the f16 max-normal (65504).
+        let seeds = [0.0f32, 0.5, 1.0, -2.25, 65504.0, 6.103_515_6e-5];
+        let bits: Vec<u16> = seeds
+            .iter()
+            .map(|value| half::f16::from_f32(*value).to_bits())
+            .collect();
+        let widened = kv_dtype_to_f32(&f16_tensor(&bits)).expect("widen f16 KV");
+        let reference: Vec<f32> = bits
+            .iter()
+            .map(|bit| half::f16::from_bits(*bit).to_f32())
+            .collect();
+        assert_eq!(
+            widened, reference,
+            "f16 KV widening must match the half crate (== ORT to_vec_f32_lossy) exactly"
+        );
+    }
+
+    /// f16 -> f32 (read) -> f16 (seed) must be bit-exact for every finite f16
+    /// value, because the source IS f16: widening is exact and the subsequent
+    /// narrowing (`f32_slice_to_dtype_bytes`, the same `half::f16::from_f32` ORT
+    /// injects with) reproduces the original bits. Covers all subnormals,
+    /// normals, ±0, and ±inf; NaN payloads are excluded (narrowing canonicalizes
+    /// them). Guards the reuse-seed path from a lossy round-trip.
+    #[test]
+    fn kv_f16_roundtrip_is_bit_exact() {
+        let bits: Vec<u16> = (0..=u16::MAX)
+            .filter(|bit| !half::f16::from_bits(*bit).is_nan())
+            .collect();
+        let source_bytes: Vec<u8> = bits.iter().flat_map(|bit| bit.to_le_bytes()).collect();
+        let widened = kv_dtype_to_f32(&f16_tensor(&bits)).expect("widen f16 KV");
+        let reencoded =
+            f32_slice_to_dtype_bytes(DataType::Float16, &widened).expect("narrow f32 back to f16");
+        assert_eq!(
+            reencoded, source_bytes,
+            "f16 -> f32 -> f16 round-trip must be bit-exact for f16-origin values"
+        );
+    }
+
+    /// f32 KV stays a pass-through (no dtype change) so the Inc-D f32 device path
+    /// is unaffected by the Inc-D.1 dtype branch.
+    #[test]
+    fn kv_f32_widen_is_identity() {
+        let values = [1.5f32, -0.25, 12345.0];
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let tensor = Tensor::from_raw(DataType::Float32, vec![values.len()], &bytes)
+            .expect("build f32 tensor");
+        assert_eq!(
+            kv_dtype_to_f32(&tensor).expect("widen f32 KV"),
+            values.to_vec()
+        );
+        assert_eq!(
+            f32_slice_to_dtype_bytes(DataType::Float32, &values).expect("encode f32 KV"),
+            bytes
+        );
+    }
 }

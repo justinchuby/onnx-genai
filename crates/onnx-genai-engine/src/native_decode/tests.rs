@@ -467,6 +467,185 @@ fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
     InferenceSession::from_graph(graph).expect("build tiny decoder")
 }
 
+/// A tiny hybrid decoder mirroring `tiny_decoder` but adding a recurrent
+/// linear-attention layer: layer 0 carries `conv_state`/`recurrent_state`
+/// (fixed loop-carried state, threaded past→present by `Identity`), layer 1 is
+/// dense GQA (`key`/`value`). All ports use the conventional
+/// `past_key_values.%d.*` / `present.%d.*` names, so the loader's graph-derived
+/// I/O fallback can classify them without a declared `io:` block.
+fn tiny_hybrid_decoder() -> InferenceSession {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 11);
+    let batch = graph.intern_symbol("batch");
+    let sequence = graph.intern_symbol("sequence");
+    let total = graph.intern_symbol("total");
+    let past = graph.intern_symbol("past");
+    let shape = |dims: &[Dim]| -> Shape { dims.to_vec() };
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        shape(&[batch.into(), total.into()]),
+    );
+    let position_ids = graph.create_named_value(
+        "position_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    // Layer 0: recurrent state ports (fixed-extent, replaced each step).
+    let conv_state = graph.create_named_value(
+        "past_key_values.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    let recurrent_state = graph.create_named_value(
+        "past_key_values.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    // Layer 1: dense GQA KV ports (growable along seq).
+    let past_key = graph.create_named_value(
+        "past_key_values.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    let past_value = graph.create_named_value(
+        "past_key_values.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    for input in [
+        input_ids,
+        attention_mask,
+        position_ids,
+        conv_state,
+        recurrent_state,
+        past_key,
+        past_value,
+    ] {
+        graph.add_input(input);
+    }
+
+    let cast = graph.create_value(DataType::Float32, shape(&[batch.into(), sequence.into()]));
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![input_ids],
+        cast,
+        &[("to", Attribute::Int(1))],
+    );
+    let current_kv = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        current_kv,
+        &[("axes", Attribute::Ints(vec![1, 3]))],
+    );
+
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        logits,
+        &[("axes", Attribute::Ints(vec![2]))],
+    );
+
+    // Recurrent state: replaced wholesale (Identity pass-through here).
+    let present_conv = graph.create_named_value(
+        "present.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    insert_op(&mut graph, "Identity", vec![conv_state], present_conv, &[]);
+    let present_recurrent = graph.create_named_value(
+        "present.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Identity",
+        vec![recurrent_state],
+        present_recurrent,
+        &[],
+    );
+    // Dense KV: appended along the sequence axis.
+    let present_key = graph.create_named_value(
+        "present.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_key, current_kv],
+        present_key,
+        &[("axis", Attribute::Int(2))],
+    );
+    let present_value = graph.create_named_value(
+        "present.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_value, current_kv],
+        present_value,
+        &[("axis", Attribute::Int(2))],
+    );
+    for output in [
+        logits,
+        present_conv,
+        present_recurrent,
+        present_key,
+        present_value,
+    ] {
+        graph.add_output(output);
+    }
+    InferenceSession::from_graph(graph).expect("build tiny hybrid decoder")
+}
+
+#[test]
+fn native_decoder_auto_derives_hybrid_state_io() {
+    // A hybrid decoder with NO declared `io:` must load via the graph-derived
+    // fallback: token/mask/position/logits bound by conventional name, dense KV
+    // for layer 1, and the layer-0 recurrent ports classified as loop-carried
+    // state pairs. This is the exact gap that blocked qwen3.x hybrids (#384).
+    NativeDecodeSession::from_session(tiny_hybrid_decoder())
+        .expect("hybrid decoder auto-derives its decoder-state io from the graph");
+}
+
+#[test]
+fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
+    // The fallback's safety gate: a pure-dense decoder derives ZERO state pairs,
+    // so auto-derive declines and the model keeps its existing shape-inference
+    // path — which still fails on the ambiguous token input exactly as before.
+    // This proves the fallback never over-fires on models that load today.
+    let error = match NativeDecodeSession::from_session(tiny_decoder(false)) {
+        Ok(_) => panic!("dense ambiguous decoder must still require explicit token_input"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("model.io.token_input"),
+        "{error:#}"
+    );
+}
+
 fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
     ModelIoSpec {
         sequence_source: Some(sequence_source),
@@ -1008,6 +1187,205 @@ fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
         .iter()
         .map(|binding| binding.device_ptr() as usize)
         .collect()
+}
+
+/// Build a synthetic single-layer CUDA decoder whose `logits` are a direct
+/// function of the *incoming* recurrent `conv_state`, and whose next state
+/// accumulates the decoded token id. Unlike `build_cuda_decoder_with_fixed_state`
+/// (where `conv_state` only passes through `Identity` and never reaches the
+/// logits, so a stale state is invisible), here a non-reset recurrent state
+/// changes the emitted logits on the next generation — the exact signature of
+/// the session-reuse corruption bug. Used by the regression test that a reused
+/// `NativeDecodeSession` re-zeros recurrent state on `reset()`.
+#[cfg(feature = "cuda")]
+fn build_cuda_recurrent_logits_decoder(max_len: usize) -> anyhow::Result<NativeDecodeSession> {
+    use prost::Message;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let total = graph.intern_symbol("total");
+    let past = graph.intern_symbol("past");
+
+    let input_ids =
+        graph.create_named_value("input_ids", DataType::Int64, vec![1.into(), 1.into()]);
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        vec![1.into(), total.into()],
+    );
+    let position_ids =
+        graph.create_named_value("position_ids", DataType::Int64, vec![1.into(), 1.into()]);
+    let past_key = graph.create_named_value(
+        "past_key_values.0.key",
+        DataType::Float32,
+        vec![1.into(), 1.into(), past.into(), 1.into()],
+    );
+    let past_value = graph.create_named_value(
+        "past_key_values.0.value",
+        DataType::Float32,
+        vec![1.into(), 1.into(), past.into(), 1.into()],
+    );
+    let conv_state = graph.create_named_value(
+        "past_key_values.0.conv_state",
+        DataType::Float16,
+        vec![1.into(), 4.into(), 3.into()],
+    );
+    for input in [
+        input_ids,
+        attention_mask,
+        position_ids,
+        past_key,
+        past_value,
+        conv_state,
+    ] {
+        graph.add_input(input);
+    }
+
+    // logits = ReduceSum(Cast(conv_state)) — depends on the INCOMING recurrent
+    // state, so a stale (non-zeroed) conv_state changes the emitted logits. Cast
+    // to f32 first: cuDNN reduction does not support Float16 inputs.
+    let conv_f32 = graph.create_named_value(
+        "conv_state_f32",
+        DataType::Float32,
+        vec![1.into(), 4.into(), 3.into()],
+    );
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![conv_state],
+        conv_f32,
+        &[("to", Attribute::Int(DataType::Float32 as i64))],
+    );
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![1.into(), 1.into(), 1.into()],
+    );
+    insert_op(
+        &mut graph,
+        "ReduceSum",
+        vec![conv_f32],
+        logits,
+        &[("keepdims", Attribute::Int(1))],
+    );
+
+    // present.0.conv_state = conv_state + Cast(input_ids) — accumulate the token
+    // id into every recurrent slot so the state grows deterministically per step.
+    let token_f16 =
+        graph.create_named_value("token_f16", DataType::Float16, vec![1.into(), 1.into()]);
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![input_ids],
+        token_f16,
+        &[("to", Attribute::Int(DataType::Float16 as i64))],
+    );
+    let present_conv_state = graph.create_named_value(
+        "present.0.conv_state",
+        DataType::Float16,
+        vec![1.into(), 4.into(), 3.into()],
+    );
+    insert_op(
+        &mut graph,
+        "Add",
+        vec![conv_state, token_f16],
+        present_conv_state,
+        &[],
+    );
+
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![1.into(), 1.into(), past.into(), 1.into()],
+    );
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![past_key],
+        present_key,
+        &[("to", Attribute::Int(DataType::Float32 as i64))],
+    );
+    let present_value = graph.create_named_value(
+        "present.0.value",
+        DataType::Float32,
+        vec![1.into(), 1.into(), past.into(), 1.into()],
+    );
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![past_value],
+        present_value,
+        &[("to", Attribute::Int(DataType::Float32 as i64))],
+    );
+
+    for output in [logits, present_key, present_value, present_conv_state] {
+        graph.add_output(output);
+    }
+
+    let model = onnx_std::Model::new(graph).to_proto()?.encode_to_vec();
+    let session = InferenceSession::builder()
+        .model_bytes(&model)
+        .device(DevicePreference::Gpu { index: Some(0) })
+        .build()
+        .context("build recurrent-logits CUDA decoder")?;
+    let mut io = tiny_decoder_io();
+    io.state_pairs = Some(vec![LoopStatePair {
+        input: "past_key_values.0.conv_state".into(),
+        output: "present.0.conv_state".into(),
+        init: Some("zeros".into()),
+        update: Some("replace".into()),
+    }]);
+    NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(session, Some(max_len), Some(&io))
+}
+
+/// Regression guard for the native-CUDA session-reuse corruption bug: a reused
+/// `NativeDecodeSession` must re-zero fixed recurrent/conv state on `reset()`,
+/// so generation #2 starts from the declared `init: zeros` — not generation #1's
+/// terminal state. Before the fix, `rewind(0)` left the recurrent binding stale
+/// and the second decode sequence produced different logits (non-deterministic
+/// degenerate output on hybrid LinearAttention models). This test is
+/// non-vacuous: the logits are a direct function of the incoming recurrent
+/// state, so a stale state changes the asserted values.
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_reused_session_rezeros_recurrent_state() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+
+    const TOKENS: [TokenId; 3] = [5, 7, 9];
+    let mut session = build_cuda_recurrent_logits_decoder(16)?;
+
+    let run_once = |session: &mut NativeDecodeSession| -> anyhow::Result<Vec<f32>> {
+        session.reset()?;
+        let mut logits = Vec::new();
+        for (position, token) in TOKENS.iter().enumerate() {
+            let step = session.decode(&[*token], position)?;
+            logits.push(step[0][0]);
+        }
+        Ok(logits)
+    };
+
+    let first = run_once(&mut session)?;
+    // The incoming recurrent state accumulates the decoded token ids, so the
+    // per-step logits form a strictly growing sequence — proving the state does
+    // flow into the logits (guards against a vacuous test).
+    assert_eq!(
+        first[0], 0.0,
+        "generation must start from zeroed recurrent state"
+    );
+    assert!(
+        first[1] > first[0] && first[2] > first[1],
+        "recurrent state must accumulate into logits: {first:?}"
+    );
+
+    let second = run_once(&mut session)?;
+    assert_eq!(
+        first, second,
+        "reused session must re-zero recurrent state on reset(): gen#1 {first:?} != gen#2 {second:?}"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]

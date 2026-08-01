@@ -1069,3 +1069,181 @@ fn expand_warmed_metadata_captures_and_matches_eager() {
     ep.deallocate(shape_buffer).unwrap();
     ep.deallocate(output_buffer).unwrap();
 }
+
+#[test]
+fn transpose_warmed_metadata_captures_and_matches_eager() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // LinearAttention decode transposes carry a fixed perm on a fixed decode
+    // shape, so the permutation metadata is stable and must survive capture.
+    let input_shape = [2usize, 1, 3];
+    let output_shape = [3usize, 2, 1];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Transpose",
+        &[input_shape.to_vec()],
+        &[output_shape.to_vec()],
+        &[("perm", Attribute::Ints(vec![2, 0, 1]))],
+    );
+
+    let data = vec![1_f32, 2., 3., 4., 5., 6.];
+    let data_bytes = raw(&data);
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let inputs = [TensorView::new(
+        DevicePtr(data_buffer.as_ptr()),
+        DataType::Float32,
+        &input_shape,
+        &input_strides,
+        device,
+    )];
+    let mut output_buffer = ep.allocate(6 * std::mem::size_of::<f32>(), 256).unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut execute = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )];
+        kernel.execute(&inputs, &mut output).unwrap();
+    };
+    // Unwarmed: the kernel must decline capture until a fixed shape is seen.
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+    // First eager run warms the fixed shape/perm signature.
+    execute();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    // Re-running eagerly reuses the cached metadata (no realloc/sync) and must
+    // still produce identical bytes.
+    execute();
+    // Capture + replay must equal the eager result byte-for-byte.
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+
+    let mut actual = vec![0; 6 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(actual, raw(&[1_f32, 4., 2., 5., 3., 6.]));
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(output_buffer).unwrap();
+}
+
+#[test]
+fn transpose_rejects_signature_change_during_capture() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // Signature A is the warmed decode shape; the persistent-metadata guard must
+    // refuse any DIFFERENT shape once a CUDA graph capture is in flight so a
+    // stale metadata buffer can never be replayed against the wrong geometry.
+    let perm = [2_i64, 0, 1];
+    let a_input_shape = [2usize, 1, 3];
+    let a_output_shape = [3usize, 2, 1];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Transpose",
+        &[a_input_shape.to_vec()],
+        &[a_output_shape.to_vec()],
+        &[("perm", Attribute::Ints(perm.to_vec()))],
+    );
+
+    let a_data = vec![1_f32, 2., 3., 4., 5., 6.];
+    let a_data_bytes = raw(&a_data);
+    let a_data_buffer = ep.allocate(a_data_bytes.len(), 256).unwrap();
+    let mut a_output_buffer = ep.allocate(6 * std::mem::size_of::<f32>(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&a_data_bytes, cuptr(a_data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let a_input_strides = compute_contiguous_strides(&a_input_shape);
+    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_inputs = [TensorView::new(
+        DevicePtr(a_data_buffer.as_ptr()),
+        DataType::Float32,
+        &a_input_shape,
+        &a_input_strides,
+        device,
+    )];
+    let mut run_a = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(a_output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &a_output_shape,
+            &a_output_strides,
+            device,
+        )];
+        kernel.execute(&a_inputs, &mut output)
+    };
+
+    // A larger, genuinely different signature B (input/output shape both change).
+    let b_input_shape = [2usize, 2, 3];
+    let b_output_shape = [3usize, 2, 2];
+    let b_data = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+    let b_data_bytes = raw(&b_data);
+    let b_data_buffer = ep.allocate(b_data_bytes.len(), 256).unwrap();
+    let mut b_output_buffer = ep.allocate(12 * std::mem::size_of::<f32>(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&b_data_bytes, cuptr(b_data_buffer.as_ptr()))
+            .unwrap();
+    }
+    let b_input_strides = compute_contiguous_strides(&b_input_shape);
+    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_inputs = [TensorView::new(
+        DevicePtr(b_data_buffer.as_ptr()),
+        DataType::Float32,
+        &b_input_shape,
+        &b_input_strides,
+        device,
+    )];
+    let mut run_b = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(b_output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &b_output_shape,
+            &b_output_strides,
+            device,
+        )];
+        kernel.execute(&b_inputs, &mut output)
+    };
+
+    // Warm signature A eagerly, then open a capture keyed on that warmed kernel.
+    run_a().unwrap();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    // Recording the warmed signature A into the graph is fine.
+    run_a().unwrap();
+    // Feeding a DIFFERENT signature mid-capture must be rejected, not silently
+    // replayed against the stale metadata buffer.
+    let err = run_b().expect_err("signature change during capture must be rejected");
+    assert!(
+        err.to_string()
+            .contains("changed during CUDA graph capture"),
+        "unexpected error message: {err}"
+    );
+    // Close the capture cleanly (it recorded only the warmed A op) and reset.
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(a_data_buffer).unwrap();
+    ep.deallocate(a_output_buffer).unwrap();
+    ep.deallocate(b_data_buffer).unwrap();
+    ep.deallocate(b_output_buffer).unwrap();
+}

@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-07-31T03:03:15Z (Scribe round 7 — rank-3 mrope native-CUDA hybrid decode == ORT landmark #543, hybrid loader-unblock #535, POD value-clone #540, capture-flag class finding #541, device weight offload #444/#63; round-6 narrative in archive)
+Last consolidated: 2026-07-31T10:24:07Z (Scribe round 9 — 27B decode profile Scan=56.5%, Scan-capture scoping PENDING JUSTIN, #554 session-reuse merged; round-8 in archive)
 
 Standing governance rules and constraints. Dated wave records and historical ledger updates
 are archived to `.squad/decisions-archive/2026-07.md`.
@@ -260,22 +260,77 @@ NEVER `to_raw_bytes()`. Unblocked the gemma-3n Bool audio mask.
   repeatable). Do NOT re-try that lever** (reduction tax > sub-wave grid-fill); a K_SPLIT>2 new
   kernel with its own A/B is the future candidate.
 
-## MoE / large-model native-CUDA status (Mary) — standing note
+## 2026-07-31 — 27B decode profile + Scan-capture scoping (round 9)
 
-- **Qwen3.6-27B int4 native-CUDA == ORT-CPU** for the first 16 greedy tokens (real weights), via
-  general fixes: rank-3 Conv1D CUDA (#438), `com.microsoft::Silu` unary shape inference, and
-  **persistent device state through control flow** (bound CF inputs made readable + CF outputs reuse
-  the external-output-aware storage so `present.*.recurrent_state` replaces `past.*`; general across
-  If/Loop/Scan). CUDA `TopK` supports fp16/bf16 router scores.
-- **Qwen3.6-35B-A3B** exports `mixture_of_experts.representation: dense_fallback` (256 experts →
-  117k decoder nodes), so it does NOT exercise the #82 routed-expert contract or #63 expert
-  offload. Efficient MoE needs a Mobius routed-expert representation + the #82 kernel contract.
+**By:** Scribe. Round-8 (#544/#552/#554/27B-A/B/GQA) → archive.
 
-## 2026-07-31 — Scribe consolidation (round 7)
+- **27B native-CUDA decode: Scan is bottleneck** (Cohaagen; profile-only): 168 ms/tok (~35× off roofline). `Scan` (48 LinearAttention blocks/step) = **56.5%**, structurally un-capturable. MatMulNBits at roofline (4.4 ms, 2%). Ceiling: **~15–30× speedup** if Scan enters capture/fuse. NOT a kernel fix.
+- **#554 MERGED** (Mary; Harry APPROVED): `DecodeCudaState.rewind(0)` re-zeroes `fixed_state_binding_range`; pure-KV models unaffected (empty range).
 
-**By:** Scribe. Wave folded into the directives above (per-PR narrative in the archive): #543/#535/
-#540/#541 plus context merges #444(#63)/#484/#480/#438 and Möbius **mobius#434** (inference-metadata
-for #377; native side complete via #382/#412). Held: **#534** (Harry, server contracts #481/#482,
-Melina APPROVED) targets Justin's branch `feat/genai-demo-dashboard` (PR #476), not on main.
-In flight: gemma-3n vision-optional text-only decode; #87 async weight prefetch (awaiting
-green-light); 35B-A3B routed-expert MoE representation.
+## ⚑ PENDING JUSTIN: 27B Scan→CUDA-capture (Mary; no code changed, awaiting go-ahead)
+
+Structurally larger than an increment — blockers: (1) shared prefill+decode plan; seq=1 inline corrupts prefill. (2) Control-flow declined at `provider.rs:458`, no trip_count exemption. (3) Child bodies never fold into parent plan.
+
+**Approach 1 — runtime dual-path** (only correct+feasible path):
+- **1a** (flag-gated): inline body into parent plan alongside Scan; runtime trip_count==1 picks body. Correctness-only, no capture.
+- **1b**: body enters capture; validate captures/replays rise; assert 27B tokens byte-identical to locked reference.
+- Blast radius: #443/#543 core. Prefill MUST be validated (shared-plan is the correctness tripwire).
+
+**Baseline + locked reference tokens ready.** Awaiting Justin go-ahead.
+In flight: #87 inc2 double-buffer; native paged-KV; 35B-A3B MoE; gemma-3n text-only.
+
+---
+
+## 2026-07-31: GAP-3 increments (#565–#568) — native paged-decode pipeline (MERGED)
+
+Last consolidated: 2026-07-31T23-33-51Z (Scribe round 10 — GAP-3 Inc-A/C/D/D.1 merged; decisions inbox consolidated).
+
+### 2026-07-31: GAP-3 Inc-A — native multi-component pipeline decode construction (#565 MERGED)
+
+**Author:** Cohaagen · **Status:** implemented, tests green, MERGED.
+
+Unblocked pure-native pipeline selection: route `PipelineBackend::Native` into the already-working flat-autoregressive decode path. Shared builder converges native-selection sources (ORT env-flag hybrid path + new backend selection) on ONE decision point `NativeComponentSelection` + identical builders. Construction no longer early-bails on native; paged is gated behind `supports_paged_kv()` (Inc-C+D). Non-paged flat-AR path unchanged. Token-exact parity: pure-native == hybrid-env == ORT on `tiny-gemma4-vlm` (CPU) and GQA on `tiny-gqa-embeds-cuda` (CUDA).
+
+Regressions all green: native-backend decoder parity + native CUDA captured-step-inputs + session-reuse + hybrid e2e + 343 lib unit tests.
+
+### 2026-07-31: GAP-3 Inc-C — native present-KV mirroring + paged native decode (#566 MERGED)
+
+**Author:** Cohaagen · **Status:** implemented, tests green, MERGED.
+
+Closed the S2 bail (`mirror_last_present_kv`). Scope: **host-resident f32 rank-4 KV only**; device-resident and in-place-GQA KV stay non-paged (Inc-D/D.1).
+
+Wired: `NativeDecodeSession` reads present-KV from growable host tensors via `host_present_kv()` + seeds materialized prefix via `seed_growable_kv()`; both driven through shared `extract_present_token`/`append_token_kv` geometry (byte-identical to ORT paged KV). Paged gate: `supports_paged_kv()` = `host_kv && rank4 && f32`. DRY: shared claim/materialize logic in `claim_paged_prefix`; native + ORT feed the same geometry.
+
+Test: `native_paged_prefix_reuse_matches_fresh_and_ort` on `tiny-gemma4-vlm` (page_size=2): warm native == cold pure-native == ORT oracle `[7,0,5]`; reuse engaged (prefix reused > 0); byte-identical pages to ORT. Non-vacuity: (a) gate revert fails reuse, (b) geometry swap (KV transpose) fails byte-assert, (c) no-op mirror fails page-collect.
+
+### 2026-07-31: GAP-3 Inc-C — test-rigor fix (Mary; authorized reviser) — NO production code change
+
+Mary rejected Inc-C: parity test was vacuous for KV geometry (argmax invariant to reused-prefix KV on `tiny-gemma4-vlm`, so key/value swap still passed tokens). Geometry-corruption mutation (b) only caught by NEW direct byte/element-equality assertion on materialized paged KV. Added `materialize_published_prefix_kv(&mut self)` test-support accessor (read-only, cfg-gated `native-backend`) and byte-comparison assertion; zero production-code edits to `native_decode/mod.rs`, `pipeline/decoder_component.rs`, `pipeline/flat_autoregressive.rs`. All 3 mutations now FAIL; green run with byte-identical pages vs ORT.
+
+### 2026-07-31: GAP-3 Inc-D — device-resident present-KV read-out + paged native CUDA decode (#567 MERGED)
+
+**Author:** Cohaagen · **Status:** implemented, tests green, MERGED.
+
+Lifted paged gate for **f32 device-resident rank-4 CUDA KV** (Inc-C only covered host). Wired: `DecodeCudaState::read_present_kv()` reads full capacity-padded device buffer (post-step, race-free) and pairs with **physical shape** `[1,H,max_len,head_dim]` (not logical); `seed_prefix()` mirrors capacity-offset writes. Critical: physical-vs-logical stride handling — the device buffer stride is `max_len*head_dim`, so feeding logical shape at `max_len > valid_len` + `H > 1` silently reads wrong head rows. Isolated in `device_present_kv_view(buffer, physical_shape, logical_shape)`.
+
+Unification: `present_kv()` + `seed_kv()` dispatch host-growable (Inc-C) vs device-CUDA by session store; both feed same `extract_present_token`/`append_token_kv` into same host f32 paged store. Test: `native_paged_prefix_reuse_matches_ort_on_cuda_device` — paged-native-CUDA warm == cold pure-native == ORT `[0,5,6,7]`; **byte-equality** of device-mirrored pages vs ORT (catches value errors, not just tokens); H=2 unit test `device_kv_view_uses_physical_stride` proves stride bug. Non-vacuity: (a) gate-revert → reused=0, (b) wrong stride → mismatch in H>1, (c) no-op mirror → page-collect fails.
+
+### 2026-07-31: GAP-3 Inc-D.1 — f16 device-resident present-KV + paged native CUDA decode (#568 MERGED)
+
+**Author:** Cohaagen · **Status:** implemented, tests green, MERGED.
+
+Real-model native paged decode. Inc-D only gated f32; every real target (Gemma4-e2b, Qwen3-30b-a3b) exports f16 device KV. Gate relaxed to `f32 || f16` (still gated → non-paged fallback on bf16, non-rank-4, in-place-CPU, sink-discontinuous). Shared `half` widen `f16→f32` via `half::slice::{reinterpret_cast, to_f32_vec}` (matching ORT `to_vec_f32_lossy`); shared narrow `f32→f16` via `half::f16::from_f32` (matching ORT `from_f32_slice_as`). Host paged store stays `Vec<f32>` (identical to ORT).
+
+Fixture: `tiny-gemma4-vlm-cuda-f16` (Concat-KV, FLOAT16 KV) — KV must be arithmetic-exact; first build used `value = key + 0.5` (f16 round-to-even midpoint, CUDA/ORT divergence); fixed to `value = key * 2` (bit-exact multiply). Test: `native_paged_prefix_reuse_matches_ort_on_cuda_device_f16` — f16 device-mirrored pages **byte-identical** to ORT via unified `half` widen (crux resolved); parity + reuse + stride (H=2) all green. 3 mutation proofs: (a) gate-revert → reused=0, (b) wrong convert (raw u16 bits) → byte-equality fails, (c) no-op mirror → reused=0. Regression: parity suite 4/4 + multimodal-reuse 14/14 + session + #541 + #543 — all green.
+
+**Remaining gaps (honestly gated):** bf16 (Inc-D.2: gate flip + fixture + widen test; verify ORT widens bf16→f32 same way); CPU in-place-GQA f32 (evaluated, not free); non-rank-4; sink-discontinuous; MoE routed-expert specifics (out of scope).
+
+### 2026-07-31: 27B Scan-capture perf lever DEFERRED — redirect to GAP-3 increment lane
+
+**By:** Coordinator (Justin away). Slice 1a (runtime dual-path single-trip inline, MERGED #564) is correctness-only, no capture. Slice 1b (inlined body enters CUDA-graph capture) requires handle-keyed multi-graph registry refactor (`CudaGraphLifecycle` singleton → registry; `graph.rs:114-122`); risk lands on working top-level GQA decode capture (2.14× eager / 1.75× ORT common-case win). Payoff is architecture-specific (recurrent/LinearAttention, e.g. 27B); higher-value lane exists: **GAP-3 Inc-A just merged → Inc-C unblocks Qwen3.6-35B-A3B MoE with real ORT oracle** (Justin target). State preserved: Mary's full 1b analysis in `feat/27b-scan-capture-1b` branch (scaffolding, counters, CUDA test, `_UNSAFE` spike flag) — parked UNMERGED. Resumption trigger: when device-graph-registry refactor prioritized; guard: GQA decode capture stays byte-exact + same tok/s.
+
+### 2026-07-31: Scan 1a — single-trip inline dual-path (#564 MERGED)
+
+**Author:** Mary · **Status:** implemented, tests green, MERGED.
+
+Slice 1a (foundation for 1b): make single-trip Scan (`trip_count==1`, decode step) execute straight-line instead of generic loop (prefill stays looped). Runtime dual-path in `exec_scan`: flag-gated `ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP` (default OFF), keyed at **execution time** on observed `trip_count`, not static rewrite (shared prefill+decode plan = correctness guarantee). Both loop and inline paths share `run_scan_body_step` + finishing code → byte-exact by construction. Counter `scan_inline_single_trip_count` (OFF=0, ON at trip_count==1). CPU byte-exact test + CUDA regression; on-model 27B (qwen3.6-27b int4, ~6.1 tok/s) token-identical flag-OFF vs flag-ON over prefill (~790 ms) and 48 decode steps. Regressions: session-reuse + async-fence + control-flow all green.

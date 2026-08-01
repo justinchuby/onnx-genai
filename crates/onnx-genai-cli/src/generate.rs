@@ -127,7 +127,8 @@ fn generate_text(
         profile.memory = memory;
     }
     let pages_before = backend.page_stats();
-    let reasoning = detect_reasoning(template.as_ref());
+    let mut reasoning = detect_reasoning(template.as_ref());
+    backend.bind_reasoning_marker_tokens(&mut reasoning);
     match run_generation_turn(
         &mut backend,
         turn,

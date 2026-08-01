@@ -225,6 +225,33 @@ attention masks, and position IDs all having rank two, or multiple same-shaped
 KV tensors—the corresponding metadata fields are required and loading fails
 with an error naming the missing field.
 
+### Graph-derived `model.io` fallback for hybrid decoders (#384)
+
+When a package declares **no** `model.io` block at all, the native loader
+attempts one additive fallback before shape inference: it derives the decoder
+I/O topology from the graph's port inventory using the conventional
+onnxruntime-genai key/value names (`past_key_values.%d.key`/`.value` →
+`present.%d.key`/`.value`). This engages **only** when the derivation finds at
+least one recurrent state pair — i.e. a hybrid linear-attention decoder that
+also exposes non-KV `conv_state`/`recurrent_state` ports (qwen3.x, incl. the
+27B). Those ports carry fixed loop-carried state that shape inference cannot
+classify, so without this fallback such stock exports fail to load natively.
+
+A declared `model.io` always wins; the fallback never overrides one. Pure-dense
+decoders derive zero state pairs, so the fallback declines and they keep the
+existing shape-inference path unchanged — no model that loads today changes its
+behavior. The derivation reuses the same guarded logic as the
+`genai_config.json` compatibility path (recurrent ports are matched by suffix,
+never misclassified as KV), with one relaxation: a `present.*` state port whose
+exported shape is fully symbolic is accepted against its concrete `past_*` input
+(a symbolic axis is unknown, not proof of a different shape).
+
+These hybrids run **eager**: their `Scan` control-flow body declines CUDA-graph
+capture, so this fallback unblocks correctness (native decode of the model
+class) independent of the capture perf lane. Correctness is validated
+byte-for-byte against the native CPU fp32 oracle (ORT-CUDA crashes on this model
+class, so there is no ORT reference).
+
 Attention representation metadata is interpreted independently of
 `model.attention.type`. In particular, `key_sequence_lengths.scalar_broadcast`
 controls the representation contract rather than selecting an implementation,

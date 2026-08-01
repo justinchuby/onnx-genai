@@ -19,3 +19,8 @@
 ## 2026-07-31T03:03:15Z — Reviewed #535 + #543 (both merged)
 
 - Reviewed #535 (hybrid loader / text-only decode synthesis) and #543 (rank-3 mrope native positions). For #543 ran the e2e parity suite: 1 passed / 0 failed, 309 conformance cases; rank-2 byte-identical; native-CUDA hybrid decode == ORT token-for-token on real qwen3.5-0.8b. Both APPROVED and MERGED this wave.
+
+## 2026-07-31T08:48:28Z — REQUEST-CHANGES then re-APPROVE #544
+
+- Initial REQUEST-CHANGES on #544: the negative poison-control arm of `async_pagein_fence_orders_weight_page_in_consumer` was racy (wall-clock race). Harry fixed by event-ordering the negative transfer after consumer.
+- Re-reviewed and APPROVED after Harry's fix (bf345904): green 5/5 parallel, non-vacuous fail 3/3. PR #544 MERGED.

@@ -6,7 +6,9 @@ use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
+use onnx_genai_metadata::{
+    KvOwnership, LoopStatePair, ModelIoSpec, SequenceInputKind, SharedKvGroup,
+};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -14,7 +16,7 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -131,6 +133,150 @@ impl NativeDecodeSession {
 
     pub fn kv_layer_count(&self) -> usize {
         self.kv_inputs.len() / 2
+    }
+
+    /// Whether this session keeps its self-attention KV as plain host tensors
+    /// that can be read out for paged present-KV mirroring and re-seeded from a
+    /// materialized paged prefix (GAP-3 Inc-C).
+    ///
+    /// True only for the host-resident *growable* CPU path: the CUDA
+    /// (device-resident) and in-place CPU-KV (`GroupQueryAttention` append)
+    /// stores do not expose a host present tensor here, and f16 / non-rank-4
+    /// caches would not round-trip losslessly through the f32 paged store — both
+    /// are deferred to Inc-D. Every declared KV past input must be a rank-4 f32
+    /// cache (`[1, num_kv_heads, seq, head_dim]`).
+    pub(crate) fn supports_host_kv_mirror(&self) -> bool {
+        if self.cuda.is_some() || self.cpu_kv.is_some() || self.kv_inputs.is_empty() {
+            return false;
+        }
+        self.kv_inputs.iter().all(|name| {
+            self.session
+                .inputs()
+                .iter()
+                .find(|meta| &meta.name == name)
+                .is_some_and(|meta| meta.dtype == DataType::Float32 && meta.shape.len() == 4)
+        })
+    }
+
+    /// Whether this session keeps its self-attention KV **device-resident** in
+    /// rank-4 CUDA bindings that can be read out for paged present-KV mirroring
+    /// and re-seeded from a materialized paged prefix — `f32` (GAP-3 Inc-D) or
+    /// `f16` (GAP-3 Inc-D.1).
+    ///
+    /// This is the device-resident counterpart of
+    /// [`supports_host_kv_mirror`](Self::supports_host_kv_mirror): it lifts the
+    /// Inc-C gate for a native CUDA decoder whose present-KV lives in device
+    /// buffers, landing that KV in the *same* host f32 paged store via the same
+    /// `extract_present_token` / `append_token_kv` geometry (a mechanical device
+    /// read-out, [`DecodeCudaState::read_present_kv`]). f16 caches are widened to
+    /// f32 with the same `half` convert ORT uses (bit-exact round-trip); `bf16`,
+    /// non-rank-4, and in-place / CPU-resident caches stay gated to the non-paged
+    /// fallback — no silent-wrong paged run.
+    pub(crate) fn supports_device_kv_mirror(&self) -> bool {
+        if self.kv_inputs.is_empty() {
+            return false;
+        }
+        self.cuda
+            .as_ref()
+            .is_some_and(DecodeCudaState::kv_bindings_paged_rank4)
+    }
+
+    /// The most recent step's accumulated present KV for one self-attention past
+    /// input, as a host f32 buffer plus the shape whose row-major strides address
+    /// it, or `None` before any step ran / when the past input is unknown.
+    ///
+    /// Unifies the host-growable path (GAP-3 Inc-C — the growable host cache the
+    /// CPU decode path leaves in `self.past`, returned with its compact
+    /// `[1, num_kv_heads, total_len, head_dim]` shape) and the device-resident
+    /// path (GAP-3 Inc-D — the capacity-padded CUDA binding, returned with its
+    /// physical `[1, num_kv_heads, max_len, head_dim]` shape). In both cases the
+    /// caller slices out the freshly-decoded tokens with the same
+    /// `extract_present_token` geometry the ORT decoder uses, so all three paths
+    /// mirror byte-identical pages.
+    pub(crate) fn present_kv(
+        &mut self,
+        past_name: &str,
+    ) -> anyhow::Result<Option<(Vec<f32>, Vec<usize>)>> {
+        if let Some(cuda) = self.cuda.as_mut() {
+            return cuda.read_present_kv(past_name);
+        }
+        Ok(self.host_present_kv(past_name))
+    }
+
+    /// The most recent step's accumulated present KV for one self-attention past
+    /// input, as a host f32 buffer plus its `[1, num_kv_heads, total_len,
+    /// head_dim]` shape, or `None` before any step ran. Reads the growable host
+    /// cache the CPU decode path leaves in `self.past` keyed by the past-input
+    /// name; the caller slices out the freshly-decoded tokens with the same
+    /// `extract_present_token` geometry the ORT decoder uses.
+    pub(crate) fn host_present_kv(&self, past_name: &str) -> Option<(Vec<f32>, Vec<usize>)> {
+        self.past
+            .get(past_name)
+            .map(|tensor| (tensor.to_vec_f32(), tensor.shape.clone()))
+    }
+
+    /// Seed the growable host KV cache from a materialized paged prefix so a
+    /// later request that shares a prompt prefix resumes without recomputing it.
+    ///
+    /// `entries` are `(past_input_name, row_major_f32, shape)` triples the caller
+    /// built from the paged cache with the same `[1, num_kv_heads, seq, head_dim]`
+    /// layout the ORT decoder injects (`kv_bridge::past_shape`), so native and
+    /// ORT prefix reuse are byte-identical. Only valid on the host-growable path
+    /// (`supports_host_kv_mirror`).
+    pub(crate) fn seed_growable_kv(
+        &mut self,
+        entries: Vec<(String, Vec<f32>, Vec<usize>)>,
+        current_len: usize,
+    ) -> anyhow::Result<()> {
+        if self.cuda.is_some() || self.cpu_kv.is_some() {
+            bail!(
+                "native paged prefix reuse requires the host-growable KV path; this session keeps \
+                 KV device-resident or in-place (Inc-D)"
+            );
+        }
+        for (name, data, shape) in entries {
+            let tensor = Tensor::from_f32(&shape, &data)
+                .with_context(|| format!("seed native paged prefix KV '{name}'"))?;
+            self.past.insert(name, tensor);
+        }
+        self.current_len = current_len;
+        Ok(())
+    }
+
+    /// Seed a materialized paged prefix into this session's KV state, dispatching
+    /// to the host-growable path (GAP-3 Inc-C) or the device-resident CUDA path
+    /// (GAP-3 Inc-D) by how the session keeps its KV. `entries` carry the same
+    /// compact `[1, num_kv_heads, seq, head_dim]` layout for both paths, so
+    /// native (host or device) and ORT prefix reuse stay byte-identical.
+    pub(crate) fn seed_kv(
+        &mut self,
+        entries: Vec<(String, Vec<f32>, Vec<usize>)>,
+        current_len: usize,
+    ) -> anyhow::Result<()> {
+        if self.cuda.is_some() {
+            return self.seed_device_kv(entries, current_len);
+        }
+        self.seed_growable_kv(entries, current_len)
+    }
+
+    /// Device-resident counterpart of [`seed_growable_kv`](Self::seed_growable_kv):
+    /// write the shared prefix into the CUDA KV bindings, advance the mask/KV
+    /// logical length, and commit `current_len` so the next step appends after it
+    /// (GAP-3 Inc-D). The `&mut self.session` / `&mut self.cuda` split borrow lets
+    /// the device seed grow the KV bucket if the prefix exceeds the current
+    /// capacity, exactly as a decode step would.
+    fn seed_device_kv(
+        &mut self,
+        entries: Vec<(String, Vec<f32>, Vec<usize>)>,
+        current_len: usize,
+    ) -> anyhow::Result<()> {
+        let cuda = self
+            .cuda
+            .as_mut()
+            .context("device paged prefix reuse requires a CUDA decode session")?;
+        cuda.seed_prefix(&mut self.session, &entries, current_len)?;
+        self.current_len = current_len;
+        Ok(())
     }
 
     /// Build the per-step `position_ids` tensor for the half-open sequence range

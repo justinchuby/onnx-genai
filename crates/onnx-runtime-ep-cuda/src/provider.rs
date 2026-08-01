@@ -81,7 +81,10 @@ impl CudaExecutionProvider {
             let budget = offload_policy
                 .device_budget_bytes
                 .unwrap_or(DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
-            Arc::new(CudaWeightResidency::new(runtime.clone(), budget))
+            Arc::new(
+                CudaWeightResidency::new(runtime.clone(), budget)
+                    .with_async_pagein(offload_policy.async_pagein),
+            )
         });
         Ok(Self {
             device: DeviceId::cuda(ordinal),
@@ -810,6 +813,187 @@ extern "C" __global__ void copy_out(const float* in, float* out, unsigned long l
         }
 
         ep.deallocate(dst).unwrap();
+        ep.deallocate(out).unwrap();
+    }
+
+    // Anti-regression lock for the async, fence-ordered weight page-in (#87 first
+    // increment). Both arms drive the transfer and compute streams through the
+    // *same* primitive chain `CudaWeightPage::upload_async` composes internally
+    // (`htod_async` + `record_copy_fence`), differing only in how the
+    // compute-stream consumer is ordered relative to the transfer:
+    //
+    //   * Positive (real page-in ordering): a spin-delay holds the H2D copy
+    //     pending on the transfer stream, then `compute_wait_fence` orders the
+    //     compute-stream consumer after it, so the consumer reads the fully
+    //     paged-in bytes. Deleting `compute_wait_fence` leaves the consumer to
+    //     read the pre-copy POISON, so the lock is non-vacuous.
+    //   * Negative (deterministic poison control): the transfer is event-ordered
+    //     strictly *after* the consumer (`record_compute_fence` + `copy_wait_fence`),
+    //     so with no `compute_wait_fence` the consumer provably reads pre-transfer
+    //     POISON. This proves the compute-side wait is load-bearing without a
+    //     wall-clock race — an earlier revision raced the consumer against a
+    //     spin-delayed copy, which the parallel, captured `cargo test` invocation
+    //     flaked whenever GPU contention delayed the consumer kernel past the copy.
+    //
+    // Every device/pinned allocation is hoisted out of the timing window, so no
+    // synchronizing `cuMemAlloc`/`cuMemHostAlloc` can drain the copy-stream
+    // spin-delay: the delay→async-copy→fence→consume window is the only thing the
+    // positive arm's ordering depends on. A trailing `upload_async` byte-parity
+    // check keeps the real allocate+stage+copy+fence entry point under test.
+    #[test]
+    fn async_pagein_fence_orders_weight_page_in_consumer() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        const MODULE: &str = "cuda_ep_async_pagein_test";
+        const SOURCE: &str = r#"
+extern "C" __global__ void spin_delay(long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+}
+extern "C" __global__ void copy_out(const float* in, float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = in[i];
+}
+"#;
+        let Ok(ep) = CudaExecutionProvider::initialized(0) else {
+            eprintln!("skipping async page-in fence test: CUDA EP unavailable");
+            return;
+        };
+        let runtime = ep.runtime().clone();
+        let spin_delay = runtime
+            .nvrtc_function(MODULE, SOURCE, "spin_delay")
+            .unwrap();
+        let copy_out = runtime.nvrtc_function(MODULE, SOURCE, "copy_out").unwrap();
+
+        let n = 4096usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let n_u64 = n as u64;
+        let payload: Vec<f32> = (0..n).map(|i| 5.0 + (i % 13) as f32).collect();
+        let payload_bytes =
+            unsafe { std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), bytes) };
+
+        // Hoist every device/pinned allocation OUT of the per-iteration timing
+        // window: a synchronizing `cuMemAlloc`/`cuMemHostAlloc` between the
+        // spin-delay and the consumer would drain the delay and let ordering lean
+        // on the alloc instead of the fence. All buffers are reused each iteration.
+        let poison = vec![-777.0f32; n];
+        let poison_bytes =
+            unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
+        let pos_dst = ep.allocate(bytes, 256).unwrap();
+        let neg_dst = ep.allocate(bytes, 256).unwrap();
+        let out = ep.allocate(bytes, 256).unwrap();
+        let pos_dst_p = cuptr(pos_dst.as_ptr());
+        let neg_dst_p = cuptr(neg_dst.as_ptr());
+        let out_p = cuptr(out.as_ptr());
+        let mut staging = runtime.alloc_pinned(bytes).unwrap();
+        staging.as_mut_slice().copy_from_slice(payload_bytes);
+        let spin: i64 = 8_000_000;
+
+        for _ in 0..8 {
+            // ── Positive: the real page-in ordering. Poison the destination, hold
+            // the H2D copy pending behind a spin-delay, then order the
+            // compute-stream consumer after the transfer with `compute_wait_fence`
+            // (the exact `htod_async` + `record_copy_fence` chain `upload_async`
+            // composes). With the fence the consumer reads the paged-in payload;
+            // delete the fence and it reads the poison below.
+            unsafe { runtime.htod(poison_bytes, pos_dst_p) }.unwrap();
+            runtime.synchronize().unwrap();
+
+            let mut delay = runtime.copy_stream().launch_builder(&spin_delay);
+            delay.arg(&spin);
+            unsafe { delay.launch(LaunchConfig::for_num_elems(1)).unwrap() };
+
+            unsafe { runtime.htod_async(staging.as_slice(), pos_dst_p) }.unwrap();
+            let fence = runtime.record_copy_fence().unwrap();
+            runtime.compute_wait_fence(fence).unwrap();
+
+            let mut consume = runtime.stream().launch_builder(&copy_out);
+            consume.arg(&pos_dst_p).arg(&out_p).arg(&n_u64);
+            unsafe {
+                consume
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap()
+            };
+            let mut got = vec![0.0f32; n];
+            let got_bytes =
+                unsafe { std::slice::from_raw_parts_mut(got.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(got_bytes, out_p) }.unwrap();
+            runtime.sync_copy_stream().unwrap();
+            assert_eq!(
+                got, payload,
+                "async page-in consumer read stale bytes — compute_wait_fence did \
+                 not order the transfer before the compute-stream read"
+            );
+
+            // ── Negative (deterministic poison control): event-order the transfer
+            // strictly AFTER the consumer, so with NO `compute_wait_fence` the
+            // consumer provably reads pre-transfer poison. The `copy_wait_fence`
+            // on a compute-stream fence removes all wall-clock racing — the
+            // outcome never depends on the consumer winning against a delayed copy.
+            unsafe { runtime.htod(poison_bytes, neg_dst_p) }.unwrap();
+            runtime.synchronize().unwrap();
+
+            let mut consume = runtime.stream().launch_builder(&copy_out);
+            consume.arg(&neg_dst_p).arg(&out_p).arg(&n_u64);
+            unsafe {
+                consume
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap()
+            };
+            // Hold the transfer until the consumer above has read `neg_dst`.
+            let consumer_fence = runtime.record_compute_fence().unwrap();
+            runtime.copy_wait_fence(consumer_fence).unwrap();
+            unsafe { runtime.htod_async(staging.as_slice(), neg_dst_p) }.unwrap();
+            let _unused_fence = runtime.record_copy_fence().unwrap();
+
+            let mut raced = vec![0.0f32; n];
+            let raced_bytes =
+                unsafe { std::slice::from_raw_parts_mut(raced.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(raced_bytes, out_p) }.unwrap();
+            // Drain the transfer (which lands after the consumer) before the next
+            // iteration reuses `neg_dst` / `staging`.
+            runtime.sync_copy_stream().unwrap();
+            assert_eq!(
+                raced, poison,
+                "un-ordered async page-in consumer did NOT read poison — the \
+                 compute-stream wait is not load-bearing, so this lock proves nothing"
+            );
+
+            // ── Real `upload_async` entry point: allocate + stage + async-copy +
+            // fence, then a fenced consumer must observe the byte-identical
+            // payload. Keeps the production API (not just its primitive chain)
+            // under regression cover.
+            let (page, page_fence) = crate::weight_paging::CudaWeightPage::upload_async(
+                &runtime,
+                DataType::Float32,
+                vec![n],
+                payload_bytes,
+            )
+            .unwrap();
+            runtime.compute_wait_fence(page_fence).unwrap();
+            let page_p = cuptr(page.device_ptr());
+            let mut consume = runtime.stream().launch_builder(&copy_out);
+            consume.arg(&page_p).arg(&out_p).arg(&n_u64);
+            unsafe {
+                consume
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap()
+            };
+            let mut paged = vec![0.0f32; n];
+            let paged_bytes =
+                unsafe { std::slice::from_raw_parts_mut(paged.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(paged_bytes, out_p) }.unwrap();
+            assert_eq!(
+                paged, payload,
+                "upload_async page-in read stale bytes — the returned copy fence \
+                 did not order the transfer before the compute-stream read"
+            );
+            drop(page);
+        }
+
+        ep.deallocate(pos_dst).unwrap();
+        ep.deallocate(neg_dst).unwrap();
         ep.deallocate(out).unwrap();
     }
 }

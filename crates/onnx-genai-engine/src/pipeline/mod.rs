@@ -305,17 +305,17 @@ fn native_backend_not_compiled_error() -> anyhow::Error {
 
 /// Construct all pipeline components through the native
 /// [`ComponentSession`](onnx_genai_metadata::ComponentSession) seam, then report
-/// the first genuinely-unimplemented step for native pipeline decode.
+/// that native decode does not yet cover this pipeline's (non-flat-autoregressive)
+/// strategy.
 ///
-/// Backend-neutral construction (GAP 1) is complete once every component loads
-/// and exposes graph I/O metadata through the trait. Wiring those neutral
-/// sessions into the pipeline decode loop — which still routes per-step state
-/// through ORT `Value`/`Session` — is the remaining native work (GAP 3), so
-/// this returns a clear, actionable error naming that precise next blocker
-/// rather than a blanket "native backend not supported" rejection at
-/// construction.
+/// GAP-3 Inc-A wires native decode for the **flat autoregressive** plan by driving
+/// every component through the backend-neutral component / decoder builders inside
+/// the shared decode loop. Other strategies (nested autoregressive TTS, iterative
+/// diffusion, single-pass, composite) are not wired yet, so this returns a clear,
+/// actionable error naming the loaded components and directing the caller to the
+/// ORT backend, rather than a blanket "native backend not supported" rejection.
 #[cfg(feature = "native-backend")]
-fn build_native_pipeline_and_report_gap(
+fn native_pipeline_plan_unsupported(
     directory: &PipelineModelDirectory,
     config: &EngineConfig,
 ) -> anyhow::Error {
@@ -325,16 +325,13 @@ fn build_native_pipeline_and_report_gap(
     };
     let component_list = components.keys().cloned().collect::<Vec<_>>().join(", ");
     anyhow::anyhow!(
-        "native pipeline decode is not yet implemented. All {} pipeline component(s) loaded \
-         successfully on the native backend and expose their graph I/O through the \
-         backend-neutral component-session interface (components: {}), so backend selection and \
-         construction are backend-neutral. Native target decode now accepts metadata-declared \
-         token or embedding sequence inputs plus arbitrary named routed step tensors. The \
-         remaining GAP 3 work is replacing `DecodeState` and `PipelineDecodeLoopBackend` ownership \
-         of ORT `Value`/`Session` with backend-neutral tensors/component sessions, then invoking \
-         the native target step with those routed tensors. To run this pipeline today, set \
-         decode_backend = EngineDecodeBackend::Ort (or \
-         ONNX_GENAI_BACKEND=ort).",
+        "native pipeline decode currently supports only flat autoregressive pipelines \
+         (GAP-3 Inc-A). All {} pipeline component(s) loaded successfully on the native backend \
+         and expose their graph I/O through the backend-neutral component-session interface \
+         (components: {}), but this pipeline uses a non-autoregressive strategy (nested \
+         autoregressive, iterative/diffusion, single-pass, or composite) whose native decode \
+         path is not wired yet. To run this pipeline today, set decode_backend = \
+         EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort).",
         components.len(),
         component_list,
     )
@@ -409,6 +406,24 @@ fn native_decoder_selected(decoder: &str) -> bool {
                     "1" | "true" | "yes" | "on" | "all"
                 ))
     })
+}
+
+/// Which pipeline components a flat autoregressive decode runs on the native
+/// nxrt backend.
+///
+/// Unifies the two native selection sources so the pure-native backend and the
+/// hybrid env-flag injection converge on the *same* component/decoder builders
+/// (`build_step_component_session` / `build_native_pipeline_decoder`) — DRY, no
+/// forked construction path:
+/// - `EngineDecodeBackend::Native` selects **every** component natively.
+/// - `EngineDecodeBackend::Ort` consults the per-component env flags
+///   (`ONNX_GENAI_PIPELINE_NATIVE_DECODER` / `_NATIVE_STEP_COMPONENTS`), leaving
+///   the default ORT decode path unchanged.
+struct NativeComponentSelection {
+    /// Drive the decoder through [`NativePipelineDecoder`] (device-resident KV).
+    decoder: bool,
+    /// every_step components to load as native `ComponentSession`s.
+    step_components: BTreeSet<String>,
 }
 
 /// Build the backend-neutral [`ComponentSession`](onnx_genai_metadata::ComponentSession)
@@ -643,23 +658,32 @@ impl PipelineEngine {
         };
         if backend == PipelineBackend::Native {
             // The native backend constructs every declared component through the
-            // backend-neutral `ComponentSession` seam (GAP 1); no ORT type
-            // reaches this path. When the crate is built without the
-            // `native-backend` feature there is nothing to construct.
+            // backend-neutral `ComponentSession` seam (GAP 1). When the crate is
+            // built without the `native-backend` feature there is nothing to
+            // construct, so fail fast with an actionable rebuild error.
             #[cfg(not(feature = "native-backend"))]
             {
                 return Err(native_backend_not_compiled_error());
             }
-            #[cfg(feature = "native-backend")]
-            {
-                let directory = PipelineModelDirectory::load(pipeline_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
-                return Err(build_native_pipeline_and_report_gap(&directory, &config));
-            }
+            // With the feature present the pipeline is constructed below exactly
+            // like the ORT path; the flat autoregressive decode loop then drives
+            // every component natively (native `ComponentSession`s + a
+            // `NativePipelineDecoder` keeping KV device-resident) via
+            // `native_component_selection` (GAP-3 Inc-A). Plans other than flat
+            // autoregressive are not yet wired for native and are rejected once
+            // the plan is known (below), rather than at construction.
         }
         let models = PipelineModels::load_with_options(pipeline_dir, session_options)
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {e}"))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
+        // GAP-3 Inc-A wires native decode only for the flat autoregressive plan.
+        // Any other strategy on the native backend is surfaced with a precise,
+        // actionable error naming the still-unwired path (rather than a blanket
+        // rejection or a silent mis-route through the ORT-shaped loop).
+        #[cfg(feature = "native-backend")]
+        if backend == PipelineBackend::Native && !matches!(plan, PipelinePlan::Autoregressive(_)) {
+            return Err(native_pipeline_plan_unsupported(&models.directory, &config));
+        }
         let memoizable_components = deterministic_components(&models.directory);
         // Only autoregressive pipelines drive a token-by-token decode loop and
         // therefore need a `DecodeState` + KV model info. Single-pass and
@@ -1023,6 +1047,61 @@ impl PipelineEngine {
         self.paged
             .as_ref()
             .map(|paged| paged.cache.page_table.usage())
+    }
+
+    /// TEST-SUPPORT (native-backend only): read back the paged KV bytes that
+    /// were published for `request`'s prompt prefix, non-destructively.
+    ///
+    /// Reconstructs the exact prefix key the paged decode path publishes under
+    /// (`digest_request_identity` + `prefix_key`), looks it up in the prefix
+    /// cache *without* touching page refcounts, attaches the matched pages to a
+    /// throwaway sequence purely to read them, and materializes the per-layer
+    /// K/V into contiguous buffers. The throwaway sequence is then dropped
+    /// without freeing the pages — they belong to the prefix cache, and the
+    /// attach did not retain them — so the cache is left exactly as found.
+    ///
+    /// This exists because the Inc-C paged-reuse parity test cannot see KV
+    /// geometry through token equality alone: the `tiny-gemma4-vlm` fixture's
+    /// argmax is invariant to the reused-prefix KV, so a key/value swap or a
+    /// fully-zeroed mirror still yields identical tokens. Comparing these
+    /// materialized bytes between the native-mirrored and ORT-mirrored caches
+    /// gives the test discriminating power over the mirror geometry.
+    ///
+    /// Returns `None` when nothing is published for the prefix (no digestable
+    /// inputs, no paged cache, or no matched pages).
+    #[cfg(feature = "native-backend")]
+    pub fn materialize_published_prefix_kv(
+        &mut self,
+        request: &PipelineGenerateRequest,
+    ) -> anyhow::Result<Option<onnx_genai_kv::MaterializedKv>> {
+        let Some(inputs) = Self::digest_request_identity(request) else {
+            return Ok(None);
+        };
+        let prompt_tokens = tokenize_with(self.tokenizer()?, &request.request.prompt)?;
+        let Some(paged) = self.paged.as_mut() else {
+            return Ok(None);
+        };
+        let key = prefix_key(inputs, &prompt_tokens);
+        let (matched_tokens, page_ids) = paged.prefix.lookup(&key);
+        let reusable = matched_tokens.saturating_sub(PREFIX_KEY_PREAMBLE);
+        if reusable == 0 || page_ids.is_empty() {
+            return Ok(None);
+        }
+        let pages_needed = reusable.div_ceil(paged.cache.page_table.page_size);
+        let pages = page_ids.into_iter().take(pages_needed).collect::<Vec<_>>();
+        let seq = paged.cache.create_sequence();
+        let materialized = (|| {
+            attach_pages_to_sequence(&mut paged.cache, seq, &pages, reusable)?;
+            paged
+                .cache
+                .materialize_sequence(seq)
+                .map_err(anyhow::Error::from)
+        })();
+        // Forget the throwaway sequence's borrowed page list without freeing the
+        // pages: `attach_pages_to_sequence` did not retain them, so the prefix
+        // cache remains their sole owner and is left untouched.
+        paged.cache.page_table.remove_sequence(seq);
+        materialized.map(Some)
     }
 
     /// Counters describing what the pipeline's reuse caches did.
