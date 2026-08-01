@@ -659,6 +659,11 @@ mod tests {
             engine: EngineDriver {
                 commands: tx,
                 generation_capacity: Arc::new(Semaphore::new(0)),
+                // A test double drives no engine, so there is no pool to
+                // mirror. Left in the default `Unknown` state rather than
+                // asserted not-applicable: nothing here has determined a
+                // decode path, and "pending" is the only claim that holds.
+                kv_telemetry: Default::default(),
             },
             tokenizer,
             chat_template: None,
