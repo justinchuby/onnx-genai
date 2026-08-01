@@ -202,58 +202,6 @@ fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i
     })
 }
 
-fn launch_metadata(
-    runtime: &CudaRuntime,
-    entry: &'static str,
-    input: &TensorView,
-    output: &mut TensorMut,
-    metadata: &[u64],
-) -> Result<()> {
-    let elements = output.numel();
-    if elements == 0 {
-        return Ok(());
-    }
-    let rank = i32::try_from(output.shape.len())
-        .map_err(|_| EpError::KernelFailed(format!("cuda_ep {entry}: rank exceeds i32")))?;
-    let elem_bytes = i32::try_from(fixed_width(entry, input.dtype)?).map_err(|_| {
-        EpError::KernelFailed(format!("cuda_ep {entry}: element width exceeds i32"))
-    })?;
-    let elements_u64 = elements as u64;
-    let scalar_metadata = [0_u64];
-    let bytes = u64_bytes(if metadata.is_empty() {
-        &scalar_metadata
-    } else {
-        metadata
-    });
-    let func = runtime.nvrtc_function("movement_ops", MOVEMENT_SOURCE, entry)?;
-    let metadata_ptr = runtime.alloc_raw(bytes.len())?;
-    if let Err(error) = unsafe { runtime.htod(bytes, metadata_ptr) } {
-        let _ = unsafe { runtime.free_raw(metadata_ptr) };
-        return Err(error);
-    }
-    let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
-    let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-    let mut builder = runtime.stream().launch_builder(&func);
-    builder
-        .arg(&input_ptr)
-        .arg(&output_ptr)
-        .arg(&metadata_ptr)
-        .arg(&rank)
-        .arg(&elem_bytes)
-        .arg(&elements_u64);
-    let launch = unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (grid(elements), 1, 1),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map_err(|e| driver_err(&format!("launch {entry}"), e));
-    let sync = launch.and_then(|_| runtime.synchronize());
-    let free = unsafe { runtime.free_raw(metadata_ptr) };
-    sync.and(free)
-}
-
 #[derive(Debug)]
 pub(super) struct PersistentMetadata {
     runtime: Arc<CudaRuntime>,
@@ -1072,12 +1020,22 @@ impl KernelFactory for TileFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(TileKernel {
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TileCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
 }
 #[derive(Debug)]
 struct TileKernel {
     runtime: Arc<CudaRuntime>,
+    metadata: Mutex<PersistentMetadata>,
+    warmed_signature: Mutex<Option<TileCaptureSignature>>,
 }
 impl Kernel for TileKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -1088,45 +1046,87 @@ impl Kernel for TileKernel {
                 "cuda_ep Tile: output dtype must match input".into(),
             ));
         }
-        let repeats = host_ints(&self.runtime, &inputs[1], "Tile")?;
-        if repeats.len() != inputs[0].shape.len() || repeats.iter().any(|&r| r < 0) {
+        let capturing = self.runtime.is_capturing()?;
+        let signature = TileCaptureSignature {
+            dtype: inputs[0].dtype,
+            input_shape: inputs[0].shape.to_vec(),
+            output_shape: outputs[0].shape.to_vec(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Tile: capture signature lock was poisoned".into())
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
             return Err(EpError::KernelFailed(
-                "cuda_ep Tile: repeats must be non-negative and match input rank".into(),
+                "cuda_ep Tile: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
             ));
         }
-        let expected = inputs[0]
+        // The `repeats` input only *validates* the output geometry; the
+        // `tile_bytes` kernel derives everything from the input/output shapes.
+        // Because `output[i] == input[i] * repeats[i]`, a warmed
+        // (dtype, input_shape, output_shape) signature fixes `repeats` exactly, so
+        // we only pay the device->host `repeats` read (a per-call sync that is
+        // illegal mid-capture) the first time we see a signature. Steady-state
+        // decode and capture reuse the cached geometry with no host read.
+        if warmed_signature.as_ref() != Some(&signature) {
+            let repeats = host_ints(&self.runtime, &inputs[1], "Tile")?;
+            if repeats.len() != inputs[0].shape.len() || repeats.iter().any(|&r| r < 0) {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Tile: repeats must be non-negative and match input rank".into(),
+                ));
+            }
+            let expected = inputs[0]
+                .shape
+                .iter()
+                .zip(&repeats)
+                .map(|(&d, &r)| d * r as usize)
+                .collect::<Vec<_>>();
+            if outputs[0].shape != expected {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Tile: output shape does not match repeats".into(),
+                ));
+            }
+        }
+        let mut metadata = outputs[0]
             .shape
             .iter()
-            .zip(&repeats)
-            .map(|(&d, &r)| d * r as usize)
+            .map(|&v| v as u64)
             .collect::<Vec<_>>();
-        if outputs[0].shape != expected {
-            return Err(EpError::KernelFailed(
-                "cuda_ep Tile: output shape does not match repeats".into(),
-            ));
-        }
-        let mut metadata = expected.iter().map(|&v| v as u64).collect::<Vec<_>>();
         metadata.extend(inputs[0].shape.iter().map(|&v| v as u64));
         metadata.extend(
             compute_contiguous_strides(inputs[0].shape)
                 .iter()
                 .map(|&v| v as u64),
         );
-        launch_metadata(
+        let metadata_ptr = self
+            .metadata
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda_ep Tile: metadata lock was poisoned".into()))?
+            .prepare(&metadata, "Tile")?;
+        launch_persistent_metadata(
             &self.runtime,
             "tile_bytes",
             &inputs[0],
             &mut outputs[0],
-            &metadata,
-        )
+            metadata_ptr,
+        )?;
+        if !capturing {
+            *warmed_signature = Some(signature);
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Tile reads repeats on the host, allocates per-call metadata, and synchronizes the stream",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Tile must warm its fixed shape/dtype signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Tile capture signature lock was poisoned",
+            ),
+        }
     }
 }
 
