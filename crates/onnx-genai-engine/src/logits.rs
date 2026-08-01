@@ -1945,16 +1945,6 @@ mod tests {
         }
     }
 
-    /// The softmax helper must not allocate more than the result it returns.
-    ///
-    /// This runs once per generated token, so a staging vector here is paid on
-    /// every step of every request. An earlier version collected `(index,
-    /// logit)` pairs purely to find the maximum and then consumed them, which
-    /// on a 151k vocabulary is an extra ~1.2 MB filled and discarded per token.
-    ///
-    /// Capacity is the observable proxy for that: `weights` must be reserved
-    /// once for the whole vocabulary rather than grown, and the zero list must
-    /// not allocate when there is nothing to put in it.
     /// The fused processor must be indistinguishable from the two it replaces.
     ///
     /// This is the whole safety argument for the fusion: it is a performance
@@ -2027,6 +2017,16 @@ mod tests {
         }
     }
 
+    /// The softmax helper must not allocate more than the result it returns.
+    ///
+    /// This runs once per generated token, so a staging vector here is paid on
+    /// every step of every request. An earlier version collected `(index,
+    /// logit)` pairs purely to find the maximum and then consumed them, which
+    /// on a 151k vocabulary is an extra ~1.2 MB filled and discarded per token.
+    ///
+    /// Capacity is the observable proxy for that: `weights` must be reserved
+    /// once for the whole vocabulary rather than grown, and the zero list must
+    /// not allocate when there is nothing to put in it.
     #[test]
     fn the_softmax_helper_reserves_once_and_does_not_allocate_an_empty_zero_list() {
         let logits: Vec<f32> = (0..4096).map(|i| (i % 97) as f32 * 0.1 - 4.0).collect();
