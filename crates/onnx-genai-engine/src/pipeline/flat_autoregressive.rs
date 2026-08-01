@@ -79,20 +79,34 @@ impl PipelineEngine {
         // keep before anything is rebuilt, because the answer decides whether
         // the decode state is recreated or carried over.
         let inputs_digest = Self::digest_request_identity(&pipeline_request);
-        // The native device-KV decoder (inc2b) keeps its KV session-resident and
-        // does not expose host present tensors, so it runs the non-paged,
-        // fresh-decode path: no paged mirroring and no cross-request KV carry-over
-        // (that reuse is Inc3). This changes cross-request KV reuse only, never
-        // the tokens produced within a generation.
-        //
         // Native selection is resolved once here (GAP-3 Inc-A): a `Native`
         // backend drives every component natively, while an `Ort` backend keeps
         // the hybrid env-flag behaviour — both through the same builders below.
         let native_selection = self.native_component_selection(&ar.decoder, &ar.step_components);
         let use_native_decoder = native_selection.decoder;
+        // Build the native decoder up front (GAP-3 Inc-C) so paged prefix reuse
+        // can seed its KV before the decode loop starts. It borrows nothing from
+        // the decode state, unlike the ORT decoder built later. A native decoder
+        // only joins the paged path when its KV is host-resident and f32
+        // (`supports_paged_kv`); a device-resident / in-place / f16 store keeps
+        // the non-paged fresh-decode path (Inc-A behaviour) — no regression, and
+        // the still-unwired case is reported as Inc-D.
+        let mut native_decoder_component: Option<Box<dyn PipelineDecoderComponent + 'static>> =
+            if use_native_decoder {
+                Some(build_native_pipeline_decoder(&self.models, &ar.decoder)?)
+            } else {
+                None
+            };
+        let native_supports_paging = native_decoder_component
+            .as_ref()
+            .is_some_and(|decoder| decoder.supports_paged_kv());
         // The paged cache supersedes the single retained context wherever it is
-        // available: it holds many prefixes rather than only the last one.
-        let paged_enabled = self.paged.is_some() && inputs_digest.is_some() && !use_native_decoder;
+        // available: it holds many prefixes rather than only the last one. A
+        // paged-capable native decoder now mirrors its present KV and reuses a
+        // shared prefix through the same paged machinery as ORT.
+        let paged_enabled = self.paged.is_some()
+            && inputs_digest.is_some()
+            && (!use_native_decoder || native_supports_paging);
         let reused = if paged_enabled || use_native_decoder {
             0
         } else {
@@ -146,17 +160,30 @@ impl PipelineEngine {
                 self.fixed_state_budget_bytes,
             )?);
             let inputs = inputs_digest.expect("paged_enabled implies a digest");
-            let decoder = self
-                .models
-                .session(&ar.decoder)
-                .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-            let paged = self.paged.as_mut().expect("paged_enabled implies storage");
-            let state = self
-                .decoder_state
-                .as_mut()
-                .expect("the decode state was just built");
-            let (seq, shared) =
-                Self::admit_paged_sequence(paged, state, decoder, inputs, &prompt_tokens)?;
+            // A paged-capable native decoder seeds its own session-resident KV
+            // from the shared prefix (GAP-3 Inc-C); the ORT decoder loads it into
+            // the host `DecodeState`. Both claim the sequence through the same
+            // `claim_paged_prefix` helper, so only the KV *sink* differs.
+            let (seq, shared) = if let Some(native_decoder) = native_decoder_component.as_mut() {
+                let paged = self.paged.as_mut().expect("paged_enabled implies storage");
+                Self::admit_native_paged_sequence(
+                    paged,
+                    native_decoder.as_mut(),
+                    inputs,
+                    &prompt_tokens,
+                )?
+            } else {
+                let decoder = self
+                    .models
+                    .session(&ar.decoder)
+                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
+                let paged = self.paged.as_mut().expect("paged_enabled implies storage");
+                let state = self
+                    .decoder_state
+                    .as_mut()
+                    .expect("the decode state was just built");
+                Self::admit_paged_sequence(paged, state, decoder, inputs, &prompt_tokens)?
+            };
             paged_session = Some((seq, inputs));
             reused = shared;
         }
@@ -224,16 +251,18 @@ impl PipelineEngine {
             }),
             _ => None,
         };
-        let decoder_component: Box<dyn PipelineDecoderComponent + '_> = if use_native_decoder {
-            build_native_pipeline_decoder(&self.models, &ar.decoder)?
-        } else {
-            Box::new(OrtPipelineDecoder::new(
-                decoder,
-                self.decoder_state
-                    .as_mut()
-                    .expect("autoregressive pipeline has decode state"),
-            ))
-        };
+        let decoder_component: Box<dyn PipelineDecoderComponent + '_> =
+            if let Some(native) = native_decoder_component {
+                // Built (and, on a shared prefix, already KV-seeded) up front.
+                native
+            } else {
+                Box::new(OrtPipelineDecoder::new(
+                    decoder,
+                    self.decoder_state
+                        .as_mut()
+                        .expect("autoregressive pipeline has decode state"),
+                ))
+            };
         let mut backend = PipelineDecodeLoopBackend {
             decoder: decoder_component,
             paged: paged_mirror,
@@ -340,19 +369,21 @@ impl PipelineEngine {
         )
     }
 
-    /// Claim a paged sequence for this request, seeded with whatever cached
-    /// prefix its attachments and tokens already share with earlier requests.
+    /// Claim a paged sequence for this request and, if its prompt shares a
+    /// prefix with an earlier request, attach that prefix's pages and materialize
+    /// them. Returns the sequence id, how many leading tokens it now holds KV for
+    /// (always at least one token short of the prompt, since a decode step needs
+    /// an input to produce logits from), and the materialized shared KV when
+    /// there is a reusable prefix.
     ///
-    /// Returns the sequence id and how many leading tokens the sequence already
-    /// holds KV for. The reuse always stops at least one token short of the
-    /// prompt, since a decode step needs an input to produce logits from.
-    fn admit_paged_sequence(
+    /// Backend-neutral: the caller injects the materialized KV into whichever KV
+    /// store its decoder uses (the ORT host `DecodeState` or a native session),
+    /// so both backends share this claim/lookup logic (DRY).
+    fn claim_paged_prefix(
         paged: &mut PipelinePagedKv,
-        state: &mut DecodeState,
-        decoder: &Session,
         inputs: Digest,
         prompt_tokens: &[TokenId],
-    ) -> anyhow::Result<(SequenceId, usize)> {
+    ) -> anyhow::Result<(SequenceId, usize, Option<onnx_genai_kv::MaterializedKv>)> {
         // Free anything a previous generation abandoned, then make room for this
         // one, before claiming any pages.
         paged.discard_active();
@@ -393,11 +424,42 @@ impl PipelineEngine {
                     .cache
                     .materialize_sequence(seq)
                     .map_err(|e| anyhow::anyhow!("failed to materialize the shared prefix: {e}"))?;
-                load_materialized_past(decoder, &paged.kv_model, state, &materialized)?;
-                return Ok((seq, reusable));
+                return Ok((seq, reusable, Some(materialized)));
             }
         }
-        Ok((seq, 0))
+        Ok((seq, 0, None))
+    }
+
+    /// Claim a paged sequence for an ORT decoder, loading any shared prefix into
+    /// its host [`DecodeState`].
+    fn admit_paged_sequence(
+        paged: &mut PipelinePagedKv,
+        state: &mut DecodeState,
+        decoder: &Session,
+        inputs: Digest,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<(SequenceId, usize)> {
+        let (seq, reusable, materialized) = Self::claim_paged_prefix(paged, inputs, prompt_tokens)?;
+        if let Some(materialized) = materialized {
+            load_materialized_past(decoder, &paged.kv_model, state, &materialized)?;
+        }
+        Ok((seq, reusable))
+    }
+
+    /// Claim a paged sequence for a native decoder, seeding any shared prefix
+    /// into its session-resident KV (GAP-3 Inc-C). The native decoder must report
+    /// [`supports_paged_kv`](PipelineDecoderComponent::supports_paged_kv).
+    fn admit_native_paged_sequence(
+        paged: &mut PipelinePagedKv,
+        decoder: &mut dyn PipelineDecoderComponent,
+        inputs: Digest,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<(SequenceId, usize)> {
+        let (seq, reusable, materialized) = Self::claim_paged_prefix(paged, inputs, prompt_tokens)?;
+        if let Some(materialized) = materialized {
+            decoder.load_paged_prefix(&paged.kv_model, &materialized)?;
+        }
+        Ok((seq, reusable))
     }
 
     /// Record this generation's KV under its prefix key and release the

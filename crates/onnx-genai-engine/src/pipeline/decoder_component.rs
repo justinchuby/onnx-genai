@@ -18,7 +18,11 @@
 
 use super::*;
 use crate::decode::{extract_next_token_logits_from_outputs, run_decode_step_with_extra};
+#[cfg(feature = "native-backend")]
+use crate::kv_bridge::extract_present_token;
 use crate::kv_bridge::{KvModelInfo, mirror_present_kv_to_pages};
+#[cfg(feature = "native-backend")]
+use onnx_genai_kv::LayerKv;
 use onnx_genai_kv::{PagedKvCache, SequenceId};
 
 /// One decoder driven inside the pipeline decode loop, owning its KV state
@@ -45,9 +49,12 @@ pub(crate) trait PipelineDecoderComponent {
     fn next_token_logits(&self) -> anyhow::Result<Vec<f32>>;
 
     /// Mirror the most recent step's present KV into the paged cache so a later
-    /// request opening with the same prefix can attach the pages.
+    /// request opening with the same prefix can attach the pages. Takes `&mut
+    /// self` because a device-resident native decoder (GAP-3 Inc-D) reads its
+    /// present KV out of a device binding, which mutates transfer bookkeeping;
+    /// the ORT and host-growable paths remain read-only in effect.
     fn mirror_last_present_kv(
-        &self,
+        &mut self,
         kv_model: &KvModelInfo,
         cache: &mut PagedKvCache,
         seq: SequenceId,
@@ -66,6 +73,30 @@ pub(crate) trait PipelineDecoderComponent {
 
     /// Number of always-retained sink tokens under a sliding window.
     fn sink_tokens(&self) -> usize;
+
+    /// Whether this decoder can mirror its present KV into the paged cache and be
+    /// re-seeded from a materialized paged prefix, so the pipeline may drive it
+    /// on the paged (cross-request KV reuse) path rather than the fresh-decode
+    /// path. ORT decoders always can; a native decoder can only when its KV is
+    /// host-resident and f32 (GAP-3 Inc-C) or device-resident CUDA f32 rank-4
+    /// (GAP-3 Inc-D) — otherwise (f16 / in-place / non-rank-4) the pipeline keeps
+    /// it on the non-paged path (Inc-A behaviour) with no regression.
+    fn supports_paged_kv(&self) -> bool {
+        true
+    }
+
+    /// Seed this decoder's KV state from a materialized shared paged prefix so a
+    /// request that reuses a common prompt prefix resumes at `materialized.
+    /// sequence_len` without recomputing it. Only invoked for decoders that
+    /// report [`supports_paged_kv`](Self::supports_paged_kv); the default is
+    /// unreachable and errors loudly.
+    fn load_paged_prefix(
+        &mut self,
+        _kv_model: &KvModelInfo,
+        _materialized: &onnx_genai_kv::MaterializedKv,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this decoder does not support paged prefix reuse")
+    }
 }
 
 /// ONNX Runtime [`PipelineDecoderComponent`]: wraps the borrowed decoder session
@@ -120,7 +151,7 @@ impl PipelineDecoderComponent for OrtPipelineDecoder<'_> {
     }
 
     fn mirror_last_present_kv(
-        &self,
+        &mut self,
         kv_model: &KvModelInfo,
         cache: &mut PagedKvCache,
         seq: SequenceId,
@@ -165,10 +196,11 @@ impl PipelineDecoderComponent for OrtPipelineDecoder<'_> {
 ///
 /// This is the Inc2b (GAP 3) counterpart to [`OrtPipelineDecoder`]: the same
 /// pipeline decode loop drives either backend through the trait with no forked
-/// code path. Paged present-KV mirroring is not yet supported here — native
-/// selection runs the non-paged, fresh-decode path (see
-/// `.squad/decisions/inbox/mary-pipeline-inc2b-design.md`); cross-attention /
-/// vision KV is Inc3.
+/// code path. Paged present-KV mirroring and prefix reuse are wired for the
+/// host-resident growable f32 KV path (GAP-3 Inc-C, see
+/// [`supports_paged_kv`](PipelineDecoderComponent::supports_paged_kv)); a
+/// device-resident (CUDA) or in-place (GQA) / f16 KV store keeps the non-paged
+/// fresh-decode path until Inc-D. Cross-attention / vision KV is Inc3.
 #[cfg(feature = "native-backend")]
 pub(crate) struct NativePipelineDecoder {
     session: crate::native_decode::NativeDecodeSession,
@@ -242,21 +274,74 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
     }
 
     fn mirror_last_present_kv(
-        &self,
-        _kv_model: &KvModelInfo,
-        _cache: &mut PagedKvCache,
-        _seq: SequenceId,
-        _retained_past_len: usize,
-        _input_len: usize,
+        &mut self,
+        kv_model: &KvModelInfo,
+        cache: &mut PagedKvCache,
+        seq: SequenceId,
+        retained_past_len: usize,
+        input_len: usize,
     ) -> anyhow::Result<()> {
-        // The native decoder keeps KV session-resident and does not expose host
-        // present tensors for paged mirroring. Native selection runs the
-        // non-paged path, so this is never reached; exposing native present-KV
-        // for cross-request reuse is Inc3.
-        anyhow::bail!(
-            "native pipeline decoder does not support paged present-KV mirroring yet (Inc3); \
-             native selection runs the non-paged decode path"
-        )
+        // Read the most recent step's accumulated present KV out of the native
+        // decoder — the growable host cache (Inc-C) or the device-resident CUDA
+        // binding (Inc-D) — then publish the freshly-decoded tokens into pages
+        // through the *same* geometry the ORT decoder uses
+        // (`extract_present_token` + `append_token_kv`), so native and ORT
+        // mirror byte-identical pages. The device read carries the physical
+        // capacity shape so strides address the padded buffer; the host read
+        // carries its compact shape. f16 / in-place / non-rank-4 KV stays gated
+        // off the paged path (`supports_paged_kv`).
+        let layer_data = kv_model
+            .layers
+            .iter()
+            .map(|layer| {
+                let (key, key_shape) =
+                    self.session.present_kv(&layer.key_past)?.with_context(|| {
+                        format!(
+                            "native decoder produced no present KV for '{}'; a decode step must \
+                             run before mirroring",
+                            layer.key_past
+                        )
+                    })?;
+                let (value, value_shape) = self
+                    .session
+                    .present_kv(&layer.value_past)?
+                    .with_context(|| {
+                        format!(
+                            "native decoder produced no present KV for '{}'",
+                            layer.value_past
+                        )
+                    })?;
+                let to_i64 =
+                    |shape: Vec<usize>| shape.iter().map(|&d| d as i64).collect::<Vec<_>>();
+                Ok((key, to_i64(key_shape), value, to_i64(value_shape)))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        for offset in 0..input_len {
+            let token_pos = retained_past_len + offset;
+            let owned_layers = layer_data
+                .iter()
+                .enumerate()
+                .map(|(layer_idx, (key, key_shape, value, value_shape))| {
+                    let layer_config = kv_model.layer_tensor_config(layer_idx);
+                    Ok((
+                        extract_present_token(key, key_shape, layer_config, token_pos)?,
+                        extract_present_token(value, value_shape, layer_config, token_pos)?,
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<(Vec<f32>, Vec<f32>)>>>()?;
+            let borrowed = owned_layers
+                .iter()
+                .map(|(key, value)| LayerKv {
+                    key: key.as_slice(),
+                    value: value.as_slice(),
+                })
+                .collect::<Vec<_>>();
+            cache
+                .append_token_kv(seq, &borrowed)
+                .context("Failed to mirror native present KV into pages")?;
+        }
+        Ok(())
     }
 
     fn use_kv(&self) -> bool {
@@ -265,7 +350,8 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
 
     fn retained_kv_len(&self, past_len: usize) -> usize {
         // No sliding window in this increment: retained length is the absolute
-        // past length. Only feeds paged mirroring, which native selection skips.
+        // past length, so the paged mirror indexes the present tensor in the
+        // same absolute space the growable host cache grows in.
         past_len
     }
 
@@ -275,6 +361,51 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
 
     fn sink_tokens(&self) -> usize {
         0
+    }
+
+    fn supports_paged_kv(&self) -> bool {
+        self.session.supports_host_kv_mirror() || self.session.supports_device_kv_mirror()
+    }
+
+    fn load_paged_prefix(
+        &mut self,
+        kv_model: &KvModelInfo,
+        materialized: &onnx_genai_kv::MaterializedKv,
+    ) -> anyhow::Result<()> {
+        // Re-seed the growable host KV from the shared prefix using the exact
+        // `[1, num_kv_heads, seq, head_dim]` layout the ORT decoder injects
+        // (`kv_bridge::materialized_past_values` via `past_shape`), so native and
+        // ORT prefix reuse are byte-identical. Discontinuous attention-sink
+        // prefixes are Inc-D, matching the ORT path's own restriction.
+        if materialized.start_position != 0 || materialized.sink_len != 0 {
+            anyhow::bail!(
+                "native paged prefix reuse cannot start at absolute position {} (sink_len {}); \
+                 discontinuous attention-sink prefixes are Inc-D",
+                materialized.start_position,
+                materialized.sink_len
+            );
+        }
+        let seq_len = materialized.sequence_len;
+        let mut entries = Vec::with_capacity(kv_model.layers.len() * 2);
+        for (layer_idx, layer) in kv_model.layers.iter().enumerate() {
+            let config = kv_model.layer_tensor_config(layer_idx);
+            let shape = vec![1_usize, config.num_kv_heads, seq_len, config.head_dim];
+            let materialized_layer = materialized
+                .layers
+                .get(layer_idx)
+                .with_context(|| format!("materialized prefix is missing layer {layer_idx} KV"))?;
+            entries.push((
+                layer.key_past.clone(),
+                materialized_layer.key.clone(),
+                shape.clone(),
+            ));
+            entries.push((
+                layer.value_past.clone(),
+                materialized_layer.value.clone(),
+                shape,
+            ));
+        }
+        self.session.seed_kv(entries, seq_len)
     }
 }
 

@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use onnx_genai::ort::{ChatMessage, ChatTemplate};
-use onnx_genai::reasoning::{ReasoningMarkers, ReasoningStream};
+use onnx_genai::reasoning::{ReasoningChunk, ReasoningMarkers, ReasoningStream};
 use onnx_genai::{GenerateToken, GenerationBudgetCap};
 
 use super::interactive::{Backend, GENERATING, INTERRUPT_REQUESTED, Interrupted, TurnInput};
@@ -18,6 +18,7 @@ pub(super) struct ReasoningConfig {
     /// True when the template writes the opening delimiter itself, so the
     /// model's output begins inside the span and never emits an opener.
     pub(super) opened_by_template: bool,
+    marker_tokens: Vec<(u32, String)>,
 }
 
 /// Reasoning delimiters this model declares through its chat template, if any.
@@ -25,16 +26,46 @@ pub(super) fn detect_reasoning(template: Option<&ChatTemplate>) -> Option<Reason
     let template = template?;
     let source = template.source();
     let markers = ReasoningMarkers::from_chat_template(source)?;
-    // The opener appearing after the assistant generation prompt means the
-    // template opens the span for the model.
-    let opened_by_template = source
-        .rsplit_once("assistant")
-        .map(|(_, tail)| tail.contains(&markers.start))
-        .unwrap_or(false);
+    let opened_by_template = template_opens_reasoning_for_generation(template, &markers);
     Some(ReasoningConfig {
         markers,
         opened_by_template,
+        marker_tokens: Vec::new(),
     })
+}
+
+impl ReasoningConfig {
+    pub(super) fn set_marker_token_ids(&mut self, start_id: Option<u32>, end_id: Option<u32>) {
+        self.marker_tokens.clear();
+        if let Some(id) = start_id {
+            self.marker_tokens.push((id, self.markers.start.clone()));
+        }
+        if let Some(id) = end_id {
+            self.marker_tokens.push((id, self.markers.end.clone()));
+        }
+    }
+
+    fn marker_text_for_token(&self, token_id: u32) -> Option<&str> {
+        self.marker_tokens
+            .iter()
+            .find_map(|(id, text)| (*id == token_id).then_some(text.as_str()))
+    }
+}
+
+fn template_opens_reasoning_for_generation(
+    template: &ChatTemplate,
+    markers: &ReasoningMarkers,
+) -> bool {
+    let probe = [ChatMessage::user("__onnx_genai_reasoning_probe__")];
+    let Ok(rendered) = template.render(&probe, None, true) else {
+        return false;
+    };
+    let Some(last_start) = rendered.rfind(markers.start.as_str()) else {
+        return false;
+    };
+    rendered
+        .rfind(markers.end.as_str())
+        .is_none_or(|last_end| last_start > last_end)
 }
 
 /// Load the model's chat template unless `raw` is set. On a load failure this
@@ -146,6 +177,49 @@ fn needs_trailing_newline(output: &str) -> bool {
     !output.is_empty() && !output.ends_with('\n')
 }
 
+fn emit_reasoning_segment(
+    segment: &ReasoningChunk,
+    dim_reasoning: bool,
+    dimmed: &mut bool,
+    live: Option<&mut live_turn::LiveTurn>,
+) -> anyhow::Result<()> {
+    if segment.text.is_empty() {
+        return Ok(());
+    }
+    if let Some(live) = live {
+        live.push(&segment.text, segment.is_reasoning)?;
+    } else {
+        if dim_reasoning && segment.is_reasoning != *dimmed {
+            print!(
+                "{}",
+                if segment.is_reasoning {
+                    "\x1b[2m"
+                } else {
+                    "\x1b[0m"
+                }
+            );
+            *dimmed = segment.is_reasoning;
+        }
+        print!("{}", segment.text);
+        io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+fn visible_token_text(token: &GenerateToken, reasoning: Option<&ReasoningConfig>) -> String {
+    if !token.text.is_empty() {
+        return token.text.clone();
+    }
+    reasoning
+        .and_then(|config| config.marker_text_for_token(token.token_id))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn live_frame_due(draws: usize, last_draw: Instant, now: Instant) -> bool {
+    draws == 0 || now.duration_since(last_draw) >= STATUS_REFRESH
+}
+
 fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
     show_stats && !show_profile
 }
@@ -222,8 +296,8 @@ pub(super) fn run_generation_turn(
     let mut live = live.filter(|live| stream && live.is_active());
     // Numbers move faster than a reader can follow, and every update costs a
     // frame, so the status is refreshed on a timer rather than per token.
-    let mut last_status = Instant::now();
-    let mut live_frames = 0usize;
+    let mut last_live_draw = Instant::now();
+    let mut live_draws = 0usize;
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Interrupted));
@@ -231,21 +305,29 @@ pub(super) fn run_generation_turn(
         // Timed here, at the point the token reaches the caller, because that
         // is the latency a user actually experiences.
         timings.token();
-        output.push_str(&token.text);
+        let token_text = visible_token_text(&token, reasoning);
+        output.push_str(&token_text);
         if stream {
-            let is_reasoning = reasoning_stream
-                .as_mut()
-                .map(|tracker| tracker.push(&token.text))
-                .unwrap_or(false);
-            if let Some(live) = live.as_deref_mut() {
-                let first = live_frames == 0;
-                live.push(&token.text, is_reasoning)?;
-                live_frames += 1;
-                // The first token draws immediately so the line is never empty
-                // while a reply is on screen; after that the numbers are
-                // throttled, since they move faster than they can be read and
-                // every update costs a frame.
-                if first || last_status.elapsed() >= STATUS_REFRESH {
+            let segments = if let Some(tracker) = reasoning_stream.as_mut() {
+                tracker.push_segments(&token_text)
+            } else {
+                vec![ReasoningChunk {
+                    text: token_text,
+                    is_reasoning: false,
+                }]
+            };
+            for segment in segments {
+                let using_live = live.is_some() && !segment.text.is_empty();
+                emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
+                let now = Instant::now();
+                let draw_live_frame = using_live && live_frame_due(live_draws, last_live_draw, now);
+                if draw_live_frame {
+                    live_draws += 1;
+                    last_live_draw = now;
+                    // The first token draws immediately so the line is never empty
+                    // while a reply is on screen; after that the numbers are
+                    // throttled, since they move faster than they can be read and
+                    // every update costs a frame.
                     let mut status = timings.live_summary();
                     if let (Some(prompt_tokens), Some(context_limit)) =
                         (prompt_tokens, context_limit)
@@ -260,22 +342,25 @@ pub(super) fn run_generation_turn(
                             status.push_str(&format!(" · ctx {context}"));
                         }
                     }
-                    live.set_status(status)?;
-                    last_status = Instant::now();
+                    if let Some(live) = live.as_deref_mut() {
+                        live.set_status(status)?;
+                        live.draw()?;
+                    }
                 }
-            } else {
-                if dim_reasoning && is_reasoning != dimmed {
-                    print!("{}", if is_reasoning { "\x1b[2m" } else { "\x1b[0m" });
-                    dimmed = is_reasoning;
-                }
-                print!("{}", token.text);
-                io::stdout().flush()?;
             }
         }
         Ok(())
     };
 
     let result = backend.generate(turn, &mut callback);
+    if stream && let Some(tracker) = reasoning_stream.as_mut() {
+        for segment in tracker.finish() {
+            emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
+        }
+    }
+    if let Some(live) = live.as_deref_mut() {
+        live.draw()?;
+    }
     if dimmed {
         print!("\x1b[0m");
         let _ = io::stdout().flush();
@@ -346,6 +431,17 @@ pub(super) fn display_paths(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::current_dir().unwrap().join(format!(
+            "output-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn scheduler_budget_cap_notice_names_values_and_levers() {
@@ -404,6 +500,66 @@ mod tests {
         assert!(needs_trailing_newline("line one\nno newline at end"));
     }
 
+    #[test]
+    fn empty_reasoning_marker_token_text_is_restored_for_display() {
+        let mut config = ReasoningConfig {
+            markers: ReasoningMarkers::new("<think>", "</think>"),
+            opened_by_template: false,
+            marker_tokens: Vec::new(),
+        };
+        config.set_marker_token_ids(Some(151667), Some(151668));
+        let token = GenerateToken {
+            token_id: 151667,
+            text: String::new(),
+            finish_reason: None,
+        };
+
+        assert_eq!(visible_token_text(&token, Some(&config)), "<think>");
+
+        let mut stream = ReasoningStream::new(config.markers.clone(), config.opened_by_template);
+        let chunks = stream.push_segments(&visible_token_text(&token, Some(&config)));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "<think>");
+        assert!(chunks[0].is_reasoning);
+    }
+
+    #[test]
+    fn unrelated_empty_special_token_stays_hidden() {
+        let mut config = ReasoningConfig {
+            markers: ReasoningMarkers::new("<think>", "</think>"),
+            opened_by_template: false,
+            marker_tokens: Vec::new(),
+        };
+        config.set_marker_token_ids(Some(151667), Some(151668));
+        let eos = GenerateToken {
+            token_id: 151645,
+            text: String::new(),
+            finish_reason: None,
+        };
+
+        assert_eq!(visible_token_text(&eos, Some(&config)), "");
+    }
+
+    #[test]
+    fn live_frames_are_coalesced_over_a_token_burst() {
+        let start = Instant::now();
+        let mut last_draw = start;
+        let mut draws = 0usize;
+
+        for millisecond in 0..250 {
+            let now = start + std::time::Duration::from_millis(millisecond);
+            if live_frame_due(draws, last_draw, now) {
+                draws += 1;
+                last_draw = now;
+            }
+        }
+
+        assert_eq!(
+            draws, 3,
+            "250 token callbacks at 1 ms spacing should draw at t=0, 100, and 200 ms, not once per token"
+        );
+    }
+
     /// The stats format is determined by stderr's terminal state, not stdout's.
     ///
     /// `stats_text` takes only `stderr_is_terminal`; stdout's state is
@@ -458,5 +614,94 @@ mod tests {
             !case_b.contains('\n'),
             "case B: stderr=plain must give line"
         );
+    }
+
+    #[test]
+    fn qwen3_template_does_not_open_reasoning_for_current_generation() {
+        let dir = temp_dir("qwen3-reasoning-template");
+        fs::write(
+            dir.join("chat_template.jinja"),
+            r#"{%- for message in messages %}
+{%- if message.role == "user" %}
+{{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
+{%- elif message.role == "assistant" %}
+{{- '<|im_start|>assistant\n' }}
+{%- if '</think>' in message.content %}
+{{- '<think>\n' + message.content.split('</think>')[0].split('<think>')[-1] + '\n</think>\n\n' }}
+{%- endif %}
+{{- message.content.split('</think>')[-1].lstrip('\n') + '<|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' }}
+{%- if enable_thinking is defined and enable_thinking is false %}
+{{- '<think>\n\n</think>\n\n' }}
+{%- endif %}
+{%- endif %}"#,
+        )
+        .unwrap();
+
+        let template = ChatTemplate::from_model_dir(&dir).unwrap();
+        let old_source_tail_heuristic = template
+            .source()
+            .rsplit_once("assistant")
+            .map(|(_, tail)| tail.contains("<think>"))
+            .unwrap_or(false);
+        let config = detect_reasoning(Some(&template)).expect("template declares think markers");
+        let rendered = template
+            .render(&[ChatMessage::user("what's the capital?")], None, true)
+            .unwrap();
+        let split = config
+            .markers
+            .split("<think>because</think>Olympia", config.opened_by_template);
+        let mut stream = ReasoningStream::new(config.markers.clone(), config.opened_by_template);
+        let trace = stream
+            .push_segments("<think>because</think>Olympia")
+            .into_iter()
+            .map(|segment| (segment.text.to_string(), segment.is_reasoning))
+            .collect::<Vec<_>>();
+
+        assert!(
+            old_source_tail_heuristic,
+            "the old source-tail heuristic must reproduce the false positive"
+        );
+        assert!(
+            !rendered.contains("<think>"),
+            "the rendered current generation prompt must not open thinking: {rendered:?}"
+        );
+        assert!(
+            !config.opened_by_template,
+            "qwen3 opens prior assistant turns and an enable_thinking=false branch, not the current default generation turn"
+        );
+        assert!(split.complete);
+        assert_eq!(split.answer, "Olympia");
+        assert_eq!(
+            trace,
+            vec![
+                ("<think>".to_string(), true),
+                ("because".to_string(), true),
+                ("</think>".to_string(), true),
+                ("Olympia".to_string(), false),
+            ]
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn template_opening_current_generation_is_still_detected() {
+        let dir = temp_dir("template-opens-reasoning");
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"{% for m in messages %}<|{{ m.role }}|>\n{{ m.content }}\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n<think>\n{% endif %}"}"#,
+        )
+        .unwrap();
+
+        let template = ChatTemplate::from_model_dir(&dir).unwrap();
+        let config = detect_reasoning(Some(&template)).expect("template declares think markers");
+
+        assert!(config.opened_by_template);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1049,6 +1049,61 @@ impl PipelineEngine {
             .map(|paged| paged.cache.page_table.usage())
     }
 
+    /// TEST-SUPPORT (native-backend only): read back the paged KV bytes that
+    /// were published for `request`'s prompt prefix, non-destructively.
+    ///
+    /// Reconstructs the exact prefix key the paged decode path publishes under
+    /// (`digest_request_identity` + `prefix_key`), looks it up in the prefix
+    /// cache *without* touching page refcounts, attaches the matched pages to a
+    /// throwaway sequence purely to read them, and materializes the per-layer
+    /// K/V into contiguous buffers. The throwaway sequence is then dropped
+    /// without freeing the pages — they belong to the prefix cache, and the
+    /// attach did not retain them — so the cache is left exactly as found.
+    ///
+    /// This exists because the Inc-C paged-reuse parity test cannot see KV
+    /// geometry through token equality alone: the `tiny-gemma4-vlm` fixture's
+    /// argmax is invariant to the reused-prefix KV, so a key/value swap or a
+    /// fully-zeroed mirror still yields identical tokens. Comparing these
+    /// materialized bytes between the native-mirrored and ORT-mirrored caches
+    /// gives the test discriminating power over the mirror geometry.
+    ///
+    /// Returns `None` when nothing is published for the prefix (no digestable
+    /// inputs, no paged cache, or no matched pages).
+    #[cfg(feature = "native-backend")]
+    pub fn materialize_published_prefix_kv(
+        &mut self,
+        request: &PipelineGenerateRequest,
+    ) -> anyhow::Result<Option<onnx_genai_kv::MaterializedKv>> {
+        let Some(inputs) = Self::digest_request_identity(request) else {
+            return Ok(None);
+        };
+        let prompt_tokens = tokenize_with(self.tokenizer()?, &request.request.prompt)?;
+        let Some(paged) = self.paged.as_mut() else {
+            return Ok(None);
+        };
+        let key = prefix_key(inputs, &prompt_tokens);
+        let (matched_tokens, page_ids) = paged.prefix.lookup(&key);
+        let reusable = matched_tokens.saturating_sub(PREFIX_KEY_PREAMBLE);
+        if reusable == 0 || page_ids.is_empty() {
+            return Ok(None);
+        }
+        let pages_needed = reusable.div_ceil(paged.cache.page_table.page_size);
+        let pages = page_ids.into_iter().take(pages_needed).collect::<Vec<_>>();
+        let seq = paged.cache.create_sequence();
+        let materialized = (|| {
+            attach_pages_to_sequence(&mut paged.cache, seq, &pages, reusable)?;
+            paged
+                .cache
+                .materialize_sequence(seq)
+                .map_err(anyhow::Error::from)
+        })();
+        // Forget the throwaway sequence's borrowed page list without freeing the
+        // pages: `attach_pages_to_sequence` did not retain them, so the prefix
+        // cache remains their sole owner and is left untouched.
+        paged.cache.page_table.remove_sequence(seq);
+        materialized.map(Some)
+    }
+
     /// Counters describing what the pipeline's reuse caches did.
     pub fn cache_stats(&self) -> PipelineCacheStats {
         self.component_cache.borrow().stats()
