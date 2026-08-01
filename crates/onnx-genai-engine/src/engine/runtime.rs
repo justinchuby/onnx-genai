@@ -73,7 +73,7 @@ impl Engine {
     }
 
     #[cfg(feature = "native-backend")]
-    fn generate_native_with_callback(
+    fn generate_native_cold_with_callback(
         &mut self,
         mut request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
@@ -157,7 +157,7 @@ impl Engine {
     }
 
     #[cfg(not(feature = "native-backend"))]
-    fn generate_native_with_callback(
+    fn generate_native_cold_with_callback(
         &mut self,
         _request: GenerateRequest,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
@@ -165,6 +165,23 @@ impl Engine {
         anyhow::bail!(
             "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
         )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn next_native_session_id(&mut self) -> SessionId {
+        self.native_session_counter = self.native_session_counter.saturating_add(1);
+        SessionId::from(self.native_session_counter)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn create_native_session_state(&mut self) -> anyhow::Result<SessionId> {
+        if self.decode_backend != EngineDecodeBackend::Native {
+            anyhow::bail!("native session state requires the native decode backend");
+        }
+        let id = self.next_native_session_id();
+        self.native_sessions
+            .insert(id, NativeSessionState { tokens: Vec::new() });
+        Ok(id)
     }
 
     fn require_ort_backend(&self, feature: &str) -> anyhow::Result<()> {
@@ -334,7 +351,7 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if !generate_uses_scheduler(self.decode_backend) {
-            return self.generate_native_with_callback(request, callback);
+            return self.generate_native_cold_with_callback(request, callback);
         }
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_callback(session_id, request, callback);
@@ -414,6 +431,16 @@ impl Engine {
         mut custom_sampler: Option<Box<dyn Sampler>>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            if priority != Priority::Normal {
+                anyhow::bail!("native backend does not support prioritized session generation");
+            }
+            if custom_sampler.is_some() {
+                anyhow::bail!("custom samplers are not supported on the native backend");
+            }
+            return self.generate_native_in_session_with_callback(session_id, request, callback);
+        }
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
@@ -657,7 +684,10 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
-        self.require_ort_backend("persistent sessions")?;
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self.create_native_session_state();
+        }
         let decode_state = self.new_target_decode_state()?;
         let id = self.kv_cache.create_sequence();
         let draft = if let Some(draft_model) = &mut self.draft {
@@ -692,6 +722,17 @@ impl Engine {
     /// page ownership intact. Checkpoints are invalid after the session is
     /// closed or reset.
     pub fn checkpoint_session(&self, session_id: SessionId) -> anyhow::Result<SessionCheckpoint> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let state = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            return Ok(SessionCheckpoint {
+                session_id,
+                position: SessionPosition::new(state.tokens.len()),
+            });
+        }
         self.require_ort_backend("session checkpoints")?;
         let state = self
             .sessions
@@ -719,6 +760,24 @@ impl Engine {
         session_id: SessionId,
         tokens: RewindTokenCount,
     ) -> anyhow::Result<SessionPosition> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let tokens = tokens.get();
+            let current = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?
+                .tokens
+                .len();
+            let target = current.checked_sub(tokens).with_context(|| {
+                format!(
+                    "cannot rewind session {session_id} by {tokens} tokens from length {current}"
+                )
+            })?;
+            let target = SessionPosition::new(target);
+            self.rewind_session_to(session_id, target)?;
+            return Ok(target);
+        }
         self.require_ort_backend("session rewind")?;
         let tokens = tokens.get();
         let current = self
@@ -745,6 +804,34 @@ impl Engine {
         session_id: SessionId,
         position: SessionPosition,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let position = position.get();
+            let current = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?
+                .tokens
+                .len();
+            if position > current {
+                anyhow::bail!(
+                    "cannot rewind session {session_id} to token {position}; current length is {current}"
+                );
+            }
+            let state = self
+                .native_sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            state.tokens.truncate(position);
+            if self.native_active_session == Some(session_id) {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.rewind(position.min(native.current_len()))?;
+            }
+            return Ok(());
+        }
         self.require_ort_backend("session rewind")?;
         let position = position.get();
         let state = self
@@ -844,6 +931,23 @@ impl Engine {
 
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let state = self
+                .native_sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            state.tokens.clear();
+            if self.native_active_session == Some(session_id) {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.reset()?;
+                self.native_active_session = None;
+            }
+            return Ok(());
+        }
         self.require_ort_backend("persistent sessions")?;
         if !self.sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
@@ -913,6 +1017,21 @@ impl Engine {
 
     /// Close a persistent session and free its associated state.
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            self.native_sessions
+                .remove(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            if self.native_active_session == Some(session_id) {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.reset()?;
+                self.native_active_session = None;
+            }
+            return Ok(());
+        }
         self.require_ort_backend("persistent sessions")?;
         self.scheduler.complete(session_id);
         let state = self
@@ -933,6 +1052,14 @@ impl Engine {
 
     /// Number of logical tokens retained in a persistent session.
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self
+                .native_sessions
+                .get(&session_id)
+                .map(|state| state.tokens.len())
+                .with_context(|| format!("session {session_id} not found"));
+        }
         self.require_ort_backend("persistent sessions")?;
         self.sessions
             .get(&session_id)
@@ -1571,109 +1698,113 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
     }
 }
 
-// ─── Native Session KV (Phase 1: single-session incremental prefill) ────────
+// ─── Native session shims and implementation ────────────────────────────────
 
 #[cfg(feature = "native-backend")]
 impl Engine {
-    /// Create a persistent native session for incremental KV reuse across turns.
-    ///
-    /// The native backend supports exactly one session at a time (Phase 1).
-    /// The stateless `generate()` API remains unchanged — calling it still resets.
+    /// Deprecated native-only shim. Use [`Engine::create_session`] for both ORT
+    /// and native backends.
     pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
         if self.decode_backend != EngineDecodeBackend::Native {
             anyhow::bail!("create_native_session requires the native decode backend");
         }
-        if self.native_session_state.is_some() {
-            anyhow::bail!(
-                "a native session already exists; close it before creating a new one (Phase 1 supports one session)"
-            );
-        }
-        let native = self
-            .native_session
-            .as_mut()
-            .context("native decoder session is unavailable")?;
-        // Ensure clean slate.
-        native.reset()?;
-        self.native_session_state = Some(NativeSessionState { tokens: Vec::new() });
-        // Return a fixed session id for the single-session Phase 1.
-        Ok(SessionId::from(0u64))
+        self.create_session()
     }
 
-    /// Close the native session, releasing its KV state.
-    pub fn close_native_session(&mut self, _session_id: SessionId) -> anyhow::Result<()> {
-        if self.native_session_state.is_none() {
-            anyhow::bail!("no native session to close");
-        }
-        if let Some(native) = self.native_session.as_mut() {
-            native.reset()?;
-        }
-        self.native_session_state = None;
-        Ok(())
+    /// Deprecated native-only shim. Use [`Engine::close_session`].
+    pub fn close_native_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        self.close_session(session_id)
     }
 
-    /// Generate in a persistent native session. Only new tokens since the last
-    /// turn are prefilled; prior KV state is reused.
-    ///
-    /// **Prefix-mismatch safety:** If the new prompt doesn't extend the existing
-    /// session token history, the KV cache is rewound to the longest common
-    /// prefix. This handles regeneration, history edits, and branching correctly.
+    /// Deprecated native-only shim. Use [`Engine::generate_in_session`].
     pub fn generate_native_in_session(
         &mut self,
-        _session_id: SessionId,
+        session_id: SessionId,
         request: GenerateRequest,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_with_callback(_session_id, request, None)
+        self.generate_in_session(session_id, request)
     }
 
-    /// Generate in a persistent native session with streaming callback.
+    /// Deprecated native-only shim. Use [`Engine::generate_in_session_with_callback`].
     pub fn generate_native_in_session_with_callback(
         &mut self,
-        _session_id: SessionId,
+        session_id: SessionId,
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.native_session_state.is_none() {
-            anyhow::bail!("no native session exists; call create_native_session first");
-        }
+        self.generate_native_in_session_impl(session_id, request, callback)
+    }
 
+    fn generate_native_in_session_impl(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options;
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer.eos_token_id();
-        }
+        reject_native_request_speculation(&options)?;
+        self.apply_eos_defaults(&mut options);
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        if native_speculation_plan(&options, &chain).is_some() {
+            anyhow::bail!(
+                "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
+            );
+        }
 
-        // Compute the common prefix between session history and new prompt.
-        // Cap at current_len: state.tokens may include the final generated token
-        // that was sampled but not yet fed back through the model.
-        let prefix_len = common_prefix_len(
-            &self.native_session_state.as_ref().unwrap().tokens,
-            &prompt_tokens,
-        );
+        let active_matches = self.native_active_session == Some(session_id);
+        if !active_matches {
+            let native = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            native.reset()?;
+            self.native_active_session = Some(session_id);
+        }
 
-        let native = self
-            .native_session
-            .as_mut()
-            .context("native decoder session is unavailable")?;
+        let prefix_len = {
+            let state = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            common_prefix_len(&state.tokens, &prompt_tokens)
+        };
 
-        let resume_from = prefix_len.min(native.current_len());
+        let result = {
+            let native = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
 
-        let result = native.generate_incremental_with_callback(
-            &prompt_tokens,
-            resume_from,
-            &options,
-            &chain,
-            &self.tokenizer,
-            callback,
-        )?;
+            let mut resume_from = if active_matches {
+                prefix_len.min(native.current_len())
+            } else {
+                0
+            };
+            if resume_from >= prompt_tokens.len() {
+                resume_from = prompt_tokens.len().saturating_sub(1);
+            }
 
-        // Update session token history: rewind to prefix, then append new prompt + generated.
-        let state = self.native_session_state.as_mut().unwrap();
+            native.generate_incremental_with_callback(
+                &prompt_tokens,
+                resume_from,
+                &options,
+                &chain,
+                &self.tokenizer,
+                callback,
+            )?
+        };
+
+        let state = self
+            .native_sessions
+            .get_mut(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
         state.tokens.truncate(prefix_len);
         state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
         state.tokens.extend_from_slice(&result.token_ids);
@@ -1681,30 +1812,13 @@ impl Engine {
         Ok(result)
     }
 
-    /// Rewind the native session KV cache by discarding tokens from the end.
+    /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
     pub fn rewind_native_session(
         &mut self,
-        _session_id: SessionId,
+        session_id: SessionId,
         token_count: RewindTokenCount,
     ) -> anyhow::Result<SessionPosition> {
-        let state = self
-            .native_session_state
-            .as_mut()
-            .context("no native session exists")?;
-        let current = state.tokens.len();
-        let target = current.checked_sub(token_count.get()).with_context(|| {
-            format!(
-                "cannot rewind native session by {} from length {current}",
-                token_count.get()
-            )
-        })?;
-        state.tokens.truncate(target);
-        let native = self
-            .native_session
-            .as_mut()
-            .context("native decoder session is unavailable")?;
-        native.rewind(target)?;
-        Ok(SessionPosition::new(target))
+        self.rewind_session_by(session_id, token_count)
     }
 }
 

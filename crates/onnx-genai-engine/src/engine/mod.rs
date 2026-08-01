@@ -197,7 +197,11 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_state: None,
+            native_sessions: HashMap::new(),
+            #[cfg(feature = "native-backend")]
+            native_active_session: None,
+            #[cfg(feature = "native-backend")]
+            native_session_counter: 0,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
             draft: None,
