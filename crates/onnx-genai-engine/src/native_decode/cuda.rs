@@ -243,17 +243,36 @@ struct CapturedStepInputBinding {
     byte_len: usize,
 }
 
-/// Whether the Inc3c captured per-step-input path is opted in via
-/// `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`. Default off keeps the eager
-/// owned path byte-identical; truthy (`1`/`true`/`yes`/`on`) enables capture of
-/// the `inputs_embeds`/routed decode step.
+/// Whether the Inc3c captured per-step-input path is enabled. It is now
+/// **default-on** (the CUDA-graph capture perf win for multi-component/routed
+/// decoders): a capture-eligible `inputs_embeds`/routed decode step reuses the
+/// persistent bindings + `run_one_token` graph instead of paying the eager
+/// per-step kernel-launch cost. The env var
+/// `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` is an **opt-out** escape
+/// hatch: a falsy value (`0`/`false`/`no`/`off`) forces the eager owned path.
+/// Any other value (including unset or truthy) keeps capture on. Structural
+/// eligibility gates (`graph_enabled`, non-empty `captured_step_inputs`) still
+/// decide whether an individual decoder actually captures, so an ineligible
+/// decoder auto-declines to eager regardless of this flag.
 fn capture_step_inputs_enabled() -> bool {
-    match std::env::var("ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS") {
-        Ok(value) => matches!(
+    capture_step_inputs_from_env_value(
+        std::env::var("ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure opt-out parse for `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`.
+/// Capture is **default-on**: only an explicit falsy value
+/// (`0`/`false`/`no`/`off`, case/whitespace-insensitive) opts out to eager;
+/// unset (`None`) or any other value keeps capture enabled.
+fn capture_step_inputs_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+            "0" | "false" | "no" | "off"
         ),
-        Err(_) => false,
+        None => true,
     }
 }
 
@@ -392,11 +411,13 @@ impl NativeDecodeSession {
         // keeps that byte-identical path. Inc3a introduced this for embeds; Inc3b
         // generalizes it to arbitrary routed ports via one shared owned build.
         if self.has_eager_step_inputs() {
-            // Inc3c: when opted in and this is a single-token decode step, drive
-            // the per-step ports through their persistent device bindings + the
-            // captured `run_one_token` state machine (recovering the graph-capture
-            // fast path lost to the eager owned uploads). Otherwise (default, or
-            // multi-token prefill) use the eager owned path.
+            // Inc3c: for a single-token decode step, drive the per-step ports
+            // through their persistent device bindings + the captured
+            // `run_one_token` state machine (recovering the graph-capture fast
+            // path lost to the eager owned uploads). This is default-on for
+            // capture-eligible decoders (`state.capture_step_inputs`); multi-token
+            // prefill, an ineligible decoder, or the `…CAPTURE_STEP_INPUTS=0`
+            // opt-out use the eager owned path.
             let capture = token_ids.len() == 1
                 && self
                     .cuda
@@ -1395,11 +1416,16 @@ impl DecodeCudaState {
         }
         let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
 
-        // Inc3c: enable the captured per-step-input path only when (a) the
-        // operator opted in via `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`,
-        // (b) the decoder actually has per-step supplied ports (embeds/routed),
-        // and (c) graph capture is structurally available. Off by default keeps
-        // the eager owned path byte-identical.
+        // Inc3c: enable the captured per-step-input path when (a) graph capture
+        // is structurally available (`graph_enabled`), (b) the decoder actually
+        // has per-step supplied ports (embeds/routed), and (c) the opt-out env
+        // `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` is not falsy. This is
+        // now **default-on**: a capture-eligible multi-component decoder reuses
+        // the `run_one_token` graph instead of the eager owned uploads. The
+        // structural gates (a)/(b) still auto-decline ineligible decoders (a
+        // growing-logical binding or a mask exposed to a non-capacity-aware
+        // consumer clears `graph_enabled`), so default-on never captures a wrong
+        // decoder; the eager owned path stays as the byte-identical fallback.
         let capture_step_inputs =
             graph_enabled && !captured_step_inputs.is_empty() && capture_step_inputs_enabled();
 
@@ -2318,5 +2344,38 @@ mod device_kv_view_tests {
             wrong0, token0,
             "logical-stride read must diverge from the physical-stride read at H >= 2"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_step_inputs_gate_tests {
+    use super::capture_step_inputs_from_env_value;
+
+    /// Capture is default-on: an unset env keeps the graph-capture perf path.
+    #[test]
+    fn unset_env_defaults_to_capture_on() {
+        assert!(capture_step_inputs_from_env_value(None));
+    }
+
+    /// The opt-out escape hatch: only explicit falsy values force eager.
+    #[test]
+    fn falsy_values_opt_out_to_eager() {
+        for value in ["0", "false", "no", "off", " OFF ", "False", "No"] {
+            assert!(
+                !capture_step_inputs_from_env_value(Some(value)),
+                "{value:?} must opt out to the eager owned path"
+            );
+        }
+    }
+
+    /// Truthy or unrecognized values keep capture on (default-on, opt-out only).
+    #[test]
+    fn truthy_and_unknown_values_keep_capture_on() {
+        for value in ["1", "true", "yes", "on", "", "anything"] {
+            assert!(
+                capture_step_inputs_from_env_value(Some(value)),
+                "{value:?} must keep capture on"
+            );
+        }
     }
 }
