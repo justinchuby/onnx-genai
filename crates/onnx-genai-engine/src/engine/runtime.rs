@@ -173,15 +173,82 @@ impl Engine {
         SessionId::from(self.native_session_counter)
     }
 
+    /// Stamp a session as most-recently-used and return the new stamp.
+    #[cfg(feature = "native-backend")]
+    fn touch_native_session(&mut self) -> u64 {
+        self.native_access_counter = self.native_access_counter.saturating_add(1);
+        self.native_access_counter
+    }
+
     #[cfg(feature = "native-backend")]
     fn create_native_session_state(&mut self) -> anyhow::Result<SessionId> {
         if self.decode_backend != EngineDecodeBackend::Native {
             anyhow::bail!("native session state requires the native decode backend");
         }
         let id = self.next_native_session_id();
-        self.native_sessions
-            .insert(id, NativeSessionState { tokens: Vec::new() });
+        let last_access = self.touch_native_session();
+        self.native_sessions.insert(
+            id,
+            NativeSessionState {
+                tokens: Vec::new(),
+                last_access,
+                estimated_kv_bytes: 0,
+            },
+        );
+        self.evict_native_sessions(id);
         Ok(id)
+    }
+
+    /// Drop least-recently-used sessions until the retention limits are met.
+    ///
+    /// `keep` is the session the caller is currently working with and is never
+    /// a candidate: evicting it would destroy live state the caller is about to
+    /// use, and would do so silently.
+    ///
+    /// Only the active session owns KV memory -- there is one native KV cache,
+    /// and switching sessions resets it -- so the byte budget can only reclaim
+    /// *inactive* sessions' token histories. When `keep` alone exceeds the
+    /// budget there is nothing left to reclaim, and this stops rather than
+    /// evicting sessions that would free nothing.
+    #[cfg(feature = "native-backend")]
+    fn evict_native_sessions(&mut self, keep: SessionId) {
+        loop {
+            let over_count = self.native_max_sessions != 0
+                && self.native_sessions.len() > self.native_max_sessions;
+            let reclaimable_bytes = self
+                .native_sessions
+                .iter()
+                .filter(|(id, _)| **id != keep)
+                .fold(0u64, |sum, (_, state)| {
+                    sum.saturating_add(state.estimated_kv_bytes)
+                });
+            let total_bytes = self.native_sessions.values().fold(0u64, |sum, state| {
+                sum.saturating_add(state.estimated_kv_bytes)
+            });
+            let over_bytes =
+                self.native_kv_budget_bytes != 0 && total_bytes > self.native_kv_budget_bytes;
+            // Being over budget is only actionable while some other session
+            // still holds bytes to give back.
+            if !over_count && !(over_bytes && reclaimable_bytes > 0) {
+                break;
+            }
+            let Some(victim) = self
+                .native_sessions
+                .iter()
+                .filter(|(id, _)| **id != keep)
+                .min_by_key(|(_, state)| state.last_access)
+                .map(|(&id, _)| id)
+            else {
+                break;
+            };
+            self.native_sessions.remove(&victim);
+            if self.native_active_session == Some(victim) {
+                self.native_active_session = None;
+            }
+            if self.native_default_session == Some(victim) {
+                self.native_default_session = None;
+            }
+        }
     }
 
     #[cfg(feature = "native-backend")]
@@ -859,6 +926,14 @@ impl Engine {
                     .as_mut()
                     .context("native decoder session is unavailable")?;
                 native.rewind(position.min(native.current_len()))?;
+                let bytes = native.estimated_kv_bytes();
+                if let Some(state) = self.native_sessions.get_mut(&session_id) {
+                    state.estimated_kv_bytes = bytes;
+                }
+            }
+            let last_access = self.touch_native_session();
+            if let Some(state) = self.native_sessions.get_mut(&session_id) {
+                state.last_access = last_access;
             }
             return Ok(());
         }
@@ -963,11 +1038,14 @@ impl Engine {
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
+            let last_access = self.touch_native_session();
             let state = self
                 .native_sessions
                 .get_mut(&session_id)
                 .with_context(|| format!("session {session_id} not found"))?;
             state.tokens.clear();
+            state.last_access = last_access;
+            state.estimated_kv_bytes = 0;
             if self.native_active_session == Some(session_id) {
                 let native = self
                     .native_session
@@ -1798,6 +1876,14 @@ impl Engine {
                 .as_mut()
                 .context("native decoder session is unavailable")?;
             native.reset()?;
+            // The previous occupant's KV was just discarded, so it no longer
+            // holds any bytes. Leaving a stale figure here would make the
+            // budget account for memory that does not exist.
+            if let Some(previous) = self.native_active_session
+                && let Some(state) = self.native_sessions.get_mut(&previous)
+            {
+                state.estimated_kv_bytes = 0;
+            }
             self.native_active_session = Some(session_id);
         }
 
@@ -1833,6 +1919,12 @@ impl Engine {
                 callback,
             )?
         };
+        let estimated_kv_bytes = self
+            .native_session
+            .as_ref()
+            .map(|native| native.estimated_kv_bytes())
+            .unwrap_or(0);
+        let last_access = self.touch_native_session();
 
         let state = self
             .native_sessions
@@ -1841,6 +1933,9 @@ impl Engine {
         state.tokens.truncate(prefix_len);
         state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
         state.tokens.extend_from_slice(&result.token_ids);
+        state.last_access = last_access;
+        state.estimated_kv_bytes = estimated_kv_bytes;
+        self.evict_native_sessions(session_id);
 
         Ok(result)
     }

@@ -49,10 +49,20 @@ pub struct Engine {
     /// Monotonic counter for native session id generation.
     #[cfg(feature = "native-backend")]
     pub(crate) native_session_counter: u64,
+    /// Monotonic counter for LRU access stamps. Kept separate from the id
+    /// counter so that touching a session does not consume session ids.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_access_counter: u64,
     /// Implicit "default" native session used by the stateless `generate()` path
     /// for transparent KV reuse.
     #[cfg(feature = "native-backend")]
     pub(crate) native_default_session: Option<SessionId>,
+    /// Maximum retained native session token histories before LRU eviction.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_max_sessions: usize,
+    /// Byte budget above which inactive native sessions are dropped.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_kv_budget_bytes: u64,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
@@ -105,6 +115,11 @@ unsafe impl Send for Engine {}
 pub(crate) struct NativeSessionState {
     /// Full token history of this session (prompt + generated tokens from all turns).
     pub(crate) tokens: Vec<TokenId>,
+    /// Monotonically increasing access stamp, used to pick an LRU victim.
+    pub(crate) last_access: u64,
+    /// Estimated KV bytes this session currently holds. Only the active session
+    /// owns KV memory, so this is zero for every other session.
+    pub(crate) estimated_kv_bytes: u64,
 }
 
 pub(crate) struct MtpModel {

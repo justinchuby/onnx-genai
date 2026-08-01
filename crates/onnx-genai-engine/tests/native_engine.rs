@@ -635,3 +635,124 @@ fn stateless_generate_with_unrelated_prompts_matches_a_cold_engine() -> anyhow::
     }
     Ok(())
 }
+
+#[test]
+fn native_session_lru_eviction_keeps_remaining_session_correct() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_max_sessions: 1,
+            native_kv_budget_bytes: 0,
+            ..EngineConfig::default()
+        },
+    )?;
+    let evicted = engine.create_session()?;
+    let retained = engine.create_session()?;
+    assert!(engine.session_token_count(evicted).is_err());
+
+    let prompt = vec![0u32, 0];
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    let retained_result = engine.generate_in_session(retained, request)?;
+
+    let mut fresh = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));
+    cold_request.options.max_new_tokens = 2;
+    cold_request.options.temperature = 0.0;
+    cold_request.options.stop_on_eos = false;
+    cold_request.options.cold_start = true;
+    let cold_result = fresh.generate(cold_request)?;
+    assert_eq!(retained_result.token_ids, cold_result.token_ids);
+    Ok(())
+}
+
+/// Eviction must never delete the session the caller is working with.
+///
+/// The original implementation picked an LRU victim while excluding the
+/// protected session, but fell back to an unfiltered scan when that filter left
+/// no candidates. With a byte budget smaller than one session's KV -- which is
+/// what a long context reaches against any fixed budget -- the fallback chose
+/// the protected session and removed it. Generation returned successfully and
+/// the session it had just written to was gone, so the next call failed with
+/// "session not found" instead of anything describing what happened.
+#[test]
+fn eviction_never_removes_the_session_being_written_to() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_max_sessions: 0,
+            // Below any real session's KV footprint.
+            native_kv_budget_bytes: 1,
+            ..EngineConfig::default()
+        },
+    )?;
+    let session = engine.create_session()?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0u32, 0]));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    engine.generate_in_session(session, request)?;
+
+    let count = engine.session_token_count(session);
+    assert!(
+        count.is_ok(),
+        "the session just generated into was evicted by its own byte budget: {:?}",
+        count.err()
+    );
+
+    // And it must still be usable, not merely present.
+    let mut second = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0u32, 0]));
+    second.options.max_new_tokens = 1;
+    second.options.temperature = 0.0;
+    second.options.stop_on_eos = false;
+    engine.generate_in_session(session, second)?;
+    Ok(())
+}
+
+/// An over-budget active session must not take other sessions down with it.
+///
+/// Inactive sessions hold no KV memory, so dropping them frees nothing when the
+/// active session is the one over budget. Evicting them anyway would destroy
+/// reusable history to no benefit.
+#[test]
+fn an_over_budget_active_session_does_not_evict_sessions_that_hold_no_bytes() -> anyhow::Result<()>
+{
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_max_sessions: 0,
+            native_kv_budget_bytes: 1,
+            ..EngineConfig::default()
+        },
+    )?;
+    let idle = engine.create_session()?;
+    let busy = engine.create_session()?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0u32, 0]));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    engine.generate_in_session(busy, request)?;
+
+    assert!(
+        engine.session_token_count(idle).is_ok(),
+        "an idle session holding no KV bytes was evicted to relieve a budget it cannot relieve"
+    );
+    Ok(())
+}

@@ -890,6 +890,12 @@ impl NativeDecodeSession {
 }
 
 impl DecodeCudaState {
+    pub(crate) fn logical_kv_bytes(&self, len: usize) -> u64 {
+        len.saturating_mul(self.capacity.bytes_per_token)
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
     pub(crate) fn kv_bytes_per_token(
         session: &InferenceSession,
         present_to_past: &HashMap<String, String>,

@@ -28,6 +28,22 @@ pub(crate) struct DecodeCpuKvState {
 }
 
 impl DecodeCpuKvState {
+    pub(crate) fn logical_kv_bytes(&self, len: usize) -> u64 {
+        let bytes = self
+            .bindings
+            .iter()
+            .map(|binding| {
+                let mut shape = binding.physical_shape().to_vec();
+                if shape.len() > 2 {
+                    shape[2] = len;
+                }
+                binding.dtype.storage_bytes(shape.iter().product::<usize>())
+            })
+            .sum::<usize>()
+            .saturating_add(len.saturating_mul(std::mem::size_of::<i64>()));
+        bytes.try_into().unwrap_or(u64::MAX)
+    }
+
     /// Build persistent CPU KV bindings, or `Ok(None)` when the model is not
     /// eligible for the in-place path (any KV input that is not rank-4 f32 with a
     /// static head geometry, e.g. an f16 cache). `present_to_past` must contain
