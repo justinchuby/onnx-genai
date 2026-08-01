@@ -32,6 +32,14 @@ required-features = ["native-backend"]
 name = "native_pipeline_decoder_parity"
 required-features = ["native-backend"]
 
+# Uses PipelineEngine::materialize_published_prefix_kv, which is itself
+# #[cfg(feature = "native-backend")]. Without this the test is built on a
+# default `cargo test --all-targets` and fails to compile; CI only checks this
+# crate with the feature on, so the break is invisible there.
+[[test]]
+name = "native_pipeline_backend_selection_parity"
+required-features = ["native-backend"]
+
 [[test]]
 name = "native_full_pipeline_parity"
 required-features = ["native-backend"]
