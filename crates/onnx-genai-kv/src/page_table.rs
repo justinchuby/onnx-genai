@@ -3,9 +3,11 @@
 use crate::{
     Device, KvError, SequenceId,
     fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8},
+    telemetry::KvTelemetry,
 };
 use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// Unique page identifier.
 pub type PageId = u32;
@@ -657,6 +659,28 @@ pub struct PageTable {
     next_page_id: PageId,
     /// Cumulative page activity, for reporting.
     stats: PageStats,
+    /// Optional lock-free mirror of this pool's aggregate state.
+    ///
+    /// `None` on every path that does not observe the pool, so the cost when
+    /// absent is one `Option` check per mutation and no stores.
+    telemetry: TelemetryHandle,
+}
+
+/// Holds the optional telemetry mirror, and **drops it on clone**.
+///
+/// A cloned page table is a different pool: it has its own pages, its own
+/// reference counts, and its own statistics. Carrying the `Arc` across the
+/// clone would give two independent pools one shared set of gauges, so every
+/// number would be the sum of two unrelated things. Dropping it means a clone
+/// simply publishes nothing until something attaches telemetry to it, which is
+/// wrong in no direction.
+#[derive(Debug, Default)]
+struct TelemetryHandle(Option<Arc<KvTelemetry>>);
+
+impl Clone for TelemetryHandle {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
 }
 
 impl PageTable {
@@ -826,6 +850,7 @@ impl PageTable {
             layer_configs,
             quant_config,
             stats: PageStats::default(),
+            telemetry: TelemetryHandle::default(),
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
@@ -839,10 +864,61 @@ impl PageTable {
             Some(_) => self.stats.allocations += 1,
             None => self.stats.allocation_failures += 1,
         }
+        self.publish_counters();
         allocated
     }
 
     /// Cumulative page activity since this table was created.
+    /// Attach a lock-free telemetry mirror to this pool.
+    ///
+    /// Seeds the mirror from the pool's current state rather than leaving it at
+    /// zero, because attaching to an already-warm pool would otherwise publish
+    /// a zero that was never true and then drift correct only as pages moved.
+    pub fn attach_telemetry(&mut self, telemetry: Arc<KvTelemetry>) {
+        telemetry.set_geometry(self.hot_capacity, self.page_size);
+        telemetry.publish_counters(&self.stats);
+        let (in_use, shared) = self.live_page_counts();
+        telemetry.set_live_gauges(in_use, shared);
+        self.telemetry = TelemetryHandle(Some(telemetry));
+    }
+
+    /// Count live and shared pages by walking the pool.
+    ///
+    /// `O(pages)`, so this is for seeding and for tests that assert the
+    /// incrementally-maintained gauges have not drifted from the truth. The
+    /// decode path uses the edge-triggered updates instead.
+    pub fn live_page_counts(&self) -> (usize, usize) {
+        let mut in_use = 0;
+        let mut shared = 0;
+        for page in self.pages.values() {
+            if page.ref_count > 0 {
+                in_use += 1;
+            }
+            if page.ref_count > 1 {
+                shared += 1;
+            }
+        }
+        (in_use, shared)
+    }
+
+    /// Mirror the cumulative counters, if telemetry is attached.
+    ///
+    /// Republishes the whole `PageStats` rather than incrementing individually,
+    /// so a counter added later cannot be silently omitted from the published
+    /// view. Costs a handful of relaxed stores.
+    fn publish_counters(&self) {
+        if let Some(telemetry) = &self.telemetry.0 {
+            telemetry.publish_counters(&self.stats);
+        }
+    }
+
+    /// Report a page's reference-count transition to the telemetry gauges.
+    fn note_ref_count_change(&self, old: u32, new: u32) {
+        if let Some(telemetry) = &self.telemetry.0 {
+            telemetry.note_ref_count_change(old, new);
+        }
+    }
+
     /// Summarize what the pool is holding right now.
     pub fn usage(&self) -> PageUsage {
         let mut references: BTreeMap<u32, usize> = BTreeMap::new();
@@ -903,6 +979,7 @@ impl PageTable {
     /// cannot tell a reclaim from an ordinary release, so the owner reports it.
     pub fn note_prefix_eviction(&mut self, pages: u64) {
         self.stats.prefix_evictions += pages;
+        self.publish_counters();
     }
 
     fn allocate_page(&mut self, device: Device) -> Option<PageId> {
@@ -923,6 +1000,8 @@ impl PageTable {
                 self.clock += 1;
                 page.last_access = self.clock;
             }
+            // A page off the free list had a zero count by construction.
+            self.note_ref_count_change(0, 1);
             return Some(page_id);
         }
         if matches!(device, Device::Gpu(_)) && self.hot_used_count() < self.hot_capacity {
@@ -939,6 +1018,7 @@ impl PageTable {
             self.clock += 1;
             page.last_access = self.clock;
             self.pages.insert(page_id, page);
+            self.note_ref_count_change(0, 1);
             return Some(page_id);
         }
         None
@@ -946,8 +1026,11 @@ impl PageTable {
 
     /// Free a page (decrement ref_count; actually free when it hits 0).
     pub fn free(&mut self, page_id: PageId) {
+        let mut transition = None;
         if let Some(page) = self.pages.get_mut(&page_id) {
+            let previous = page.ref_count;
             page.ref_count = page.ref_count.saturating_sub(1);
+            transition = Some((previous, page.ref_count));
             if page.ref_count == 0 {
                 page.reset_storage(self.tensor_config);
                 let device = page.device;
@@ -955,17 +1038,28 @@ impl PageTable {
                 self.stats.frees += 1;
             }
         }
+        if let Some((previous, current)) = transition {
+            self.note_ref_count_change(previous, current);
+            self.publish_counters();
+        }
     }
 
     /// Increment a page reference for CoW/prefix sharing.
     pub fn retain(&mut self, page_id: PageId) -> bool {
+        let mut transition = None;
         if let Some(page) = self.pages.get_mut(&page_id) {
+            let previous = page.ref_count;
             page.ref_count = page.ref_count.saturating_add(1);
             self.clock += 1;
             page.last_access = self.clock;
-            true
-        } else {
-            false
+            transition = Some((previous, page.ref_count));
+        }
+        match transition {
+            Some((previous, current)) => {
+                self.note_ref_count_change(previous, current);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1085,6 +1179,7 @@ impl PageTable {
             .ok_or(KvError::PageNotFound(victim_id))?;
         victim.device = Device::Cpu;
         self.stats.hot_evictions += 1;
+        self.publish_counters();
         Ok(victim_id)
     }
 
@@ -1115,6 +1210,7 @@ impl PageTable {
             }
         }
         self.stats.hot_evictions += demoted as u64;
+        self.publish_counters();
         demoted
     }
 

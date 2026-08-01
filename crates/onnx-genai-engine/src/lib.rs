@@ -59,7 +59,10 @@ pub use native_decode::{
     NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeCudaOptions, NativeDecodeDevice,
     NativeDecodeSession,
 };
-pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
+pub use onnx_genai_kv::{
+    Applicability, CachePriority, KvDType, KvNotApplicable, KvTelemetry, KvTelemetrySnapshot,
+    LocalTieredConfig,
+};
 pub use onnx_genai_metadata::GenerationDefaults;
 pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,

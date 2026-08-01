@@ -252,6 +252,44 @@ impl Engine {
         self.kv_cache.page_table.stats()
     }
 
+    /// Attach a lock-free mirror of the KV pool's aggregate state.
+    ///
+    /// [`page_usage`](Self::page_usage) cannot serve a live monitor: it is
+    /// `O(pages)` and allocates, and reaching it requires `&self` on an engine
+    /// that is mutably borrowed for the whole of a generation. The mirror is
+    /// updated incrementally at the pool's mutation sites and read from any
+    /// thread, so a reader can observe the pool *during* generation, which is
+    /// the only time paged-KV behaviour is worth watching.
+    ///
+    /// Returns `false` when this engine's KV cannot page, so a caller can
+    /// report the numbers as not-applicable rather than presenting a pool that
+    /// will never move as one that is merely idle. The pool is attached either
+    /// way: its capacity is a real number, and a client that knows the
+    /// mechanism is inactive can still show it truthfully.
+    ///
+    /// A caller must not infer this from the *absence* of some other
+    /// capability. See [`pages_kv`](Self::pages_kv).
+    pub fn attach_kv_telemetry(
+        &mut self,
+        telemetry: std::sync::Arc<onnx_genai_kv::KvTelemetry>,
+    ) -> bool {
+        self.kv_cache.page_table.attach_telemetry(telemetry);
+        self.pages_kv()
+    }
+
+    /// Whether this engine's KV cache can actually hold paged tensors.
+    ///
+    /// Both halves are required and neither implies the other: an engine can
+    /// own a KV model while its page table carries no tensor storage, in which
+    /// case the page table is bookkeeping the decoder never consults.
+    ///
+    /// Do not derive this from the absence of another capability. A pool that
+    /// reports a non-zero capacity is not thereby in use, which is exactly the
+    /// reading that makes an inactive mechanism look active.
+    pub fn pages_kv(&self) -> bool {
+        self.kv_model.is_some() && self.kv_cache.page_table.tensor_config.is_some()
+    }
+
     /// External KV connector activity from the most recent generation.
     ///
     /// Reflects lookups, would-be prefix extensions, tokens actually fetched and

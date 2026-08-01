@@ -14,7 +14,8 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
-    GovernorSnapshot, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
+    GovernorSnapshot, KvNotApplicable, KvTelemetry, PipelineEngine, PipelineGenerateRequest,
+    ResourceLimit,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -32,6 +33,8 @@ const MICROBATCH_POLL_WAIT: Duration = Duration::from_micros(250);
 pub(crate) struct EngineDriver {
     pub(crate) commands: mpsc::Sender<DriverCommand>,
     pub(crate) generation_capacity: Arc<Semaphore>,
+    /// Lock-free mirror of the KV page pool, readable during a generation.
+    pub(crate) kv_telemetry: Arc<KvTelemetry>,
 }
 
 pub(crate) enum DriverCommand {
@@ -136,6 +139,16 @@ impl EngineDriver {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
+        // Attach before the engine moves onto the driver thread: this is the
+        // last point at which it is reachable from here, and the mirror must
+        // outlive that move because reading it is the whole reason it exists.
+        let mut engine = engine;
+        let kv_telemetry = Arc::new(KvTelemetry::default());
+        if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
+            kv_telemetry.set_applicable();
+        } else {
+            kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
+        }
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
@@ -146,6 +159,7 @@ impl EngineDriver {
         Self {
             commands,
             generation_capacity,
+            kv_telemetry,
         }
     }
 
@@ -154,6 +168,12 @@ impl EngineDriver {
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
+        // A pipeline engine owns its components' caches rather than one page
+        // table, so there is nothing here to mirror. Reported as an explicit
+        // not-applicable rather than an all-zero pool, which would read as an
+        // idle paged cache instead of an absent one.
+        let kv_telemetry = Arc::new(KvTelemetry::default());
+        kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
             .spawn(move || run_engine_driver(owner, rx, 1, max_queue_depth, driver_capacity))
@@ -161,7 +181,18 @@ impl EngineDriver {
         Self {
             commands,
             generation_capacity,
+            kv_telemetry,
         }
+    }
+
+    /// The KV page pool mirror.
+    ///
+    /// Deliberately not a command round-trip. `/metrics` and `/v1/resources`
+    /// must answer while the driver thread is inside an inline generation, and
+    /// a command could not be serviced until that generation finished -- which
+    /// is precisely when the pool is worth reading.
+    pub(crate) fn kv_telemetry(&self) -> &Arc<KvTelemetry> {
+        &self.kv_telemetry
     }
 
     pub(crate) async fn create_session(&self) -> anyhow::Result<SessionId> {
