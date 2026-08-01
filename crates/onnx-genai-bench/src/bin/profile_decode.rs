@@ -19,10 +19,40 @@
 //! run with `apply_chat_template`. Pass `--raw` to feed the prompt untemplated.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use onnx_genai_engine::{Engine, EngineConfig, GenerateRequest};
-use onnx_genai_ort::{ChatMessage, ChatTemplate, SessionOptions, profile};
+use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest};
+use onnx_genai_ort::{ChatMessage, ChatTemplate, SessionOptions, Tokenizer, profile};
+
+#[derive(Debug, Clone, Copy)]
+struct RunTiming {
+    tokens: usize,
+    first_token: Duration,
+    last_token: Duration,
+    total: Duration,
+}
+
+impl RunTiming {
+    fn decode_tokens_per_second(self) -> f64 {
+        let decode = self.last_token.saturating_sub(self.first_token);
+        if self.tokens <= 1 || decode.is_zero() {
+            return 0.0;
+        }
+        (self.tokens - 1) as f64 / decode.as_secs_f64()
+    }
+
+    fn end_to_end_tokens_per_second(self) -> f64 {
+        if self.total.is_zero() {
+            return 0.0;
+        }
+        self.tokens as f64 / self.total.as_secs_f64()
+    }
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
 
 struct Args {
     model: PathBuf,
@@ -183,6 +213,42 @@ fn request(args: &Args, prompt: &str) -> GenerateRequest {
     request
 }
 
+fn tokenized_request(args: &Args, token_ids: &[u32]) -> GenerateRequest {
+    let mut request = request(args, "");
+    request.prompt = GeneratePrompt::TokenIds(token_ids.to_vec());
+    request
+}
+
+fn run_timed_generation(
+    engine: &mut Engine,
+    request: GenerateRequest,
+) -> anyhow::Result<(onnx_genai_engine::GenerateResult, RunTiming)> {
+    let start = Instant::now();
+    let mut tokens = 0usize;
+    let mut first_token = None;
+    let mut last_token = None;
+    let mut callback = |_token: onnx_genai_engine::GenerateToken| -> anyhow::Result<()> {
+        let elapsed = start.elapsed();
+        if first_token.is_none() {
+            first_token = Some(elapsed);
+        }
+        last_token = Some(elapsed);
+        tokens += 1;
+        Ok(())
+    };
+    let result = engine.generate_with_callback(request, Some(&mut callback))?;
+    let total = start.elapsed();
+    Ok((
+        result,
+        RunTiming {
+            tokens,
+            first_token: first_token.unwrap_or(total),
+            last_token: last_token.unwrap_or(total),
+            total,
+        },
+    ))
+}
+
 fn main() {
     let args = parse_args();
     println!(
@@ -202,26 +268,41 @@ fn main() {
 
     let mut engine = build_engine(&args);
     let prompt = resolve_prompt(&args);
+    let tokenizer =
+        Tokenizer::from_file(args.model.join("tokenizer.json")).expect("tokenizer must load");
+    let prompt_tokens = tokenizer.encode(&prompt).expect("prompt must tokenize");
+    println!("prompt_tokens: {}", prompt_tokens.len());
 
     for _ in 0..args.warmups {
-        let result = engine
-            .generate(request(&args, &prompt))
-            .expect("warmup generate");
+        let result = run_timed_generation(&mut engine, tokenized_request(&args, &prompt_tokens))
+            .expect("warmup generate")
+            .0;
         std::hint::black_box(&result);
     }
 
     // Discard warmup measurements; only the measured runs count.
     profile::reset();
 
+    let mut timings = Vec::new();
     let mut total_tokens = 0u64;
     let mut last_text = String::new();
     let start = Instant::now();
-    for _ in 0..args.runs {
-        let result = engine
-            .generate(request(&args, &prompt))
-            .expect("measured generate");
+    for run in 0..args.runs {
+        let (result, timing) =
+            run_timed_generation(&mut engine, tokenized_request(&args, &prompt_tokens))
+                .expect("measured generate");
         total_tokens += result.token_ids.len() as u64;
         last_text = result.text.clone();
+        println!(
+            "run {}: tokens={} ttft_ms={:.3} total_ms={:.3} decode_tok_s={:.2} e2e_tok_s={:.2}",
+            run + 1,
+            timing.tokens,
+            timing.first_token.as_secs_f64() * 1000.0,
+            timing.total.as_secs_f64() * 1000.0,
+            timing.decode_tokens_per_second(),
+            timing.end_to_end_tokens_per_second()
+        );
+        timings.push(timing);
         std::hint::black_box(&result);
     }
     let elapsed = start.elapsed();
@@ -236,6 +317,31 @@ fn main() {
         tok_per_s,
         per_token_us
     );
+    if !timings.is_empty() {
+        let mut ttft_ms = timings
+            .iter()
+            .map(|timing| timing.first_token.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>();
+        let mut total_ms = timings
+            .iter()
+            .map(|timing| timing.total.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>();
+        let mut decode_tok_s = timings
+            .iter()
+            .map(|timing| timing.decode_tokens_per_second())
+            .collect::<Vec<_>>();
+        let mut e2e_tok_s = timings
+            .iter()
+            .map(|timing| timing.end_to_end_tokens_per_second())
+            .collect::<Vec<_>>();
+        println!(
+            "median: ttft_ms={:.3} total_ms={:.3} decode_tok_s={:.2} e2e_tok_s={:.2}",
+            median(&mut ttft_ms),
+            median(&mut total_ms),
+            median(&mut decode_tok_s),
+            median(&mut e2e_tok_s)
+        );
+    }
     println!("--- generated text (coherence check) ---\n{last_text}\n---");
 
     if profile::enabled() {
