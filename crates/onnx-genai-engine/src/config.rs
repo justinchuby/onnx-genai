@@ -875,6 +875,11 @@ pub struct GenerateOptions {
     /// The chosen token is always included in `TokenLogprob::top`, in addition to the
     /// requested alternatives when it is not already among them.
     pub top_logprobs: Option<usize>,
+    /// Force a cold start (full KV reset) even when session-persistent KV reuse
+    /// is available. Default is `false`, which allows the engine to reuse cached
+    /// KV state for matching prompt prefixes. Set to `true` for A/B measurement
+    /// or when guaranteed-cold behaviour is required.
+    pub cold_start: bool,
 }
 
 impl Default for GenerateOptions {
@@ -904,6 +909,7 @@ impl Default for GenerateOptions {
             speculative_mode: None,
             constraint: None,
             top_logprobs: None,
+            cold_start: false,
         }
     }
 }

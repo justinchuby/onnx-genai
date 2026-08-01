@@ -506,6 +506,7 @@ fn native_session_switching_matches_cold_start() -> anyhow::Result<()> {
     cold_request.options.max_new_tokens = 2;
     cold_request.options.temperature = 0.0;
     cold_request.options.stop_on_eos = false;
+    cold_request.options.cold_start = true;
     let cold_result = fresh.generate(cold_request)?;
     assert_eq!(switched_result.token_ids, cold_result.token_ids);
     Ok(())
@@ -531,5 +532,106 @@ fn native_session_creation_uses_unified_multi_session_api() -> anyhow::Result<()
     assert_eq!(engine.session_token_count(second)?, 0);
     engine.close_session(first)?;
     engine.close_session(second)?;
+    Ok(())
+}
+
+#[test]
+fn native_stateless_generate_reuses_default_session_by_default() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut reused = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut cold = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    let hits_before = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
+    let mut reused_context = vec![0u32];
+    let mut cold_context = vec![0u32];
+    for turn in 0..3 {
+        if turn > 0 {
+            reused_context.push(0);
+            cold_context.push(0);
+        }
+        let mut reused_request =
+            GenerateRequest::new(GeneratePrompt::TokenIds(reused_context.clone()));
+        reused_request.options.max_new_tokens = 2;
+        reused_request.options.temperature = 0.0;
+        reused_request.options.stop_on_eos = false;
+        let reused_result = reused.generate(reused_request)?;
+
+        let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(cold_context.clone()));
+        cold_request.options.max_new_tokens = 2;
+        cold_request.options.temperature = 0.0;
+        cold_request.options.stop_on_eos = false;
+        cold_request.options.cold_start = true;
+        let cold_result = cold.generate(cold_request)?;
+
+        assert_eq!(reused_result.token_ids, cold_result.token_ids);
+        reused_context.extend_from_slice(&reused_result.token_ids);
+        cold_context.extend_from_slice(&cold_result.token_ids);
+    }
+    let hits_after = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
+    assert!(
+        hits_after - hits_before >= 2,
+        "default session did not reuse KV: before={hits_before}, after={hits_after}"
+    );
+    Ok(())
+}
+
+/// Reuse must not leak state between unrelated prompts.
+///
+/// The growing-context test only exercises the case where each prompt extends
+/// the last, which is the case reuse is designed for. The risk of making reuse
+/// the default is the opposite case: two consecutive `generate()` calls that
+/// share no prefix must behave exactly as if each ran on a fresh engine, or
+/// stateless callers silently get output conditioned on a previous request.
+#[test]
+fn stateless_generate_with_unrelated_prompts_matches_a_cold_engine() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let native_config = || EngineConfig {
+        decode_backend: EngineDecodeBackend::Native,
+        ..EngineConfig::default()
+    };
+    let mut reusing = Engine::from_dir(&fixture, native_config())?;
+
+    // Deliberately divergent: no shared prefix beyond nothing at all.
+    let prompts = vec![
+        vec![0u32, 0, 0],
+        vec![1u32],
+        vec![0u32, 1],
+        vec![1u32, 1, 1],
+    ];
+    for prompt in prompts {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let reused_result = reusing.generate(request)?;
+
+        // A brand-new engine is the ground truth for "no carried state".
+        let mut fresh = Engine::from_dir(&fixture, native_config())?;
+        let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        cold_request.options.max_new_tokens = 2;
+        cold_request.options.temperature = 0.0;
+        cold_request.options.stop_on_eos = false;
+        cold_request.options.cold_start = true;
+        let cold_result = fresh.generate(cold_request)?;
+
+        assert_eq!(
+            reused_result.token_ids, cold_result.token_ids,
+            "default-on reuse changed the output for prompt {prompt:?}"
+        );
+    }
     Ok(())
 }

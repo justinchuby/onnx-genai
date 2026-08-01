@@ -49,6 +49,10 @@ pub struct Engine {
     /// Monotonic counter for native session id generation.
     #[cfg(feature = "native-backend")]
     pub(crate) native_session_counter: u64,
+    /// Implicit "default" native session used by the stateless `generate()` path
+    /// for transparent KV reuse.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_default_session: Option<SessionId>,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
