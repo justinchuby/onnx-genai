@@ -994,8 +994,11 @@ mod tests {
                 "dry",
                 "stop_sequence",
                 "temperature",
-                "top_k",
-                "top_p",
+                // top_k and top_p are fused when both are configured: running
+                // them separately makes top_p rescan the whole vocabulary that
+                // top_k just reduced. The fused processor occupies the same
+                // position in the order and produces the same surviving set.
+                "top_k_top_p",
                 "min_p",
                 "top_a",
                 "typical_p",
@@ -1036,8 +1039,7 @@ mod tests {
                 "presence_penalty",
                 "json_constraint",
                 "temperature",
-                "top_k",
-                "top_p",
+                "top_k_top_p",
                 "min_p",
                 "top_a",
                 "typical_p"

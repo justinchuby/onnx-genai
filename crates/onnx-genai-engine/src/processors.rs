@@ -7,7 +7,8 @@ use crate::logits::{
     JsonConstraint, LlguidanceConstraint, MinPProcessor, MirostatProcessor,
     PresencePenaltyProcessor, ProcessorChain, ProcessorContext, ProcessorSignal,
     RepetitionPenaltyProcessor, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
-    TopAProcessor, TopKProcessor, TopPProcessor, TypicalPProcessor, XtcProcessor,
+    TopAProcessor, TopKProcessor, TopKTopPProcessor, TopPProcessor, TypicalPProcessor,
+    XtcProcessor,
 };
 use crate::sampling::{Sampler, default_sampler_for_options};
 use anyhow::Context;
@@ -115,16 +116,28 @@ pub(crate) fn build_processor_chain(
         }));
     }
 
-    if options.top_k > 0 {
-        chain.add(Box::new(TopKProcessor {
-            top_k: options.top_k,
-        }));
-    }
-
-    if options.top_p < 1.0 {
-        chain.add(Box::new(TopPProcessor {
-            top_p: options.top_p,
-        }));
+    // Fused when both are configured, which is the common case. Running them
+    // separately makes top-p rescan the whole vocabulary that top-k has
+    // already reduced to `top_k` entries; the fused processor keeps the
+    // survivors and runs the nucleus search on those alone.
+    match (options.top_k > 0, options.top_p < 1.0) {
+        (true, true) => {
+            chain.add(Box::new(TopKTopPProcessor {
+                top_k: options.top_k,
+                top_p: options.top_p,
+            }));
+        }
+        (true, false) => {
+            chain.add(Box::new(TopKProcessor {
+                top_k: options.top_k,
+            }));
+        }
+        (false, true) => {
+            chain.add(Box::new(TopPProcessor {
+                top_p: options.top_p,
+            }));
+        }
+        (false, false) => {}
     }
 
     if options.min_p > 0.0 {
@@ -167,11 +180,20 @@ pub(crate) fn build_processor_chain(
 }
 
 /// Whether every processor in `chain` is implemented by the device sampler.
+///
+/// `top_k_top_p` is the fused form of `top_k` followed by `top_p`. It performs
+/// exactly the same filtering, so a chain containing it is portable wherever
+/// one containing the two separately would have been. Omitting it here would
+/// silently disable the device sampling fast path for the most common
+/// configuration -- the chain would still produce correct tokens, just on the
+/// host, with no error to indicate why.
 pub(crate) fn is_device_portable_chain(chain: &ProcessorChain) -> bool {
-    chain
-        .names()
-        .into_iter()
-        .all(|name| matches!(name, "temperature" | "top_k" | "top_p" | "min_p"))
+    chain.names().into_iter().all(|name| {
+        matches!(
+            name,
+            "temperature" | "top_k" | "top_p" | "top_k_top_p" | "min_p"
+        )
+    })
 }
 
 pub(crate) fn load_fim_config_from_model_dir(
@@ -308,5 +330,63 @@ pub(crate) fn finish_reason_after_token(
         }
         Some(ProcessorSignal::StopSequence { .. }) => None,
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod device_portability_tests {
+    use super::*;
+    use crate::config::GenerateOptions;
+
+    fn options_with(top_k: usize, top_p: f32) -> GenerateOptions {
+        GenerateOptions {
+            top_k,
+            top_p,
+            ..Default::default()
+        }
+    }
+
+    /// The standard sampling configuration must stay eligible for the device
+    /// sampling fast path.
+    ///
+    /// `is_device_portable_chain` matches on processor *names*, so renaming or
+    /// fusing a processor silently drops the chain off the device path: tokens
+    /// stay correct, they are just sampled on the host instead, with no error
+    /// to say why. Fusing top_k and top_p broke exactly this, and only two
+    /// decode-loop tests noticed. This pins it directly.
+    #[test]
+    fn a_top_k_top_p_chain_is_device_portable() {
+        let chain = build_processor_chain(&options_with(40, 0.95), None)
+            .expect("standard sampling options build a chain");
+        assert!(
+            chain.names().contains(&"top_k_top_p"),
+            "expected the fused processor, got {:?}",
+            chain.names()
+        );
+        assert!(
+            is_device_portable_chain(&chain),
+            "the most common sampling configuration must reach the device \
+             sampler, got {:?}",
+            chain.names()
+        );
+    }
+
+    /// Each half alone must remain portable too.
+    #[test]
+    fn top_k_alone_and_top_p_alone_stay_device_portable() {
+        for (top_k, top_p, expected) in [(40usize, 1.0f32, "top_k"), (0, 0.95, "top_p")] {
+            let chain =
+                build_processor_chain(&options_with(top_k, top_p), None).expect("chain builds");
+            assert!(
+                chain.names().contains(&expected),
+                "expected {expected}, got {:?}",
+                chain.names()
+            );
+            assert!(
+                is_device_portable_chain(&chain),
+                "{expected} alone must stay device portable, got {:?}",
+                chain.names()
+            );
+        }
     }
 }
