@@ -203,7 +203,11 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_session_counter: 0,
             #[cfg(feature = "native-backend")]
+            native_access_counter: 0,
+            #[cfg(feature = "native-backend")]
             native_default_session: None,
+            #[cfg(feature = "native-backend")]
+            native_max_sessions: 8,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
             draft: None,

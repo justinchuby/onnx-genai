@@ -580,6 +580,16 @@ pub struct EngineConfig {
     /// so its outputs are kept, keyed by the exact bytes that produced them.
     /// `0` disables the cache and every turn recomputes.
     pub pipeline_cache_bytes: u64,
+    /// Maximum number of native session token histories to retain before the
+    /// least-recently-used one is dropped. Defaults to 8. `0` disables the
+    /// limit.
+    ///
+    /// This bounds retained *history*, not KV memory. Native sessions do not
+    /// hold KV memory of their own: one KV cache exists and switching sessions
+    /// resets it. Bounding KV bytes belongs to `EngineResourceGovernor` once
+    /// native sessions hold real leases on the central KV manager, so that it
+    /// applies to both backends rather than being a native-only knob.
+    pub native_max_sessions: usize,
 }
 
 impl Default for EngineConfig {
@@ -604,6 +614,7 @@ impl Default for EngineConfig {
             // a conversation about a few images keeps all of them, small enough
             // to be an unremarkable line in a process's memory profile.
             pipeline_cache_bytes: 512 * 1024 * 1024,
+            native_max_sessions: 8,
         }
     }
 }

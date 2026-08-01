@@ -635,3 +635,43 @@ fn stateless_generate_with_unrelated_prompts_matches_a_cold_engine() -> anyhow::
     }
     Ok(())
 }
+
+#[test]
+fn native_session_lru_eviction_keeps_remaining_session_correct() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_max_sessions: 1,
+            ..EngineConfig::default()
+        },
+    )?;
+    let evicted = engine.create_session()?;
+    let retained = engine.create_session()?;
+    assert!(engine.session_token_count(evicted).is_err());
+
+    let prompt = vec![0u32, 0];
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    let retained_result = engine.generate_in_session(retained, request)?;
+
+    let mut fresh = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));
+    cold_request.options.max_new_tokens = 2;
+    cold_request.options.temperature = 0.0;
+    cold_request.options.stop_on_eos = false;
+    cold_request.options.cold_start = true;
+    let cold_result = fresh.generate(cold_request)?;
+    assert_eq!(retained_result.token_ids, cold_result.token_ids);
+    Ok(())
+}

@@ -173,15 +173,71 @@ impl Engine {
         SessionId::from(self.native_session_counter)
     }
 
+    /// Stamp a session as most-recently-used and return the new stamp.
+    #[cfg(feature = "native-backend")]
+    fn touch_native_session(&mut self) -> u64 {
+        self.native_access_counter = self.native_access_counter.saturating_add(1);
+        self.native_access_counter
+    }
+
     #[cfg(feature = "native-backend")]
     fn create_native_session_state(&mut self) -> anyhow::Result<SessionId> {
         if self.decode_backend != EngineDecodeBackend::Native {
             anyhow::bail!("native session state requires the native decode backend");
         }
         let id = self.next_native_session_id();
-        self.native_sessions
-            .insert(id, NativeSessionState { tokens: Vec::new() });
+        let last_access = self.touch_native_session();
+        self.native_sessions.insert(
+            id,
+            NativeSessionState {
+                tokens: Vec::new(),
+                last_access,
+            },
+        );
+        self.evict_native_sessions(id);
         Ok(id)
+    }
+
+    /// Drop least-recently-used sessions until the retention limit is met.
+    ///
+    /// `keep` is the session the caller is currently working with and is
+    /// structurally excluded: there is a `filter` and deliberately **no**
+    /// fallback scan. An earlier version had one, and under a byte budget it
+    /// let a session pick itself as the victim and be deleted while the caller
+    /// was writing to it -- generation returned `Ok`, and the failure surfaced
+    /// later as a bare "session not found".
+    ///
+    /// With only a count limit that path is unreachable, because every caller
+    /// touches `keep` immediately before evicting, making it the *most*
+    /// recently used. So this is defensive and no test claims to cover it. It
+    /// is written this way because adding any limit that `keep` alone can
+    /// exceed would make a fallback reachable again instantly.
+    ///
+    /// This bounds retained history, not memory. Native sessions hold only a
+    /// token list -- one KV cache exists and switching resets it -- so a byte
+    /// budget here would bound nothing. That belongs to the resource governor
+    /// once native sessions hold leases on the central KV manager.
+    #[cfg(feature = "native-backend")]
+    fn evict_native_sessions(&mut self, keep: SessionId) {
+        while self.native_max_sessions != 0 && self.native_sessions.len() > self.native_max_sessions
+        {
+            let Some(victim) = self
+                .native_sessions
+                .iter()
+                .filter(|(id, _)| **id != keep)
+                .min_by_key(|(_, state)| state.last_access)
+                .map(|(&id, _)| id)
+            else {
+                break;
+            };
+            self.native_sessions.remove(&victim);
+            if self.native_active_session == Some(victim) {
+                self.native_active_session = None;
+            }
+            if self.native_default_session == Some(victim) {
+                self.native_default_session = None;
+            }
+        }
     }
 
     #[cfg(feature = "native-backend")]
@@ -860,6 +916,10 @@ impl Engine {
                     .context("native decoder session is unavailable")?;
                 native.rewind(position.min(native.current_len()))?;
             }
+            let last_access = self.touch_native_session();
+            if let Some(state) = self.native_sessions.get_mut(&session_id) {
+                state.last_access = last_access;
+            }
             return Ok(());
         }
         self.require_ort_backend("session rewind")?;
@@ -963,11 +1023,13 @@ impl Engine {
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
+            let last_access = self.touch_native_session();
             let state = self
                 .native_sessions
                 .get_mut(&session_id)
                 .with_context(|| format!("session {session_id} not found"))?;
             state.tokens.clear();
+            state.last_access = last_access;
             if self.native_active_session == Some(session_id) {
                 let native = self
                     .native_session
@@ -1833,6 +1895,7 @@ impl Engine {
                 callback,
             )?
         };
+        let last_access = self.touch_native_session();
 
         let state = self
             .native_sessions
@@ -1841,6 +1904,8 @@ impl Engine {
         state.tokens.truncate(prefix_len);
         state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
         state.tokens.extend_from_slice(&result.token_ids);
+        state.last_access = last_access;
+        self.evict_native_sessions(session_id);
 
         Ok(result)
     }
