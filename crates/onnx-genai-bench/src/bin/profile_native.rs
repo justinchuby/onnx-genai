@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
-use onnx_genai_engine::logits::{MinPProcessor, RepetitionPenaltyProcessor};
+use onnx_genai_engine::logits::{
+    MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
+};
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
@@ -135,18 +137,45 @@ struct Args {
     /// 0.0 is OFF. Only affects categorical (non-greedy) sampling.
     #[arg(long, default_value_t = 0.0)]
     min_p: f32,
+    /// Temperature for categorical sampling. Values > 0 switch the benchmark
+    /// from greedy argmax to seeded categorical sampling.
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+    /// Nucleus sampling probability. Values >= 1 disable top-p filtering.
+    #[arg(long, default_value_t = 1.0)]
+    top_p: f32,
+    /// Keep only the top-k logits before token selection. Zero disables top-k.
+    #[arg(long, default_value_t = 0)]
+    top_k: usize,
+    /// Seed for reproducible categorical sampling across measured runs.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+fn categorical_sampling_enabled(args: &Args) -> bool {
+    args.temperature > 0.0
 }
 
 /// Whether any host-side sampling policy (penalty / min-p) is enabled. When
 /// false the decode path is byte-identical to the default greedy benchmark and,
 /// on CUDA, keeps the captured device-argmax fast path.
 fn sampling_enabled(args: &Args) -> bool {
-    args.repetition_penalty != 1.0 || args.min_p > 0.0
+    args.repetition_penalty != 1.0
+        || args.min_p > 0.0
+        || categorical_sampling_enabled(args)
+        || args.top_p < 1.0
+        || args.top_k > 0
 }
 
 /// Copy the CLI sampling policy onto generation options (default values are
 /// no-ops, preserving existing greedy behavior exactly).
 fn apply_sampling_options(options: &mut GenerateOptions, args: &Args) {
+    let categorical = categorical_sampling_enabled(args);
+    options.temperature = if categorical { args.temperature } else { 0.0 };
+    options.greedy = !categorical;
+    options.seed = categorical.then_some(args.seed);
+    options.top_p = args.top_p;
+    options.top_k = args.top_k;
     options.repetition_penalty = args.repetition_penalty;
     options.repetition_window = args.repetition_window;
     options.min_p = args.min_p;
@@ -161,6 +190,17 @@ fn sampling_chain(args: &Args) -> ProcessorChain {
             penalty: args.repetition_penalty,
             window: args.repetition_window,
         }));
+    }
+    if args.temperature > 0.0 && args.temperature != 1.0 {
+        chain.add(Box::new(TemperatureProcessor {
+            temperature: args.temperature,
+        }));
+    }
+    if args.top_k > 0 {
+        chain.add(Box::new(TopKProcessor { top_k: args.top_k }));
+    }
+    if args.top_p < 1.0 {
+        chain.add(Box::new(TopPProcessor { top_p: args.top_p }));
     }
     if args.min_p > 0.0 {
         chain.add(Box::new(MinPProcessor { min_p: args.min_p }));
@@ -195,8 +235,6 @@ fn generate(
 ) -> Result<Vec<u32>> {
     let mut options = GenerateOptions {
         max_new_tokens: tokens,
-        temperature: 0.0,
-        greedy: true,
         stop_on_eos: false,
         ..GenerateOptions::default()
     };
@@ -212,8 +250,6 @@ fn generate(
 fn request(args: &Args, tokens: usize) -> GenerateRequest {
     let mut request = GenerateRequest::new(args.prompt.clone());
     request.options.max_new_tokens = tokens;
-    request.options.temperature = 0.0;
-    request.options.greedy = true;
     request.options.stop_on_eos = false;
     apply_sampling_options(&mut request.options, args);
     request
@@ -231,8 +267,15 @@ fn describe_sampling(args: &Args) -> String {
         .repetition_window
         .map_or_else(|| "all".to_string(), |w| w.to_string());
     format!(
-        "sampling: ON repetition_penalty={} repetition_window={} min_p={}",
-        args.repetition_penalty, window, args.min_p
+        "sampling: ON temperature={} top_p={} top_k={} seed={} repetition_penalty={} \
+         repetition_window={} min_p={}",
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.seed,
+        args.repetition_penalty,
+        window,
+        args.min_p
     )
 }
 
@@ -377,7 +420,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         if let Some(reference) = &reference_tokens {
             if reference != &result.token_ids {
                 bail!(
-                    "{} greedy decode was not deterministic across measured runs",
+                    "{} decode was not deterministic across measured runs",
                     args.backend.as_str()
                 );
             }

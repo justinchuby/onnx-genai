@@ -135,34 +135,31 @@ pub fn sample_categorical(logits: &[f32], rng_value: f32) -> u32 {
         return 0;
     }
 
-    let max_logit = logits
-        .iter()
-        .copied()
-        .filter(|v| !v.is_nan())
-        .fold(f32::NEG_INFINITY, f32::max);
+    let mut finite_logits = Vec::new();
+    let mut max_logit = f32::NEG_INFINITY;
+    for (index, &logit) in logits.iter().enumerate() {
+        if !logit.is_nan() && logit != f32::NEG_INFINITY {
+            max_logit = max_logit.max(logit);
+            finite_logits.push((index, logit));
+        }
+    }
     if !max_logit.is_finite() {
         return sample_greedy(logits);
     }
 
-    let weights: Vec<f32> = logits
+    let exp_sum: f32 = finite_logits
         .iter()
-        .map(|&logit| {
-            if logit.is_nan() {
-                0.0
-            } else {
-                (logit - max_logit).exp()
-            }
-        })
-        .collect();
-    let exp_sum: f32 = weights.iter().sum();
+        .map(|&(_, logit)| logit)
+        .map(|logit| (logit - max_logit).exp())
+        .sum();
     if !exp_sum.is_finite() || exp_sum <= 0.0 {
         return sample_greedy(logits);
     }
 
     let target = rng_value.clamp(0.0, 1.0);
     let mut cumulative = 0.0;
-    for (i, weight) in weights.iter().enumerate() {
-        cumulative += *weight / exp_sum;
+    for (i, logit) in finite_logits {
+        cumulative += (logit - max_logit).exp() / exp_sum;
         if target < cumulative {
             return i as u32;
         }
