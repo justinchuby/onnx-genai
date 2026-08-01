@@ -1,7 +1,7 @@
-//! Native multi-component pipeline — increment 3c (issue #384).
+//! Native multi-component pipeline — increment 3c (issue #384), now default-on.
 //!
 //! Proves the **captured per-step-input decode path** is (a) behavior-identical
-//! to the default eager owned-input path and (b) genuinely engaged — not a
+//! to the eager owned-input path and (b) genuinely engaged **by default** — not a
 //! silent decline back to eager.
 //!
 //! Inc3a/Inc3b bind the decoder's `inputs_embeds`/routed ports on-device per
@@ -9,15 +9,16 @@
 //! uncaptured kernel-launch cost (measured ~2.8x below the graph-captured ceiling
 //! and ~2x below ORT-CUDA on qwen3-0.6b). Inc3c writes those one-token per-step
 //! tensors into *persistent* device bindings and reuses the captured
-//! `run_one_token` graph, gated behind `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`
-//! (default off, so the eager path stays byte-identical).
+//! `run_one_token` graph. This is now **default-on**;
+//! `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS=0` is the opt-out escape hatch
+//! that forces the eager owned path (which stays byte-identical).
 //!
 //! Non-tautological proof: the captured and eager decode steps are distinct
 //! functions. The process-global counter
 //! [`NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES`] is bumped only inside the
-//! captured branch, so a non-zero delta with the flag on — and a zero delta with
-//! it off — is direct evidence the intended path executed, while identical token
-//! IDs prove it stayed correct.
+//! captured branch, so a non-zero delta with the flag *unset* (the default) — and
+//! a zero delta under the `=0` opt-out — is direct evidence the intended path
+//! executed, while identical token IDs prove it stayed correct.
 //!
 //! Fixture: `tiny-gqa-embeds-cuda` — an `inputs_embeds` composite pipeline whose
 //! decoder routes its KV through a real `GroupQueryAttention` op, so the native
@@ -55,14 +56,22 @@ fn cuda_device_index() -> Option<u32> {
 /// Run the native-CUDA pipeline decoder for `max_new_tokens` steps, optionally
 /// enabling the captured per-step-input path, and return `(tokens, captured
 /// step-input decode count observed during this run)`.
-fn generate_tokens_capturing(index: u32, capture: bool) -> anyhow::Result<(Vec<u32>, u64)> {
+///
+/// `capture_env` controls the opt-out flag:
+/// * `None` — leave `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` unset (the
+///   shipped **default**, which is capture-on for eligible decoders);
+/// * `Some("0")` — the opt-out escape hatch that forces the eager owned path;
+/// * `Some("1")` — an explicit truthy opt-in (still capture-on).
+fn generate_tokens_capturing(
+    index: u32,
+    capture_env: Option<&str>,
+) -> anyhow::Result<(Vec<u32>, u64)> {
     unsafe {
         std::env::set_var(NATIVE_DECODER_ENV, "decoder");
         std::env::set_var(NATIVE_DECODER_DEVICE_ENV, format!("cuda:{index}"));
-        if capture {
-            std::env::set_var(CAPTURE_STEP_INPUTS_ENV, "1");
-        } else {
-            std::env::remove_var(CAPTURE_STEP_INPUTS_ENV);
+        match capture_env {
+            Some(value) => std::env::set_var(CAPTURE_STEP_INPUTS_ENV, value),
+            None => std::env::remove_var(CAPTURE_STEP_INPUTS_ENV),
         }
     }
 
@@ -101,9 +110,9 @@ fn native_cuda_captured_step_inputs_match_eager_and_engage() -> anyhow::Result<(
         return Ok(());
     };
 
-    // Default eager owned-input path: the reference token stream. No decode step
-    // should take the captured branch, so the counter must not move.
-    let (eager_tokens, eager_captured) = generate_tokens_capturing(index, false)?;
+    // Opt-out (env=0) eager owned-input path: the reference token stream. No
+    // decode step should take the captured branch, so the counter must not move.
+    let (eager_tokens, eager_captured) = generate_tokens_capturing(index, Some("0"))?;
     assert_eq!(
         eager_tokens,
         vec![0, 5, 6, 7],
@@ -111,23 +120,40 @@ fn native_cuda_captured_step_inputs_match_eager_and_engage() -> anyhow::Result<(
     );
     assert_eq!(
         eager_captured, 0,
-        "the captured per-step-input path must stay dormant with the flag off"
+        "the captured per-step-input path must stay dormant under the env=0 opt-out"
     );
 
-    // Captured per-step-input path: identical tokens (correctness preserved) and
-    // a non-zero counter delta (the captured branch genuinely executed instead of
-    // silently declining to eager). One captured decode per generated token.
-    let (captured_tokens, captured_count) = generate_tokens_capturing(index, true)?;
+    // DEFAULT (no env set): capture is now on. Identical tokens (correctness
+    // preserved) and a non-zero counter delta (the captured branch genuinely
+    // executed by default instead of silently declining to eager). One captured
+    // decode per generated token. A regression that reverted the default to
+    // eager, or a silent no-capture fallback, fails this assertion.
+    let (default_tokens, default_count) = generate_tokens_capturing(index, None)?;
     assert_eq!(
-        captured_tokens, eager_tokens,
-        "captured per-step-input decode diverged from the eager owned-input path"
+        default_tokens, eager_tokens,
+        "default (capture-on) per-step-input decode diverged from the eager owned-input path"
     );
     assert!(
-        captured_count >= 1,
-        "expected the captured per-step-input path to run at least once, saw {captured_count}"
+        default_count >= 1,
+        "expected the DEFAULT (no env) to engage the captured per-step-input path at least once, \
+         saw {default_count}"
     );
+
+    // Explicit truthy opt-in stays capture-on and byte-identical too.
+    let (opt_in_tokens, opt_in_count) = generate_tokens_capturing(index, Some("1"))?;
+    assert_eq!(
+        opt_in_tokens, eager_tokens,
+        "explicit opt-in per-step-input decode diverged from the eager owned-input path"
+    );
+    assert!(
+        opt_in_count >= 1,
+        "expected the explicit opt-in to engage the captured path, saw {opt_in_count}"
+    );
+
     eprintln!(
-        "inc3c captured-step-inputs parity: tokens={captured_tokens:?} captured_decodes={captured_count}"
+        "inc3c captured-step-inputs parity: tokens={default_tokens:?} \
+         default_captured_decodes={default_count} opt_in_captured_decodes={opt_in_count} \
+         opt_out_captured_decodes={eager_captured}"
     );
     Ok(())
 }

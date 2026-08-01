@@ -120,16 +120,20 @@ fn decode(engine: &mut PipelineEngine) -> anyhow::Result<Vec<u32>> {
     Ok(result.token_ids)
 }
 
-/// Run the native-CUDA pipeline decode once with the capture flag set to
-/// `capture`, returning `(tokens, captured_step_input_decodes)`.
+/// Run the native-CUDA pipeline decode once. `capture` selects the capture
+/// mode: `true` uses the shipped **default** (env unset → capture-on), `false`
+/// uses the `=0` opt-out (eager owned path). Returns
+/// `(tokens, captured_step_input_decodes)`.
 fn run(dir: &Path, capture: bool) -> anyhow::Result<(Vec<u32>, u64)> {
     unsafe {
         std::env::set_var(NATIVE_DECODER_ENV, "decoder");
         std::env::set_var(NATIVE_DECODER_DEVICE_ENV, "cuda:0");
         if capture {
-            std::env::set_var(CAPTURE_ENV, "1");
-        } else {
+            // Default-on: leave the opt-out env unset.
             std::env::remove_var(CAPTURE_ENV);
+        } else {
+            // Opt-out escape hatch forces the eager owned path.
+            std::env::set_var(CAPTURE_ENV, "0");
         }
     }
     let before = NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES.load(Ordering::Relaxed);
@@ -175,9 +179,13 @@ fn gemma3n_native_cuda_capture_engages_and_is_token_parity() -> anyhow::Result<(
             return Ok(());
         }
     };
-    eprintln!("capture OFF: tokens={tokens_off:?} captured_step_input_decodes={captured_off}");
+    eprintln!(
+        "capture OFF (opt-out env=0): tokens={tokens_off:?} captured_step_input_decodes={captured_off}"
+    );
     let (tokens_on, captured_on) = run(&dir, true)?;
-    eprintln!("capture ON : tokens={tokens_on:?} captured_step_input_decodes={captured_on}");
+    eprintln!(
+        "capture ON (default, no env): tokens={tokens_on:?} captured_step_input_decodes={captured_on}"
+    );
 
     assert_eq!(
         tokens_off.len(),
@@ -189,14 +197,17 @@ fn gemma3n_native_cuda_capture_engages_and_is_token_parity() -> anyhow::Result<(
         tokens_off, tokens_on,
         "captured step-inputs path changed the real-model token output"
     );
-    // Flag OFF must never engage the captured path.
-    assert_eq!(captured_off, 0, "captured path engaged with the flag OFF");
-    // Flag ON must engage on this real GQA-capacity-KV decoder (one captured
-    // decode per single-token step after the multi-token prefill).
+    // The opt-out (env=0) must never engage the captured path.
+    assert_eq!(
+        captured_off, 0,
+        "captured path engaged under the env=0 opt-out"
+    );
+    // The default (capture-on) must engage on this real GQA-capacity-KV decoder
+    // (one captured decode per single-token step after the multi-token prefill).
     assert!(
         captured_on > 0,
-        "captured step-inputs path did NOT engage on the real gemma-3n decoder \
-         (flag ON produced {captured_on} captured decodes) — real model declines capture"
+        "captured step-inputs path did NOT engage by default on the real gemma-3n decoder \
+         (default produced {captured_on} captured decodes) — real model declines capture"
     );
     eprintln!(
         "PROVEN: real gemma-3n native-CUDA pipeline capture engaged {captured_on}x, tokens identical {tokens_off:?}"

@@ -77,8 +77,10 @@ fn qwen3_0_6b_single_component_declines_capture_step_inputs() -> anyhow::Result<
     );
 
     // (2) Its native-CUDA single-graph decode leaves the captured-step-inputs
-    // counter at 0 even with the flag ON — the flag path is pipeline-only.
-    unsafe { std::env::set_var(CAPTURE_ENV, "1") };
+    // counter at 0 under the DEFAULT (capture default-on, no env set) — the
+    // step-inputs capture path is pipeline-only, so an ineligible single-graph
+    // decoder auto-declines even though capture is on by default.
+    unsafe { std::env::remove_var(CAPTURE_ENV) };
     let before = NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES.load(Ordering::Relaxed);
     let tokens = (|| {
         let mut engine = Engine::from_dir(
@@ -100,7 +102,6 @@ fn qwen3_0_6b_single_component_declines_capture_step_inputs() -> anyhow::Result<
         Ok::<_, anyhow::Error>(engine.generate(request)?.token_ids)
     })();
     let after = NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES.load(Ordering::Relaxed);
-    unsafe { std::env::remove_var(CAPTURE_ENV) };
     let tokens = tokens?;
 
     assert_eq!(
@@ -114,7 +115,7 @@ fn qwen3_0_6b_single_component_declines_capture_step_inputs() -> anyhow::Result<
         "qwen3-0.6b single-graph decode unexpectedly engaged the capture-step-inputs path"
     );
     eprintln!(
-        "PROVEN: qwen3-0.6b native-CUDA decode with capture flag ON → captured_step_input_decodes=0 \
+        "PROVEN: qwen3-0.6b native-CUDA decode with capture default-on → captured_step_input_decodes=0 \
          (single-component input_ids model does NOT route through the pipeline capture-step-inputs path); tokens={tokens:?}"
     );
     Ok(())
