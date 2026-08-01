@@ -71,13 +71,33 @@ pub const WEIGHT_OFFLOAD_ENV: &str = onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV;
 /// manager is constructed with a caller-chosen default.
 pub const WEIGHT_OFFLOAD_DEVICE_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES";
 
-/// Sub-knob (default ON) selecting the asynchronous, fence-ordered residency
-/// page-in over the legacy synchronous `cuMemcpyHtoD`. Set to exactly `0` to
-/// force the old synchronous page-in — used as the A/B "before" arm to measure
-/// the overlap win, and as a kill-switch. It only has any effect when weight
-/// offload itself is enabled (`ONNX_GENAI_WEIGHT_OFFLOAD=1`); with offload off
-/// the resident fast path is untouched and byte-identical regardless.
+/// Sub-knob (default OFF / opt-IN) selecting the asynchronous, fence-ordered
+/// residency page-in over the synchronous `cuMemcpyHtoD`. Set to a truthy value
+/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to enable async page-in;
+/// unset or any other value uses the synchronous page-in. Async is opt-in because
+/// a measured A/B (qwen3-0.6b-int4, 96MiB budget, eviction/thrash regime) showed
+/// sync is FASTER (15.84 vs 12.16 tok/s): when every admit evicts, the async path
+/// cannot overlap and still pays a non-overlappable pinned-staging alloc+copy. The
+/// async path stays fully intact behind this flag (the A/B "after" arm) and is
+/// expected to become a net win once a warm-host materialize cache lands. This
+/// knob only has any effect when weight offload itself is enabled
+/// (`ONNX_GENAI_WEIGHT_OFFLOAD=1`); with offload off the resident fast path is
+/// untouched and byte-identical regardless.
 pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN";
+
+/// Pure opt-in parse for [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is
+/// **default-off**: only an explicit truthy value (`1`/`true`/`yes`/`on`,
+/// case/whitespace-insensitive) enables it; unset (`None`) or any other value
+/// keeps the synchronous page-in.
+pub(crate) fn async_pagein_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
 
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
@@ -87,9 +107,10 @@ pub struct DeviceOffloadPolicy {
     pub enabled: bool,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
     pub device_budget_bytes: Option<u64>,
-    /// Use the asynchronous, fence-ordered page-in (default `true`). Disabled
-    /// only when `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0`, which restores the
-    /// synchronous page-in for A/B measurement or as a kill-switch.
+    /// Use the asynchronous, fence-ordered page-in (default `false` / opt-IN).
+    /// Enabled only when `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is set to a
+    /// truthy value (`1`/`true`/`yes`/`on`); otherwise the synchronous page-in
+    /// is used, which is faster in the eviction/thrash regime (measured A/B).
     pub async_pagein: bool,
 }
 
@@ -98,7 +119,7 @@ impl Default for DeviceOffloadPolicy {
         Self {
             enabled: false,
             device_budget_bytes: None,
-            async_pagein: true,
+            async_pagein: false,
         }
     }
 }
@@ -110,9 +131,12 @@ impl DeviceOffloadPolicy {
         let device_budget_bytes = std::env::var(WEIGHT_OFFLOAD_DEVICE_BYTES_ENV)
             .ok()
             .and_then(|value| parse_budget_bytes(&value));
-        // Async page-in defaults ON; only an explicit `0` disables it.
-        let async_pagein =
-            std::env::var_os(WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV).is_none_or(|value| value != "0");
+        // Async page-in defaults OFF (opt-in); only an explicit truthy value enables it.
+        let async_pagein = async_pagein_from_env_value(
+            std::env::var(WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV)
+                .ok()
+                .as_deref(),
+        );
         Self {
             enabled,
             device_budget_bytes,
@@ -386,8 +410,9 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
 /// full compute-stream drain is now taken **only when admitting must evict** (so
 /// eviction never frees a page a prior kernel still reads); a page-in that fits
 /// the budget no longer host-blocks, which is what lets the transfer overlap.
-/// Set `async_pagein = false` (env `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0`) to
-/// restore the legacy synchronous page-in for A/B comparison.
+/// Set `async_pagein = true` (env `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1`) to
+/// opt into the asynchronous page-in for A/B comparison; the synchronous page-in
+/// is the default (faster in the eviction/thrash regime, measured A/B).
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
     /// Whether misses page in asynchronously (see [`CudaWeightPage::upload_async`]).
@@ -409,11 +434,11 @@ struct ResidencyInner {
 
 impl CudaWeightResidency {
     /// Build a residency cache with an explicit VRAM `budget_bytes`. Page-in is
-    /// asynchronous by default; chain [`Self::with_async_pagein`] to override.
+    /// synchronous by default; chain [`Self::with_async_pagein`] to opt into async.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         Self {
             runtime,
-            async_pagein: true,
+            async_pagein: false,
             inner: Mutex::new(ResidencyInner {
                 budget: budget_bytes,
                 resident_bytes: 0,
@@ -665,6 +690,24 @@ mod tests {
         let policy = DeviceOffloadPolicy::default();
         assert!(!policy.enabled);
         assert_eq!(policy.device_budget_bytes, None);
+        // Async page-in is opt-in: the default policy uses the synchronous path.
+        assert!(!policy.async_pagein);
+    }
+
+    #[test]
+    fn async_pagein_env_is_opt_in() {
+        // Unset => synchronous (default off).
+        assert!(!async_pagein_from_env_value(None));
+        // Truthy spellings enable async, case/whitespace-insensitive.
+        assert!(async_pagein_from_env_value(Some("1")));
+        assert!(async_pagein_from_env_value(Some("true")));
+        assert!(async_pagein_from_env_value(Some("YES")));
+        assert!(async_pagein_from_env_value(Some("  On ")));
+        // Explicit falsey / anything else stays synchronous.
+        assert!(!async_pagein_from_env_value(Some("0")));
+        assert!(!async_pagein_from_env_value(Some("false")));
+        assert!(!async_pagein_from_env_value(Some("")));
+        assert!(!async_pagein_from_env_value(Some("maybe")));
     }
 
     #[test]
