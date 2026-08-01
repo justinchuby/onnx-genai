@@ -753,7 +753,7 @@ fn build_movement_kernel(
         .map(|(index, shape)| {
             graph.create_named_value(
                 format!("input_{index}"),
-                if index == 1 && matches!(op, "Expand" | "Reshape") {
+                if index == 1 && matches!(op, "Expand" | "Reshape" | "Tile") {
                     DataType::Int64
                 } else {
                     DataType::Float32
@@ -1245,5 +1245,218 @@ fn transpose_rejects_signature_change_during_capture() {
     ep.deallocate(a_data_buffer).unwrap();
     ep.deallocate(a_output_buffer).unwrap();
     ep.deallocate(b_data_buffer).unwrap();
+    ep.deallocate(b_output_buffer).unwrap();
+}
+
+#[test]
+fn tile_warmed_metadata_captures_and_matches_eager() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // Fixed decode-shape Tile: the repeats/geometry are stable, so the persistent
+    // metadata must survive capture with no per-call host read or sync.
+    let input_shape = [2usize, 1];
+    let repeats_shape = [2usize];
+    let output_shape = [4usize, 3];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Tile",
+        &[input_shape.to_vec(), repeats_shape.to_vec()],
+        &[output_shape.to_vec()],
+        &[],
+    );
+
+    let data = vec![1_f32, 2.];
+    let data_bytes = raw(&data);
+    let repeats_bytes = raw(&[2_i64, 3]);
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let repeats_buffer = ep.allocate(repeats_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&repeats_bytes, cuptr(repeats_buffer.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let repeats_strides = compute_contiguous_strides(&repeats_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &input_shape,
+            &input_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(repeats_buffer.as_ptr()),
+            DataType::Int64,
+            &repeats_shape,
+            &repeats_strides,
+            device,
+        ),
+    ];
+    let mut output_buffer = ep.allocate(12 * std::mem::size_of::<f32>(), 256).unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut execute = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )];
+        kernel.execute(&inputs, &mut output).unwrap();
+    };
+    // Unwarmed: the kernel must decline capture until a fixed shape is seen.
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+    // First eager run reads/validates repeats once and warms the signature.
+    execute();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    // Re-running eagerly reuses cached metadata with no host read/sync and must
+    // still produce identical bytes.
+    execute();
+    // Capture + replay must equal the eager result byte-for-byte.
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+
+    let mut actual = vec![0; 12 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(
+        actual,
+        raw(&[1_f32, 1., 1., 2., 2., 2., 1., 1., 1., 2., 2., 2.])
+    );
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(repeats_buffer).unwrap();
+    ep.deallocate(output_buffer).unwrap();
+}
+
+#[test]
+fn tile_rejects_signature_change_during_capture() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // Signature A is the warmed decode shape; feeding a different tiled geometry
+    // mid-capture must be rejected, not replayed against the stale metadata.
+    let input_shape = [2usize, 1];
+    let repeats_shape = [2usize];
+    let a_output_shape = [4usize, 3];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Tile",
+        &[input_shape.to_vec(), repeats_shape.to_vec()],
+        &[a_output_shape.to_vec()],
+        &[],
+    );
+
+    let data = vec![1_f32, 2.];
+    let data_bytes = raw(&data);
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let a_repeats_bytes = raw(&[2_i64, 3]);
+    let a_repeats_buffer = ep.allocate(a_repeats_bytes.len(), 256).unwrap();
+    let b_repeats_bytes = raw(&[2_i64, 2]);
+    let b_repeats_buffer = ep.allocate(b_repeats_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&a_repeats_bytes, cuptr(a_repeats_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&b_repeats_bytes, cuptr(b_repeats_buffer.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let repeats_strides = compute_contiguous_strides(&repeats_shape);
+    let a_inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &input_shape,
+            &input_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(a_repeats_buffer.as_ptr()),
+            DataType::Int64,
+            &repeats_shape,
+            &repeats_strides,
+            device,
+        ),
+    ];
+    let b_inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &input_shape,
+            &input_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(b_repeats_buffer.as_ptr()),
+            DataType::Int64,
+            &repeats_shape,
+            &repeats_strides,
+            device,
+        ),
+    ];
+    let mut a_output_buffer = ep.allocate(12 * std::mem::size_of::<f32>(), 256).unwrap();
+    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let b_output_shape = [4usize, 2];
+    let mut b_output_buffer = ep.allocate(8 * std::mem::size_of::<f32>(), 256).unwrap();
+    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let mut run_a = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(a_output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &a_output_shape,
+            &a_output_strides,
+            device,
+        )];
+        kernel.execute(&a_inputs, &mut output)
+    };
+    let mut run_b = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(b_output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &b_output_shape,
+            &b_output_strides,
+            device,
+        )];
+        kernel.execute(&b_inputs, &mut output)
+    };
+
+    // Warm signature A eagerly, then open a capture keyed on that warmed kernel.
+    run_a().unwrap();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    // Recording the warmed signature A into the graph is fine.
+    run_a().unwrap();
+    // A DIFFERENT tiled output geometry mid-capture must be rejected.
+    let err = run_b().expect_err("signature change during capture must be rejected");
+    assert!(
+        err.to_string()
+            .contains("changed during CUDA graph capture"),
+        "unexpected error message: {err}"
+    );
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(a_repeats_buffer).unwrap();
+    ep.deallocate(b_repeats_buffer).unwrap();
+    ep.deallocate(a_output_buffer).unwrap();
     ep.deallocate(b_output_buffer).unwrap();
 }
