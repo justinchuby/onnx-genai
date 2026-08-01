@@ -365,12 +365,26 @@ Environment aliases for command-line deployments:
 ```text
 ONNX_GENAI_WEIGHT_OFFLOAD=1                    # Phase-1 route-first mmap CPU MoE
 ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=<bytes>   # owned Phase-2 warm-cache override
+ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1       # opt-IN async fence-ordered device page-in (default: sync)
 ONNX_GENAI_WEIGHT_BUDGET=auto|<bytes>          # shorthand resident-weight cap
 ONNX_GENAI_WEIGHT_DEVICE_BUDGET=auto|<bytes>
 ONNX_GENAI_WEIGHT_HOST_BUDGET=auto|<bytes>
 ONNX_GENAI_GPU_LAYERS=<N>
 ONNX_GENAI_WEIGHT_PREFETCH=off|exact|heat|predictive|auto
 ```
+
+`ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is **opt-in** (default: synchronous
+page-in). Set it to a truthy value (`1`/`true`/`yes`/`on`) to use the
+asynchronous, fence-ordered device page-in; unset or any other value keeps the
+synchronous `cuMemcpyHtoD`. The synchronous path is the default because a
+measured A/B (qwen3-0.6b-int4, 96 MiB device budget, eviction/thrash regime)
+showed sync is faster — **15.84 tok/s sync vs 12.16 tok/s async**. When every
+admit must evict, the async path re-serializes on the eviction compute-stream
+drain and still pays a non-overlappable pinned-staging alloc+copy, so it cannot
+hide the transfer. The async path stays fully available behind this flag and is
+expected to become a net win once a warm-host materialize cache lands (removing
+the per-page-in staging cost from the critical path). Both paths are byte-exact:
+this flag never changes output, only the page-in mechanism.
 
 `ONNX_GENAI_WEIGHT_OFFLOAD` is opt-in in Phases 1 and 2. When set to `1`, pageable
 expert-major external QMoE tensors use route-first execution and bypass
