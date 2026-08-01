@@ -395,11 +395,14 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
                 .context("steady warmup generation")?,
         );
     }
+    profile::reset();
+    onnx_runtime_session::reset_exec_phase_profile();
 
     let mut prefills_ms = Vec::with_capacity(args.runs);
     let mut decode_ms_per_token = Vec::with_capacity(args.runs);
     let mut throughputs = Vec::with_capacity(args.runs);
     let mut reference_tokens = None;
+    let mut generated = 0usize;
     for run in 1..=args.runs {
         let start = Instant::now();
         let mut token_times = Vec::with_capacity(args.tokens);
@@ -428,6 +431,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             reference_tokens = Some(result.token_ids.clone());
             println!("generated_text: {:?}", result.text);
         }
+        generated += result.token_ids.len();
 
         let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
         let decode_tokens = token_times.len() - args.decode_skip;
@@ -457,6 +461,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     );
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
+    }
+    if profile::enabled() {
+        println!("{}", profile::report(generated as u64));
     }
     onnx_runtime_session::print_exec_phase_profile();
     Ok(())

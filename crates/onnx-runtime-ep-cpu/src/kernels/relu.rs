@@ -176,6 +176,12 @@ mod tests {
     }
 
     /// Proves the fast (non-MLAS) path fires on contiguous f32 input.
+    ///
+    /// Calls `relu_contiguous_f32_fast` directly rather than going through
+    /// `execute`, because with `--features mlas` the MLAS activation path runs
+    /// first and returns, so the fast path would never be reached and the hit
+    /// counter would never move. This test is about the fast path itself, so it
+    /// exercises the fast path itself and stays meaningful in both builds.
     #[test]
     fn relu_f32_fast_path_fires_on_contiguous_input() {
         let before = RELU_F32_FAST_TEST_HITS.load(Ordering::Relaxed);
@@ -187,9 +193,8 @@ mod tests {
             ],
         );
         let mut out = Owned::zeros_f32(&[4, 4]);
-        ReluKernel
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        let handled = relu_contiguous_f32_fast(&a.view(), &mut out.view_mut()).unwrap();
+        assert!(handled, "fast path declined contiguous f32 input");
         let after = RELU_F32_FAST_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
@@ -265,15 +270,21 @@ mod tests {
     }
 
     /// NaN semantics through the fast path specifically.
+    ///
+    /// Pins the reference contract `Relu(NaN) = NaN` (numpy `maximum(0, NaN)`).
+    /// Calls the fast path directly: under `--features mlas` the MLAS activation
+    /// path shadows it in `execute`, and MLAS implements Relu with SIMD `max`,
+    /// which returns the non-NaN operand and therefore flushes NaN to 0. That
+    /// divergence is a property of the opt-in MLAS path, not of this kernel, so
+    /// asserting it here through `execute` would test the wrong thing.
     #[test]
     fn relu_f32_fast_path_nan_semantics() {
         let before = RELU_F32_FAST_TEST_HITS.load(Ordering::Relaxed);
         let data = vec![f32::NAN, -0.0, 0.0, -1.0, 1.0, f32::NAN];
         let a = Owned::f32(&[6], &data);
         let mut out = Owned::zeros_f32(&[6]);
-        ReluKernel
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        let handled = relu_contiguous_f32_fast(&a.view(), &mut out.view_mut()).unwrap();
+        assert!(handled, "fast path declined contiguous f32 input");
         let after = RELU_F32_FAST_TEST_HITS.load(Ordering::Relaxed);
         assert!(after > before, "fast path did not fire");
 

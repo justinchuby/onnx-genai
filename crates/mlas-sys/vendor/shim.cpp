@@ -9,8 +9,7 @@
 // by re-partitioning at the Rust level, we let MLAS keep its own partitioning
 // and give it a *pluggable parallel-for backend*: the vendored standalone
 // primitives call the `MlasStandalone*` hooks below, which forward the
-// parallel-for onto a real thread pool that Rust drives with Rayon (the same
-// global pool the rest of ep-cpu uses, so there is no oversubscription). When
+// parallel-for onto a persistent Rust work-stealing pool. When
 // no backend is registered (e.g. the mlas-sys unit tests, or the ep-cpu default
 // build) the hooks run serially — identical to the original spike behaviour.
 //
@@ -18,14 +17,69 @@
 // Licensed under the MIT License.
 
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/inc/mlas_float16.h"
 #include "core/mlas/inc/mlas_qnbit.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <functional>
 #include <new>
 
-// ---- Pluggable parallel-for backend (driven from Rust/Rayon) ----------------
+namespace onnxruntime {
+struct MLFloat16 {
+    uint16_t val;
+};
+
+std::atomic<int> saturation_count{0};
+}  // namespace onnxruntime
+
+void MLASCALL MlasConvertHalfToFloatBuffer(
+    const MLAS_FP16* Source,
+    float* Destination,
+    size_t Count)
+{
+    for (size_t i = 0; i < Count; ++i) {
+        Destination[i] = MLAS_Half2Float(Source[i].val);
+    }
+}
+
+void MLASCALL MlasConvertHalfToFloatBufferInParallel(
+    const MLAS_FP16* Source,
+    float* Destination,
+    size_t Count,
+    MLAS_THREADPOOL*)
+{
+    MlasConvertHalfToFloatBuffer(Source, Destination, Count);
+}
+
+void MLASCALL MlasConvertFloatToHalfBuffer(
+    const float* Source,
+    MLAS_FP16* Destination,
+    size_t Count)
+{
+    for (size_t i = 0; i < Count; ++i) {
+        Destination[i].val = MLAS_Float2Half(Source[i]);
+    }
+}
+
+void MLASCALL MlasConvertFloatToHalfBufferInParallel(
+    const float* Source,
+    MLAS_FP16* Destination,
+    size_t Count,
+    MLAS_THREADPOOL*)
+{
+    MlasConvertFloatToHalfBuffer(Source, Destination, Count);
+}
+
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+bool MLASCALL MlasHGemmSupported(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE)
+{
+    return false;
+}
+#endif
+
+// ---- Pluggable parallel-for backend (driven from Rust) ----------------------
 
 extern "C" {
 
@@ -84,11 +138,15 @@ void mlas_std_function_trampoline(void* task_ctx, std::ptrdiff_t tid)
 }  // namespace
 
 // Hook called by the vendored standalone `MlasTrySimpleParallel`. Forwards the
-// parallel-for onto the registered backend, or runs serially if none is set.
-extern "C" void MlasStandaloneParallelFor(std::ptrdiff_t iterations, void* work)
+// parallel-for onto the registered backend when the caller passed a non-null
+// MLAS_THREADPOOL sentinel, or runs serially otherwise.
+extern "C" void MlasStandaloneParallelFor(
+    std::ptrdiff_t iterations,
+    void* work,
+    bool enable_backend)
 {
     const auto& fn = *static_cast<const std::function<void(std::ptrdiff_t)>*>(work);
-    if (g_parallel_for != nullptr && iterations > 1) {
+    if (enable_backend && g_parallel_for != nullptr && iterations > 1) {
         g_parallel_for(
             g_rust_ctx,
             iterations,
@@ -167,7 +225,7 @@ extern "C" void mlas_sgemm_pack_b(
 //   3 = SQNBIT_CompInt8 (int8 activation, int32 accumulate) -- accuracy_level=4.
 //
 // Threading: like the SGEMM shim, MLAS's own N/M tile partitioning is routed
-// through the registered Rust/Rayon parallel-for backend (`MlasStandalone*`
+// through the registered Rust parallel-for backend (`MlasStandalone*`
 // hooks above). `MlasQNBitGemmBatch` only takes its parallel branch when
 // `ThreadPool != nullptr`, so pass a non-null sentinel (the pointer is never
 // dereferenced in the standalone build -- `MlasGetMaximumThreadCount` and
@@ -202,9 +260,35 @@ extern "C" void mlas_qnbit_gemm_pack_b(
     int has_zp,
     const void* quant_b_zero_point)
 {
+    const auto ct = static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type);
+    if (bits == 8 && ct == SQNBIT_CompInt8) {
+        // ORT's MatMulNBits pre-pack path calls MLAS once per pre-packable
+        // input. The SQ8 ARM64 packer accumulates state across those calls:
+        // first quantized B bytes, then scales/zero-points. Expose a single
+        // Rust-friendly call by replaying that sequence into the same buffer.
+        MlasQNBitGemmPackQuantBData(
+            n, k, bits, blk_len, ct,
+            quant_b_data,
+            packed_b,
+            nullptr,
+            false,
+            nullptr,
+            /*ThreadPool=*/nullptr,
+            /*BackendKernelSelectorConfig=*/nullptr);
+        MlasQNBitGemmPackQuantBData(
+            n, k, bits, blk_len, ct,
+            nullptr,
+            packed_b,
+            quant_b_scale,
+            has_zp != 0,
+            quant_b_zero_point,
+            /*ThreadPool=*/nullptr,
+            /*BackendKernelSelectorConfig=*/nullptr);
+        return;
+    }
+
     MlasQNBitGemmPackQuantBData(
-        n, k, bits, blk_len,
-        static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type),
+        n, k, bits, blk_len, ct,
         quant_b_data,
         packed_b,
         quant_b_scale,
@@ -253,9 +337,13 @@ extern "C" void mlas_qnbit_gemm(
     if (ct == SQNBIT_CompInt8) {
         // The int8-compute path derives PackedQuantBData / QuantBScale /
         // QuantBBlkSum from the combined workspace produced by
-        // MlasQNBitGemmPackQuantBData (which baked scale + zero point into the
-        // block sums), so only the workspace pointer is needed here.
+        // MlasQNBitGemmPackQuantBData. The KleidiAI packed ARM64 path also
+        // reads PackedQuantBData directly (and stores zero-point correction
+        // after it), so provide both views over the same packed buffer.
         params.QuantBDataWorkspace = packed_b;
+        params.PackedQuantBData = static_cast<const std::byte*>(packed_b);
+        params.QuantBScale = quant_b_scale;
+        params.QuantBZeroPoint = has_zp != 0 ? quant_b_zero_point : nullptr;
     } else {
         // The fp32-compute path repacks only the quantized nibbles; scales and
         // (optional) zero points are consumed at compute time in their original

@@ -1022,6 +1022,13 @@ mod tests {
         assert_eq!(output.to_i64(), vec![0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]);
     }
 
+    /// Proves the fast (non-MLAS) path fires on contiguous f32 input.
+    ///
+    /// Calls `clip_contiguous_f32_fast` directly rather than going through
+    /// `execute`, because with `--features mlas` the MLAS activation path runs
+    /// first and returns, so the fast path would never be reached and the hit
+    /// counter would never move. This test is about the fast path itself, so it
+    /// exercises the fast path itself and stays meaningful in both builds.
     #[test]
     fn clip_f32_fast_path_fires_on_contiguous_input() {
         let before = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
@@ -1031,12 +1038,17 @@ mod tests {
         let lo = Owned::f32(&[], &[0.0]);
         let hi = Owned::f32(&[], &[6.0]);
         let mut y = Owned::zeros_f32(&[1, 3, 8, 8]);
-        ClipKernel {
+        let kernel = ClipKernel {
             min: None,
             max: None,
-        }
-        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        };
+        let handled = clip_contiguous_f32_fast(
+            &kernel,
+            &[x.view(), lo.view(), hi.view()],
+            &mut y.view_mut(),
+        )
         .unwrap();
+        assert!(handled, "fast path declined contiguous f32 input");
         let after = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             after > before,
@@ -1091,12 +1103,22 @@ mod tests {
         let lo = Owned::f32(&[], &[0.0]);
         let hi = Owned::f32(&[], &[6.0]);
         let mut y = Owned::zeros_f32(&[5]);
-        ClipKernel {
+        // Direct call: with `--features mlas` the MLAS activation path shadows
+        // this one in `execute`, and MLAS implements Clip with SIMD min/max,
+        // which returns the non-NaN operand and so clamps NaN to a bound. That
+        // divergence belongs to the opt-in MLAS path; this test pins the
+        // reference contract for the kernel it names.
+        let kernel = ClipKernel {
             min: None,
             max: None,
-        }
-        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        };
+        let handled = clip_contiguous_f32_fast(
+            &kernel,
+            &[x.view(), lo.view(), hi.view()],
+            &mut y.view_mut(),
+        )
         .unwrap();
+        assert!(handled, "fast path declined contiguous f32 input");
         let after = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             after > before,
