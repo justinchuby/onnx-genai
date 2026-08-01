@@ -6,6 +6,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
+use nu_ansi_term::{Color as AnsiColor, Style as AnsiStyle};
 use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::GenerationDefaults;
 use onnx_genai::ort::profile::TraceVerbosity;
@@ -16,9 +17,10 @@ use onnx_genai::{
 };
 use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
 use reedline::{
-    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
-    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, default_emacs_keybindings,
+    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, Highlighter, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
+    Suggestion, default_emacs_keybindings,
 };
 
 use super::commands::{
@@ -104,6 +106,19 @@ impl Prompt for ReplPrompt {
             "({status}reverse-search: {}) ",
             history_search.term
         ))
+    }
+}
+
+struct ReplInputHighlighter;
+
+impl Highlighter for ReplInputHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+        styled.push((
+            AnsiStyle::new().bold().fg(AnsiColor::Cyan),
+            line.to_string(),
+        ));
+        styled
     }
 }
 
@@ -217,6 +232,7 @@ fn build_reedline_editor() -> Reedline {
         .with_completer(Box::new(SlashCompleter))
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_edit_mode(edit_mode)
+        .with_highlighter(Box::new(ReplInputHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
 }
 
@@ -695,6 +711,34 @@ impl Backend {
         }
     }
 
+    /// Token id for an exact one-token marker string, when the loaded tokenizer
+    /// represents it as one token.
+    pub(super) fn single_token_id(&self, token: &str) -> Option<u32> {
+        let ids = match self {
+            Self::Text(engine) => engine.tokenize(token).ok()?,
+            Self::Pipeline(pipeline) => pipeline
+                .tokenizer
+                .token_id(token)
+                .map(|id| vec![id])
+                .or_else(|| pipeline.tokenizer.encode(token).ok())?,
+        };
+        match ids.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub(super) fn bind_reasoning_marker_tokens(
+        &self,
+        reasoning: &mut Option<super::output::ReasoningConfig>,
+    ) {
+        if let Some(config) = reasoning {
+            let start_id = self.single_token_id(&config.markers.start);
+            let end_id = self.single_token_id(&config.markers.end);
+            config.set_marker_token_ids(start_id, end_id);
+        }
+    }
+
     pub(super) fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         match self {
             Self::Text(engine) => engine.effective_max_context(options),
@@ -959,6 +1003,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut live = live_turn::LiveTurn::new();
     let mut template = load_chat_template(&model_dir, raw_mode);
     let mut reasoning = detect_reasoning(template.as_ref());
+    backend.bind_reasoning_marker_tokens(&mut reasoning);
     let mut warned_missing_context_limit = false;
 
     eprintln!(
@@ -1088,10 +1133,12 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         match reload(&next) {
                             Ok(loaded) => {
                                 backend = loaded;
+                                backend.bind_reasoning_marker_tokens(&mut reasoning);
                                 settings = next;
                                 model_dir = settings.model_dir.clone();
                                 template = load_chat_template(&model_dir, raw_mode);
                                 reasoning = detect_reasoning(template.as_ref());
+                                backend.bind_reasoning_marker_tokens(&mut reasoning);
                                 warned_missing_context_limit = false;
                                 // A conversation is about the model that held
                                 // it; replaying it into a different model would
@@ -1163,6 +1210,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         match reload(&next) {
                             Ok(loaded) => {
                                 backend = loaded;
+                                backend.bind_reasoning_marker_tokens(&mut reasoning);
                                 settings = next;
                                 history.clear();
                                 session_usage = SessionUsage::default();
@@ -1241,6 +1289,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 raw_mode = !raw_mode;
                 template = load_chat_template(&model_dir, raw_mode);
                 reasoning = detect_reasoning(template.as_ref());
+                backend.bind_reasoning_marker_tokens(&mut reasoning);
                 println!("raw mode {}", if raw_mode { "enabled" } else { "disabled" });
                 None
             }
@@ -1399,7 +1448,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             emit_stats_line(show_stats, show_profile, &mut profile);
                             continue;
                         }
-                        split.answer.to_string()
+                        split.answer
                     }
                     None => output,
                 };
