@@ -33,6 +33,65 @@ struct DecoderStateMetadata {
     kv_dtype: String,
 }
 
+/// How strictly a fixed-state input/output port pair's ONNX shapes must agree
+/// during decoder-state derivation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateShapeMatch {
+    /// Every axis must match exactly, including symbolic vs concrete. Used by the
+    /// config-driven `strict_decoder_state` path, whose contract is unchanged.
+    Exact,
+    /// Same rank, with symbolic (unknown) axes treated as wildcards: a concrete
+    /// axis matches an unknown axis, only two differing concrete extents fail.
+    /// Stock exports frequently leave a `present.*` recurrent-state shape fully
+    /// symbolic (`[?,?,?]`) even though the paired `past_*` input carries the
+    /// concrete running-state extent, so the config-free graph fallback must not
+    /// reject that legitimate pairing.
+    AllowSymbolic,
+}
+
+impl StateShapeMatch {
+    fn shapes_pair(self, input: &[Option<usize>], output: &[Option<usize>]) -> bool {
+        match self {
+            StateShapeMatch::Exact => input == output,
+            StateShapeMatch::AllowSymbolic => {
+                input.len() == output.len()
+                    && input.iter().zip(output).all(|(a, b)| match (a, b) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    })
+            }
+        }
+    }
+}
+
+/// A single loop-carried recurrent state port pair (`conv_state`/
+/// `recurrent_state`), threaded in→out and replaced wholesale each decode step
+/// rather than appended along the sequence axis like growable KV.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedStatePair {
+    /// Graph input port carrying the state into the step.
+    pub input: String,
+    /// Graph output port carrying the updated state out of the step.
+    pub output: String,
+}
+
+/// Decoder KV/state topology derived purely from an ONNX graph's port
+/// inventory, without a `genai_config.json`. Returned by
+/// [`GenAiConfig::derive_decoder_io_from_graph`]; consumed by the native
+/// loader's auto-derive fallback when the sidecar declares no `io` block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedDecoderIo {
+    /// Growable dense KV input ports (`past_key_values.%d.key`/`.value`), paired
+    /// positionally with `kv_outputs`.
+    pub kv_inputs: Vec<String>,
+    /// Growable dense KV output ports (`present.%d.key`/`.value`).
+    pub kv_outputs: Vec<String>,
+    /// Fixed loop-carried recurrent state pairs (empty for pure-dense decoders).
+    pub state_pairs: Vec<DerivedStatePair>,
+    /// Canonical dtype spelling shared by every KV cache tensor.
+    pub kv_dtype: String,
+}
+
 /// Coarse structural family a `genai_config.json` describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelShape {
@@ -1485,6 +1544,36 @@ impl GenAiConfig {
             "model.decoder.outputs.present_value_names",
         )?;
 
+        Self::decoder_state_from_patterns(
+            graph,
+            past_key,
+            past_value,
+            present_key,
+            present_value,
+            StateShapeMatch::Exact,
+        )
+    }
+
+    /// Derive a decoder's KV/state topology from the ONNX graph interface using
+    /// the four indexed `%d` key/value name patterns.
+    ///
+    /// This is the pure, config-independent core of
+    /// [`strict_decoder_state`](Self::strict_decoder_state): it depends only on
+    /// the graph inventory and the four pattern strings, so callers that lack a
+    /// `genai_config.json` (e.g. stock native exports carrying only an
+    /// `inference_metadata.yaml`) can reuse the exact same guarded derivation via
+    /// [`derive_decoder_io_from_graph`](Self::derive_decoder_io_from_graph). The
+    /// guard is inherited unchanged: only `suffix_tensor_map` (not
+    /// `strict_indexed_kv`) finds the non-KV recurrent `state_pairs`, so
+    /// cross-attention/Whisper KV is never misclassified as running state.
+    fn decoder_state_from_patterns(
+        graph: &ModelGraphInfo,
+        past_key: &str,
+        past_value: &str,
+        present_key: &str,
+        present_value: &str,
+        state_shape_match: StateShapeMatch,
+    ) -> Result<DecoderStateMetadata, GenAiConfigError> {
         let past_key_names = match_indexed_tensors(&graph.inputs, past_key)?;
         let past_value_names = match_indexed_tensors(&graph.inputs, past_value)?;
         let present_key_names = match_indexed_tensors(&graph.outputs, present_key)?;
@@ -1562,7 +1651,7 @@ impl GenAiConfig {
         for (suffix, input) in state_inputs {
             let output = state_outputs[&suffix];
             require_same_dtype(input, output, "fixed-state input/output")?;
-            if input.dimensions != output.dimensions {
+            if !state_shape_match.shapes_pair(&input.dimensions, &output.dimensions) {
                 return Err(incomplete(format!(
                     "fixed-state pair '{}'/'{}' has different ONNX shapes",
                     input.name, output.name
@@ -1581,6 +1670,51 @@ impl GenAiConfig {
             kv_outputs,
             state_pairs,
             kv_dtype: kv_dtype.expect("non-empty KV indices establish a dtype"),
+        })
+    }
+
+    /// Derive a decoder's KV/state I/O topology directly from an ONNX graph's
+    /// port inventory, using the conventional onnxruntime-genai key/value name
+    /// patterns (`past_key_values.%d.key`/`.value` → `present.%d.key`/`.value`).
+    ///
+    /// This is the config-free entry point for stock native exports that ship an
+    /// `inference_metadata.yaml` without an explicit `io` block (and no
+    /// `genai_config.json`): the native loader calls it as an additive fallback
+    /// so hybrid linear-attention decoders (which carry recurrent
+    /// `conv_state`/`recurrent_state` ports the shape-inference path cannot
+    /// classify) still load. It reuses the exact guarded derivation
+    /// ([`decoder_state_from_patterns`](Self::decoder_state_from_patterns)), so
+    /// dense cross-attention/Whisper KV is never misclassified as running state.
+    ///
+    /// Structural derivation failures are swallowed into `None` (mirroring
+    /// [`graph_decoder_state`](Self::graph_decoder_state)) so a caller can fall
+    /// back to its existing shape-inference path without regressing any model
+    /// that loads today.
+    pub fn derive_decoder_io_from_graph(graph: &ModelGraphInfo) -> Option<DerivedDecoderIo> {
+        let metadata = Self::decoder_state_from_patterns(
+            graph,
+            "past_key_values.%d.key",
+            "past_key_values.%d.value",
+            "present.%d.key",
+            "present.%d.value",
+            StateShapeMatch::AllowSymbolic,
+        )
+        .ok()?;
+        let state_pairs = metadata
+            .state_pairs
+            .iter()
+            .map(|pair| {
+                Some(DerivedStatePair {
+                    input: pair.get("input")?.as_str()?.to_owned(),
+                    output: pair.get("output")?.as_str()?.to_owned(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(DerivedDecoderIo {
+            kv_inputs: metadata.kv_inputs,
+            kv_outputs: metadata.kv_outputs,
+            state_pairs,
+            kv_dtype: metadata.kv_dtype,
         })
     }
 

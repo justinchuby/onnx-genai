@@ -467,6 +467,185 @@ fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
     InferenceSession::from_graph(graph).expect("build tiny decoder")
 }
 
+/// A tiny hybrid decoder mirroring `tiny_decoder` but adding a recurrent
+/// linear-attention layer: layer 0 carries `conv_state`/`recurrent_state`
+/// (fixed loop-carried state, threaded past→present by `Identity`), layer 1 is
+/// dense GQA (`key`/`value`). All ports use the conventional
+/// `past_key_values.%d.*` / `present.%d.*` names, so the loader's graph-derived
+/// I/O fallback can classify them without a declared `io:` block.
+fn tiny_hybrid_decoder() -> InferenceSession {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 11);
+    let batch = graph.intern_symbol("batch");
+    let sequence = graph.intern_symbol("sequence");
+    let total = graph.intern_symbol("total");
+    let past = graph.intern_symbol("past");
+    let shape = |dims: &[Dim]| -> Shape { dims.to_vec() };
+
+    let input_ids = graph.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    let attention_mask = graph.create_named_value(
+        "attention_mask",
+        DataType::Int64,
+        shape(&[batch.into(), total.into()]),
+    );
+    let position_ids = graph.create_named_value(
+        "position_ids",
+        DataType::Int64,
+        shape(&[batch.into(), sequence.into()]),
+    );
+    // Layer 0: recurrent state ports (fixed-extent, replaced each step).
+    let conv_state = graph.create_named_value(
+        "past_key_values.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    let recurrent_state = graph.create_named_value(
+        "past_key_values.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    // Layer 1: dense GQA KV ports (growable along seq).
+    let past_key = graph.create_named_value(
+        "past_key_values.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    let past_value = graph.create_named_value(
+        "past_key_values.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+    );
+    for input in [
+        input_ids,
+        attention_mask,
+        position_ids,
+        conv_state,
+        recurrent_state,
+        past_key,
+        past_value,
+    ] {
+        graph.add_input(input);
+    }
+
+    let cast = graph.create_value(DataType::Float32, shape(&[batch.into(), sequence.into()]));
+    insert_op(
+        &mut graph,
+        "Cast",
+        vec![input_ids],
+        cast,
+        &[("to", Attribute::Int(1))],
+    );
+    let current_kv = graph.create_value(
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        current_kv,
+        &[("axes", Attribute::Ints(vec![1, 3]))],
+    );
+
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        shape(&[batch.into(), sequence.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Unsqueeze",
+        vec![cast],
+        logits,
+        &[("axes", Attribute::Ints(vec![2]))],
+    );
+
+    // Recurrent state: replaced wholesale (Identity pass-through here).
+    let present_conv = graph.create_named_value(
+        "present.0.conv_state",
+        DataType::Float32,
+        shape(&[batch.into(), 4.into(), 3.into()]),
+    );
+    insert_op(&mut graph, "Identity", vec![conv_state], present_conv, &[]);
+    let present_recurrent = graph.create_named_value(
+        "present.0.recurrent_state",
+        DataType::Float32,
+        shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Identity",
+        vec![recurrent_state],
+        present_recurrent,
+        &[],
+    );
+    // Dense KV: appended along the sequence axis.
+    let present_key = graph.create_named_value(
+        "present.1.key",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_key, current_kv],
+        present_key,
+        &[("axis", Attribute::Int(2))],
+    );
+    let present_value = graph.create_named_value(
+        "present.1.value",
+        DataType::Float32,
+        shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+    );
+    insert_op(
+        &mut graph,
+        "Concat",
+        vec![past_value, current_kv],
+        present_value,
+        &[("axis", Attribute::Int(2))],
+    );
+    for output in [
+        logits,
+        present_conv,
+        present_recurrent,
+        present_key,
+        present_value,
+    ] {
+        graph.add_output(output);
+    }
+    InferenceSession::from_graph(graph).expect("build tiny hybrid decoder")
+}
+
+#[test]
+fn native_decoder_auto_derives_hybrid_state_io() {
+    // A hybrid decoder with NO declared `io:` must load via the graph-derived
+    // fallback: token/mask/position/logits bound by conventional name, dense KV
+    // for layer 1, and the layer-0 recurrent ports classified as loop-carried
+    // state pairs. This is the exact gap that blocked qwen3.x hybrids (#384).
+    NativeDecodeSession::from_session(tiny_hybrid_decoder())
+        .expect("hybrid decoder auto-derives its decoder-state io from the graph");
+}
+
+#[test]
+fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
+    // The fallback's safety gate: a pure-dense decoder derives ZERO state pairs,
+    // so auto-derive declines and the model keeps its existing shape-inference
+    // path — which still fails on the ambiguous token input exactly as before.
+    // This proves the fallback never over-fires on models that load today.
+    let error = match NativeDecodeSession::from_session(tiny_decoder(false)) {
+        Ok(_) => panic!("dense ambiguous decoder must still require explicit token_input"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("model.io.token_input"),
+        "{error:#}"
+    );
+}
+
 fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
     ModelIoSpec {
         sequence_source: Some(sequence_source),

@@ -326,6 +326,177 @@ fn hybrid_decoder_derives_sparse_kv_and_state_pairs() {
     }
 }
 
+/// A qwen3.6-27b-shaped hybrid graph: 64 decoder layers where every 4th layer
+/// (indices 3, 7, ... 63) is dense GQA full-attention (`key`/`value`) and the
+/// remaining 48 layers are linear-attention recurrent
+/// (`conv_state`/`recurrent_state`), using the conventional onnxruntime-genai
+/// `past_key_values.%d.*` / `present.%d.*` port names the config-free
+/// derivation keys off.
+fn qwen27b_hybrid_graph() -> ModelGraphInfo {
+    let dense = [Some(1), Some(8), None, Some(128)];
+    let conv = [Some(1), Some(10240), Some(3)];
+    let recur = [Some(1), Some(16), Some(128), Some(128)];
+    let mut inputs = vec![
+        hybrid_graph_tensor("input_ids", "int64", &[Some(1), None]),
+        hybrid_graph_tensor("attention_mask", "int64", &[Some(1), None]),
+        hybrid_graph_tensor("position_ids", "int64", &[Some(1), None]),
+    ];
+    let mut outputs = vec![hybrid_graph_tensor(
+        "logits",
+        "float32",
+        &[Some(1), None, Some(151936)],
+    )];
+    for layer in 0..64 {
+        if layer % 4 == 3 {
+            inputs.push(hybrid_graph_tensor(
+                &format!("past_key_values.{layer}.key"),
+                "float16",
+                &dense,
+            ));
+            inputs.push(hybrid_graph_tensor(
+                &format!("past_key_values.{layer}.value"),
+                "float16",
+                &dense,
+            ));
+            outputs.push(hybrid_graph_tensor(
+                &format!("present.{layer}.key"),
+                "float16",
+                &dense,
+            ));
+            outputs.push(hybrid_graph_tensor(
+                &format!("present.{layer}.value"),
+                "float16",
+                &dense,
+            ));
+        } else {
+            inputs.push(hybrid_graph_tensor(
+                &format!("past_key_values.{layer}.conv_state"),
+                "float16",
+                &conv,
+            ));
+            inputs.push(hybrid_graph_tensor(
+                &format!("past_key_values.{layer}.recurrent_state"),
+                "float16",
+                &recur,
+            ));
+            // Stock exports leave the present recurrent-state shapes fully
+            // symbolic even though the paired past input carries the concrete
+            // running-state extent; the config-free fallback must accept this.
+            outputs.push(hybrid_graph_tensor(
+                &format!("present.{layer}.conv_state"),
+                "float16",
+                &[None, None, None],
+            ));
+            outputs.push(hybrid_graph_tensor(
+                &format!("present.{layer}.recurrent_state"),
+                "float16",
+                &[None, None, None, None],
+            ));
+        }
+    }
+    ModelGraphInfo { inputs, outputs }
+}
+
+/// A dense qwen3-0.6b-shaped graph: 28 decoder layers, all dense GQA
+/// (`key`/`value`), no recurrent state ports.
+fn qwen06b_dense_graph() -> ModelGraphInfo {
+    let dense = [Some(1), Some(8), None, Some(128)];
+    let mut inputs = vec![
+        hybrid_graph_tensor("input_ids", "int64", &[Some(1), None]),
+        hybrid_graph_tensor("attention_mask", "int64", &[Some(1), None]),
+        hybrid_graph_tensor("position_ids", "int64", &[Some(1), None]),
+    ];
+    let mut outputs = vec![hybrid_graph_tensor(
+        "logits",
+        "float32",
+        &[Some(1), None, Some(151936)],
+    )];
+    for layer in 0..28 {
+        inputs.push(hybrid_graph_tensor(
+            &format!("past_key_values.{layer}.key"),
+            "float16",
+            &dense,
+        ));
+        inputs.push(hybrid_graph_tensor(
+            &format!("past_key_values.{layer}.value"),
+            "float16",
+            &dense,
+        ));
+        outputs.push(hybrid_graph_tensor(
+            &format!("present.{layer}.key"),
+            "float16",
+            &dense,
+        ));
+        outputs.push(hybrid_graph_tensor(
+            &format!("present.{layer}.value"),
+            "float16",
+            &dense,
+        ));
+    }
+    ModelGraphInfo { inputs, outputs }
+}
+
+#[test]
+fn derive_decoder_io_from_graph_splits_hybrid_kv_and_state() {
+    // The 27b hybrid layout: 16 dense GQA layers (2 ports each = 32 kv entries)
+    // and 48 recurrent layers (conv_state + recurrent_state = 96 state pairs).
+    let derived = GenAiConfig::derive_decoder_io_from_graph(&qwen27b_hybrid_graph())
+        .expect("hybrid graph derives decoder io");
+    assert_eq!(derived.kv_inputs.len(), 32);
+    assert_eq!(derived.kv_outputs.len(), 32);
+    assert_eq!(derived.state_pairs.len(), 96);
+    assert_eq!(derived.kv_dtype, "float16");
+
+    // KV lists must contain ONLY the dense full-attention ports.
+    assert!(
+        derived
+            .kv_inputs
+            .contains(&"past_key_values.3.key".to_string())
+    );
+    assert!(
+        derived
+            .kv_inputs
+            .contains(&"past_key_values.63.value".to_string())
+    );
+    assert!(
+        !derived
+            .kv_inputs
+            .iter()
+            .any(|name| name.contains("conv_state") || name.contains("recurrent_state"))
+    );
+
+    // Every recurrent port is a loop-carried state pair, past→present paired.
+    assert!(derived.state_pairs.iter().any(|pair| {
+        pair.input == "past_key_values.0.conv_state" && pair.output == "present.0.conv_state"
+    }));
+    assert!(derived.state_pairs.iter().any(|pair| {
+        pair.input == "past_key_values.62.recurrent_state"
+            && pair.output == "present.62.recurrent_state"
+    }));
+    assert!(
+        derived
+            .state_pairs
+            .iter()
+            .all(|pair| pair.input.contains("_state") && pair.output.contains("_state"))
+    );
+}
+
+#[test]
+fn derive_decoder_io_from_graph_dense_has_no_state_pairs() {
+    // A pure-dense GQA decoder must derive KV ports but NEVER over-derive state
+    // pairs — the loader's safety gate leaves such models on the existing
+    // shape-inference path unchanged.
+    let derived = GenAiConfig::derive_decoder_io_from_graph(&qwen06b_dense_graph())
+        .expect("dense graph derives decoder io");
+    assert_eq!(derived.kv_inputs.len(), 56);
+    assert_eq!(derived.kv_outputs.len(), 56);
+    assert!(
+        derived.state_pairs.is_empty(),
+        "dense decoder must not gain recurrent state pairs, got {:?}",
+        derived.state_pairs
+    );
+}
+
 #[test]
 fn uniform_decoder_graph_matches_pattern_expansion() {
     // A dense-KV model must produce the SAME kv_inputs whether or not the

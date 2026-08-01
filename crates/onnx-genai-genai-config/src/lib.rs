@@ -33,6 +33,7 @@ mod json_builders;
 mod loading;
 mod wire_types;
 
+pub use compatibility::{DerivedDecoderIo, DerivedStatePair};
 pub(crate) use compatibility::{
     ModelShape, incomplete, required_str, transducer_unsupported, unrepresentable_preprocessing,
 };
