@@ -1,8 +1,6 @@
 use std::ffi::CStr;
 
-use onnx_genai_runtime_config::EpSelection;
-#[cfg(target_os = "macos")]
-use onnx_genai_runtime_config::runtime_config;
+use onnx_genai_runtime_config::{EpSelection, runtime_config};
 
 use crate::{OrtError, Result};
 
@@ -50,6 +48,9 @@ pub struct SessionOptions {
     /// an ONNX Runtime optimized-attention kernel defect; it is never selected
     /// from model identity.
     pub cuda_attention_mode: CudaAttentionMode,
+    /// Generic ORT session configuration entries applied through
+    /// `AddSessionConfigEntry` before provider append/session creation.
+    pub session_config_entries: Vec<(String, String)>,
     /// Whether the non-CPU execution provider was auto-selected for this platform
     /// (e.g. the macOS MLX/Metal default) rather than explicitly requested. An
     /// auto-selected provider must fall back to CPU on load failure, even if the
@@ -110,6 +111,7 @@ impl SessionOptions {
             graph_capture: false,
             webgpu_disable_validation: false,
             cuda_attention_mode: cuda_attention_mode_from_runtime_config(),
+            session_config_entries: runtime_config().session_config_entries.clone(),
             auto_selected: false,
         }
     }
@@ -150,6 +152,13 @@ impl SessionOptions {
             .any(|ep| ep.transitional_webgpu)
     }
 
+    /// Whether a Qualcomm QNN execution provider is selected.
+    pub(super) fn selects_qnn(&self) -> bool {
+        self.execution_providers
+            .iter()
+            .any(|ep| ep.caps.name.eq_ignore_ascii_case("qnn"))
+    }
+
     /// Whether a CUDA execution provider is selected in these options.
     pub fn selects_cuda(&self) -> bool {
         self.execution_providers
@@ -165,8 +174,38 @@ impl SessionOptions {
         if self.selects_webgpu() {
             self.webgpu_disable_validation = webgpu_disable_validation_from_env();
         }
+        if self.selects_qnn() {
+            self.apply_qnn_session_config_defaults();
+        }
         self.graph_capture =
             self.primary_caps().has(capability::GRAPH_CAPTURE) && self.primary_graph_capture_env();
+    }
+
+    fn apply_qnn_session_config_defaults(&mut self) {
+        let config = runtime_config();
+        if config.qnn_disable_cpu_fallback {
+            self.push_session_config_if_absent("session.disable_cpu_ep_fallback", "1");
+        }
+        if config.qnn_context_enable {
+            self.push_session_config_if_absent("ep.context_enable", "1");
+        }
+        if let Some(path) = &config.qnn_context_file {
+            self.push_session_config_if_absent("ep.context_file_path", &path.display().to_string());
+        }
+        if let Some(value) = &config.qnn_context_embed {
+            self.push_session_config_if_absent("ep.context_embed_mode", value);
+        }
+    }
+
+    fn push_session_config_if_absent(&mut self, key: &str, value: &str) {
+        if !self
+            .session_config_entries
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        {
+            self.session_config_entries
+                .push((key.to_string(), value.to_string()));
+        }
     }
 
     /// Set the number of ORT intra-op threads.

@@ -216,6 +216,13 @@ pub fn selectable_execution_providers() -> Vec<&'static str> {
     {
         names.push("metal");
     }
+    if runtime_config()
+        .qnn_ep_lib
+        .as_ref()
+        .is_some_and(|library| library.is_file())
+    {
+        names.push("qnn");
+    }
     names
 }
 
@@ -327,6 +334,32 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
             graph_capture_env: false,
             transitional_webgpu: false,
         },
+        // Qualcomm QNN ships as a self-registering ORT plugin EP. Keep the
+        // runtime capabilities conservative until HTP fixed-shape KV and
+        // device-resident buffers are proven on hardware.
+        "qnn" | "qnn-htp" | "qnn_htp" => ResolvedEp {
+            selection: selection.clone(),
+            caps: EpCapabilities::new(
+                "qnn",
+                HardwareKind::Npu,
+                None,
+                Some("Qualcomm".to_string()),
+                &[],
+            ),
+            strategy: AppendStrategy::PluginLibrary {
+                lib: qnn_plugin_library_path(),
+                registration_name: "onnxruntime_qnn_ep".to_string(),
+                options: qnn_provider_options(selection),
+                device: Some(
+                    runtime_config()
+                        .qnn_device
+                        .clone()
+                        .unwrap_or_else(|| "NPU".to_string()),
+                ),
+            },
+            graph_capture_env: false,
+            transitional_webgpu: false,
+        },
         // Any other name: no plugin library env is configured, so attempt an
         // ORT built-in append by name with conservative capabilities.
         other => {
@@ -351,4 +384,95 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
             }
         }
     }
+}
+
+fn qnn_plugin_library_path() -> PathBuf {
+    runtime_config()
+        .qnn_ep_lib
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(qnn_plugin_library_name()))
+}
+
+fn qnn_plugin_library_name() -> &'static str {
+    if cfg!(windows) {
+        "onnxruntime_providers_qnn.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime_providers_qnn.dylib"
+    } else {
+        "libonnxruntime_providers_qnn.so"
+    }
+}
+
+fn qnn_htp_backend_library_name() -> &'static str {
+    if cfg!(windows) {
+        "QnnHtp.dll"
+    } else if cfg!(target_os = "macos") {
+        "libQnnHtp.dylib"
+    } else {
+        "libQnnHtp.so"
+    }
+}
+
+fn qnn_default_backend_path() -> PathBuf {
+    if let Some(path) = runtime_config().qnn_backend_path.clone() {
+        return path;
+    }
+    if let Some(parent) = runtime_config()
+        .qnn_ep_lib
+        .as_ref()
+        .and_then(|path| path.parent())
+    {
+        return parent.join(qnn_htp_backend_library_name());
+    }
+    PathBuf::from(qnn_htp_backend_library_name())
+}
+
+fn qnn_provider_options(selection: &EpSelection) -> Vec<(String, String)> {
+    let config = runtime_config();
+    let mut options = selection
+        .options
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+
+    let has_backend_path = provider_option_exists(&options, "backend_path");
+    let has_backend_type = provider_option_exists(&options, "backend_type");
+    if !has_backend_path && !has_backend_type {
+        if let Some(backend_type) = &config.qnn_backend_type {
+            options.push(("backend_type".to_string(), backend_type.clone()));
+        } else {
+            options.push((
+                "backend_path".to_string(),
+                qnn_default_backend_path().display().to_string(),
+            ));
+        }
+    }
+    push_qnn_option_if_absent(
+        &mut options,
+        "htp_performance_mode",
+        &config.qnn_performance_mode,
+    );
+    push_qnn_option_if_absent(&mut options, "vtcm_mb", &config.qnn_vtcm_mb);
+    push_qnn_option_if_absent(&mut options, "htp_arch", &config.qnn_htp_arch);
+    push_qnn_option_if_absent(&mut options, "soc_model", &config.qnn_soc_model);
+    push_qnn_option_if_absent(&mut options, "device_id", &config.qnn_device_id);
+    options
+}
+
+fn push_qnn_option_if_absent(
+    options: &mut Vec<(String, String)>,
+    key: &str,
+    value: &Option<String>,
+) {
+    if let Some(value) = value
+        && !provider_option_exists(options, key)
+    {
+        options.push((key.to_string(), value.clone()));
+    }
+}
+
+fn provider_option_exists(options: &[(String, String)], key: &str) -> bool {
+    options
+        .iter()
+        .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
 }

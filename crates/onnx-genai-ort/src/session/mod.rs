@@ -29,7 +29,9 @@ use env_config::{
     fixed_capacity_present_binding_supported, is_textproto_path, requested_non_cpu_provider,
     requested_strict_provider, shared_kv_present_binding_opt_in_from_env,
 };
-use providers::{append_execution_providers, apply_webgpu_provider_options};
+use providers::{
+    add_session_config_entry, append_execution_providers, apply_webgpu_provider_options,
+};
 
 #[cfg(all(test, feature = "cuda"))]
 use cuda::{
@@ -656,6 +658,10 @@ impl RawSessionOptions {
             crate::error::check_status(unsafe {
                 set_threads(this.ptr.as_ptr(), options.inter_op_num_threads)
             })?;
+        }
+
+        for (key, value) in &options.session_config_entries {
+            add_session_config_entry(this.ptr.as_ptr(), key, value)?;
         }
 
         append_execution_providers(env, this.ptr.as_ptr(), options)?;
