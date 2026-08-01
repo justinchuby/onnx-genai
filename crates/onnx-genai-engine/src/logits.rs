@@ -1120,9 +1120,12 @@ impl LogitProcessor for TopKTopPProcessor {
         };
 
         // Collect the survivors once, instead of writing -inf across the whole
-        // vocabulary and reading it back. `top_k` is the exact capacity: the
-        // threshold is the k-th largest value, so at most k entries clear it,
-        // and ties are resolved below.
+        // vocabulary and reading it back. `top_k` is the common case rather
+        // than a bound: the threshold is the k-th largest value and every entry
+        // `>= threshold` is kept, so a tie at the threshold lets the survivor
+        // set exceed `top_k` and the vector grows. That matches what
+        // `TopKProcessor` keeps, which is the property the fusion must
+        // preserve; the reservation is only sized for the untied case.
         let mut survivors: Vec<(usize, f32)> = Vec::with_capacity(self.top_k);
         let mut maximum_logit = f32::NEG_INFINITY;
         for (index, logit) in logits.iter_mut().enumerate() {
