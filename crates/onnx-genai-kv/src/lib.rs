@@ -200,6 +200,13 @@ pub struct CacheCheckpoint {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KvError {
+    /// The memory governor refused to lease the page pool.
+    ///
+    /// Reported instead of allocating anyway, so a pool can never occupy more
+    /// than it was granted: a budget that is exceeded while reporting success
+    /// is worse than no budget.
+    #[error("cannot lease the KV page pool: {0}")]
+    PoolNotLeased(#[from] onnx_runtime_memory_governor::MemoryError),
     #[error("Sequence {0} not found")]
     SequenceNotFound(SequenceId),
     #[error("Out of memory: need {needed} pages, have {available}")]

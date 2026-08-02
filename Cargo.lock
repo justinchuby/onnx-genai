@@ -2140,6 +2140,7 @@ version = "0.1.0-dev.5"
 dependencies = [
  "async-trait",
  "onnx-genai-metadata",
+ "onnx-runtime-memory-governor",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

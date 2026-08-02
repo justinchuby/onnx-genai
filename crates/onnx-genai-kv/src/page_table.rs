@@ -410,6 +410,20 @@ impl Page {
         }
     }
 
+    /// Bytes this page's storage actually occupies.
+    ///
+    /// Measured from the live buffers rather than recomputed from the layout,
+    /// so it cannot drift from what was allocated. A page carries storage only
+    /// when the table was built with per-layer geometry; a bookkeeping-only
+    /// table reports zero here, which is the honest answer.
+    pub fn allocated_bytes(&self) -> u64 {
+        let f32_bytes = size_of::<f32>() as u64;
+        (self.data.len() as u64) * f32_bytes
+            + (self.quantized_data.len() as u64)
+            + (self.fp8_data.len() as u64)
+            + (self.quant_scales.len() as u64) * f32_bytes
+    }
+
     pub fn reset_storage(&mut self, _config: Option<PageTensorConfig>) {
         self.filled = 0;
         self.data.fill(0.0);
@@ -615,7 +629,15 @@ pub struct SequenceUsage {
     pub shared: usize,
 }
 
-#[derive(Clone)]
+/// Cloning duplicates every page's storage but **not** the governor's grant:
+/// the copy reports `leased_bytes() == None` and occupies memory nobody leased.
+///
+/// The clone exists for one caller — a speculative rewind validated on a copy
+/// before the real pool is touched (`kv_bridge::rewind_materialized_ort_past`).
+/// That is an expensive way to get transactional semantics on a real pool, and
+/// removing it is tracked separately; until then the behaviour is pinned by a
+/// test rather than left to chance, so nobody reads a clone's zero lease as
+/// evidence that pools are ungoverned.
 pub struct PageTable {
     /// Logical sequence → ordered list of page IDs.
     pub sequences: HashMap<SequenceId, Vec<PageId>>,
@@ -657,6 +679,13 @@ pub struct PageTable {
     hot_capacity: usize,
     /// Next page id for cold-offload-backed growth beyond the initial hot pool.
     next_page_id: PageId,
+    /// The governor's grant covering this pool's page storage.
+    ///
+    /// `None` for a bookkeeping-only table, which occupies nothing and so has
+    /// nothing to lease. Dropping the table drops the lease, which is the only
+    /// way the bytes are returned — there is deliberately no release call to
+    /// forget.
+    pool_lease: Option<onnx_runtime_memory_governor::MemoryLease>,
     /// Cumulative page activity, for reporting.
     stats: PageStats,
     /// Optional lock-free mirror of this pool's aggregate state.
@@ -680,6 +709,32 @@ struct TelemetryHandle(Option<Arc<KvTelemetry>>);
 impl Clone for TelemetryHandle {
     fn clone(&self) -> Self {
         Self(None)
+    }
+}
+
+impl Clone for PageTable {
+    fn clone(&self) -> Self {
+        Self {
+            sequences: self.sequences.clone(),
+            sequence_lengths: self.sequence_lengths.clone(),
+            sequence_starts: self.sequence_starts.clone(),
+            sequence_sink_lens: self.sequence_sink_lens.clone(),
+            pages: self.pages.clone(),
+            free_pages: self.free_pages.clone(),
+            page_size: self.page_size,
+            tensor_config: self.tensor_config,
+            layer_configs: self.layer_configs.clone(),
+            quant_config: self.quant_config.clone(),
+            stats: self.stats,
+            telemetry: self.telemetry.clone(),
+            clock: self.clock,
+            hot_capacity: self.hot_capacity,
+            next_page_id: self.next_page_id,
+            // A lease is a grant to one holder. Duplicating it would let two
+            // pools claim the same bytes, so the copy carries none and is
+            // therefore ungoverned -- see the type's documentation.
+            pool_lease: None,
+        }
     }
 }
 
@@ -854,7 +909,108 @@ impl PageTable {
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
+            pool_lease: None,
         }
+    }
+
+    /// Build a pool whose storage is granted by a memory governor.
+    ///
+    /// The size is planned first and leased before a single page is allocated.
+    /// Allocating and asking afterwards is how a budget gets exceeded while
+    /// every counter still reports that it was respected, so a refusal here
+    /// returns an error rather than a smaller pool: silently shrinking would
+    /// trade an explicit failure for mysteriously worse generation quality
+    /// later, when the pool ran dry mid-sequence.
+    pub fn new_leased(
+        page_size: usize,
+        num_gpu_pages: usize,
+        dtype: KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<Self, KvError> {
+        let quant_config = KvQuantConfig::homogeneous(dtype, layer_configs.len());
+        let planned = Self::planned_pool_bytes(
+            page_size,
+            num_gpu_pages,
+            &layer_configs,
+            Some(&quant_config),
+        );
+        let lease = governor.reserve(
+            tier,
+            planned,
+            onnx_runtime_memory_governor::MemoryRole::KvCache,
+            holder,
+        )?;
+        let mut table = Self::new_with_layer_storage(
+            page_size,
+            num_gpu_pages,
+            dtype,
+            layer_configs,
+            quant_config,
+        );
+        debug_assert_eq!(
+            planned,
+            table.pool_bytes(),
+            "the leased pool size disagrees with what was allocated"
+        );
+        table.pool_lease = Some(lease);
+        Ok(table)
+    }
+
+    /// Bytes this pool currently holds a grant for, or `None` if ungoverned.
+    pub fn leased_bytes(&self) -> Option<u64> {
+        self.pool_lease
+            .as_ref()
+            .map(onnx_runtime_memory_governor::MemoryLease::bytes)
+    }
+    /// Bytes the whole page pool actually occupies.
+    ///
+    /// This is what a memory lease has to cover. It is summed from the live
+    /// pages rather than recomputed, so it reports what was allocated even if
+    /// the planning arithmetic below ever drifts from the allocator.
+    pub fn pool_bytes(&self) -> u64 {
+        self.pages
+            .values()
+            .map(Page::allocated_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Bytes a pool of `num_pages` *would* occupy, before allocating one.
+    ///
+    /// Needed because a lease has to be granted before the memory is taken:
+    /// allocating first and asking afterwards is how a budget gets exceeded
+    /// while reporting that it was respected. Mirrors [`Page::new`]'s layout,
+    /// and a test pins the two together so the mirror cannot rot.
+    pub fn planned_pool_bytes(
+        page_size: usize,
+        num_pages: usize,
+        layer_configs: &[LayerTensorConfig],
+        quant_config: Option<&KvQuantConfig>,
+    ) -> u64 {
+        let Some(quant_config) = quant_config else {
+            return 0;
+        };
+        if layer_configs.is_empty() {
+            return 0;
+        }
+        let f32_bytes = size_of::<f32>() as u64;
+        let mut per_page = 0u64;
+        for (layer, geom) in layer_configs.iter().enumerate() {
+            let component_len = (geom.num_kv_heads * page_size * geom.head_dim) as u64;
+            let scale_slots = (geom.num_kv_heads * page_size) as u64;
+            for kind in [KvKind::Key, KvKind::Value] {
+                per_page = per_page.saturating_add(match quant_config.dtype(layer, kind) {
+                    KvDType::F32 => component_len.saturating_mul(f32_bytes),
+                    KvDType::Int8 => component_len.saturating_add(scale_slots * f32_bytes),
+                    KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
+                        component_len.saturating_add(scale_slots * f32_bytes)
+                    }
+                });
+            }
+        }
+        per_page.saturating_mul(num_pages as u64)
     }
 
     /// Allocate a new page on the specified device.
@@ -1332,5 +1488,273 @@ mod page_stats_tests {
             );
         }
         table.free(only);
+    }
+}
+
+#[cfg(test)]
+mod pool_accounting_tests {
+    use super::*;
+
+    fn geometry(num_layers: usize, kv_heads: usize, head_dim: usize) -> Vec<LayerTensorConfig> {
+        (0..num_layers)
+            .map(|_| LayerTensorConfig {
+                num_kv_heads: kv_heads,
+                head_dim,
+            })
+            .collect()
+    }
+
+    /// The planner and the allocator must agree, for every geometry.
+    ///
+    /// A lease has to be granted before memory is taken, so the size is
+    /// predicted from the layout rather than measured. If that prediction ever
+    /// drifts below what `Page::new` really allocates, the pool would occupy
+    /// more than it leased while every counter reported that the budget was
+    /// respected -- the exact failure this whole contract exists to prevent.
+    #[test]
+    fn the_planned_pool_size_equals_what_the_pool_actually_allocates() {
+        for (label, page_size, pages, layers, kv_heads, head_dim, dtype) in [
+            ("f32 uniform", 16, 8, 4, 2, 64, KvDType::F32),
+            ("f32 wide", 32, 3, 2, 8, 128, KvDType::F32),
+            ("int8", 16, 5, 3, 4, 64, KvDType::Int8),
+            ("fp8 e4m3", 16, 5, 3, 4, 64, KvDType::Fp8E4M3Fn),
+            ("fp8 e5m2", 8, 7, 6, 2, 32, KvDType::Fp8E5M2),
+            ("single page", 4, 1, 1, 1, 8, KvDType::F32),
+        ] {
+            let configs = geometry(layers, kv_heads, head_dim);
+            let quant = KvQuantConfig::homogeneous(dtype, layers);
+            let planned = PageTable::planned_pool_bytes(page_size, pages, &configs, Some(&quant));
+            let table = PageTable::new_with_layer_configs(page_size, pages, dtype, configs.clone());
+            assert_eq!(
+                planned,
+                table.pool_bytes(),
+                "{label}: planned {planned} bytes but allocated {}",
+                table.pool_bytes()
+            );
+            assert!(planned > 0, "{label}: a configured pool must occupy memory");
+        }
+    }
+
+    /// Heterogeneous layers must be summed per layer, not multiplied by a mean.
+    #[test]
+    fn planning_handles_layers_with_different_geometry() {
+        let configs = vec![
+            LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 64,
+            },
+            LayerTensorConfig {
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, configs.len());
+        let planned = PageTable::planned_pool_bytes(16, 4, &configs, Some(&quant));
+        let table = PageTable::new_with_layer_configs(16, 4, KvDType::F32, configs);
+        assert_eq!(planned, table.pool_bytes());
+    }
+
+    /// A table with no per-layer geometry occupies nothing.
+    ///
+    /// Worth pinning because it is easy to assume the paged cache always owns
+    /// the KV. It does not: without tensor geometry it is pure bookkeeping, and
+    /// the engine's default construction takes exactly this path. Leasing has
+    /// to reflect that rather than reserving for memory nobody took.
+    #[test]
+    fn a_bookkeeping_only_pool_occupies_no_memory() {
+        let table = PageTable::new(16, 64);
+        assert_eq!(
+            table.pool_bytes(),
+            0,
+            "a table without per-layer geometry allocated page storage"
+        );
+        assert_eq!(PageTable::planned_pool_bytes(16, 64, &[], None), 0);
+    }
+
+    /// Pool size scales with page count, so the lease does too.
+    #[test]
+    fn pool_size_scales_linearly_with_page_count() {
+        let configs = geometry(2, 4, 32);
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 2);
+        let one = PageTable::planned_pool_bytes(16, 1, &configs, Some(&quant));
+        let ten = PageTable::planned_pool_bytes(16, 10, &configs, Some(&quant));
+        assert_eq!(ten, one * 10);
+    }
+}
+
+#[cfg(test)]
+mod pool_lease_tests {
+    use super::*;
+    use onnx_runtime_memory_governor::{
+        HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+    };
+
+    const HOLDER: HolderId = HolderId::new(7);
+
+    fn configs(layers: usize) -> Vec<LayerTensorConfig> {
+        (0..layers)
+            .map(|_| LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 32,
+            })
+            .collect()
+    }
+
+    fn planned(pages: usize, layers: usize) -> u64 {
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, layers);
+        PageTable::planned_pool_bytes(16, pages, &configs(layers), Some(&quant))
+    }
+
+    /// A governed pool leases exactly what it occupies.
+    #[test]
+    fn a_governed_pool_leases_exactly_what_it_allocates() {
+        let want = planned(4, 2);
+        let governor = LedgerGovernor::new(LeaseLedger::new(want, 0, 0));
+        let table = PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Device,
+            HOLDER,
+        )
+        .expect("the tier holds exactly this pool");
+
+        assert_eq!(table.leased_bytes(), Some(want));
+        assert_eq!(table.pool_bytes(), want, "leased and occupied must agree");
+        assert_eq!(governor.available(Tier::Device), 0);
+    }
+
+    /// Too small a budget refuses the pool rather than quietly shrinking it.
+    ///
+    /// A pool that silently came back smaller would trade an explicit startup
+    /// failure for a mid-generation one, when the pool ran dry and mirroring
+    /// stopped early -- wrong output with nothing in the logs.
+    #[test]
+    fn an_insufficient_budget_refuses_the_pool_instead_of_shrinking_it() {
+        let want = planned(4, 2);
+        let governor = LedgerGovernor::new(LeaseLedger::new(want - 1, 0, 0));
+        let error = PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Device,
+            HOLDER,
+        )
+        .map(|_| ())
+        .expect_err("one byte short must not be granted");
+        assert!(
+            matches!(error, KvError::PoolNotLeased(_)),
+            "expected a lease refusal, got {error}"
+        );
+        assert_eq!(
+            governor.available(Tier::Device),
+            want - 1,
+            "a refused pool must not have consumed budget"
+        );
+    }
+
+    /// Dropping the pool returns its bytes to the tier.
+    #[test]
+    fn dropping_a_governed_pool_returns_its_bytes() {
+        let want = planned(4, 2);
+        let governor = LedgerGovernor::new(LeaseLedger::new(want, 0, 0));
+        {
+            let _table = PageTable::new_leased(
+                16,
+                4,
+                KvDType::F32,
+                configs(2),
+                &governor,
+                Tier::Device,
+                HOLDER,
+            )
+            .expect("the tier holds this pool");
+            assert_eq!(governor.available(Tier::Device), 0);
+        }
+        assert_eq!(
+            governor.available(Tier::Device),
+            want,
+            "dropping the pool did not return its lease"
+        );
+
+        // And the tier can grant the whole pool again, which a double release
+        // would have turned into spare capacity that does not exist.
+        let _second = PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Device,
+            HOLDER,
+        )
+        .expect("the tier is free again");
+        assert_eq!(governor.available(Tier::Device), 0);
+    }
+
+    /// Two pools cannot both be granted a budget that only fits one.
+    #[test]
+    fn a_tier_that_fits_one_pool_refuses_the_second() {
+        let want = planned(4, 2);
+        let governor = LedgerGovernor::new(LeaseLedger::new(want, 0, 0));
+        let _first = PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Device,
+            HOLDER,
+        )
+        .expect("the first pool fits");
+        PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Device,
+            HOLDER,
+        )
+        .map(|_| ())
+        .expect_err("the tier cannot hold a second pool of the same size");
+    }
+    /// A cloned pool carries no grant, and that is pinned rather than incidental.
+    ///
+    /// Duplicating a lease would let two pools claim the same bytes. The copy
+    /// therefore holds none -- which also means it occupies memory nobody
+    /// leased, so this test exists as much to document the hazard as to check
+    /// the field.
+    #[test]
+    fn a_cloned_pool_reports_no_lease() {
+        let want = planned(4, 2);
+        let governor = LedgerGovernor::new(LeaseLedger::new(want, 0, 0));
+        let table = PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Device,
+            HOLDER,
+        )
+        .expect("the tier holds this pool");
+
+        let copy = table.clone();
+        assert_eq!(copy.leased_bytes(), None, "a clone duplicated the grant");
+        assert_eq!(
+            copy.pool_bytes(),
+            want,
+            "the clone still duplicated the page storage"
+        );
+        assert_eq!(
+            governor.available(Tier::Device),
+            0,
+            "cloning must not consume further budget"
+        );
     }
 }
