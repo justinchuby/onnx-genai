@@ -59,12 +59,121 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use onnx_runtime_ir::is_default_domain;
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, is_default_domain, normalize_domain};
 
 use crate::LoaderError;
 use crate::proto::onnx::{
     AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
+    ValueInfoProto, attribute_proto, type_proto,
 };
+
+/// Predicate deciding whether a matched function-call node should be **kept as
+/// an op** (a fused kernel claims it) instead of being inlined into its body.
+///
+/// Receives a lightweight claim-view [`Node`] (op type, normalized domain, and
+/// scalar attributes — enough for an EP's `supports_op` claim gate), the
+/// effective `opset` for the node's domain, and the node's positional input
+/// dtypes (resolved from the model's `value_info`/inputs/initializers;
+/// [`DataType::Undefined`] where unknown). Returning `true` keeps the node;
+/// `false` (or an unresolved dtype the caller declines on) inlines it, so the
+/// default behavior is preserved for every op no kernel claims.
+pub type KeepAsOp<'a> = dyn Fn(&Node, u64, &[DataType]) -> bool + 'a;
+
+/// Per-inline claim context: the caller's keep-as-op predicate plus the
+/// proto-level metadata needed to evaluate it (value dtypes and per-domain
+/// opset). Built once, at the top-level graph, and shared by reference.
+struct InlineFilter<'a> {
+    keep_as_op: &'a KeepAsOp<'a>,
+    value_types: HashMap<String, DataType>,
+    opset_of: HashMap<String, u64>,
+}
+
+impl InlineFilter<'_> {
+    /// Whether `np` (already known to match a declared function) should be kept
+    /// as an op rather than inlined.
+    fn should_keep(&self, np: &NodeProto) -> bool {
+        let node = claim_view_node(np);
+        let opset = self
+            .opset_of
+            .get(normalize_domain(&np.domain))
+            .copied()
+            .unwrap_or(1);
+        let dtypes: Vec<DataType> = np
+            .input
+            .iter()
+            .map(|name| {
+                self.value_types
+                    .get(name)
+                    .copied()
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect();
+        (self.keep_as_op)(&node, opset, &dtypes)
+    }
+}
+
+/// Build a claim-view [`Node`] from a proto call node: op type, normalized
+/// domain, and scalar attributes only. Inputs/outputs are left empty because EP
+/// claim gates key on op identity, attributes, and input dtypes — never on the
+/// IR value ids. Tensor/graph-valued attributes are dropped (claim gates never
+/// inspect them), keeping this graph-free.
+fn claim_view_node(np: &NodeProto) -> Node {
+    let mut node = Node::new(NodeId(0), np.op_type.clone(), Vec::new(), Vec::new());
+    node.name = np.name.clone();
+    node.domain = normalize_domain(&np.domain).to_string();
+    for ap in &np.attribute {
+        if let Some(attr) = scalar_attribute(ap) {
+            node.attributes.insert(ap.name.clone(), attr);
+        }
+    }
+    node
+}
+
+/// Convert a scalar/list ONNX attribute to its IR form for claim evaluation.
+/// Returns `None` for tensor/graph attributes (claim gates never read them).
+fn scalar_attribute(ap: &AttributeProto) -> Option<Attribute> {
+    use attribute_proto::AttributeType as AT;
+    match AT::try_from(ap.r#type).unwrap_or(AT::Undefined) {
+        AT::Float => Some(Attribute::Float(ap.f)),
+        AT::Int => Some(Attribute::Int(ap.i)),
+        AT::String => Some(Attribute::String(ap.s.clone())),
+        AT::Floats => Some(Attribute::Floats(ap.floats.clone())),
+        AT::Ints => Some(Attribute::Ints(ap.ints.clone())),
+        AT::Strings => Some(Attribute::Strings(ap.strings.clone())),
+        _ => None,
+    }
+}
+
+/// Elem dtype of a `value_info`/input/output entry, if it is a tensor type.
+fn tensor_elem_type(vi: &ValueInfoProto) -> Option<DataType> {
+    match vi.r#type.as_ref()?.value.as_ref()? {
+        type_proto::Value::TensorType(t) => DataType::from_onnx(t.elem_type),
+        _ => None,
+    }
+}
+
+/// Collect a name -> dtype map for a graph from its `value_info`, formal
+/// inputs/outputs, and initializers, so a kept-as-op decision can resolve a
+/// function-call node's input dtypes at proto level.
+fn collect_value_types(graph: &GraphProto) -> HashMap<String, DataType> {
+    let mut map = HashMap::new();
+    for vi in graph
+        .value_info
+        .iter()
+        .chain(&graph.input)
+        .chain(&graph.output)
+    {
+        if let Some(dt) = tensor_elem_type(vi) {
+            map.insert(vi.name.clone(), dt);
+        }
+    }
+    for init in &graph.initializer {
+        if let Some(dt) = DataType::from_onnx(init.data_type) {
+            map.entry(init.name.clone()).or_insert(dt);
+        }
+    }
+    map
+}
 
 /// Unique identity of a model-local function: `(domain, name, overload)`.
 type FnKey = (String, String, String);
@@ -85,6 +194,26 @@ fn fn_key_of_call(n: &NodeProto) -> FnKey {
 /// back unchanged (`Cow::Borrowed`). Otherwise a rewritten owned `ModelProto`
 /// is returned with `functions` cleared and function opset imports merged in.
 pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, LoaderError> {
+    inline_functions_impl(model, None)
+}
+
+/// Like [`inline_functions`], but a matched function-call node is **kept as an
+/// op** (not inlined) whenever `keep_as_op` returns `true` for it — the general
+/// "keep-as-op iff a kernel claims it, else inline" policy. `keep_as_op` is
+/// evaluated only on nodes that match a declared function; every other node,
+/// and every function the predicate declines, inlines exactly as
+/// [`inline_functions`] would, so the default path is unchanged.
+pub fn inline_functions_filtered<'a>(
+    model: &'a ModelProto,
+    keep_as_op: &KeepAsOp<'_>,
+) -> Result<Cow<'a, ModelProto>, LoaderError> {
+    inline_functions_impl(model, Some(keep_as_op))
+}
+
+fn inline_functions_impl<'a>(
+    model: &'a ModelProto,
+    keep_as_op: Option<&KeepAsOp<'_>>,
+) -> Result<Cow<'a, ModelProto>, LoaderError> {
     if model.functions.is_empty() {
         return Ok(Cow::Borrowed(model));
     }
@@ -98,6 +227,23 @@ pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, Loade
         .graph
         .as_ref()
         .ok_or_else(|| LoaderError::GraphBuild("ModelProto has no graph".into()))?;
+
+    // Claim context (value dtypes + per-domain opset) for the keep-as-op
+    // predicate, built once from the (merged) top-level metadata. `None` when no
+    // predicate is supplied, so the fast path allocates nothing extra.
+    let filter = keep_as_op.map(|keep| {
+        let mut opset_of: HashMap<String, u64> = HashMap::new();
+        for o in merged_opset_imports(model) {
+            if o.version > 0 {
+                opset_of.insert(normalize_domain(&o.domain).to_string(), o.version as u64);
+            }
+        }
+        InlineFilter {
+            keep_as_op: keep,
+            value_types: collect_value_types(graph),
+            opset_of,
+        }
+    });
 
     let mut counter: usize = 0;
     let mut stack: Vec<FnKey> = Vec::new();
@@ -117,6 +263,7 @@ pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, Loade
         &mut stack,
         &mut used,
         &mut synthesized_default,
+        filter.as_ref(),
     )?;
 
     let mut out = model.clone();
@@ -226,6 +373,7 @@ fn inline_graph(
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
     synthesized_default: &mut bool,
+    filter: Option<&InlineFilter<'_>>,
 ) -> Result<GraphProto, LoaderError> {
     let mut out = gp.clone();
     out.node = Vec::with_capacity(gp.node.len());
@@ -237,6 +385,7 @@ fn inline_graph(
             stack,
             used,
             synthesized_default,
+            filter,
             &mut out.node,
         )?;
     }
@@ -244,8 +393,11 @@ fn inline_graph(
 }
 
 /// Append the fully-inlined form of `node` to `sink`. If `node` calls a
-/// function, its body (recursively inlined) is appended; otherwise the node is
+/// function, its body (recursively inlined) is appended — unless `filter` keeps
+/// it as an op, in which case the call node is emitted unchanged (with its
+/// subgraph attributes still recursively inlined). Otherwise the node is
 /// appended with its subgraph attributes recursively inlined.
+#[allow(clippy::too_many_arguments)]
 fn expand_node(
     node: &NodeProto,
     funcs: &HashMap<FnKey, &FunctionProto>,
@@ -253,19 +405,36 @@ fn expand_node(
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
     synthesized_default: &mut bool,
+    filter: Option<&InlineFilter<'_>>,
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     if let Some(func) = funcs.get(&fn_key_of_call(node)) {
-        instantiate(
-            node,
-            func,
-            funcs,
-            counter,
-            stack,
-            used,
-            synthesized_default,
-            sink,
-        )?;
+        // Keep-as-op: a fused kernel claims this call, so leave it as an op node
+        // for the executor to dispatch (still inline any control-flow subgraph
+        // bodies it carries, for generality).
+        if filter.is_some_and(|f| f.should_keep(node)) {
+            sink.push(inline_subgraph_attrs(
+                node,
+                funcs,
+                counter,
+                stack,
+                used,
+                synthesized_default,
+                filter,
+            )?);
+        } else {
+            instantiate(
+                node,
+                func,
+                funcs,
+                counter,
+                stack,
+                used,
+                synthesized_default,
+                filter,
+                sink,
+            )?;
+        }
     } else {
         sink.push(inline_subgraph_attrs(
             node,
@@ -274,6 +443,7 @@ fn expand_node(
             stack,
             used,
             synthesized_default,
+            filter,
         )?);
     }
     Ok(())
@@ -288,14 +458,15 @@ fn inline_subgraph_attrs(
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
     synthesized_default: &mut bool,
+    filter: Option<&InlineFilter<'_>>,
 ) -> Result<NodeProto, LoaderError> {
     let mut out = node.clone();
     for attr in &mut out.attribute {
         if let Some(g) = attr.g.as_mut() {
-            *g = inline_graph(g, funcs, counter, stack, used, synthesized_default)?;
+            *g = inline_graph(g, funcs, counter, stack, used, synthesized_default, filter)?;
         }
         for g in &mut attr.graphs {
-            *g = inline_graph(g, funcs, counter, stack, used, synthesized_default)?;
+            *g = inline_graph(g, funcs, counter, stack, used, synthesized_default, filter)?;
         }
     }
     Ok(out)
@@ -313,6 +484,7 @@ fn instantiate(
     stack: &mut Vec<FnKey>,
     used: &mut HashSet<String>,
     synthesized_default: &mut bool,
+    filter: Option<&InlineFilter<'_>>,
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     let key = fn_key_of_function(func);
@@ -456,6 +628,7 @@ fn instantiate(
                 stack,
                 used,
                 synthesized_default,
+                filter,
                 &mut expanded,
             )?;
         }

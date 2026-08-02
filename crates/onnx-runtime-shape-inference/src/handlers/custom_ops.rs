@@ -433,6 +433,8 @@ pub fn register(reg: &mut InferenceRegistry) {
         causal_conv_with_state,
     );
     reg.register("com.microsoft", "LinearAttention", 1, linear_attention);
+    // Standard ONNX-domain spelling (onnx/onnx#7689): same shape rule.
+    reg.register("", "LinearAttention", 1, linear_attention);
     reg.register(
         "com.microsoft",
         "GatherBlockQuantized",

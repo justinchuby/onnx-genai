@@ -315,6 +315,56 @@ fn linear_attention_matches_onnxruntime_1_26() {
     }
 }
 
+/// The standard ONNX-domain spelling (`""`, onnx/onnx#7689) must dispatch to
+/// the SAME fused CPU kernel as `com.microsoft` and produce byte-identical
+/// output — proving the dual-domain registration is wired through the CPU EP.
+#[test]
+fn linear_attention_standard_domain_matches_com_microsoft() {
+    use la as g;
+
+    let [batch, heads, d_k, d_v, sequence] = g::LAA_DIMS;
+    let input_shapes = vec![
+        vec![batch, sequence, heads * d_k],
+        vec![batch, sequence, heads * d_k],
+        vec![batch, sequence, heads * d_v],
+        vec![batch, heads, d_k, d_v],
+        vec![batch, sequence, heads],
+        vec![batch, sequence, heads],
+    ];
+    let input_data = vec![
+        bits(&g::LAA_Q[..]),
+        bits(&g::LAA_K[..]),
+        bits(&g::LAA_V[..]),
+        bits(&g::LAA_STATE[..]),
+        bits(&g::LAA_G[..]),
+        bits(&g::LAA_BETA[..]),
+    ];
+    let output_shapes = vec![
+        vec![batch, sequence, heads * d_v],
+        vec![batch, heads, d_k, d_v],
+    ];
+
+    let msft_node = linear_attention_node(heads, g::LAA_SCALE);
+    let mut std_node = linear_attention_node(heads, g::LAA_SCALE);
+    std_node.domain = String::new();
+
+    let msft = run_f32(&msft_node, &input_shapes, &input_data, &output_shapes);
+    let std = run_f32(&std_node, &input_shapes, &input_data, &output_shapes);
+
+    // Same kernel → bit-identical outputs across the two domain spellings.
+    assert_eq!(
+        msft, std,
+        "standard-domain vs com.microsoft LinearAttention"
+    );
+    // And the standard-domain result still matches the ORT golden.
+    assert_close(&std[0], &g::LAA_O[..], "standard-domain output");
+    assert_close(
+        &std[1],
+        &g::LAA_PRESENT[..],
+        "standard-domain present_state",
+    );
+}
+
 #[test]
 fn causal_conv_half_precision_widens_and_narrows_through_ep() {
     use conv as g;

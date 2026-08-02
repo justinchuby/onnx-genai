@@ -616,7 +616,35 @@ impl SessionBuilder {
         // Memory limits and profiling remain reserved builder intents.
         let _ = (self.memory_limit, self.enable_profiling);
 
-        let (mut graph, weights, model_dir, model_metadata) =
+        // EP selection is graph-independent (it only inspects the requested
+        // device / explicit override), so resolve it *before* loading. The
+        // loader then keeps a function-call node as an op — instead of inlining
+        // it into its body — whenever this EP's claim gate reports a fused kernel
+        // for it (the general "keep-as-op iff a kernel claims it, else inline"
+        // policy). With no fused kernel the predicate declines and inlining is
+        // byte-identical to the default path.
+        let ep = {
+            let mut span = trace_span("session.select_execution_provider", "session");
+            let ep = match self.execution_provider {
+                Some(ep) => ep,
+                None => select_execution_provider(&self.device)?,
+            };
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("provider", ep.name().to_string())
+                        .with("device", ep.device_type().trace_name().into_owned())
+                        .with("device_index", ep.device_id().index as u64),
+                );
+            }
+            ep
+        };
+
+        let (mut graph, weights, model_dir, model_metadata) = {
+            let keep_as_op =
+                |node: &onnx_runtime_ir::Node, opset: u64, dtypes: &[onnx_runtime_ir::DataType]| {
+                    ep.supports_op(node, opset, &[], dtypes, &[]).is_supported()
+                };
             match (self.model_path, self.model_bytes) {
                 (Some(path), _) => {
                     // The EPContext load path resolves `embed_mode=0` external blob
@@ -639,8 +667,11 @@ impl SessionBuilder {
                         }
                         metadata
                     };
-                    let (g, w) =
-                        onnx_runtime_loader::load_model_bytes_with_weights(&bytes, &model_dir)?;
+                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights_filtered(
+                        &bytes,
+                        &model_dir,
+                        &keep_as_op,
+                    )?;
                     (g, w, model_dir, metadata)
                 }
                 (None, Some(bytes)) => {
@@ -656,11 +687,16 @@ impl SessionBuilder {
                         }
                         metadata
                     };
-                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?;
+                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights_filtered(
+                        &bytes,
+                        ".",
+                        &keep_as_op,
+                    )?;
                     (g, w, PathBuf::from("."), metadata)
                 }
                 (None, None) => return Err(SessionError::NoModelSource),
-            };
+            }
+        };
 
         // Decoder precision rewrite (opt-in). Applied here — on the freshly
         // loaded graph, before the I/O signature (`IoMeta`) is computed and
@@ -690,22 +726,6 @@ impl SessionBuilder {
 
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
-        let ep = {
-            let mut span = trace_span("session.select_execution_provider", "session");
-            let ep = match self.execution_provider {
-                Some(ep) => ep,
-                None => select_execution_provider(&self.device)?,
-            };
-            if let Some(span) = span.as_mut() {
-                span.set_args(
-                    Args::new()
-                        .with("provider", ep.name().to_string())
-                        .with("device", ep.device_type().trace_name().into_owned())
-                        .with("device_index", ep.device_id().index as u64),
-                );
-            }
-            ep
-        };
 
         let mut session = InferenceSession::from_parts(
             graph,

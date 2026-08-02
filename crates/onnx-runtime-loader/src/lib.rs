@@ -127,7 +127,7 @@ pub fn load_model_with_weights(
     let path = path.as_ref();
     let bytes = read_model_binary(path)?;
     let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    build_from_bytes_with_weights(&bytes, model_dir)
+    build_from_bytes_with_weights(&bytes, model_dir, None)
 }
 
 /// Read a model file into the binary protobuf bytes of its `ModelProto`.
@@ -193,19 +193,34 @@ pub fn load_model_bytes_with_weights(
     bytes: &[u8],
     base_dir: impl AsRef<Path>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
-    build_from_bytes_with_weights(bytes, base_dir.as_ref())
+    build_from_bytes_with_weights(bytes, base_dir.as_ref(), None)
+}
+
+/// Like [`load_model_bytes_with_weights`], but a matched function-call node is
+/// **kept as an op** (not inlined) whenever `keep_as_op` returns `true` for it —
+/// the general "keep-as-op iff a kernel claims it, else inline" policy used to
+/// let a registered fused kernel dispatch on a call that would otherwise expand
+/// into its function body. Passing `None` (or using the non-filtered entry) is
+/// byte-identical to inlining every function.
+pub fn load_model_bytes_with_weights_filtered(
+    bytes: &[u8],
+    base_dir: impl AsRef<Path>,
+    keep_as_op: &function_inline::KeepAsOp<'_>,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    build_from_bytes_with_weights(bytes, base_dir.as_ref(), Some(keep_as_op))
 }
 
 fn build_from_bytes_with_weights(
     bytes: &[u8],
     model_dir: &Path,
+    keep_as_op: Option<&function_inline::KeepAsOp<'_>>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let model = parse_model(bytes)?;
     validate_proto(&model)?;
     let BuiltGraph {
         mut graph,
         name_map,
-    } = build_graph(&model)?;
+    } = build_graph(&model, keep_as_op)?;
 
     // Fail-fast legality check that needs no weights: reject illegal opset
     // imports before we touch the (potentially large) weight files.
@@ -243,9 +258,12 @@ fn validate_proto(model: &proto::onnx::ModelProto) -> Result<(), LoaderError> {
     Ok(())
 }
 
-fn build_graph(model: &proto::onnx::ModelProto) -> Result<BuiltGraph, LoaderError> {
+fn build_graph(
+    model: &proto::onnx::ModelProto,
+    keep_as_op: Option<&function_inline::KeepAsOp<'_>>,
+) -> Result<BuiltGraph, LoaderError> {
     let mut span = trace_span("load.build_graph", "load");
-    let built = graph_builder::build_graph(model)?;
+    let built = graph_builder::build_graph(model, keep_as_op)?;
     if let Some(span) = span.as_mut() {
         span.set_args(
             Args::new()

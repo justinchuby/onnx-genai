@@ -1085,3 +1085,127 @@ fn generated_names_avoid_preexisting_collisions() {
     assert_ne!(wire, "__fn0_t");
     assert!(wire.starts_with("__fn0_t"));
 }
+
+// --- keep-as-op (claim-driven) filtered inlining ----------------------------
+
+use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_loader::function_inline::inline_functions_filtered;
+
+/// A `ValueInfoProto` carrying a tensor elem dtype (so the filtered inliner can
+/// resolve a call node's input dtypes at proto level).
+fn typed_value_info(name: &str, dt: onnx::tensor_proto::DataType) -> onnx::ValueInfoProto {
+    onnx::ValueInfoProto {
+        name: name.to_string(),
+        r#type: Some(onnx::TypeProto {
+            value: Some(onnx::type_proto::Value::TensorType(
+                onnx::type_proto::Tensor {
+                    elem_type: dt as i32,
+                    shape: None,
+                },
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A model with one call to a `com.microsoft`-domain `Fused` function whose body
+/// is a single `Scan`, plus typed inputs so a claim predicate sees their dtype.
+fn model_with_fused_call(dt: onnx::tensor_proto::DataType) -> onnx::ModelProto {
+    let body = vec![node("Scan", &["q", "k", "v"], &["Y"])];
+    let mut f = function("Fused", "com.microsoft", &["q", "k", "v"], &["Y"], body);
+    f.opset_import = vec![onnx::OperatorSetIdProto {
+        domain: "com.microsoft".to_string(),
+        version: 1,
+    }];
+    let graph = onnx::GraphProto {
+        node: vec![call("Fused", "com.microsoft", &["q", "k", "v"], &["out"])],
+        input: vec![
+            typed_value_info("q", dt),
+            typed_value_info("k", dt),
+            typed_value_info("v", dt),
+        ],
+        ..Default::default()
+    };
+    let mut m = model(graph, vec![f]);
+    m.opset_import = vec![
+        onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 17,
+        },
+        onnx::OperatorSetIdProto {
+            domain: "com.microsoft".to_string(),
+            version: 1,
+        },
+    ];
+    m
+}
+
+#[test]
+fn filtered_keeps_function_as_op_when_predicate_claims_it() {
+    let m = model_with_fused_call(onnx::tensor_proto::DataType::Float16);
+    // Predicate: claim `com.microsoft::Fused` on f16 inputs — the "keep-as-op"
+    // case. It must receive the claim-view node (op/domain/attrs) plus dtypes.
+    let keep = |node: &Node, opset: u64, dtypes: &[DataType]| {
+        assert_eq!(node.op_type, "Fused");
+        assert_eq!(node.domain, "com.microsoft");
+        assert_eq!(opset, 1);
+        node.op_type == "Fused" && dtypes.first() == Some(&DataType::Float16)
+    };
+    let out = inline_functions_filtered(&m, &keep).unwrap().into_owned();
+    let g = out.graph.as_ref().unwrap();
+    // The call survives as an op; the body `Scan` was NOT inlined.
+    assert_eq!(
+        op_types(g),
+        vec![("com.microsoft".to_string(), "Fused".to_string())]
+    );
+    assert!(g.node.iter().all(|n| n.op_type != "Scan"));
+    // Functions are still cleared from the rewritten model.
+    assert!(out.functions.is_empty());
+}
+
+#[test]
+fn filtered_inlines_when_predicate_declines_dtype() {
+    // Same call, but inputs are f32 and the predicate only claims f16 → fall
+    // back to inlining (today's behavior preserved for unclaimed configs).
+    let m = model_with_fused_call(onnx::tensor_proto::DataType::Float);
+    let keep = |node: &Node, _opset: u64, dtypes: &[DataType]| {
+        node.op_type == "Fused" && dtypes.first() == Some(&DataType::Float16)
+    };
+    let out = inline_functions_filtered(&m, &keep).unwrap().into_owned();
+    let g = out.graph.as_ref().unwrap();
+    // Declined → body inlined; no `Fused` op survives, the `Scan` is exposed.
+    assert_eq!(op_types(g), vec![(String::new(), "Scan".to_string())]);
+}
+
+#[test]
+fn filtered_still_inlines_functions_no_kernel_claims() {
+    // A different function the predicate never claims must inline exactly as the
+    // unfiltered path would — the filter only keeps ops a kernel claims.
+    let body = vec![
+        node("MatMul", &["X", "W"], &["xw"]),
+        node("Add", &["xw", "B"], &["Y"]),
+    ];
+    let f = function("MyLinear", "custom.domain", &["X", "W", "B"], &["Y"], body);
+    let graph = onnx::GraphProto {
+        node: vec![call(
+            "MyLinear",
+            "custom.domain",
+            &["input", "weight", "bias"],
+            &["out"],
+        )],
+        ..Default::default()
+    };
+    let m = model(graph, vec![f]);
+    // Predicate only claims `Fused`; declines everything else.
+    let keep = |node: &Node, _opset: u64, _dtypes: &[DataType]| node.op_type == "Fused";
+    let out = inline_functions_filtered(&m, &keep).unwrap().into_owned();
+    let g = out.graph.as_ref().unwrap();
+    assert_eq!(
+        op_types(g),
+        vec![
+            (String::new(), "MatMul".to_string()),
+            (String::new(), "Add".to_string()),
+        ]
+    );
+}
