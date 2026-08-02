@@ -12,13 +12,19 @@
 
 use std::sync::Arc;
 
+use prost::Message;
+
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DeviceId, DeviceType, EpConfig, EpId, ExecutionProvider, Fence, Kernel,
+    Cost, DeviceBuffer, DeviceId, DeviceType, EpConfig, EpId, ExecutionProvider, Fence, Kernel,
     KernelMatch, Result as EpResult,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, TensorLayout, static_shape};
+use onnx_runtime_ir::{
+    DataType, Graph, ModelFunction, Node, NodeId, Shape, TensorData, TensorLayout, WeightRef,
+    static_shape,
+};
 use onnx_runtime_loader::WeightStore;
+use onnx_runtime_loader::proto::onnx;
 
 use super::*;
 use crate::executor::Executor;
@@ -29,6 +35,7 @@ use crate::executor::Executor;
 struct AcceleratorEp {
     inner: CpuExecutionProvider,
     allowed: Vec<&'static str>,
+    claim_only: Vec<&'static str>,
     device: DeviceId,
 }
 
@@ -39,10 +46,17 @@ impl AcceleratorEp {
         Self {
             inner,
             allowed,
+            claim_only: Vec::new(),
             // Mlx is host-accessible, so the CPU execution path stays valid while
             // the device id differs from CPU:0 for transfer planning.
             device: DeviceId::new(DeviceType::Mlx, 0),
         }
+    }
+
+    fn claim_only(allowed: Vec<&'static str>) -> Self {
+        let mut ep = Self::new(Vec::new());
+        ep.claim_only = allowed;
+        ep
     }
 }
 
@@ -70,6 +84,13 @@ impl ExecutionProvider for AcceleratorEp {
         input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch {
+        if self.claim_only.contains(&op.op_type.as_str()) {
+            return KernelMatch::Supported {
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous(); op.outputs.len()],
+            };
+        }
         if self.allowed.contains(&op.op_type.as_str()) {
             self.inner
                 .supports_op(op, opset, shapes, input_dtypes, layouts)
@@ -123,6 +144,13 @@ fn accel_slot(ep: u32, allowed: Vec<&'static str>) -> ProviderPlacement {
     }
 }
 
+fn claim_only_slot(ep: u32, allowed: Vec<&'static str>) -> ProviderPlacement {
+    ProviderPlacement {
+        ep: EpId(ep),
+        provider: Arc::new(AcceleratorEp::claim_only(allowed)),
+    }
+}
+
 fn weights() -> Arc<WeightStore> {
     Arc::new(WeightStore::new())
 }
@@ -160,6 +188,214 @@ fn assert_byte_identical(a: &[Tensor], b: &[Tensor]) {
     }
 }
 
+fn inline_f32(dims: &[usize], data: &[f32]) -> WeightRef {
+    WeightRef::Inline(TensorData::from_raw(
+        DataType::Float32,
+        dims.to_vec(),
+        data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    ))
+}
+
+fn add_relu_body(name: &str, inner_call: Option<&str>) -> ModelFunction {
+    let mut body = Graph::new();
+    body.opset_imports.insert(String::new(), 17);
+    let x = body.create_named_value("X", DataType::Float32, static_shape([4]));
+    let b = body.create_named_value("B", DataType::Float32, static_shape([4]));
+    body.add_input(x);
+    body.add_input(b);
+    let y = body.create_named_value("Y", DataType::Float32, static_shape([4]));
+    match inner_call {
+        Some(inner) => {
+            let mut call = Node::new(NodeId(0), inner, vec![Some(x), Some(b)], vec![y]);
+            call.domain = "custom.domain".to_string();
+            body.insert_node(call);
+        }
+        None => {
+            let sum = body.create_named_value("sum", DataType::Float32, static_shape([4]));
+            body.insert_node(Node::new(
+                NodeId(0),
+                "Add",
+                vec![Some(x), Some(b)],
+                vec![sum],
+            ));
+            body.insert_node(Node::new(NodeId(0), "Relu", vec![Some(sum)], vec![y]));
+        }
+    }
+    body.add_output(y);
+    ModelFunction {
+        domain: "custom.domain".to_string(),
+        name: name.to_string(),
+        inputs: vec!["X".to_string(), "B".to_string()],
+        outputs: vec!["Y".to_string()],
+        body,
+    }
+}
+
+fn kept_fused_add_relu_graph(nested: bool) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("custom.domain".to_string(), 1);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let b = graph.create_named_value("b", DataType::Float32, static_shape([4]));
+    graph.set_initializer(b, inline_f32(&[4], &[1.0, -3.0, 10.0, -20.0]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    let op = if nested {
+        "OuterFusedAddRelu"
+    } else {
+        "FusedAddRelu"
+    };
+    let mut fused = Node::new(NodeId(0), op, vec![Some(x), Some(b)], vec![y]);
+    fused.domain = "custom.domain".to_string();
+    graph.insert_node(fused);
+    graph.add_output(y);
+    if nested {
+        graph.model_functions.insert(
+            ("custom.domain".to_string(), "OuterFusedAddRelu".to_string()),
+            add_relu_body("OuterFusedAddRelu", Some("InnerFusedAddRelu")),
+        );
+        graph.model_functions.insert(
+            ("custom.domain".to_string(), "InnerFusedAddRelu".to_string()),
+            add_relu_body("InnerFusedAddRelu", None),
+        );
+    } else {
+        graph.model_functions.insert(
+            ("custom.domain".to_string(), "FusedAddRelu".to_string()),
+            add_relu_body("FusedAddRelu", None),
+        );
+    }
+    graph
+}
+
+fn primitive_add_relu_graph() -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let b = graph.create_named_value("b", DataType::Float32, static_shape([4]));
+    graph.set_initializer(b, inline_f32(&[4], &[1.0, -3.0, 10.0, -20.0]));
+    let sum = graph.create_named_value("sum", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(x), Some(b)],
+        vec![sum],
+    ));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(sum)], vec![y]));
+    graph.add_output(y);
+    graph
+}
+
+fn op_count(graph: &Graph, op: &str) -> usize {
+    graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.op_type == op)
+        .count()
+}
+
+fn onnx_tensor_type(dims: &[i64]) -> onnx::TypeProto {
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
+    onnx::TypeProto {
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type: 1,
+                shape: Some(onnx::TensorShapeProto {
+                    dim: dims
+                        .iter()
+                        .map(|&n| Dimension {
+                            value: Some(DV::DimValue(n)),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+fn onnx_value_info(name: &str, dims: &[i64]) -> onnx::ValueInfoProto {
+    onnx::ValueInfoProto {
+        name: name.to_string(),
+        r#type: Some(onnx_tensor_type(dims)),
+        ..Default::default()
+    }
+}
+
+fn onnx_f32_initializer(name: &str, data: &[f32]) -> onnx::TensorProto {
+    onnx::TensorProto {
+        name: name.to_string(),
+        data_type: 1,
+        dims: vec![data.len() as i64],
+        raw_data: data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        ..Default::default()
+    }
+}
+
+fn onnx_node(op: &str, inputs: &[&str], outputs: &[&str]) -> onnx::NodeProto {
+    onnx::NodeProto {
+        op_type: op.to_string(),
+        input: inputs.iter().map(|s| s.to_string()).collect(),
+        output: outputs.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+fn onnx_call(op: &str, domain: &str, inputs: &[&str], outputs: &[&str]) -> onnx::NodeProto {
+    let mut node = onnx_node(op, inputs, outputs);
+    node.domain = domain.to_string();
+    node
+}
+
+fn fused_add_relu_model_bytes() -> Vec<u8> {
+    let func = onnx::FunctionProto {
+        name: "FusedAddRelu".to_string(),
+        domain: "custom.domain".to_string(),
+        input: vec!["X".to_string(), "B".to_string()],
+        output: vec!["Y".to_string()],
+        node: vec![
+            onnx_node("Add", &["X", "B"], &["sum"]),
+            onnx_node("Relu", &["sum"], &["Y"]),
+        ],
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 17,
+        }],
+        ..Default::default()
+    };
+    let graph = onnx::GraphProto {
+        input: vec![onnx_value_info("x", &[4])],
+        output: vec![onnx_value_info("y", &[4])],
+        initializer: vec![onnx_f32_initializer("b", &[1.0, -3.0, 10.0, -20.0])],
+        node: vec![onnx_call(
+            "FusedAddRelu",
+            "custom.domain",
+            &["x", "b"],
+            &["y"],
+        )],
+        ..Default::default()
+    };
+    onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![
+            onnx::OperatorSetIdProto {
+                domain: String::new(),
+                version: 17,
+            },
+            onnx::OperatorSetIdProto {
+                domain: "custom.domain".to_string(),
+                version: 1,
+            },
+        ],
+        graph: Some(graph),
+        functions: vec![func],
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 #[test]
 fn pure_cpu_single_partition() {
     // Accelerator supports nothing; every node lands on the CPU EP as one
@@ -175,6 +411,97 @@ fn pure_cpu_single_partition() {
     let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
     let out = execute(&plan, &graph, &weights(), &providers, &[("x", &x)]).unwrap();
     assert_byte_identical(&out, &reference(&graph, &[("x", &x)]));
+}
+
+#[test]
+fn kept_function_declined_by_assignment_ep_is_inlined_and_runs() {
+    let bytes = fused_add_relu_model_bytes();
+    let keep = |node: &Node, _opset: u64, _dtypes: &[DataType]| node.op_type == "FusedAddRelu";
+    let (graph, store) =
+        onnx_runtime_loader::load_model_bytes_with_weights_filtered(&bytes, ".", &keep)
+            .expect("filtered load keeps synthetic fused function");
+    assert_eq!(
+        op_count(&graph, "FusedAddRelu"),
+        1,
+        "load-time keep predicate should leave the fused function call in the graph"
+    );
+    let (reference_graph, reference_store) =
+        onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")
+            .expect("unfiltered load inlines function body");
+    let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    let legalized = plan
+        .legalized_graph
+        .as_ref()
+        .expect("fused function should be legalized");
+
+    assert_eq!(op_count(legalized, "FusedAddRelu"), 0);
+    assert_eq!(op_count(legalized, "Add"), 1);
+    assert_eq!(op_count(legalized, "Relu"), 1);
+    assert!(
+        plan.node_placement
+            .iter()
+            .any(|(&node, &ep)| legalized.node(node).op_type == "Relu" && ep == EpId(0)),
+        "primitive body ops should be repartitioned after legalization"
+    );
+
+    let x = Tensor::from_f32(&[4], &[-2.0, 4.0, -5.0, 100.0]).unwrap();
+    let hetero = execute(&plan, &graph, &store, &providers, &[("x", &x)]).unwrap();
+    let mut reference_exec =
+        Executor::build(reference_graph, reference_store, cpu_slot(0).provider).unwrap();
+    let reference = reference_exec.run(&[("x", &x)]).unwrap();
+    assert_byte_identical(&hetero, &reference);
+}
+
+#[test]
+fn nested_kept_functions_legalize_to_fixpoint() {
+    let graph = kept_fused_add_relu_graph(true);
+    let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    let legalized = plan
+        .legalized_graph
+        .as_ref()
+        .expect("nested fused functions should be legalized");
+
+    assert_eq!(op_count(legalized, "OuterFusedAddRelu"), 0);
+    assert_eq!(op_count(legalized, "InnerFusedAddRelu"), 0);
+    assert_eq!(op_count(legalized, "Add"), 1);
+    assert_eq!(op_count(legalized, "Relu"), 1);
+
+    let x = Tensor::from_f32(&[4], &[-2.0, 4.0, -5.0, 100.0]).unwrap();
+    let hetero = execute(&plan, &graph, &weights(), &providers, &[("x", &x)]).unwrap();
+    let reference = reference(&primitive_add_relu_graph(), &[("x", &x)]);
+    assert_byte_identical(&hetero, &reference);
+}
+
+#[test]
+fn ambiguous_model_function_identity_fails_closed() {
+    let mut graph = kept_fused_add_relu_graph(false);
+    graph.model_functions.clear();
+    graph
+        .ambiguous_model_functions
+        .insert(("custom.domain".to_string(), "FusedAddRelu".to_string()));
+    let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
+    let err = plan(&graph, &providers).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("multiple overloads"), "{msg}");
+    assert!(msg.contains("FusedAddRelu"), "{msg}");
+}
+
+#[test]
+fn claimed_function_stays_kept_when_assigned_provider_supports_it() {
+    let graph = kept_fused_add_relu_graph(false);
+    let providers = vec![claim_only_slot(0, vec!["FusedAddRelu"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+
+    assert!(
+        plan.legalized_graph.is_none(),
+        "single-provider-supported fused function should not be decomposed"
+    );
+    assert_eq!(plan.partitions.len(), 1);
+    let fused_node = plan.partitions[0].nodes[0];
+    assert_eq!(graph.node(fused_node).op_type, "FusedAddRelu");
+    assert_eq!(plan.partitions[0].ep, EpId(0));
 }
 
 #[test]

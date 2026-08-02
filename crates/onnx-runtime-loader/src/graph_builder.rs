@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use onnx_runtime_ir::{
-    Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, TypeProto, ValueId,
-    normalize_domain,
+    Attribute, DataType, Dim, Graph, ModelFunction, ModelFunctionKey, Node, NodeId, Shape,
+    TensorData, TypeProto, ValueId, normalize_domain,
 };
 
 use crate::LoaderError;
@@ -48,6 +48,7 @@ pub(crate) fn build_graph(
     model: &ModelProto,
     keep_as_op: Option<&crate::function_inline::KeepAsOp<'_>>,
 ) -> Result<BuiltGraph, LoaderError> {
+    let (model_functions, ambiguous_model_functions) = build_model_function_catalog(model)?;
     // Expand any model-local function calls into their primitive bodies before
     // building the IR, so the rest of the pipeline only ever sees ops the
     // runtime has kernels for. No-op (borrow) when the model declares no
@@ -60,6 +61,8 @@ pub(crate) fn build_graph(
     let model = inlined.as_ref();
 
     let mut graph = Graph::new();
+    graph.model_functions = model_functions;
+    graph.ambiguous_model_functions = ambiguous_model_functions;
 
     // Opset imports: domain -> version.
     for opset in &model.opset_import {
@@ -79,6 +82,74 @@ pub(crate) fn build_graph(
     let name_map = build_graph_proto(&mut graph, graph_proto, true)?;
 
     Ok(BuiltGraph { graph, name_map })
+}
+
+fn build_model_function_catalog(
+    model: &ModelProto,
+) -> Result<
+    (
+        HashMap<ModelFunctionKey, ModelFunction>,
+        std::collections::HashSet<ModelFunctionKey>,
+    ),
+    LoaderError,
+> {
+    let mut functions: HashMap<ModelFunctionKey, ModelFunction> = HashMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for func in &model.functions {
+        let key = (
+            normalize_domain(&func.domain).to_string(),
+            func.name.clone(),
+        );
+        if ambiguous.contains(&key) {
+            continue;
+        }
+        if functions.contains_key(&key) {
+            functions.remove(&key);
+            ambiguous.insert(key);
+            continue;
+        }
+
+        let gp = GraphProto {
+            input: func
+                .input
+                .iter()
+                .map(|name| onnx::ValueInfoProto {
+                    name: name.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output: func
+                .output
+                .iter()
+                .map(|name| onnx::ValueInfoProto {
+                    name: name.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            node: func.node.clone(),
+            ..Default::default()
+        };
+        let mut body = build_subgraph(&gp)?;
+        for opset in &func.opset_import {
+            if opset.version > 0 {
+                body.opset_imports.insert(
+                    normalize_domain(&opset.domain).to_string(),
+                    opset.version as u64,
+                );
+            }
+        }
+        functions.insert(
+            key,
+            ModelFunction {
+                domain: normalize_domain(&func.domain).to_string(),
+                name: func.name.clone(),
+                inputs: func.input.clone(),
+                outputs: func.output.clone(),
+                body,
+            },
+        );
+    }
+    Ok((functions, ambiguous))
 }
 
 /// Populate `graph` from a `GraphProto`. When `is_top_level` is true, inputs
