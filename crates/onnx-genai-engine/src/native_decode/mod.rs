@@ -102,39 +102,26 @@ pub struct NativeDecodeSession {
     /// a rank-3 mrope decoder gets rank-3 coordinates while a rank-2 decoder is
     /// byte-identical to before.
     position_rank: usize,
-    /// Inc-1b PR-2 decode-inline plan state. Default-off: unless the
-    /// `ONNX_GENAI_DECODE_INLINE_SCAN` flag is set AND the model is on the
-    /// hybrid single-trip recurrent `Scan` path, this stays `Disabled`/`Untried`
-    /// and every decode step uses today's Scan child-session executor unchanged.
+    /// Inc-1b PR-2 decode-inline plan state. Graph-property gated: the sibling
+    /// is built (and single-token decode steps routed to it) automatically iff
+    /// the model's decode graph has an inlineable single-trip (extent==1)
+    /// recurrent `Scan` that `inline_single_trip_scan_bodies` can lower. For a
+    /// model with no such `Scan` this latches `Disabled` and every decode step
+    /// uses today's Scan child-session executor unchanged (no sibling built).
     decode_inline: DecodeInlineState,
 }
 
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeInlineState {
-    /// Not yet probed (flag read + sibling build are lazy, at first decode step).
+    /// Not yet probed (the sibling build is lazy, at first decode step).
     Untried,
-    /// Flag off, or the model has no single-trip-eligible `Scan`: use the main
-    /// (Scan child-session) executor for every step.
+    /// The model has no single-trip-eligible `Scan` (a dense / non-hybrid
+    /// decoder): use the main (Scan child-session) executor for every step.
     Disabled,
     /// A decode-inline sibling executor is built; route single-token decode
     /// steps to it (extent≠1 steps still fall back to the main executor).
     Enabled,
-}
-
-/// Whether the Inc-1b PR-2 decode-inline plan is opted in via
-/// `ONNX_GENAI_DECODE_INLINE_SCAN`. **Default OFF**: only an explicit truthy
-/// value (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) enables it, so an
-/// unset or falsy var leaves decode on today's Scan child-session path with zero
-/// behavior change.
-fn decode_inline_scan_enabled() -> bool {
-    match std::env::var("ONNX_GENAI_DECODE_INLINE_SCAN") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
 }
 
 /// Pure decision for whether a decode step routes to the decode-inline sibling
@@ -524,21 +511,19 @@ impl NativeDecodeSession {
         }
     }
 
-    /// Inc-1b PR-2: lazily probe and, if opted in, build the decode-specialized
-    /// inlined-body sibling executor at the **first decode step** (not at load —
-    /// only models that actually take the hybrid decode path pay the
-    /// transform+compile, once). Default-off via `ONNX_GENAI_DECODE_INLINE_SCAN`;
-    /// a build that finds no single-trip-eligible recurrent `Scan` latches
-    /// `Disabled`, so a dense decoder never retries and stays on the main path.
+    /// Inc-1b PR-2: lazily probe and, if the model is eligible, build the
+    /// decode-specialized inlined-body sibling executor at the **first decode
+    /// step** (not at load — only models that actually take the hybrid decode
+    /// path pay the transform+compile, once). Graph-property gated: the sibling
+    /// is built iff the decode graph has a single-trip-eligible recurrent
+    /// `Scan`. A probe that finds no such `Scan` latches `Disabled`, so a dense
+    /// decoder never builds a sibling, never retries, and stays byte-identical
+    /// on the main path.
     ///
     /// A build failure is non-fatal: it latches `Disabled` and decode proceeds
     /// on the byte-identical main (Scan child-session) executor.
     fn maybe_enable_decode_inline(&mut self, token_ids: &[TokenId]) {
         if self.decode_inline != DecodeInlineState::Untried {
-            return;
-        }
-        if !decode_inline_scan_enabled() {
-            self.decode_inline = DecodeInlineState::Disabled;
             return;
         }
         // Probe at the first genuine decode step (a single new token); a

@@ -163,7 +163,8 @@ pub(crate) struct DecodeCudaState {
     /// Inc-1b PR-3: capture phase of the **decode-inline sibling** graph, tracked
     /// separately from `graph_phase` because the sibling executor owns its own
     /// capture schedule. Only advanced on the routed single-token decode path
-    /// (`ONNX_GENAI_DECODE_INLINE_SCAN` on); `NeedsWarmup` and dormant otherwise.
+    /// (a model with an inlineable single-trip `Scan`); `NeedsWarmup` and
+    /// dormant otherwise.
     /// The sibling shares the main executor's EP (one graph slot + one latch), so
     /// this and `graph_phase` are never both past `NeedsWarmup` in one generation.
     inline_graph_phase: DecodeCudaGraphPhase,
@@ -484,9 +485,9 @@ impl NativeDecodeSession {
                 // Inc-1b PR-3: route this single-token decode step to the
                 // decode-specialized inlined-body sibling exec and drive its
                 // CUDA-graph capture state machine so the inlined body folds into
-                // a replayed device graph (capture engages only because the
-                // default-OFF ONNX_GENAI_DECODE_INLINE_SCAN flag gates
-                // `route_inline`). It binds the identical persistent device
+                // a replayed device graph (capture engages only because
+                // `route_inline` is true — i.e. the model has an inlineable
+                // single-trip recurrent `Scan` and a sibling was built). It binds the identical persistent device
                 // KV/state bindings, so recurrent-state continuity across the
                 // prefill→decode boundary is preserved (design §3). The main
                 // exec's capture machine stays dormant on decode, so the shared
@@ -1898,9 +1899,10 @@ impl DecodeCudaState {
     /// machinery; body ops that sync/host-read (Transpose/Slice/Tile/ReduceSum)
     /// stay quarantined to eager seams by the sibling executor's own
     /// `capture_quarantine_ops`, exactly like the main path. Reached only when
-    /// `ONNX_GENAI_DECODE_INLINE_SCAN` is on (the caller's `route_inline` gate),
-    /// so capture engagement here is flag-gated; with the flag off this is never
-    /// called and the sibling is never even built.
+    /// `route_inline` is true (a model with an inlineable single-trip recurrent
+    /// `Scan` whose sibling was built), so capture engagement here is
+    /// graph-property-gated; with no such `Scan` this is never called and the
+    /// sibling is never even built.
     ///
     /// The main decode capture machine ([`Self::run_one_token`]) is NOT reached on
     /// routed steps, so the shared EP's single graph slot + capture-error latch

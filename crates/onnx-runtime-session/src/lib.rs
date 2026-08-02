@@ -1113,8 +1113,9 @@ impl InferenceSession {
     /// keep today's Scan child-session path. The main/prefill executor is left
     /// byte-identical either way.
     ///
-    /// Callers gate this behind their own default-off feature flag
-    /// (`ONNX_GENAI_DECODE_INLINE_SCAN`); the session itself reads no env.
+    /// The caller probes this automatically at the first decode step; the
+    /// session itself reads no env and takes no user knob — the graph property
+    /// (an inlineable single-trip recurrent `Scan`) is the only gate.
     pub fn enable_decode_inline(&mut self) -> Result<bool> {
         if self.decode_inline_exec.is_none() {
             self.decode_inline_exec = self.exec.build_decode_inline_sibling()?;

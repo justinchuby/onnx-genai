@@ -2584,7 +2584,11 @@ fn declared_position_rank_maps_graph_shape() {
 
 // ---------------------------------------------------------------------------
 // Inc-1b PR-2: decode-inline routing decision (Harry guard #2 — runtime
-// scan-axis extent==1 fallback) and the default-off feature flag.
+// scan-axis extent==1 fallback). The plan is graph-property gated (an
+// inlineable single-trip recurrent `Scan`), not a user flag; the with-Scan →
+// sibling-built and dense → no-sibling gate is covered directly by the session
+// crate's `decode_inline_sibling_folds_body_into_captured_graph_byte_exact` and
+// `decode_inline_sibling_none_for_dense_graph` executor tests.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2664,31 +2668,4 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
         1,
         false
     ));
-}
-
-#[test]
-fn decode_inline_flag_defaults_off_and_parses_truthy() {
-    // The flag is process-global env; serialize the mutation so parallel tests
-    // do not observe each other's writes.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap();
-    let key = "ONNX_GENAI_DECODE_INLINE_SCAN";
-    let previous = std::env::var_os(key);
-
-    // SAFETY: single-threaded within this test's lock; restored before return.
-    unsafe { std::env::remove_var(key) };
-    assert!(!decode_inline_scan_enabled(), "unset must default OFF");
-    for falsy in ["0", "false", "no", "off", "", "  ", "nonsense"] {
-        unsafe { std::env::set_var(key, falsy) };
-        assert!(!decode_inline_scan_enabled(), "'{falsy}' must be OFF");
-    }
-    for truthy in ["1", "true", "yes", "on", " ON ", "True"] {
-        unsafe { std::env::set_var(key, truthy) };
-        assert!(decode_inline_scan_enabled(), "'{truthy}' must be ON");
-    }
-
-    match previous {
-        Some(value) => unsafe { std::env::set_var(key, value) },
-        None => unsafe { std::env::remove_var(key) },
-    }
 }
