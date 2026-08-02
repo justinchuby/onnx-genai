@@ -166,6 +166,22 @@ pub enum EvictionPolicy {
     LayerAware,
 }
 
+/// How a backend can be handed this store's KV without a copy.
+///
+/// Capability is a type rather than a name-keyed lookup, so a mismatch is a
+/// compile-or-construction-time refusal instead of a silent fall back to a
+/// slower path whose only symptom is that generation got slower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvViewKind {
+    /// Scattered pages. A backend must read through the store's accessors.
+    Paged,
+    /// One flat address range whose pages are physically scattered. Satisfies a
+    /// backend that requires contiguity, with no copy.
+    VirtuallyContiguous,
+    /// One real allocation.
+    PhysicallyContiguous,
+}
+
 /// KV cache operations trait (from spec §4c).
 pub trait KvCacheOps {
     /// Truncate cache to position. O(pages_removed).
@@ -188,6 +204,30 @@ pub trait KvCacheOps {
 
     /// Remove a sequence entirely, freeing all its pages.
     fn remove(&mut self, seq: SequenceId) -> Result<(), KvError>;
+
+    /// Bytes of KV storage this sequence references.
+    ///
+    /// **Attributed, not exclusive.** A page shared with another sequence — the
+    /// normal result of prefix reuse or a fork — is counted in full for every
+    /// sequence that references it, because that is what the sequence would need
+    /// if it were alone. Summing this across sequences therefore over-counts and
+    /// is *not* the store's footprint; use [`Self::resident_bytes`] for that.
+    ///
+    /// Getting this backwards is how a memory budget starts describing memory
+    /// that was never allocated.
+    fn sequence_bytes(&self, seq: SequenceId) -> Result<u64, KvError>;
+
+    /// Bytes of KV storage actually occupied by pages currently referenced.
+    ///
+    /// Counts each page once regardless of how many sequences share it, so this
+    /// is the number that can be compared against a memory lease.
+    fn resident_bytes(&self) -> u64;
+
+    /// Bytes this store holds a memory grant for, or `None` when ungoverned.
+    fn leased_bytes(&self) -> Option<u64>;
+
+    /// What a backend can be handed without a copy.
+    fn view(&self) -> KvViewKind;
 }
 
 /// A saved cache state for checkpoint/restore.

@@ -959,6 +959,30 @@ impl KvCacheOps for PagedKvCache {
             .ok_or(KvError::SequenceNotFound(seq))
     }
 
+    fn sequence_bytes(&self, seq: SequenceId) -> Result<u64, KvError> {
+        let pages = self
+            .page_table
+            .get_sequence(seq)
+            .ok_or(KvError::SequenceNotFound(seq))?;
+        Ok((pages.len() as u64).saturating_mul(self.page_table.bytes_per_page()))
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.page_table.resident_bytes()
+    }
+
+    fn leased_bytes(&self) -> Option<u64> {
+        self.page_table.leased_bytes()
+    }
+
+    fn view(&self) -> crate::KvViewKind {
+        // Pages are scattered host buffers today. Virtual contiguity, which
+        // would let a backend that needs one flat range read them without a
+        // copy, is not built yet -- so claiming it here would be a promise the
+        // store cannot keep.
+        crate::KvViewKind::Paged
+    }
+
     fn remove(&mut self, seq: SequenceId) -> Result<(), KvError> {
         let pages = self.page_table.remove_sequence(seq);
         for page_id in pages {
@@ -2297,5 +2321,110 @@ mod tests {
                 .is_none(),
             "quantized component must report no borrowable f32 row"
         );
+    }
+}
+
+#[cfg(test)]
+mod accounting_contract_tests {
+    use super::*;
+    use crate::{KvCacheOps, KvViewKind};
+
+    fn configs(layers: usize) -> Vec<crate::LayerTensorConfig> {
+        (0..layers)
+            .map(|_| crate::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 32,
+            })
+            .collect()
+    }
+
+    fn cache() -> PagedKvCache {
+        PagedKvCache::new_with_layer_tensor_configs(4, crate::KvDType::F32, configs(2), 32)
+    }
+
+    /// Summing per-sequence bytes is **not** the store's footprint.
+    ///
+    /// A forked sequence shares its prefix pages, and `sequence_bytes` counts a
+    /// shared page in full for each holder because that is what the sequence
+    /// would need on its own. Anything that adds those numbers up to decide how
+    /// much memory is in use will over-count -- which is how a budget starts
+    /// describing memory that was never allocated. `resident_bytes` counts each
+    /// page once and is the number to compare against a lease.
+    #[test]
+    fn sharing_makes_attributed_bytes_exceed_what_is_actually_resident() {
+        let mut cache = cache();
+        let base = cache.create_sequence();
+        cache.append(base, 8).expect("pool has capacity");
+        let resident_before = cache.resident_bytes();
+
+        let forked = cache.fork(base, 8).expect("fork at the full length");
+
+        let attributed = cache.sequence_bytes(base).expect("base exists")
+            + cache.sequence_bytes(forked).expect("fork exists");
+        let resident_after = cache.resident_bytes();
+
+        assert_eq!(
+            resident_after, resident_before,
+            "a copy-on-write fork allocated new pages before anything diverged"
+        );
+        assert!(
+            attributed > resident_after,
+            "expected attributed bytes ({attributed}) to exceed resident bytes \
+             ({resident_after}) once two sequences share pages; if these are equal the \
+             fork did not actually share and the test is no longer testing sharing"
+        );
+        assert_eq!(
+            attributed,
+            resident_after * 2,
+            "both sequences reference the same pages, so attribution should be exactly double"
+        );
+    }
+
+    /// Resident bytes never exceed what the pool allocated, or the lease is a lie.
+    #[test]
+    fn resident_bytes_never_exceed_the_pool() {
+        let mut cache = cache();
+        let mut sequences = Vec::new();
+        for _ in 0..6 {
+            let seq = cache.create_sequence();
+            cache.append(seq, 8).expect("pool has capacity");
+            sequences.push(seq);
+        }
+        assert!(
+            cache.resident_bytes() <= cache.page_table.pool_bytes(),
+            "resident {} exceeds pool {}",
+            cache.resident_bytes(),
+            cache.page_table.pool_bytes()
+        );
+    }
+
+    /// Removing a sequence returns its pages to the pool's free bytes.
+    #[test]
+    fn removing_a_sequence_frees_its_resident_bytes() {
+        let mut cache = cache();
+        let empty = cache.resident_bytes();
+        let seq = cache.create_sequence();
+        cache.append(seq, 8).expect("pool has capacity");
+        assert!(cache.resident_bytes() > empty, "append occupied no pages");
+
+        cache.remove(seq).expect("sequence exists");
+        assert_eq!(
+            cache.resident_bytes(),
+            empty,
+            "removing a sequence left its pages referenced"
+        );
+        assert!(
+            cache.sequence_bytes(seq).is_err(),
+            "a removed sequence still reports bytes"
+        );
+    }
+
+    /// The store reports the view it can actually provide.
+    ///
+    /// Claiming `VirtuallyContiguous` before the mapping exists would let a
+    /// backend that needs one flat range bind scattered pages.
+    #[test]
+    fn a_paged_store_does_not_claim_contiguity_it_cannot_provide() {
+        assert_eq!(cache().view(), KvViewKind::Paged);
     }
 }

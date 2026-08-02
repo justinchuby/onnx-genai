@@ -965,6 +965,25 @@ impl PageTable {
             .as_ref()
             .map(onnx_runtime_memory_governor::MemoryLease::bytes)
     }
+    /// Bytes occupied by pages that are currently referenced by something.
+    ///
+    /// Each page counts once however many sequences share it, so this is what a
+    /// memory lease can be compared against. Free pages in a pre-allocated pool
+    /// still occupy memory, so this is a lower bound on the pool, not a
+    /// replacement for [`Self::pool_bytes`].
+    pub fn resident_bytes(&self) -> u64 {
+        self.pages
+            .values()
+            .filter(|page| page.ref_count > 0)
+            .map(Page::allocated_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Bytes one page of this pool occupies, or zero for a bookkeeping-only pool.
+    pub fn bytes_per_page(&self) -> u64 {
+        self.pages.values().next().map_or(0, Page::allocated_bytes)
+    }
+
     /// Bytes the whole page pool actually occupies.
     ///
     /// This is what a memory lease has to cover. It is summed from the live
