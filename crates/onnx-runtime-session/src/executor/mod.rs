@@ -99,6 +99,7 @@ mod phase_profile {
     use std::time::Instant;
 
     static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+    static PRINTED: AtomicBool = AtomicBool::new(false);
 
     pub fn enabled() -> bool {
         match STATE.load(Ordering::Relaxed) {
@@ -169,6 +170,13 @@ mod phase_profile {
         rows
     }
 
+    pub fn reset() {
+        if let Ok(mut reg) = registry().lock() {
+            reg.clear();
+        }
+        PRINTED.store(false, Ordering::Relaxed);
+    }
+
     /// Scoped timer that records its lifetime to `phase` on drop.
     pub struct PhaseSpan {
         phase: &'static str,
@@ -204,7 +212,6 @@ mod phase_profile {
             Ok(reg) => reg.iter().map(|(n, s)| (*n, *s)).collect(),
             Err(_) => return,
         };
-        static PRINTED: AtomicBool = AtomicBool::new(false);
         if PRINTED.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -272,6 +279,10 @@ pub fn exec_phase_stats() -> Vec<(&'static str, u128, u64)> {
 
 pub fn print_exec_phase_profile() {
     phase_profile::report_to_stderr();
+}
+
+pub fn reset_exec_phase_profile() {
+    phase_profile::reset();
 }
 
 fn host_dtype_alignment(dtype: DataType) -> usize {

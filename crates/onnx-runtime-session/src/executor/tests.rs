@@ -41,6 +41,17 @@ fn phase_profile_gating_and_accumulation() {
         after_ns > base_ns,
         "an enabled span must accumulate a positive duration"
     );
+    assert!(
+        phase_profile::all_stats()
+            .iter()
+            .any(|(phase, _, _)| *phase == enabled_phase),
+        "enabled phase must appear in aggregate stats before reset"
+    );
+    phase_profile::reset();
+    assert!(
+        phase_profile::all_stats().is_empty(),
+        "reset must clear accumulated phase stats"
+    );
 
     // Restore the default (disabled) state so other tests stay inert.
     phase_profile::force_enabled(false);
