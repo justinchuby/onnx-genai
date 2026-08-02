@@ -2589,44 +2589,80 @@ fn declared_position_rank_maps_graph_shape() {
 
 #[test]
 fn decode_inline_routes_only_single_token_when_enabled() {
-    // Enabled + sibling ready + single token → route to the decode-inline exec.
+    // Enabled + sibling ready + single token + no eager step inputs → route to
+    // the decode-inline exec.
     assert!(route_decode_inline_decision(
         DecodeInlineState::Enabled,
         true,
-        1
+        1,
+        false
     ));
     // Guard #2: a multi-token (extent≠1) step must fall back to the main Scan
     // executor even when the sibling is ready — never run a collapsed graph.
     assert!(!route_decode_inline_decision(
         DecodeInlineState::Enabled,
         true,
-        2
+        2,
+        false
     ));
     assert!(!route_decode_inline_decision(
         DecodeInlineState::Enabled,
         true,
-        8
+        8,
+        false
     ));
     // A zero-token step is not a decode step.
     assert!(!route_decode_inline_decision(
         DecodeInlineState::Enabled,
         true,
-        0
+        0,
+        false
     ));
+}
+
+/// PR-3 scope-lock (Harry #588 rec #4): a decoder that declares
+/// `inputs_embeds`/routed step-input ports is NEVER routed to the decode-inline
+/// sibling, even when it is otherwise a perfect candidate (Enabled + ready +
+/// single token). This locks the author's stated scope against future dispatch
+/// drift on both `decode_cuda` and the `decode_cuda_greedy` fast path.
+#[test]
+fn decode_inline_never_routes_when_decoder_has_eager_step_inputs() {
+    // The exact single-token candidate that WOULD route (mutation baseline)...
+    assert!(route_decode_inline_decision(
+        DecodeInlineState::Enabled,
+        true,
+        1,
+        false
+    ));
+    // ...is refused the instant the decoder declares eager step inputs.
+    assert!(
+        !route_decode_inline_decision(DecodeInlineState::Enabled, true, 1, true),
+        "inputs_embeds/routed decoders must never reach the decode-inline sibling"
+    );
+    // Belt-and-suspenders across token counts.
+    for count in [1usize, 2, 8] {
+        assert!(!route_decode_inline_decision(
+            DecodeInlineState::Enabled,
+            true,
+            count,
+            true
+        ));
+    }
 }
 
 #[test]
 fn decode_inline_never_routes_when_disabled_or_unbuilt() {
     // Untried / Disabled never route, regardless of token count.
     for state in [DecodeInlineState::Untried, DecodeInlineState::Disabled] {
-        assert!(!route_decode_inline_decision(state, true, 1));
-        assert!(!route_decode_inline_decision(state, false, 1));
+        assert!(!route_decode_inline_decision(state, true, 1, false));
+        assert!(!route_decode_inline_decision(state, false, 1, false));
     }
     // Enabled but no sibling actually built (defensive): never route.
     assert!(!route_decode_inline_decision(
         DecodeInlineState::Enabled,
         false,
-        1
+        1,
+        false
     ));
 }
 

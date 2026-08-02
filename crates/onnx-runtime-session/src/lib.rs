@@ -1131,6 +1131,87 @@ impl InferenceSession {
         exec.run_with_device_bindings(inputs, bindings)
     }
 
+    /// Inc-1b PR-3: capture-record one decode step of the **decode-inline
+    /// sibling** into a device graph (`cohaagen-inc1b-pr3-scope.md`, bucket-A).
+    /// Mirrors [`Self::try_capture_with_device_bindings`] but drives the sibling
+    /// executor instead of the main one, so the inlined-body ops fold into the
+    /// CUDA graph exactly like any other kernel — the same segmenter/warm-seeded
+    /// machinery, no #443/#543 shared-capture-code change. The sibling shares the
+    /// main executor's `Arc<dyn ExecutionProvider>` (one EP graph slot + one
+    /// capture-error latch), so callers MUST keep the main decode capture machine
+    /// dormant while routing single-token decode here (no double-capture).
+    ///
+    /// Errors if [`Self::enable_decode_inline`] has not built a sibling.
+    pub fn try_capture_decode_inline_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "decode-inline capture requested but no sibling built; call enable_decode_inline first"
+                    .into(),
+            )
+        })?;
+        exec.try_capture_with_device_bindings(inputs, bindings)
+    }
+
+    /// Replay the decode-inline sibling's installed device graph. Mirrors
+    /// [`Self::replay_device_graph`] on the sibling executor. Returns `false`
+    /// when a control-flow seam retired the graph this step (token produced
+    /// eagerly; caller re-warms/re-captures).
+    ///
+    /// Errors if [`Self::enable_decode_inline`] has not built a sibling.
+    pub fn replay_decode_inline_device_graph(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<bool> {
+        let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "decode-inline replay requested but no sibling built; call enable_decode_inline first"
+                    .into(),
+            )
+        })?;
+        exec.replay_device_graph(bindings)
+    }
+
+    /// Invalidate the decode-inline sibling's installed device graph (before
+    /// reset, KV-bucket growth, shape change, or binding destruction). A no-op
+    /// returning `false` when no sibling has been built. Because the sibling
+    /// shares the main executor's EP, the underlying EP graph + capture-error
+    /// latch are also cleared by [`Self::reset_device_graph`]; this additionally
+    /// clears the sibling executor's host-side capture schedule so it re-warms
+    /// rather than replaying a stale graph.
+    pub fn reset_decode_inline_device_graph(&mut self) -> Result<bool> {
+        match self.decode_inline_exec.as_mut() {
+            Some(exec) => exec.reset_device_graph(),
+            None => Ok(false),
+        }
+    }
+
+    /// Number of captured device-graph segments installed by the most recent
+    /// [`Self::try_capture_decode_inline_with_device_bindings`] call on the
+    /// sibling (`0` when no sibling, or nothing captured; `>= 1` once the
+    /// inlined body folds; `>= 2` when eager seams split it). Backs the PR-3
+    /// capture-engagement test.
+    pub fn decode_inline_captured_graph_segment_count(&self) -> usize {
+        self.decode_inline_exec
+            .as_ref()
+            .map(executor::Executor::captured_segment_count)
+            .unwrap_or(0)
+    }
+
+    /// Structured segment boundaries from the sibling's most recent capture (one
+    /// entry per eager seam node between captured segments, with its seam kind and
+    /// `CaptureSupport` decline reason). Empty for a whole-subgraph capture or no
+    /// sibling.
+    pub fn decode_inline_capture_segmentation(&self) -> &[CaptureDecline] {
+        self.decode_inline_exec
+            .as_ref()
+            .map(executor::Executor::capture_segmentation)
+            .unwrap_or(&[])
+    }
+
     /// Allocate a persistent buffer on this session's execution device.
     pub fn allocate_device_binding(
         &self,
@@ -1622,6 +1703,196 @@ mod device_binding_tests {
             "segmented replay must be bit-identical to eager execution"
         );
         assert_eq!(replay_b, values_b.to_vec());
+    }
+
+    /// Inc-1b PR-3 capture-engagement (design §4 / Harry #588 rec #2, #3): the
+    /// decode-inline sibling folds its inlined body ops into a captured device
+    /// graph (`decode_inline_captured_graph_segment_count() >= 1`) while staying
+    /// byte-exact with the eager sibling run — and the shared-EP invalidation path
+    /// (`reset_decode_inline_device_graph`) drops that graph cleanly. Distinct
+    /// (non-aliased) present/past bindings per design §3, so each run is idempotent
+    /// for a fixed input and the eager vs captured comparison is exact.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decode_inline_sibling_folds_body_into_captured_graph_byte_exact() {
+        use onnx_runtime_ir::Dim;
+
+        let Ok(mut ep) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+            eprintln!("skipping decode-inline capture-engagement test: CUDA runtime unavailable");
+            return;
+        };
+        onnx_runtime_ep_api::ExecutionProvider::initialize(&mut ep, &Default::default()).unwrap();
+
+        const W: usize = 3;
+        // Hybrid single-trip recurrent Scan: state threaded through the body,
+        // one scan input at decode extent 1. Body: present = state + scan_in;
+        // scan_out = present * scan_in. Distinct present/past (no in-place alias).
+        let mut body = Graph::new();
+        body.opset_imports.insert(String::new(), 17);
+        let state = body.create_named_value("state", DataType::Float32, static_shape([W]));
+        let scan_in = body.create_named_value("scan_in", DataType::Float32, static_shape([W]));
+        body.add_input(state);
+        body.add_input(scan_in);
+        let present = body.create_named_value("present", DataType::Float32, static_shape([W]));
+        body.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(state), Some(scan_in)],
+            vec![present],
+        ));
+        let y = body.create_named_value("y", DataType::Float32, static_shape([W]));
+        body.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(present), Some(scan_in)],
+            vec![y],
+        ));
+        body.add_output(present);
+        body.add_output(y);
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let seq = graph.intern_symbol("seq");
+        let past_state =
+            graph.create_named_value("past_state", DataType::Float32, static_shape([W]));
+        graph.add_input(past_state);
+        let x =
+            graph.create_named_value("x", DataType::Float32, vec![Dim::from(seq), Dim::Static(W)]);
+        graph.add_input(x);
+        let present_state =
+            graph.create_named_value("present_state", DataType::Float32, static_shape([W]));
+        let scan_out = graph.create_named_value(
+            "scan_out",
+            DataType::Float32,
+            vec![Dim::from(seq), Dim::Static(W)],
+        );
+        let mut scan = Node::new(
+            NodeId(0),
+            "Scan",
+            vec![Some(past_state), Some(x)],
+            vec![present_state, scan_out],
+        );
+        scan.attributes
+            .insert("num_scan_inputs".to_string(), Attribute::Int(1));
+        let scan_id = graph.insert_node(scan);
+        graph.subgraphs.insert((scan_id, "body".to_string()), body);
+        graph.add_output(present_state);
+        graph.add_output(scan_out);
+
+        let mut session = InferenceSession::from_parts(
+            graph,
+            std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            EpContextDumpConfig::default(),
+            ModelMetadata::default(),
+            std::sync::Arc::new(ep),
+        )
+        .unwrap();
+
+        assert!(
+            session.enable_decode_inline().unwrap(),
+            "single-trip recurrent Scan must yield a decode-inline sibling"
+        );
+
+        // Persistent device bindings: past_state + x as inputs, present_state +
+        // scan_out as outputs (every graph output MUST be persistently bound for
+        // capture). Decode extent 1, so x is [1, W].
+        let mut past = session
+            .allocate_device_binding(
+                "past_state",
+                None::<String>,
+                DataType::Float32,
+                vec![W],
+                vec![W],
+            )
+            .unwrap();
+        let mut x_bind = session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![1, W],
+                vec![1, W],
+            )
+            .unwrap();
+        let present_bind = session
+            .allocate_device_output_binding("present_state", DataType::Float32, vec![W], vec![W])
+            .unwrap();
+        let scan_bind = session
+            .allocate_device_output_binding("scan_out", DataType::Float32, vec![1, W], vec![1, W])
+            .unwrap();
+        let write_f32 = |b: &mut DeviceIoBinding, v: &[f32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            b.write_bytes(0, &bytes).unwrap();
+        };
+        let read_f32 = |b: &mut DeviceIoBinding| -> Vec<f32> {
+            b.read_bytes()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        write_f32(&mut past, &[1.0, 2.0, 3.0]);
+        write_f32(&mut x_bind, &[0.5, 1.5, 2.5]);
+        let mut bindings = vec![past, x_bind, present_bind, scan_bind];
+
+        // Eager warmup (also warms the shape-keyed kernels capture requires).
+        session
+            .run_decode_inline_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let eager_present = read_f32(&mut bindings[2]);
+        let eager_scan = read_f32(&mut bindings[3]);
+        // present = past + x ; scan_out = present * x.
+        assert_eq!(eager_present, vec![1.5, 3.5, 5.5]);
+        assert_eq!(eager_scan, vec![0.75, 5.25, 13.75]);
+
+        // Capture pass: the inlined body (Add + Mul) must fold into >= 1 captured
+        // device-graph segment (Harry #2: segment growth over the body) while
+        // staying byte-exact with the eager reference (Harry #3: the inlined
+        // interior shapes were warm-seeded so capture engages).
+        match session
+            .try_capture_decode_inline_with_device_bindings(&[], &mut bindings)
+            .unwrap()
+        {
+            DeviceGraphCaptureResult::Captured(outputs) => {
+                assert!(
+                    outputs.iter().all(Option::is_none),
+                    "device-bound outputs must not materialize to host"
+                );
+            }
+            DeviceGraphCaptureResult::NotCapturable(report) => {
+                panic!("decode-inline body did not fold into a captured graph: {report}");
+            }
+        }
+        assert!(
+            session.decode_inline_captured_graph_segment_count() >= 1,
+            "the inlined body must fold into at least one captured segment (engagement proof)"
+        );
+        assert_eq!(
+            read_f32(&mut bindings[2]),
+            eager_present,
+            "captured present-state must be byte-exact"
+        );
+        assert_eq!(
+            read_f32(&mut bindings[3]),
+            eager_scan,
+            "captured scan-out must be byte-exact"
+        );
+
+        // Replay stays byte-exact for the same inputs.
+        session
+            .replay_decode_inline_device_graph(&mut bindings)
+            .unwrap();
+        assert_eq!(read_f32(&mut bindings[2]), eager_present);
+        assert_eq!(read_f32(&mut bindings[3]), eager_scan);
+
+        // Shared-EP invalidation drops the sibling graph cleanly.
+        assert!(session.reset_decode_inline_device_graph().unwrap());
+        assert_eq!(
+            session.decode_inline_captured_graph_segment_count(),
+            0,
+            "reset must clear the sibling's captured schedule"
+        );
     }
 
     #[cfg(feature = "cuda")]

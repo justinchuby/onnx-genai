@@ -138,16 +138,26 @@ fn decode_inline_scan_enabled() -> bool {
 }
 
 /// Pure decision for whether a decode step routes to the decode-inline sibling
-/// exec (Inc-1b PR-2). Encapsulates guard #2: the decode-inline plan is a
+/// exec (Inc-1b PR-2/PR-3). Encapsulates guard #2: the decode-inline plan is a
 /// single-iteration (scan-axis extent 1) specialization, so it is used only for
 /// a single-token step and only when a sibling was actually built; every
 /// multi-token (extent≠1) step falls back to the main Scan executor.
+///
+/// `has_eager_step_inputs` is the PR-3 scope-lock (Harry #588 rec #4): a decoder
+/// with `inputs_embeds`/routed ports is never routed to the sibling regardless of
+/// state/readiness/token-count, because those per-step ports are served by the
+/// eager/captured step-input paths, not the token fast path the sibling
+/// specializes. This keeps the author's stated scope locked by construction.
 fn route_decode_inline_decision(
     state: DecodeInlineState,
     sibling_ready: bool,
     token_count: usize,
+    has_eager_step_inputs: bool,
 ) -> bool {
-    state == DecodeInlineState::Enabled && sibling_ready && token_count == 1
+    !has_eager_step_inputs
+        && state == DecodeInlineState::Enabled
+        && sibling_ready
+        && token_count == 1
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -553,14 +563,22 @@ impl NativeDecodeSession {
     }
 
     /// Whether this decode step should route to the decode-inline sibling exec
-    /// (Inc-1b PR-2). Guard #2 (runtime scan-axis extent==1 fallback): only a
+    /// (Inc-1b PR-2/PR-3). Guard #2 (runtime scan-axis extent==1 fallback): only a
     /// single-token step is single-trip; any multi-token step falls back to the
     /// main (Scan) executor so a wrongly-collapsed graph is never run.
+    ///
+    /// Scope-lock (Harry #588 PR-3 rec #4): never route a decoder that declares
+    /// `inputs_embeds`/routed ports. Those ports are uploaded per step and are
+    /// served by the eager/captured step-input paths, not the token fast path the
+    /// decode-inline sibling specializes; excluding them here locks the author's
+    /// stated scope by construction on every entry path (both `decode_cuda` and
+    /// the `decode_cuda_greedy` fast path), independent of the caller's dispatch.
     fn route_decode_inline(&self, token_ids: &[TokenId]) -> bool {
         route_decode_inline_decision(
             self.decode_inline,
             self.session.decode_inline_ready(),
             token_ids.len(),
+            self.has_eager_step_inputs(),
         )
     }
 

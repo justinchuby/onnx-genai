@@ -160,6 +160,13 @@ pub(crate) struct DecodeCudaState {
     /// which also forfeits CUDA-graph capture (mirroring the eager prefill path).
     mask_exposes_logical: bool,
     graph_phase: DecodeCudaGraphPhase,
+    /// Inc-1b PR-3: capture phase of the **decode-inline sibling** graph, tracked
+    /// separately from `graph_phase` because the sibling executor owns its own
+    /// capture schedule. Only advanced on the routed single-token decode path
+    /// (`ONNX_GENAI_DECODE_INLINE_SCAN` on); `NeedsWarmup` and dormant otherwise.
+    /// The sibling shares the main executor's EP (one graph slot + one latch), so
+    /// this and `graph_phase` are never both past `NeedsWarmup` in one generation.
+    inline_graph_phase: DecodeCudaGraphPhase,
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
@@ -474,21 +481,36 @@ impl NativeDecodeSession {
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
             if route_inline {
-                // Route this single-token decode step to the decode-specialized
-                // inlined-body sibling exec (eager, capture OFF for PR-2). It
-                // binds the identical persistent device KV/state bindings, so
-                // recurrent-state continuity across the prefill→decode boundary
-                // is preserved (design §3). The main exec's capture state
-                // machine stays dormant on decode, so there is no captured
-                // replay to validate below.
-                if let Err(error) = self
-                    .session
-                    .run_decode_inline_with_device_bindings(&[], &mut state.bindings)
-                {
+                // Inc-1b PR-3: route this single-token decode step to the
+                // decode-specialized inlined-body sibling exec and drive its
+                // CUDA-graph capture state machine so the inlined body folds into
+                // a replayed device graph (capture engages only because the
+                // default-OFF ONNX_GENAI_DECODE_INLINE_SCAN flag gates
+                // `route_inline`). It binds the identical persistent device
+                // KV/state bindings, so recurrent-state continuity across the
+                // prefill→decode boundary is preserved (design §3). The main
+                // exec's capture machine stays dormant on decode, so the shared
+                // EP's single graph slot + capture-error latch are owned solely by
+                // the sibling.
+                if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                     bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
                 }
                 let logits = state.read_logits()?;
+                // Detection-before-consumption (Harry #588 PR-3 rec #1): the
+                // logits read above is the single per-step device→host sync.
+                // Piggyback on it to poll the shared capture-error word — a
+                // captured sibling replay that violated a device-side bound
+                // latches the flag; fail hard before consuming the produced token.
+                // The latch lives on the shared EP, so this reads the sibling's
+                // replay result even though the poll is the main-exec-facing call.
+                let capture_error = self.session.check_device_capture_error()?;
+                if capture_error != 0 {
+                    let _ = state.invalidate_graph(&mut self.session);
+                    bail!(
+                        "native CUDA decode-inline aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode-inline graph was invalidated"
+                    );
+                }
                 if logits.iter().flatten().any(|value| !value.is_finite()) {
                     bail!("native decoder produced non-finite logits");
                 }
@@ -533,8 +555,9 @@ impl NativeDecodeSession {
 
     /// True when the decoder declares any `inputs_embeds` or generic `Routed`
     /// step input — the ports that must be uploaded per step and therefore force
-    /// the eager (uncaptured) CUDA device path in [`Self::decode_cuda`].
-    fn has_eager_step_inputs(&self) -> bool {
+    /// the eager (uncaptured) CUDA device path in [`Self::decode_cuda`], and are
+    /// excluded from the decode-inline fast path by `route_decode_inline`.
+    pub(super) fn has_eager_step_inputs(&self) -> bool {
         self.step_input_name(NativeStepInputSource::InputsEmbeds)
             .is_some()
             || self
@@ -821,23 +844,30 @@ impl NativeDecodeSession {
         )?;
         state.write_decode_inputs(token_id, past_len)?;
         if route_inline {
-            // Inc-1b PR-2: run this single-token decode step through the
-            // decode-specialized inlined-body sibling exec (eager, capture OFF).
-            // It binds the identical persistent device KV/state bindings, so
-            // recurrent-state continuity across the prefill→decode boundary is
-            // preserved (design §3). The greedy token is read with the same
-            // device-argmax kernel the captured path uses, so tie-breaking is
-            // byte-identical and the full logits never round-trip to the host.
-            // There is no captured replay this step, so the device capture-error
-            // word does not apply and is not polled.
-            if let Err(error) = self
-                .session
-                .run_decode_inline_with_device_bindings(&[], &mut state.bindings)
-            {
+            // Inc-1b PR-3: run this single-token decode step through the
+            // decode-specialized inlined-body sibling exec, driving its CUDA-graph
+            // capture state machine so the inlined body folds into a replayed
+            // device graph (flag-gated via `route_inline`). It binds the identical
+            // persistent device KV/state bindings, so recurrent-state continuity
+            // across the prefill→decode boundary is preserved (design §3). The
+            // greedy token is read with the same device-argmax kernel the captured
+            // path uses, so tie-breaking is byte-identical and the full logits
+            // never round-trip to the host.
+            if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                 bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
             }
-            let (token_id, _capture_error) = state.read_greedy_result()?;
+            // Detection-before-consumption (Harry #588 PR-3 rec #1): the greedy
+            // device-argmax read already returns the shared capture-error word;
+            // reject the token before consumption if a captured sibling replay
+            // latched a device-side violation.
+            let (token_id, capture_error) = state.read_greedy_result()?;
+            if capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA decode-inline aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode-inline graph was invalidated"
+                );
+            }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
             return Ok(token_id);
@@ -1498,6 +1528,7 @@ impl DecodeCudaState {
             graph_enabled,
             mask_exposes_logical,
             graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
+            inline_graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
@@ -1859,6 +1890,86 @@ impl DecodeCudaState {
         Ok(())
     }
 
+    /// Inc-1b PR-3: run one **routed** single-token decode step through the
+    /// decode-inline sibling executor, driving the same warm-up → arm → capture →
+    /// replay CUDA-graph state machine as [`Self::run_one_token`] but on the
+    /// sibling entry points (`cohaagen-inc1b-pr3-scope.md`). The inlined body ops
+    /// fold into the captured graph via the identical segmenter/warm-seeded
+    /// machinery; body ops that sync/host-read (Transpose/Slice/Tile/ReduceSum)
+    /// stay quarantined to eager seams by the sibling executor's own
+    /// `capture_quarantine_ops`, exactly like the main path. Reached only when
+    /// `ONNX_GENAI_DECODE_INLINE_SCAN` is on (the caller's `route_inline` gate),
+    /// so capture engagement here is flag-gated; with the flag off this is never
+    /// called and the sibling is never even built.
+    ///
+    /// The main decode capture machine ([`Self::run_one_token`]) is NOT reached on
+    /// routed steps, so the shared EP's single graph slot + capture-error latch
+    /// are owned solely by the sibling — no double-capture, no cross-latch bleed.
+    fn run_one_token_inline(
+        &mut self,
+        session: &mut InferenceSession,
+        trace: &TraceContext,
+    ) -> anyhow::Result<()> {
+        debug_assert!(self.auxiliary_binding_range.end <= self.base_binding_count);
+        if !self.graph_enabled {
+            session.run_decode_inline_with_device_bindings(&[], &mut self.bindings)?;
+            return Ok(());
+        }
+
+        match self.inline_graph_phase {
+            DecodeCudaGraphPhase::NeedsWarmup => {
+                session.run_decode_inline_with_device_bindings(&[], &mut self.bindings)?;
+                self.inline_graph_phase = DecodeCudaGraphPhase::Armed;
+            }
+            DecodeCudaGraphPhase::Armed => {
+                match session
+                    .try_capture_decode_inline_with_device_bindings(&[], &mut self.bindings)?
+                {
+                    DeviceGraphCaptureResult::Captured(outputs) => {
+                        if outputs.iter().any(Option::is_some) {
+                            bail!(
+                                "captured CUDA decode-inline step unexpectedly materialized a host output"
+                            );
+                        }
+                        self.graph_captures += 1;
+                        self.inline_graph_phase = DecodeCudaGraphPhase::Ready;
+                        tracing::debug!(
+                            capacity = self.max_len,
+                            captures = self.graph_captures,
+                            segments = session.decode_inline_captured_graph_segment_count(),
+                            "native CUDA decode-inline graph captured"
+                        );
+                    }
+                    DeviceGraphCaptureResult::NotCapturable(report) => {
+                        self.graph_fallbacks += 1;
+                        self.inline_graph_phase = DecodeCudaGraphPhase::Unsupported;
+                        trace_capture_declines(trace, &report);
+                        let reason = report.to_string();
+                        self.graph_fallback_reason = Some(reason.clone());
+                        self.graph_fallback_report = Some(report);
+                        tracing::warn!(
+                            "native CUDA decode-inline graph capture disabled for this generation: {reason}"
+                        );
+                        session.run_decode_inline_with_device_bindings(&[], &mut self.bindings)?;
+                    }
+                }
+            }
+            DecodeCudaGraphPhase::Ready => {
+                let still_valid = session.replay_decode_inline_device_graph(&mut self.bindings)?;
+                self.graph_replays += 1;
+                if !still_valid {
+                    // A control-flow seam retired the sibling's captured graph
+                    // after producing this token eagerly; re-warm and re-capture.
+                    self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+                }
+            }
+            DecodeCudaGraphPhase::Unsupported => {
+                session.run_decode_inline_with_device_bindings(&[], &mut self.bindings)?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_logits(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
         let bytes = self.bindings[self.logits_binding].read_bytes()?;
         let logits = Tensor::from_raw(self.logits_dtype, self.logits_shape.clone(), &bytes)?;
@@ -1896,7 +2007,13 @@ impl DecodeCudaState {
         session: &mut InferenceSession,
     ) -> anyhow::Result<()> {
         session.reset_device_graph()?;
+        // The sibling shares the main executor's EP, so the reset above already
+        // cleared the shared EP graph + capture-error latch; additionally clear
+        // the sibling executor's host-side capture schedule so a routed decode
+        // step re-warms rather than replaying a graph the EP has dropped.
+        session.reset_decode_inline_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+        self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         Ok(())
     }
 
