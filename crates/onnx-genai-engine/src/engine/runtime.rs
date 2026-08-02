@@ -184,6 +184,18 @@ impl Engine {
         Ok(id)
     }
 
+    #[cfg(feature = "native-backend")]
+    fn default_native_session(&mut self) -> anyhow::Result<SessionId> {
+        if let Some(id) = self.native_default_session
+            && self.native_sessions.contains_key(&id)
+        {
+            return Ok(id);
+        }
+        let id = self.create_native_session_state()?;
+        self.native_default_session = Some(id);
+        Ok(id)
+    }
+
     fn require_ort_backend(&self, feature: &str) -> anyhow::Result<()> {
         if self.decode_backend == EngineDecodeBackend::Native {
             anyhow::bail!(
@@ -351,7 +363,25 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if !generate_uses_scheduler(self.decode_backend) {
-            return self.generate_native_cold_with_callback(request, callback);
+            #[cfg(feature = "native-backend")]
+            {
+                // Speculation still runs cold: the native speculative paths own
+                // the KV cache themselves and cannot resume a shared prefix.
+                let native_spec_requested = request.options.speculative_mode.is_some()
+                    || request.options.num_speculative_tokens.is_some();
+                if request.options.cold_start || native_spec_requested {
+                    let result = self.generate_native_cold_with_callback(request, callback);
+                    self.native_active_session = None;
+                    return result;
+                }
+                let session_id = self.default_native_session()?;
+                return self
+                    .generate_native_in_session_with_callback(session_id, request, callback);
+            }
+            #[cfg(not(feature = "native-backend"))]
+            {
+                return self.generate_native_cold_with_callback(request, callback);
+            }
         }
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_callback(session_id, request, callback);
@@ -1029,6 +1059,9 @@ impl Engine {
                     .context("native decoder session is unavailable")?;
                 native.reset()?;
                 self.native_active_session = None;
+            }
+            if self.native_default_session == Some(session_id) {
+                self.native_default_session = None;
             }
             return Ok(());
         }
