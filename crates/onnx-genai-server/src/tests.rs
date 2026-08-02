@@ -13,6 +13,8 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+#[cfg(feature = "native-backend")]
+use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
@@ -2001,6 +2003,38 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .expect("fast request timed out behind stalled consumer")
         .expect("fast request failed");
     assert_eq!(fast_result.token_ids.len(), 2);
+}
+
+#[cfg(feature = "native-backend")]
+#[tokio::test]
+async fn native_driver_sessions_generate_through_server_path() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-native-sub4-engine");
+    let engine = Engine::from_dir(
+        &model_dir,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    let driver = EngineDriver::start(engine, 2, 4);
+    let session_id = driver.create_session().await.unwrap();
+
+    let mut request =
+        onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    let rx = driver.generate(Some(session_id), request).await.unwrap();
+    let result = timeout(Duration::from_secs(5), collect_generation_result(rx))
+        .await
+        .expect("native session generation timed out")
+        .expect("native session generation failed");
+
+    assert_eq!(result.token_ids, vec![1, 1]);
+    assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
+    driver.close_session(session_id).await.unwrap();
 }
 
 #[tokio::test]

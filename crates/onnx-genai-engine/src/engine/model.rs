@@ -37,9 +37,18 @@ pub struct Engine {
     /// by the server's fallback driver in this first milestone.
     #[cfg(feature = "native-backend")]
     pub(crate) native_session: Option<crate::native_decode::NativeDecodeSession>,
-    /// Persistent native session state for incremental KV reuse across turns.
+    /// Multi-session native state: per-session token history keyed by session id.
+    /// The active session (whose KV is loaded in `native_session`) is tracked by
+    /// `native_active_session`. When switching, the engine re-prefills from the
+    /// target session's token history.
     #[cfg(feature = "native-backend")]
-    pub(crate) native_session_state: Option<NativeSessionState>,
+    pub(crate) native_sessions: HashMap<SessionId, NativeSessionState>,
+    /// Which native session currently has its KV state loaded in `native_session`.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_active_session: Option<SessionId>,
+    /// Monotonic counter for native session id generation.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_session_counter: u64,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
