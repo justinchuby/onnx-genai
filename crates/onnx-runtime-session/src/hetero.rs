@@ -48,7 +48,8 @@ use onnx_runtime_ep_api::{
     KernelMatch, Result as EpResult, SubgraphClaim,
 };
 use onnx_runtime_ir::{
-    DataType, Graph, GraphViewCache, Node, NodeId, Shape, TensorLayout, ValueId,
+    DataType, Graph, GraphViewCache, ModelFunction, ModelFunctionKey, Node, NodeId, Shape,
+    TensorLayout, ValueId,
 };
 use onnx_runtime_loader::WeightStore;
 
@@ -109,6 +110,12 @@ pub struct HeterogeneousPlan {
     pub transfers: Vec<Transfer>,
     /// Per-node provider assignment (stable across runs).
     pub node_placement: HashMap<NodeId, EpId>,
+    /// Legalized graph used by this plan when assignment-time function fallback
+    /// expanded kept model-local function ops.
+    /// TODO(hetero-session-phase3): make the public multi-EP executor own this
+    /// planned graph directly, including child control-flow hetero plans, instead
+    /// of threading it as a compatibility overlay for the Phase-1 planner.
+    pub legalized_graph: Option<Arc<Graph>>,
 }
 
 /// Capability oracle that reports support only for a fixed set of nodes.
@@ -255,6 +262,362 @@ fn assign_nodes(graph: &Graph, providers: &[ProviderPlacement]) -> Result<HashMa
         }
     }
     Ok(placement)
+}
+
+fn provider_by_id(providers: &[ProviderPlacement], ep: EpId) -> Option<&ProviderPlacement> {
+    providers.iter().find(|slot| slot.ep == ep)
+}
+
+fn model_function_key(node: &Node) -> ModelFunctionKey {
+    (node.domain.clone(), node.op_type.clone())
+}
+
+fn function_like_node_bound(graph: &Graph) -> usize {
+    let mut count = graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            let key = model_function_key(node);
+            graph.model_functions.contains_key(&key)
+                || graph.ambiguous_model_functions.contains(&key)
+        })
+        .count();
+    for subgraph in graph.subgraphs.values() {
+        count += function_like_node_bound(subgraph);
+    }
+    for function in graph.model_functions.values() {
+        count += function_like_node_bound(&function.body);
+    }
+    count
+}
+
+fn unsupported_function_nodes(
+    graph: &Graph,
+    providers: &[ProviderPlacement],
+) -> Result<Vec<NodeId>> {
+    let mut out = Vec::new();
+    for (node_id, node) in graph.nodes.iter() {
+        let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
+        let (shapes, dtypes, layouts) = node_capability_inputs(graph, node);
+        if providers.iter().any(|slot| {
+            slot.provider
+                .supports_op(node, opset, &shapes, &dtypes, &layouts)
+                .is_supported()
+        }) {
+            continue;
+        }
+        let key = model_function_key(node);
+        if graph.ambiguous_model_functions.contains(&key) {
+            return Err(SessionError::Internal(format!(
+                "cannot legalize model-local function node {}::{} (node #{}): \
+                 multiple overloads share this (domain, op_type); add overload-aware \
+                 function metadata before heterogeneous planning",
+                node.domain, node.op_type, node_id.0
+            )));
+        }
+        if graph.model_functions.contains_key(&key) {
+            out.push(node_id);
+        } else {
+            let reason = providers
+                .iter()
+                .map(|slot| slot.provider.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(SessionError::unsupported_op(
+                node,
+                node_id,
+                opset,
+                reason,
+                "no registered provider supports this operator at this opset/shape",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn assigned_function_mismatches(
+    graph: &Graph,
+    providers: &[ProviderPlacement],
+    placement: &HashMap<NodeId, EpId>,
+) -> Result<Vec<NodeId>> {
+    let mut out = Vec::new();
+    for (&node_id, &ep) in placement {
+        let node = graph.node(node_id);
+        let key = model_function_key(node);
+        if !graph.model_functions.contains_key(&key)
+            && !graph.ambiguous_model_functions.contains(&key)
+        {
+            continue;
+        }
+        if graph.ambiguous_model_functions.contains(&key) {
+            return Err(SessionError::Internal(format!(
+                "cannot legalize model-local function node {}::{} (node #{}): \
+                 multiple overloads share this (domain, op_type); add overload-aware \
+                 function metadata before heterogeneous planning",
+                node.domain, node.op_type, node_id.0
+            )));
+        }
+        let Some(slot) = provider_by_id(providers, ep) else {
+            return Err(SessionError::Internal(format!(
+                "no execution provider registered for EpId({})",
+                ep.0
+            )));
+        };
+        let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
+        let (shapes, dtypes, layouts) = node_capability_inputs(graph, node);
+        if !slot
+            .provider
+            .supports_op(node, opset, &shapes, &dtypes, &layouts)
+            .is_supported()
+        {
+            out.push(node_id);
+        }
+    }
+    Ok(out)
+}
+
+fn value_by_name(graph: &Graph, name: &str) -> Option<ValueId> {
+    graph
+        .values
+        .iter()
+        .find_map(|(vid, value)| (value.name.as_deref() == Some(name)).then_some(vid))
+}
+
+fn create_remapped_value(
+    parent: &mut Graph,
+    body: &Graph,
+    value: ValueId,
+    name: String,
+) -> ValueId {
+    let metadata = body.value(value);
+    let new_value = parent.create_named_value(name, metadata.dtype, metadata.shape.clone());
+    if !body.value_type_is_known(value) {
+        parent.mark_value_type_unknown(new_value);
+    }
+    if !body.value_shape_is_known(value) {
+        parent.mark_value_shape_unknown(new_value);
+    }
+    if let Some(weight) = body.initializers.get(&value) {
+        parent.set_initializer(new_value, weight.clone());
+    }
+    new_value
+}
+
+fn function_has_attribute_parameters(call: &Node, function: &ModelFunction) -> bool {
+    // Phase 1 IR function bodies intentionally do not preserve
+    // AttributeProto::ref_attr_name, and the IR-level inliner below only copies
+    // body attributes. Be conservative: any FunctionProto formal attribute, any
+    // proto-level ref_attr_name captured before IR conversion, or any call-site
+    // attributes on the kept function require proto-level binding and must fail
+    // closed here rather than silently inlining defaults/missing attributes.
+    !function.attributes.is_empty() || function.has_attribute_refs || !call.attributes.is_empty()
+}
+
+fn body_has_control_flow(body: &Graph) -> bool {
+    // TODO(hetero-function-phase2): support full scope-aware Graph/Graphs
+    // attribute remapping by sharing the proto inliner's FunctionLibrary-grade
+    // expansion primitive. Phase 1 handles functions that appear inside
+    // subgraphs, but not function bodies that themselves contain control flow.
+    !body.subgraphs.is_empty()
+        || body.nodes.iter().any(|(_, node)| {
+            node.attributes.values().any(|attr| {
+                matches!(
+                    attr,
+                    onnx_runtime_ir::Attribute::Graph(_) | onnx_runtime_ir::Attribute::Graphs(_)
+                )
+            })
+        })
+}
+
+fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> {
+    let call = graph.node(node_id).clone();
+    let key = model_function_key(&call);
+    if graph.ambiguous_model_functions.contains(&key) {
+        return Err(SessionError::Internal(format!(
+            "cannot legalize model-local function node {}::{} (node #{}): \
+             multiple overloads share this (domain, op_type); add overload-aware \
+             function metadata before heterogeneous planning",
+            call.domain, call.op_type, node_id.0
+        )));
+    }
+    let function: ModelFunction = graph.model_functions.get(&key).cloned().ok_or_else(|| {
+        SessionError::Internal(format!(
+            "node {}::{} (node #{}) is not a model-local function",
+            call.domain, call.op_type, node_id.0
+        ))
+    })?;
+    if body_has_control_flow(&function.body) {
+        return Err(SessionError::Internal(format!(
+            "cannot legalize model-local function node {}::{} (node #{}): \
+             function bodies containing control-flow subgraphs require the deferred \
+             overload-aware FunctionLibrary/IR splicer",
+            call.domain, call.op_type, node_id.0
+        )));
+    }
+    if function_has_attribute_parameters(&call, &function) {
+        // Phase 2: bind call-site/ref_attr_name attributes by sharing the
+        // proto-level function_inline primitive instead of this IR-only splicer.
+        return Err(SessionError::Internal(format!(
+            "cannot legalize model-local function node {}::{} (node #{}): \
+             attribute-parameterized function legalization at assignment time is not yet supported; \
+             Phase 2 must bind call-site/ref_attr_name attributes via the shared function_inline primitive",
+            call.domain, call.op_type, node_id.0
+        )));
+    }
+
+    let mut remap: HashMap<ValueId, Option<ValueId>> = HashMap::new();
+    for (index, formal) in function.inputs.iter().enumerate() {
+        if let Some(body_value) = value_by_name(&function.body, formal) {
+            remap.insert(body_value, call.inputs.get(index).copied().flatten());
+        }
+    }
+
+    let mut aliases: Vec<(ValueId, ValueId)> = Vec::new();
+    for (index, formal) in function.outputs.iter().enumerate() {
+        let Some(&actual) = call.outputs.get(index) else {
+            continue;
+        };
+        let Some(body_value) = value_by_name(&function.body, formal) else {
+            continue;
+        };
+        if function.body.value(body_value).producer.is_some() {
+            remap.insert(body_value, Some(actual));
+        } else if let Some(Some(src)) = remap.get(&body_value).copied() {
+            if src != actual {
+                aliases.push((src, actual));
+            }
+        } else {
+            remap.insert(body_value, Some(actual));
+        }
+    }
+
+    let mut fresh_index = 0usize;
+    let mut get_or_create = |parent: &mut Graph,
+                             remap: &mut HashMap<ValueId, Option<ValueId>>,
+                             value: ValueId|
+     -> Option<ValueId> {
+        if let Some(mapped) = remap.get(&value) {
+            return *mapped;
+        }
+        let base = function
+            .body
+            .value(value)
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("v{}", value.0));
+        let name = format!("__fn{}_{}_{}", node_id.0, fresh_index, base);
+        fresh_index += 1;
+        let new_value = create_remapped_value(parent, &function.body, value, name);
+        remap.insert(value, Some(new_value));
+        Some(new_value)
+    };
+
+    let order = function.body.topological_order().map_err(|error| {
+        SessionError::Internal(format!(
+            "cannot legalize model-local function node {}::{} (node #{}): function body is invalid: {error}",
+            call.domain, call.op_type, node_id.0
+        ))
+    })?;
+    let mut new_nodes = Vec::new();
+    for body_node_id in order {
+        let body_node = function.body.node(body_node_id);
+        let inputs = body_node
+            .inputs
+            .iter()
+            .map(|slot| slot.and_then(|value| get_or_create(graph, &mut remap, value)))
+            .collect::<Vec<_>>();
+        let outputs = body_node
+            .outputs
+            .iter()
+            .filter_map(|&value| get_or_create(graph, &mut remap, value))
+            .collect::<Vec<_>>();
+        let mut node = Node::new(NodeId(0), body_node.op_type.clone(), inputs, outputs);
+        node.name = if body_node.name.is_empty() {
+            format!("__fn{}_n{}", node_id.0, body_node_id.0)
+        } else {
+            format!("__fn{}_{}", node_id.0, body_node.name)
+        };
+        node.domain = body_node.domain.clone();
+        node.version = body_node.version;
+        node.attributes = body_node.attributes.clone();
+        node.doc_string = body_node.doc_string.clone();
+        new_nodes.push(node);
+    }
+    for (index, (src, dst)) in aliases.into_iter().enumerate() {
+        let mut alias = Node::new(NodeId(0), "Identity", vec![Some(src)], vec![dst]);
+        alias.name = format!("__fn{}_alias{}", node_id.0, index);
+        new_nodes.push(alias);
+    }
+
+    graph.remove_node(node_id);
+    for node in new_nodes {
+        graph.insert_node(node);
+    }
+    Ok(())
+}
+
+fn refresh_shapes(graph: &mut Graph) -> Result<()> {
+    let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
+    let opset_imports = graph.opset_imports.clone();
+    registry.infer_graph(
+        graph,
+        &opset_imports,
+        onnx_runtime_shape_inference::MergePolicy::Permissive,
+    )?;
+    Ok(())
+}
+
+fn legalize_function_fallbacks(
+    graph: &mut Graph,
+    providers: &[ProviderPlacement],
+    max_iterations: usize,
+) -> Result<bool> {
+    let mut changed = false;
+    for iteration in 0..=max_iterations {
+        let placement = match assign_nodes(graph, providers) {
+            Ok(placement) => placement,
+            Err(_) => {
+                let unsupported = unsupported_function_nodes(graph, providers)?;
+                if unsupported.is_empty() {
+                    return assign_nodes(graph, providers).map(|_| false);
+                }
+                for node in unsupported {
+                    inline_model_function_node(graph, node)?;
+                }
+                refresh_shapes(graph)?;
+                changed = true;
+                continue;
+            }
+        };
+        let mismatches = assigned_function_mismatches(graph, providers, &placement)?;
+        if mismatches.is_empty() {
+            let model_functions = graph.model_functions.clone();
+            let ambiguous_model_functions = graph.ambiguous_model_functions.clone();
+            for subgraph in graph.subgraphs.values_mut() {
+                if subgraph.model_functions.is_empty() {
+                    subgraph.model_functions = model_functions.clone();
+                }
+                if subgraph.ambiguous_model_functions.is_empty() {
+                    subgraph.ambiguous_model_functions = ambiguous_model_functions.clone();
+                }
+                changed |= legalize_function_fallbacks(subgraph, providers, max_iterations)?;
+            }
+            return Ok(changed);
+        }
+        if iteration == max_iterations {
+            return Err(SessionError::Internal(format!(
+                "unstable/recursive function legalization after {max_iterations} iterations"
+            )));
+        }
+        for node in mismatches {
+            inline_model_function_node(graph, node)?;
+        }
+        refresh_shapes(graph)?;
+        changed = true;
+    }
+    Err(SessionError::Internal(
+        "unstable/recursive function legalization exceeded iteration bound".into(),
+    ))
 }
 
 /// Emit convex partitions for one provider by running the landed
@@ -414,6 +777,17 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
             "heterogeneous placement requires at least one provider".into(),
         ));
     }
+    let mut planned_graph = graph.clone();
+    let bound = function_like_node_bound(&planned_graph)
+        + planned_graph.model_functions.len()
+        + planned_graph.ambiguous_model_functions.len();
+    let legalized = if bound > 0 {
+        legalize_function_fallbacks(&mut planned_graph, providers, bound)?
+    } else {
+        false
+    };
+    let graph = &planned_graph;
+
     let cache = GraphViewCache::build(graph)
         .map_err(|e| SessionError::Internal(format!("graph view: {e}")))?;
     let node_placement = assign_nodes(graph, providers)?;
@@ -451,6 +825,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
         partitions,
         transfers,
         node_placement,
+        legalized_graph: legalized.then(|| Arc::new(planned_graph)),
     })
 }
 
@@ -548,6 +923,7 @@ pub fn execute(
     providers: &[ProviderPlacement],
     inputs: &[(&str, &Tensor)],
 ) -> Result<Vec<Tensor>> {
+    let graph = plan.legalized_graph.as_deref().unwrap_or(graph);
     let provider_by_ep: HashMap<EpId, Arc<dyn ExecutionProvider>> = providers
         .iter()
         .map(|slot| (slot.ep, Arc::clone(&slot.provider)))

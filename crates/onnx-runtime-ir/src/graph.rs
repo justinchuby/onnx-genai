@@ -32,11 +32,43 @@ pub struct Graph {
     pub opset_imports: HashMap<String, u64>,
     /// Subgraph bodies for control-flow ops, keyed by `(node, attr_name)`.
     pub subgraphs: HashMap<(NodeId, String), Graph>,
+    /// Unique model-local functions keyed by normalized `(domain, op_type)`.
+    ///
+    /// Phase-1 heterogeneous legalization intentionally fails closed on overload
+    /// ambiguity, so overload is not represented here; ambiguous keys are tracked
+    /// separately in [`Self::ambiguous_model_functions`].
+    /// TODO(hetero-function-phase2): replace this with an overload-aware
+    /// FunctionLibrary/IR function identity instead of the bounded unique-name
+    /// catalog used by the Phase-1 correctness fix.
+    pub model_functions: HashMap<ModelFunctionKey, ModelFunction>,
+    /// Model-local function names that are ambiguous without overload metadata.
+    pub ambiguous_model_functions: HashSet<ModelFunctionKey>,
 
     next_symbol: u32,
     symbol_names: HashMap<String, SymbolId>,
     unknown_value_types: HashSet<ValueId>,
     unknown_value_shapes: HashSet<ValueId>,
+}
+
+/// Phase-1 identity for a model-local function body.
+pub type ModelFunctionKey = (String, String);
+
+/// A model-local ONNX function body converted into IR for late legalization.
+#[derive(Clone, Debug)]
+pub struct ModelFunction {
+    pub domain: String,
+    pub name: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    /// Formal attribute names declared by the FunctionProto (`attribute` plus
+    /// names from `attribute_proto`). The IR does not preserve `ref_attr_name`
+    /// bindings, so heterogeneous assignment-time IR inlining must treat these
+    /// as requiring proto-level attribute binding.
+    pub attributes: Vec<String>,
+    /// Whether any FunctionProto body attribute (including nested subgraphs) used
+    /// `ref_attr_name`. This is captured before IR conversion drops that field.
+    pub has_attribute_refs: bool,
+    pub body: Graph,
 }
 
 /// Upper bound on a plausible opset version.
