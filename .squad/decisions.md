@@ -670,3 +670,16 @@ Full report: `docs/benchmarks/2026-07-27-foundry-native-vs-ort-cuda.md`
 **By:** Cohaagen (perf)
 **What:** Widening the existing two-way split-K dispatch gate for the 7B square o_proj GEMV regressed steady native CUDA decode on H200 from 309.05 to 307.23 tok/s (−0.59%, repeatable across 5/5 trials); 1.5B and 0.5B remained within noise, and 7B greedy token IDs were byte-identical. The change was reverted.
 **Why:** Two-way split-K raises o_proj only from roughly 0.42 to 0.85 wave while adding a shared-memory reduction, so its reduction cost exceeds the grid-fill benefit. Do not retry this lever. A larger (3–4 way) specialized split factor would be a new kernel requiring its own A/B; GQA profiling remains the other candidate.
+
+
+## Active native CUDA 27B / Inc-1b guidance
+
+### 2026-08-02: Inc-1b PR-3 capture-fold shipped and merged (#589)
+**By:** Cohaagen (build) and Harry (independent review); merged by coordinator.
+**What:** PR #589 completed Inc-1b PR-3 by driving the decode-inline sibling `Executor` through existing CUDA-graph capture, flag-gated default-OFF and confined to bucket-A decode-inline/native-decode surface. It changed 4 files, left flag-off behavior a no-op, captured the single graph slot/latch path, and produced 2.05x native Qwen3.6-27B decode speedup (143.8 -> 70.1 ms/tok) with byte-exact output vs CPU fp32 oracle while capture was engaged.
+**Why:** This validates the bounded staged path for the orchestration-bound single-trip Scan/LinearAttention decode case without taking ownership of shared capture machinery or altering the #443/#543 capture surface. Harry independently approved #589, mutation-proved the critical invariants, re-ran GPU engagement, and confirmed single-slot/latch safety.
+
+### 2026-08-02: Decision inbox batch moved to archive
+**By:** Scribe
+**What:** Processed 40 inbox drops into `.squad/decisions-archive/2026-08.md`, including Cohaagen 27B/offload/Inc-1b scope and build notes, Harry reviews through #589, Mary scan/GAP review notes, and coordinator ownership/deferral records. Live file keeps only spawn-relevant Inc-1b guidance plus archive pointers.
+**Why:** The live ledger was already 45963 bytes before merging; preserving full inbox text live would exceed the Scribe size gate and slow every spawn. The archive keeps the complete record while this file carries the current directive: #589 is merged, Inc-1b capture-fold is bucket-A and default-OFF, and future claims must preserve byte-exact oracle plus capture-engagement proof.
