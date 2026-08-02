@@ -403,6 +403,16 @@ fn create_remapped_value(
     new_value
 }
 
+fn function_has_attribute_parameters(call: &Node, function: &ModelFunction) -> bool {
+    // Phase 1 IR function bodies intentionally do not preserve
+    // AttributeProto::ref_attr_name, and the IR-level inliner below only copies
+    // body attributes. Be conservative: any FunctionProto formal attribute, any
+    // proto-level ref_attr_name captured before IR conversion, or any call-site
+    // attributes on the kept function require proto-level binding and must fail
+    // closed here rather than silently inlining defaults/missing attributes.
+    !function.attributes.is_empty() || function.has_attribute_refs || !call.attributes.is_empty()
+}
+
 fn body_has_control_flow(body: &Graph) -> bool {
     // TODO(hetero-function-phase2): support full scope-aware Graph/Graphs
     // attribute remapping by sharing the proto inliner's FunctionLibrary-grade
@@ -441,6 +451,16 @@ fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> 
             "cannot legalize model-local function node {}::{} (node #{}): \
              function bodies containing control-flow subgraphs require the deferred \
              overload-aware FunctionLibrary/IR splicer",
+            call.domain, call.op_type, node_id.0
+        )));
+    }
+    if function_has_attribute_parameters(&call, &function) {
+        // Phase 2: bind call-site/ref_attr_name attributes by sharing the
+        // proto-level function_inline primitive instead of this IR-only splicer.
+        return Err(SessionError::Internal(format!(
+            "cannot legalize model-local function node {}::{} (node #{}): \
+             attribute-parameterized function legalization at assignment time is not yet supported; \
+             Phase 2 must bind call-site/ref_attr_name attributes via the shared function_inline primitive",
             call.domain, call.op_type, node_id.0
         )));
     }

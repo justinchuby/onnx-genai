@@ -227,6 +227,8 @@ fn add_relu_body(name: &str, inner_call: Option<&str>) -> ModelFunction {
         name: name.to_string(),
         inputs: vec!["X".to_string(), "B".to_string()],
         outputs: vec!["Y".to_string()],
+        attributes: Vec::new(),
+        has_attribute_refs: false,
         body,
     }
 }
@@ -349,6 +351,82 @@ fn onnx_call(op: &str, domain: &str, inputs: &[&str], outputs: &[&str]) -> onnx:
     node
 }
 
+fn onnx_float_attr(name: &str, value: f32) -> onnx::AttributeProto {
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Float as i32,
+        f: value,
+        ..Default::default()
+    }
+}
+
+fn onnx_ref_attr(name: &str, ref_attr_name: &str) -> onnx::AttributeProto {
+    onnx::AttributeProto {
+        name: name.to_string(),
+        ref_attr_name: ref_attr_name.to_string(),
+        ..Default::default()
+    }
+}
+
+fn onnx_call_with_attrs(
+    op: &str,
+    domain: &str,
+    inputs: &[&str],
+    outputs: &[&str],
+    attributes: Vec<onnx::AttributeProto>,
+) -> onnx::NodeProto {
+    let mut node = onnx_call(op, domain, inputs, outputs);
+    node.attribute = attributes;
+    node
+}
+
+fn attributed_leaky_relu_model_bytes() -> Vec<u8> {
+    let mut body = onnx_node("LeakyRelu", &["X"], &["Y"]);
+    body.attribute = vec![onnx_ref_attr("alpha", "alpha")];
+    let func = onnx::FunctionProto {
+        name: "ParamLeakyRelu".to_string(),
+        domain: "custom.domain".to_string(),
+        input: vec!["X".to_string()],
+        output: vec!["Y".to_string()],
+        attribute: vec!["alpha".to_string()],
+        node: vec![body],
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 17,
+        }],
+        ..Default::default()
+    };
+    let graph = onnx::GraphProto {
+        input: vec![onnx_value_info("x", &[4])],
+        output: vec![onnx_value_info("y", &[4])],
+        node: vec![onnx_call_with_attrs(
+            "ParamLeakyRelu",
+            "custom.domain",
+            &["x"],
+            &["y"],
+            vec![onnx_float_attr("alpha", 0.25)],
+        )],
+        ..Default::default()
+    };
+    onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![
+            onnx::OperatorSetIdProto {
+                domain: String::new(),
+                version: 17,
+            },
+            onnx::OperatorSetIdProto {
+                domain: "custom.domain".to_string(),
+                version: 1,
+            },
+        ],
+        graph: Some(graph),
+        functions: vec![func],
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 fn fused_add_relu_model_bytes() -> Vec<u8> {
     let func = onnx::FunctionProto {
         name: "FusedAddRelu".to_string(),
@@ -451,6 +529,32 @@ fn kept_function_declined_by_assignment_ep_is_inlined_and_runs() {
         Executor::build(reference_graph, reference_store, cpu_slot(0).provider).unwrap();
     let reference = reference_exec.run(&[("x", &x)]).unwrap();
     assert_byte_identical(&hetero, &reference);
+}
+
+#[test]
+fn attribute_parameterized_kept_function_legalization_fails_closed() {
+    let bytes = attributed_leaky_relu_model_bytes();
+    let keep = |node: &Node, _opset: u64, _dtypes: &[DataType]| node.op_type == "ParamLeakyRelu";
+    let (graph, _store) =
+        onnx_runtime_loader::load_model_bytes_with_weights_filtered(&bytes, ".", &keep)
+            .expect("filtered load keeps synthetic attributed function");
+    assert_eq!(op_count(&graph, "ParamLeakyRelu"), 1);
+    let function = graph
+        .model_functions
+        .get(&("custom.domain".to_string(), "ParamLeakyRelu".to_string()))
+        .expect("model-local function catalog should retain metadata");
+    assert_eq!(function.attributes, vec!["alpha".to_string()]);
+    assert!(
+        function.has_attribute_refs,
+        "ref_attr_name must be captured before IR conversion drops it"
+    );
+
+    let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
+    let err = plan(&graph, &providers).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("ParamLeakyRelu"), "{msg}");
+    assert!(msg.contains("attribute-parameterized"), "{msg}");
+    assert!(msg.contains("Phase 2"), "{msg}");
 }
 
 #[test]

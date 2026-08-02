@@ -84,6 +84,37 @@ pub(crate) fn build_graph(
     Ok(BuiltGraph { graph, name_map })
 }
 
+fn attribute_proto_has_ref_attr(attribute: &AttributeProto) -> bool {
+    if !attribute.ref_attr_name.is_empty() {
+        return true;
+    }
+    attribute
+        .g
+        .iter()
+        .chain(attribute.graphs.iter())
+        .any(graph_proto_has_ref_attr)
+}
+
+fn graph_proto_has_ref_attr(graph: &GraphProto) -> bool {
+    graph
+        .node
+        .iter()
+        .any(|node| node.attribute.iter().any(attribute_proto_has_ref_attr))
+}
+
+fn function_attribute_names(func: &onnx::FunctionProto) -> Vec<String> {
+    let mut attributes = func.attribute.clone();
+    attributes.extend(
+        func.attribute_proto
+            .iter()
+            .map(|attr| attr.name.clone())
+            .filter(|name| !name.is_empty()),
+    );
+    attributes.sort();
+    attributes.dedup();
+    attributes
+}
+
 fn build_model_function_catalog(
     model: &ModelProto,
 ) -> Result<
@@ -138,6 +169,11 @@ fn build_model_function_catalog(
                 );
             }
         }
+        let attributes = function_attribute_names(func);
+        let has_attribute_refs = func
+            .node
+            .iter()
+            .any(|node| node.attribute.iter().any(attribute_proto_has_ref_attr));
         functions.insert(
             key,
             ModelFunction {
@@ -145,6 +181,8 @@ fn build_model_function_catalog(
                 name: func.name.clone(),
                 inputs: func.input.clone(),
                 outputs: func.output.clone(),
+                attributes,
+                has_attribute_refs,
                 body,
             },
         );

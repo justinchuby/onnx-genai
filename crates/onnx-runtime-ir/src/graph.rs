@@ -60,6 +60,14 @@ pub struct ModelFunction {
     pub name: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// Formal attribute names declared by the FunctionProto (`attribute` plus
+    /// names from `attribute_proto`). The IR does not preserve `ref_attr_name`
+    /// bindings, so heterogeneous assignment-time IR inlining must treat these
+    /// as requiring proto-level attribute binding.
+    pub attributes: Vec<String>,
+    /// Whether any FunctionProto body attribute (including nested subgraphs) used
+    /// `ref_attr_name`. This is captured before IR conversion drops that field.
+    pub has_attribute_refs: bool,
     pub body: Graph,
 }
 
