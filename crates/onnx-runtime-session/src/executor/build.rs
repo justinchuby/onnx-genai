@@ -1,5 +1,16 @@
 use super::*;
 
+/// Count default-domain `Scan` nodes in a graph — the population
+/// [`Executor::build_decode_inline_sibling`] compares before/after inlining to
+/// decide whether a decode-inline plan is warranted.
+fn default_domain_scan_count(graph: &Graph) -> usize {
+    graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.is_default_domain() && node.op_type == "Scan")
+        .count()
+}
+
 pub(super) struct WeightStoreInitializerResolver(Arc<WeightStore>);
 
 impl InitializerResolver for WeightStoreInitializerResolver {
@@ -655,6 +666,44 @@ impl Executor {
         }
 
         Ok(exec)
+    }
+
+    /// Build the decode-specialized *inlined-body* sibling of this executor
+    /// (Inc-1b PR-2, `cohaagen-27b-inc1b-design.md` §1). Runs
+    /// [`inline_single_trip_scan_bodies`](onnx_runtime_ir::inline_single_trip_scan_bodies)
+    /// over this executor's graph, re-resolves interior shapes with Permissive
+    /// inference (exactly as `ChildExecutor::compile` does), and builds a second
+    /// [`Executor`] that **shares this executor's `Arc<WeightStore>` and
+    /// `Arc<dyn ExecutionProvider>`** — the multi-plan/shared-weights pattern.
+    ///
+    /// Returns `Ok(None)` when the graph has no single-trip-eligible recurrent
+    /// `Scan` (a dense / non-hybrid decoder), so the caller keeps today's Scan
+    /// child-session path unchanged. The prefill/main executor (`self`) is left
+    /// **byte-identical** — this is a separate, additive plan.
+    ///
+    /// The returned sibling runs **eager** (capture is out of scope for PR-2);
+    /// letting the inlined body fold into the captured graph is PR-3.
+    pub(crate) fn build_decode_inline_sibling(&self) -> Result<Option<Self>> {
+        let scans_before = default_domain_scan_count(&self.graph);
+        if scans_before == 0 {
+            return Ok(None);
+        }
+        let mut graph = onnx_runtime_ir::inline_single_trip_scan_bodies(&self.graph);
+        // The transform is a structural no-op unless it actually lowered an
+        // eligible Scan; if nothing changed there is no decode-inline plan to
+        // build (the model is not on the hybrid single-trip Scan path).
+        if default_domain_scan_count(&graph) >= scans_before {
+            return Ok(None);
+        }
+
+        // Re-resolve the merged interior shapes (Squeeze/Unsqueeze boundaries and
+        // remapped body values) before build, mirroring `ChildExecutor::compile`.
+        let registry = InferenceRegistry::default_registry();
+        let opset_imports = graph.opset_imports.clone();
+        registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+
+        let sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        Ok(Some(sibling))
     }
 
     /// Place the graph on execution providers: reject incompatible graphs, run

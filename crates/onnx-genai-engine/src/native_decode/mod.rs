@@ -102,6 +102,52 @@ pub struct NativeDecodeSession {
     /// a rank-3 mrope decoder gets rank-3 coordinates while a rank-2 decoder is
     /// byte-identical to before.
     position_rank: usize,
+    /// Inc-1b PR-2 decode-inline plan state. Default-off: unless the
+    /// `ONNX_GENAI_DECODE_INLINE_SCAN` flag is set AND the model is on the
+    /// hybrid single-trip recurrent `Scan` path, this stays `Disabled`/`Untried`
+    /// and every decode step uses today's Scan child-session executor unchanged.
+    decode_inline: DecodeInlineState,
+}
+
+/// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeInlineState {
+    /// Not yet probed (flag read + sibling build are lazy, at first decode step).
+    Untried,
+    /// Flag off, or the model has no single-trip-eligible `Scan`: use the main
+    /// (Scan child-session) executor for every step.
+    Disabled,
+    /// A decode-inline sibling executor is built; route single-token decode
+    /// steps to it (extent≠1 steps still fall back to the main executor).
+    Enabled,
+}
+
+/// Whether the Inc-1b PR-2 decode-inline plan is opted in via
+/// `ONNX_GENAI_DECODE_INLINE_SCAN`. **Default OFF**: only an explicit truthy
+/// value (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) enables it, so an
+/// unset or falsy var leaves decode on today's Scan child-session path with zero
+/// behavior change.
+fn decode_inline_scan_enabled() -> bool {
+    match std::env::var("ONNX_GENAI_DECODE_INLINE_SCAN") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Pure decision for whether a decode step routes to the decode-inline sibling
+/// exec (Inc-1b PR-2). Encapsulates guard #2: the decode-inline plan is a
+/// single-iteration (scan-axis extent 1) specialization, so it is used only for
+/// a single-token step and only when a sibling was actually built; every
+/// multi-token (extent≠1) step falls back to the main Scan executor.
+fn route_decode_inline_decision(
+    state: DecodeInlineState,
+    sibling_ready: bool,
+    token_count: usize,
+) -> bool {
+    state == DecodeInlineState::Enabled && sibling_ready && token_count == 1
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -452,6 +498,7 @@ impl NativeDecodeSession {
                 self.current_len
             );
         }
+        self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
             return self.decode_cuda(token_ids, past_len, step_inputs);
         }
@@ -465,6 +512,56 @@ impl NativeDecodeSession {
             NativeCpuDecodeResult::Logits(logits) => Ok(logits),
             NativeCpuDecodeResult::Token(_) => unreachable!("logits decode requested"),
         }
+    }
+
+    /// Inc-1b PR-2: lazily probe and, if opted in, build the decode-specialized
+    /// inlined-body sibling executor at the **first decode step** (not at load —
+    /// only models that actually take the hybrid decode path pay the
+    /// transform+compile, once). Default-off via `ONNX_GENAI_DECODE_INLINE_SCAN`;
+    /// a build that finds no single-trip-eligible recurrent `Scan` latches
+    /// `Disabled`, so a dense decoder never retries and stays on the main path.
+    ///
+    /// A build failure is non-fatal: it latches `Disabled` and decode proceeds
+    /// on the byte-identical main (Scan child-session) executor.
+    fn maybe_enable_decode_inline(&mut self, token_ids: &[TokenId]) {
+        if self.decode_inline != DecodeInlineState::Untried {
+            return;
+        }
+        if !decode_inline_scan_enabled() {
+            self.decode_inline = DecodeInlineState::Disabled;
+            return;
+        }
+        // Probe at the first genuine decode step (a single new token); a
+        // multi-token prefill step is not a decode step and keeps the main plan.
+        if token_ids.len() != 1 {
+            return;
+        }
+        self.decode_inline = match self.session.enable_decode_inline() {
+            Ok(true) => {
+                tracing::debug!("Inc-1b: decode-inline plan enabled (single-trip Scan lowered)");
+                DecodeInlineState::Enabled
+            }
+            Ok(false) => DecodeInlineState::Disabled,
+            Err(error) => {
+                tracing::warn!(
+                    "Inc-1b: decode-inline plan build failed, staying on the Scan child-session \
+                     path: {error}"
+                );
+                DecodeInlineState::Disabled
+            }
+        };
+    }
+
+    /// Whether this decode step should route to the decode-inline sibling exec
+    /// (Inc-1b PR-2). Guard #2 (runtime scan-axis extent==1 fallback): only a
+    /// single-token step is single-trip; any multi-token step falls back to the
+    /// main (Scan) executor so a wrongly-collapsed graph is never run.
+    fn route_decode_inline(&self, token_ids: &[TokenId]) -> bool {
+        route_decode_inline_decision(
+            self.decode_inline,
+            self.session.decode_inline_ready(),
+            token_ids.len(),
+        )
     }
 
     /// Rewind by prefix-slicing every carried host KV tensor.

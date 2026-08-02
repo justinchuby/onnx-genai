@@ -445,6 +445,9 @@ impl NativeDecodeSession {
         let position_input = self
             .step_input_name(NativeStepInputSource::PositionIds)
             .map(str::to_owned);
+        // Inc-1b PR-2: decide decode-inline routing before borrowing `cuda`
+        // mutably below (the decision reads `self.session`/`self.decode_inline`).
+        let route_inline = self.route_decode_inline(token_ids);
         let state = self
             .cuda
             .as_mut()
@@ -470,6 +473,29 @@ impl NativeDecodeSession {
 
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
+            if route_inline {
+                // Route this single-token decode step to the decode-specialized
+                // inlined-body sibling exec (eager, capture OFF for PR-2). It
+                // binds the identical persistent device KV/state bindings, so
+                // recurrent-state continuity across the prefill→decode boundary
+                // is preserved (design §3). The main exec's capture state
+                // machine stays dormant on decode, so there is no captured
+                // replay to validate below.
+                if let Err(error) = self
+                    .session
+                    .run_decode_inline_with_device_bindings(&[], &mut state.bindings)
+                {
+                    let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                    bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                }
+                let logits = state.read_logits()?;
+                if logits.iter().flatten().any(|value| !value.is_finite()) {
+                    bail!("native decoder produced non-finite logits");
+                }
+                state.set_logical_len(total_len)?;
+                self.current_len = total_len;
+                return Ok(logits);
+            }
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                 bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
@@ -776,6 +802,7 @@ impl NativeDecodeSession {
         token_id: TokenId,
         past_len: usize,
     ) -> anyhow::Result<TokenId> {
+        let route_inline = self.route_decode_inline(std::slice::from_ref(&token_id));
         let total_len = past_len
             .checked_add(1)
             .context("native decode context length overflow")?;
@@ -793,6 +820,28 @@ impl NativeDecodeSession {
             state.decode_mask_expose_len(total_len),
         )?;
         state.write_decode_inputs(token_id, past_len)?;
+        if route_inline {
+            // Inc-1b PR-2: run this single-token decode step through the
+            // decode-specialized inlined-body sibling exec (eager, capture OFF).
+            // It binds the identical persistent device KV/state bindings, so
+            // recurrent-state continuity across the prefill→decode boundary is
+            // preserved (design §3). The greedy token is read with the same
+            // device-argmax kernel the captured path uses, so tie-breaking is
+            // byte-identical and the full logits never round-trip to the host.
+            // There is no captured replay this step, so the device capture-error
+            // word does not apply and is not polled.
+            if let Err(error) = self
+                .session
+                .run_decode_inline_with_device_bindings(&[], &mut state.bindings)
+            {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+            }
+            let (token_id, _capture_error) = state.read_greedy_result()?;
+            state.set_logical_len(total_len)?;
+            self.current_len = total_len;
+            return Ok(token_id);
+        }
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
             bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");

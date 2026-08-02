@@ -406,13 +406,26 @@ impl NativeDecodeSession {
         drop(prepare_span);
 
         let uses_decode_pool = self.uses_decode_pool;
+        // Inc-1b PR-2: decide decode-inline routing before borrowing `cpu_kv`
+        // mutably (the decision reads `self.session`/`self.decode_inline`).
+        let route_inline = self.route_decode_inline(token_ids);
         let state = self
             .cpu_kv
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("decode_cpu_inplace requires CPU KV state"))?;
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
-            if token_ids.len() == 1 && !self.has_plugin_fused {
+            if route_inline {
+                // Route this single-token decode step to the decode-specialized
+                // inlined-body sibling exec (eager), binding the identical
+                // persistent KV/state buffers so recurrent-state continuity is
+                // preserved across the prefill→decode boundary (design §3).
+                onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
+                    self.session
+                        .run_decode_inline_with_device_bindings(&bindings, &mut state.bindings)
+                        .map_err(anyhow::Error::from)
+                })
+            } else if token_ids.len() == 1 && !self.has_plugin_fused {
                 onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session
                         .run_with_device_bindings(&bindings, &mut state.bindings)
