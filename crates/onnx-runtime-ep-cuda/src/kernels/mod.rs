@@ -735,6 +735,14 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
+    // the com.microsoft op — served by the same fused kernel.
+    reg.register(
+        OpKey::new("LinearAttention", "", 1),
+        Box::new(linear_attention::LinearAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("QMoE", "com.microsoft", 1),
         Box::new(qmoe::QMoEFactory {

@@ -143,18 +143,18 @@ fn check(cfg: &Config, dtype: DataType) {
         eprintln!("skip {}: no CUDA GPU", cfg.label);
         return;
     };
-    run_check(&ep, cfg, dtype);
+    run_check(&ep, cfg, dtype, DOMAIN);
 }
 
-fn run_check(ep: &CudaExecutionProvider, cfg: &Config, dtype: DataType) {
+fn run_check(ep: &CudaExecutionProvider, cfg: &Config, dtype: DataType, domain: &str) {
     let inputs = build_inputs(cfg, dtype);
     let outputs = vec![
         (dtype, vec![cfg.batch, cfg.seq, cfg.output_hidden()]),
         (dtype, vec![cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v]),
     ];
     let a = attrs(cfg);
-    let cuda = run_cuda(ep, "LinearAttention", DOMAIN, OPSET, &inputs, &outputs, &a);
-    let cpu = run_cpu("LinearAttention", DOMAIN, OPSET, &inputs, &outputs, &a);
+    let cuda = run_cuda(ep, "LinearAttention", domain, OPSET, &inputs, &outputs, &a);
+    let cpu = run_cpu("LinearAttention", domain, OPSET, &inputs, &outputs, &a);
     assert_eq!(cuda.len(), 2, "{}: expected 2 outputs", cfg.label);
     assert_eq!(cpu.len(), 2, "{}: CPU expected 2 outputs", cfg.label);
     let tol = tolerance(dtype);
@@ -162,7 +162,7 @@ fn run_check(ep: &CudaExecutionProvider, cfg: &Config, dtype: DataType) {
         let got = decode_floats(&cuda[idx], dtype);
         let want = decode_floats(&cpu[idx], dtype);
         assert_close(
-            &format!("{} [{name}] {dtype:?}", cfg.label),
+            &format!("{} [{name}] {dtype:?} ({domain})", cfg.label),
             dtype,
             &got,
             &want,
@@ -310,6 +310,61 @@ fn linear_attention_f16_parity() {
 fn linear_attention_bf16_parity() {
     for cfg in configs() {
         check(&cfg, DataType::BFloat16);
+    }
+}
+
+/// The standard ONNX-domain spelling (`""`) must dispatch to the SAME fused
+/// kernel and match the CPU oracle exactly like the `com.microsoft` spelling —
+/// proving the dual-domain registration (onnx/onnx#7689) is wired end to end.
+#[test]
+fn linear_attention_standard_domain_parity() {
+    let Some(ep) = cuda_ep() else {
+        eprintln!("skip: no CUDA GPU");
+        return;
+    };
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for cfg in configs() {
+            run_check(&ep, &cfg, dtype, "");
+        }
+    }
+}
+
+/// The two domain spellings are semantically identical: for the same inputs the
+/// standard-domain (`""`) and `com.microsoft` ops must produce byte-identical
+/// CUDA outputs (same kernel, no numeric drift).
+#[test]
+fn linear_attention_both_domains_identical() {
+    let Some(ep) = cuda_ep() else {
+        eprintln!("skip: no CUDA GPU");
+        return;
+    };
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for cfg in configs() {
+            let inputs = build_inputs(&cfg, dtype);
+            let outputs = vec![
+                (dtype, vec![cfg.batch, cfg.seq, cfg.output_hidden()]),
+                (dtype, vec![cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v]),
+            ];
+            let a = attrs(&cfg);
+            let msft = run_cuda(
+                &ep,
+                "LinearAttention",
+                "com.microsoft",
+                OPSET,
+                &inputs,
+                &outputs,
+                &a,
+            );
+            let std = run_cuda(&ep, "LinearAttention", "", OPSET, &inputs, &outputs, &a);
+            assert_eq!(msft.len(), std.len(), "{}: output arity", cfg.label);
+            for (idx, name) in ["output", "present_state"].iter().enumerate() {
+                assert_eq!(
+                    msft[idx], std[idx],
+                    "{} [{name}] {dtype:?}: com.microsoft vs standard-domain bytes differ",
+                    cfg.label
+                );
+            }
+        }
     }
 }
 

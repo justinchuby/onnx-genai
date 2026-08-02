@@ -37,6 +37,14 @@ const DEFAULT_MODEL_DIR: &str = "/home/justinchu/mary-models/qwen3.6-27b-int4-cu
 const PROMPT: &str = "The capital of France is";
 const MAX_NEW_TOKENS: usize = 16;
 
+/// The known-good greedy decode for `PROMPT` on the stock 27B export — the
+/// byte-exact correctness lock. With the fused-dispatch loader change the 48
+/// `com.microsoft::LinearAttention` function calls stay as ops (no inlined
+/// `Scan`) and dispatch to the fused kernel; the token stream must be unchanged.
+const GOLDEN_IDS: [u32; 16] = [
+    11751, 13, 271, 248068, 271, 248069, 271, 4639, 369, 4252, 13, 11751, 369, 279, 6511, 321,
+];
+
 fn model_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("QWEN3_6_27B_CUDA_E2E_DIR")
         .map(PathBuf::from)
@@ -119,6 +127,67 @@ fn stock_export_auto_derives_io_and_matches_cpu_oracle() -> anyhow::Result<()> {
         MAX_NEW_TOKENS,
         "expected {MAX_NEW_TOKENS} generated tokens, got {}",
         cuda.token_ids.len()
+    );
+    assert_eq!(
+        cuda.token_ids, GOLDEN_IDS,
+        "fused-dispatch native CUDA decode diverged from the known-good greedy \
+         ids — keeping LinearAttention as a fused op (no inlined Scan) must be \
+         byte-exact.\ngot={:?}\nwant={:?}",
+        cuda.token_ids, GOLDEN_IDS
+    );
+    Ok(())
+}
+
+/// Structural lock for Part 1 of the fused-dispatch lever: loading the stock 27B
+/// through the same claim-driven filtered loader the session uses must keep all
+/// 48 `com.microsoft::LinearAttention` calls as fused ops and inline ZERO of
+/// their `Scan` bodies. This is the "0 LinearAttention Scans" gate.
+#[test]
+#[ignore = "requires the real Qwen3.6-27B int4 hybrid export and a CUDA device"]
+fn stock_export_keeps_linear_attention_as_fused_op_with_zero_scans() -> anyhow::Result<()> {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let Some(dir) = model_dir() else {
+        return Ok(());
+    };
+    let ep = match onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        Ok(ep) => ep,
+        Err(error) => {
+            eprintln!("skipping 0-Scan structural check: CUDA unavailable: {error}");
+            return Ok(());
+        }
+    };
+
+    let bytes = std::fs::read(dir.join("model.onnx"))?;
+    // Same predicate the session builds: keep a function call as an op iff this
+    // EP's claim gate reports a fused kernel for it.
+    let keep = |node: &onnx_runtime_ir::Node,
+                opset: u64,
+                dtypes: &[onnx_runtime_ir::DataType]| {
+        ep.supports_op(node, opset, &[], dtypes, &[]).is_supported()
+    };
+    let (graph, _weights) =
+        onnx_runtime_loader::load_model_bytes_with_weights_filtered(&bytes, &dir, &keep)?;
+
+    let mut linear_attention = 0usize;
+    let mut scans = 0usize;
+    for id in graph.topological_order().expect("loaded graph is a DAG") {
+        match graph.node(id).op_type.as_str() {
+            "LinearAttention" => linear_attention += 1,
+            "Scan" => scans += 1,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "loaded 27B plan: LinearAttention fused ops={linear_attention}, Scan ops={scans}"
+    );
+    assert_eq!(
+        linear_attention, 48,
+        "expected 48 fused LinearAttention ops kept in the runtime plan"
+    );
+    assert_eq!(
+        scans, 0,
+        "expected 0 Scans — every LinearAttention must stay a fused op, not inline its Scan body"
     );
     Ok(())
 }

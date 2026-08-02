@@ -44,12 +44,19 @@ pub(crate) struct BuiltGraph {
 ///
 /// [`WeightRef`]: onnx_runtime_ir::WeightRef
 /// [`Graph::validate`]: onnx_runtime_ir::Graph::validate
-pub(crate) fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError> {
+pub(crate) fn build_graph(
+    model: &ModelProto,
+    keep_as_op: Option<&crate::function_inline::KeepAsOp<'_>>,
+) -> Result<BuiltGraph, LoaderError> {
     // Expand any model-local function calls into their primitive bodies before
     // building the IR, so the rest of the pipeline only ever sees ops the
     // runtime has kernels for. No-op (borrow) when the model declares no
-    // functions.
-    let inlined = crate::function_inline::inline_functions(model)?;
+    // functions. When `keep_as_op` is supplied, a function call a fused kernel
+    // claims is kept as an op instead of being inlined.
+    let inlined = match keep_as_op {
+        Some(keep) => crate::function_inline::inline_functions_filtered(model, keep)?,
+        None => crate::function_inline::inline_functions(model)?,
+    };
     let model = inlined.as_ref();
 
     let mut graph = Graph::new();

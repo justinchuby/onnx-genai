@@ -516,6 +516,12 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory),
     );
+    // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
+    // the com.microsoft op — served by the same fused kernel.
+    reg.register(
+        OpKey::new("LinearAttention", "", 1),
+        Box::new(linear_attention::LinearAttentionFactory),
+    );
     // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
     // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
     // dequantizes on the fly to the graph's activation dtype.
