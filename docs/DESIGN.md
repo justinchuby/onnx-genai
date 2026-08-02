@@ -7979,6 +7979,49 @@ Both are standard ONNX ops. No custom ops needed. The "paging" is expressed pure
 
 ### 39.5 Recommended Strategy
 
+> **Superseded.** The plan below was written before virtual memory mapping was
+> considered. The decided strategy is in #596; this section records what changed
+> and why, because the original reasoning is still useful for the options it
+> rules out.
+>
+> **What changed.** Options A–C all assume the runtime must either copy pages
+> into a contiguous buffer or change the model graph. There is a third
+> possibility neither considered: reserve a contiguous **virtual address range**
+> per sequence and map physically scattered pages into it. The attention op sees
+> one flat buffer and runs the unmodified contiguous kernel; the pages remain
+> individually reclaimable and migratable. Growth needs no copy, and offload
+> becomes unmap/remap rather than memcpy.
+>
+> ```
+> CUDA        cuMemAddressReserve + cuMemCreate + cuMemMap + cuMemSetAccess
+> Linux host  mmap reservation + MAP_FIXED
+> Windows     VirtualAlloc2 + MapViewOfFile3 placeholders
+> ```
+>
+> **Measured granularity** (RTX 4060 Laptop, Windows), which is what decides
+> where this is cheap. ONNX exposes one `past_key`/`past_value` per layer, so a
+> range is reserved per tensor and layers cannot share one:
+>
+> | mapping | granularity | tokens per granule, 8B GQA (2048 B/token) |
+> |---|---|---|
+> | CUDA VMM (min and recommended) | 2 MiB | 1024 |
+> | Windows host | 64 KiB | 32 |
+>
+> On the host, granularity is as fine as paging, so virtual contiguity is
+> strictly better than both copying and a paged kernel. On CUDA the 2 MiB granule
+> floors a sequence at `num_layers × 2 × 2 MiB` regardless of its length, which
+> only matters with many concurrent short sequences — a workload this project has
+> decided not to target.
+>
+> **Phase 3 is dropped.** ORT's `PagedAttention`
+> (`contrib_ops/cuda/bert/paged_attention.*`) exists, but it is CUDA-only — zero
+> hits under `contrib_ops/cpu` — and it is a *graph operator*, so a stock
+> HuggingFace export containing `GroupQueryAttention` cannot use it. §39.4
+> already reached that conclusion. It would pay off only at concurrency that is
+> out of scope, and would fork the exported graph by device.
+
+The original plan, kept for the record:
+
 ```
 Phase 1 (now):     Option A with incremental gather
                    Works with ALL existing ONNX models
@@ -7992,6 +8035,24 @@ Phase 2 (medium):  Option C for Mobius-exported models
 Phase 3 (future):  Custom PagedAttention ONNX op
                    Like FlashAttention but paging-aware
                    Maximum performance, requires ORT EP support
+```
+
+The decided replacement:
+
+```
+Now:      Virtual contiguity on the host (ORT CPU and native CPU)
+          Model-agnostic, no kernel change, removes the mirror copy
+
+Next:     Virtual contiguity on CUDA
+          Same properties; 2 MiB granularity is affordable at the
+          concurrency this project targets
+
+Also:     native_decode/paged_gqa.rs already reads pages directly and is
+          bit-for-bit identical to the contiguous kernel. Wiring it into
+          live decode is an optimisation, not a prerequisite, once virtual
+          contiguity exists
+
+Dropped:  PagedAttention as a graph op (CUDA-only, needs model changes)
 ```
 
 ### 39.6 Scatter/Gather Cost Analysis
