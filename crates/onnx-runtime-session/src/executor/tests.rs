@@ -42,15 +42,15 @@ fn phase_profile_gating_and_accumulation() {
         "an enabled span must accumulate a positive duration"
     );
     assert!(
-        phase_profile::all_stats()
-            .iter()
-            .any(|(phase, _, _)| *phase == enabled_phase),
-        "enabled phase must appear in aggregate stats before reset"
+        phase_profile::snapshot(enabled_phase).is_some(),
+        "enabled phase must appear in stats before reset"
     );
     phase_profile::reset();
+    // Other tests can repopulate the process-global stats map under the
+    // parallel runner, so assert only this test's unique phase was cleared.
     assert!(
-        phase_profile::all_stats().is_empty(),
-        "reset must clear accumulated phase stats"
+        phase_profile::snapshot(enabled_phase).is_none(),
+        "reset must clear this test's accumulated phase stats"
     );
 
     // Restore the default (disabled) state so other tests stay inert.
