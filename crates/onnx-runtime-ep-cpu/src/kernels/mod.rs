@@ -1690,7 +1690,9 @@ mod tests {
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
         // `CausalConvWithState` and `LinearAttention` (Qwen3.5 hybrid
-        // linear-attention primitives) add two more contrib entries,
+        // linear-attention primitives) add two more contrib entries, and
+        // `LinearAttention` is additionally registered under the standard ONNX
+        // domain (onnx/onnx#7689), reusing the same kernel, for one more entry.
         // `GatherBlockQuantized` (block-quantized embedding gather) adds one,
         // the `com.microsoft::RotaryEmbedding` contrib alias adds one,
         // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one, and
@@ -1703,7 +1705,7 @@ mod tests {
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 100 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 101 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
