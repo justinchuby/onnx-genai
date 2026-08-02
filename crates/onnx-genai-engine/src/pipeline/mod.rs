@@ -750,9 +750,16 @@ impl PipelineEngine {
                 let component_governor = component_governor(&config, kv_model.as_ref())?;
                 let fixed_state_budget_bytes =
                     component_governor.snapshot().resolved_limits.host_ram_bytes;
-                let pipeline_pages =
-                    usize::try_from(component_governor.snapshot().derived_budget.total_pages)
-                        .unwrap_or(usize::MAX);
+                let pipeline_pages = match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::kv_pages_for_budget(
+                        component_governor.snapshot().derived_budget.kv_bytes,
+                        config.scheduler.max_total_tokens,
+                        kv_model.tensor_config.page_size,
+                        kv_model.tensor_config.dtype,
+                        &kv_model.layer_configs,
+                    ),
+                    None => 0,
+                };
                 // A zero page size makes `div_ceil` panic and the page-boundary
                 // walk below produce zeros forever, so it is refused rather than
                 // carried into arithmetic that assumes it is positive.

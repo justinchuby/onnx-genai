@@ -247,11 +247,11 @@ impl Engine {
         };
         let mut scheduler_config = config.scheduler.clone();
         // The native pool carries no per-layer geometry, so it holds only
-        // bookkeeping and occupies nothing. Its size still comes from the
-        // governor rather than a separate config knob, so there is one answer
-        // to "how many pages" instead of two that can disagree.
-        let native_kv_pages =
-            usize::try_from(governor.snapshot().derived_budget.total_pages).unwrap_or(usize::MAX);
+        // bookkeeping. Its size is a fixed bound rather than a budget
+        // derivation: the table pre-creates one `Page` per slot, so deriving
+        // the count from a memory budget would build hundreds of millions of
+        // empty structs for storage that is never allocated.
+        let native_kv_pages = BOOKKEEPING_POOL_PAGES;
         if scheduler_config.bytes_per_token.is_none() {
             scheduler_config.bytes_per_token = Some(
                 governor_kv_config
@@ -523,9 +523,14 @@ fn load_draft_model(
             config.page_size,
             onnx_genai_kv::KvDType::F32,
         )?;
-        let draft_pages =
-            usize::try_from(governor.snapshot().derived_budget.total_pages).unwrap_or(usize::MAX);
         let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
+            let draft_pages = kv_pages_for_budget(
+                governor.snapshot().derived_budget.kv_bytes,
+                config.scheduler.max_total_tokens,
+                kv_model.tensor_config.page_size,
+                kv_model.tensor_config.dtype,
+                &kv_model.layer_configs,
+            );
             PagedKvCache::new_leased(
                 kv_model.tensor_config.page_size,
                 kv_model.tensor_config.dtype,
@@ -540,7 +545,7 @@ fn load_draft_model(
                  draft model needs its own pages alongside the target model's",
             )?
         } else {
-            PagedKvCache::new(config.page_size, draft_pages)
+            PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES)
         };
         Some(DraftModel {
             session: Box::new(draft_session),
@@ -553,6 +558,43 @@ fn load_draft_model(
         None
     };
     Ok(draft)
+}
+
+/// Pages retained by a pool that holds no KV data.
+///
+/// Without per-layer geometry a page carries no storage, so this bounds only
+/// the page-table bookkeeping. It still needs a bound: the table pre-creates
+/// one `Page` per slot, so a count derived from a memory budget would build
+/// hundreds of millions of empty structs and exhaust the machine before any KV
+/// existed.
+const BOOKKEEPING_POOL_PAGES: usize = 1024;
+
+/// How many pages of real KV storage fit in the governor's KV budget.
+///
+/// Deliberately **not** `derived_budget.total_pages`. That figure divides the
+/// budget by the governor's own `page_size_bytes`, which is a placeholder when
+/// no KV model has been inferred — on a machine with 8 GiB of device memory it
+/// resolves to hundreds of millions of pages, and the pool would try to
+/// allocate a `Page` for every one of them. The page count has to come from the
+/// geometry the pages will actually have.
+pub(crate) fn kv_pages_for_budget(
+    kv_budget_bytes: u64,
+    working_set_tokens: usize,
+    page_size: usize,
+    dtype: onnx_genai_kv::KvDType,
+    layer_configs: &[onnx_genai_kv::LayerTensorConfig],
+) -> usize {
+    let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, layer_configs.len());
+    let per_page =
+        onnx_genai_kv::PageTable::planned_pool_bytes(page_size, 1, layer_configs, Some(&quant));
+    if per_page == 0 {
+        return BOOKKEEPING_POOL_PAGES;
+    }
+    let ceiling = usize::try_from(kv_budget_bytes / per_page).unwrap_or(usize::MAX);
+    let wanted = working_set_tokens.div_ceil(page_size.max(1));
+    // At least one page, or the pool cannot hold a single token and the failure
+    // surfaces later as a decode that mysteriously caches nothing.
+    wanted.min(ceiling).max(1)
 }
 
 /// Build the KV page pool, sized and granted by the governor.
@@ -577,11 +619,17 @@ fn allocate_kv_cache(
     governor: &EngineResourceGovernor,
 ) -> anyhow::Result<PagedKvCache> {
     let budget = governor.snapshot().derived_budget;
-    let num_pages = usize::try_from(budget.total_pages).unwrap_or(usize::MAX);
     if let Some(kv_model) = kv_model {
+        let num_pages = kv_pages_for_budget(
+            budget.kv_bytes,
+            config.scheduler.max_total_tokens,
+            kv_model.tensor_config.page_size,
+            kv_model.tensor_config.dtype,
+            &kv_model.layer_configs,
+        );
         let mut span = onnx_genai_ort::prof_span!("engine.kv_cache_alloc");
         span.set_arg("page_size", kv_model.tensor_config.page_size as u64);
-        span.set_arg("num_gpu_pages", budget.total_pages);
+        span.set_arg("num_gpu_pages", num_pages as u64);
         span.set_arg("kv_budget_bytes", budget.kv_bytes);
         span.set_arg("layers", kv_model.layer_configs.len() as u64);
         // The paged tensor layout is derived from present-KV outputs: each
@@ -611,8 +659,8 @@ fn allocate_kv_cache(
     } else {
         let mut span = onnx_genai_ort::prof_span!("engine.kv_cache_alloc");
         span.set_arg("page_size", config.page_size as u64);
-        span.set_arg("num_gpu_pages", budget.total_pages);
-        Ok(PagedKvCache::new(config.page_size, num_pages))
+        span.set_arg("num_gpu_pages", BOOKKEEPING_POOL_PAGES as u64);
+        Ok(PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES))
     }
 }
 
@@ -969,4 +1017,119 @@ fn load_shared_kv_proposer(
         None
     };
     Ok(shared_kv_proposer)
+}
+
+#[cfg(test)]
+mod pool_sizing_tests {
+    use super::*;
+
+    fn geometry(layers: usize) -> Vec<onnx_genai_kv::LayerTensorConfig> {
+        (0..layers)
+            .map(|_| onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 8,
+                head_dim: 128,
+            })
+            .collect()
+    }
+
+    /// The pool must never be sized by a budget divided by the wrong page size.
+    ///
+    /// `derived_budget.total_pages` divides the KV budget by the governor's own
+    /// `page_size_bytes`, which is a placeholder when no KV model has been
+    /// inferred. On an 8 GiB device it comes to ~483 million pages, and because
+    /// the table pre-creates one `Page` per slot, building that pool exhausts
+    /// the machine before any KV exists -- which is exactly how this was found,
+    /// as a CI runner dying with SIGTERM mid-test.
+    ///
+    /// So the count has to come from the geometry the pages will really have,
+    /// and the resulting pool has to fit the budget it was derived from.
+    #[test]
+    fn pages_derived_from_a_budget_produce_a_pool_that_fits_that_budget() {
+        let configs = geometry(32);
+        let dtype = onnx_genai_kv::KvDType::F32;
+        for budget in [
+            64 * 1024 * 1024u64,
+            1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        ] {
+            let pages = kv_pages_for_budget(budget, 1 << 20, 16, dtype, &configs);
+            let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, configs.len());
+            let planned =
+                onnx_genai_kv::PageTable::planned_pool_bytes(16, pages, &configs, Some(&quant));
+            assert!(
+                planned <= budget,
+                "a {budget} byte budget produced {pages} pages needing {planned} bytes"
+            );
+            assert!(pages >= 1, "a usable budget produced a pool with no pages");
+        }
+    }
+
+    /// A budget too small for even one page still yields a usable pool.
+    ///
+    /// Returning zero pages would defer the failure to the first decode, which
+    /// would simply cache nothing and look like a mysterious slowdown.
+    #[test]
+    fn a_budget_below_one_page_still_yields_one_page() {
+        assert_eq!(
+            kv_pages_for_budget(1, 65536, 16, onnx_genai_kv::KvDType::F32, &geometry(32)),
+            1
+        );
+    }
+
+    /// Without geometry the pool is bookkeeping only and takes a fixed bound.
+    #[test]
+    fn a_pool_without_geometry_is_bounded_rather_than_derived() {
+        assert_eq!(
+            kv_pages_for_budget(
+                8 * 1024 * 1024 * 1024,
+                65536,
+                16,
+                onnx_genai_kv::KvDType::F32,
+                &[]
+            ),
+            BOOKKEEPING_POOL_PAGES
+        );
+    }
+    /// A large budget must not become a large eager allocation.
+    ///
+    /// The page table materialises every page at construction, so sizing the
+    /// pool by the *ceiling* claims the whole KV budget before a token is
+    /// generated -- 8 GiB on an 8 GiB device. The budget is a limit, not a
+    /// target; the scheduler's working set is the target. This caught a second
+    /// bug after the first fix: engine tests went from ~2s to 872s because
+    /// every engine built a pool sized to the entire device.
+    #[test]
+    fn a_huge_budget_does_not_produce_a_huge_pool() {
+        let configs = geometry(32);
+        let dtype = onnx_genai_kv::KvDType::F32;
+        let working_set = 65_536;
+        let pages = kv_pages_for_budget(64 * 1024 * 1024 * 1024, working_set, 16, dtype, &configs);
+
+        assert_eq!(
+            pages,
+            working_set / 16,
+            "the pool should hold the scheduler's working set, not the whole budget"
+        );
+
+        let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, configs.len());
+        let planned =
+            onnx_genai_kv::PageTable::planned_pool_bytes(16, pages, &configs, Some(&quant));
+        assert!(
+            planned < 64 * 1024 * 1024 * 1024,
+            "a 64 GiB budget produced a {planned} byte pool"
+        );
+    }
+
+    /// A budget smaller than the working set still caps the pool.
+    #[test]
+    fn the_budget_still_caps_a_working_set_that_does_not_fit() {
+        let configs = geometry(32);
+        let dtype = onnx_genai_kv::KvDType::F32;
+        let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, configs.len());
+        let per_page = onnx_genai_kv::PageTable::planned_pool_bytes(16, 1, &configs, Some(&quant));
+        let budget = per_page * 4;
+
+        let pages = kv_pages_for_budget(budget, 1 << 20, 16, dtype, &configs);
+        assert_eq!(pages, 4, "the budget must cap a working set it cannot hold");
+    }
 }
