@@ -547,8 +547,6 @@ pub struct EngineConfig {
     /// A strict no-op for every other model, so the default path is unchanged.
     #[cfg(feature = "native-backend")]
     pub decode_precision: onnx_runtime_session::DecodePrecision,
-    /// Number of GPU pages for KV cache.
-    pub num_gpu_pages: usize,
     /// Tokens per KV page.
     pub page_size: usize,
     /// Scheduler config.
@@ -600,7 +598,6 @@ impl Default for EngineConfig {
             native_device: None,
             #[cfg(feature = "native-backend")]
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
-            num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),
             draft_model: None,

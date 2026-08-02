@@ -441,7 +441,6 @@ fn many_distinct_conversations_do_not_exhaust_the_page_pool() -> anyhow::Result<
         EngineConfig {
             page_size: 2,
             // Deliberately small: enough for a few conversations, not for fifty.
-            num_gpu_pages: 24,
             ..EngineConfig::default()
         },
     )?;

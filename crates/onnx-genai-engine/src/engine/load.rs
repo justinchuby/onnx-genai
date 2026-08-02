@@ -115,10 +115,11 @@ impl Engine {
             &environment,
             &session_options,
             metadata_max_context,
+            &governor,
         )?;
 
-        // Stage: runtime KV-cache allocation.
-        let kv_cache = allocate_kv_cache(&config, kv_model.as_ref());
+        // Stage: runtime KV-cache allocation, granted by the governor built above.
+        let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
 
         // Stage: speculative-assistant loading (mode resolution then per-mode heads).
         let (speculative_mode, resolved_mtp_config) = resolve_speculative_mode(
@@ -245,6 +246,12 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
         let mut scheduler_config = config.scheduler.clone();
+        // The native pool carries no per-layer geometry, so it holds only
+        // bookkeeping and occupies nothing. Its size still comes from the
+        // governor rather than a separate config knob, so there is one answer
+        // to "how many pages" instead of two that can disagree.
+        let native_kv_pages =
+            usize::try_from(governor.snapshot().derived_budget.total_pages).unwrap_or(usize::MAX);
         if scheduler_config.bytes_per_token.is_none() {
             scheduler_config.bytes_per_token = Some(
                 governor_kv_config
@@ -296,7 +303,7 @@ impl Engine {
             decode_backend: EngineDecodeBackend::Native,
             metadata,
             metadata_hints,
-            kv_cache: PagedKvCache::new(config.page_size, config.num_gpu_pages),
+            kv_cache: PagedKvCache::new(config.page_size, native_kv_pages),
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
@@ -470,11 +477,17 @@ fn build_governor_and_scheduler(
     Ok((governor, scheduler))
 }
 
+/// Identifies the draft model's KV page pool, a second pool the engine holds
+/// that was previously sized and allocated without consulting any budget.
+const DRAFT_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
+    onnx_runtime_memory_governor::HolderId::new(3);
+
 fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
     session_options: &SessionOptions,
     metadata_max_context: Option<usize>,
+    governor: &EngineResourceGovernor,
 ) -> anyhow::Result<Option<DraftModel>> {
     let draft = if let Some(draft_model_path) = &config.draft_model {
         let draft_directory = ModelDirectory::load(draft_model_path)
@@ -510,15 +523,24 @@ fn load_draft_model(
             config.page_size,
             onnx_genai_kv::KvDType::F32,
         )?;
+        let draft_pages =
+            usize::try_from(governor.snapshot().derived_budget.total_pages).unwrap_or(usize::MAX);
         let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
-            PagedKvCache::new_with_layer_tensor_configs(
+            PagedKvCache::new_leased(
                 kv_model.tensor_config.page_size,
                 kv_model.tensor_config.dtype,
                 kv_model.layer_configs.clone(),
-                config.num_gpu_pages,
+                draft_pages,
+                governor.memory(),
+                onnx_runtime_memory_governor::Tier::Device,
+                DRAFT_KV_POOL_HOLDER,
             )
+            .context(
+                "cannot allocate the draft model's KV page pool within the device KV budget; a \
+                 draft model needs its own pages alongside the target model's",
+            )?
         } else {
-            PagedKvCache::new(config.page_size, config.num_gpu_pages)
+            PagedKvCache::new(config.page_size, draft_pages)
         };
         Some(DraftModel {
             session: Box::new(draft_session),
@@ -533,28 +555,64 @@ fn load_draft_model(
     Ok(draft)
 }
 
-fn allocate_kv_cache(config: &EngineConfig, kv_model: Option<&KvModelInfo>) -> PagedKvCache {
+/// Build the KV page pool, sized and granted by the governor.
+///
+/// The page count comes from `derived_budget.total_pages`, which the governor
+/// already computes from the device ceiling minus the fixed reservation. It
+/// used to come from `EngineConfig::num_gpu_pages` as well, and two sources of
+/// truth for one quantity is how a budget ends up describing memory nobody
+/// allocated.
+///
+/// Only the configured path holds storage worth leasing. Without per-layer
+/// geometry a pool is pure bookkeeping and occupies nothing, so it is built
+/// ungoverned rather than taking a lease of zero that implies otherwise.
+/// Identifies the KV page pool to the memory governor, so a pool asked to
+/// release under pressure can be told apart from any other holder.
+const KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
+    onnx_runtime_memory_governor::HolderId::new(1);
+
+fn allocate_kv_cache(
+    config: &EngineConfig,
+    kv_model: Option<&KvModelInfo>,
+    governor: &EngineResourceGovernor,
+) -> anyhow::Result<PagedKvCache> {
+    let budget = governor.snapshot().derived_budget;
+    let num_pages = usize::try_from(budget.total_pages).unwrap_or(usize::MAX);
     if let Some(kv_model) = kv_model {
         let mut span = onnx_genai_ort::prof_span!("engine.kv_cache_alloc");
         span.set_arg("page_size", kv_model.tensor_config.page_size as u64);
-        span.set_arg("num_gpu_pages", config.num_gpu_pages as u64);
+        span.set_arg("num_gpu_pages", budget.total_pages);
+        span.set_arg("kv_budget_bytes", budget.kv_bytes);
         span.set_arg("layers", kv_model.layer_configs.len() as u64);
         // The paged tensor layout is derived from present-KV outputs: each
         // layer has key/value tensors shaped like [batch, kv_heads, seq, head_dim].
         // Per-layer geometry (heterogeneous head_dim across layers, e.g. the
         // Gemma-4 sliding/full split) is fed from the model's own KV output
         // shapes so mixed-geometry models page correctly.
-        PagedKvCache::new_with_layer_tensor_configs(
+        PagedKvCache::new_leased(
             kv_model.tensor_config.page_size,
             kv_model.tensor_config.dtype,
             kv_model.layer_configs.clone(),
-            config.num_gpu_pages,
+            num_pages,
+            governor.memory(),
+            onnx_runtime_memory_governor::Tier::Device,
+            KV_POOL_HOLDER,
         )
+        .with_context(|| {
+            format!(
+                "cannot allocate the KV page pool: {num_pages} page(s) of {} token(s) across {} \
+                 layer(s) do not fit the {} byte KV budget; lower the context length, raise the \
+                 device limit, or use a smaller KV precision",
+                kv_model.tensor_config.page_size,
+                kv_model.layer_configs.len(),
+                budget.kv_bytes,
+            )
+        })
     } else {
         let mut span = onnx_genai_ort::prof_span!("engine.kv_cache_alloc");
         span.set_arg("page_size", config.page_size as u64);
-        span.set_arg("num_gpu_pages", config.num_gpu_pages as u64);
-        PagedKvCache::new(config.page_size, config.num_gpu_pages)
+        span.set_arg("num_gpu_pages", budget.total_pages);
+        Ok(PagedKvCache::new(config.page_size, num_pages))
     }
 }
 

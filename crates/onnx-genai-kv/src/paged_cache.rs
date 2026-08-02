@@ -116,6 +116,37 @@ impl PagedKvCache {
         }
     }
 
+    /// Heterogeneous per-layer geometry whose storage is granted by a memory
+    /// governor.
+    ///
+    /// The pool is planned, leased, and only then allocated, so it can never
+    /// occupy more than it was granted. A tier with insufficient room refuses
+    /// rather than returning a smaller pool: a pool that quietly came back
+    /// short would fail later, mid-generation, when mirroring ran dry and pages
+    /// claimed KV that was never written.
+    pub fn new_leased(
+        page_size: usize,
+        dtype: crate::KvDType,
+        layer_configs: Vec<LayerTensorConfig>,
+        num_gpu_pages: usize,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<Self, KvError> {
+        Ok(Self {
+            page_table: PageTable::new_leased(
+                page_size,
+                num_gpu_pages,
+                dtype,
+                layer_configs,
+                governor,
+                tier,
+                holder,
+            )?,
+            next_seq_id: 0,
+        })
+    }
+
     /// Heterogeneous per-layer geometry with an explicit KV precision policy.
     pub fn new_with_layer_quant_config(
         page_size: usize,

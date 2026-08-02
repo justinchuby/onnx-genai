@@ -93,6 +93,12 @@ pub(crate) const PROVISIONAL_DISK_CAPACITY_BYTES: u64 = 16 << 30;
 pub struct EngineResourceGovernor {
     inner: ResourceGovernor,
     allow_runtime_override: bool,
+    /// Grants the tier budgets that `inner` merely reports.
+    ///
+    /// Shared, so every lease this engine hands out is counted against the same
+    /// ledger; a per-caller governor would let each holder believe it had the
+    /// whole tier to itself.
+    memory: onnx_runtime_memory_governor::LedgerGovernor,
     #[cfg(feature = "native-backend")]
     weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
 }
@@ -139,6 +145,18 @@ impl EngineResourceGovernor {
             },
             kv_config,
         )?;
+        // The ledger is seeded from the *KV* budget rather than the raw device
+        // ceiling: the ceiling still has to cover weights, activations and
+        // runtime overhead, so leasing against it would let KV claim memory
+        // that is already spoken for.
+        let snapshot = inner.snapshot();
+        let memory = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new(
+                snapshot.derived_budget.kv_bytes,
+                snapshot.resolved_limits.host_ram_bytes,
+                snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
+            ),
+        );
         #[cfg(feature = "native-backend")]
         let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new(
             inner.snapshot().resolved_limits.host_ram_bytes,
@@ -150,9 +168,19 @@ impl EngineResourceGovernor {
         Ok(Self {
             inner,
             allow_runtime_override,
+            memory,
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
         })
+    }
+
+    /// The authority that grants memory leases against this engine's budgets.
+    ///
+    /// Separate from [`Self::snapshot`], which only *reports*. Anything that
+    /// holds bytes takes a lease here so the tier totals reflect what is
+    /// actually occupied rather than what was planned.
+    pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {
+        &self.memory
     }
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
@@ -267,18 +295,24 @@ pub(crate) fn governor_kv_config(
     })
 }
 
-pub(crate) fn resolved_host_ram_budget(
+/// Build a governor for a component that owns memory but is not the engine.
+///
+/// The pipeline needs one for the same reasons the engine does: to size its KV
+/// pool from a budget and to lease what it allocates. Returning the governor
+/// rather than a single number keeps both uses on **one** ledger — building a
+/// second governor per question would let each holder believe it had the whole
+/// tier to itself, which is how two pools end up each sure they own the device.
+pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
-) -> anyhow::Result<u64> {
-    let governor = EngineResourceGovernor::new(
+) -> anyhow::Result<EngineResourceGovernor> {
+    EngineResourceGovernor::new(
         config.limits.clone(),
         config.allow_runtime_override,
         governor_kv_config(kv_model, config)?,
-        // This resolves the host-RAM ceiling only, which the weight reservation
-        // does not affect; the model path is not in scope here.
+        // This resolves ceilings only; the model path is not in scope here, so
+        // the weight reservation is left at zero.
         0,
     )
-    .context("failed to resolve the engine memory budget for decoder fixed state")?;
-    Ok(governor.snapshot().resolved_limits.host_ram_bytes)
+    .context("failed to resolve the engine memory budget for decoder fixed state")
 }
