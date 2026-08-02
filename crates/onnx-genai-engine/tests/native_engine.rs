@@ -111,7 +111,8 @@ fn native_backend_rejects_unsupported_session_device() {
     let message = format!("{error:#}");
     assert!(
         message.contains("does not support execution provider")
-            && message.contains("WebGpuExecutionProvider"),
+            && message.contains("webgpu")
+            && message.contains("neither host, CUDA, nor an ORT plugin"),
         "{message}"
     );
 }
