@@ -283,8 +283,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 217);
-    assert_eq!(registry.entry_count(), 262);
+    assert_eq!(registry.operator_count(), 218);
+    assert_eq!(registry.entry_count(), 263);
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
