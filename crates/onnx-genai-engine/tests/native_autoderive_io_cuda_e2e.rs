@@ -161,9 +161,7 @@ fn stock_export_keeps_linear_attention_as_fused_op_with_zero_scans() -> anyhow::
     let bytes = std::fs::read(dir.join("model.onnx"))?;
     // Same predicate the session builds: keep a function call as an op iff this
     // EP's claim gate reports a fused kernel for it.
-    let keep = |node: &onnx_runtime_ir::Node,
-                opset: u64,
-                dtypes: &[onnx_runtime_ir::DataType]| {
+    let keep = |node: &onnx_runtime_ir::Node, opset: u64, dtypes: &[onnx_runtime_ir::DataType]| {
         ep.supports_op(node, opset, &[], dtypes, &[]).is_supported()
     };
     let (graph, _weights) =
@@ -178,9 +176,7 @@ fn stock_export_keeps_linear_attention_as_fused_op_with_zero_scans() -> anyhow::
             _ => {}
         }
     }
-    eprintln!(
-        "loaded 27B plan: LinearAttention fused ops={linear_attention}, Scan ops={scans}"
-    );
+    eprintln!("loaded 27B plan: LinearAttention fused ops={linear_attention}, Scan ops={scans}");
     assert_eq!(
         linear_attention, 48,
         "expected 48 fused LinearAttention ops kept in the runtime plan"
