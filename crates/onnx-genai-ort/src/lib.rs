@@ -49,7 +49,7 @@ pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{
     ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths,
-    model_weight_bytes,
+    graph_io_from_model_path, model_weight_bytes,
 };
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
@@ -64,9 +64,10 @@ pub use onnx_genai_metadata::{
 pub use onnx_genai_runtime_config::EpSelection;
 pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{
-    CudaAttentionMode, EpCapabilities, HardwareKind, ResolvedEp, RunPhaseError, Session,
-    SessionOptions, TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers, capability,
-    ep_selection, resolve_execution_provider, selectable_execution_providers,
+    CudaAttentionMode, EpCapabilities, GraphIo, GraphIoMetadata, HardwareKind, ResolvedEp,
+    RunPhaseError, Session, SessionOptions, TensorInfo, USE_ENV_ALLOCATORS,
+    available_execution_providers, capability, ep_selection, resolve_execution_provider,
+    selectable_execution_providers,
 };
 pub use shared_kv_proposer::{
     SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,

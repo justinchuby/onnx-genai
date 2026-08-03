@@ -9,7 +9,7 @@ use onnx_genai_kv::{
     KvCacheOps, KvDType, KvLayerPayload, KvPayload, KvPayloadDtype, LayerKv, LayerTensorConfig,
     PageId, PageTensorConfig, PagedKvCache,
 };
-use onnx_genai_ort::{DataType, Session, TensorInfo, Value};
+use onnx_genai_ort::{DataType, GraphIo, Session, TensorInfo, Value};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -63,12 +63,12 @@ struct ResolvedKvLayer {
 }
 
 pub(crate) fn infer_kv_model_info(
-    session: &Session,
+    graph: &dyn GraphIo,
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
     page_size: usize,
     dtype: KvDType,
 ) -> anyhow::Result<Option<KvModelInfo>> {
-    let Some(resolved_layers) = resolve_kv_layers(session, io)? else {
+    let Some(resolved_layers) = resolve_kv_layers(graph, io)? else {
         return Ok(None);
     };
 
@@ -123,7 +123,7 @@ pub(crate) fn infer_kv_model_info(
 /// closed, naming `model.io.kv_inputs`/`kv_outputs`, when a decoder genuinely
 /// carries unpaired KV state without an explicit declaration.
 fn resolve_kv_layers(
-    session: &Session,
+    graph: &dyn GraphIo,
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
 ) -> anyhow::Result<Option<Vec<ResolvedKvLayer>>> {
     let (kv_inputs, kv_outputs) = match io.map(|io| (io.kv_inputs.as_ref(), io.kv_outputs.as_ref()))
@@ -148,10 +148,10 @@ fn resolve_kv_layers(
     }
     let mut layers = Vec::with_capacity(port_layers.len());
     for ports in port_layers {
-        let key_present_info = require_present_kv_output(session, &ports.key_present)?;
-        require_present_kv_output(session, &ports.value_present)?;
-        require_kv_input(session, &ports.key_past)?;
-        require_kv_input(session, &ports.value_past)?;
+        let key_present_info = require_present_kv_output(graph, &ports.key_present)?;
+        require_present_kv_output(graph, &ports.value_present)?;
+        require_kv_input(graph, &ports.key_past)?;
+        require_kv_input(graph, &ports.value_past)?;
         layers.push(ResolvedKvLayer {
             key_past: ports.key_past,
             key_present: ports.key_present,
@@ -215,8 +215,8 @@ fn pair_kv_ports(
 /// Look up a declared present-KV output and validate its element type, returning
 /// its shape record for structural geometry inference. Errors name the exact
 /// missing/invalid `model.io.kv_outputs` port.
-fn require_present_kv_output(session: &Session, name: &str) -> anyhow::Result<TensorInfo> {
-    let info = session
+fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<TensorInfo> {
+    let info = graph
         .outputs()
         .iter()
         .find(|output| output.name == name)
@@ -235,8 +235,8 @@ fn require_present_kv_output(session: &Session, name: &str) -> anyhow::Result<Te
 
 /// Validate that a declared past-KV input exists; errors name the exact missing
 /// `model.io.kv_inputs` port.
-fn require_kv_input(session: &Session, name: &str) -> anyhow::Result<()> {
-    if !session.inputs().iter().any(|input| input.name == name) {
+fn require_kv_input(graph: &dyn GraphIo, name: &str) -> anyhow::Result<()> {
+    if !graph.inputs().iter().any(|input| input.name == name) {
         anyhow::bail!("declared model.io.kv_inputs port '{name}' is not exposed by the graph");
     }
     Ok(())

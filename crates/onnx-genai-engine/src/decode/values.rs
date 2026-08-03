@@ -87,7 +87,7 @@ fn fixed_state_bytes(info: &TensorInfo) -> anyhow::Result<u64> {
 }
 
 pub(super) fn validate_fixed_state_budget(
-    session: &Session,
+    session: &dyn GraphIo,
     state_pairs: &[(String, String)],
     budget_bytes: u64,
 ) -> anyhow::Result<()> {

@@ -13,7 +13,10 @@ use onnx_genai_metadata::{
 };
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
-use crate::{Environment, OrtError, Result, Session, SessionOptions, Tokenizer};
+use crate::{
+    DataType, Environment, GraphIo, GraphIoMetadata, OrtError, Result, Session, SessionOptions,
+    TensorInfo, Tokenizer,
+};
 
 /// Resolved files needed to load a single ONNX text-generation model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +329,11 @@ impl PipelineModelDirectory {
 /// Loaded ORT sessions and tokenizer assets for a pipeline model directory.
 pub struct PipelineModels {
     pub sessions: BTreeMap<String, Session>,
+    /// Declared graph I/O for components whose ORT [`Session`] was intentionally
+    /// not built because the pipeline executes them on the native backend (an
+    /// ORT session for such a component would be redundant, and a native-only
+    /// operator would make ORT reject the graph at load).
+    pub graph_io_metadata: BTreeMap<String, GraphIoMetadata>,
     pub tokenizers: BTreeMap<String, Tokenizer>,
     pub shared_tokenizer: Option<Tokenizer>,
     pub directory: PipelineModelDirectory,
@@ -340,15 +348,38 @@ impl PipelineModels {
 
     /// Resolve and load all pipeline ONNX models using caller-provided session options.
     pub fn load_with_options(root: impl AsRef<Path>, options: SessionOptions) -> Result<Self> {
+        Self::load_with_ort_session_filter(root, options, |_| true)
+    }
+
+    /// Resolve and load pipeline assets, building an ORT [`Session`] only for the
+    /// components for which `build_ort_session(name)` returns `true`.
+    ///
+    /// A component the predicate rejects is loaded as session-free
+    /// [`GraphIoMetadata`] (its declared graph I/O only, read from the ONNX graph
+    /// without instantiating ORT or materializing weights). This is how a
+    /// pipeline whose component runs on the native backend avoids building — and
+    /// having ORT reject at load — an ORT session it would never execute, while
+    /// still exposing that component's I/O contract for decode resolution through
+    /// the backend-neutral [`GraphIo`] seam ([`PipelineModels::graph_io`]).
+    pub fn load_with_ort_session_filter(
+        root: impl AsRef<Path>,
+        options: SessionOptions,
+        build_ort_session: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         let directory = PipelineModelDirectory::load(root)?;
         let environment = Environment::new("onnx-genai-pipeline")?;
 
         let mut sessions = BTreeMap::new();
+        let mut graph_io_metadata = BTreeMap::new();
         for (name, path) in &directory.model_paths {
-            sessions.insert(
-                name.clone(),
-                Session::new(&environment, path, options.clone())?,
-            );
+            if build_ort_session(name) {
+                sessions.insert(
+                    name.clone(),
+                    Session::new(&environment, path, options.clone())?,
+                );
+            } else {
+                graph_io_metadata.insert(name.clone(), graph_io_from_model_path(path)?);
+            }
         }
 
         let shared_tokenizer = directory
@@ -366,6 +397,7 @@ impl PipelineModels {
 
         Ok(Self {
             sessions,
+            graph_io_metadata,
             tokenizers,
             shared_tokenizer,
             directory,
@@ -384,6 +416,134 @@ impl PipelineModels {
     pub fn session(&self, component: &str) -> Option<&Session> {
         self.sessions.get(component)
     }
+
+    /// Return a component's declared graph I/O through the backend-neutral
+    /// [`GraphIo`] seam: the ORT session's own I/O when it was loaded on ORT,
+    /// otherwise the session-free metadata captured for a native-executed
+    /// component. Decode I/O, KV-layout, and state-budget resolution read the
+    /// contract from here so they work identically regardless of which backend
+    /// runs the component.
+    pub fn graph_io(&self, component: &str) -> Option<&dyn GraphIo> {
+        if let Some(session) = self.sessions.get(component) {
+            return Some(session as &dyn GraphIo);
+        }
+        self.graph_io_metadata
+            .get(component)
+            .map(|graph| graph as &dyn GraphIo)
+    }
+}
+
+/// Read only a component's declared graph I/O — input/output tensor names,
+/// dtypes, and shapes — from an ONNX model file, without building an ORT session
+/// or materializing external weights. Dynamic axes are represented as `-1`, the
+/// same convention [`TensorInfo`] uses for an ORT session's declared I/O.
+pub fn graph_io_from_model_path(path: &Path) -> Result<GraphIoMetadata> {
+    let bytes = model_proto_bytes(path)?;
+    let model = onnx_runtime_loader::proto::decode_model(&bytes).map_err(|error| {
+        OrtError::InvalidArgument(format!(
+            "failed to parse ONNX model {} for graph I/O: {error}",
+            path.display()
+        ))
+    })?;
+    let graph = model.graph.as_ref().ok_or_else(|| {
+        OrtError::InvalidArgument(format!("ONNX model {} has no graph", path.display()))
+    })?;
+    let inputs = graph
+        .input
+        .iter()
+        .map(value_info_to_tensor_info)
+        .collect::<Result<Vec<_>>>()?;
+    let outputs = graph
+        .output
+        .iter()
+        .map(value_info_to_tensor_info)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphIoMetadata::new(inputs, outputs))
+}
+
+/// Serialized `ModelProto` bytes for `path`, converting a git-friendly
+/// `*.textproto` fixture to binary first (mirroring [`Session::new`]).
+fn model_proto_bytes(path: &Path) -> Result<Vec<u8>> {
+    let is_textproto = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("textproto"));
+    if is_textproto {
+        let text = std::fs::read_to_string(path)?;
+        onnx_std::textproto::to_binary(&text).map_err(|error| {
+            OrtError::InvalidArgument(format!(
+                "failed to convert textproto model {}: {error}",
+                path.display()
+            ))
+        })
+    } else {
+        onnx_runtime_loader::read_model_binary(path)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))
+    }
+}
+
+fn value_info_to_tensor_info(
+    value_info: &onnx_runtime_loader::proto::onnx::ValueInfoProto,
+) -> Result<TensorInfo> {
+    use onnx_runtime_loader::proto::onnx::{tensor_shape_proto, type_proto};
+
+    let tensor_type = match value_info.r#type.as_ref().and_then(|ty| ty.value.as_ref()) {
+        Some(type_proto::Value::TensorType(tensor_type)) => tensor_type,
+        _ => {
+            return Err(OrtError::InvalidArgument(format!(
+                "graph I/O '{}' is not a dense tensor type",
+                value_info.name
+            )));
+        }
+    };
+    let dtype = onnx_elem_type_to_data_type(tensor_type.elem_type, &value_info.name)?;
+    let shape = tensor_type
+        .shape
+        .as_ref()
+        .map(|shape| {
+            shape
+                .dim
+                .iter()
+                .map(|dim| match dim.value.as_ref() {
+                    Some(tensor_shape_proto::dimension::Value::DimValue(value)) if *value >= 0 => {
+                        *value
+                    }
+                    // Symbolic, unset, or negative axes are dynamic: -1.
+                    _ => -1,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(TensorInfo {
+        name: value_info.name.clone(),
+        dtype,
+        shape,
+    })
+}
+
+/// Map an ONNX `TensorProto.DataType` code to a [`DataType`], erroring on codes
+/// the runtime does not model as a dense tensor element type.
+fn onnx_elem_type_to_data_type(elem_type: i32, name: &str) -> Result<DataType> {
+    Ok(match elem_type {
+        1 => DataType::Float32,
+        2 => DataType::Uint8,
+        3 => DataType::Int8,
+        4 => DataType::Uint16,
+        5 => DataType::Int16,
+        6 => DataType::Int32,
+        7 => DataType::Int64,
+        9 => DataType::Bool,
+        10 => DataType::Float16,
+        12 => DataType::Uint32,
+        13 => DataType::Uint64,
+        16 => DataType::BFloat16,
+        17 => DataType::Float8E4M3,
+        19 => DataType::Float8E5M2,
+        other => {
+            return Err(OrtError::InvalidArgument(format!(
+                "graph I/O '{name}' uses unsupported ONNX tensor element type {other}"
+            )));
+        }
+    })
 }
 
 fn resolve_model_path(root: &Path) -> Result<PathBuf> {
