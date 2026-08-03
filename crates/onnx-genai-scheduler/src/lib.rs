@@ -8,6 +8,7 @@
 
 pub mod byte_budget;
 pub mod governor;
+pub mod host_lease;
 pub mod policy;
 pub mod pressure;
 

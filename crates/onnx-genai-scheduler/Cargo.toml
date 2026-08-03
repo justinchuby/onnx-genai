@@ -10,6 +10,7 @@ categories = ["concurrency", "science"]
 
 [dependencies]
 onnx-genai-kv = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-protocol-trace = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
