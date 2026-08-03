@@ -95,6 +95,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
@@ -125,6 +126,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
@@ -155,6 +157,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
@@ -263,6 +266,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
@@ -386,6 +390,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
@@ -479,6 +484,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
@@ -509,6 +515,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
