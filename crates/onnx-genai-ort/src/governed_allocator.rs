@@ -83,13 +83,40 @@ impl GovernedAllocator {
     /// `tier` must match where `memory_info` says the memory lives; charging
     /// host allocations to a device budget is the mis-accounting this is meant
     /// to remove, not introduce.
+    /// Build a governed allocator over **host** memory.
+    ///
+    /// This implementation allocates with Rust's global allocator, so it can
+    /// only back host memory. Accepting a CUDA `MemoryInfo` here would hand ORT
+    /// a host pointer labelled as device memory — a wild access from a kernel,
+    /// not an error. Device backing needs an allocator that actually owns
+    /// device memory; that is a separate implementation of the same contract,
+    /// not a configuration of this one.
+    ///
+    /// Returns an error rather than silently correcting the arguments, because
+    /// a caller who passed `Tier::Device` believes their device budget is being
+    /// charged.
     pub fn new(
         memory_info: MemoryInfo,
         governor: Arc<dyn MemoryGovernor + Send + Sync>,
         tier: Tier,
         role: MemoryRole,
         holder: HolderId,
-    ) -> Box<Self> {
+    ) -> crate::error::Result<Box<Self>> {
+        if tier != Tier::Host {
+            return Err(crate::error::OrtError::InvalidArgument(format!(
+                "GovernedAllocator allocates host memory, so it cannot be charged to {tier:?}; \
+                 pass Tier::Host, or use an allocator implementation that owns memory on that tier"
+            )));
+        }
+        if memory_info.device_name != "Cpu" {
+            return Err(crate::error::OrtError::InvalidArgument(format!(
+                "GovernedAllocator allocates host memory, but its memory info names device \
+                 '{}'; ONNX Runtime would treat the host pointers it returns as memory on \
+                 that device. Pass MemoryInfo::cpu_device(), or use an allocator \
+                 implementation that owns memory on '{}'",
+                memory_info.device_name, memory_info.device_name
+            )));
+        }
         let mut allocator = Box::new(Self {
             base: onnx_genai_ort_sys::OrtAllocator {
                 version: onnx_genai_ort_sys::ORT_API_VERSION,
@@ -116,7 +143,7 @@ impl GovernedAllocator {
         // The vtable is only reachable through this pointer, so it must not move
         // afterwards; returning a Box makes that the caller's problem to keep.
         let _ = &mut *allocator;
-        allocator
+        Ok(allocator)
     }
 
     /// The pointer to hand ORT's registration API.
@@ -241,20 +268,34 @@ unsafe extern "C" fn governed_info(
 /// A [`GovernedAllocator`] installed on an ONNX Runtime environment.
 ///
 /// Registration is environment-wide and keyed by memory info, and sessions opt
-/// in with the `session.use_env_allocators` config entry. Dropping this
-/// unregisters and only then releases the allocator.
+/// in with the `session.use_env_allocators` config entry.
 ///
-/// The guard **owns** the allocator for exactly that reason. ORT keeps the raw
-/// pointer it was given, so an allocator freed while still registered would
-/// leave the runtime calling into freed memory on its next allocation — the
-/// kind of failure that surfaces as corruption somewhere unrelated.
-pub struct RegisteredAllocator {
-    environment: *mut onnx_genai_ort_sys::OrtEnv,
-    allocator: Box<GovernedAllocator>,
+/// # Why this leaks by default
+///
+/// Unregistering removes the environment's *registration*. It does not reclaim
+/// the allocator from sessions that already took it: ONNX Runtime copies
+/// environment allocators into session state and wraps the raw pointer with a
+/// no-op deleter, so a session created with `use_env_allocators` keeps calling
+/// `Alloc`/`Free` on this pointer for its whole life, and so does anything
+/// still holding memory that allocator handed out.
+///
+/// There is no ORT API that reports when the last of those is gone. Freeing the
+/// allocator on drop would therefore be a use-after-free whose symptom appears
+/// somewhere unrelated. So [`Drop`] unregisters and then **deliberately leaks**
+/// the allocator: one bounded leak per registration, which is a fixed cost
+/// rather than a growing one. [`RegisteredAllocator::release`] is the escape
+/// hatch for callers who can prove no session is left.
+///
+/// The guard borrows the [`Environment`](crate::env::Environment) so it cannot
+/// outlive it — unregistering through a freed `OrtEnv*` would otherwise be
+/// reachable from safe code.
+pub struct RegisteredAllocator<'env> {
+    environment: &'env crate::env::Environment,
+    allocator: std::mem::ManuallyDrop<Box<GovernedAllocator>>,
     unregistered: bool,
 }
 
-impl RegisteredAllocator {
+impl RegisteredAllocator<'_> {
     /// Bytes currently held by allocations ORT made through this allocator.
     pub fn live_bytes(&self) -> u64 {
         self.allocator.live_bytes()
@@ -267,33 +308,60 @@ impl RegisteredAllocator {
 
     /// Remove this allocator from the environment, reporting failure.
     ///
-    /// [`Drop`] does the same thing but cannot report anything. Call this when
-    /// a failed unregistration is worth knowing about — it means ORT still
-    /// holds a pointer to an allocator that is about to be freed.
+    /// The allocator itself is still leaked; see the type documentation. Use
+    /// this over [`Drop`] when a failed unregistration is worth knowing about.
     pub fn unregister(mut self) -> crate::error::Result<()> {
         self.unregister_once()
+    }
+
+    /// Unregister **and free** the allocator.
+    ///
+    /// # Safety
+    ///
+    /// Every session created while this allocator was registered must already
+    /// be dropped, and no memory it returned may still be live. ONNX Runtime
+    /// copies environment allocators into session state behind a no-op deleter
+    /// and offers no way to observe that the last user is gone, so this cannot
+    /// be checked here.
+    ///
+    /// On failure to unregister, the allocator is left leaked rather than
+    /// freed: an allocator ORT may still reach is worth more than the bytes.
+    pub unsafe fn release(mut self) -> crate::error::Result<()> {
+        self.unregister_once()?;
+        // SAFETY: taken exactly once — `self` is consumed and its `Drop` is
+        // skipped by the `forget` below.
+        let allocator = unsafe { std::mem::ManuallyDrop::take(&mut self.allocator) };
+        drop(allocator);
+        std::mem::forget(self);
+        Ok(())
     }
 
     fn unregister_once(&mut self) -> crate::error::Result<()> {
         if self.unregistered {
             return Ok(());
         }
-        self.unregistered = true;
         let api = crate::error::api()?;
         let unregister = api
             .UnregisterAllocator
             .ok_or(crate::error::OrtError::ApiUnavailable(
                 "UnregisterAllocator",
             ))?;
-        // SAFETY: this pair was registered by `register_governed_allocator` and
-        // is unregistered exactly once, guarded by `unregistered`.
+        // SAFETY: this pair was registered by `register_governed_allocator`;
+        // `environment` is borrowed so the handle is live. The flag is set only
+        // after success, so a failed attempt is retried by `Drop` rather than
+        // being recorded as done.
         crate::error::check_status(unsafe {
-            unregister(self.environment, self.allocator.memory_info.as_ptr())
-        })
+            unregister(
+                self.environment.as_ptr().cast_mut(),
+                self.allocator.memory_info.as_ptr(),
+            )
+        })?;
+        self.unregistered = true;
+        Ok(())
     }
 }
 
-impl std::fmt::Debug for RegisteredAllocator {
+impl std::fmt::Debug for RegisteredAllocator<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegisteredAllocator")
             .field("live_bytes", &self.live_bytes())
@@ -302,21 +370,14 @@ impl std::fmt::Debug for RegisteredAllocator {
     }
 }
 
-impl Drop for RegisteredAllocator {
+impl Drop for RegisteredAllocator<'_> {
     fn drop(&mut self) {
-        // Best effort: `Drop` has nowhere to report to. Callers that care use
-        // `unregister`, after which this is a no-op.
+        // Best effort: `Drop` has nowhere to report to.
         let _ = self.unregister_once();
-        // `self.allocator` is still alive here: `Drop::drop` runs before fields
-        // are dropped, so the memory info we unregister with is the one that
-        // was registered.
+        // `self.allocator` is `ManuallyDrop`, so it is leaked here on purpose.
+        // See the type documentation for why freeing it would be unsound.
     }
 }
-
-// The registration is owned by whoever holds the guard; the pointers inside are
-// not thread-affine.
-unsafe impl Send for RegisteredAllocator {}
-unsafe impl Sync for RegisteredAllocator {}
 
 /// Install `allocator` on `environment` so ORT allocates through the governor.
 ///
@@ -327,7 +388,7 @@ unsafe impl Sync for RegisteredAllocator {}
 pub fn register_governed_allocator(
     environment: &crate::env::Environment,
     mut allocator: Box<GovernedAllocator>,
-) -> crate::error::Result<RegisteredAllocator> {
+) -> crate::error::Result<RegisteredAllocator<'_>> {
     let api = crate::error::api()?;
     let register = api
         .RegisterAllocator
@@ -342,13 +403,17 @@ pub fn register_governed_allocator(
                 .into(),
         ));
     }
-    let env_ptr = environment.as_ptr().cast_mut();
-    // SAFETY: `env_ptr` outlives the guard (the environment is process-wide),
-    // and the allocator pointer stays valid because the guard owns the Box.
-    crate::error::check_status(unsafe { register(env_ptr, allocator.as_ort_allocator()) })?;
+    // SAFETY: the allocator pointer stays valid because the guard owns the Box
+    // and never frees it unless the caller opts in through `release`.
+    crate::error::check_status(unsafe {
+        register(
+            environment.as_ptr().cast_mut(),
+            allocator.as_ort_allocator(),
+        )
+    })?;
     Ok(RegisteredAllocator {
-        environment: env_ptr,
-        allocator,
+        environment,
+        allocator: std::mem::ManuallyDrop::new(allocator),
         unregistered: false,
     })
 }
@@ -379,7 +444,7 @@ mod tests {
             MemoryRole::Activation,
             HOLDER,
         );
-        (allocator, governor)
+        (allocator.expect("host allocator"), governor)
     }
 
     /// Every byte ORT takes is leased before it is handed over.
@@ -566,6 +631,28 @@ mod tests {
         assert!(
             message.contains("cpu_device"),
             "the error must name the constructor to use instead, got: {message}"
+        );
+    }
+    /// The allocator uses Rust's global allocator, so it must refuse to be
+    /// charged to a device tier. Accepting it would report a device budget
+    /// consumed while every byte sat in host RAM.
+    #[test]
+    fn a_device_tier_is_refused_because_this_allocator_only_has_host_memory() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 4096, 0));
+        let result = GovernedAllocator::new(
+            MemoryInfo::cpu_device().expect("cpu device memory info"),
+            Arc::new(governor),
+            Tier::Device,
+            MemoryRole::Activation,
+            HOLDER,
+        );
+        let error = match result {
+            Ok(_) => panic!("a device tier must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("Tier::Host"),
+            "the error must say which tier is valid, got: {error}"
         );
     }
 }

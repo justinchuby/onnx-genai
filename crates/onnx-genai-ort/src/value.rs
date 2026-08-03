@@ -100,7 +100,15 @@ enum TensorBacking {
     /// device memory from an external memory manager. The `Value` borrows it,
     /// so keeping it alive is the caller's obligation, enforced at the unsafe
     /// constructor rather than here.
-    External,
+    ///
+    /// `host_accessible` records whether the memory info named a host device.
+    /// Every accessor here reaches the bytes through `GetTensorMutableData`,
+    /// which returns whatever address the tensor holds; dereferencing a device
+    /// address on the CPU is a wild access, not an error, so the accessors
+    /// consult this rather than trying and faulting.
+    External {
+        host_accessible: bool,
+    },
     None,
 }
 
@@ -239,7 +247,12 @@ impl Value {
             ));
         }
         validate_shape(shape, None)?;
-        let elements: usize = shape.iter().map(|&d| d as usize).product();
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
+            })?;
         let needed = elements.checked_mul(dtype.size_of()).ok_or_else(|| {
             OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
         })?;
@@ -249,13 +262,45 @@ impl Value {
                  which needs {needed}; ORT would read past the end of the allocation"
             )));
         }
+        let host_accessible = memory_info.device_name == "Cpu";
         let ptr = create_tensor_with_data_in(data, bytes, shape, dtype, memory_info)?;
         Ok(Self {
             ptr,
             shape: shape.to_vec(),
             dtype,
-            backing: TensorBacking::External,
+            backing: TensorBacking::External { host_accessible },
         })
+    }
+
+    /// Whether this value's bytes can be read or written through a host
+    /// pointer.
+    ///
+    /// Only external tensors can answer `false`: every other constructor here
+    /// owns a host `Vec`.
+    pub fn is_host_accessible(&self) -> bool {
+        !matches!(
+            self.backing,
+            TensorBacking::External {
+                host_accessible: false
+            }
+        )
+    }
+
+    /// Reject host access to a tensor whose bytes are not on the host.
+    ///
+    /// The accessors reach the data through `GetTensorMutableData`, which hands
+    /// back the tensor's own address with no indication of where it lives. On a
+    /// device tensor that address is not dereferenceable from the CPU, so the
+    /// alternative to this check is a wild read or store rather than a fault.
+    fn ensure_host_accessible(&self, operation: &str) -> Result<()> {
+        if self.is_host_accessible() {
+            return Ok(());
+        }
+        Err(OrtError::InvalidArgument(format!(
+            "{operation} needs to reach this tensor's bytes through a host pointer, but it \
+             wraps external memory that was declared as living on a device; copy it to the \
+             host first, or use the device-side helpers"
+        )))
     }
 
     /// Create a CPU tensor from owned f32 data.
@@ -430,6 +475,7 @@ impl Value {
     }
 
     pub fn to_raw_bytes(&self) -> Result<Vec<u8>> {
+        self.ensure_host_accessible("to_raw_bytes")?;
         let bytes = self.numel() * self.dtype.size_of();
         let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
         // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
@@ -440,6 +486,7 @@ impl Value {
 
     /// Copy tensor data out as f32 values.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        self.ensure_host_accessible("to_vec_f32")?;
         if self.dtype != DataType::Float32 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested f32 data from {:?} tensor",
@@ -456,6 +503,7 @@ impl Value {
     /// readers that must consume fp16 GroupQueryAttention (GQA) outputs on the
     /// host without a separate device conversion pass.
     pub fn to_vec_f32_lossy(&self) -> Result<Vec<f32>> {
+        self.ensure_host_accessible("to_vec_f32_lossy")?;
         match self.dtype {
             DataType::Float32 => self.to_vec_f32(),
             DataType::Float16 => {
@@ -546,6 +594,7 @@ impl Value {
 
     /// Copy Float16 tensor data out as IEEE-754 half-precision bit patterns.
     pub fn to_vec_f16_bits(&self) -> Result<Vec<u16>> {
+        self.ensure_host_accessible("to_vec_f16_bits")?;
         if self.dtype != DataType::Float16 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested Float16 data from {:?} tensor",
@@ -557,6 +606,7 @@ impl Value {
 
     /// Copy BFloat16 tensor data out as bfloat16 bit patterns.
     pub fn to_vec_bf16_bits(&self) -> Result<Vec<u16>> {
+        self.ensure_host_accessible("to_vec_bf16_bits")?;
         if self.dtype != DataType::BFloat16 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested BFloat16 data from {:?} tensor",
@@ -568,6 +618,7 @@ impl Value {
 
     /// Copy tensor data out as i64 values.
     pub fn to_vec_i64(&self) -> Result<Vec<i64>> {
+        self.ensure_host_accessible("to_vec_i64")?;
         if self.dtype != DataType::Int64 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested i64 data from {:?} tensor",
@@ -601,6 +652,7 @@ impl Value {
     /// smaller than the tensor to update only a prefix (e.g. the valid region
     /// of a max-length attention mask).
     pub fn write_i64_prefix(&self, data: &[i64]) -> Result<()> {
+        self.ensure_host_accessible("write_i64_prefix")?;
         if self.dtype != DataType::Int64 {
             return Err(OrtError::InvalidArgument(format!(
                 "write_i64_prefix requires an Int64 tensor, got {:?}",
@@ -630,6 +682,7 @@ impl Value {
     /// (typically a single element) instead of rewriting the whole prefix —
     /// keeping the captured-decode step O(1) rather than O(context).
     pub fn fill_i64_range(&self, start: usize, count: usize, value: i64) -> Result<()> {
+        self.ensure_host_accessible("fill_i64_range")?;
         if self.dtype != DataType::Int64 {
             return Err(OrtError::InvalidArgument(format!(
                 "fill_i64_range requires an Int64 tensor, got {:?}",
@@ -820,7 +873,7 @@ impl Value {
                     "cannot zero row for non-owned or non-KV tensor".into(),
                 ));
             }
-            TensorBacking::External => {
+            TensorBacking::External { .. } => {
                 // The buffer may live on a device, and this path writes through
                 // a host pointer. Refusing is the only safe answer: the caller
                 // owns the memory and knows how to clear it where it lives.
@@ -911,7 +964,7 @@ impl Value {
                     "cannot pack rows for non-owned or non-KV tensor".into(),
                 ));
             }
-            TensorBacking::External => {
+            TensorBacking::External { .. } => {
                 // Same reasoning as zeroing: this repacks through a host
                 // pointer, and an external buffer may be device memory.
                 return Err(OrtError::InvalidArgument(
@@ -997,7 +1050,7 @@ impl Drop for Value {
             TensorBacking::Bytes(data) => data.len(),
             TensorBacking::Alias(owner) => owner.numel(),
             // Borrowed memory: nothing here keeps it alive, by construction.
-            TensorBacking::External => 0,
+            TensorBacking::External { .. } => 0,
             TensorBacking::None => 0,
         };
         if let Ok(api) = crate::error::api()
@@ -1795,5 +1848,68 @@ mod external_memory_tests {
         }
         .expect("a pool sub-allocation is normally larger than the tensor");
         assert_eq!(value.to_vec_f32().expect("read back")[0], 7.0);
+    }
+    /// A tensor whose memory was declared to live on a device must refuse every
+    /// host accessor.
+    ///
+    /// These all reach the bytes through `GetTensorMutableData`, which returns
+    /// the tensor's own address with no indication of where it lives. Without
+    /// this check the failure is a wild read or store, not an error -- and it
+    /// is reachable from entirely safe code once the unsafe constructor has
+    /// been called correctly.
+    #[test]
+    fn host_accessors_refuse_a_tensor_declared_to_live_on_a_device() {
+        let Ok(device_info) = MemoryInfo::dml(0) else {
+            return; // no device memory info available here
+        };
+        // Host memory, deliberately mislabelled as device memory: this test is
+        // about the bookkeeping, and a real device pointer is not needed to
+        // prove the accessors consult it.
+        let mut backing = vec![0i64; 4];
+        let value = unsafe {
+            Value::from_external_memory(
+                backing.as_mut_ptr().cast(),
+                std::mem::size_of_val(backing.as_slice()),
+                &[4],
+                DataType::Int64,
+                &device_info,
+            )
+        }
+        .expect("wrapping external device memory");
+
+        assert!(!value.is_host_accessible());
+        for (name, result) in [
+            ("to_raw_bytes", value.to_raw_bytes().map(|_| ())),
+            ("to_vec_i64", value.to_vec_i64().map(|_| ())),
+            ("write_i64_prefix", value.write_i64_prefix(&[1, 2])),
+            ("fill_i64_range", value.fill_i64_range(0, 2, 7)),
+        ] {
+            let error = result.expect_err("host access to device memory must be refused");
+            assert!(
+                error.to_string().contains(name),
+                "the error must name the operation that was refused, got: {error}"
+            );
+        }
+    }
+
+    /// The same accessors must keep working when the external memory really is
+    /// on the host, or the check above would just be breaking the feature.
+    #[test]
+    fn host_accessors_still_work_for_external_host_memory() {
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let mut backing = vec![5i64, 6, 7, 8];
+        let value = unsafe {
+            Value::from_external_memory(
+                backing.as_mut_ptr().cast(),
+                std::mem::size_of_val(backing.as_slice()),
+                &[4],
+                DataType::Int64,
+                &info,
+            )
+        }
+        .expect("wrapping external host memory");
+
+        assert!(value.is_host_accessible());
+        assert_eq!(value.to_vec_i64().expect("read back"), vec![5, 6, 7, 8]);
     }
 }
