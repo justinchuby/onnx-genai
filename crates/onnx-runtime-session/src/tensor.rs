@@ -244,7 +244,12 @@ pub(crate) struct DeviceBindingSpec {
 /// `ptr`/`len_bytes` describe memory the **caller** owns; the rest describes how
 /// the graph should see it.
 pub struct ExternalMemorySpec {
+    /// Graph input to bind. Empty when the binding is output-only.
     pub input_name: String,
+    /// Whether the buffer is bound as a graph input at all. `false` gives an
+    /// output-only binding: the graph writes into the caller's memory without
+    /// reading it first.
+    pub bind_input: bool,
     pub output_name: Option<String>,
     pub dtype: DataType,
     pub physical_shape: Vec<usize>,
@@ -253,6 +258,51 @@ pub struct ExternalMemorySpec {
     pub ptr: *mut core::ffi::c_void,
     /// Length of the caller's allocation in bytes.
     pub len_bytes: usize,
+}
+
+impl ExternalMemorySpec {
+    /// A buffer bound as a graph input, optionally aliased by an output.
+    pub fn input(
+        input_name: impl Into<String>,
+        output_name: Option<impl Into<String>>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        ptr: *mut core::ffi::c_void,
+        len_bytes: usize,
+    ) -> Self {
+        Self {
+            input_name: input_name.into(),
+            bind_input: true,
+            output_name: output_name.map(Into::into),
+            dtype,
+            physical_shape,
+            logical_shape,
+            ptr,
+            len_bytes,
+        }
+    }
+
+    /// A buffer the graph only writes to.
+    pub fn output(
+        output_name: impl Into<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        ptr: *mut core::ffi::c_void,
+        len_bytes: usize,
+    ) -> Self {
+        Self {
+            input_name: String::new(),
+            bind_input: false,
+            output_name: Some(output_name.into()),
+            dtype,
+            physical_shape,
+            logical_shape,
+            ptr,
+            len_bytes,
+        }
+    }
 }
 
 /// An externally owned persistent device allocation bound to a graph input and
@@ -363,7 +413,21 @@ impl DeviceIoBinding {
                 ),
             });
         }
-        let alignment = TensorLayout::contiguous().alignment;
+        // Borrowed memory only has to satisfy the dtype's alignment. The EP's
+        // 64-byte figure is an *allocation* requirement it imposes on memory it
+        // hands out, not a precondition for reading memory someone else owns —
+        // the same distinction the zero-copy initializer path already makes.
+        let alignment = crate::executor::host_dtype_alignment(dtype);
+        if !ptr.is_null() && !ptr.addr().is_multiple_of(alignment) {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: format!(
+                    "it is at address {:#x}, which is not a multiple of the {alignment}-byte \
+                     alignment {dtype:?} requires; allocate it with at least that alignment",
+                    ptr.addr()
+                ),
+            });
+        }
         // SAFETY: delegated to this function's own contract; the size check
         // above is the part that can be verified here.
         let buffer = unsafe {
@@ -371,9 +435,7 @@ impl DeviceIoBinding {
         }
         .ok_or_else(|| SessionError::ExternalBuffer {
             binding: input_name.clone(),
-            reason: format!(
-                "it is null or misaligned; it must be non-null and aligned to {alignment} bytes"
-            ),
+            reason: "it is null; pass the address of a real allocation".to_string(),
         })?;
         Ok(Self {
             input_name,

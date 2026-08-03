@@ -1750,6 +1750,7 @@ impl Executor {
     ) -> Result<DeviceIoBinding> {
         let crate::tensor::ExternalMemorySpec {
             input_name,
+            bind_input,
             output_name,
             dtype,
             physical_shape,
@@ -1757,6 +1758,14 @@ impl Executor {
             ptr,
             len_bytes,
         } = spec;
+        if !bind_input && output_name.is_none() {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: "it binds neither an input nor an output, so nothing would ever \
+                         read or write it"
+                    .to_string(),
+            });
+        }
         let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
             if output_name.is_some() {
                 !self.binding_consumers_use_physical_capacity(vid)
@@ -1770,7 +1779,7 @@ impl Executor {
                 self.ep.clone(),
                 DeviceBindingSpec {
                     input_name,
-                    bind_input: true,
+                    bind_input,
                     output_name,
                     dtype,
                     physical_shape,

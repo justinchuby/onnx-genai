@@ -3777,15 +3777,15 @@ fn an_external_buffer_is_used_in_place_rather_than_copied() {
     let len_bytes = std::mem::size_of_val(owned.as_slice());
 
     let mut binding = unsafe {
-        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec {
-            input_name: "kv".into(),
-            output_name: Some("kvout".into()),
-            dtype: DataType::Float32,
-            physical_shape: vec![4],
-            logical_shape: vec![4],
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec::input(
+            "kv",
+            Some("kvout"),
+            DataType::Float32,
+            vec![4],
+            vec![4],
             ptr,
             len_bytes,
-        })
+        ))
     }
     .unwrap();
 
@@ -3833,15 +3833,15 @@ fn an_undersized_external_buffer_is_refused_with_the_size_it_needed() {
 
     let mut too_small: Vec<f32> = vec![0.0; 2];
     let error = unsafe {
-        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec {
-            input_name: "kv".into(),
-            output_name: Some("kvout".into()),
-            dtype: DataType::Float32,
-            physical_shape: vec![4],
-            logical_shape: vec![4],
-            ptr: too_small.as_mut_ptr().cast::<core::ffi::c_void>(),
-            len_bytes: std::mem::size_of_val(too_small.as_slice()),
-        })
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec::input(
+            "kv",
+            Some("kvout"),
+            DataType::Float32,
+            vec![4],
+            vec![4],
+            too_small.as_mut_ptr().cast::<core::ffi::c_void>(),
+            std::mem::size_of_val(too_small.as_slice()),
+        ))
     }
     .expect_err("a buffer half the required size must be refused");
     let message = error.to_string();
@@ -3877,16 +3877,147 @@ fn a_null_external_buffer_is_refused() {
     .unwrap();
 
     let error = unsafe {
-        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec {
-            input_name: "kv".into(),
-            output_name: Some("kvout".into()),
-            dtype: DataType::Float32,
-            physical_shape: vec![4],
-            logical_shape: vec![4],
-            ptr: core::ptr::null_mut(),
-            len_bytes: 16,
-        })
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec::input(
+            "kv",
+            Some("kvout"),
+            DataType::Float32,
+            vec![4],
+            vec![4],
+            core::ptr::null_mut(),
+            16,
+        ))
     }
     .expect_err("a null buffer must be refused");
     assert!(error.to_string().contains("null"));
+}
+
+/// An output-only external buffer: the graph writes into the caller's memory
+/// without the buffer also being a graph input.
+///
+/// Without this the native side is strictly weaker than the ORT side, which can
+/// bind an external value as an output, and the two backends stop being
+/// interchangeable for anyone managing their own memory.
+#[test]
+fn an_external_buffer_can_be_bound_as_an_output_only() {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let mut owned: Vec<f32> = vec![99.0; 4];
+    let ptr = owned.as_mut_ptr().cast::<core::ffi::c_void>();
+    let len_bytes = std::mem::size_of_val(owned.as_slice());
+    let mut binding = unsafe {
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec::output(
+            "y",
+            DataType::Float32,
+            vec![4],
+            vec![4],
+            ptr,
+            len_bytes,
+        ))
+    }
+    .unwrap();
+
+    let x_tensor = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
+    exec.run_with_device_bindings(&[("x", &x_tensor)], std::slice::from_mut(&mut binding))
+        .unwrap();
+    drop(binding);
+
+    assert_eq!(
+        owned,
+        vec![0.0, 2.0, 0.0, 4.0],
+        "the graph output must land in the caller's buffer"
+    );
+}
+
+/// A spec that binds neither an input nor an output is refused rather than
+/// producing a binding nothing ever touches.
+#[test]
+fn an_external_buffer_bound_to_nothing_is_refused() {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+
+    let exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let mut owned: Vec<f32> = vec![0.0; 4];
+    let mut spec = crate::tensor::ExternalMemorySpec::output(
+        "y",
+        DataType::Float32,
+        vec![4],
+        vec![4],
+        owned.as_mut_ptr().cast::<core::ffi::c_void>(),
+        std::mem::size_of_val(owned.as_slice()),
+    );
+    spec.output_name = None;
+    let error = unsafe { exec.device_binding_from_external_memory(spec) }
+        .expect_err("a binding attached to nothing must be refused");
+    assert!(error.to_string().contains("neither an input nor an output"));
+}
+
+/// A misaligned pointer is refused, and the error says so specifically rather
+/// than lumping it in with null.
+#[test]
+fn a_misaligned_external_buffer_is_refused() {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let kv = graph.create_named_value("kv", DataType::Float32, static_shape([4]));
+    graph.add_input(kv);
+    let kvout = graph.create_named_value("kvout", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+    graph.add_output(kvout);
+
+    let exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    // A byte buffer offset by one, so the address cannot be suitably aligned.
+    let mut bytes = vec![0u8; 64];
+    let misaligned = unsafe { bytes.as_mut_ptr().add(1) }.cast::<core::ffi::c_void>();
+    let error = unsafe {
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec::input(
+            "kv",
+            Some("kvout"),
+            DataType::Float32,
+            vec![4],
+            vec![4],
+            misaligned,
+            32,
+        ))
+    }
+    .expect_err("a misaligned buffer must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("alignment"),
+        "the error must say the problem is alignment, got: {message}"
+    );
 }

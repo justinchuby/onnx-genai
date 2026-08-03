@@ -285,7 +285,7 @@ pub fn reset_exec_phase_profile() {
     phase_profile::reset();
 }
 
-fn host_dtype_alignment(dtype: DataType) -> usize {
+pub(crate) fn host_dtype_alignment(dtype: DataType) -> usize {
     match dtype {
         DataType::Float16 | DataType::BFloat16 | DataType::Int16 | DataType::Uint16 => 2,
         DataType::Float32 | DataType::Int32 | DataType::Uint32 | DataType::Complex64 => 4,
