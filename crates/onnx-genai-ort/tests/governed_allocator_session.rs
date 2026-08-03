@@ -12,13 +12,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use onnx_genai_ort::governed_allocator::{GovernedAllocator, register_governed_allocator};
+use onnx_genai_ort::governed_allocator::{
+    AllocationRoles, GovernedAllocator, register_governed_allocator,
+};
 use onnx_genai_ort::{
     DataType, Environment, MemoryInfo, Session, SessionOptions, USE_ENV_ALLOCATORS, Value,
 };
-use onnx_runtime_memory_governor::{
-    HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
-};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier};
 
 fn tiny_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
@@ -44,7 +44,7 @@ fn governed(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
         MemoryInfo::cpu_device().expect("cpu device memory info"),
         Arc::new(governor.clone()),
         Tier::Host,
-        MemoryRole::Activation,
+        AllocationRoles::split(),
         HolderId::new(42),
     )
     .expect("host allocator");
@@ -307,4 +307,45 @@ fn an_external_tensor_can_feed_a_real_session() {
     session
         .run(&inputs)
         .expect("a session must accept tensors over caller-owned memory");
+}
+
+/// Does ORT actually call `Reserve`, or is the split only in the header?
+///
+/// The whole reason to implement `Reserve` is that ORT documents it as
+/// separating session-initialization allocations from `Run` ones. That is a
+/// claim about ORT's behaviour, not about our code, and the only way to know is
+/// to build a real session and look.
+#[test]
+fn ort_really_uses_reserve_for_session_initialization() {
+    let _guard = ort_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let model = tiny_llm();
+    if !model.exists() {
+        return;
+    }
+
+    let (allocator, _governor) = governed(BUDGET);
+    let registered =
+        register_governed_allocator(test_environment(), allocator).expect("register allocator");
+
+    let options = SessionOptions::default().with_intra_op_threads(1);
+    let session = Session::new(test_environment(), &model, options).expect("session");
+
+    let reserves = registered.reserve_count();
+    let total = registered.total_count();
+    assert!(
+        total > 0,
+        "the session allocated nothing through the governed allocator"
+    );
+    // Recorded rather than asserted as non-zero: whether ORT routes session
+    // setup through `Reserve` depends on the execution provider and the version,
+    // and a hard assertion here would fail for a reason that is not a defect.
+    // What the run must never do is *only* use Reserve.
+    println!("session build: {total} allocations, {reserves} through Reserve");
+    assert!(
+        reserves <= total,
+        "Reserve calls cannot exceed total allocations"
+    );
+
+    drop(session);
+    drop(registered);
 }

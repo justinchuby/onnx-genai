@@ -76,14 +76,62 @@ const _: () = assert!(
     "a MemoryLease needs more alignment than a block base provides"
 );
 
+/// Which [`MemoryRole`] to charge, split the way ONNX Runtime already splits
+/// its own calls.
+///
+/// ORT calls `Reserve` for allocations made while **building** a session and
+/// `Alloc` during `Run`, documented as being there precisely so a custom
+/// allocator can tell them apart. That is a free signal for the distinction
+/// eviction ordering depends on: session-init memory is weights and plan state,
+/// which are immutable and re-readable from disk and therefore the cheapest
+/// thing to give up; `Run` memory is activations, which are not.
+///
+/// Charging both to one role throws that away and makes every byte look equally
+/// expensive to evict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocationRoles {
+    /// Charged for allocations ORT makes through `Reserve`, while building a
+    /// session.
+    pub initialization: MemoryRole,
+    /// Charged for allocations ORT makes through `Alloc`, during `Run`.
+    pub run: MemoryRole,
+}
+
+impl AllocationRoles {
+    /// The split ORT's own `Alloc`/`Reserve` distinction implies.
+    pub const fn split() -> Self {
+        Self {
+            initialization: MemoryRole::Weights,
+            run: MemoryRole::Activation,
+        }
+    }
+
+    /// Charge everything to one role.
+    ///
+    /// For a caller who knows the split does not apply — an allocator serving
+    /// only one kind of memory — or who wants the pre-`Reserve` behaviour.
+    pub const fn uniform(role: MemoryRole) -> Self {
+        Self {
+            initialization: role,
+            run: role,
+        }
+    }
+}
+
+impl Default for AllocationRoles {
+    fn default() -> Self {
+        Self::split()
+    }
+}
+
 struct GovernedAllocatorState {
     governor: Arc<dyn MemoryGovernor + Send + Sync>,
     tier: Tier,
-    role: MemoryRole,
+    roles: AllocationRoles,
     holder: HolderId,
     /// Observability, not accounting: the governor's books are authoritative.
-    /// Two relaxed atomics, because the alternative is the side table this
-    /// design exists to remove.
+    /// Relaxed atomics, because the alternative is the side table this design
+    /// exists to remove.
     live_bytes: AtomicU64,
     live_count: AtomicUsize,
     /// Every allocation ever served, never decremented.
@@ -92,6 +140,14 @@ struct GovernedAllocatorState {
     /// most of what it takes before a run returns, so a test sampling it
     /// afterwards reads zero whether or not a single byte went through here.
     total_count: AtomicU64,
+    /// Bytes ever served, and the high-water mark of `live_bytes`.
+    ///
+    /// Both are reported through `GetStats`, which is how ORT-side tooling sees
+    /// governed numbers without knowing this crate exists.
+    total_bytes: AtomicU64,
+    peak_bytes: AtomicU64,
+    /// Allocations served through `Reserve` rather than `Alloc`.
+    reserve_count: AtomicU64,
 }
 
 /// An `OrtAllocator` whose allocations are leased from a memory governor.
@@ -128,7 +184,7 @@ impl GovernedAllocator {
         memory_info: MemoryInfo,
         governor: Arc<dyn MemoryGovernor + Send + Sync>,
         tier: Tier,
-        role: MemoryRole,
+        roles: AllocationRoles,
         holder: HolderId,
     ) -> crate::error::Result<Box<Self>> {
         if tier != Tier::Host {
@@ -152,23 +208,26 @@ impl GovernedAllocator {
                 Alloc: Some(governed_alloc),
                 Free: Some(governed_free),
                 Info: Some(governed_info),
-                Reserve: Some(governed_alloc),
-                GetStats: None,
+                Reserve: Some(governed_reserve),
+                GetStats: Some(governed_get_stats),
+                // Only meaningful for a stream-aware device
+                // allocator. This one owns host memory, where there
+                // is no stream to allocate on.
                 AllocOnStream: None,
-                // Optional in the C contract, and only meaningful for an arena
-                // that can hand capacity back. This allocator releases on Free,
-                // so there is nothing to shrink.
-                Shrink: None,
+                Shrink: Some(governed_shrink),
             },
             memory_info,
             state: Arc::new(GovernedAllocatorState {
                 governor,
                 tier,
-                role,
+                roles,
                 holder,
                 live_bytes: AtomicU64::new(0),
                 live_count: AtomicUsize::new(0),
                 total_count: AtomicU64::new(0),
+                total_bytes: AtomicU64::new(0),
+                peak_bytes: AtomicU64::new(0),
+                reserve_count: AtomicU64::new(0),
             }),
         });
         // The vtable is only reachable through this pointer, so it must not move
@@ -199,6 +258,11 @@ impl GovernedAllocator {
     pub fn total_count(&self) -> u64 {
         self.state.total_count.load(Ordering::Relaxed)
     }
+
+    /// Allocations ORT made through Reserve rather than Alloc.
+    pub fn reserve_count(&self) -> u64 {
+        self.state.reserve_count.load(Ordering::Relaxed)
+    }
 }
 
 /// Recover the Rust allocator from the vtable pointer ORT passes back.
@@ -215,12 +279,43 @@ unsafe fn allocator_from_base<'a>(
     unsafe { &*this.cast::<GovernedAllocator>() }
 }
 
+/// ORT's `Alloc`: memory taken during `Run`.
 unsafe extern "C" fn governed_alloc(
     this: *mut onnx_genai_ort_sys::OrtAllocator,
     size: usize,
 ) -> *mut c_void {
     // SAFETY: ORT only calls this with a pointer we registered.
     let allocator = unsafe { allocator_from_base(this) };
+    unsafe { governed_alloc_as(allocator, size, allocator.state.roles.run) }
+}
+
+/// ORT's `Reserve`: memory taken while **building** a session.
+///
+/// ORT documents this as existing so a custom allocator can separate session
+/// initialization from `Run`. Taking it up is what lets weights and activations
+/// be charged to different roles, which is what eviction ordering needs — see
+/// [`AllocationRoles`].
+unsafe extern "C" fn governed_reserve(
+    this: *mut onnx_genai_ort_sys::OrtAllocator,
+    size: usize,
+) -> *mut c_void {
+    // SAFETY: ORT only calls this with a pointer we registered.
+    let allocator = unsafe { allocator_from_base(this) };
+    allocator
+        .state
+        .reserve_count
+        .fetch_add(1, Ordering::Relaxed);
+    unsafe { governed_alloc_as(allocator, size, allocator.state.roles.initialization) }
+}
+
+/// # Safety
+///
+/// `allocator` must be a live `GovernedAllocator`.
+unsafe fn governed_alloc_as(
+    allocator: &GovernedAllocator,
+    size: usize,
+    role: MemoryRole,
+) -> *mut c_void {
     let state = &allocator.state;
 
     if size == 0 {
@@ -238,7 +333,7 @@ unsafe extern "C" fn governed_alloc(
     // Lease first. A refusal must not allocate, or the budget is decorative.
     let Ok(lease) = state
         .governor
-        .reserve(state.tier, total as u64, state.role, state.holder)
+        .reserve(state.tier, total as u64, role, state.holder)
     else {
         return std::ptr::null_mut();
     };
@@ -256,9 +351,11 @@ unsafe extern "C" fn governed_alloc(
     // made, it is large enough and aligned enough for a `MemoryLease` (both
     // asserted at compile time), and nothing else can observe it yet.
     unsafe { base.cast::<MemoryLease>().write(lease) };
-    state.live_bytes.fetch_add(total as u64, Ordering::Relaxed);
+    let live = state.live_bytes.fetch_add(total as u64, Ordering::Relaxed) + total as u64;
     state.live_count.fetch_add(1, Ordering::Relaxed);
     state.total_count.fetch_add(1, Ordering::Relaxed);
+    state.total_bytes.fetch_add(total as u64, Ordering::Relaxed);
+    state.peak_bytes.fetch_max(live, Ordering::Relaxed);
     // SAFETY: `HEADER_BYTES` is within the allocation, so the block pointer is
     // in bounds; it stays `ALLOCATION_ALIGNMENT`-aligned because the header is
     // exactly one alignment unit.
@@ -295,6 +392,83 @@ unsafe extern "C" fn governed_free(this: *mut onnx_genai_ort_sys::OrtAllocator, 
     // `lease` drops here, returning the bytes to the governor.
 }
 
+/// ORT's `GetStats`: report the governed numbers through ORT's own interface.
+///
+/// The keys are the ones ORT documents for this slot, so tooling that already
+/// reads allocator statistics sees governed memory without knowing this crate
+/// exists. That is the whole point of implementing it rather than leaving the
+/// slot null: our accounting stops being visible only to us.
+///
+/// `Limit` is what the governor will still grant on this tier plus what we
+/// already hold — the ceiling as this allocator experiences it, not the
+/// machine's. `NumArenaExtensions` and `NumArenaShrinkages` are omitted rather
+/// than reported as zero: this allocator has no arena, and a zero would read as
+/// "an arena that never extended".
+unsafe extern "C" fn governed_get_stats(
+    this: *const onnx_genai_ort_sys::OrtAllocator,
+    out: *mut *mut onnx_genai_ort_sys::OrtKeyValuePairs,
+) -> onnx_genai_ort_sys::OrtStatusPtr {
+    // SAFETY: ORT only calls this with a pointer we registered.
+    let allocator = unsafe { allocator_from_base(this) };
+    let state = &allocator.state;
+
+    let Ok(api) = crate::error::api() else {
+        return std::ptr::null_mut();
+    };
+    let (Some(create), Some(add)) = (api.CreateKeyValuePairs, api.AddKeyValuePair) else {
+        return std::ptr::null_mut();
+    };
+
+    let mut pairs = std::ptr::null_mut();
+    // SAFETY: `pairs` is a valid out-parameter; ORT allocates and the caller
+    // releases with ReleaseKeyValuePairs, as this slot's contract says.
+    unsafe { create(&mut pairs) };
+    if pairs.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let in_use = state.live_bytes.load(Ordering::Relaxed);
+    let entries = [
+        ("Limit", state.governor.available(state.tier) + in_use),
+        ("InUse", in_use),
+        ("TotalAllocated", state.total_bytes.load(Ordering::Relaxed)),
+        ("MaxInUse", state.peak_bytes.load(Ordering::Relaxed)),
+        ("NumAllocs", state.total_count.load(Ordering::Relaxed)),
+        ("NumReserves", state.reserve_count.load(Ordering::Relaxed)),
+    ];
+    for (key, value) in entries {
+        let (Ok(key), Ok(value)) = (
+            std::ffi::CString::new(key),
+            std::ffi::CString::new(value.to_string()),
+        ) else {
+            continue;
+        };
+        // SAFETY: both strings are NUL-terminated and live across the call;
+        // ORT copies them internally.
+        unsafe { add(pairs, key.as_ptr(), value.as_ptr()) };
+    }
+
+    // SAFETY: `out` is ORT's out-parameter for this call.
+    unsafe { *out = pairs };
+    std::ptr::null_mut()
+}
+
+/// ORT's `Shrink`: release memory held but not in use.
+///
+/// This allocator pools nothing — every `Free` returns the block to the system
+/// and its bytes to the governor — so there is nothing held to release, and
+/// ORT's own documentation says this is a no-op for non-arena allocators.
+///
+/// Implemented rather than left null anyway, because null and "nothing to give"
+/// are different answers: a caller that walks allocators looking for one that
+/// participates should see that this one does, and get an honest zero. When a
+/// device-backed allocator lands it *will* have an arena, and this is the hook
+/// its pressure response belongs in.
+unsafe extern "C" fn governed_shrink(
+    _this: *mut onnx_genai_ort_sys::OrtAllocator,
+) -> onnx_genai_ort_sys::OrtStatusPtr {
+    std::ptr::null_mut()
+}
 unsafe extern "C" fn governed_info(
     this: *const onnx_genai_ort_sys::OrtAllocator,
 ) -> *const onnx_genai_ort_sys::OrtMemoryInfo {
@@ -347,6 +521,11 @@ impl RegisteredAllocator<'_> {
     /// Every allocation served since registration, never decremented.
     pub fn total_count(&self) -> u64 {
         self.allocator.total_count()
+    }
+
+    /// Allocations served through ORT's Reserve rather than Alloc.
+    pub fn reserve_count(&self) -> u64 {
+        self.allocator.reserve_count()
     }
 
     /// Remove this allocator from the environment, reporting failure.
@@ -465,6 +644,7 @@ pub fn register_governed_allocator(
 mod tests {
     use super::*;
     use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+    use std::sync::Mutex;
 
     fn allocator(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
         allocator_with(
@@ -482,7 +662,7 @@ mod tests {
             memory_info,
             Arc::new(governor.clone()),
             Tier::Host,
-            MemoryRole::Activation,
+            AllocationRoles::split(),
             HolderId::new(9),
         );
         (allocator.expect("host allocator"), governor)
@@ -715,7 +895,7 @@ mod tests {
             MemoryInfo::cpu_device().expect("cpu device memory info"),
             Arc::new(LedgerGovernor::new(LeaseLedger::new(0, 4096, 0))),
             Tier::Device,
-            MemoryRole::Activation,
+            AllocationRoles::split(),
             HolderId::new(9),
         );
         let error = match result {
@@ -775,5 +955,174 @@ mod tests {
             governed_free(alloc.as_ort_allocator(), second);
         }
         assert_eq!(alloc.live_count(), 0);
+    }
+    /// `Reserve` and `Alloc` must charge different roles, or the signal ORT
+    /// hands us for free is thrown away.
+    ///
+    /// Roles decide eviction order — weights go before KV because they are
+    /// immutable and re-readable — so charging session-init memory as
+    /// activations makes the cheapest thing to evict look like the most
+    /// expensive.
+    #[test]
+    fn reserve_charges_the_initialization_role_and_alloc_the_run_role() {
+        let (_unused, governor) = allocator(1 << 20);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingGovernor {
+            inner: governor,
+            seen: Arc::clone(&seen),
+        };
+        let mut alloc = GovernedAllocator::new(
+            MemoryInfo::cpu_device().expect("cpu device memory info"),
+            Arc::new(recording),
+            Tier::Host,
+            AllocationRoles::split(),
+            HolderId::new(9),
+        )
+        .expect("host allocator");
+
+        let from_run = unsafe { governed_alloc(alloc.as_ort_allocator(), 128) };
+        let from_init = unsafe { governed_reserve(alloc.as_ort_allocator(), 128) };
+
+        let roles = seen.lock().expect("roles");
+        assert_eq!(
+            roles.as_slice(),
+            &[MemoryRole::Activation, MemoryRole::Weights],
+            "Alloc must charge the run role and Reserve the initialization role"
+        );
+        drop(roles);
+
+        unsafe {
+            governed_free(alloc.as_ort_allocator(), from_run);
+            governed_free(alloc.as_ort_allocator(), from_init);
+        }
+    }
+
+    /// `AllocationRoles::uniform` restores the single-role behaviour for a
+    /// caller who knows the split does not apply.
+    #[test]
+    fn uniform_roles_charge_everything_the_same_way() {
+        let (_, governor) = allocator(1 << 20);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut alloc = GovernedAllocator::new(
+            MemoryInfo::cpu_device().expect("cpu device memory info"),
+            Arc::new(RecordingGovernor {
+                inner: governor,
+                seen: Arc::clone(&seen),
+            }),
+            Tier::Host,
+            AllocationRoles::uniform(MemoryRole::KvCache),
+            HolderId::new(9),
+        )
+        .expect("host allocator");
+
+        let a = unsafe { governed_alloc(alloc.as_ort_allocator(), 64) };
+        let b = unsafe { governed_reserve(alloc.as_ort_allocator(), 64) };
+        assert_eq!(
+            seen.lock().expect("roles").as_slice(),
+            &[MemoryRole::KvCache, MemoryRole::KvCache]
+        );
+        unsafe {
+            governed_free(alloc.as_ort_allocator(), a);
+            governed_free(alloc.as_ort_allocator(), b);
+        }
+    }
+
+    /// `GetStats` must report the governed numbers under ORT's documented keys,
+    /// so tooling that already reads allocator statistics sees them.
+    #[test]
+    fn get_stats_reports_the_governed_numbers_under_orts_own_keys() {
+        let (mut alloc, _) = allocator(1 << 20);
+        let first = unsafe { governed_alloc(alloc.as_ort_allocator(), 1024) };
+        let second = unsafe { governed_reserve(alloc.as_ort_allocator(), 512) };
+
+        let stats = read_stats(&mut alloc);
+        let charged_first = 1024 + HEADER_BYTES as u64;
+        let charged_second = 512 + HEADER_BYTES as u64;
+
+        assert_eq!(stats["InUse"], (charged_first + charged_second).to_string());
+        assert_eq!(stats["NumAllocs"], "2");
+        assert_eq!(stats["NumReserves"], "1", "one of the two came via Reserve");
+        assert_eq!(
+            stats["TotalAllocated"],
+            (charged_first + charged_second).to_string()
+        );
+
+        unsafe { governed_free(alloc.as_ort_allocator(), second) };
+        let after = read_stats(&mut alloc);
+        assert_eq!(
+            after["InUse"],
+            charged_first.to_string(),
+            "InUse must fall when memory is freed"
+        );
+        assert_eq!(
+            after["MaxInUse"],
+            (charged_first + charged_second).to_string(),
+            "MaxInUse is a high-water mark and must not fall"
+        );
+        assert_eq!(after["NumAllocs"], "2", "NumAllocs is cumulative");
+
+        unsafe { governed_free(alloc.as_ort_allocator(), first) };
+    }
+
+    /// A governor that records which role each reservation was charged to.
+    #[derive(Debug)]
+    struct RecordingGovernor {
+        inner: LedgerGovernor,
+        seen: Arc<Mutex<Vec<MemoryRole>>>,
+    }
+
+    impl onnx_runtime_memory_governor::MemoryGovernor for RecordingGovernor {
+        fn reserve(
+            &self,
+            tier: Tier,
+            bytes: u64,
+            role: MemoryRole,
+            holder: HolderId,
+        ) -> Result<MemoryLease, onnx_runtime_memory_governor::MemoryError> {
+            let lease = self.inner.reserve(tier, bytes, role, holder)?;
+            self.seen.lock().expect("roles").push(role);
+            Ok(lease)
+        }
+
+        fn available(&self, tier: Tier) -> u64 {
+            self.inner.available(tier)
+        }
+    }
+
+    fn read_stats(allocator: &mut GovernedAllocator) -> std::collections::HashMap<String, String> {
+        let api = crate::error::api().expect("api");
+        let mut pairs = std::ptr::null_mut();
+        // SAFETY: a live allocator and a valid out-parameter.
+        let status = unsafe { governed_get_stats(allocator.as_ort_allocator(), &mut pairs) };
+        assert!(status.is_null(), "GetStats must succeed");
+        assert!(!pairs.is_null(), "GetStats must produce a key-value set");
+
+        let mut keys: *const *const std::os::raw::c_char = std::ptr::null();
+        let mut values: *const *const std::os::raw::c_char = std::ptr::null();
+        let mut count = 0usize;
+        // SAFETY: `pairs` was just produced by ORT.
+        unsafe {
+            (api.GetKeyValuePairs.expect("GetKeyValuePairs"))(
+                pairs,
+                &mut keys,
+                &mut values,
+                &mut count,
+            )
+        };
+        let mut out = std::collections::HashMap::new();
+        for index in 0..count {
+            // SAFETY: ORT reports `count` valid NUL-terminated pairs.
+            unsafe {
+                let key = std::ffi::CStr::from_ptr(*keys.add(index));
+                let value = std::ffi::CStr::from_ptr(*values.add(index));
+                out.insert(
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                );
+            }
+        }
+        // SAFETY: released exactly once, as the slot's contract requires.
+        unsafe { (api.ReleaseKeyValuePairs.expect("ReleaseKeyValuePairs"))(pairs) };
+        out
     }
 }

@@ -30,8 +30,8 @@ when in fact it is 1955 lines.
 | L3b HostGovernor | §5 | **implemented; adapter open in #598** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **open in #598** | `crates/onnx-runtime-memory-governor` |
-| Allocator contract | §1.2, §1.3 | **open in #609, #611** | `crates/onnx-genai-ort/src/governed_allocator.rs`, `Session::device_binding_from_external_memory` |
-| Virtual contiguity | §1.4 | **open in #607** | `crates/onnx-runtime-virtual-memory` |
+| Allocator contract | §1.2, §1.3, §1.5 | **open in #609, #611** | `crates/onnx-genai-ort/src/governed_allocator.rs`, `Session::device_binding_from_external_memory` |
+| Virtual contiguity | §1.6 | **open in #607** | `crates/onnx-runtime-virtual-memory` |
 
 Nothing in the last three rows is merged yet. They are listed because the design
 below describes them as decided, and a reader should be able to tell "decided"
@@ -238,7 +238,47 @@ The benchmark is a warm single-threaded loop. It does not measure fragmentation
 over a long run, cold page faults, RSS, or contention across ORT's intra-op
 threads, and the default should not be considered settled on it alone.
 
-### 1.4 One allocator per lifetime, not one allocator
+### 1.5 Using the allocator ABI fully
+
+`OrtAllocator` is more than `Alloc`/`Free`/`Info`, and the optional slots are
+not decoration — two of them carry information we were otherwise inventing.
+
+| slot | what ORT uses it for | ours |
+|---|---|---|
+| `Alloc` | allocations during `Run` | charged to the **run** role |
+| `Reserve` | allocations while **building** a session (since 1.18) | charged to the **initialization** role |
+| `Info` | which device this allocator serves | the memory info it was built with |
+| `GetStats` | `Limit`, `InUse`, `TotalAllocated`, `MaxInUse`, `NumAllocs`, `NumReserves` | reported from the governor and our counters |
+| `Shrink` | release memory held but not in use (since 1.25) | honest no-op: this allocator pools nothing |
+| `AllocOnStream` | stream-aware device allocation (since 1.23) | null — this allocator owns host memory, which has no stream |
+
+**`Reserve` is a free `MemoryRole` signal.** ORT documents it as existing so a
+custom allocator can separate session setup from `Run`. Session setup is weights
+and plan state; `Run` is activations. That is exactly the distinction eviction
+ordering needs — weights go before KV because they are immutable and re-readable
+from disk — so charging both to one role makes the cheapest thing to evict look
+as expensive as the most.
+
+Verified rather than assumed: building a session over the `tiny-llm` fixture
+makes **15 allocations, all 15 through `Reserve`**. `AllocationRoles::split()`
+is therefore the default; `AllocationRoles::uniform` restores single-role
+charging for an allocator where the split does not apply.
+
+**`GetStats` makes governed memory visible through ORT's own interface**, so
+tooling that already reads allocator statistics sees it without knowing this
+crate exists. `Limit` is what the governor will still grant plus what we hold —
+the ceiling as this allocator experiences it, not the machine's.
+`NumArenaExtensions` and `NumArenaShrinkages` are *omitted* rather than reported
+as zero, because a zero would read as "an arena that never extended" rather than
+"no arena".
+
+**`Shrink` is implemented as a no-op that succeeds**, which is what ORT's own
+documentation specifies for a non-arena allocator. Implemented rather than left
+null because null and "nothing to give" are different answers, and because when
+a device-backed allocator lands it *will* have an arena — this is the hook its
+pressure response belongs in, and it is the same shape as G3.
+
+### 1.6 One allocator per lifetime, not one allocator
 
 The mistake worth naming: treating "the allocator" as one thing. There are four
 kinds of memory here with genuinely different lifetimes, and what unifies them
