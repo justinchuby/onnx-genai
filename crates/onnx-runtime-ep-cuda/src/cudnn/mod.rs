@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::cudnn::{
     ConvBiasActivationForward, ConvForward, Cudnn, CudnnDataType, NoIndices, PoolingForward,
-    ReduceTensor, ReductionDescriptor, SoftmaxForward, TensorDescriptor, sys,
+    ReduceTensor, ReductionDescriptor, SoftmaxForward, TensorDescriptor, result, sys,
 };
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
@@ -312,6 +312,10 @@ impl CudnnTensorDescriptor<'_> {
 pub struct CudnnHandle<'handle> {
     handle: &'handle Arc<Cudnn>,
     stream: &'handle Arc<CudaStream>,
+    /// Raw cuDNN handle, stream-bound, used only by the half/bf16 reduce path
+    /// (see [`CudnnHandle::reduce_raw_f32_comp`]). It aliases the same CUDA
+    /// stream as `handle` and is serialized by the backend's handle mutex.
+    reduce_handle: sys::cudnnHandle_t,
 }
 
 impl CudnnHandle<'_> {
@@ -408,24 +412,32 @@ impl CudnnHandle<'_> {
         op: CudnnReduceOp,
         buffers: CudnnBufferPair,
     ) -> Result<()> {
-        let input = self.tensor_descriptor(input_spec)?;
-        let output = self.tensor_descriptor(output_spec)?;
-        match (&input.inner, &output.inner) {
-            (TensorDescriptorInner::F32(a), TensorDescriptorInner::F32(c)) => {
+        if input_spec.dtype() != output_spec.dtype() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cuDNN reduction input/output descriptor dtypes differ".into(),
+            ));
+        }
+        match input_spec.dtype() {
+            // f32 I/O reduces in f32 already, so the type-coupled safe path is
+            // correct and stays the fast path.
+            CudnnTensorType::F32 => {
+                let input = self.tensor_descriptor(input_spec)?;
+                let output = self.tensor_descriptor(output_spec)?;
+                let a = input.as_f32().expect("dtype checked to be f32");
+                let c = output.as_f32().expect("dtype checked to be f32");
                 self.reduce_t(a, c, op, buffers, (1.0f32, 0.0f32))
             }
-            (TensorDescriptorInner::F16(a), TensorDescriptorInner::F16(c)) => {
-                self.reduce_t(a, c, op, buffers, (f16::from_f32(1.0), f16::from_f32(0.0)))
-            }
-            (TensorDescriptorInner::Bf16(a), TensorDescriptorInner::Bf16(c)) => self.reduce_t(
-                a,
-                c,
-                op,
-                buffers,
-                (bf16::from_f32(1.0), bf16::from_f32(0.0)),
-            ),
-            _ => Err(EpError::KernelFailed(
-                "cuda_ep: cuDNN reduction input/output descriptor dtypes differ".into(),
+            // f16 I/O must reduce with an f32 compute type, which cudarc's
+            // type-coupled safe reduce cannot express (see below).
+            CudnnTensorType::F16 => self.reduce_raw_f32_comp(input_spec, output_spec, op, buffers),
+            // cuDNN cannot reduce bf16 at all (rejected even with an f32 comp
+            // type — `CUDNN_STATUS_NOT_SUPPORTED`). The reduce kernel routes
+            // bf16 to its typed NVRTC block reduction instead, so this arm is a
+            // defensive guard and must never be reached.
+            CudnnTensorType::Bf16 => Err(EpError::KernelFailed(
+                "cuda_ep: cuDNN cannot reduce bf16 tensors; route bf16 reductions \
+                 to the NVRTC block-reduction kernel"
+                    .into(),
             )),
         }
     }
@@ -466,6 +478,69 @@ impl CudnnHandle<'_> {
         // workspace is at least the size returned by cuDNN and indices are off.
         unsafe { op.launch(&mut workspace, scaling, &input, &mut output) }
             .map_err(|e| cudnn_err("cudnnReduceTensor", e))
+    }
+
+    /// Reduce f16 tensors with an **f32 compute type**.
+    ///
+    /// `cudnnReduceTensor` rejects a half `reduceTensorCompType`
+    /// (`CUDNN_STATUS_NOT_SUPPORTED`, reproduced on cuDNN 9.10 and 9.20); it
+    /// requires `CUDNN_DATA_FLOAT` accumulation for half I/O. That f32
+    /// accumulation is also exactly the ONNX `ReduceSum`/`ReduceMean` semantics
+    /// for half inputs (accumulate in f32, cast the result back to half).
+    ///
+    /// cudarc's safe `ReduceTensor<T>` / `create_reduction_no_indices::<T>` bind
+    /// both the reduce compute type and the alpha/beta scalar type to the I/O
+    /// `T`, so they cannot express "f32 comp type + half I/O + f32 scalars".
+    /// This path therefore drives the raw cuDNN FFI directly: it keeps the
+    /// half tensor descriptors and device buffers but builds an f32 reduction
+    /// descriptor and passes f32 alpha/beta. (bf16 is not routed here — cuDNN
+    /// rejects bf16 reductions outright, so they use the NVRTC kernel.)
+    fn reduce_raw_f32_comp(
+        &self,
+        input_spec: &TensorDescriptorSpec,
+        output_spec: &TensorDescriptorSpec,
+        op: CudnnReduceOp,
+        buffers: CudnnBufferPair,
+    ) -> Result<()> {
+        let a_desc = RawTensorDescriptor::new(input_spec)?;
+        let c_desc = RawTensorDescriptor::new(output_spec)?;
+        let reduce = RawReductionDescriptor::new_f32_comp(op)?;
+
+        // SAFETY: the handle is live and stream-bound; the tensor and reduction
+        // descriptors were just created and are still alive.
+        let workspace_bytes = unsafe {
+            result::get_reduction_workspace_size(self.reduce_handle, reduce.0, a_desc.0, c_desc.0)
+        }
+        .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?;
+
+        let mut workspace = self
+            .stream
+            .alloc_zeros::<u8>(workspace_bytes.max(1))
+            .map_err(|e| driver_err("allocating cuDNN reduction workspace", e))?;
+        let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(self.stream);
+
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        // SAFETY: the tensor descriptors describe the half/bf16 device buffers;
+        // the reduction descriptor uses an f32 comp type, so alpha/beta are f32;
+        // the workspace is at least the queried size and indices are disabled.
+        unsafe {
+            result::reduce_tensor(
+                self.reduce_handle,
+                reduce.0,
+                std::ptr::null_mut(),
+                0,
+                workspace_ptr as *mut std::ffi::c_void,
+                workspace_bytes,
+                (&alpha as *const f32).cast::<std::ffi::c_void>(),
+                a_desc.0,
+                buffers.input as *const std::ffi::c_void,
+                (&beta as *const f32).cast::<std::ffi::c_void>(),
+                c_desc.0,
+                buffers.output as *mut std::ffi::c_void,
+            )
+        }
+        .map_err(|e| cudnn_err("cudnnReduceTensor", e))
     }
 
     /// Select a cuDNN forward algorithm, allocate its workspace, and execute a
@@ -716,6 +791,97 @@ impl<T> DevicePtrMut<T> for RawDevice<T> {
 pub struct CudnnBackend {
     stream: Arc<CudaStream>,
     handle: Mutex<Option<Arc<Cudnn>>>,
+    /// Lazily created raw handle for the half/bf16 reduce path. Created once and
+    /// reused (not per call) so the f32-comp reduce adds no per-op handle cost.
+    reduce_handle: Mutex<Option<RawReduceHandle>>,
+}
+
+/// An owned raw cuDNN handle, destroyed on drop.
+///
+/// Used only by the half/bf16 reduce path, which needs an f32 compute type that
+/// cudarc's type-coupled safe reduce API cannot express while keeping half I/O.
+struct RawReduceHandle(sys::cudnnHandle_t);
+
+// SAFETY: like `Cudnn`, a raw cuDNN handle is not safe for concurrent use, but
+// every access is serialized by `CudnnBackend`'s handle mutexes and runs on the
+// thread bound to the owning CUDA context.
+unsafe impl Send for RawReduceHandle {}
+
+impl Drop for RawReduceHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle was created by `result::create_handle` and is
+        // destroyed exactly once here.
+        unsafe {
+            let _ = result::destroy_handle(self.0);
+        }
+    }
+}
+
+/// An owned raw cuDNN tensor descriptor, destroyed on drop.
+struct RawTensorDescriptor(sys::cudnnTensorDescriptor_t);
+
+impl RawTensorDescriptor {
+    fn new(spec: &TensorDescriptorSpec) -> Result<Self> {
+        let desc = result::create_tensor_descriptor()
+            .map_err(|e| cudnn_err("creating tensor descriptor", e))?;
+        let guard = Self(desc);
+        // SAFETY: `desc` was just created; `dims`/`strides` are validated i32s
+        // of equal, rank-padded length.
+        unsafe {
+            result::set_tensornd_descriptor(
+                desc,
+                spec.dtype().as_raw(),
+                spec.dims().len() as std::ffi::c_int,
+                spec.dims().as_ptr(),
+                spec.strides().as_ptr(),
+            )
+        }
+        .map_err(|e| cudnn_err("setting tensor descriptor", e))?;
+        Ok(guard)
+    }
+}
+
+impl Drop for RawTensorDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is live and destroyed exactly once here.
+        unsafe {
+            let _ = result::destroy_tensor_descriptor(self.0);
+        }
+    }
+}
+
+/// An owned raw cuDNN reduction descriptor with an f32 compute type.
+struct RawReductionDescriptor(sys::cudnnReduceTensorDescriptor_t);
+
+impl RawReductionDescriptor {
+    fn new_f32_comp(op: CudnnReduceOp) -> Result<Self> {
+        let desc = result::create_reduce_tensor_descriptor()
+            .map_err(|e| cudnn_err("creating reduction descriptor", e))?;
+        let guard = Self(desc);
+        // SAFETY: `desc` was just created; the f32 comp type and no-indices mode
+        // are valid for any half/bf16 reduction.
+        unsafe {
+            result::set_reduce_tensor_descriptor(
+                desc,
+                op.as_raw(),
+                sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
+                sys::cudnnNanPropagation_t::CUDNN_PROPAGATE_NAN,
+                sys::cudnnReduceTensorIndices_t::CUDNN_REDUCE_TENSOR_NO_INDICES,
+                sys::cudnnIndicesType_t::CUDNN_32BIT_INDICES,
+            )
+        }
+        .map_err(|e| cudnn_err("setting reduction descriptor", e))?;
+        Ok(guard)
+    }
+}
+
+impl Drop for RawReductionDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is live and destroyed exactly once here.
+        unsafe {
+            let _ = result::destroy_reduce_tensor_descriptor(self.0);
+        }
+    }
 }
 
 impl std::fmt::Debug for CudnnBackend {
@@ -736,6 +902,7 @@ impl CudnnBackend {
         Self {
             stream,
             handle: Mutex::new(None),
+            reduce_handle: Mutex::new(None),
         }
     }
 
@@ -762,10 +929,39 @@ impl CudnnBackend {
         let handle = handle.as_ref().ok_or_else(|| {
             EpError::KernelFailed("cuda_ep: cuDNN handle initialization produced no handle".into())
         })?;
+
+        let mut reduce_handle = self.reduce_handle.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: cuDNN reduce handle mutex was poisoned".into())
+        })?;
+        if reduce_handle.is_none() {
+            *reduce_handle = Some(self.create_reduce_handle()?);
+        }
+        let reduce_handle = reduce_handle
+            .as_ref()
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cuDNN reduce handle initialization produced no handle".into(),
+                )
+            })?
+            .0;
+
         operation(CudnnHandle {
             handle,
             stream: &self.stream,
+            reduce_handle,
         })
+    }
+
+    /// Create a raw cuDNN handle bound to the EP's compute stream, mirroring
+    /// what cudarc's `Cudnn::new` does for the safe handle.
+    fn create_reduce_handle(&self) -> Result<RawReduceHandle> {
+        let handle = initialize_cudnn(result::create_handle)?;
+        let guard = RawReduceHandle(handle);
+        // SAFETY: `handle` was just created; the stream outlives the backend and
+        // shares the context already bound to this thread.
+        unsafe { result::set_stream(handle, self.stream.cu_stream() as sys::cudaStream_t) }
+            .map_err(|e| cudnn_err("cudnnSetStream", e))?;
+        Ok(guard)
     }
 
     /// Cheap loader probe used to select an existing non-cuDNN fallback.
@@ -780,9 +976,14 @@ impl Drop for CudnnBackend {
             .handle
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if handle.is_some() {
+        let reduce_handle = self
+            .reduce_handle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if handle.is_some() || reduce_handle.is_some() {
             let _ = self.stream.context().bind_to_thread();
             handle.take();
+            reduce_handle.take();
         }
     }
 }

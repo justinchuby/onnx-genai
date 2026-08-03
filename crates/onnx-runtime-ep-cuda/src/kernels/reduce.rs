@@ -1,9 +1,12 @@
 //! GPU **reductions** over arbitrary axes with `keepdims`
 //! (`docs/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
 //!
-//! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32/f16/bf16.
-//! Their previous f32 NVRTC block reduction remains the runtime fallback when
-//! cuDNN is absent. `ReduceMax`/`ReduceMin` continue to use NVRTC.
+//! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32 (native f32
+//! comp type) and f16 (with an f32 comp type). bf16 cannot be reduced by cuDNN
+//! (rejected even with an f32 comp type — `CUDNN_STATUS_NOT_SUPPORTED`), so it
+//! uses the typed NVRTC block reduction, which accumulates in f32. That same
+//! NVRTC fallback also runs for f32/f16 when cuDNN is absent.
+//! `ReduceMax`/`ReduceMin` always use NVRTC.
 //!
 //! `cub::DeviceReduce` / `DeviceSegmentedReduce` are the vendor primitives for
 //! reductions, and a segmented block reduction is exactly the shape they use.
@@ -106,9 +109,14 @@ extern "C" __global__ void validate_reduce_axes_i64(
     }
 }
 
-extern "C" __global__ void reduce_f32(
-    const float*     x,
-    float*           y,
+// Base sum/mean/max/min block reduction. Accumulation is always in f32 (the
+// ONNX ReduceSum/ReduceMean semantics for half inputs: accumulate in f32, cast
+// the result back), so the half/bf16 instantiations load/store through the
+// f32-widening `reduce_load`/`reduce_store` helpers above.
+template <typename T>
+__device__ void reduce_base(
+    const T*         x,
+    T*               y,
     const long long* base_off,     // [out_count]
     const long long* delta_off,    // [reduce_count]
     const int        out_count,
@@ -132,7 +140,7 @@ extern "C" __global__ void reduce_f32(
 
     float acc = (op == 1) ? NEG_INF : (op == 2) ? POS_INF : 0.0f;
     for (int r = tid; r < reduce_count; r += nt) {
-        const float v = x[base + (size_t)delta_off[r]];
+        const float v = reduce_load(x, base + (size_t)delta_off[r]);
         if (op == 1)      acc = (isnan(acc) || isnan(v)) ? QNAN : fmaxf(acc, v);
         else if (op == 2) acc = (isnan(acc) || isnan(v)) ? QNAN : fminf(acc, v);
         else              acc += v;
@@ -151,9 +159,22 @@ extern "C" __global__ void reduce_f32(
     if (tid == 0) {
         float out = red[0];
         if (is_mean) out /= (float)reduce_count;
-        y[o] = out;
+        reduce_store(y, (size_t)o, out);
     }
 }
+
+#define DEFINE_REDUCE_BASE(T, suffix) \
+extern "C" __global__ void reduce_##suffix( \
+    const T* x, T* y, const long long* base_off, const long long* delta_off, \
+    const int out_count, const int reduce_count, const int op, \
+    const int is_mean, const unsigned int* capture_error) { \
+    reduce_base<T>(x, y, base_off, delta_off, out_count, reduce_count, op, \
+                   is_mean, capture_error); \
+}
+
+DEFINE_REDUCE_BASE(float, f32)
+DEFINE_REDUCE_BASE(__half, f16)
+DEFINE_REDUCE_BASE(__nv_bfloat16, bf16)
 
 template <typename T>
 __device__ void reduce_ext(
@@ -322,6 +343,8 @@ extern "C" __global__ void reduce_i64_sum(
 
 const REDUCE_MODULE: &str = "reduce_f32";
 const REDUCE_ENTRY: &str = "reduce_f32";
+const REDUCE_F16_ENTRY: &str = "reduce_f16";
+const REDUCE_BF16_ENTRY: &str = "reduce_bf16";
 const REDUCE_EXT_F32_ENTRY: &str = "reduce_ext_f32";
 const REDUCE_EXT_F16_ENTRY: &str = "reduce_ext_f16";
 const REDUCE_EXT_BF16_ENTRY: &str = "reduce_ext_bf16";
@@ -917,31 +940,33 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        if x.dtype != DataType::Int64
+        // cuDNN reduces f32 (native comp type) and f16 (with an f32 comp type,
+        // see `CudnnBackend::reduce`). It cannot reduce bf16 at all — cuDNN
+        // rejects a bf16 tensor even with an f32 comp type
+        // (`CUDNN_STATUS_NOT_SUPPORTED`, reproduced on cuDNN 9.10 and 9.20) — so
+        // bf16 falls through to the typed NVRTC block reduction below, which
+        // accumulates in f32 (identical ONNX semantics).
+        if matches!(x.dtype, DataType::Float32 | DataType::Float16)
             && let Some(cudnn_op) = cudnn_op
+            && self.runtime.cudnn().is_available()
         {
-            if self.runtime.cudnn().is_available() {
-                let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
-                let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
-                let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-                self.runtime.cudnn().with_handle(|handle| {
-                    handle.reduce(
-                        &input_spec,
-                        &output_spec,
-                        cudnn_op,
-                        CudnnBufferPair {
-                            input: x_ptr,
-                            output: y_ptr,
-                            input_numel: x.numel(),
-                            output_numel: outputs[0].numel(),
-                        },
-                    )
-                })?;
-                return self.runtime.synchronize();
-            }
-            if x.dtype != DataType::Float32 {
-                return self.runtime.cudnn().with_handle(|_| Ok(()));
-            }
+            let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
+            let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
+            let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+            self.runtime.cudnn().with_handle(|handle| {
+                handle.reduce(
+                    &input_spec,
+                    &output_spec,
+                    cudnn_op,
+                    CudnnBufferPair {
+                        input: x_ptr,
+                        output: y_ptr,
+                        input_numel: x.numel(),
+                        output_numel: outputs[0].numel(),
+                    },
+                )
+            })?;
+            return self.runtime.synchronize();
         }
 
         let plan = build_plan(x.shape, &reduce, self.keepdims);
@@ -1085,7 +1110,11 @@ impl ReduceKernel {
                 _ => unreachable!("validated extended-reduce dtype {:?}", x.dtype),
             }
         } else {
-            REDUCE_ENTRY
+            match x.dtype {
+                DataType::Float16 => REDUCE_F16_ENTRY,
+                DataType::BFloat16 => REDUCE_BF16_ENTRY,
+                _ => REDUCE_ENTRY,
+            }
         };
         let func = self
             .runtime
@@ -1169,7 +1198,20 @@ mod tests {
 
     #[test]
     fn entry_point_present_in_source() {
-        assert!(REDUCE_SRC.contains(REDUCE_ENTRY));
+        // The base sum/mean/max/min entries are macro-generated per dtype
+        // (used for bf16, which cuDNN cannot reduce, and for f16/f32 when cuDNN
+        // is absent), so assert the instantiations rather than the expanded
+        // symbol names.
+        for definition in [
+            "DEFINE_REDUCE_BASE(float, f32)",
+            "DEFINE_REDUCE_BASE(__half, f16)",
+            "DEFINE_REDUCE_BASE(__nv_bfloat16, bf16)",
+        ] {
+            assert!(
+                REDUCE_SRC.contains(definition),
+                "missing NVRTC definition {definition}"
+            );
+        }
     }
 
     #[test]
