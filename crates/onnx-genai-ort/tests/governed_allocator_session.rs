@@ -17,7 +17,7 @@ use onnx_genai_ort::{
     DataType, Environment, MemoryInfo, Session, SessionOptions, USE_ENV_ALLOCATORS, Value,
 };
 use onnx_runtime_memory_governor::{
-    LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
+    HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
 };
 
 fn tiny_llm() -> PathBuf {
@@ -39,29 +39,86 @@ fn ort_test_lock() -> &'static Mutex<()> {
 const BUDGET: u64 = 512 * 1024 * 1024;
 
 fn governed(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
-    let ledger = LeaseLedger::new(0, budget, 0);
-    let governor = LedgerGovernor::new(Arc::clone(&ledger));
+    let governor = LedgerGovernor::new(LeaseLedger::new(0, budget, 0));
     let allocator = GovernedAllocator::new(
         MemoryInfo::cpu_device().expect("cpu device memory info"),
-        ledger as Arc<dyn LeaseAccounting>,
+        Arc::new(governor.clone()),
         Tier::Host,
         MemoryRole::Activation,
+        HolderId::new(42),
     )
     .expect("host allocator");
     (allocator, governor)
 }
 
-fn run_once(session: &Session) {
-    let tokens = Value::from_vec_i64(vec![1, 2, 3], &[1, 3]).expect("token tensor");
-    let _ = session.run(&[("input_ids", &tokens)]);
+/// Build valid inputs from the model's own signature, so the run actually
+/// executes rather than failing on a missing port.
+fn model_inputs(session: &Session) -> (Vec<Vec<u8>>, Vec<Vec<i64>>) {
+    const SEQ: i64 = 3;
+    let mut buffers = Vec::new();
+    let mut shapes = Vec::new();
+    for input in session.inputs() {
+        let is_past = input.name.contains("past");
+        let shape: Vec<i64> = input
+            .shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &dim)| match (dim < 0, axis, is_past) {
+                (false, _, _) => dim,
+                (true, 0, _) => 1,
+                (true, _, true) => 0,
+                (true, _, false) => SEQ,
+            })
+            .collect();
+        let elements: usize = shape.iter().map(|&d| d as usize).product();
+        let mut bytes = vec![0u8; elements * input.dtype.size_of()];
+        if input.dtype == DataType::Int64 {
+            for (index, chunk) in bytes.chunks_exact_mut(8).enumerate() {
+                let value = if input.name == "attention_mask" {
+                    1i64
+                } else {
+                    index as i64 % 2
+                };
+                chunk.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        buffers.push(bytes);
+        shapes.push(shape);
+    }
+    (buffers, shapes)
+}
+
+fn run_once(session: &Session) -> Result<(), onnx_genai_ort::OrtError> {
+    let (buffers, shapes) = model_inputs(session);
+    let mut values = Vec::new();
+    for ((buffer, shape), input) in buffers
+        .iter()
+        .zip(shapes.iter())
+        .zip(session.inputs().iter())
+    {
+        values.push(Value::from_raw_bytes(buffer.clone(), shape, input.dtype)?);
+    }
+    let inputs: Vec<(&str, &Value)> = session
+        .input_names()
+        .iter()
+        .map(String::as_str)
+        .zip(values.iter())
+        .collect();
+    session.run(&inputs).map(|_| ())
 }
 
 /// The whole point: a session that opted in must charge its allocations to the
 /// governor.
 ///
-/// Peak is what is asserted, not the final count. ORT frees most of what it
-/// allocates before `run` returns, so a test that only looked afterwards would
-/// pass whether or not a single byte went through us.
+/// Two things are asserted, because either alone is weak. Construction moving
+/// the ledger shows the registration is live. `total_count` moving *across the
+/// run* shows inference itself flows through us — `live_count` cannot say that,
+/// because ORT frees most of what it takes before `run` returns, so a test
+/// sampling it afterwards reads zero either way.
+///
+/// The run has to actually succeed for the second half to mean anything. An
+/// earlier version let it fail on a missing input and asserted nothing about
+/// it; the run allocated zero times and the test still passed.
 #[test]
 fn a_session_that_opted_in_allocates_through_the_governor() {
     let _guard = ort_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -74,19 +131,24 @@ fn a_session_that_opted_in_allocates_through_the_governor() {
     let registered =
         register_governed_allocator(test_environment(), allocator).expect("register allocator");
 
-    let mut options = SessionOptions::default().with_intra_op_threads(1);
-    options.use_env_allocators();
+    let options = SessionOptions::default().with_intra_op_threads(1);
     let session = Session::new(test_environment(), &model, options).expect("session");
 
-    let free_before = governor.available(Tier::Host);
-    run_once(&session);
-
-    // Session construction alone already allocates weights and plan state, so
-    // the ledger must have moved before the run even started.
+    let free_after_build = governor.available(Tier::Host);
     assert!(
-        free_before < BUDGET,
-        "building a session with use_env_allocators charged the governor nothing, \
-         so the registration is not actually being used ({free_before} of {BUDGET} free)"
+        free_after_build < BUDGET,
+        "building a session charged the governor nothing, so the registration is \
+         not actually being used ({free_after_build} of {BUDGET} free)"
+    );
+
+    let allocations_before_run = registered.total_count();
+    run_once(&session).expect("the model must actually run");
+    assert!(
+        registered.total_count() > allocations_before_run,
+        "running the model allocated nothing through the governed allocator \
+         ({} allocations before, {} after)",
+        allocations_before_run,
+        registered.total_count()
     );
 
     drop(session);
@@ -110,10 +172,14 @@ fn a_session_that_did_not_opt_in_leaves_the_governor_untouched() {
     let registered =
         register_governed_allocator(test_environment(), allocator).expect("register allocator");
 
-    // Deliberately no `use_env_allocators`.
-    let options = SessionOptions::default().with_intra_op_threads(1);
+    // Explicitly opt *out*: governance is on by default, so this is what a
+    // caller who wants ORT's own allocator has to do.
+    let mut options = SessionOptions::default().with_intra_op_threads(1);
+    options
+        .session_config_entries
+        .retain(|(key, _)| key != USE_ENV_ALLOCATORS);
     let session = Session::new(test_environment(), &model, options).expect("session");
-    run_once(&session);
+    let _ = run_once(&session);
 
     assert_eq!(
         governor.available(Tier::Host),
@@ -124,6 +190,22 @@ fn a_session_that_did_not_opt_in_leaves_the_governor_untouched() {
 
     drop(session);
     drop(registered);
+}
+
+/// Governance is on by default. This is the difference between the feature
+/// existing and the feature being used: an opt-in switch leaves every ordinary
+/// session ungoverned, and the budget decorative.
+#[test]
+fn the_default_session_options_opt_in_to_governance() {
+    let options = SessionOptions::default();
+    assert!(
+        options
+            .session_config_entries
+            .iter()
+            .any(|(key, value)| key == USE_ENV_ALLOCATORS && value == "1"),
+        "SessionOptions::default() must enable env allocators, or a registered \
+         governor never sees an ordinary session's allocations"
+    );
 }
 
 /// The config entry must survive onto the session options ORT actually sees.

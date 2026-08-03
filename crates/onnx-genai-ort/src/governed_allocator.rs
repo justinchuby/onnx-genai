@@ -37,7 +37,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use onnx_runtime_memory_governor::{LeaseAccounting, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease, MemoryRole, Tier};
 
 use crate::allocator::MemoryInfo;
 
@@ -49,7 +49,7 @@ use crate::allocator::MemoryInfo;
 /// possible way to find out.
 const ALLOCATION_ALIGNMENT: usize = 64;
 
-/// Bytes reserved before every block to record its size.
+/// Bytes reserved before every block to hold its [`MemoryLease`].
 ///
 /// ORT's `Free` hands back only a pointer, so the size has to be recovered
 /// somehow. The first version kept a `HashMap<address, (layout, lease)>`, which
@@ -57,20 +57,41 @@ const ALLOCATION_ALIGNMENT: usize = 64;
 /// that side table was the dominant cost of governing an allocation — not the
 /// lease, and not `malloc`.
 ///
-/// A header costs one alignment unit per block and nothing else: no lock, no
-/// hash, no allocation. It is a full [`ALLOCATION_ALIGNMENT`] so the pointer
-/// handed to ORT keeps the alignment its kernels are entitled to assume.
+/// Putting the lease *in* the block removes the table without giving up what
+/// the table was holding. `Drop` still returns the bytes exactly once (G2),
+/// because the lease is still a lease; it just lives in the memory it governs.
+///
+/// The header is a full [`ALLOCATION_ALIGNMENT`] so the pointer handed to ORT
+/// keeps the alignment its kernels are entitled to assume.
 const HEADER_BYTES: usize = ALLOCATION_ALIGNMENT;
 
+// The header only works if a lease fits in it. Checked here rather than
+// discovered as a heap overwrite.
+const _: () = assert!(
+    std::mem::size_of::<MemoryLease>() <= HEADER_BYTES,
+    "a MemoryLease no longer fits in the block header"
+);
+const _: () = assert!(
+    std::mem::align_of::<MemoryLease>() <= ALLOCATION_ALIGNMENT,
+    "a MemoryLease needs more alignment than a block base provides"
+);
+
 struct GovernedAllocatorState {
-    accounting: Arc<dyn LeaseAccounting>,
+    governor: Arc<dyn MemoryGovernor + Send + Sync>,
     tier: Tier,
     role: MemoryRole,
+    holder: HolderId,
     /// Observability, not accounting: the governor's books are authoritative.
     /// Two relaxed atomics, because the alternative is the side table this
     /// design exists to remove.
     live_bytes: AtomicU64,
     live_count: AtomicUsize,
+    /// Every allocation ever served, never decremented.
+    ///
+    /// `live_count` cannot answer "did this run allocate through us": ORT frees
+    /// most of what it takes before a run returns, so a test sampling it
+    /// afterwards reads zero whether or not a single byte went through here.
+    total_count: AtomicU64,
 }
 
 /// An `OrtAllocator` whose allocations are leased from a memory governor.
@@ -105,9 +126,10 @@ impl GovernedAllocator {
     /// charged.
     pub fn new(
         memory_info: MemoryInfo,
-        accounting: Arc<dyn LeaseAccounting>,
+        governor: Arc<dyn MemoryGovernor + Send + Sync>,
         tier: Tier,
         role: MemoryRole,
+        holder: HolderId,
     ) -> crate::error::Result<Box<Self>> {
         if tier != Tier::Host {
             return Err(crate::error::OrtError::InvalidArgument(format!(
@@ -140,11 +162,13 @@ impl GovernedAllocator {
             },
             memory_info,
             state: Arc::new(GovernedAllocatorState {
-                accounting,
+                governor,
                 tier,
                 role,
+                holder,
                 live_bytes: AtomicU64::new(0),
                 live_count: AtomicUsize::new(0),
+                total_count: AtomicU64::new(0),
             }),
         });
         // The vtable is only reachable through this pointer, so it must not move
@@ -166,6 +190,14 @@ impl GovernedAllocator {
     /// Number of live allocations.
     pub fn live_count(&self) -> usize {
         self.state.live_count.load(Ordering::Relaxed)
+    }
+
+    /// Every allocation this allocator has ever served.
+    ///
+    /// Monotonic, so it can answer whether work flowed through here even after
+    /// everything it allocated has been freed again.
+    pub fn total_count(&self) -> u64 {
+        self.state.total_count.load(Ordering::Relaxed)
     }
 }
 
@@ -203,29 +235,30 @@ unsafe extern "C" fn governed_alloc(
         return std::ptr::null_mut();
     };
 
-    // Charge first. A refusal must not allocate, or the budget is decorative.
-    if state
-        .accounting
-        .try_claim(state.tier, total as u64, state.role)
-        .is_err()
-    {
+    // Lease first. A refusal must not allocate, or the budget is decorative.
+    let Ok(lease) = state
+        .governor
+        .reserve(state.tier, total as u64, state.role, state.holder)
+    else {
         return std::ptr::null_mut();
-    }
+    };
 
     // SAFETY: `layout` has a non-zero size and a valid power-of-two alignment.
     let base = unsafe { alloc(layout) };
     if base.is_null() {
-        // Give the budget back; failing to would leak it on every allocation
-        // failure.
-        state.accounting.release(state.tier, total as u64);
+        // Dropping the lease returns the bytes; failing to would leak budget on
+        // every allocation failure.
+        drop(lease);
         return std::ptr::null_mut();
     }
 
-    // SAFETY: the header slot is the first `HEADER_BYTES` of an allocation we
-    // just made, and `HEADER_BYTES` is at least `size_of::<usize>()`.
-    unsafe { base.cast::<usize>().write(total) };
+    // SAFETY: the header is the first `HEADER_BYTES` of an allocation we just
+    // made, it is large enough and aligned enough for a `MemoryLease` (both
+    // asserted at compile time), and nothing else can observe it yet.
+    unsafe { base.cast::<MemoryLease>().write(lease) };
     state.live_bytes.fetch_add(total as u64, Ordering::Relaxed);
     state.live_count.fetch_add(1, Ordering::Relaxed);
+    state.total_count.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `HEADER_BYTES` is within the allocation, so the block pointer is
     // in bounds; it stays `ALLOCATION_ALIGNMENT`-aligned because the header is
     // exactly one alignment unit.
@@ -241,19 +274,25 @@ unsafe extern "C" fn governed_free(this: *mut onnx_genai_ort_sys::OrtAllocator, 
     let state = &allocator.state;
 
     // SAFETY: `p` came from `governed_alloc`, so the header sits immediately
-    // before it and holds the total size. Unlike the side-table version there
-    // is no way to detect a foreign pointer here; freeing one was already
-    // undefined, and ORT only frees what this allocator returned.
+    // before it and holds the lease. Reading it out moves ownership here, so
+    // the lease is dropped exactly once (G2) even though no table tracked it.
+    //
+    // Unlike the side-table version there is no way to detect a foreign
+    // pointer: the table could refuse an address it never handed out, a header
+    // cannot. Freeing a pointer this allocator did not return was already
+    // undefined, and ORT only frees what it was given.
     let base = unsafe { p.cast::<u8>().sub(HEADER_BYTES) };
-    let total = unsafe { base.cast::<usize>().read() };
+    let lease = unsafe { base.cast::<MemoryLease>().read() };
+    let total = lease.bytes() as usize;
     let Ok(layout) = Layout::from_size_align(total, ALLOCATION_ALIGNMENT) else {
         return;
     };
     // SAFETY: the pointer and layout are the pair `governed_alloc` created.
+    // The lease was moved out above, so nothing reads the header after this.
     unsafe { dealloc(base, layout) };
-    state.accounting.release(state.tier, total as u64);
     state.live_bytes.fetch_sub(total as u64, Ordering::Relaxed);
     state.live_count.fetch_sub(1, Ordering::Relaxed);
+    // `lease` drops here, returning the bytes to the governor.
 }
 
 unsafe extern "C" fn governed_info(
@@ -303,6 +342,11 @@ impl RegisteredAllocator<'_> {
     /// Number of live allocations ORT holds through this allocator.
     pub fn live_count(&self) -> usize {
         self.allocator.live_count()
+    }
+
+    /// Every allocation served since registration, never decremented.
+    pub fn total_count(&self) -> u64 {
+        self.allocator.total_count()
     }
 
     /// Remove this allocator from the environment, reporting failure.
@@ -420,7 +464,7 @@ pub fn register_governed_allocator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryGovernor};
+    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
     fn allocator(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
         allocator_with(
@@ -433,13 +477,13 @@ mod tests {
         budget: u64,
         memory_info: MemoryInfo,
     ) -> (Box<GovernedAllocator>, LedgerGovernor) {
-        let ledger = LeaseLedger::new(0, budget, 0);
-        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, budget, 0));
         let allocator = GovernedAllocator::new(
             memory_info,
-            ledger as Arc<dyn LeaseAccounting>,
+            Arc::new(governor.clone()),
             Tier::Host,
             MemoryRole::Activation,
+            HolderId::new(9),
         );
         (allocator.expect("host allocator"), governor)
     }
@@ -669,9 +713,10 @@ mod tests {
     fn a_device_tier_is_refused_because_this_allocator_only_has_host_memory() {
         let result = GovernedAllocator::new(
             MemoryInfo::cpu_device().expect("cpu device memory info"),
-            LeaseLedger::new(0, 4096, 0) as Arc<dyn LeaseAccounting>,
+            Arc::new(LedgerGovernor::new(LeaseLedger::new(0, 4096, 0))),
             Tier::Device,
             MemoryRole::Activation,
+            HolderId::new(9),
         );
         let error = match result {
             Ok(_) => panic!("a device tier must be refused"),
@@ -681,5 +726,54 @@ mod tests {
             error.to_string().contains("Tier::Host"),
             "the error must say which tier is valid, got: {error}"
         );
+    }
+    /// A request the system allocator cannot satisfy must give the budget back.
+    ///
+    /// The claim happens before the allocation, so a failure between them leaks
+    /// budget on every occurrence unless the lease is dropped. Provoked with a
+    /// size no allocator can serve but that the governor will happily grant.
+    #[test]
+    fn a_failed_system_allocation_returns_the_budget_it_had_claimed() {
+        let (mut alloc, governor) = allocator(u64::MAX);
+        let before = governor.available(Tier::Host);
+
+        // Large enough that `alloc` must fail, small enough that the layout is
+        // still valid and the governor's ceiling is not the thing refusing it.
+        let ptr = unsafe { governed_alloc(alloc.as_ort_allocator(), isize::MAX as usize / 2) };
+        assert!(ptr.is_null(), "the system allocator cannot serve this");
+        assert_eq!(
+            governor.available(Tier::Host),
+            before,
+            "a failed allocation kept the budget it had claimed"
+        );
+        assert_eq!(alloc.live_bytes(), 0);
+        assert_eq!(alloc.live_count(), 0);
+    }
+
+    /// A block's bytes survive being handed out, i.e. writing the lease into the
+    /// header does not overlap the block.
+    #[test]
+    fn the_header_does_not_overlap_the_block() {
+        let (mut alloc, _) = allocator(1 << 20);
+        let size = 256usize;
+        let first = unsafe { governed_alloc(alloc.as_ort_allocator(), size) };
+        let second = unsafe { governed_alloc(alloc.as_ort_allocator(), size) };
+        unsafe {
+            std::ptr::write_bytes(first.cast::<u8>(), 0x11, size);
+            std::ptr::write_bytes(second.cast::<u8>(), 0x22, size);
+            for offset in 0..size {
+                assert_eq!(*first.cast::<u8>().add(offset), 0x11, "block one clobbered");
+                assert_eq!(
+                    *second.cast::<u8>().add(offset),
+                    0x22,
+                    "block two clobbered"
+                );
+            }
+            // Freeing reads the lease back out of each header; if a block write
+            // had reached its own header this would corrupt the ledger.
+            governed_free(alloc.as_ort_allocator(), first);
+            governed_free(alloc.as_ort_allocator(), second);
+        }
+        assert_eq!(alloc.live_count(), 0);
     }
 }

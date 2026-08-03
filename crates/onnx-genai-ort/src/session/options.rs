@@ -93,6 +93,14 @@ impl Default for SessionOptions {
             options.auto_selected = true;
         }
         options.apply_provider_defaults();
+        // Governance is on by default. Without this entry a session silently
+        // builds its own allocator, so a registered governor would report zero
+        // bytes forever and be indistinguishable from a model that does not
+        // allocate — the budget would be decorative for every default session.
+        //
+        // Costs nothing when no allocator is registered: ORT then falls back to
+        // its own, exactly as before.
+        options.use_env_allocators();
         options
     }
 }
