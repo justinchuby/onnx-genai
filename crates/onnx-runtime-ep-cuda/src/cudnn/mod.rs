@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use cudarc::cudnn::{
-    ConvBiasActivationForward, ConvForward, Cudnn, CudnnDataType, NoIndices, PoolingForward,
-    ReduceTensor, ReductionDescriptor, SoftmaxForward, TensorDescriptor, result, sys,
+    ConvBiasActivationForward, ConvForward, Cudnn, CudnnDataType, PoolingForward, SoftmaxForward,
+    TensorDescriptor, result, sys,
 };
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
@@ -134,25 +134,6 @@ pub struct CudnnPoolingSpec {
     pub pads: [i32; 2],
     pub strides: [i32; 2],
     pub mode: CudnnPoolingMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReductionScratchSizes {
-    workspace_bytes: usize,
-    indices_bytes: usize,
-}
-
-impl ReductionScratchSizes {
-    fn no_indices(workspace_bytes: usize) -> Self {
-        Self {
-            workspace_bytes,
-            indices_bytes: 0,
-        }
-    }
-
-    fn workspace_allocation_bytes(self) -> usize {
-        self.workspace_bytes.max(1)
-    }
 }
 
 impl CudnnTensorType {
@@ -312,8 +293,8 @@ impl CudnnTensorDescriptor<'_> {
 pub struct CudnnHandle<'handle> {
     handle: &'handle Arc<Cudnn>,
     stream: &'handle Arc<CudaStream>,
-    /// Raw cuDNN handle, stream-bound, used only by the half/bf16 reduce path
-    /// (see [`CudnnHandle::reduce_raw_f32_comp`]). It aliases the same CUDA
+    /// Raw cuDNN handle, stream-bound, used only by the f32-compute-type reduce
+    /// path (see [`CudnnHandle::reduce_cached`]). It aliases the same CUDA
     /// stream as `handle` and is serialized by the backend's handle mutex.
     reduce_handle: sys::cudnnHandle_t,
 }
@@ -404,103 +385,117 @@ impl CudnnHandle<'_> {
         .map_err(|e| cudnn_err("cudnnSoftmaxForward", e))
     }
 
-    /// Query scratch space and execute a no-indices cuDNN tensor reduction.
-    pub fn reduce(
+    /// CUDA-graph-capture-eligible cuDNN reduce that reuses cached descriptors
+    /// and a cached device workspace across calls with the same signature.
+    ///
+    /// A per-call `cudnnGetReductionWorkspaceSize` + `alloc_zeros` (device
+    /// `cuMemAlloc`) plus the reduce kernel's trailing `synchronize()` are what
+    /// make the plain [`CudnnHandle::reduce`] path non-capturable — a device
+    /// allocation and a host sync are both illegal inside a CUDA graph capture,
+    /// so the segmenter shreds the graph at every float reduce (the dense
+    /// MoE per-expert mask reduce fires this thousands of times per decode
+    /// step). This entry point hoists all of that out of the hot path: the
+    /// first call for a signature (or after a shape change) allocates the
+    /// descriptors and workspace and caches them on `cache`; every subsequent
+    /// call with the same `(op, input, output)` signature reuses them and only
+    /// enqueues `cudnnReduceTensor`, so the reduce records cleanly into a
+    /// captured segment.
+    ///
+    /// This drives the raw cuDNN FFI with an **f32 compute type and f32
+    /// alpha/beta** for both f32 and f16 I/O. For f16 that is the ONNX
+    /// accumulate-in-f32 semantics (`cudnnReduceTensor` rejects a half
+    /// `reduceTensorCompType` — `CUDNN_STATUS_NOT_SUPPORTED` — and requires
+    /// `CUDNN_DATA_FLOAT` accumulation for half I/O, which is exactly ONNX's
+    /// accumulate-in-f32-then-cast-back rule); for f32 it is byte-identical to
+    /// the type-coupled safe reduce (f32 comp type, `alpha = 1`, `beta = 0`,
+    /// same descriptors). bf16 is rejected here — cuDNN cannot reduce it — and
+    /// is routed to the NVRTC kernel by the caller.
+    ///
+    /// The caller must **not** synchronize after this returns while a capture is
+    /// recording; in eager mode it keeps its usual trailing sync.
+    pub fn reduce_cached(
         &self,
+        cache: &mut CudnnReduceCache,
         input_spec: &TensorDescriptorSpec,
         output_spec: &TensorDescriptorSpec,
         op: CudnnReduceOp,
         buffers: CudnnBufferPair,
+        capturing: bool,
     ) -> Result<()> {
         if input_spec.dtype() != output_spec.dtype() {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cuDNN reduction input/output descriptor dtypes differ".into(),
             ));
         }
-        match input_spec.dtype() {
-            // f32 I/O reduces in f32 already, so the type-coupled safe path is
-            // correct and stays the fast path.
-            CudnnTensorType::F32 => {
-                let input = self.tensor_descriptor(input_spec)?;
-                let output = self.tensor_descriptor(output_spec)?;
-                let a = input.as_f32().expect("dtype checked to be f32");
-                let c = output.as_f32().expect("dtype checked to be f32");
-                self.reduce_t(a, c, op, buffers, (1.0f32, 0.0f32))
-            }
-            // f16 I/O must reduce with an f32 compute type, which cudarc's
-            // type-coupled safe reduce cannot express (see below).
-            CudnnTensorType::F16 => self.reduce_raw_f32_comp(input_spec, output_spec, op, buffers),
-            // cuDNN cannot reduce bf16 at all (rejected even with an f32 comp
-            // type — `CUDNN_STATUS_NOT_SUPPORTED`). The reduce kernel routes
-            // bf16 to its typed NVRTC block reduction instead, so this arm is a
-            // defensive guard and must never be reached.
-            CudnnTensorType::Bf16 => Err(EpError::KernelFailed(
+        if input_spec.dtype() == CudnnTensorType::Bf16 {
+            return Err(EpError::KernelFailed(
                 "cuda_ep: cuDNN cannot reduce bf16 tensors; route bf16 reductions \
                  to the NVRTC block-reduction kernel"
                     .into(),
-            )),
+            ));
         }
-    }
 
-    fn reduce_t<T: CudnnDataType + Copy>(
-        &self,
-        a: &TensorDescriptor<T>,
-        c: &TensorDescriptor<T>,
-        reduce_op: CudnnReduceOp,
-        buffers: CudnnBufferPair,
-        scaling: (T, T),
-    ) -> Result<()> {
-        let descriptor: ReductionDescriptor<T, NoIndices> = self
-            .handle
-            .create_reduction_no_indices::<T>(
-                reduce_op.as_raw(),
-                sys::cudnnNanPropagation_t::CUDNN_PROPAGATE_NAN,
-            )
-            .map_err(|e| cudnn_err("creating reduction descriptor", e))?;
-        let op = ReduceTensor {
-            reduce: &descriptor,
-            a,
-            c,
+        let key = CudnnReduceKey {
+            op,
+            input: input_spec.clone(),
+            output: output_spec.clone(),
         };
-        let scratch = ReductionScratchSizes::no_indices(
-            op.get_workspace_size()
-                .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?,
-        );
-        debug_assert_eq!(scratch.indices_bytes, 0);
-        let mut workspace = self
-            .stream
-            .alloc_zeros::<u8>(scratch.workspace_allocation_bytes())
-            .map_err(|e| driver_err("allocating cuDNN reduction workspace", e))?;
-        let input = RawDevice::<T>::new(buffers.input, buffers.input_numel, self.stream.clone());
-        let mut output =
-            RawDevice::<T>::new(buffers.output, buffers.output_numel, self.stream.clone());
-        // SAFETY: descriptors and raw buffers have matching dtypes/layouts;
-        // workspace is at least the size returned by cuDNN and indices are off.
-        unsafe { op.launch(&mut workspace, scaling, &input, &mut output) }
-            .map_err(|e| cudnn_err("cudnnReduceTensor", e))
+        if cache.key.as_ref() != Some(&key) {
+            if capturing {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: cuDNN reduction signature changed during CUDA graph capture; \
+                     warm the fixed decode shape before capture"
+                        .into(),
+                ));
+            }
+            self.repopulate_reduce_cache(cache, input_spec, output_spec, op, key)?;
+        }
+
+        let reduce = cache
+            .reduce_desc
+            .as_ref()
+            .expect("reduce descriptor cached");
+        let a_desc = cache.input_desc.as_ref().expect("input descriptor cached");
+        let c_desc = cache
+            .output_desc
+            .as_ref()
+            .expect("output descriptor cached");
+
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        // SAFETY: the cached tensor descriptors describe the f16/f32 device
+        // buffers, the cached reduction descriptor uses an f32 comp type (so
+        // alpha/beta are f32), and the cached workspace is at least the queried
+        // size for this signature with indices disabled.
+        unsafe {
+            result::reduce_tensor(
+                self.reduce_handle,
+                reduce.0,
+                std::ptr::null_mut(),
+                0,
+                cache.workspace as *mut std::ffi::c_void,
+                cache.workspace_bytes,
+                (&alpha as *const f32).cast::<std::ffi::c_void>(),
+                a_desc.0,
+                buffers.input as *const std::ffi::c_void,
+                (&beta as *const f32).cast::<std::ffi::c_void>(),
+                c_desc.0,
+                buffers.output as *mut std::ffi::c_void,
+            )
+        }
+        .map_err(|e| cudnn_err("cudnnReduceTensor", e))
     }
 
-    /// Reduce f16 tensors with an **f32 compute type**.
-    ///
-    /// `cudnnReduceTensor` rejects a half `reduceTensorCompType`
-    /// (`CUDNN_STATUS_NOT_SUPPORTED`, reproduced on cuDNN 9.10 and 9.20); it
-    /// requires `CUDNN_DATA_FLOAT` accumulation for half I/O. That f32
-    /// accumulation is also exactly the ONNX `ReduceSum`/`ReduceMean` semantics
-    /// for half inputs (accumulate in f32, cast the result back to half).
-    ///
-    /// cudarc's safe `ReduceTensor<T>` / `create_reduction_no_indices::<T>` bind
-    /// both the reduce compute type and the alpha/beta scalar type to the I/O
-    /// `T`, so they cannot express "f32 comp type + half I/O + f32 scalars".
-    /// This path therefore drives the raw cuDNN FFI directly: it keeps the
-    /// half tensor descriptors and device buffers but builds an f32 reduction
-    /// descriptor and passes f32 alpha/beta. (bf16 is not routed here — cuDNN
-    /// rejects bf16 reductions outright, so they use the NVRTC kernel.)
-    fn reduce_raw_f32_comp(
+    /// (Re)build the cached descriptors and device workspace for a new reduce
+    /// signature. Only ever called in eager mode (a signature change during
+    /// capture is rejected by [`CudnnHandle::reduce_cached`]).
+    fn repopulate_reduce_cache(
         &self,
+        cache: &mut CudnnReduceCache,
         input_spec: &TensorDescriptorSpec,
         output_spec: &TensorDescriptorSpec,
         op: CudnnReduceOp,
-        buffers: CudnnBufferPair,
+        key: CudnnReduceKey,
     ) -> Result<()> {
         let a_desc = RawTensorDescriptor::new(input_spec)?;
         let c_desc = RawTensorDescriptor::new(output_spec)?;
@@ -513,34 +508,32 @@ impl CudnnHandle<'_> {
         }
         .map_err(|e| cudnn_err("cudnnGetReductionWorkspaceSize", e))?;
 
-        let mut workspace = self
-            .stream
-            .alloc_zeros::<u8>(workspace_bytes.max(1))
-            .map_err(|e| driver_err("allocating cuDNN reduction workspace", e))?;
-        let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(self.stream);
-
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
-        // SAFETY: the tensor descriptors describe the half/bf16 device buffers;
-        // the reduction descriptor uses an f32 comp type, so alpha/beta are f32;
-        // the workspace is at least the queried size and indices are disabled.
-        unsafe {
-            result::reduce_tensor(
-                self.reduce_handle,
-                reduce.0,
-                std::ptr::null_mut(),
-                0,
-                workspace_ptr as *mut std::ffi::c_void,
-                workspace_bytes,
-                (&alpha as *const f32).cast::<std::ffi::c_void>(),
-                a_desc.0,
-                buffers.input as *const std::ffi::c_void,
-                (&beta as *const f32).cast::<std::ffi::c_void>(),
-                c_desc.0,
-                buffers.output as *mut std::ffi::c_void,
-            )
+        // Retire the previous workspace only after every prior launch using it
+        // has completed. This runs in eager mode, so the sync is legal.
+        if cache.workspace != 0 {
+            self.stream.synchronize().map_err(|e| {
+                driver_err("synchronizing before freeing cuDNN reduce workspace", e)
+            })?;
+            // SAFETY: the cache exclusively owns this pointer and the sync above
+            // drained every launch that referenced it.
+            unsafe { free_reduce_workspace(cache.workspace) }?;
+            cache.workspace = 0;
+            cache.workspace_bytes = 0;
         }
-        .map_err(|e| cudnn_err("cudnnReduceTensor", e))
+
+        // SAFETY: a fresh device allocation the cache owns and frees exactly once.
+        let workspace = unsafe {
+            cudarc::driver::result::malloc_sync(workspace_bytes.max(1))
+                .map_err(|e| driver_err("allocating cuDNN reduce workspace", e))?
+        };
+
+        cache.input_desc = Some(a_desc);
+        cache.output_desc = Some(c_desc);
+        cache.reduce_desc = Some(reduce);
+        cache.workspace = workspace;
+        cache.workspace_bytes = workspace_bytes;
+        cache.key = Some(key);
+        Ok(())
     }
 
     /// Select a cuDNN forward algorithm, allocate its workspace, and execute a
@@ -820,6 +813,13 @@ impl Drop for RawReduceHandle {
 /// An owned raw cuDNN tensor descriptor, destroyed on drop.
 struct RawTensorDescriptor(sys::cudnnTensorDescriptor_t);
 
+impl std::fmt::Debug for RawTensorDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawTensorDescriptor")
+            .finish_non_exhaustive()
+    }
+}
+
 impl RawTensorDescriptor {
     fn new(spec: &TensorDescriptorSpec) -> Result<Self> {
         let desc = result::create_tensor_descriptor()
@@ -853,6 +853,13 @@ impl Drop for RawTensorDescriptor {
 /// An owned raw cuDNN reduction descriptor with an f32 compute type.
 struct RawReductionDescriptor(sys::cudnnReduceTensorDescriptor_t);
 
+impl std::fmt::Debug for RawReductionDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawReductionDescriptor")
+            .finish_non_exhaustive()
+    }
+}
+
 impl RawReductionDescriptor {
     fn new_f32_comp(op: CudnnReduceOp) -> Result<Self> {
         let desc = result::create_reduce_tensor_descriptor()
@@ -880,6 +887,79 @@ impl Drop for RawReductionDescriptor {
         // SAFETY: the descriptor is live and destroyed exactly once here.
         unsafe {
             let _ = result::destroy_reduce_tensor_descriptor(self.0);
+        }
+    }
+}
+
+/// Free a cuDNN reduce workspace previously allocated by [`CudnnReduceCache`].
+///
+/// # Safety
+/// `ptr` must be a live device allocation from `cudarc::driver::result::malloc_sync`
+/// (as produced by [`CudnnHandle::repopulate_reduce_cache`]) that has not been
+/// freed, and no in-flight launch may still reference it.
+unsafe fn free_reduce_workspace(ptr: CUdeviceptr) -> Result<()> {
+    // SAFETY: the caller upholds the single-free / no-live-use contract.
+    unsafe { cudarc::driver::result::free_sync(ptr) }
+        .map_err(|e| driver_err("freeing cuDNN reduce workspace", e))
+}
+
+/// Signature identifying a cached cuDNN reduce: the op plus the input and output
+/// descriptor specs (dtype, padded dims, strides). Axes/`keepdims` are fully
+/// captured by the output spec, so a change in any of them is a cache miss.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CudnnReduceKey {
+    op: CudnnReduceOp,
+    input: TensorDescriptorSpec,
+    output: TensorDescriptorSpec,
+}
+
+/// Per-reduce-kernel cache of cuDNN descriptors and a device workspace, reused
+/// across calls with a stable signature so a fixed-shape decode reduce needs no
+/// per-call device allocation or workspace-size query. This is what lets the
+/// float reduce record into a captured CUDA graph (see
+/// [`CudnnHandle::reduce_cached`]). One instance is owned per `ReduceKernel` and
+/// serialized behind that kernel's mutex.
+#[derive(Debug)]
+pub struct CudnnReduceCache {
+    stream: Arc<CudaStream>,
+    key: Option<CudnnReduceKey>,
+    input_desc: Option<RawTensorDescriptor>,
+    output_desc: Option<RawTensorDescriptor>,
+    reduce_desc: Option<RawReductionDescriptor>,
+    workspace: CUdeviceptr,
+    workspace_bytes: usize,
+}
+
+// SAFETY: cuDNN descriptors and the raw workspace pointer are not safe for
+// concurrent use, but every access is serialized behind the owning kernel's
+// mutex and runs on the thread bound to the owning CUDA context (bound by
+// `with_handle` for launches and by `Drop` before freeing).
+unsafe impl Send for CudnnReduceCache {}
+
+impl CudnnReduceCache {
+    /// Create an empty cache bound to the EP's compute stream.
+    pub fn new(stream: Arc<CudaStream>) -> Self {
+        Self {
+            stream,
+            key: None,
+            input_desc: None,
+            output_desc: None,
+            reduce_desc: None,
+            workspace: 0,
+            workspace_bytes: 0,
+        }
+    }
+}
+
+impl Drop for CudnnReduceCache {
+    fn drop(&mut self) {
+        if self.workspace != 0 {
+            let _ = self.stream.context().bind_to_thread();
+            let _ = self.stream.synchronize();
+            // SAFETY: the cache exclusively owns this pointer; the sync above
+            // drained every launch that referenced it, and it is freed once.
+            let _ = unsafe { free_reduce_workspace(self.workspace) };
+            self.workspace = 0;
         }
     }
 }
@@ -1117,15 +1197,6 @@ mod tests {
             CudnnPoolingMode::AverageExcludePadding.as_raw(),
             sys::cudnnPoolingMode_t::CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING
         );
-    }
-
-    #[test]
-    fn reduction_workspace_query_result_is_raii_allocatable() {
-        let zero = ReductionScratchSizes::no_indices(0);
-        assert_eq!(zero.workspace_allocation_bytes(), 1);
-        assert_eq!(zero.indices_bytes, 0);
-        let nonzero = ReductionScratchSizes::no_indices(4096);
-        assert_eq!(nonzero.workspace_allocation_bytes(), 4096);
     }
 
     #[test]
