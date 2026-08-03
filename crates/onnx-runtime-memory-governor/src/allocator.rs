@@ -182,7 +182,9 @@ mod tests {
     #[test]
     fn a_zero_byte_request_is_not_a_failure() {
         let allocator = HostAllocator;
-        let ptr = allocator.allocate(0, 64).expect("zero bytes is not an error");
+        let ptr = allocator
+            .allocate(0, 64)
+            .expect("zero bytes is not an error");
         // SAFETY: as returned.
         unsafe { allocator.deallocate(ptr, 0, 64) };
     }
