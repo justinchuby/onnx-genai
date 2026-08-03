@@ -31,7 +31,7 @@ use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout}
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
-use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
+use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 
 /// Default VRAM budget for the device weight-offload residency cache when
@@ -48,6 +48,13 @@ pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
 pub struct CudaExecutionProvider {
     device: DeviceId,
     runtime: Arc<CudaRuntime>,
+    /// Where this EP's device buffers come from.
+    ///
+    /// The same DeviceAllocator contract the CPU EP and the ONNX Runtime
+    /// allocator use, so an allocator a caller writes serves every backend.
+    /// Defaults to CudaDeviceAllocator, which is the cuMemAlloc call this
+    /// EP used to make directly.
+    memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
     initialized: bool,
     registry: OpRegistry,
     csa_metrics: Arc<CsaMetrics>,
@@ -88,6 +95,10 @@ impl CudaExecutionProvider {
         });
         Ok(Self {
             device: DeviceId::cuda(ordinal),
+            memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
+                runtime.cuda_context(),
+                ordinal,
+            )),
             runtime,
             initialized: false,
             registry,
@@ -95,6 +106,22 @@ impl CudaExecutionProvider {
             offload_policy,
             residency,
         })
+    }
+
+    /// Take device buffers from `memory` instead of calling `cuMemAlloc`
+    /// directly.
+    ///
+    /// The same `DeviceAllocator` a caller installs on the CPU EP or the ONNX
+    /// Runtime side. This is where a CUDA arena belongs: `cudaMalloc` is a
+    /// synchronising driver call in the microseconds, so unlike host memory,
+    /// device memory genuinely needs one — and behind this seam it is written
+    /// once rather than once per backend.
+    pub fn with_memory(
+        mut self,
+        memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    ) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Construct and initialize a CUDA execution provider with default settings.
@@ -441,14 +468,23 @@ impl ExecutionProvider for CudaExecutionProvider {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
-        // cuMemAlloc returns at least 256-byte-aligned device pointers, which
-        // satisfies any realistic tensor alignment; we still record the
-        // requested `alignment` on the handle for symmetry with the CPU EP.
-        let dptr = self.runtime.alloc_raw(size)?;
-        // SAFETY: `dptr` is a fresh, unique, non-null device allocation of
+        // One allocator for the whole project: the same `DeviceAllocator` a
+        // caller can install on the CPU EP or the ONNX Runtime side backs this
+        // one. The default is `CudaDeviceAllocator`, which is the `cuMemAlloc`
+        // this used to call directly.
+        let ptr =
+            self.memory
+                .allocate(size.max(1), alignment)
+                .map_err(|_| EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                })?;
+        // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in
         // `deallocate`. It is a device address, never dereferenced on the host.
-        Ok(unsafe { DeviceBuffer::from_raw_parts(raw_ptr(dptr), self.device, size, alignment) })
+        Ok(unsafe {
+            DeviceBuffer::from_raw_parts(ptr.as_ptr().cast(), self.device, size, alignment)
+        })
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
@@ -464,10 +500,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(());
         }
-        let dptr = cuptr(buffer.into_raw());
-        // SAFETY: `dptr` came from this EP's `alloc_raw`; `into_raw` consumed the
-        // owning handle so no alias remains, and this is its single free.
-        unsafe { self.runtime.free_raw(dptr) }
+        let size = buffer.len();
+        let align = buffer.alignment();
+        let ptr = buffer.into_raw();
+        let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
+            return Ok(());
+        };
+        // SAFETY: `ptr`, `size` and `align` are the triple this EP obtained
+        // from `self.memory` in `allocate`; `into_raw` consumed the owning
+        // handle so no alias remains, and this is its single free.
+        unsafe { self.memory.deallocate(ptr, size, align) };
+        Ok(())
     }
 
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
