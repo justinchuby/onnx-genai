@@ -11,9 +11,6 @@ use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerCon
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[cfg(feature = "native-backend")]
-use crate::native_decode::NativeDecodeDevice;
-
 /// Error returned when a user-facing resource limit cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
@@ -536,8 +533,7 @@ pub struct EngineConfig {
     pub decode_backend: EngineDecodeBackend,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
-    #[cfg(feature = "native-backend")]
-    pub native_device: Option<NativeDecodeDevice>,
+    pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
     /// Decoder-wide numeric precision for the native decode session
     /// (see [`onnx_runtime_session::DecodePrecision`]). Defaults to
     /// [`DecodePrecision::Model`](onnx_runtime_session::DecodePrecision::Model)
@@ -596,7 +592,6 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Auto,
-            #[cfg(feature = "native-backend")]
             native_device: None,
             #[cfg(feature = "native-backend")]
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
