@@ -2175,6 +2175,7 @@ dependencies = [
  "onnx-genai-runtime-config",
  "onnx-model-package",
  "onnx-runtime-loader",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-tracer",
  "onnx-std",
  "serde",

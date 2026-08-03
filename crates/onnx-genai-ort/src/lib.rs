@@ -20,6 +20,7 @@ pub(crate) mod device_sampler;
 pub mod eagle3;
 pub mod env;
 pub mod error;
+pub mod governed_allocator;
 pub mod io_roles;
 pub mod loader;
 pub mod mtp;
