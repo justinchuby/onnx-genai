@@ -39,7 +39,7 @@
 //! `M>1` prefill on CPU), partition-level CUDA-graph capture, and multi-GPU peer
 //! copies are all left to later phases (see the design doc §5 and §9).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::abi::OrtGraphView;
@@ -827,6 +827,142 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
         node_placement,
         legalized_graph: legalized.then(|| Arc::new(planned_graph)),
     })
+}
+
+/// Outcome of classifying a graph against an ordered provider set for the
+/// default session build path (Thread-3 Phase 3).
+#[derive(Debug)]
+pub enum PlacementDecision {
+    /// Every node is claimed by a single provider and no cross-device transfer
+    /// is needed: the caller keeps its existing single-EP executor unchanged
+    /// (byte-identical fast path). Carries the winning [`EpId`].
+    SingleProvider(EpId),
+    /// Nodes are split across providers; realizing this requires the
+    /// heterogeneous executor. Carries the concrete [`HeterogeneousPlan`].
+    Heterogeneous(Box<HeterogeneousPlan>),
+}
+
+/// Classify `graph` against `providers` (priority order, front = highest).
+///
+/// Runs the Phase-1 [`plan`] and collapses its result: a graph is homogeneous
+/// iff every node landed on the same provider. (A single provider on a non-host
+/// device still needs its inputs staged H2D, so transfer count is not the
+/// signal — a lone provider's input staging is ordinary single-EP behavior, not
+/// a cross-EP split.) Homogeneous graphs return
+/// [`PlacementDecision::SingleProvider`] so the caller keeps its single-EP path
+/// untouched; anything else returns the concrete per-node [`HeterogeneousPlan`].
+pub fn classify_placement(
+    graph: &Graph,
+    providers: &[ProviderPlacement],
+) -> Result<PlacementDecision> {
+    let plan = plan(graph, providers)?;
+    let distinct: HashSet<EpId> = plan.node_placement.values().copied().collect();
+    if distinct.len() <= 1 {
+        // Prefer the actually-assigned EP; an empty graph falls back to the
+        // highest-priority provider so the caller always gets a concrete id.
+        let ep = distinct
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| providers[0].ep);
+        Ok(PlacementDecision::SingleProvider(ep))
+    } else {
+        Ok(PlacementDecision::Heterogeneous(Box::new(plan)))
+    }
+}
+
+/// Human-readable, per-op placement summary for diagnostics and fail-closed
+/// errors. Names the op classes forced onto every non-primary (fallback)
+/// provider so the operator forcing a split is visible without a GPU.
+pub fn placement_summary(
+    plan: &HeterogeneousPlan,
+    graph: &Graph,
+    providers: &[ProviderPlacement],
+) -> String {
+    // Node ids in the plan refer to the legalized graph when function fallback
+    // expanded kept ops; use it for op-name lookups so the summary is accurate.
+    let graph = plan.legalized_graph.as_deref().unwrap_or(graph);
+    let primary = providers.first().map(|slot| slot.ep);
+    let device_name = |ep: EpId| -> String {
+        providers
+            .iter()
+            .find(|slot| slot.ep == ep)
+            .map(|slot| {
+                let device = slot.provider.device_id();
+                format!(
+                    "{} ({}:{})",
+                    slot.provider.name(),
+                    device.device_type.trace_name(),
+                    device.index
+                )
+            })
+            .unwrap_or_else(|| format!("ep#{}", ep.0))
+    };
+
+    let mut per_ep: BTreeMap<u32, usize> = BTreeMap::new();
+    for &ep in plan.node_placement.values() {
+        *per_ep.entry(ep.0).or_default() += 1;
+    }
+    let ep_counts = per_ep
+        .iter()
+        .map(|(&ep, &count)| format!("{count} node(s) on {}", device_name(EpId(ep))))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut fallback_ops: BTreeSet<String> = BTreeSet::new();
+    for (&node, &ep) in &plan.node_placement {
+        if Some(ep) != primary {
+            let node = graph.node(node);
+            let domain = if node.domain.is_empty() {
+                "ai.onnx"
+            } else {
+                node.domain.as_str()
+            };
+            fallback_ops.insert(format!("{domain}::{}", node.op_type));
+        }
+    }
+    let fallback = if fallback_ops.is_empty() {
+        "none".to_string()
+    } else {
+        fallback_ops.into_iter().collect::<Vec<_>>().join(", ")
+    };
+
+    format!(
+        "{} partition(s) across {} device(s); {ep_counts}; {} cross-device transfer(s); \
+         ops forced onto a fallback provider: {fallback}",
+        plan.partitions.len(),
+        per_ep.len(),
+        plan.transfers.len(),
+    )
+}
+
+/// Guard the default session build path when per-op heterogeneous *planning* is
+/// available but integrated stateful *execution* is not yet wired (Thread-3
+/// Phase 3, deferred parts tracked under #603).
+///
+/// When `enabled`, classify `graph` over `providers`. A genuinely homogeneous
+/// graph returns `Ok(())`, leaving the caller's single-EP / whole-session
+/// fallback path untouched (byte-identical). A graph that genuinely needs
+/// per-node placement across providers **fails closed** with an actionable
+/// [`SessionError::HeterogeneousExecutionUnsupported`] naming the offending ops,
+/// rather than letting the caller silently drop the whole session onto one
+/// fallback provider. When `!enabled` this is a no-op, so the default path is
+/// unchanged.
+pub fn guard_heterogeneous_fallback(
+    graph: &Graph,
+    providers: &[ProviderPlacement],
+    enabled: bool,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    match classify_placement(graph, providers)? {
+        PlacementDecision::SingleProvider(_) => Ok(()),
+        PlacementDecision::Heterogeneous(plan) => {
+            Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: placement_summary(&plan, graph, providers),
+            })
+        }
+    }
 }
 
 /// Deterministic per-value name used to feed subgraph inputs by name.

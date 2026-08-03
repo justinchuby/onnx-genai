@@ -172,6 +172,14 @@ mod error {
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
         #[error(
+            "heterogeneous per-op execution is required but not yet wired into the stateful \
+             session executor (deferred, see issue #603): {placement_summary}. To proceed today, \
+             unset ONNX_GENAI_HETERO to use whole-session CPU fallback, or extend the accelerator's \
+             operator coverage so it can claim every node"
+        )]
+        HeterogeneousExecutionUnsupported { placement_summary: String },
+
+        #[error(
             "unsupported operator {domain}::{op_type}: no available execution provider has a \
              kernel; node {node}, opset {opset}; decline reason: {reason}; consulted execution \
              providers (priority order): {execution_providers}. To fix: {remediation}",

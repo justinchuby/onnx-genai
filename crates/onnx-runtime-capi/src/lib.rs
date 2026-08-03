@@ -148,7 +148,8 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::OutputShapeCountMismatch { .. }
         | E::SequenceOp { .. }
         | E::ControlFlow { .. }
-        | E::HeterogeneousPlacementRequired { .. } => OrtErrorCode::Fail,
+        | E::HeterogeneousPlacementRequired { .. }
+        | E::HeterogeneousExecutionUnsupported { .. } => OrtErrorCode::Fail,
     }
 }
 

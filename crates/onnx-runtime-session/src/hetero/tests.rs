@@ -797,3 +797,117 @@ fn placement_is_deterministic_across_runs() {
     assert_eq!(a.partitions, b.partitions);
     assert_eq!(a.transfers, b.transfers);
 }
+
+// ---------------------------------------------------------------------------
+// Thread-3 Phase 3: default-path classification + fail-closed execution guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn classify_homogeneous_graph_is_single_provider() {
+    // The accelerator claims every op, so the whole graph collapses onto ep#0
+    // with no cross-device transfers: the caller keeps its single-EP path.
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Abs", "Neg"]), cpu_slot(1)];
+    match classify_placement(&graph, &providers).unwrap() {
+        PlacementDecision::SingleProvider(ep) => assert_eq!(ep, EpId(0)),
+        other => panic!("expected SingleProvider, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_whole_session_cpu_fallback_is_single_provider() {
+    // The accelerator claims nothing, so every node lands on the CPU EP: this is
+    // the existing whole-session fallback shape, and it must NOT be flagged as
+    // heterogeneous (so the guard lets the byte-identical fallback proceed).
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec![]), cpu_slot(1)];
+    match classify_placement(&graph, &providers).unwrap() {
+        PlacementDecision::SingleProvider(ep) => assert_eq!(ep, EpId(1)),
+        other => panic!("expected SingleProvider, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_mixed_graph_is_heterogeneous() {
+    // Relu/Neg on the accelerator, Abs on CPU: a genuine per-op split.
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    match classify_placement(&graph, &providers).unwrap() {
+        PlacementDecision::Heterogeneous(plan) => {
+            assert!(!plan.transfers.is_empty(), "a split needs transfers");
+            let eps: std::collections::HashSet<_> = plan.node_placement.values().copied().collect();
+            assert_eq!(eps.len(), 2, "nodes must span both providers");
+        }
+        other => panic!("expected Heterogeneous, got {other:?}"),
+    }
+}
+
+#[test]
+fn classified_heterogeneous_plan_still_executes_byte_identically() {
+    // De-latenting proof: a classified mixed plan, executed per-op via the
+    // standalone host-staged executor, is byte-identical to the single-EP
+    // reference.
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    let plan = match classify_placement(&graph, &providers).unwrap() {
+        PlacementDecision::Heterogeneous(plan) => *plan,
+        other => panic!("expected Heterogeneous, got {other:?}"),
+    };
+    let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
+    let hetero = execute(&plan, &graph, &weights(), &providers, &[("x", &x)]).unwrap();
+    assert_byte_identical(&hetero, &reference(&graph, &[("x", &x)]));
+}
+
+#[test]
+fn placement_summary_names_the_fallback_op() {
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    let summary = placement_summary(&plan, &graph, &providers);
+    assert!(
+        summary.contains("Abs"),
+        "summary should name Abs: {summary}"
+    );
+    assert!(
+        summary.contains("transfer"),
+        "summary should report transfers: {summary}"
+    );
+}
+
+#[test]
+fn guard_disabled_is_a_noop() {
+    // With the opt-in flag off, even a genuinely mixed graph is a no-op: the
+    // caller's whole-session fallback proceeds unchanged (byte-identical).
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    guard_heterogeneous_fallback(&graph, &providers, false).unwrap();
+}
+
+#[test]
+fn guard_enabled_homogeneous_is_ok() {
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec![]), cpu_slot(1)];
+    guard_heterogeneous_fallback(&graph, &providers, true).unwrap();
+}
+
+#[test]
+fn guard_enabled_mixed_fails_closed() {
+    // With the flag on and a genuine split, fail closed with an actionable
+    // error naming the fallback op instead of silently dropping the session.
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    let err = guard_heterogeneous_fallback(&graph, &providers, true).unwrap_err();
+    assert!(matches!(
+        err,
+        SessionError::HeterogeneousExecutionUnsupported { .. }
+    ));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Abs"),
+        "error should name the fallback op: {msg}"
+    );
+    assert!(
+        msg.contains("#603"),
+        "error should point at the deferred issue: {msg}"
+    );
+}
