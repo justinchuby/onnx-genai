@@ -52,7 +52,7 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::cudnn::{CudnnBufferPair, CudnnReduceOp, TensorDescriptorSpec};
+use crate::cudnn::{CudnnBufferPair, CudnnReduceCache, CudnnReduceOp, TensorDescriptorSpec};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -603,6 +603,8 @@ macro_rules! reduce_factory {
                     noop_with_empty_axes,
                     runtime: self.runtime.clone(),
                     int64_metadata: Mutex::new(ReductionMetadataCache::new(self.runtime.clone())),
+                    cudnn_reduce: Mutex::new(CudnnReduceCache::new(self.runtime.stream().clone())),
+                    warmed_axes: Mutex::new(None),
                     last_call_capture_safe: AtomicBool::new(false),
                 }))
             }
@@ -631,6 +633,14 @@ pub struct ReduceKernel {
     noop_with_empty_axes: bool,
     runtime: Arc<CudaRuntime>,
     int64_metadata: Mutex<ReductionMetadataCache>,
+    /// Cached cuDNN descriptors + device workspace for the float (f32/f16)
+    /// cuDNN reduce path, so a shape-stable decode reduce allocates nothing
+    /// per call and can be captured into a CUDA graph.
+    cudnn_reduce: Mutex<CudnnReduceCache>,
+    /// Axes resolved from the optional axes **input** on the last eager call,
+    /// reused during CUDA graph capture where a device read of that input is
+    /// illegal. `None` until the first 2-input eager call warms it.
+    warmed_axes: Mutex<Option<Vec<i64>>>,
     last_call_capture_safe: AtomicBool,
 }
 
@@ -891,27 +901,50 @@ impl ReduceKernel {
                     "cuda_ep ReduceSum: captured axes input must be Int64".into(),
                 ));
             }
-            Some(
-                self.int64_metadata
+            // A device read of the axes input is illegal during capture, so
+            // reuse the axes warmed on the pre-capture eager call. The Int64
+            // DATA path keeps its own device-validated metadata cache; the float
+            // cuDNN path (and any other) warms `warmed_axes` on every eager
+            // 2-input call. Prefer the validated Int64 metadata when present,
+            // else the warmed copy.
+            let int64_axes = self
+                .int64_metadata
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                    )
+                })?
+                .key
+                .as_ref()
+                .map(|key| key.axes.clone());
+            let axes = match int64_axes {
+                Some(axes) => axes,
+                None => self
+                    .warmed_axes
                     .lock()
                     .map_err(|_| {
                         EpError::KernelFailed(
-                            "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                            "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
                         )
                     })?
-                    .key
-                    .as_ref()
+                    .clone()
                     .ok_or_else(|| {
                         EpError::KernelFailed(
                             "cuda_ep ReduceSum: axes were not warmed before CUDA graph capture"
                                 .into(),
                         )
-                    })?
-                    .axes
-                    .clone(),
-            )
+                    })?,
+            };
+            Some(axes)
         } else if inputs.len() == 2 {
-            Some(self.read_axes_input(op, &inputs[1])?)
+            let axes = self.read_axes_input(op, &inputs[1])?;
+            *self.warmed_axes.lock().map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
+                )
+            })? = Some(axes.clone());
+            Some(axes)
         } else {
             self.axes_attr.clone()
         };
@@ -953,8 +986,14 @@ impl ReduceKernel {
             let (input_spec, output_spec) = cudnn_reduce_specs(x.dtype, x.shape, &reduce)?;
             let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
             let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+            let mut cache = self.cudnn_reduce.lock().map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: cuDNN reduce cache lock was poisoned".into(),
+                )
+            })?;
             self.runtime.cudnn().with_handle(|handle| {
-                handle.reduce(
+                handle.reduce_cached(
+                    &mut cache,
                     &input_spec,
                     &output_spec,
                     cudnn_op,
@@ -964,9 +1003,19 @@ impl ReduceKernel {
                         input_numel: x.numel(),
                         output_numel: outputs[0].numel(),
                     },
+                    capturing,
                 )
             })?;
-            return self.runtime.synchronize();
+            drop(cache);
+            // During capture a host sync is illegal and is exactly what shreds
+            // the graph; in eager mode keep the EP-wide sync contract. With the
+            // per-call device allocation now cached away, gating the sync makes
+            // the float reduce fold into the captured segment.
+            if !capturing {
+                self.runtime.synchronize()?;
+            }
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            return Ok(());
         }
 
         let plan = build_plan(x.shape, &reduce, self.keepdims);
