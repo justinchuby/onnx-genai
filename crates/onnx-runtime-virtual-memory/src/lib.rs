@@ -56,8 +56,10 @@
 
 #![allow(unsafe_code)]
 
+pub mod backing;
 pub mod buffer;
 
+pub use backing::{HostBacking, VirtualBacking};
 pub use buffer::{VirtualBuffer, VirtualBufferError};
 
 use std::ptr::NonNull;

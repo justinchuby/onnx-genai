@@ -15,6 +15,7 @@ cuda = []
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-virtual-memory = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
@@ -38,6 +39,7 @@ features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "cuda-13000", 
 
 [dev-dependencies]
 onnx-runtime-loader = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 
 [lints]
 workspace = true

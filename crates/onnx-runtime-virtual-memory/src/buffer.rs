@@ -37,7 +37,8 @@ use onnx_runtime_memory_governor::{
     HolderId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
 };
 
-use crate::{VirtualMemoryError, VirtualRange, granularity};
+use crate::VirtualMemoryError;
+use crate::backing::{HostBacking, VirtualBacking};
 
 /// A growable region whose base address never changes.
 ///
@@ -45,8 +46,12 @@ use crate::{VirtualMemoryError, VirtualRange, granularity};
 /// that starts at zero. [`VirtualBuffer::grow_to`] commits pages;
 /// [`VirtualBuffer::shrink_to`] gives them back. The pointer returned by
 /// [`VirtualBuffer::as_ptr`] is the same for the buffer's whole life.
-pub struct VirtualBuffer {
-    range: VirtualRange,
+pub struct VirtualBuffer<B: VirtualBacking = HostBacking> {
+    backing: B,
+    reservation: B::Reservation,
+    /// Address space reserved at construction. Recorded here because a
+    /// reservation is opaque to this type -- only the backing knows its shape.
+    capacity_bytes: usize,
     /// Bytes the caller has asked for, which may be less than what is committed
     /// because commitment rounds up to a granule.
     len: usize,
@@ -85,12 +90,10 @@ pub enum VirtualBufferError {
     },
 }
 
-impl VirtualBuffer {
-    /// Reserve `capacity` bytes of address space, committing nothing.
+impl VirtualBuffer<HostBacking> {
+    /// Reserve capacity bytes of the process's own address space.
     ///
-    /// `capacity` is rounded up to the mapping granularity. Reserve for the
-    /// largest the buffer could ever be: it costs address space, not memory,
-    /// and it is the only bound that cannot be raised later.
+    /// The device equivalent takes a backing; see [VirtualBuffer::with_backing].
     pub fn with_capacity(
         capacity: usize,
         governor: Arc<dyn MemoryGovernor + Send + Sync>,
@@ -98,9 +101,31 @@ impl VirtualBuffer {
         role: MemoryRole,
         holder: HolderId,
     ) -> Result<Self, VirtualBufferError> {
-        let capacity = round_up(capacity.max(1));
+        Self::with_backing(HostBacking, capacity, governor, tier, role, holder)
+    }
+}
+
+impl<B: VirtualBacking> VirtualBuffer<B> {
+    /// Reserve `capacity` bytes of address space from `backing`, committing
+    /// nothing.
+    ///
+    /// `capacity` is rounded up to the backing's granularity. Reserve for the
+    /// largest the buffer could ever be: it costs address space, not memory,
+    /// and it is the only bound that cannot be raised later.
+    pub fn with_backing(
+        backing: B,
+        capacity: usize,
+        governor: Arc<dyn MemoryGovernor + Send + Sync>,
+        tier: Tier,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<Self, VirtualBufferError> {
+        let capacity = round_up(backing.granularity(), capacity.max(1));
+        let reservation = backing.reserve(capacity)?;
         Ok(Self {
-            range: VirtualRange::reserve(capacity)?,
+            backing,
+            reservation,
+            capacity_bytes: capacity,
             len: 0,
             committed: 0,
             governor,
@@ -131,19 +156,19 @@ impl VirtualBuffer {
 
     /// Address space reserved at construction. Cannot be raised.
     pub fn capacity(&self) -> usize {
-        self.range.len()
+        self.capacity_bytes
     }
 
     /// The base address, fixed for this buffer's whole life.
     ///
     /// Only the first [`VirtualBuffer::len`] bytes may be read or written.
     pub fn as_ptr(&self) -> *const u8 {
-        self.range.as_ptr()
+        B::base(&self.reservation) as *const u8
     }
 
     /// The base address, mutable.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.range.as_mut_ptr()
+        B::base(&self.reservation) as *mut u8
     }
 
     /// The committed prefix, as bytes.
@@ -174,7 +199,7 @@ impl VirtualBuffer {
             });
         }
 
-        let needed = round_up(bytes);
+        let needed = round_up(self.backing.granularity(), bytes);
         if needed > self.committed {
             let extra = needed - self.committed;
             // Lease before mapping. A refusal must not commit memory, or the
@@ -190,7 +215,10 @@ impl VirtualBuffer {
                     )?);
                 }
             }
-            if let Err(error) = self.range.map(self.committed, extra) {
+            if let Err(error) = self
+                .backing
+                .commit(&mut self.reservation, self.committed, extra)
+            {
                 // Give the pages back rather than leaving the governor
                 // believing they are held.
                 self.release(extra);
@@ -211,12 +239,13 @@ impl VirtualBuffer {
         if bytes >= self.len {
             return Ok(());
         }
-        let needed = round_up(bytes);
+        let needed = round_up(self.backing.granularity(), bytes);
         let mut offset = self.committed;
         while offset > needed {
-            let granule = granularity();
+            let granule = self.backing.granularity();
             offset -= granule;
-            self.range.unmap(offset)?;
+            self.backing
+                .release(&mut self.reservation, offset, granule)?;
             self.release(granule);
             self.committed = offset;
         }
@@ -236,15 +265,14 @@ impl VirtualBuffer {
     }
 }
 
-fn round_up(bytes: usize) -> usize {
-    let granule = granularity();
+fn round_up(granule: usize, bytes: usize) -> usize {
     bytes.div_ceil(granule) * granule
 }
 
 // `MemoryGovernor` is not `Debug` — it is a trait a third party implements, and
 // requiring `Debug` of them to make this struct derivable would be the wrong
 // way round. Report what the buffer itself knows.
-impl std::fmt::Debug for VirtualBuffer {
+impl<B: VirtualBacking> std::fmt::Debug for VirtualBuffer<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VirtualBuffer")
             .field("base", &self.as_ptr())
@@ -260,6 +288,7 @@ impl std::fmt::Debug for VirtualBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::granularity;
     use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
     const HOLDER: HolderId = HolderId::new(4);

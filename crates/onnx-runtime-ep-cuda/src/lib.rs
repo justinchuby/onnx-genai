@@ -66,6 +66,7 @@ mod optimizer;
 pub mod provider;
 pub mod runtime;
 mod trace;
+pub mod virtual_memory;
 pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
