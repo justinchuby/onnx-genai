@@ -238,6 +238,121 @@ unsafe extern "C" fn governed_info(
     allocator.memory_info.as_ptr()
 }
 
+/// A [`GovernedAllocator`] installed on an ONNX Runtime environment.
+///
+/// Registration is environment-wide and keyed by memory info, and sessions opt
+/// in with the `session.use_env_allocators` config entry. Dropping this
+/// unregisters and only then releases the allocator.
+///
+/// The guard **owns** the allocator for exactly that reason. ORT keeps the raw
+/// pointer it was given, so an allocator freed while still registered would
+/// leave the runtime calling into freed memory on its next allocation — the
+/// kind of failure that surfaces as corruption somewhere unrelated.
+pub struct RegisteredAllocator {
+    environment: *mut onnx_genai_ort_sys::OrtEnv,
+    allocator: Box<GovernedAllocator>,
+    unregistered: bool,
+}
+
+impl RegisteredAllocator {
+    /// Bytes currently held by allocations ORT made through this allocator.
+    pub fn live_bytes(&self) -> u64 {
+        self.allocator.live_bytes()
+    }
+
+    /// Number of live allocations ORT holds through this allocator.
+    pub fn live_count(&self) -> usize {
+        self.allocator.live_count()
+    }
+
+    /// Remove this allocator from the environment, reporting failure.
+    ///
+    /// [`Drop`] does the same thing but cannot report anything. Call this when
+    /// a failed unregistration is worth knowing about — it means ORT still
+    /// holds a pointer to an allocator that is about to be freed.
+    pub fn unregister(mut self) -> crate::error::Result<()> {
+        self.unregister_once()
+    }
+
+    fn unregister_once(&mut self) -> crate::error::Result<()> {
+        if self.unregistered {
+            return Ok(());
+        }
+        self.unregistered = true;
+        let api = crate::error::api()?;
+        let unregister = api
+            .UnregisterAllocator
+            .ok_or(crate::error::OrtError::ApiUnavailable(
+                "UnregisterAllocator",
+            ))?;
+        // SAFETY: this pair was registered by `register_governed_allocator` and
+        // is unregistered exactly once, guarded by `unregistered`.
+        crate::error::check_status(unsafe {
+            unregister(self.environment, self.allocator.memory_info.as_ptr())
+        })
+    }
+}
+
+impl std::fmt::Debug for RegisteredAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredAllocator")
+            .field("live_bytes", &self.live_bytes())
+            .field("live_count", &self.live_count())
+            .finish()
+    }
+}
+
+impl Drop for RegisteredAllocator {
+    fn drop(&mut self) {
+        // Best effort: `Drop` has nowhere to report to. Callers that care use
+        // `unregister`, after which this is a no-op.
+        let _ = self.unregister_once();
+        // `self.allocator` is still alive here: `Drop::drop` runs before fields
+        // are dropped, so the memory info we unregister with is the one that
+        // was registered.
+    }
+}
+
+// The registration is owned by whoever holds the guard; the pointers inside are
+// not thread-affine.
+unsafe impl Send for RegisteredAllocator {}
+unsafe impl Sync for RegisteredAllocator {}
+
+/// Install `allocator` on `environment` so ORT allocates through the governor.
+///
+/// Sessions must additionally be created with the `session.use_env_allocators`
+/// config entry, or they keep their own built-in allocator and nothing is
+/// governed — which is why [`crate::session::SessionOptions`] exposes it rather
+/// than this function setting it invisibly.
+pub fn register_governed_allocator(
+    environment: &crate::env::Environment,
+    mut allocator: Box<GovernedAllocator>,
+) -> crate::error::Result<RegisteredAllocator> {
+    let api = crate::error::api()?;
+    let register = api
+        .RegisterAllocator
+        .ok_or(crate::error::OrtError::ApiUnavailable("RegisterAllocator"))?;
+    if allocator.memory_info.is_arena()? {
+        // ORT's own message for this names an enum the caller never wrote down.
+        return Err(crate::error::OrtError::InvalidArgument(
+            "a governed allocator's memory info describes an arena allocator, but \
+             ONNX Runtime reserves the arena kind for its internal arenas; build \
+             the memory info with MemoryInfo::cpu_device() rather than \
+             MemoryInfo::cpu(), even if the allocator pools internally"
+                .into(),
+        ));
+    }
+    let env_ptr = environment.as_ptr().cast_mut();
+    // SAFETY: `env_ptr` outlives the guard (the environment is process-wide),
+    // and the allocator pointer stays valid because the guard owns the Box.
+    crate::error::check_status(unsafe { register(env_ptr, allocator.as_ort_allocator()) })?;
+    Ok(RegisteredAllocator {
+        environment: env_ptr,
+        allocator,
+        unregistered: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,9 +361,19 @@ mod tests {
     const HOLDER: HolderId = HolderId::new(9);
 
     fn allocator(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
+        allocator_with(
+            budget,
+            MemoryInfo::cpu_device().expect("cpu device memory info"),
+        )
+    }
+
+    fn allocator_with(
+        budget: u64,
+        memory_info: MemoryInfo,
+    ) -> (Box<GovernedAllocator>, LedgerGovernor) {
         let governor = LedgerGovernor::new(LeaseLedger::new(0, budget, 0));
         let allocator = GovernedAllocator::new(
-            MemoryInfo::cpu().expect("cpu memory info"),
+            memory_info,
             Arc::new(governor.clone()),
             Tier::Host,
             MemoryRole::Activation,
@@ -382,6 +507,65 @@ mod tests {
             info,
             alloc.memory_info.as_ptr(),
             "Info returned a different OrtMemoryInfo than the allocator holds"
+        );
+    }
+    /// Registration must actually reach ORT: a session created afterwards is
+    /// expected to allocate through us, so a silently-dropped registration is
+    /// the failure worth catching.
+    ///
+    /// The observable proof is ORT's own rule that unregistering a memory info
+    /// with no allocator behind it is an error. The first unregister succeeding
+    /// and the second failing is only possible if something was really there.
+    #[test]
+    fn registering_installs_the_allocator_and_unregistering_removes_it() {
+        let env = match crate::env::Environment::new("governed-allocator-registration") {
+            Ok(env) => env,
+            Err(_) => return, // no ORT library available in this environment
+        };
+        let (alloc, governor) = allocator(1 << 20);
+        let registered = register_governed_allocator(&env, alloc).expect("register");
+        assert_eq!(registered.live_bytes(), 0, "nothing allocated yet");
+
+        registered
+            .unregister()
+            .expect("unregistering a live registration must succeed");
+        assert_eq!(
+            governor.available(Tier::Host),
+            1 << 20,
+            "unregistering must return every byte"
+        );
+
+        let api = crate::error::api().expect("api");
+        let info = MemoryInfo::cpu_device().expect("cpu device memory info");
+        // SAFETY: a live environment and a live memory info handle.
+        let status = unsafe {
+            (api.UnregisterAllocator.expect("UnregisterAllocator"))(
+                env.as_ptr().cast_mut(),
+                info.as_ptr(),
+            )
+        };
+        assert!(
+            !status.is_null(),
+            "unregistering twice must fail, otherwise the first call proves nothing"
+        );
+        // SAFETY: a non-null status is owned by the caller.
+        unsafe { (api.ReleaseStatus.expect("ReleaseStatus"))(status) };
+    }
+
+    /// An arena-kind memory info is rejected up front with an actionable
+    /// message, rather than by ORT naming an enum the caller never wrote.
+    #[test]
+    fn an_arena_memory_info_is_refused_with_a_message_that_says_what_to_do() {
+        let env = match crate::env::Environment::new("governed-allocator-arena") {
+            Ok(env) => env,
+            Err(_) => return,
+        };
+        let (alloc, _) = allocator_with(4096, MemoryInfo::cpu().expect("cpu memory info"));
+        let error = register_governed_allocator(&env, alloc).expect_err("arena must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("cpu_device"),
+            "the error must name the constructor to use instead, got: {message}"
         );
     }
 }

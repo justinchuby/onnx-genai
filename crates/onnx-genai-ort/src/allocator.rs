@@ -58,6 +58,47 @@ impl MemoryInfo {
         })
     }
 
+    /// Create CPU memory info describing a *device* allocator rather than an
+    /// arena.
+    ///
+    /// [`MemoryInfo::cpu`] reports `OrtArenaAllocator`, which ORT refuses to
+    /// accept in `RegisterAllocator`: the arena kind is reserved for its own
+    /// internal arena implementations. A custom CPU allocator must describe
+    /// itself this way even when it does its own pooling internally.
+    pub fn cpu_device() -> Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        let api = crate::error::api()?;
+        let create = api
+            .CreateCpuMemoryInfo
+            .ok_or(OrtError::ApiUnavailable("CreateCpuMemoryInfo"))?;
+        // SAFETY: `ptr` is a valid out-parameter; the handle is owned here.
+        crate::error::check_status(unsafe {
+            create(
+                onnx_genai_ort_sys::OrtDeviceAllocator,
+                onnx_genai_ort_sys::OrtMemTypeDefault,
+                &mut ptr,
+            )
+        })?;
+        Ok(Self {
+            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
+            device_name: "Cpu".to_string(),
+            device_id: 0,
+            memory_type: MemoryType::Default,
+        })
+    }
+
+    /// Whether this memory info describes an arena allocator.
+    pub(crate) fn is_arena(&self) -> Result<bool> {
+        let api = crate::error::api()?;
+        let get = api
+            .MemoryInfoGetType
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetType"))?;
+        let mut kind = onnx_genai_ort_sys::OrtInvalidAllocator;
+        // SAFETY: `self.ptr` is a live handle; `kind` is a valid out-parameter.
+        crate::error::check_status(unsafe { get(self.ptr.as_ptr(), &mut kind) })?;
+        Ok(kind == onnx_genai_ort_sys::OrtArenaAllocator)
+    }
+
     /// Create CUDA device memory info.
     #[cfg(feature = "cuda")]
     pub fn cuda(device_id: i32) -> Result<Self> {

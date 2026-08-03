@@ -58,6 +58,31 @@ pub struct SessionOptions {
     pub auto_selected: bool,
 }
 
+/// ORT session config key that makes a session allocate through allocators
+/// registered on the environment instead of creating its own.
+pub const USE_ENV_ALLOCATORS: &str = "session.use_env_allocators";
+
+impl SessionOptions {
+    /// Route this session's allocations through allocators registered on the
+    /// environment.
+    ///
+    /// Registering an allocator is not enough on its own: without this entry
+    /// ORT silently builds the session its own default allocator, so a governed
+    /// allocator would be installed, report zero live bytes forever, and look
+    /// like the model simply did not allocate.
+    pub fn use_env_allocators(&mut self) -> &mut Self {
+        if !self
+            .session_config_entries
+            .iter()
+            .any(|(key, _)| key == USE_ENV_ALLOCATORS)
+        {
+            self.session_config_entries
+                .push((USE_ENV_ALLOCATORS.to_string(), "1".to_string()));
+        }
+        self
+    }
+}
+
 impl Default for SessionOptions {
     fn default() -> Self {
         let mut options = Self::cpu();
@@ -266,4 +291,24 @@ pub fn available_execution_providers() -> Result<Vec<String>> {
     // SAFETY: releases the array returned by `GetAvailableProviders` exactly once.
     crate::error::check_status(unsafe { release_available(providers_ptr, provider_count) })?;
     providers
+}
+
+#[cfg(test)]
+mod use_env_allocator_tests {
+    use super::*;
+
+    /// The session option is the half that makes a registered allocator
+    /// observable; without it ORT builds its own and governs nothing.
+    #[test]
+    fn use_env_allocators_sets_the_config_entry_once() {
+        let mut options = SessionOptions::cpu();
+        options.use_env_allocators().use_env_allocators();
+        let entries: Vec<_> = options
+            .session_config_entries
+            .iter()
+            .filter(|(key, _)| key == USE_ENV_ALLOCATORS)
+            .collect();
+        assert_eq!(entries.len(), 1, "the entry must not be duplicated");
+        assert_eq!(entries[0].1, "1");
+    }
 }

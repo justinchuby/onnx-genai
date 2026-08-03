@@ -1,0 +1,36 @@
+feat(ort): install the governed allocator on the environment
+
+`GovernedAllocator` existed but nothing could reach it: `RegisterAllocator`
+was unbound and there was no way to make a session use a registered
+allocator. This adds both halves.
+
+`register_governed_allocator` returns a guard that **owns** the allocator.
+ORT keeps the raw pointer it was given, so an allocator freed while still
+registered leaves the runtime calling into freed memory on its next
+allocation -- a failure that would surface as corruption somewhere
+unrelated. Field order makes `Drop` unregister before the allocator is
+released.
+
+`RegisteredAllocator::unregister` reports failure; `Drop` cannot, so it is
+best effort and idempotent via a flag.
+
+`SessionOptions::use_env_allocators` is the other half. Registration alone
+is not enough: without the config entry ORT builds the session its own
+default allocator, so a governed allocator would be installed, report zero
+live bytes forever, and look exactly like a model that did not allocate.
+Exposed as a typed method rather than leaving callers to guess the string.
+
+`MemoryInfo::cpu_device` was needed because `MemoryInfo::cpu` reports
+`OrtArenaAllocator`, which `RegisterAllocator` refuses -- the arena kind is
+reserved for ORT's internal arenas. Found by the test, not by reading:
+ORT's message names an enum the caller never wrote down, so registration
+now checks first and says which constructor to use.
+
+The registration test's assertion is ORT's rule that unregistering a
+memory info with no allocator behind it is an error. The first unregister
+succeeding and the second failing is the only observable that a no-op
+registration could not also produce. An earlier version asserted that a
+duplicate registration is rejected; ORT overwrites instead.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: d60eb808-7cc6-4abc-b48d-2a6dd3841624
