@@ -302,6 +302,35 @@ impl LeaseLedger {
     }
 }
 
+/// Where a [`MemoryLease`] gives its bytes back.
+///
+/// The lease is deliberately *not* tied to [`LeaseLedger`]. A third party
+/// implementing [`MemoryGovernor`] has to be able to hand out leases, and a
+/// lease that could only be released into this crate's own ledger would make
+/// the trait unimplementable from outside — the accounting would have to be
+/// ours, which is the opposite of a substitutable component.
+///
+/// `try_claim` is here alongside `release` because [`MemoryLease::grow`] needs
+/// it: growing in place is what lets a lease expand at a tier that is merely
+/// full rather than over-subscribed.
+pub trait LeaseAccounting: Send + Sync + std::fmt::Debug {
+    /// Charge `bytes` on `tier` for `role`, or fail without changing anything.
+    fn try_claim(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError>;
+
+    /// Give `bytes` back on `tier`.
+    fn release(&self, tier: Tier, bytes: u64);
+}
+
+impl LeaseAccounting for LeaseLedger {
+    fn try_claim(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError> {
+        LeaseLedger::try_claim(self, tier, bytes, role)
+    }
+
+    fn release(&self, tier: Tier, bytes: u64) {
+        LeaseLedger::release(self, tier, bytes);
+    }
+}
+
 /// A granted claim on a tier.
 ///
 /// Holding one is what entitles a component to occupy that many bytes. Dropping
@@ -313,10 +342,32 @@ pub struct MemoryLease {
     bytes: u64,
     role: MemoryRole,
     holder: HolderId,
-    ledger: Arc<LeaseLedger>,
+    accounting: Arc<dyn LeaseAccounting>,
 }
 
 impl MemoryLease {
+    /// Build a lease over caller-supplied accounting.
+    ///
+    /// This is what makes [`MemoryGovernor`] implementable from outside this
+    /// crate: an implementor charges its own books, then wraps the result here
+    /// so the bytes are returned exactly once on drop, by the same rule
+    /// everything else obeys.
+    pub fn new(
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+        accounting: Arc<dyn LeaseAccounting>,
+    ) -> Self {
+        Self {
+            tier,
+            bytes,
+            role,
+            holder,
+            accounting,
+        }
+    }
+
     /// The tier these bytes were taken from.
     pub fn tier(&self) -> Tier {
         self.tier
@@ -346,7 +397,7 @@ impl MemoryLease {
         if extra == 0 {
             return Ok(());
         }
-        self.ledger.try_claim(self.tier, extra, self.role)?;
+        self.accounting.try_claim(self.tier, extra, self.role)?;
         self.bytes = self.bytes.saturating_add(extra);
         Ok(())
     }
@@ -358,7 +409,7 @@ impl MemoryLease {
     pub fn shrink(&mut self, bytes: u64) -> u64 {
         let returned = bytes.min(self.bytes);
         if returned > 0 {
-            self.ledger.release(self.tier, returned);
+            self.accounting.release(self.tier, returned);
             self.bytes -= returned;
         }
         returned
@@ -368,7 +419,7 @@ impl MemoryLease {
 impl Drop for MemoryLease {
     fn drop(&mut self) {
         if self.bytes > 0 {
-            self.ledger.release(self.tier, self.bytes);
+            self.accounting.release(self.tier, self.bytes);
         }
     }
 }
@@ -433,13 +484,13 @@ impl MemoryGovernor for LedgerGovernor {
         holder: HolderId,
     ) -> Result<MemoryLease, MemoryError> {
         self.ledger.try_claim(tier, bytes, role)?;
-        Ok(MemoryLease {
+        Ok(MemoryLease::new(
             tier,
             bytes,
             role,
             holder,
-            ledger: Arc::clone(&self.ledger),
-        })
+            Arc::clone(&self.ledger) as Arc<dyn LeaseAccounting>,
+        ))
     }
 
     fn available(&self, tier: Tier) -> u64 {
