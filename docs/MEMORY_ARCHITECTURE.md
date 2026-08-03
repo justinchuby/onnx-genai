@@ -13,6 +13,51 @@
 
 ---
 
+## Implementation status
+
+This document describes the target architecture. Most of it is not built yet,
+and the parts that are built are mostly not connected to anything. The table
+below is what a reader would otherwise have to reconstruct by searching, and it
+is easy to get wrong: a first pass at this used a glob that skipped every
+top-level `src/*.rs` file and concluded the pressure protocol did not exist,
+when in fact it is 1955 lines.
+
+| layer | designed in | status | where |
+|---|---|---|---|
+| L1 EP memory | §2 | **implemented** | `ExecutionProvider::{allocate, deallocate, copy}` in `onnx-runtime-ep-api` |
+| L2 Weight residency | §3 | **design only** | no `WeightResidencyManager` type exists |
+| L3a DeviceGovernor | §4 | **implemented under its old name** | `ResourceGovernor`, `crates/onnx-genai-scheduler/src/governor.rs` |
+| L3b HostGovernor | §5 | **implemented, not wired** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
+| L4 ClusterCoordinator | §6 | **design only** | no type exists |
+
+Two things follow that are worth stating plainly, because both are the kind of
+gap that reads as "already handled" from the prose:
+
+- **`HostGovernor` has no callers.** Outside its own crate the only mentions are
+  trace-event definitions. The ticketed protocol, its TLA+ model, and its
+  priority/aging arbitration are all real and all unreached. Whatever connects
+  the engine to it will be that code's first user.
+- **Activations are named here but not designed.** §4.6's
+  `VramBreakdown.activations_bytes` is hardcoded to `0` with a TODO saying it
+  needs runtime instrumentation. It does not: `onnx-runtime-memory` is a
+  liveness-based activation planner that computes exactly this figure, and it
+  has zero dependents. Every budget derived from the device ceiling currently
+  assumes activations are free.
+
+There is also a tension between §3's weight tiering and what the engine does
+today. `model_weight_bytes` measures the whole package and the governor
+subtracts it wholesale, falling back to `reservation_applied: false` when that
+leaves no room — with a comment that the reservation "must never be the reason a
+model refuses to start". So for a model larger than VRAM, the reservation is
+silently dropped rather than triggering streaming. The mechanism that should
+turn "weights do not fit" into "stream them" instead turns it into "pretend they
+are free". §3 is the design that fixes this, and it is unimplemented.
+
+Related: #596 (decisions taken while implementing the first slice of L3), #598,
+#608.
+
+---
+
 ## Table of Contents
 
 1. [Overview](#1-overview)

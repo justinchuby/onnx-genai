@@ -26,6 +26,34 @@
 //! buffer reuse within a single graph. That crate is a future lease holder
 //! ([`MemoryRole::Activation`]); this one decides whether it may hold anything.
 //!
+//! ## Where this sits
+//!
+//! `docs/MEMORY_ARCHITECTURE.md` is the canonical design. This crate implements
+//! a slice of its Layer 3: the vocabulary a lease is expressed in, and a
+//! self-contained ledger for callers that have no governor.
+//!
+//! It exists as a separate crate for a layering reason that survives that
+//! design: `onnx-genai-kv` must lease, and `onnx-genai-scheduler` — where the
+//! canonical `HostGovernor` lives — already depends on `onnx-genai-kv`. The KV
+//! store therefore cannot lease from `HostGovernor` without a dependency cycle,
+//! so the vocabulary has to sit below both. It is also what a third party would
+//! implement against, which is why it depends on nothing but `thiserror`.
+//!
+//! Two divergences from the canonical design, stated rather than hidden:
+//!
+//! * **[`LeaseLedger`] holds all three tiers in one object.** The canonical
+//!   design separates a per-device governor from a per-machine one, because
+//!   device memory is exclusive while host RAM is shared by every device on the
+//!   machine. A single ledger per engine reproduces the problem that split
+//!   exists to prevent, one level down. Use it for a single-device engine or for
+//!   tests; multi-device belongs to `HostGovernor`.
+//! * **[`PressureResponder`] is weaker than the protocol already implemented.**
+//!   `onnx-genai-scheduler`'s `pressure` module implements a ticketed,
+//!   non-blocking protocol with cancellation, configuration generations and
+//!   priority arbitration, modelled in `specs/tla/PressureProtocol.tla`. This
+//!   synchronous trait is a placeholder for callers not yet routed through it,
+//!   not an alternative to it.
+//!
 //! ## The invariants this crate enforces
 //!
 //! * **G1** For every tier, the sum of live leases never exceeds that tier's
