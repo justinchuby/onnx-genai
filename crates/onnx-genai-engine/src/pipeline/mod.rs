@@ -242,6 +242,10 @@ pub struct PipelineEngine {
     /// Paged KV for the decoder, when its `present.*` outputs describe a layout
     /// the page table can address.
     paged: Option<PipelinePagedKv>,
+    /// Decoder device requested via [`EngineConfig::native_device`] (e.g. from
+    /// `--ep cuda`), honored by the native pipeline decoder when the
+    /// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` override is unset.
+    native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
 }
 
 /// Paged KV storage for an autoregressive pipeline decoder.
@@ -454,7 +458,7 @@ fn build_step_component_session<'a>(
             // placement of the pipeline decoder is the later (inc2/inc3) work.
             let native = crate::native_component::NativeComponentSession::load(
                 path,
-                crate::native_decode::NativeDecodeDevice::Cpu,
+                crate::native_decode_device::NativeDecodeDevice::Cpu,
             )
             .with_context(|| format!("failed to load native every_step component '{component}'"))?;
             return Ok(Box::new(native));
@@ -487,6 +491,7 @@ fn build_step_component_session<'a>(
 fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
+    config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
@@ -502,17 +507,23 @@ fn build_native_pipeline_decoder(
             .models
             .get(decoder)
             .and_then(|component| component.io.as_ref());
-        // The decoder runs on CPU by default (the deterministic parity fixture);
-        // set ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE=cuda[:index] to keep the
-        // device-resident KV cache on the CUDA EP (Inc3a). One token's embedding
-        // uploads host->device per step; the KV never round-trips.
-        let native =
-            crate::pipeline::NativePipelineDecoder::load(path, native_decoder_device(), io)?;
+        // Device precedence: ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE overrides
+        // (back-compat / the deterministic parity fixture), else the engine's
+        // configured `native_device` (so `--ep cuda` decodes on the GPU), else
+        // CPU. A CUDA device keeps the KV cache resident on the CUDA EP (Inc3a);
+        // one token's embedding uploads host->device per step, KV never
+        // round-trips.
+        let native = crate::pipeline::NativePipelineDecoder::load(
+            path,
+            native_decoder_device(config_device),
+            io,
+        )?;
         Ok(Box::new(native))
     }
     #[cfg(not(feature = "native-backend"))]
     {
         let _ = models;
+        let _ = config_device;
         anyhow::bail!(
             "decoder '{decoder}' was requested on the native backend via \
              ONNX_GENAI_PIPELINE_NATIVE_DECODER, but this build was compiled without the \
@@ -521,16 +532,43 @@ fn build_native_pipeline_decoder(
     }
 }
 
-/// Resolve the native pipeline decoder's device from
-/// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE`: `cpu` (default), `cuda`, or
-/// `cuda:<index>` / `cuda=<index>` to pin a GPU. Any unrecognized value falls
-/// back to CPU so a stray setting never silently changes the device.
+/// Resolve the native pipeline decoder's device.
+///
+/// Precedence: the `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` env override wins
+/// when set (`cpu`, `cuda`, or `cuda:<index>` / `cuda=<index>`; any unrecognized
+/// value falls back to CPU so a stray setting never silently changes the
+/// device). When the env var is unset, honor the engine-configured
+/// `native_device` (so `--ep cuda` decodes on the GPU), else default to CPU.
 #[cfg(feature = "native-backend")]
-fn native_decoder_device() -> crate::native_decode::NativeDecodeDevice {
-    use crate::native_decode::NativeDecodeDevice;
-    let Ok(value) = std::env::var("ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE") else {
-        return NativeDecodeDevice::Cpu;
-    };
+fn native_decoder_device(
+    config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+) -> crate::native_decode_device::NativeDecodeDevice {
+    let env = std::env::var("ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE").ok();
+    resolve_native_decoder_device(env.as_deref(), config_device)
+}
+
+/// Pure device-precedence logic behind [`native_decoder_device`], split out so
+/// the env-override-wins / config-fallback behavior is unit-testable without
+/// mutating process-global environment state.
+#[cfg(feature = "native-backend")]
+fn resolve_native_decoder_device(
+    env_value: Option<&str>,
+    config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+) -> crate::native_decode_device::NativeDecodeDevice {
+    use crate::native_decode_device::NativeDecodeDevice;
+    match env_value {
+        Some(value) => parse_native_decoder_device_value(value),
+        None => config_device.cloned().unwrap_or(NativeDecodeDevice::Cpu),
+    }
+}
+
+/// Parse a `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` value: `cuda`,
+/// `cuda:<index>` / `cuda=<index>`, or anything else (→ CPU).
+#[cfg(feature = "native-backend")]
+fn parse_native_decoder_device_value(
+    value: &str,
+) -> crate::native_decode_device::NativeDecodeDevice {
+    use crate::native_decode_device::NativeDecodeDevice;
     let value = value.trim().to_ascii_lowercase();
     match value.strip_prefix("cuda") {
         Some(rest) => {
@@ -779,6 +817,7 @@ impl PipelineEngine {
             memoizable_components,
             retained: None,
             paged,
+            native_device: config.native_device.clone(),
         })
     }
 
@@ -2488,6 +2527,70 @@ mod tests {
         assert!(
             message.contains("code_predictor"),
             "the error must name the offending component: {message}"
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_decoder_device_prefers_config_when_env_unset() {
+        use crate::native_decode_device::NativeDecodeDevice;
+        // Env unset -> honor the engine-configured device (this is the `--ep cuda`
+        // fix: the pipeline decoder must run on the configured GPU).
+        assert_eq!(
+            resolve_native_decoder_device(None, Some(&NativeDecodeDevice::Cuda { index: Some(3) })),
+            NativeDecodeDevice::Cuda { index: Some(3) }
+        );
+        // Env unset and no configured device -> CPU default.
+        assert_eq!(
+            resolve_native_decoder_device(None, None),
+            NativeDecodeDevice::Cpu
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_decoder_device_env_override_wins_over_config() {
+        use crate::native_decode_device::NativeDecodeDevice;
+        // A set env var wins over the configured device, in both directions, for
+        // back-compat with the deterministic parity fixture.
+        assert_eq!(
+            resolve_native_decoder_device(
+                Some("cpu"),
+                Some(&NativeDecodeDevice::Cuda { index: Some(1) })
+            ),
+            NativeDecodeDevice::Cpu
+        );
+        assert_eq!(
+            resolve_native_decoder_device(Some("cuda:2"), Some(&NativeDecodeDevice::Cpu)),
+            NativeDecodeDevice::Cuda { index: Some(2) }
+        );
+        assert_eq!(
+            resolve_native_decoder_device(Some("cuda"), None),
+            NativeDecodeDevice::Cuda { index: None }
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_decoder_device_value_parsing() {
+        use crate::native_decode_device::NativeDecodeDevice;
+        assert_eq!(
+            parse_native_decoder_device_value("  CUDA=0 "),
+            NativeDecodeDevice::Cuda { index: Some(0) }
+        );
+        assert_eq!(
+            parse_native_decoder_device_value("cuda"),
+            NativeDecodeDevice::Cuda { index: None }
+        );
+        // Non-numeric index degrades to the default CUDA device, not CPU.
+        assert_eq!(
+            parse_native_decoder_device_value("cuda:xyz"),
+            NativeDecodeDevice::Cuda { index: None }
+        );
+        // Any unrecognized value falls back to CPU.
+        assert_eq!(
+            parse_native_decoder_device_value("gpu"),
+            NativeDecodeDevice::Cpu
         );
     }
 

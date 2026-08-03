@@ -93,7 +93,11 @@ impl PipelineEngine {
         // the still-unwired case is reported as Inc-D.
         let mut native_decoder_component: Option<Box<dyn PipelineDecoderComponent + 'static>> =
             if use_native_decoder {
-                Some(build_native_pipeline_decoder(&self.models, &ar.decoder)?)
+                Some(build_native_pipeline_decoder(
+                    &self.models,
+                    &ar.decoder,
+                    self.native_device.as_ref(),
+                )?)
             } else {
                 None
             };
