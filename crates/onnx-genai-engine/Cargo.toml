@@ -109,6 +109,7 @@ cuda-13000 = ["onnx-genai-ort/cuda-13000"]
 onnx-genai-metadata = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false }
 onnx-genai-runtime-config = { workspace = true }

@@ -2107,6 +2107,7 @@ dependencies = [
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-session",
  "onnx-runtime-tracer",
  "onnx-std",
@@ -2140,6 +2141,7 @@ version = "0.1.0-dev.5"
 dependencies = [
  "async-trait",
  "onnx-genai-metadata",
+ "onnx-runtime-memory-governor",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2247,6 +2249,7 @@ name = "onnx-genai-scheduler"
 version = "0.1.0-dev.5"
 dependencies = [
  "onnx-genai-kv",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-protocol-trace",
  "serde_json",
  "thiserror 2.0.19",
@@ -2415,6 +2418,13 @@ name = "onnx-runtime-memory"
 version = "0.1.0-dev.5"
 dependencies = [
  "onnx-runtime-ir",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-memory-governor"
+version = "0.1.0-dev.5"
+dependencies = [
  "thiserror 2.0.19",
 ]
 

@@ -23,9 +23,16 @@ fn request(tokens: Vec<u32>, max_new_tokens: usize) -> GenerateRequest {
 
 #[test]
 fn ten_plus_interleaved_sessions_complete_under_kv_page_pressure() -> anyhow::Result<()> {
+    // Pressure is now expressed as a *budget*, not as a page count. The pool
+    // size is derived from the governor, so squeezing the device ceiling is
+    // what makes pages scarce -- and it exercises the same derivation a real
+    // deployment uses, instead of a knob only tests could set.
     let config = EngineConfig {
-        num_gpu_pages: 2,
         page_size: 2,
+        limits: onnx_genai_scheduler::ResourceLimits {
+            vram_limit: onnx_genai_scheduler::ResourceLimit::Bytes(64 * 1024),
+            ..EngineConfig::default().limits
+        },
         ..EngineConfig::default()
     };
     let mut engine = Engine::from_dir(&tiny_fixture()?, config)?;

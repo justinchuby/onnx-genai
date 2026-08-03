@@ -208,21 +208,29 @@ fn attaching_to_a_warm_pool_seeds_from_its_real_state() {
 }
 
 #[test]
-fn a_cloned_table_does_not_share_gauges_with_its_source() {
+fn two_pools_do_not_move_each_other_s_gauges() {
     // Two independent pools sharing one set of gauges would make every number
     // the sum of two unrelated things, which is worse than publishing nothing.
+    //
+    // This used to be phrased against `PageTable::clone`, which is how two
+    // pools could accidentally end up attached to one telemetry handle. That
+    // route is gone -- a pool is no longer `Clone`, because copying one would
+    // duplicate every page's storage while leaving the memory grant behind.
+    // The property still matters for pools built separately, so it is pinned
+    // that way instead.
     let mut table = PageTable::new(16, 8);
     let telemetry = Arc::new(KvTelemetry::default());
     table.attach_telemetry(Arc::clone(&telemetry));
     let _ = table.allocate(GPU).expect("pool has capacity");
 
-    let mut cloned = table.clone();
+    let mut other = PageTable::new(16, 8);
+    other.attach_telemetry(Arc::new(KvTelemetry::default()));
     let before = telemetry.snapshot();
-    let _ = cloned.allocate(GPU).expect("pool has capacity");
+    let _ = other.allocate(GPU).expect("pool has capacity");
     let after = telemetry.snapshot();
 
     assert_eq!(
         before, after,
-        "allocating on a clone must not move the source pool's gauges"
+        "allocating on an unrelated pool moved this pool's gauges"
     );
 }

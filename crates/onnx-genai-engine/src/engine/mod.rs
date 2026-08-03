@@ -70,6 +70,7 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor};
+pub(crate) use load::kv_pages_for_budget;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;

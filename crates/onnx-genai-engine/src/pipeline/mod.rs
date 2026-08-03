@@ -5,14 +5,19 @@ use crate::decode::{
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
-    Engine, EngineConfig, model_requires_native_backend, requested_decode_backend,
-    resolved_host_ram_budget,
+    Engine, EngineConfig, component_governor, model_requires_native_backend,
+    requested_decode_backend,
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
     sequence_pages_for_len,
 };
 use crate::logits::TokenId;
+
+/// Identifies the pipeline's KV page pool to the memory governor, distinct from
+/// the engine's own pool so pressure can be directed at the right holder.
+const PIPELINE_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
+    onnx_runtime_memory_governor::HolderId::new(2);
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
     RetainedContext, absorb_value, digest_named_values, graph_is_deterministic, prefix_key,
@@ -744,24 +749,47 @@ impl PipelineEngine {
                     config.page_size,
                     config.kv_cache_dtype,
                 )?;
+                let component_governor = component_governor(&config, kv_model.as_ref())?;
                 let fixed_state_budget_bytes =
-                    resolved_host_ram_budget(&config, kv_model.as_ref())?;
+                    component_governor.snapshot().resolved_limits.host_ram_bytes;
+                let pipeline_pages = match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::kv_pages_for_budget(
+                        component_governor.snapshot().derived_budget.kv_bytes,
+                        component_governor.snapshot().resolved_limits.host_ram_bytes,
+                        config.scheduler.max_total_tokens,
+                        kv_model.tensor_config.page_size,
+                        kv_model.tensor_config.dtype,
+                        &kv_model.layer_configs,
+                    ),
+                    None => 0,
+                };
                 // A zero page size makes `div_ceil` panic and the page-boundary
                 // walk below produce zeros forever, so it is refused rather than
                 // carried into arithmetic that assumes it is positive.
-                paged = kv_model
-                    .filter(|kv_model| kv_model.tensor_config.page_size > 0)
-                    .map(|kv_model| PipelinePagedKv {
-                        cache: PagedKvCache::new_with_layer_tensor_configs(
+                paged = match kv_model.filter(|kv_model| kv_model.tensor_config.page_size > 0) {
+                    Some(kv_model) => Some(PipelinePagedKv {
+                        cache: PagedKvCache::new_leased(
                             kv_model.tensor_config.page_size,
                             kv_model.tensor_config.dtype,
                             kv_model.layer_configs.clone(),
-                            config.num_gpu_pages,
-                        ),
+                            pipeline_pages,
+                            component_governor.memory(),
+                            onnx_runtime_memory_governor::Tier::Device,
+                            PIPELINE_KV_POOL_HOLDER,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "cannot allocate the pipeline KV page pool: {pipeline_pages} \
+                                 page(s) across {} layer(s) do not fit the device KV budget",
+                                kv_model.layer_configs.len()
+                            )
+                        })?,
                         kv_model,
                         prefix: PrefixCache::new(),
                         active: None,
-                    });
+                    }),
+                    None => None,
+                };
                 let decoder_io = models
                     .directory
                     .spec

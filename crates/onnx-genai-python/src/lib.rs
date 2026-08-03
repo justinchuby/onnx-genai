@@ -194,12 +194,8 @@ struct Engine {
 #[pymethods]
 impl Engine {
     #[staticmethod]
-    #[pyo3(signature = (model_dir, *, num_gpu_pages=None, page_size=None))]
-    fn from_dir(
-        model_dir: &Bound<'_, PyAny>,
-        num_gpu_pages: Option<usize>,
-        page_size: Option<usize>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (model_dir, *, page_size=None))]
+    fn from_dir(model_dir: &Bound<'_, PyAny>, page_size: Option<usize>) -> PyResult<Self> {
         let path = model_dir
             .str()
             .map_err(|_| {
@@ -223,9 +219,6 @@ impl Engine {
             )));
         }
         let mut config = EngineConfig::default();
-        if let Some(value) = num_gpu_pages {
-            config.num_gpu_pages = value;
-        }
         if let Some(value) = page_size {
             if value == 0 {
                 return Err(PyValueError::new_err(

@@ -166,6 +166,22 @@ pub enum EvictionPolicy {
     LayerAware,
 }
 
+/// How a backend can be handed this store's KV without a copy.
+///
+/// Capability is a type rather than a name-keyed lookup, so a mismatch is a
+/// compile-or-construction-time refusal instead of a silent fall back to a
+/// slower path whose only symptom is that generation got slower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvViewKind {
+    /// Scattered pages. A backend must read through the store's accessors.
+    Paged,
+    /// One flat address range whose pages are physically scattered. Satisfies a
+    /// backend that requires contiguity, with no copy.
+    VirtuallyContiguous,
+    /// One real allocation.
+    PhysicallyContiguous,
+}
+
 /// KV cache operations trait (from spec §4c).
 pub trait KvCacheOps {
     /// Truncate cache to position. O(pages_removed).
@@ -188,6 +204,30 @@ pub trait KvCacheOps {
 
     /// Remove a sequence entirely, freeing all its pages.
     fn remove(&mut self, seq: SequenceId) -> Result<(), KvError>;
+
+    /// Bytes of KV storage this sequence references.
+    ///
+    /// **Attributed, not exclusive.** A page shared with another sequence — the
+    /// normal result of prefix reuse or a fork — is counted in full for every
+    /// sequence that references it, because that is what the sequence would need
+    /// if it were alone. Summing this across sequences therefore over-counts and
+    /// is *not* the store's footprint; use [`Self::resident_bytes`] for that.
+    ///
+    /// Getting this backwards is how a memory budget starts describing memory
+    /// that was never allocated.
+    fn sequence_bytes(&self, seq: SequenceId) -> Result<u64, KvError>;
+
+    /// Bytes of KV storage actually occupied by pages currently referenced.
+    ///
+    /// Counts each page once regardless of how many sequences share it, so this
+    /// is the number that can be compared against a memory lease.
+    fn resident_bytes(&self) -> u64;
+
+    /// Bytes this store holds a memory grant for, or `None` when ungoverned.
+    fn leased_bytes(&self) -> Option<u64>;
+
+    /// What a backend can be handed without a copy.
+    fn view(&self) -> KvViewKind;
 }
 
 /// A saved cache state for checkpoint/restore.
@@ -200,6 +240,30 @@ pub struct CacheCheckpoint {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KvError {
+    /// The memory governor refused to lease the page pool.
+    ///
+    /// Reported instead of allocating anyway, so a pool can never occupy more
+    /// than it was granted: a budget that is exceeded while reporting success
+    /// is worse than no budget.
+    #[error("cannot lease the KV page pool: {0}")]
+    PoolNotLeased(#[from] onnx_runtime_memory_governor::MemoryError),
+    /// The pool allocated a different amount than it leased.
+    ///
+    /// Only reachable if the size planner and the page allocator disagree,
+    /// which would mean the pool silently occupies memory outside its grant.
+    /// Refused rather than corrected, because the two must be kept in step
+    /// rather than reconciled after the fact.
+    #[error(
+        "the KV page pool leased {planned} bytes but allocated {actual}; the pool size planner \
+         and the page allocator have diverged, so the pool would occupy memory outside its \
+         grant. Fix by updating PageTable::planned_pool_bytes to match Page::new's layout"
+    )]
+    PoolSizeMismatch {
+        /// What was leased.
+        planned: u64,
+        /// What was allocated.
+        actual: u64,
+    },
     #[error("Sequence {0} not found")]
     SequenceNotFound(SequenceId),
     #[error("Out of memory: need {needed} pages, have {available}")]
