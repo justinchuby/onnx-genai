@@ -119,6 +119,20 @@ pub(super) fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Whether opt-in per-op heterogeneous placement is enabled on the default
+/// session build path (`ONNX_GENAI_HETERO`). Default OFF: unset/empty and the
+/// explicit `0`/`false`/`off` values (case-insensitive) all disable it, so the
+/// whole-session fallback stays byte-identical unless a caller opts in.
+pub(super) fn hetero_placement_env_enabled() -> bool {
+    match std::env::var("ONNX_GENAI_HETERO") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Reject operators no execution provider can run, before EP optimizer passes
 /// run. An optimizer pass's postcondition validation walks the whole graph and
 /// would otherwise surface a less actionable structural error (e.g. an
@@ -751,6 +765,27 @@ impl Executor {
                     unsupported_nodes: report.to_string(),
                 });
             }
+            // Thread-3 Phase 3: before silently dropping the whole session onto
+            // CPU (a catastrophic perf cliff), consult the per-op heterogeneous
+            // planner when opted in (`ONNX_GENAI_HETERO`). A genuinely mixed
+            // graph fails closed with an actionable per-op summary; a homogeneous
+            // graph proceeds to the byte-identical whole-session fallback below.
+            // Default OFF ⇒ this is a no-op and the fallback is unchanged.
+            let hetero_providers = [
+                crate::hetero::ProviderPlacement {
+                    ep: onnx_runtime_ep_api::EpId(0),
+                    provider: Arc::clone(ep),
+                },
+                crate::hetero::ProviderPlacement {
+                    ep: onnx_runtime_ep_api::EpId(1),
+                    provider: auto_detect_cpu_ep()?,
+                },
+            ];
+            crate::hetero::guard_heterogeneous_fallback(
+                &graph_before_ep_passes,
+                &hetero_providers,
+                hetero_placement_env_enabled(),
+            )?;
             *graph = graph_before_ep_passes;
             *ep = auto_detect_cpu_ep()?;
             run_ep_scoped_passes(graph, weights, ep.as_ref())?;
