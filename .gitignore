@@ -85,3 +85,7 @@ onnx-genai-session.perfetto.json
 .msg.txt
 .pr-body.md
 .git-msg.txt
+# Belt and braces: the convention above is easy to forget, and a stray commit-
+# message file has reached a PR before.
+CM*.txt
+PR*.md
