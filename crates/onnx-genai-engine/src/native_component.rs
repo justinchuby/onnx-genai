@@ -10,9 +10,13 @@
 //! ORT type appearing on the engine's construction path.
 //!
 //! This provides the GAP 1 component-session seam. GAP 2's native target
-//! step-input binding lives in [`crate::native_decode`]; wiring these neutral
-//! sessions and tensors into the ORT-owned pipeline decode loop is the remaining
-//! GAP 3 work; see [`crate::pipeline`].
+//! step-input binding lives in [`crate::native_decode`]. GAP 3 then wired these
+//! neutral sessions and tensors into the pipeline decode loop, which is now
+//! backend-neutral: the flat-autoregressive path drives native components and a
+//! native decoder through the `PipelineDecoderComponent` / `ComponentSession`
+//! seams with paged present-KV mirroring (Inc-A/C/D). Non-flat plans (nested-AR
+//! TTS, iterative diffusion, single-pass, composite) and native cross-attention
+//! / vision KV remain unwired; see [`crate::pipeline`].
 
 use crate::native_decode::NativeDecodeDevice;
 use onnx_genai_metadata::{
