@@ -27,15 +27,15 @@ when in fact it is 1955 lines.
 | L1 EP memory | §2 | **implemented** | `ExecutionProvider::{allocate, deallocate, copy}` in `onnx-runtime-ep-api` |
 | L2 Weight residency | §3 | **design only** | no `WeightResidencyManager` type exists |
 | L3a DeviceGovernor | §4 | **implemented under its old name** | `ResourceGovernor`, `crates/onnx-genai-scheduler/src/governor.rs` |
-| L3b HostGovernor | §5 | **implemented; adapter open in #598** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
+| L3b HostGovernor | §5 | **implemented; adapter in `HostLeaseGovernor`** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
-| Lease contract | §1.1 | **open in #598** | `crates/onnx-runtime-memory-governor` |
-| Allocator contract | §1.2, §1.3, §1.5 | **open in #609, #611** | `crates/onnx-genai-ort/src/governed_allocator.rs`, `Session::device_binding_from_external_memory` |
+| Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
+| Allocator contract | §1.2, §1.3, §1.5 | **native side implemented; ORT side open in #609** | `crates/onnx-genai-ort/src/governed_allocator.rs`, `Session::device_binding_from_external_memory` |
 | Virtual contiguity | §1.6 | **open in #607** | `crates/onnx-runtime-virtual-memory` |
 
-Nothing in the last three rows is merged yet. They are listed because the design
-below describes them as decided, and a reader should be able to tell "decided"
-from "in `main`".
+The last three rows are newer than the layers above them and move fastest, so
+each says where it actually is. "Decided" and "in `main` are different states
+and a reader should not have to guess which one a row means.
 
 Two things follow that are worth stating plainly, because both are the kind of
 gap that reads as "already handled" from the prose:
@@ -48,7 +48,7 @@ gap that reads as "already handled" from the prose:
   behaviour and is deliberately a separate change.
 - **Activations can now be sized, and still are not.** §4.6's
   `VramBreakdown.activations_bytes` is hardcoded to `0`. `onnx-runtime-memory`
-  is a liveness-based activation planner, and #614 adds
+  is a liveness-based activation planner, and it now has
   `peak_activation_bytes_at_bounds` so it can answer for a *dynamic* graph —
   planning from static shapes alone defers on any symbolic dimension, which is
   every LLM, so a reservation built on it was always zero. The planner still has
