@@ -2249,6 +2249,7 @@ name = "onnx-genai-scheduler"
 version = "0.1.0-dev.5"
 dependencies = [
  "onnx-genai-kv",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-protocol-trace",
  "serde_json",
  "thiserror 2.0.19",
