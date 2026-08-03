@@ -219,6 +219,11 @@ mod error {
         #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
         ShapeOverflow { value: String, dims: Vec<usize> },
 
+        /// A caller-supplied buffer cannot back the device binding it was
+        /// offered for.
+        #[error("external buffer for device binding '{binding}' cannot be used: {reason}")]
+        ExternalBuffer { binding: String, reason: String },
+
         #[error(
             "op {op} produced {got} data-dependent output shape(s) but has {expected} output(s)"
         )]
@@ -1257,6 +1262,34 @@ impl InferenceSession {
             physical_shape,
             logical_shape,
         )
+    }
+
+    /// Bind a persistent buffer the **caller** allocated on this session's
+    /// execution device.
+    ///
+    /// [`Session::allocate_device_binding`] has the execution provider allocate,
+    /// which puts the bytes outside any budget kept elsewhere. This entry point
+    /// is for the opposite arrangement: a memory manager owns the allocation and
+    /// lends it to the session, so device memory can be leased, pooled, or
+    /// migrated by code this crate knows nothing about.
+    ///
+    /// The session **borrows**; dropping the binding does not free the buffer.
+    ///
+    /// # Safety
+    ///
+    /// * `ptr` must be non-null, on this session's device, correctly aligned,
+    ///   and at least `len_bytes` long; `len_bytes` must cover
+    ///   `physical_shape` (this part is checked and reported).
+    /// * The allocation must outlive the returned binding and every run that
+    ///   reads or writes it, including a captured device graph that recorded
+    ///   its address.
+    /// * Nothing else may write to the memory while the binding is live.
+    pub unsafe fn device_binding_from_external_memory(
+        &self,
+        spec: crate::tensor::ExternalMemorySpec,
+    ) -> Result<DeviceIoBinding> {
+        // SAFETY: delegated to this function's contract.
+        unsafe { self.exec.device_binding_from_external_memory(spec) }
     }
 
     /// Allocate a persistent buffer for a graph output without also binding it

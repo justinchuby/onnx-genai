@@ -3744,3 +3744,149 @@ fn decode_inline_sibling_none_for_dense_graph() {
         "a dense decoder must not build a decode-inline sibling"
     );
 }
+
+/// A caller-owned buffer really backs the binding: the graph must read what
+/// the caller wrote and write its result back into the caller's own memory.
+///
+/// Constructing the binding successfully proves nothing on its own — an
+/// implementation that quietly allocated its own buffer and copied would look
+/// identical. Reading the *caller's* array after the run is what distinguishes
+/// them.
+#[test]
+fn an_external_buffer_is_used_in_place_rather_than_copied() {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let kv = graph.create_named_value("kv", DataType::Float32, static_shape([4]));
+    graph.add_input(kv);
+    let kvout = graph.create_named_value("kvout", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+    graph.add_output(kvout);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    // The caller owns this. Nothing inside the session may free it.
+    let mut owned: Vec<f32> = vec![-1.0, 2.0, -3.0, 4.0];
+    let ptr = owned.as_mut_ptr().cast::<core::ffi::c_void>();
+    let len_bytes = std::mem::size_of_val(owned.as_slice());
+
+    let mut binding = unsafe {
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec {
+            input_name: "kv".into(),
+            output_name: Some("kvout".into()),
+            dtype: DataType::Float32,
+            physical_shape: vec![4],
+            logical_shape: vec![4],
+            ptr,
+            len_bytes,
+        })
+    }
+    .unwrap();
+
+    assert_eq!(
+        binding.device_ptr().addr(),
+        ptr.addr(),
+        "the binding must point at the caller's buffer, not a copy of it"
+    );
+
+    exec.run_with_device_bindings(&[], std::slice::from_mut(&mut binding))
+        .unwrap();
+    drop(binding);
+
+    // Relu, computed in place, observed through the caller's own Vec.
+    assert_eq!(
+        owned,
+        vec![0.0, 2.0, 0.0, 4.0],
+        "the run's output must land in the caller's buffer"
+    );
+    // `owned` is still valid here; dropping the binding must not have freed it.
+    owned.push(5.0);
+    assert_eq!(owned.len(), 5);
+}
+
+/// A buffer too small for the declared shape is refused before it can be
+/// written past its end, and the error says what was needed.
+#[test]
+fn an_undersized_external_buffer_is_refused_with_the_size_it_needed() {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let kv = graph.create_named_value("kv", DataType::Float32, static_shape([4]));
+    graph.add_input(kv);
+    let kvout = graph.create_named_value("kvout", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+    graph.add_output(kvout);
+
+    let exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let mut too_small: Vec<f32> = vec![0.0; 2];
+    let error = unsafe {
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec {
+            input_name: "kv".into(),
+            output_name: Some("kvout".into()),
+            dtype: DataType::Float32,
+            physical_shape: vec![4],
+            logical_shape: vec![4],
+            ptr: too_small.as_mut_ptr().cast::<core::ffi::c_void>(),
+            len_bytes: std::mem::size_of_val(too_small.as_slice()),
+        })
+    }
+    .expect_err("a buffer half the required size must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("16"),
+        "the error must state the required byte count, got: {message}"
+    );
+    assert!(
+        message.contains('8'),
+        "the error must state the byte count supplied, got: {message}"
+    );
+}
+
+/// A null pointer is refused rather than turned into a binding that faults on
+/// first use.
+#[test]
+fn a_null_external_buffer_is_refused() {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let kv = graph.create_named_value("kv", DataType::Float32, static_shape([4]));
+    graph.add_input(kv);
+    let kvout = graph.create_named_value("kvout", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+    graph.add_output(kvout);
+
+    let exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let error = unsafe {
+        exec.device_binding_from_external_memory(crate::tensor::ExternalMemorySpec {
+            input_name: "kv".into(),
+            output_name: Some("kvout".into()),
+            dtype: DataType::Float32,
+            physical_shape: vec![4],
+            logical_shape: vec![4],
+            ptr: core::ptr::null_mut(),
+            len_bytes: 16,
+        })
+    }
+    .expect_err("a null buffer must be refused");
+    assert!(error.to_string().contains("null"));
+}

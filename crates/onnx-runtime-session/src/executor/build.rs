@@ -1737,6 +1737,52 @@ impl Executor {
         )
     }
 
+    /// Bind a buffer the **caller** allocated instead of allocating one here.
+    ///
+    /// # Safety
+    ///
+    /// See [`DeviceIoBinding::from_external_memory`]: the buffer must be large
+    /// enough (checked), and must outlive the binding and every run that
+    /// touches it (not checkable).
+    pub(crate) unsafe fn device_binding_from_external_memory(
+        &self,
+        spec: crate::tensor::ExternalMemorySpec,
+    ) -> Result<DeviceIoBinding> {
+        let crate::tensor::ExternalMemorySpec {
+            input_name,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            ptr,
+            len_bytes,
+        } = spec;
+        let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
+            if output_name.is_some() {
+                !self.binding_consumers_use_physical_capacity(vid)
+            } else {
+                !self.binding_consumers_use_padded_capacity(vid)
+            }
+        });
+        // SAFETY: delegated to this function's contract.
+        unsafe {
+            DeviceIoBinding::from_external_memory(
+                self.ep.clone(),
+                DeviceBindingSpec {
+                    input_name,
+                    bind_input: true,
+                    output_name,
+                    dtype,
+                    physical_shape,
+                    logical_shape,
+                    expose_logical_input_shape,
+                },
+                ptr,
+                len_bytes,
+            )
+        }
+    }
+
     pub(crate) fn allocate_device_output_binding(
         &self,
         output_name: String,

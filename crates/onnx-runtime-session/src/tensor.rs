@@ -238,6 +238,23 @@ pub(crate) struct DeviceBindingSpec {
     pub(crate) expose_logical_input_shape: bool,
 }
 
+/// The parameters for [`DeviceIoBinding::from_external_memory`], grouped the
+/// same way [`DeviceBindingSpec`] groups the allocating constructor's.
+///
+/// `ptr`/`len_bytes` describe memory the **caller** owns; the rest describes how
+/// the graph should see it.
+pub struct ExternalMemorySpec {
+    pub input_name: String,
+    pub output_name: Option<String>,
+    pub dtype: DataType,
+    pub physical_shape: Vec<usize>,
+    pub logical_shape: Vec<usize>,
+    /// Base address of the caller's allocation, on the session's device.
+    pub ptr: *mut core::ffi::c_void,
+    /// Length of the caller's allocation in bytes.
+    pub len_bytes: usize,
+}
+
 /// An externally owned persistent device allocation bound to a graph input and
 /// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
@@ -277,6 +294,87 @@ impl DeviceIoBinding {
             .max(1);
         let allocator_for_buffer = allocator.clone();
         let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
+        Ok(Self {
+            input_name,
+            bind_input,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            expose_logical_input_shape,
+            buffer: Some(buffer),
+            allocator,
+            transfer_stats: DeviceBindingTransferStats::default(),
+        })
+    }
+
+    /// Wrap memory the **caller** allocated, rather than allocating here.
+    ///
+    /// This is the native counterpart of handing ONNX Runtime an externally
+    /// allocated tensor: it lets a memory manager outside this crate own the
+    /// device allocation and lend it to a session for the binding's lifetime.
+    /// Without it the only way to get a persistent device binding is to let the
+    /// EP allocate, which puts the bytes outside any external budget.
+    ///
+    /// The binding **borrows**: `Drop` will not free `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee all of:
+    /// * `ptr` is non-null, points to at least `expected_bytes(dtype,
+    ///   physical_shape)` bytes on the EP's device, and is aligned to at least
+    ///   the contiguous-layout alignment.
+    /// * The allocation outlives this binding **and** every run that reads or
+    ///   writes it, including any captured device graph that recorded its
+    ///   address.
+    /// * No other live handle writes to the same memory while this binding
+    ///   exists; the binding assumes exclusive access.
+    ///
+    /// The byte-length requirement is checked and reported; the lifetime and
+    /// aliasing requirements cannot be, which is why this is `unsafe`.
+    pub(crate) unsafe fn from_external_memory(
+        allocator: Arc<dyn ExecutionProvider>,
+        spec: DeviceBindingSpec,
+        ptr: *mut core::ffi::c_void,
+        len_bytes: usize,
+    ) -> Result<Self> {
+        let DeviceBindingSpec {
+            input_name,
+            bind_input,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            expose_logical_input_shape,
+        } = spec;
+        validate_logical_shape(&physical_shape, &logical_shape)?;
+        let required = checked_expected_bytes(dtype, &physical_shape)
+            .ok_or_else(|| SessionError::ShapeOverflow {
+                value: format!("device binding '{input_name}'"),
+                dims: physical_shape.clone(),
+            })?
+            .max(1);
+        if len_bytes < required {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: format!(
+                    "it is {len_bytes} bytes but {physical_shape:?} of {dtype:?} needs \
+                     {required}; pass a buffer at least that large or reduce the physical shape"
+                ),
+            });
+        }
+        let alignment = TensorLayout::contiguous().alignment;
+        // SAFETY: delegated to this function's own contract; the size check
+        // above is the part that can be verified here.
+        let buffer = unsafe {
+            DeviceBuffer::from_borrowed_mut_parts(ptr, allocator.device_id(), required, alignment)
+        }
+        .ok_or_else(|| SessionError::ExternalBuffer {
+            binding: input_name.clone(),
+            reason: format!(
+                "it is null or misaligned; it must be non-null and aligned to {alignment} bytes"
+            ),
+        })?;
         Ok(Self {
             input_name,
             bind_input,
