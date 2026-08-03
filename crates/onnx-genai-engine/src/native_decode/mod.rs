@@ -59,19 +59,10 @@ pub static NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES: AtomicU64 = AtomicU64::ne
 pub static NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Device requested for a native decode session.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum NativeDecodeDevice {
-    #[default]
-    Cpu,
-    Cuda {
-        index: Option<u32>,
-    },
-    Plugin {
-        library: std::path::PathBuf,
-        registration_name: Option<String>,
-        provider_name: String,
-    },
-}
+///
+/// Defined outside this module so ungated code can name it; re-exported here so
+/// every existing `native_decode::NativeDecodeDevice` path still resolves.
+pub use crate::native_decode_device::NativeDecodeDevice;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeDecodeCudaOptions {

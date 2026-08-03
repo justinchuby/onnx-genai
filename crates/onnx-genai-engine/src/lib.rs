@@ -21,6 +21,7 @@ pub mod logits;
 pub mod native_component;
 #[cfg(feature = "native-backend")]
 pub mod native_decode;
+pub mod native_decode_device;
 #[cfg(feature = "native-backend")]
 pub(crate) mod native_speculative;
 pub mod pipeline;
