@@ -146,11 +146,13 @@ A component does not "allocate". It **leases**: it asks a `MemoryGovernor` for
 bytes on a tier for a stated role, and holds a `MemoryLease` for as long as it
 occupies them. Dropping the lease returns them.
 
-    trait MemoryGovernor {
-        fn reserve(&self, tier: Tier, bytes: u64, role: MemoryRole, holder: HolderId)
-            -> Result<MemoryLease, MemoryError>;
-        fn available(&self, tier: Tier) -> u64;
-    }
+```rust
+trait MemoryGovernor {
+    fn reserve(&self, tier: Tier, bytes: u64, role: MemoryRole, holder: HolderId)
+        -> Result<MemoryLease, MemoryError>;
+    fn available(&self, tier: Tier) -> u64;
+}
+```
 
 Four invariants, stated as the properties tests are written against:
 
