@@ -247,6 +247,23 @@ pub enum KvError {
     /// is worse than no budget.
     #[error("cannot lease the KV page pool: {0}")]
     PoolNotLeased(#[from] onnx_runtime_memory_governor::MemoryError),
+    /// The pool allocated a different amount than it leased.
+    ///
+    /// Only reachable if the size planner and the page allocator disagree,
+    /// which would mean the pool silently occupies memory outside its grant.
+    /// Refused rather than corrected, because the two must be kept in step
+    /// rather than reconciled after the fact.
+    #[error(
+        "the KV page pool leased {planned} bytes but allocated {actual}; the pool size planner \
+         and the page allocator have diverged, so the pool would occupy memory outside its \
+         grant. Fix by updating PageTable::planned_pool_bytes to match Page::new's layout"
+    )]
+    PoolSizeMismatch {
+        /// What was leased.
+        planned: u64,
+        /// What was allocated.
+        actual: u64,
+    },
     #[error("Sequence {0} not found")]
     SequenceNotFound(SequenceId),
     #[error("Out of memory: need {needed} pages, have {available}")]

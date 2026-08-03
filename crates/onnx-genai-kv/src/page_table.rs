@@ -950,11 +950,14 @@ impl PageTable {
             layer_configs,
             quant_config,
         );
-        debug_assert_eq!(
-            planned,
-            table.pool_bytes(),
-            "the leased pool size disagrees with what was allocated"
-        );
+        // Checked in release too, not just debug. An under-plan means the pool
+        // occupies more than it leased while the ledger reports success, which
+        // is the one failure this contract exists to prevent -- so it must not
+        // be a class of bug that only shows up in a debug build.
+        let actual = table.pool_bytes();
+        if actual != planned {
+            return Err(KvError::PoolSizeMismatch { planned, actual });
+        }
         table.pool_lease = Some(lease);
         Ok(table)
     }
@@ -1774,6 +1777,36 @@ mod pool_lease_tests {
             governor.available(Tier::Device),
             0,
             "cloning must not consume further budget"
+        );
+    }
+    /// A page is host memory, so the pool must be charged to the host tier.
+    ///
+    /// `Page` holds `Vec<f32>`. Charging it to the device tier -- which the
+    /// `num_gpu_pages` lineage invites -- would let the pool exhaust host RAM
+    /// while the device ledger still reported headroom, which is the governor
+    /// failing at the one thing it exists to do. Caught in review before it
+    /// shipped, so this test is what keeps it caught.
+    #[test]
+    fn a_host_backed_pool_is_charged_to_the_host_tier() {
+        let want = planned(4, 2);
+        // Device has room, host does not. A pool that charged the device tier
+        // would be granted here; one that charges host must be refused.
+        let governor = LedgerGovernor::new(LeaseLedger::new(want * 8, want - 1, 0));
+        PageTable::new_leased(
+            16,
+            4,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Host,
+            HOLDER,
+        )
+        .map(|_| ())
+        .expect_err("a host tier without room must refuse a host-backed pool");
+        assert_eq!(
+            governor.available(Tier::Device),
+            want * 8,
+            "the refusal consumed device budget for a host allocation"
         );
     }
 }

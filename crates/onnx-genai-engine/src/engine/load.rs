@@ -526,6 +526,7 @@ fn load_draft_model(
         let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
             let draft_pages = kv_pages_for_budget(
                 governor.snapshot().derived_budget.kv_bytes,
+                governor.snapshot().resolved_limits.host_ram_bytes,
                 config.scheduler.max_total_tokens,
                 kv_model.tensor_config.page_size,
                 kv_model.tensor_config.dtype,
@@ -537,7 +538,7 @@ fn load_draft_model(
                 kv_model.layer_configs.clone(),
                 draft_pages,
                 governor.memory(),
-                onnx_runtime_memory_governor::Tier::Device,
+                KV_POOL_TIER,
                 DRAFT_KV_POOL_HOLDER,
             )
             .context(
@@ -560,6 +561,14 @@ fn load_draft_model(
     Ok(draft)
 }
 
+/// The tier a `PagedKvCache` page pool actually lives on.
+///
+/// `Page` holds `Vec<f32>` — host memory, whatever the pool's `num_gpu_pages`
+/// lineage suggests. Charging it to `Tier::Device` would let the pool exhaust
+/// host RAM while the device ledger still reported headroom, which is the
+/// governor failing at the one thing it exists to do.
+const KV_POOL_TIER: onnx_runtime_memory_governor::Tier = onnx_runtime_memory_governor::Tier::Host;
+
 /// Pages retained by a pool that holds no KV data.
 ///
 /// Without per-layer geometry a page carries no storage, so this bounds only
@@ -579,6 +588,7 @@ const BOOKKEEPING_POOL_PAGES: usize = 1024;
 /// geometry the pages will actually have.
 pub(crate) fn kv_pages_for_budget(
     kv_budget_bytes: u64,
+    host_ram_bytes: u64,
     working_set_tokens: usize,
     page_size: usize,
     dtype: onnx_genai_kv::KvDType,
@@ -590,10 +600,18 @@ pub(crate) fn kv_pages_for_budget(
     if per_page == 0 {
         return BOOKKEEPING_POOL_PAGES;
     }
-    let ceiling = usize::try_from(kv_budget_bytes / per_page).unwrap_or(usize::MAX);
+    // Two ceilings, both binding: the KV budget is policy, host RAM is physics.
+    // A page is a `Vec<f32>`, so a pool that fits the KV budget but not host
+    // memory still cannot be allocated.
+    let ceiling =
+        usize::try_from(kv_budget_bytes.min(host_ram_bytes) / per_page).unwrap_or(usize::MAX);
     let wanted = working_set_tokens.div_ceil(page_size.max(1));
     // At least one page, or the pool cannot hold a single token and the failure
     // surfaces later as a decode that mysteriously caches nothing.
+    //
+    // Note what this does *not* promise: when a ceiling is the binding term the
+    // pool still eagerly allocates up to it. The working set bounds the pool
+    // only while it is the smallest of the three.
     wanted.min(ceiling).max(1)
 }
 
@@ -622,6 +640,7 @@ fn allocate_kv_cache(
     if let Some(kv_model) = kv_model {
         let num_pages = kv_pages_for_budget(
             budget.kv_bytes,
+            governor.snapshot().resolved_limits.host_ram_bytes,
             config.scheduler.max_total_tokens,
             kv_model.tensor_config.page_size,
             kv_model.tensor_config.dtype,
@@ -643,7 +662,7 @@ fn allocate_kv_cache(
             kv_model.layer_configs.clone(),
             num_pages,
             governor.memory(),
-            onnx_runtime_memory_governor::Tier::Device,
+            KV_POOL_TIER,
             KV_POOL_HOLDER,
         )
         .with_context(|| {
@@ -1052,7 +1071,7 @@ mod pool_sizing_tests {
             1024 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
         ] {
-            let pages = kv_pages_for_budget(budget, 1 << 20, 16, dtype, &configs);
+            let pages = kv_pages_for_budget(budget, u64::MAX, 1 << 20, 16, dtype, &configs);
             let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, configs.len());
             let planned =
                 onnx_genai_kv::PageTable::planned_pool_bytes(16, pages, &configs, Some(&quant));
@@ -1071,7 +1090,14 @@ mod pool_sizing_tests {
     #[test]
     fn a_budget_below_one_page_still_yields_one_page() {
         assert_eq!(
-            kv_pages_for_budget(1, 65536, 16, onnx_genai_kv::KvDType::F32, &geometry(32)),
+            kv_pages_for_budget(
+                1,
+                u64::MAX,
+                65536,
+                16,
+                onnx_genai_kv::KvDType::F32,
+                &geometry(32)
+            ),
             1
         );
     }
@@ -1082,6 +1108,7 @@ mod pool_sizing_tests {
         assert_eq!(
             kv_pages_for_budget(
                 8 * 1024 * 1024 * 1024,
+                u64::MAX,
                 65536,
                 16,
                 onnx_genai_kv::KvDType::F32,
@@ -1103,7 +1130,14 @@ mod pool_sizing_tests {
         let configs = geometry(32);
         let dtype = onnx_genai_kv::KvDType::F32;
         let working_set = 65_536;
-        let pages = kv_pages_for_budget(64 * 1024 * 1024 * 1024, working_set, 16, dtype, &configs);
+        let pages = kv_pages_for_budget(
+            64 * 1024 * 1024 * 1024,
+            u64::MAX,
+            working_set,
+            16,
+            dtype,
+            &configs,
+        );
 
         assert_eq!(
             pages,
@@ -1129,7 +1163,51 @@ mod pool_sizing_tests {
         let per_page = onnx_genai_kv::PageTable::planned_pool_bytes(16, 1, &configs, Some(&quant));
         let budget = per_page * 4;
 
-        let pages = kv_pages_for_budget(budget, 1 << 20, 16, dtype, &configs);
+        let pages = kv_pages_for_budget(budget, u64::MAX, 1 << 20, 16, dtype, &configs);
         assert_eq!(pages, 4, "the budget must cap a working set it cannot hold");
+    }
+    /// Host RAM caps the pool even when the KV budget would allow more.
+    ///
+    /// A page is a `Vec<f32>`, so a pool that fits the KV policy budget but not
+    /// physical host memory still cannot be allocated. Charging only the KV
+    /// budget would let a CPU deployment OOM while every counter reported
+    /// headroom.
+    #[test]
+    fn host_memory_caps_the_pool_even_when_the_kv_budget_would_allow_more() {
+        let configs = geometry(32);
+        let dtype = onnx_genai_kv::KvDType::F32;
+        let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, configs.len());
+        let per_page = onnx_genai_kv::PageTable::planned_pool_bytes(16, 1, &configs, Some(&quant));
+
+        let pages = kv_pages_for_budget(
+            u64::MAX,     // KV policy budget: unlimited
+            per_page * 3, // host RAM: three pages
+            1 << 20,      // working set: far more than three pages
+            16,
+            dtype,
+            &configs,
+        );
+        assert_eq!(pages, 3, "host memory did not cap the pool");
+    }
+
+    /// The working set bounds the pool only while it is the smallest term.
+    ///
+    /// Stated explicitly because the sibling test's name invites the opposite
+    /// reading: when a ceiling binds, the pool still eagerly allocates up to
+    /// that ceiling. That is the intended behaviour for a pre-allocated pool,
+    /// but it is not the unconditional bound the phrase "does not produce a
+    /// huge pool" suggests, so it is pinned rather than left to the reader.
+    #[test]
+    fn a_binding_ceiling_is_still_allocated_eagerly() {
+        let configs = geometry(32);
+        let dtype = onnx_genai_kv::KvDType::F32;
+        let quant = onnx_genai_kv::KvQuantConfig::homogeneous(dtype, configs.len());
+        let per_page = onnx_genai_kv::PageTable::planned_pool_bytes(16, 1, &configs, Some(&quant));
+
+        let pages = kv_pages_for_budget(per_page * 64, u64::MAX, 1 << 30, 16, dtype, &configs);
+        assert_eq!(
+            pages, 64,
+            "a binding budget should be taken in full, not reduced further"
+        );
     }
 }
