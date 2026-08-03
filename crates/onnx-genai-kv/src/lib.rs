@@ -275,6 +275,23 @@ pub enum KvError {
         position: usize,
         retained_start: usize,
     },
+    /// A read at a rewind target below the pinned attention-sink prefix.
+    ///
+    /// The rewind itself is legal, but it resets the sequence's window
+    /// bookkeeping, and a read that does not mutate cannot reproduce the result.
+    /// Refused rather than answered with a view the rewind would not produce.
+    #[error(
+        "cannot materialize sequence at position {position} without rewinding: it is inside the \
+         {sink_len} pinned attention-sink tokens, and rewinding there resets the window \
+         bookkeeping this read cannot reproduce. Fix by rewinding first and then materializing, \
+         or by choosing a position at or above {sink_len}"
+    )]
+    RewindBelowSinkNotMaterializable {
+        /// The requested read position.
+        position: usize,
+        /// The pinned sink prefix length.
+        sink_len: usize,
+    },
     #[error("Sliding-window size must be greater than zero")]
     InvalidWindowSize,
     #[error("Tensor storage is not configured for this cache")]
