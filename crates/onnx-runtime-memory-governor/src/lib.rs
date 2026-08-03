@@ -70,6 +70,10 @@
 //! eviction pass deleted the very session it was writing to in order to satisfy
 //! a budget. Live state is never taken to make room.
 
+pub mod allocator;
+
+pub use allocator::{DeviceAllocator, DeviceKey, HostAllocator};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
