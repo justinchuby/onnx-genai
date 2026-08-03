@@ -147,3 +147,62 @@ fn an_alignment_cuda_does_not_guarantee_is_refused() {
         "the error must say what is guaranteed, got: {error}"
     );
 }
+
+/// Concurrent `allocate` calls return regions that do not overlap.
+///
+/// One allocator serves every session on a device, so several sessions
+/// allocating at once is the normal case, not an edge one. The trait takes
+/// `&self` and is bound `Send + Sync` to say exactly this, and a device
+/// allocator that handed two threads overlapping memory would corrupt one
+/// session's tensors with another's writes -- silently, and only under load.
+///
+/// Disjointness is the property worth asserting: it is what a caller relies on
+/// and what a wrong lock would break.
+#[test]
+fn concurrent_allocations_do_not_overlap() {
+    let Some(allocator) = allocator() else { return };
+    let allocator = std::sync::Arc::new(allocator);
+
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 16;
+    const BYTES: usize = 4096;
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let allocator = std::sync::Arc::clone(&allocator);
+            std::thread::spawn(move || {
+                (0..PER_THREAD)
+                    .map(|_| {
+                        allocator
+                            .allocate(BYTES, 256)
+                            .expect("a concurrent device allocation")
+                            .as_ptr() as usize
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let mut regions: Vec<usize> = handles
+        .into_iter()
+        .flat_map(|handle| handle.join().expect("an allocating thread panicked"))
+        .collect();
+
+    assert_eq!(regions.len(), THREADS * PER_THREAD);
+    regions.sort_unstable();
+    for pair in regions.windows(2) {
+        assert!(
+            pair[0] + BYTES <= pair[1],
+            "two concurrent allocations overlap: {:#x} + {BYTES} runs into {:#x}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    for address in regions {
+        let ptr = NonNull::new(address as *mut u8).expect("a recorded allocation");
+        // SAFETY: each address came from `allocate` above with this size and
+        // alignment, and each appears once, so this is its single free.
+        unsafe { allocator.deallocate(ptr, BYTES, 256) };
+    }
+}
