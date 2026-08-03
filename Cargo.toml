@@ -21,6 +21,7 @@ members = [
     # ── ORT 2.0 runtime layer (new — see docs/ORT2.md) ──
     "crates/onnx-runtime-ir",
     "crates/onnx-runtime-memory",
+    "crates/onnx-runtime-virtual-memory",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
     "crates/onnx-model-package",
@@ -79,6 +80,7 @@ default-members = [
     "crates/onnx-genai-ort/ort-sys",
     "crates/onnx-runtime-ir",
     "crates/onnx-runtime-memory",
+    "crates/onnx-runtime-virtual-memory",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
     "crates/onnx-model-package",
@@ -138,6 +140,7 @@ onnx-genai-server = { path = "crates/onnx-genai-server", version = "=0.1.0-dev.5
 # ORT 2.0 runtime layer (new)
 onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.5" }
 onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.5" }
+onnx-runtime-virtual-memory = { path = "crates/onnx-runtime-virtual-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.5" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.5" }
 onnx-model-package = { path = "crates/onnx-model-package", version = "=0.1.0-dev.5" }

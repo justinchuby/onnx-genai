@@ -2502,6 +2502,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-virtual-memory"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libc",
+ "thiserror 2.0.19",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "onnx-std"
 version = "0.1.0-dev.5"
 dependencies = [
