@@ -2,7 +2,8 @@
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut,
+    TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -532,6 +533,141 @@ fn topk_fp16_and_bf16_router_values_match_cpu_order() {
         ]
     );
     assert_eq!(i64s(&bf16_out[1]), expected_indices);
+}
+
+/// Router-scale fp16 parity: the Qwen3.6-35B-A3B (`dense_fallback` MoE) gate is a
+/// 256-expert / top-8 `TopK` in fp16. Prove the CUDA kernel is byte-identical to
+/// the CPU EP oracle at that exact shape (large last-dim, k=8, many ties) and that
+/// the fp16 path handles a non-final axis identically to the proven f32 kernel.
+#[test]
+fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
+    // 256-expert / top-8 router on the final axis (two token rows). The `% 37`
+    // pattern repeats every 37 experts, so each row has many ties, forcing the
+    // ascending-index tie-break the upcast-for-compare path must reproduce.
+    let (rows, width) = (2_usize, 256_usize);
+    let data = (0..rows * width)
+        .map(|n| f16::from_f32((n % 37) as f32 - 18.0))
+        .collect::<Vec<_>>();
+    let inputs = [
+        tensor(DataType::Float16, &[rows, width], &data),
+        tensor(DataType::Int64, &[], &[8_i64]),
+    ];
+    let outputs = [
+        (DataType::Float16, vec![rows, 8]),
+        (DataType::Int64, vec![rows, 8]),
+    ];
+    let attrs = [("axis", Attribute::Int(-1))];
+    let router = run("TopK", 10, &inputs, &outputs, &attrs);
+    assert_eq!(
+        router,
+        run_cpu("TopK", 10, &inputs, &outputs, &attrs),
+        "256-expert fp16 router GPU/CPU byte parity"
+    );
+    // Each token's 8 selected experts must be distinct and in range.
+    let indices = i64s(&router[1]);
+    assert_eq!(indices.len(), rows * 8);
+    for row in indices.chunks(8) {
+        for (a, &idx) in row.iter().enumerate() {
+            assert!((0..256).contains(&idx), "index {idx} out of range");
+            for &other in &row[a + 1..] {
+                assert_ne!(idx, other, "router selected a duplicate expert");
+            }
+        }
+    }
+
+    // Non-final axis (axis 0): oracle the fp16 kernel against the proven f32 GPU
+    // path on identical, exactly-representable integer inputs. (The CPU EP writes
+    // non-final-axis TopK in push order while the CUDA kernel and ONNX use the
+    // k-major layout asserted by `topk_non_final_axes_*`; that divergence is
+    // pre-existing and independent of dtype, so f32 GPU is the layout oracle here.)
+    let axis0 = [("axis", Attribute::Int(0))];
+    let f32_data = (0..20).map(|n| (n % 37) as f32 - 18.0).collect::<Vec<_>>();
+    let f16_data = f32_data
+        .iter()
+        .map(|&v| f16::from_f32(v))
+        .collect::<Vec<_>>();
+    let f32_out = run(
+        "TopK",
+        10,
+        &[
+            tensor(DataType::Float32, &[5, 4], &f32_data),
+            tensor(DataType::Int64, &[], &[2_i64]),
+        ],
+        &[
+            (DataType::Float32, vec![2, 4]),
+            (DataType::Int64, vec![2, 4]),
+        ],
+        &axis0,
+    );
+    let f16_out = run(
+        "TopK",
+        10,
+        &[
+            tensor(DataType::Float16, &[5, 4], &f16_data),
+            tensor(DataType::Int64, &[], &[2_i64]),
+        ],
+        &[
+            (DataType::Float16, vec![2, 4]),
+            (DataType::Int64, vec![2, 4]),
+        ],
+        &axis0,
+    );
+    assert_eq!(
+        i64s(&f16_out[1]),
+        i64s(&f32_out[1]),
+        "fp16 non-final-axis indices match the f32 kernel"
+    );
+    assert_eq!(
+        f16s(&f16_out[0])
+            .iter()
+            .map(|v| v.to_f32())
+            .collect::<Vec<_>>(),
+        f32s(&f32_out[0]),
+        "fp16 non-final-axis values match the f32 kernel"
+    );
+}
+
+/// Regression guard for the Qwen3.6-35B-A3B unblock: the model's 40 MoE router
+/// gates are fp16 `TopK`. Before fp16 support the CUDA claim gate rejected them
+/// with `input 0 ('X') dtype Float16 unsupported; expected Float32`, forcing a
+/// whole-session CPU fallback. The EP must now CLAIM fp16 TopK (and still claim
+/// f32, so no dtype is regressed).
+#[test]
+fn cuda_ep_claims_fp16_topk_router_nodes() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    let claims = |dtype: DataType| {
+        let (graph, node_id) = graph(
+            "TopK",
+            10,
+            &[
+                tensor(dtype, &[1, 256], &vec![0_u16; 256]),
+                tensor(DataType::Int64, &[], &[8_i64]),
+            ],
+            &[(dtype, vec![1, 8]), (DataType::Int64, vec![1, 8])],
+            &[("axis", Attribute::Int(-1))],
+        );
+        let model = Model::new(&graph);
+        let shapes = [
+            static_shape([1_usize, 256]),
+            static_shape(std::iter::empty::<usize>()),
+        ];
+        matches!(
+            ep.supports_op(
+                model.graph.node(node_id),
+                10,
+                &shapes,
+                &[dtype, DataType::Int64],
+                &[],
+            ),
+            KernelMatch::Supported { .. }
+        )
+    };
+    assert!(claims(DataType::Float16), "CUDA EP must claim fp16 TopK");
+    assert!(claims(DataType::BFloat16), "CUDA EP must claim bf16 TopK");
+    assert!(
+        claims(DataType::Float32),
+        "CUDA EP must still claim f32 TopK"
+    );
 }
 
 #[test]
