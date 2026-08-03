@@ -17,7 +17,7 @@ use onnx_genai_ort::{
     DataType, Environment, MemoryInfo, Session, SessionOptions, USE_ENV_ALLOCATORS, Value,
 };
 use onnx_runtime_memory_governor::{
-    HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
+    LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
 };
 
 fn tiny_llm() -> PathBuf {
@@ -36,17 +36,16 @@ fn ort_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-const HOLDER: HolderId = HolderId::new(42);
 const BUDGET: u64 = 512 * 1024 * 1024;
 
 fn governed(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
-    let governor = LedgerGovernor::new(LeaseLedger::new(0, budget, 0));
+    let ledger = LeaseLedger::new(0, budget, 0);
+    let governor = LedgerGovernor::new(Arc::clone(&ledger));
     let allocator = GovernedAllocator::new(
         MemoryInfo::cpu_device().expect("cpu device memory info"),
-        Arc::new(governor.clone()),
+        ledger as Arc<dyn LeaseAccounting>,
         Tier::Host,
         MemoryRole::Activation,
-        HOLDER,
     )
     .expect("host allocator");
     (allocator, governor)

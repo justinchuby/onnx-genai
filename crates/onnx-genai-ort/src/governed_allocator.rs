@@ -33,11 +33,11 @@
 //! contract exists to prevent.
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{LeaseAccounting, MemoryRole, Tier};
 
 use crate::allocator::MemoryInfo;
 
@@ -49,20 +49,28 @@ use crate::allocator::MemoryInfo;
 /// possible way to find out.
 const ALLOCATION_ALIGNMENT: usize = 64;
 
-/// What one live allocation costs, so `Free` can return exactly that much.
-struct LiveBlock {
-    layout: Layout,
-    /// Dropping this returns the bytes to the governor.
-    _lease: onnx_runtime_memory_governor::MemoryLease,
-}
+/// Bytes reserved before every block to record its size.
+///
+/// ORT's `Free` hands back only a pointer, so the size has to be recovered
+/// somehow. The first version kept a `HashMap<address, (layout, lease)>`, which
+/// cost a lock and a hash on **both** paths. Measured against the alternatives,
+/// that side table was the dominant cost of governing an allocation — not the
+/// lease, and not `malloc`.
+///
+/// A header costs one alignment unit per block and nothing else: no lock, no
+/// hash, no allocation. It is a full [`ALLOCATION_ALIGNMENT`] so the pointer
+/// handed to ORT keeps the alignment its kernels are entitled to assume.
+const HEADER_BYTES: usize = ALLOCATION_ALIGNMENT;
 
 struct GovernedAllocatorState {
-    governor: Arc<dyn MemoryGovernor + Send + Sync>,
+    accounting: Arc<dyn LeaseAccounting>,
     tier: Tier,
     role: MemoryRole,
-    holder: HolderId,
-    /// ORT's `Free` hands back only a pointer, so the size has to be remembered.
-    live: Mutex<HashMap<usize, LiveBlock>>,
+    /// Observability, not accounting: the governor's books are authoritative.
+    /// Two relaxed atomics, because the alternative is the side table this
+    /// design exists to remove.
+    live_bytes: AtomicU64,
+    live_count: AtomicUsize,
 }
 
 /// An `OrtAllocator` whose allocations are leased from a memory governor.
@@ -97,10 +105,9 @@ impl GovernedAllocator {
     /// charged.
     pub fn new(
         memory_info: MemoryInfo,
-        governor: Arc<dyn MemoryGovernor + Send + Sync>,
+        accounting: Arc<dyn LeaseAccounting>,
         tier: Tier,
         role: MemoryRole,
-        holder: HolderId,
     ) -> crate::error::Result<Box<Self>> {
         if tier != Tier::Host {
             return Err(crate::error::OrtError::InvalidArgument(format!(
@@ -133,11 +140,11 @@ impl GovernedAllocator {
             },
             memory_info,
             state: Arc::new(GovernedAllocatorState {
-                governor,
+                accounting,
                 tier,
                 role,
-                holder,
-                live: Mutex::new(HashMap::new()),
+                live_bytes: AtomicU64::new(0),
+                live_count: AtomicUsize::new(0),
             }),
         });
         // The vtable is only reachable through this pointer, so it must not move
@@ -151,18 +158,14 @@ impl GovernedAllocator {
         std::ptr::from_mut(&mut self.base)
     }
 
-    /// Bytes currently held by live allocations.
+    /// Bytes currently held by live allocations, including their headers.
     pub fn live_bytes(&self) -> u64 {
-        self.state
-            .live
-            .lock()
-            .map(|live| live.values().map(|b| b.layout.size() as u64).sum())
-            .unwrap_or(0)
+        self.state.live_bytes.load(Ordering::Relaxed)
     }
 
     /// Number of live allocations.
     pub fn live_count(&self) -> usize {
-        self.state.live.lock().map(|live| live.len()).unwrap_or(0)
+        self.state.live_count.load(Ordering::Relaxed)
     }
 }
 
@@ -193,46 +196,40 @@ unsafe extern "C" fn governed_alloc(
         // zero-length layout would also be undefined.
         return std::ptr::null_mut();
     }
-    let Ok(layout) = Layout::from_size_align(size, ALLOCATION_ALIGNMENT) else {
+    let Some(total) = size.checked_add(HEADER_BYTES) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(layout) = Layout::from_size_align(total, ALLOCATION_ALIGNMENT) else {
         return std::ptr::null_mut();
     };
 
-    // Lease first. A refusal must not allocate, or the budget is decorative.
-    let Ok(lease) = state
-        .governor
-        .reserve(state.tier, size as u64, state.role, state.holder)
-    else {
+    // Charge first. A refusal must not allocate, or the budget is decorative.
+    if state
+        .accounting
+        .try_claim(state.tier, total as u64, state.role)
+        .is_err()
+    {
         return std::ptr::null_mut();
-    };
+    }
 
     // SAFETY: `layout` has a non-zero size and a valid power-of-two alignment.
-    let ptr = unsafe { alloc(layout) };
-    if ptr.is_null() {
-        // Dropping the lease here returns the bytes; failing to would leak
-        // budget on every allocation failure.
+    let base = unsafe { alloc(layout) };
+    if base.is_null() {
+        // Give the budget back; failing to would leak it on every allocation
+        // failure.
+        state.accounting.release(state.tier, total as u64);
         return std::ptr::null_mut();
     }
 
-    match state.live.lock() {
-        Ok(mut live) => {
-            live.insert(
-                ptr as usize,
-                LiveBlock {
-                    layout,
-                    _lease: lease,
-                },
-            );
-            ptr.cast::<c_void>()
-        }
-        Err(_) => {
-            // The map is poisoned, so this block could never be freed through
-            // `Free` and would leak both memory and budget. Give both back and
-            // report failure instead.
-            // SAFETY: `ptr` came from `alloc` with this exact `layout`.
-            unsafe { dealloc(ptr, layout) };
-            std::ptr::null_mut()
-        }
-    }
+    // SAFETY: the header slot is the first `HEADER_BYTES` of an allocation we
+    // just made, and `HEADER_BYTES` is at least `size_of::<usize>()`.
+    unsafe { base.cast::<usize>().write(total) };
+    state.live_bytes.fetch_add(total as u64, Ordering::Relaxed);
+    state.live_count.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `HEADER_BYTES` is within the allocation, so the block pointer is
+    // in bounds; it stays `ALLOCATION_ALIGNMENT`-aligned because the header is
+    // exactly one alignment unit.
+    unsafe { base.add(HEADER_BYTES) }.cast::<c_void>()
 }
 
 unsafe extern "C" fn governed_free(this: *mut onnx_genai_ort_sys::OrtAllocator, p: *mut c_void) {
@@ -241,20 +238,22 @@ unsafe extern "C" fn governed_free(this: *mut onnx_genai_ort_sys::OrtAllocator, 
     }
     // SAFETY: ORT only calls this with a pointer we registered.
     let allocator = unsafe { allocator_from_base(this) };
+    let state = &allocator.state;
 
-    let Ok(mut live) = allocator.state.live.lock() else {
+    // SAFETY: `p` came from `governed_alloc`, so the header sits immediately
+    // before it and holds the total size. Unlike the side-table version there
+    // is no way to detect a foreign pointer here; freeing one was already
+    // undefined, and ORT only frees what this allocator returned.
+    let base = unsafe { p.cast::<u8>().sub(HEADER_BYTES) };
+    let total = unsafe { base.cast::<usize>().read() };
+    let Ok(layout) = Layout::from_size_align(total, ALLOCATION_ALIGNMENT) else {
         return;
     };
-    let Some(block) = live.remove(&(p as usize)) else {
-        // Freeing something we did not allocate would corrupt the heap, so it
-        // is ignored rather than passed to `dealloc`. This cannot happen if ORT
-        // honours the allocator contract.
-        return;
-    };
-    drop(live);
-    // SAFETY: the pointer and layout are the pair recorded by `governed_alloc`.
-    unsafe { dealloc(p.cast::<u8>(), block.layout) };
-    // `block` drops here, returning the lease.
+    // SAFETY: the pointer and layout are the pair `governed_alloc` created.
+    unsafe { dealloc(base, layout) };
+    state.accounting.release(state.tier, total as u64);
+    state.live_bytes.fetch_sub(total as u64, Ordering::Relaxed);
+    state.live_count.fetch_sub(1, Ordering::Relaxed);
 }
 
 unsafe extern "C" fn governed_info(
@@ -421,9 +420,7 @@ pub fn register_governed_allocator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
-
-    const HOLDER: HolderId = HolderId::new(9);
+    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryGovernor};
 
     fn allocator(budget: u64) -> (Box<GovernedAllocator>, LedgerGovernor) {
         allocator_with(
@@ -436,33 +433,62 @@ mod tests {
         budget: u64,
         memory_info: MemoryInfo,
     ) -> (Box<GovernedAllocator>, LedgerGovernor) {
-        let governor = LedgerGovernor::new(LeaseLedger::new(0, budget, 0));
+        let ledger = LeaseLedger::new(0, budget, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
         let allocator = GovernedAllocator::new(
             memory_info,
-            Arc::new(governor.clone()),
+            ledger as Arc<dyn LeaseAccounting>,
             Tier::Host,
             MemoryRole::Activation,
-            HOLDER,
         );
         (allocator.expect("host allocator"), governor)
     }
 
-    /// Every byte ORT takes is leased before it is handed over.
+    /// Every byte ORT takes is charged before it is handed over — including the
+    /// header, which is memory this allocator really takes from the OS.
+    ///
+    /// Charging only the requested size would understate the budget by 64 bytes
+    /// per allocation, which on a graph making thousands of them per step is a
+    /// budget that quietly does not hold.
     #[test]
-    fn an_allocation_is_leased_before_the_memory_is_returned() {
+    fn an_allocation_is_charged_before_the_memory_is_returned() {
         let (mut alloc, governor) = allocator(4096);
         let ptr = unsafe { governed_alloc(alloc.as_ort_allocator(), 1024) };
         assert!(!ptr.is_null(), "a request within budget must succeed");
-        assert_eq!(governor.available(Tier::Host), 4096 - 1024);
-        assert_eq!(alloc.live_bytes(), 1024);
+        let charged = 1024 + HEADER_BYTES as u64;
+        assert_eq!(
+            governor.available(Tier::Host),
+            4096 - charged,
+            "the header is real memory and must be charged too"
+        );
+        assert_eq!(alloc.live_bytes(), charged);
 
         unsafe { governed_free(alloc.as_ort_allocator(), ptr) };
         assert_eq!(
             governor.available(Tier::Host),
             4096,
-            "freeing did not return the lease"
+            "freeing did not return the charge"
         );
         assert_eq!(alloc.live_count(), 0);
+    }
+
+    /// The block ORT is given is aligned and writable for its full requested
+    /// size — the header must not eat into it.
+    #[test]
+    fn the_block_is_aligned_and_writable_past_the_header() {
+        let (mut alloc, _) = allocator(1 << 20);
+        for size in [1usize, 63, 64, 1000, 4096] {
+            let ptr = unsafe { governed_alloc(alloc.as_ort_allocator(), size) };
+            assert!(!ptr.is_null());
+            assert_eq!(
+                ptr as usize % ALLOCATION_ALIGNMENT,
+                0,
+                "a {size}-byte request produced a misaligned block"
+            );
+            // SAFETY: the block is ours for `size` bytes.
+            unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0xA5, size) };
+            unsafe { governed_free(alloc.as_ort_allocator(), ptr) };
+        }
     }
 
     /// A refused lease must return null and allocate nothing.
@@ -485,10 +511,13 @@ mod tests {
     /// The budget is enforced across many allocations, not just one.
     #[test]
     fn allocations_are_refused_once_the_budget_is_exhausted() {
-        let (mut alloc, governor) = allocator(4096);
+        let block = 1024usize;
+        let charged = block + HEADER_BYTES;
+        let budget = (charged * 4) as u64;
+        let (mut alloc, governor) = allocator(budget);
         let mut pointers = Vec::new();
         for _ in 0..4 {
-            let ptr = unsafe { governed_alloc(alloc.as_ort_allocator(), 1024) };
+            let ptr = unsafe { governed_alloc(alloc.as_ort_allocator(), block) };
             assert!(!ptr.is_null());
             pointers.push(ptr);
         }
@@ -500,7 +529,7 @@ mod tests {
         for ptr in pointers {
             unsafe { governed_free(alloc.as_ort_allocator(), ptr) };
         }
-        assert_eq!(governor.available(Tier::Host), 4096);
+        assert_eq!(governor.available(Tier::Host), budget);
     }
 
     /// Memory handed out is writable and distinct.
@@ -638,13 +667,11 @@ mod tests {
     /// consumed while every byte sat in host RAM.
     #[test]
     fn a_device_tier_is_refused_because_this_allocator_only_has_host_memory() {
-        let governor = LedgerGovernor::new(LeaseLedger::new(0, 4096, 0));
         let result = GovernedAllocator::new(
             MemoryInfo::cpu_device().expect("cpu device memory info"),
-            Arc::new(governor),
+            LeaseLedger::new(0, 4096, 0) as Arc<dyn LeaseAccounting>,
             Tier::Device,
             MemoryRole::Activation,
-            HOLDER,
         );
         let error = match result {
             Ok(_) => panic!("a device tier must be refused"),
