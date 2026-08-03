@@ -41,6 +41,7 @@ tracing = ["dep:onnx-runtime-tracer", "dep:tracing-crate"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
 mlas-sys = { workspace = true, optional = true }

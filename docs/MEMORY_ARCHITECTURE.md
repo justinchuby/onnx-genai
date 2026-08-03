@@ -27,22 +27,33 @@ when in fact it is 1955 lines.
 | L1 EP memory | §2 | **implemented** | `ExecutionProvider::{allocate, deallocate, copy}` in `onnx-runtime-ep-api` |
 | L2 Weight residency | §3 | **design only** | no `WeightResidencyManager` type exists |
 | L3a DeviceGovernor | §4 | **implemented under its old name** | `ResourceGovernor`, `crates/onnx-genai-scheduler/src/governor.rs` |
-| L3b HostGovernor | §5 | **implemented, not wired** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
+| L3b HostGovernor | §5 | **implemented; adapter in `HostLeaseGovernor`** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
+| Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
+| Allocator contract | §1.2, §1.3, §1.5 | **native side implemented; ORT side open in #609** | `crates/onnx-genai-ort/src/governed_allocator.rs`, `Session::device_binding_from_external_memory` |
+| Virtual contiguity | §1.6 | **open in #607** | `crates/onnx-runtime-virtual-memory` |
+
+The last three rows are newer than the layers above them and move fastest, so
+each says where it actually is. "Decided" and "in `main` are different states
+and a reader should not have to guess which one a row means.
 
 Two things follow that are worth stating plainly, because both are the kind of
 gap that reads as "already handled" from the prose:
 
-- **`HostGovernor` has no callers.** Outside its own crate the only mentions are
-  trace-event definitions. The ticketed protocol, its TLA+ model, and its
-  priority/aging arbitration are all real and all unreached. Whatever connects
-  the engine to it will be that code's first user.
-- **Activations are named here but not designed.** §4.6's
-  `VramBreakdown.activations_bytes` is hardcoded to `0` with a TODO saying it
-  needs runtime instrumentation. It does not: `onnx-runtime-memory` is a
-  liveness-based activation planner that computes exactly this figure, and it
-  has zero dependents. Every budget derived from the device ceiling currently
-  assumes activations are free.
+- **`HostGovernor`'s first caller is `HostLeaseGovernor`** (#598), which adapts
+  it to the lease contract in §1.1. Before that it had no callers at all outside
+  trace-event definitions: the ticketed protocol, its TLA+ model, and its
+  priority/aging arbitration were all real and all unreached. The engine still
+  charges a private ledger; swapping that for the adapter changes runtime
+  behaviour and is deliberately a separate change.
+- **Activations can now be sized, and still are not.** §4.6's
+  `VramBreakdown.activations_bytes` is hardcoded to `0`. `onnx-runtime-memory`
+  is a liveness-based activation planner, and it now has
+  `peak_activation_bytes_at_bounds` so it can answer for a *dynamic* graph —
+  planning from static shapes alone defers on any symbolic dimension, which is
+  every LLM, so a reservation built on it was always zero. The planner still has
+  no callers in the engine. Every budget derived from the device ceiling
+  continues to assume activations are free.
 
 There is also a tension between §3's weight tiering and what the engine does
 today. `model_weight_bytes` measures the whole package and the governor
@@ -124,6 +135,165 @@ and residency managers allocate through EPs. No layer bypasses the one below it.
 > and `disk_spill_limit` fields of `ResourceLimits` are delegated to the `HostGovernor`
 > (per-machine shared memory). The §26.11 interfaces and semantics remain canonical;
 > this document refines the ownership boundaries.
+
+### 1.1 The lease contract, and who may replace it
+
+The layers above describe *authorities*. This section describes the one
+mechanism they all share, because a design where every layer invents its own
+accounting is a design where two authorities disagree about the same bytes.
+
+A component does not "allocate". It **leases**: it asks a `MemoryGovernor` for
+bytes on a tier for a stated role, and holds a `MemoryLease` for as long as it
+occupies them. Dropping the lease returns them.
+
+```rust
+trait MemoryGovernor {
+    fn reserve(&self, tier: Tier, bytes: u64, role: MemoryRole, holder: HolderId)
+        -> Result<MemoryLease, MemoryError>;
+    fn available(&self, tier: Tier) -> u64;
+}
+```
+
+Four invariants, stated as the properties tests are written against:
+
+- **G1** For every tier, live leases never exceed that tier's limit. There is no
+  advisory mode; a limit that can be exceeded is not a limit.
+- **G2** A lease is released exactly once, by `Drop`. There is no `release`
+  method, because an explicit one can be skipped by an early return.
+- **G3** The governor never *takes* memory. Under pressure it asks; the holder
+  decides how much to give, and zero is a legitimate answer.
+- **G4** A refused reservation leaves every existing lease undisturbed.
+
+**Substitutability is the point, and it is enforced by where the tests live.**
+A third party must be able to supply their own manager — that is what makes the
+two backends interchangeable rather than merely parallel. `MemoryLease` is
+therefore built over a `LeaseAccounting` trait rather than over this crate's own
+ledger, and `MemoryLease::new` is public: an implementor charges their own books
+and wraps the result, so G2 holds for their leases too.
+
+This was not true when the contract was first written. `MemoryLease` held the
+built-in ledger and had no public constructor, so `MemoryGovernor` was a trait
+nobody outside the crate could implement — the accounting *had* to be ours. Every
+test passed, because every test lived inside the crate where private fields are
+reachable. The proof now lives in `tests/`, where it sees exactly what a third
+party sees and stops compiling if the contract closes again.
+
+### 1.2 Two directions, both backends
+
+"Bring your own memory manager" needs traffic in both directions, and a backend
+that supports only one is not substitutable for a backend that supports both.
+
+| direction | ORT backend | native backend |
+|---|---|---|
+| the runtime allocates; we govern it | `GovernedAllocator` registered on the environment | the EP allocator, already ours |
+| we allocate; the runtime borrows it | `Value::from_external_memory` | `Session::device_binding_from_external_memory` |
+
+Two things about the ORT side are not obvious and cost real time to discover:
+
+- **Registering an allocator governs nothing on its own.** A session must also
+  set `session.use_env_allocators`, or ORT silently builds its own. The symptom
+  is a governed allocator that installs cleanly and reports zero bytes forever —
+  indistinguishable from a model that does not allocate. `SessionOptions`
+  therefore sets it by default, and exposes it as a typed method rather than a
+  string for callers to guess.
+- **ORT will not wrap a custom allocator in its own arena.**
+  `CreateAndRegisterAllocator` builds ORT's *own* allocator; it does not take
+  ours. ORT's rejection message says as much — *"register the allocator as
+  OrtDeviceAllocator even if the provided allocator has arena logic built-in"*.
+  Whatever is registered **is** the per-request path, and has to be fast enough
+  to be there.
+
+### 1.3 Why the host allocator has no arena, and the device one will need one
+
+An arena was built for the host path and then deleted, because it lost. The
+numbers, on one machine, release build, alloc+free of decode-shaped sizes:
+
+| design | cheap governor (atomics) | governor that takes a lock |
+|---|---|---|
+| per-request + side table | 18.0 ns | 30.9 ns |
+| per-request + header | **15.2 ns** | 30.3 ns |
+| bulk-leasing arena | 31.5 ns | 31.3 ns |
+
+Two reasons, both of which generalise:
+
+1. **`malloc` is already an arena, with per-thread caches**, so its fast path
+   takes no lock. An arena layered on top adds one.
+2. **The arena moved the lock rather than removing it.** Trading the governor's
+   lock for the arena's own nets zero. Winning requires *no* lock on the hot
+   path — thread-local free lists, i.e. reimplementing mimalloc to beat mimalloc.
+
+The actual cost was the **side table** that recovered an allocation's size at
+free time, since ORT's `Free` passes only a pointer. Storing the lease in a
+64-byte header before each block removes the table and keeps G2: `Free` reads
+the lease out, which moves ownership, so `Drop` still returns the bytes exactly
+once.
+
+**This does not generalise to device memory.** `cudaMalloc` is a synchronising
+driver call in the microseconds with no thread cache — three orders of magnitude
+worse than host `malloc`. That is why ORT ships a BFC arena for CUDA and not for
+CPU, and a device-backed allocator here will need one too. The measurement above
+argues that *host* memory already has an arena, not that arenas are wrong.
+
+The benchmark is a warm single-threaded loop. It does not measure fragmentation
+over a long run, cold page faults, RSS, or contention across ORT's intra-op
+threads, and the default should not be considered settled on it alone.
+
+### 1.5 Using the allocator ABI fully
+
+`OrtAllocator` is more than `Alloc`/`Free`/`Info`, and the optional slots are
+not decoration — two of them carry information we were otherwise inventing.
+
+| slot | what ORT uses it for | ours |
+|---|---|---|
+| `Alloc` | allocations during `Run` | charged to the **run** role |
+| `Reserve` | allocations while **building** a session (since 1.18) | charged to the **initialization** role |
+| `Info` | which device this allocator serves | the memory info it was built with |
+| `GetStats` | `Limit`, `InUse`, `TotalAllocated`, `MaxInUse`, `NumAllocs`, `NumReserves` | reported from the governor and our counters |
+| `Shrink` | release memory held but not in use (since 1.25) | honest no-op: this allocator pools nothing |
+| `AllocOnStream` | stream-aware device allocation (since 1.23) | null — this allocator owns host memory, which has no stream |
+
+**`Reserve` is a free `MemoryRole` signal.** ORT documents it as existing so a
+custom allocator can separate session setup from `Run`. Session setup is weights
+and plan state; `Run` is activations. That is exactly the distinction eviction
+ordering needs — weights go before KV because they are immutable and re-readable
+from disk — so charging both to one role makes the cheapest thing to evict look
+as expensive as the most.
+
+Verified rather than assumed: building a session over the `tiny-llm` fixture
+makes **15 allocations, all 15 through `Reserve`**. `AllocationRoles::split()`
+is therefore the default; `AllocationRoles::uniform` restores single-role
+charging for an allocator where the split does not apply.
+
+**`GetStats` makes governed memory visible through ORT's own interface**, so
+tooling that already reads allocator statistics sees it without knowing this
+crate exists. `Limit` is what the governor will still grant plus what we hold —
+the ceiling as this allocator experiences it, not the machine's.
+`NumArenaExtensions` and `NumArenaShrinkages` are *omitted* rather than reported
+as zero, because a zero would read as "an arena that never extended" rather than
+"no arena".
+
+**`Shrink` is implemented as a no-op that succeeds**, which is what ORT's own
+documentation specifies for a non-arena allocator. Implemented rather than left
+null because null and "nothing to give" are different answers, and because when
+a device-backed allocator lands it *will* have an arena — this is the hook its
+pressure response belongs in, and it is the same shape as G3.
+
+### 1.6 One allocator per lifetime, not one allocator
+
+The mistake worth naming: treating "the allocator" as one thing. There are four
+kinds of memory here with genuinely different lifetimes, and what unifies them
+is the lease contract above — not a shared allocator.
+
+| memory | lifetime | pattern | structure | paged or streamed? |
+|---|---|---|---|---|
+| activations, workspace | one step | same shapes every step, thousands per step | header + `malloc` (§1.3) | no — freed each step |
+| KV cache | per sequence | fixed-size pages, shared, forked, migrated | paged pool | **yes** — device↔host↔disk |
+| weights | model lifetime | immutable, huge, re-readable from disk | mmap + residency manager (§3) | **yes** — weight streaming |
+| large logically-contiguous buffers | per step or persistent | one address range over scattered pages | `VirtualRange` | **yes** — pages remapped under a stable address |
+
+An arena serves none of the last three: it hands out physically contiguous
+blocks with no identity, which is the opposite of what paging needs, and it
+would pin weights in RAM, which is the opposite of what streaming needs.
 
 ---
 

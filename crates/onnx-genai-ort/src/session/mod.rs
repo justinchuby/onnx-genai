@@ -22,7 +22,9 @@ pub use ep_compat::{
     EpCapabilities, HardwareKind, ResolvedEp, capability, resolve_execution_provider,
     selectable_execution_providers,
 };
-pub use options::{SessionOptions, available_execution_providers, ep_selection};
+pub use options::{
+    SessionOptions, USE_ENV_ALLOCATORS, available_execution_providers, ep_selection,
+};
 
 use env_config::{
     cuda_device_id_from_env, device_kv_enabled_from_env, effective_intra_op_threads,

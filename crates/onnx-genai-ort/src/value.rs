@@ -94,6 +94,21 @@ enum TensorBacking {
     /// opaque bytes).
     Bytes(Vec<u8>),
     Alias(Arc<Value>),
+    /// Memory this `Value` does not own.
+    ///
+    /// Used when a caller hands ORT a buffer it allocated itself — typically
+    /// device memory from an external memory manager. The `Value` borrows it,
+    /// so keeping it alive is the caller's obligation, enforced at the unsafe
+    /// constructor rather than here.
+    ///
+    /// `host_accessible` records whether the memory info named a host device.
+    /// Every accessor here reaches the bytes through `GetTensorMutableData`,
+    /// which returns whatever address the tensor holds; dereferencing a device
+    /// address on the CPU is a wild access, not an error, so the accessors
+    /// consult this rather than trying and faulting.
+    External {
+        host_accessible: bool,
+    },
     None,
 }
 
@@ -196,6 +211,96 @@ impl Value {
     /// Create a tensor from i64 data (for input_ids, attention_mask).
     pub fn from_slice_i64(data: &[i64], shape: &[i64]) -> Result<Self> {
         Self::from_vec_i64(data.to_vec(), shape)
+    }
+
+    /// Wrap memory this `Value` does not own, wherever `memory_info` says it
+    /// lives.
+    ///
+    /// This is how an external memory manager hands ONNX Runtime a buffer it
+    /// allocated itself — device memory in particular. Every other constructor
+    /// here owns a `Vec` and reports host memory; this one owns nothing and
+    /// takes the location as a parameter, because ORT uses it to decide whether
+    /// the pointer is a host address or a device one.
+    ///
+    /// # Safety
+    ///
+    /// * `data` must be valid for `bytes` and remain so for the entire lifetime
+    ///   of the returned `Value` **and of anything ORT derives from it**. ORT
+    ///   does not copy, so a buffer freed early becomes a use-after-free inside
+    ///   the runtime rather than a Rust error.
+    /// * `memory_info` must describe where `data` actually lives. Saying host
+    ///   for a device pointer makes ORT dereference a device address on the CPU.
+    /// * `bytes` must cover `shape` at `dtype`, which is checked, but the check
+    ///   cannot see whether the allocation behind `data` is really that large.
+    pub unsafe fn from_external_memory(
+        data: *mut std::ffi::c_void,
+        bytes: usize,
+        shape: &[i64],
+        dtype: DataType,
+        memory_info: &MemoryInfo,
+    ) -> Result<Self> {
+        if data.is_null() {
+            return Err(OrtError::InvalidArgument(
+                "cannot wrap a null pointer as an external tensor; allocate the buffer first, or \
+                 use a Value constructor that owns its data"
+                    .to_owned(),
+            ));
+        }
+        validate_shape(shape, None)?;
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
+            })?;
+        let needed = elements.checked_mul(dtype.size_of()).ok_or_else(|| {
+            OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
+        })?;
+        if bytes < needed {
+            return Err(OrtError::InvalidArgument(format!(
+                "external buffer of {bytes} bytes is too small for shape {shape:?} at {dtype:?}, \
+                 which needs {needed}; ORT would read past the end of the allocation"
+            )));
+        }
+        let host_accessible = memory_info.device_name == "Cpu";
+        let ptr = create_tensor_with_data_in(data, bytes, shape, dtype, memory_info)?;
+        Ok(Self {
+            ptr,
+            shape: shape.to_vec(),
+            dtype,
+            backing: TensorBacking::External { host_accessible },
+        })
+    }
+
+    /// Whether this value's bytes can be read or written through a host
+    /// pointer.
+    ///
+    /// Only external tensors can answer `false`: every other constructor here
+    /// owns a host `Vec`.
+    pub fn is_host_accessible(&self) -> bool {
+        !matches!(
+            self.backing,
+            TensorBacking::External {
+                host_accessible: false
+            }
+        )
+    }
+
+    /// Reject host access to a tensor whose bytes are not on the host.
+    ///
+    /// The accessors reach the data through `GetTensorMutableData`, which hands
+    /// back the tensor's own address with no indication of where it lives. On a
+    /// device tensor that address is not dereferenceable from the CPU, so the
+    /// alternative to this check is a wild read or store rather than a fault.
+    fn ensure_host_accessible(&self, operation: &str) -> Result<()> {
+        if self.is_host_accessible() {
+            return Ok(());
+        }
+        Err(OrtError::InvalidArgument(format!(
+            "{operation} needs to reach this tensor's bytes through a host pointer, but it \
+             wraps external memory that was declared as living on a device; copy it to the \
+             host first, or use the device-side helpers"
+        )))
     }
 
     /// Create a CPU tensor from owned f32 data.
@@ -370,6 +475,7 @@ impl Value {
     }
 
     pub fn to_raw_bytes(&self) -> Result<Vec<u8>> {
+        self.ensure_host_accessible("to_raw_bytes")?;
         let bytes = self.numel() * self.dtype.size_of();
         let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
         // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
@@ -380,6 +486,7 @@ impl Value {
 
     /// Copy tensor data out as f32 values.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        self.ensure_host_accessible("to_vec_f32")?;
         if self.dtype != DataType::Float32 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested f32 data from {:?} tensor",
@@ -396,6 +503,7 @@ impl Value {
     /// readers that must consume fp16 GroupQueryAttention (GQA) outputs on the
     /// host without a separate device conversion pass.
     pub fn to_vec_f32_lossy(&self) -> Result<Vec<f32>> {
+        self.ensure_host_accessible("to_vec_f32_lossy")?;
         match self.dtype {
             DataType::Float32 => self.to_vec_f32(),
             DataType::Float16 => {
@@ -486,6 +594,7 @@ impl Value {
 
     /// Copy Float16 tensor data out as IEEE-754 half-precision bit patterns.
     pub fn to_vec_f16_bits(&self) -> Result<Vec<u16>> {
+        self.ensure_host_accessible("to_vec_f16_bits")?;
         if self.dtype != DataType::Float16 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested Float16 data from {:?} tensor",
@@ -497,6 +606,7 @@ impl Value {
 
     /// Copy BFloat16 tensor data out as bfloat16 bit patterns.
     pub fn to_vec_bf16_bits(&self) -> Result<Vec<u16>> {
+        self.ensure_host_accessible("to_vec_bf16_bits")?;
         if self.dtype != DataType::BFloat16 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested BFloat16 data from {:?} tensor",
@@ -508,6 +618,7 @@ impl Value {
 
     /// Copy tensor data out as i64 values.
     pub fn to_vec_i64(&self) -> Result<Vec<i64>> {
+        self.ensure_host_accessible("to_vec_i64")?;
         if self.dtype != DataType::Int64 {
             return Err(OrtError::InvalidArgument(format!(
                 "requested i64 data from {:?} tensor",
@@ -541,6 +652,7 @@ impl Value {
     /// smaller than the tensor to update only a prefix (e.g. the valid region
     /// of a max-length attention mask).
     pub fn write_i64_prefix(&self, data: &[i64]) -> Result<()> {
+        self.ensure_host_accessible("write_i64_prefix")?;
         if self.dtype != DataType::Int64 {
             return Err(OrtError::InvalidArgument(format!(
                 "write_i64_prefix requires an Int64 tensor, got {:?}",
@@ -570,6 +682,7 @@ impl Value {
     /// (typically a single element) instead of rewriting the whole prefix —
     /// keeping the captured-decode step O(1) rather than O(context).
     pub fn fill_i64_range(&self, start: usize, count: usize, value: i64) -> Result<()> {
+        self.ensure_host_accessible("fill_i64_range")?;
         if self.dtype != DataType::Int64 {
             return Err(OrtError::InvalidArgument(format!(
                 "fill_i64_range requires an Int64 tensor, got {:?}",
@@ -760,6 +873,17 @@ impl Value {
                     "cannot zero row for non-owned or non-KV tensor".into(),
                 ));
             }
+            TensorBacking::External { .. } => {
+                // The buffer may live on a device, and this path writes through
+                // a host pointer. Refusing is the only safe answer: the caller
+                // owns the memory and knows how to clear it where it lives.
+                return Err(OrtError::InvalidArgument(
+                    "cannot zero a row of an externally owned tensor from the host; the buffer \
+                     may be device memory. Clear it through whatever allocated it, or pass an \
+                     owned tensor instead"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -840,6 +964,16 @@ impl Value {
                     "cannot pack rows for non-owned or non-KV tensor".into(),
                 ));
             }
+            TensorBacking::External { .. } => {
+                // Same reasoning as zeroing: this repacks through a host
+                // pointer, and an external buffer may be device memory.
+                return Err(OrtError::InvalidArgument(
+                    "cannot repack rows of an externally owned tensor from the host; the buffer \
+                     may be device memory. Repack it through whatever allocated it, or pass an \
+                     owned tensor instead"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -915,6 +1049,8 @@ impl Drop for Value {
             TensorBacking::I64(data) => data.len(),
             TensorBacking::Bytes(data) => data.len(),
             TensorBacking::Alias(owner) => owner.numel(),
+            // Borrowed memory: nothing here keeps it alive, by construction.
+            TensorBacking::External { .. } => 0,
             TensorBacking::None => 0,
         };
         if let Ok(api) = crate::error::api()
@@ -955,13 +1091,30 @@ fn create_tensor_with_data(
     dtype: DataType,
 ) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
     let memory_info = MemoryInfo::cpu()?;
+    create_tensor_with_data_in(data, bytes, shape, dtype, &memory_info)
+}
+
+/// Wrap `data` as a tensor living where `memory_info` says it does.
+///
+/// Split from [`create_tensor_with_data`] so a caller can hand ORT memory it
+/// allocated itself. The memory info is what tells ORT whether the pointer is
+/// host or device; getting it wrong makes ORT read device memory as host
+/// addresses, so it is a parameter rather than an assumption.
+fn create_tensor_with_data_in(
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: &[i64],
+    dtype: DataType,
+    memory_info: &MemoryInfo,
+) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
     let mut ptr = std::ptr::null_mut();
     let api = crate::error::api()?;
     let create = api
         .CreateTensorWithDataAsOrtValue
         .ok_or(OrtError::ApiUnavailable("CreateTensorWithDataAsOrtValue"))?;
-    // SAFETY: `data` points to an owned Vec buffer held by Value::backing for
-    // at least the lifetime of the OrtValue. `shape` is valid for the call.
+    // SAFETY: `data` is valid for `bytes` for at least the lifetime of the
+    // OrtValue -- owned by `Value::backing` for the owning constructors, and by
+    // the caller's contract for the external one. `shape` is valid for the call.
     crate::error::check_status(unsafe {
         create(
             memory_info.as_ptr(),
@@ -1578,5 +1731,185 @@ mod cuda_device_write_tests {
         assert_eq!(read_back, vec![1, 1, 1, 1, 1, 0, 0, 0]);
 
         release_cuda_resources_in_order(mask, allocator, session, env);
+    }
+}
+
+#[cfg(test)]
+mod external_memory_tests {
+    use super::*;
+
+    /// ORT must read the caller's buffer, not a copy of it.
+    ///
+    /// Constructing successfully proves nothing: a constructor that quietly
+    /// copied would pass any test that only checks the value comes back. This
+    /// mutates the source buffer *after* the tensor exists and requires the
+    /// change to be visible through ORT, which is only true if nothing copied.
+    #[test]
+    fn ort_reads_through_to_the_callers_buffer_rather_than_a_copy() {
+        let mut buffer = vec![1.0f32, 2.0, 3.0, 4.0];
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let value = unsafe {
+            Value::from_external_memory(
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer[..]),
+                &[2, 2],
+                DataType::Float32,
+                &info,
+            )
+        }
+        .expect("wrapping a host buffer");
+
+        buffer[0] = 99.0;
+        let seen = value.to_vec_f32().expect("reading back the tensor");
+        assert_eq!(
+            seen[0], 99.0,
+            "the tensor did not observe a write to the caller's buffer, so it copied"
+        );
+    }
+
+    /// A buffer too small for the shape is refused before ORT can read past it.
+    #[test]
+    fn a_buffer_too_small_for_its_shape_is_refused() {
+        let mut buffer = vec![0.0f32; 3];
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let error = unsafe {
+            Value::from_external_memory(
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer[..]),
+                &[2, 2],
+                DataType::Float32,
+                &info,
+            )
+        }
+        .map(|_| ())
+        .expect_err("3 floats cannot hold a 2x2 tensor");
+        let message = error.to_string();
+        assert!(
+            message.contains("too small") && message.contains("16"),
+            "the error should name the size actually needed: {message}"
+        );
+    }
+
+    /// A null pointer is refused rather than handed to ORT.
+    #[test]
+    fn a_null_pointer_is_refused() {
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let error = unsafe {
+            Value::from_external_memory(std::ptr::null_mut(), 16, &[2, 2], DataType::Float32, &info)
+        }
+        .map(|_| ())
+        .expect_err("null is not a buffer");
+        assert!(error.to_string().contains("null pointer"), "{error}");
+    }
+
+    /// Host-side mutation helpers refuse externally owned tensors.
+    ///
+    /// They write through a host pointer, and an external buffer may be device
+    /// memory — where that write would be a wild store rather than an error.
+    #[test]
+    fn host_side_mutation_refuses_an_externally_owned_tensor() {
+        let mut buffer = vec![0.0f32; 8];
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let mut value = unsafe {
+            Value::from_external_memory(
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer[..]),
+                &[2, 2, 2],
+                DataType::Float32,
+                &info,
+            )
+        }
+        .expect("wrapping a host buffer");
+
+        let error = value
+            .zero_rank3_row(0)
+            .expect_err("zeroing an external tensor from the host must be refused");
+        assert!(
+            error.to_string().contains("externally owned"),
+            "the refusal should say why: {error}"
+        );
+    }
+
+    /// A larger buffer than the shape needs is allowed.
+    ///
+    /// Callers sub-allocate from a pool, so an exact fit is the exception.
+    #[test]
+    fn a_buffer_larger_than_the_shape_is_accepted() {
+        let mut buffer = vec![7.0f32; 64];
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let value = unsafe {
+            Value::from_external_memory(
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer[..]),
+                &[2, 2],
+                DataType::Float32,
+                &info,
+            )
+        }
+        .expect("a pool sub-allocation is normally larger than the tensor");
+        assert_eq!(value.to_vec_f32().expect("read back")[0], 7.0);
+    }
+    /// A tensor whose memory was declared to live on a device must refuse every
+    /// host accessor.
+    ///
+    /// These all reach the bytes through `GetTensorMutableData`, which returns
+    /// the tensor's own address with no indication of where it lives. Without
+    /// this check the failure is a wild read or store, not an error -- and it
+    /// is reachable from entirely safe code once the unsafe constructor has
+    /// been called correctly.
+    #[test]
+    fn host_accessors_refuse_a_tensor_declared_to_live_on_a_device() {
+        let Ok(device_info) = MemoryInfo::dml(0) else {
+            return; // no device memory info available here
+        };
+        // Host memory, deliberately mislabelled as device memory: this test is
+        // about the bookkeeping, and a real device pointer is not needed to
+        // prove the accessors consult it.
+        let mut backing = vec![0i64; 4];
+        let value = unsafe {
+            Value::from_external_memory(
+                backing.as_mut_ptr().cast(),
+                std::mem::size_of_val(backing.as_slice()),
+                &[4],
+                DataType::Int64,
+                &device_info,
+            )
+        }
+        .expect("wrapping external device memory");
+
+        assert!(!value.is_host_accessible());
+        for (name, result) in [
+            ("to_raw_bytes", value.to_raw_bytes().map(|_| ())),
+            ("to_vec_i64", value.to_vec_i64().map(|_| ())),
+            ("write_i64_prefix", value.write_i64_prefix(&[1, 2])),
+            ("fill_i64_range", value.fill_i64_range(0, 2, 7)),
+        ] {
+            let error = result.expect_err("host access to device memory must be refused");
+            assert!(
+                error.to_string().contains(name),
+                "the error must name the operation that was refused, got: {error}"
+            );
+        }
+    }
+
+    /// The same accessors must keep working when the external memory really is
+    /// on the host, or the check above would just be breaking the feature.
+    #[test]
+    fn host_accessors_still_work_for_external_host_memory() {
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let mut backing = vec![5i64, 6, 7, 8];
+        let value = unsafe {
+            Value::from_external_memory(
+                backing.as_mut_ptr().cast(),
+                std::mem::size_of_val(backing.as_slice()),
+                &[4],
+                DataType::Int64,
+                &info,
+            )
+        }
+        .expect("wrapping external host memory");
+
+        assert!(value.is_host_accessible());
+        assert_eq!(value.to_vec_i64().expect("read back"), vec![5, 6, 7, 8]);
     }
 }

@@ -22,9 +22,6 @@
 //! 5. **Thread-affine allocators** — N/A: host `malloc` addresses are portable,
 //!    so `DeviceBuffer` is soundly `Send`/`Sync` (documented in ep-api).
 
-use std::alloc::{Layout, alloc, dealloc};
-use std::ffi::c_void;
-
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
     OpRegistry, Result, deny,
@@ -44,6 +41,13 @@ pub struct CpuExecutionProvider {
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
+    /// Where this EP's buffers come from.
+    ///
+    /// The same `DeviceAllocator` contract the ONNX Runtime side uses, so an
+    /// allocator a caller writes serves both backends instead of having to be
+    /// written twice. Defaults to `HostAllocator`, which is the `std::alloc`
+    /// code this EP used to inline.
+    memory: std::sync::Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
 }
 
 impl std::fmt::Debug for CpuExecutionProvider {
@@ -69,6 +73,7 @@ impl CpuExecutionProvider {
             device: DeviceId::cpu(),
             initialized: false,
             registry: build_cpu_registry(),
+            memory: std::sync::Arc::new(onnx_runtime_memory_governor::HostAllocator),
         }
     }
 
@@ -78,7 +83,21 @@ impl CpuExecutionProvider {
             device: DeviceId::cpu(),
             initialized: false,
             registry: build_cpu_registry_with_weight_offload_cache(host_cache),
+            memory: std::sync::Arc::new(onnx_runtime_memory_governor::HostAllocator),
         }
+    }
+
+    /// Take buffers from `memory` instead of the system allocator.
+    ///
+    /// The same `DeviceAllocator` a caller installs on the ONNX Runtime side.
+    /// That is the point of the contract living in a crate both backends
+    /// depend on: an allocator is written once, not once per backend.
+    pub fn with_memory(
+        mut self,
+        memory: std::sync::Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    ) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Construct and initialize a CPU EP with a governor-owned host-cache partition.
@@ -271,26 +290,25 @@ impl ExecutionProvider for CpuExecutionProvider {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
-        // std::alloc rejects zero-sized layouts; allocate at least one byte so
-        // the base pointer is non-null, but record the requested `size`.
-        let alloc_size = size.max(1);
-        let layout =
-            Layout::from_size_align(alloc_size, alignment).map_err(|_| EpError::AlignmentError)?;
-        // SAFETY: `layout` has non-zero size (bumped to >= 1) and a valid
-        // power-of-two alignment. We check the returned pointer for null below
-        // and treat OOM as an error rather than dereferencing.
-        let ptr = unsafe { alloc(layout) } as *mut c_void;
-        if ptr.is_null() {
-            return Err(EpError::OutOfMemory {
+        // One allocator for the whole project: the same `DeviceAllocator` a
+        // caller can install on the ONNX Runtime side backs this one, so an
+        // allocator is written once rather than once per backend. The default
+        // is `HostAllocator`, which is the `std::alloc` code this used to
+        // inline.
+        let ptr = self
+            .memory
+            .allocate(size, alignment)
+            .map_err(|_| EpError::OutOfMemory {
                 requested: size,
                 available: 0,
-            });
-        }
-        // SAFETY: `ptr` is a fresh, unique, non-null allocation of `alloc_size`
-        // (>= `size`) bytes aligned to `alignment`, owned by this EP and freed
+            })?;
+        // SAFETY: `ptr` is a fresh, unique, non-null allocation of at least
+        // `size` bytes aligned to `alignment`, owned by this EP and freed
         // exactly once in `deallocate` (invariant #2). No other handle aliases
         // it. We record the caller-requested `size`.
-        Ok(unsafe { DeviceBuffer::from_raw_parts(ptr, self.device, size, alignment) })
+        Ok(unsafe {
+            DeviceBuffer::from_raw_parts(ptr.as_ptr().cast(), self.device, size, alignment)
+        })
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
@@ -310,13 +328,14 @@ impl ExecutionProvider for CpuExecutionProvider {
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw() as *mut u8;
-        // Reconstruct the exact layout used in `allocate` (same `max(1)` bump).
-        let layout = Layout::from_size_align(size.max(1), align)
-            .expect("cpu_ep: layout was valid at allocation time");
-        // SAFETY: `ptr` came from this EP's `alloc` with `layout` (invariant #2),
-        // `into_raw` consumed the owning handle so no alias remains, and this is
-        // the single free of that allocation.
-        unsafe { dealloc(ptr, layout) };
+        let Some(ptr) = std::ptr::NonNull::new(ptr) else {
+            return Ok(());
+        };
+        // SAFETY: `ptr`, `size` and `align` are the triple this EP obtained
+        // from `self.memory` in `allocate` (invariant #2); `into_raw` consumed
+        // the owning handle so no alias remains, and this is the single free of
+        // that allocation.
+        unsafe { self.memory.deallocate(ptr, size, align) };
         Ok(())
     }
 
@@ -370,6 +389,7 @@ mod tests {
     use super::*;
     use onnx_runtime_ep_api::abi::OrtGraphView;
     use onnx_runtime_ir::{Attribute, FrozenGraph, Graph, NodeId, static_shape};
+    use std::ffi::c_void;
 
     fn stateful_csa_node(ratio: i64, input_count: usize, output_count: usize) -> Node {
         let mut graph = Graph::new();

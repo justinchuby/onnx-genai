@@ -32,6 +32,7 @@ cuda-13000 = ["cudarc?/cuda-13000"]
 
 [dependencies]
 half = { workspace = true, features = ["use-intrinsics"] }
+onnx-runtime-memory-governor = { workspace = true }
 libloading = { workspace = true, optional = true }
 # Only compiled under the `cuda` feature. `dynamic-loading` dlopen's the driver
 # (nvcuda) and NVRTC at runtime, so `cargo build` needs no CUDA toolkit. We use
