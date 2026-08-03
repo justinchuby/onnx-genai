@@ -10,6 +10,7 @@ categories = ["memory-management", "science"]
 
 [dependencies]
 thiserror = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

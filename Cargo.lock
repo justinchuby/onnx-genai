@@ -2516,6 +2516,7 @@ name = "onnx-runtime-virtual-memory"
 version = "0.1.0-dev.5"
 dependencies = [
  "libc",
+ "onnx-runtime-memory-governor",
  "thiserror 2.0.19",
  "windows-sys 0.61.2",
 ]

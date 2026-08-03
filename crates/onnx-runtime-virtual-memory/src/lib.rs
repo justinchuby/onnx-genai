@@ -56,6 +56,10 @@
 
 #![allow(unsafe_code)]
 
+pub mod buffer;
+
+pub use buffer::{VirtualBuffer, VirtualBufferError};
+
 use std::ptr::NonNull;
 
 mod sys;
