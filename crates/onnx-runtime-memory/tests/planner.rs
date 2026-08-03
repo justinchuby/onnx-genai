@@ -5,9 +5,10 @@
 
 use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, ValueId, static_shape};
 use onnx_runtime_memory::{
-    PlanOptions, PlanStatus, SlotId, ValidateError, ViewMap, plan_activations,
-    plan_activations_static, validate_static,
+    PlanOptions, PlanStatus, SlotId, ValidateError, ViewMap, peak_activation_bytes_at_bounds,
+    plan_activations, plan_activations_static, validate_static,
 };
+use std::collections::HashMap;
 
 const F32: DataType = DataType::Float32;
 
@@ -355,4 +356,114 @@ fn dead_on_arrival_value_is_graceful() {
     // Everything validates and the dead value got a slot without inflating peak
     // beyond the live set.
     assert!(plan.num_slots >= 1);
+}
+
+// === Reservation from admission bounds ===
+
+/// A graph whose activations are dynamic in one symbol -- the shape of every
+/// real LLM, where the symbol is sequence length.
+fn dynamic_chain() -> (Graph, ViewMap, onnx_runtime_ir::SymbolId) {
+    let mut g = Graph::new();
+    let seq = g.intern_symbol("S");
+    let shape: Shape = vec![onnx_runtime_ir::Dim::Static(4), seq.into()];
+    let inp = g.create_named_value("in", F32, shape.clone());
+    g.add_input(inp);
+    let a = op(&mut g, "Relu", &[inp], shape.clone());
+    let b = op(&mut g, "Relu", &[a], shape.clone());
+    let out = op(&mut g, "Relu", &[b], shape);
+    g.add_output(out);
+    (g, ViewMap::new(), seq)
+}
+
+/// Static planning defers on a dynamic graph, which is why a reservation built
+/// on it would always be zero.
+///
+/// This test exists to pin the *reason* the bounded oracle is needed. If it
+/// ever starts returning a complete plan, the bounded path is redundant and
+/// should be deleted rather than left as parallel machinery.
+#[test]
+fn static_planning_defers_on_a_dynamic_graph() {
+    let (g, vm, _seq) = dynamic_chain();
+    let status = plan_activations_static(&g, &vm, &PlanOptions::default()).unwrap();
+    assert!(
+        status.is_deferred(),
+        "a graph with a symbolic dimension cannot be sized statically"
+    );
+}
+
+/// Binding the symbol to its admission ceiling produces a real reservation.
+#[test]
+fn bounds_turn_a_deferred_plan_into_a_reservation() {
+    let (g, vm, seq) = dynamic_chain();
+    let bounds = HashMap::from([(seq, 128usize)]);
+
+    let peak = peak_activation_bytes_at_bounds(&g, &vm, &bounds, &PlanOptions::default())
+        .unwrap()
+        .expect("every symbol is bound, so the plan must complete");
+
+    // 4 x 128 f32 = 2048 bytes per activation. The chain has three activations
+    // but only two are ever concurrently live, so the reservation is the
+    // double buffer, not the sum.
+    assert_eq!(
+        peak,
+        2 * 2048,
+        "the reservation must be the concurrent peak"
+    );
+}
+
+/// The reservation must scale with the bound, or it is not a function of the
+/// admission ceiling at all.
+///
+/// A constant would satisfy the test above; this rules that out.
+#[test]
+fn the_reservation_scales_with_the_bound() {
+    let (g, vm, seq) = dynamic_chain();
+
+    let small = peak_activation_bytes_at_bounds(
+        &g,
+        &vm,
+        &HashMap::from([(seq, 16usize)]),
+        &PlanOptions::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let large = peak_activation_bytes_at_bounds(
+        &g,
+        &vm,
+        &HashMap::from([(seq, 160usize)]),
+        &PlanOptions::default(),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        large,
+        small * 10,
+        "ten times the admitted sequence length must reserve ten times the bytes"
+    );
+}
+
+/// An unbound symbol is reported as deferred, not silently sized as zero.
+///
+/// Treating partial knowledge as a bound is the failure this whole path exists
+/// to avoid: it would produce a confident, wrong, too-small reservation.
+#[test]
+fn an_unbound_symbol_defers_rather_than_reserving_nothing() {
+    let mut g = Graph::new();
+    let seq = g.intern_symbol("S");
+    let other = g.intern_symbol("T");
+    let shape: Shape = vec![seq.into(), other.into()];
+    let inp = g.create_named_value("in", F32, shape.clone());
+    g.add_input(inp);
+    let out = op(&mut g, "Relu", &[inp], shape);
+    g.add_output(out);
+    let vm = ViewMap::new();
+
+    // Only one of the two symbols is bound.
+    let bounds = HashMap::from([(seq, 8usize)]);
+    let peak = peak_activation_bytes_at_bounds(&g, &vm, &bounds, &PlanOptions::default()).unwrap();
+    assert!(
+        peak.is_none(),
+        "a partially bound graph must defer, not reserve a number derived from guessing"
+    );
 }

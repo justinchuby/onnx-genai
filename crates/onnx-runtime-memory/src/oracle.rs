@@ -10,7 +10,18 @@
 //! * **run-time** planning, where the executor supplies a closure backed by the
 //!   resolved concrete shapes for the current run.
 
-use onnx_runtime_ir::{Graph, ValueId, as_static_shape};
+use std::collections::HashMap;
+
+use onnx_runtime_ir::{Dim, Graph, SymbolId, ValueId, as_static_shape};
+
+/// A size oracle closure that sizes values from their fully-static shapes.
+///
+/// Returns `None` for any symbolic-shaped value, which the planner reports as
+/// [`crate::PlanStatus::Deferred`] so the executor can re-plan once shapes
+/// resolve.
+pub fn static_size_oracle(graph: &Graph) -> impl Fn(ValueId) -> Option<usize> + '_ {
+    move |value| static_size(graph, value)
+}
 
 /// Byte size of a value from its *static* shape, or `None` if any dimension is
 /// symbolic (unknown until run time) or the element count overflows `usize`.
@@ -28,11 +39,45 @@ pub fn static_size(graph: &Graph, value: ValueId) -> Option<usize> {
     val.dtype.checked_storage_bytes(numel)
 }
 
-/// A size oracle closure that sizes values from their fully-static shapes.
+/// A size oracle that resolves symbolic dimensions to caller-supplied **upper
+/// bounds**.
 ///
-/// Returns `None` for any symbolic-shaped value, which the planner reports as
-/// [`crate::PlanStatus::Deferred`] so the executor can re-plan once shapes
-/// resolve.
-pub fn static_size_oracle(graph: &Graph) -> impl Fn(ValueId) -> Option<usize> + '_ {
-    move |value| static_size(graph, value)
+/// [`static_size_oracle`] answers `None` for anything dynamic, which is right
+/// for a plan that must be exact but useless for a *reservation*: an LLM's
+/// activations are dynamic in sequence length, so a reservation computed from
+/// static shapes alone is always zero — and a zero reservation is
+/// indistinguishable from a model that allocates nothing.
+///
+/// A reservation does not need the exact size, it needs the ceiling. Admission
+/// control already knows that ceiling, because it is the largest shape it will
+/// admit. Binding those bounds turns "cannot know" into "cannot exceed".
+///
+/// Symbols with no bound are still `None`, so the planner defers rather than
+/// guessing. Partial knowledge is not a bound.
+pub fn bounded_size_oracle<'a>(
+    graph: &'a Graph,
+    bounds: &'a HashMap<SymbolId, usize>,
+) -> impl Fn(ValueId) -> Option<usize> + 'a {
+    move |value| bounded_size(graph, value, bounds)
+}
+
+/// Byte size of a value with symbolic dimensions resolved through `bounds`.
+///
+/// Returns `None` if any dimension is symbolic and unbound, or if the element
+/// count overflows.
+pub fn bounded_size(
+    graph: &Graph,
+    value: ValueId,
+    bounds: &HashMap<SymbolId, usize>,
+) -> Option<usize> {
+    let val = graph.try_value(value)?;
+    let mut numel: usize = 1;
+    for dim in &val.shape {
+        let extent = match *dim {
+            Dim::Static(extent) => extent,
+            Dim::Symbolic(symbol) => *bounds.get(&symbol)?,
+        };
+        numel = numel.checked_mul(extent)?;
+    }
+    val.dtype.checked_storage_bytes(numel)
 }
