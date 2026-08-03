@@ -1,0 +1,28 @@
+fix(engine): let ungated code name NativeDecodeDevice
+
+`main` does not compile with `native-backend` off, so the CUDA-only CI jobs
+fail on every open PR. Reproduced on a clean `main` at f6e23e4b with the
+exact command CI runs:
+
+    cargo check --locked -p onnx-runtime-ep-cuda -p onnx-runtime-python \
+        --features onnx-runtime-python/cuda
+    error[E0433]: cannot find `native_decode` in `crate`
+
+`NativeDecodeDevice` lived inside the `native-backend`-gated `native_decode`
+module, but ungated code names it: `pipeline::PipelineEngine` stores one, and
+`build_native_pipeline_decoder` takes one in its *signature* while gating only
+its body. A gated body does not help when the signature is what fails to
+resolve.
+
+The enum is a plain choice with std types only -- configuration, not backend
+implementation -- so it now lives in an ungated `native_decode_device` module
+and is re-exported from `native_decode`, leaving every existing
+`native_decode::NativeDecodeDevice` path working. `EngineConfig::native_device`
+loses its `#[cfg]` for the same reason: a caller should be able to express
+which device they want without the backend that honours it being compiled in.
+
+Not my regression, but it blocks CI for everything, and the fix is smaller
+than the workaround.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: d60eb808-7cc6-4abc-b48d-2a6dd3841624
