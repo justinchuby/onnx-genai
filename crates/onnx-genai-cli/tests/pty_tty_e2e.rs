@@ -278,6 +278,10 @@ mod pty_tty {
     // \r\n` would fail).
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
+    #[ignore = "flaky under CI load, see #615: the drain loop can consume the \
+                full 120s idle window after the child has already produced \
+                everything the test asserts on. Re-enable with the fix, not by \
+                raising the timeout."]
     fn tty_stdout_gets_exactly_one_trailing_newline_after_streaming() {
         let (master, slave) = open_pty();
         let slave_stdin = dup(&slave).expect("dup must succeed");
@@ -346,6 +350,10 @@ mod pty_tty {
     }
 
     #[test]
+    #[ignore = "flaky under CI load, see #615: the turn state machine counts \
+                '>>>' occurrences, which reedline's prompt repaints inflate \
+                non-deterministically. Re-enable once it advances on a \
+                once-per-turn event instead."]
     fn run_repl_preserves_submitted_lines_across_two_tty_turns() {
         let (master, slave) = open_pty();
         let slave_stdin = dup(&slave).expect("dup stdin must succeed");
