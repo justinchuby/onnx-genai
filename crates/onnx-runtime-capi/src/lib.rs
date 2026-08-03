@@ -127,7 +127,11 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::DynamicShape { .. }
         | E::SymbolConflict { .. }
         | E::RankMismatch { .. }
-        | E::RuntimeBroadcastIncompatible { .. } => OrtErrorCode::InvalidArgument,
+        | E::RuntimeBroadcastIncompatible { .. }
+        // The caller handed us a buffer that cannot back the binding they
+        // asked for — wrong size, null, or misaligned. That is their argument,
+        // not a runtime fault.
+        | E::ExternalBuffer { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,

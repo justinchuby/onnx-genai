@@ -238,6 +238,73 @@ pub(crate) struct DeviceBindingSpec {
     pub(crate) expose_logical_input_shape: bool,
 }
 
+/// The parameters for [`DeviceIoBinding::from_external_memory`], grouped the
+/// same way [`DeviceBindingSpec`] groups the allocating constructor's.
+///
+/// `ptr`/`len_bytes` describe memory the **caller** owns; the rest describes how
+/// the graph should see it.
+pub struct ExternalMemorySpec {
+    /// Graph input to bind. Empty when the binding is output-only.
+    pub input_name: String,
+    /// Whether the buffer is bound as a graph input at all. `false` gives an
+    /// output-only binding: the graph writes into the caller's memory without
+    /// reading it first.
+    pub bind_input: bool,
+    pub output_name: Option<String>,
+    pub dtype: DataType,
+    pub physical_shape: Vec<usize>,
+    pub logical_shape: Vec<usize>,
+    /// Base address of the caller's allocation, on the session's device.
+    pub ptr: *mut core::ffi::c_void,
+    /// Length of the caller's allocation in bytes.
+    pub len_bytes: usize,
+}
+
+impl ExternalMemorySpec {
+    /// A buffer bound as a graph input, optionally aliased by an output.
+    pub fn input(
+        input_name: impl Into<String>,
+        output_name: Option<impl Into<String>>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        ptr: *mut core::ffi::c_void,
+        len_bytes: usize,
+    ) -> Self {
+        Self {
+            input_name: input_name.into(),
+            bind_input: true,
+            output_name: output_name.map(Into::into),
+            dtype,
+            physical_shape,
+            logical_shape,
+            ptr,
+            len_bytes,
+        }
+    }
+
+    /// A buffer the graph only writes to.
+    pub fn output(
+        output_name: impl Into<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        ptr: *mut core::ffi::c_void,
+        len_bytes: usize,
+    ) -> Self {
+        Self {
+            input_name: String::new(),
+            bind_input: false,
+            output_name: Some(output_name.into()),
+            dtype,
+            physical_shape,
+            logical_shape,
+            ptr,
+            len_bytes,
+        }
+    }
+}
+
 /// An externally owned persistent device allocation bound to a graph input and
 /// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
@@ -277,6 +344,99 @@ impl DeviceIoBinding {
             .max(1);
         let allocator_for_buffer = allocator.clone();
         let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
+        Ok(Self {
+            input_name,
+            bind_input,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            expose_logical_input_shape,
+            buffer: Some(buffer),
+            allocator,
+            transfer_stats: DeviceBindingTransferStats::default(),
+        })
+    }
+
+    /// Wrap memory the **caller** allocated, rather than allocating here.
+    ///
+    /// This is the native counterpart of handing ONNX Runtime an externally
+    /// allocated tensor: it lets a memory manager outside this crate own the
+    /// device allocation and lend it to a session for the binding's lifetime.
+    /// Without it the only way to get a persistent device binding is to let the
+    /// EP allocate, which puts the bytes outside any external budget.
+    ///
+    /// The binding **borrows**: `Drop` will not free `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee all of:
+    /// * `ptr` is non-null, points to at least `expected_bytes(dtype,
+    ///   physical_shape)` bytes on the EP's device, and is aligned to at least
+    ///   the contiguous-layout alignment.
+    /// * The allocation outlives this binding **and** every run that reads or
+    ///   writes it, including any captured device graph that recorded its
+    ///   address.
+    /// * No other live handle writes to the same memory while this binding
+    ///   exists; the binding assumes exclusive access.
+    ///
+    /// The byte-length requirement is checked and reported; the lifetime and
+    /// aliasing requirements cannot be, which is why this is `unsafe`.
+    pub(crate) unsafe fn from_external_memory(
+        allocator: Arc<dyn ExecutionProvider>,
+        spec: DeviceBindingSpec,
+        ptr: *mut core::ffi::c_void,
+        len_bytes: usize,
+    ) -> Result<Self> {
+        let DeviceBindingSpec {
+            input_name,
+            bind_input,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            expose_logical_input_shape,
+        } = spec;
+        validate_logical_shape(&physical_shape, &logical_shape)?;
+        let required = checked_expected_bytes(dtype, &physical_shape)
+            .ok_or_else(|| SessionError::ShapeOverflow {
+                value: format!("device binding '{input_name}'"),
+                dims: physical_shape.clone(),
+            })?
+            .max(1);
+        if len_bytes < required {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: format!(
+                    "it is {len_bytes} bytes but {physical_shape:?} of {dtype:?} needs \
+                     {required}; pass a buffer at least that large or reduce the physical shape"
+                ),
+            });
+        }
+        // Borrowed memory only has to satisfy the dtype's alignment. The EP's
+        // 64-byte figure is an *allocation* requirement it imposes on memory it
+        // hands out, not a precondition for reading memory someone else owns —
+        // the same distinction the zero-copy initializer path already makes.
+        let alignment = crate::executor::host_dtype_alignment(dtype);
+        if !ptr.is_null() && !ptr.addr().is_multiple_of(alignment) {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: format!(
+                    "it is at address {:#x}, which is not a multiple of the {alignment}-byte \
+                     alignment {dtype:?} requires; allocate it with at least that alignment",
+                    ptr.addr()
+                ),
+            });
+        }
+        // SAFETY: delegated to this function's own contract; the size check
+        // above is the part that can be verified here.
+        let buffer = unsafe {
+            DeviceBuffer::from_borrowed_mut_parts(ptr, allocator.device_id(), required, alignment)
+        }
+        .ok_or_else(|| SessionError::ExternalBuffer {
+            binding: input_name.clone(),
+            reason: "it is null; pass the address of a real allocation".to_string(),
+        })?;
         Ok(Self {
             input_name,
             bind_input,

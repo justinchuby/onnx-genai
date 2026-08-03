@@ -602,7 +602,7 @@ macro_rules! reduce_factory {
                     keepdims,
                     noop_with_empty_axes,
                     runtime: self.runtime.clone(),
-                    int64_metadata: Mutex::new(ReductionMetadataCache::new(self.runtime.clone())),
+                    reduce_metadata: Mutex::new(ReductionMetadataCache::new(self.runtime.clone())),
                     cudnn_reduce: Mutex::new(CudnnReduceCache::new(self.runtime.stream().clone())),
                     warmed_axes: Mutex::new(None),
                     last_call_capture_safe: AtomicBool::new(false),
@@ -632,7 +632,14 @@ pub struct ReduceKernel {
     keepdims: bool,
     noop_with_empty_axes: bool,
     runtime: Arc<CudaRuntime>,
-    int64_metadata: Mutex<ReductionMetadataCache>,
+    /// Cached i64 base/delta offset tables (and axes) for the NVRTC block-reduce
+    /// path. Shared by the Int64 DATA reduce and every float/bf16 reduce that
+    /// falls to the NVRTC kernel (all `ReduceSumSquare`/L1/L2/Prod/LogSum…
+    /// extended ops, bf16, and f16/f32 when cuDNN is absent). Caching the tables
+    /// means a shape-stable decode reduce allocates nothing per call and records
+    /// into a captured CUDA graph segment instead of shredding it with a
+    /// per-call `alloc`/`htod`/`sync`/`free`.
+    reduce_metadata: Mutex<ReductionMetadataCache>,
     /// Cached cuDNN descriptors + device workspace for the float (f32/f16)
     /// cuDNN reduce path, so a shape-stable decode reduce allocates nothing
     /// per call and can be captured into a CUDA graph.
@@ -902,13 +909,13 @@ impl ReduceKernel {
                 ));
             }
             // A device read of the axes input is illegal during capture, so
-            // reuse the axes warmed on the pre-capture eager call. The Int64
-            // DATA path keeps its own device-validated metadata cache; the float
-            // cuDNN path (and any other) warms `warmed_axes` on every eager
-            // 2-input call. Prefer the validated Int64 metadata when present,
-            // else the warmed copy.
-            let int64_axes = self
-                .int64_metadata
+            // reuse the axes warmed on the pre-capture eager call. The NVRTC
+            // reduce path (Int64 DATA and every float/bf16 block reduce) records
+            // the resolved axes in its metadata cache; the float cuDNN path warms
+            // `warmed_axes` on every eager 2-input call. Prefer the cached
+            // metadata axes when present, else the warmed copy.
+            let cached_axes = self
+                .reduce_metadata
                 .lock()
                 .map_err(|_| {
                     EpError::KernelFailed(
@@ -918,7 +925,7 @@ impl ReduceKernel {
                 .key
                 .as_ref()
                 .map(|key| key.axes.clone());
-            let axes = match int64_axes {
+            let axes = match cached_axes {
                 Some(axes) => axes,
                 None => self
                     .warmed_axes
@@ -1026,56 +1033,41 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        if x.dtype == DataType::Int64 && (inputs.len() == 1 || inputs[1].dtype == DataType::Int64) {
-            let axes = axes_raw.as_deref().unwrap_or(&[]);
-            let mut metadata = self.int64_metadata.lock().map_err(|_| {
-                EpError::KernelFailed("cuda_ep ReduceSum: metadata cache lock was poisoned".into())
-            })?;
-            let (base_buf, delta_buf, expected_axes) =
-                metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
-            if capturing && inputs.len() == 2 {
-                self.validate_captured_axes(&inputs[1], expected_axes)?;
-            }
-            self.launch(
-                x,
-                outputs,
-                base_buf,
-                delta_buf,
-                out_count,
-                reduce_count,
-                capturing,
-            )?;
-            self.last_call_capture_safe.store(true, Ordering::Relaxed);
-            return Ok(());
+        // NVRTC block-reduction path (Int64 DATA reduce; bf16, which cuDNN
+        // cannot reduce; every extended op — `ReduceSumSquare`/L1/L2/Prod/
+        // LogSum(Exp) — routed by `ext_tags`; and f16/f32 when cuDNN is absent).
+        // All of these use the i64 base/delta offset tables, so they share one
+        // capture-eligible metadata cache: a shape-stable decode reduce reuses
+        // the cached device tables with no per-call `alloc`/`htod`/`free`, gates
+        // its trailing `synchronize()` on `!capturing` (in `launch`), and marks
+        // the call capture-safe so the segmenter folds it into the replayed
+        // graph. A signature change mid-capture is rejected by `prepare` rather
+        // than reallocating device memory inside the capture.
+        let axes = axes_raw.as_deref().unwrap_or(&[]);
+        let mut metadata = self.reduce_metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ReduceSum: metadata cache lock was poisoned".into())
+        })?;
+        let (base_buf, delta_buf, expected_axes) =
+            metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+        // Only the Int64 DATA reduce reads the axes device buffer, so it alone
+        // validates the captured axes against the warmed metadata. The float/
+        // bf16 block reduce bakes the reduce mask into base/delta and never reads
+        // the axes buffer, and any axes change flips the cache key (rejected by
+        // `prepare` above during capture), so it needs no device validation.
+        if capturing && inputs.len() == 2 && x.dtype == DataType::Int64 {
+            self.validate_captured_axes(&inputs[1], expected_axes)?;
         }
-
-        // Upload the base/delta offset tables (i64).
-        let base_bytes = as_i64_bytes(&plan.base);
-        let delta_bytes = as_i64_bytes(&plan.delta);
-        let base_buf = self.runtime.alloc_raw(base_bytes.len())?;
-        let delta_buf = self.runtime.alloc_raw(delta_bytes.len())?;
-
-        let result = (|| {
-            // SAFETY: both fresh allocations cover their corresponding slices.
-            unsafe { self.runtime.htod(&base_bytes, base_buf) }?;
-            unsafe { self.runtime.htod(&delta_bytes, delta_buf) }?;
-            self.launch(
-                x,
-                outputs,
-                base_buf,
-                delta_buf,
-                out_count,
-                reduce_count,
-                false,
-            )
-        })();
-
-        // Always release the scratch tables, even on failure.
-        // SAFETY: both pointers came from the `alloc_raw` calls above and are
-        // each freed exactly once here.
-        let free_base = unsafe { self.runtime.free_raw(base_buf) };
-        let free_delta = unsafe { self.runtime.free_raw(delta_buf) };
-        result.and(free_base).and(free_delta)
+        self.launch(
+            x,
+            outputs,
+            base_buf,
+            delta_buf,
+            out_count,
+            reduce_count,
+            capturing,
+        )?;
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn validate_captured_axes(&self, actual: &TensorView, expected: CUdeviceptr) -> Result<()> {

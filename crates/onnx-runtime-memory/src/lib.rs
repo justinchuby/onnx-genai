@@ -113,9 +113,10 @@ mod view_map;
 pub use error::{PlanError, ValidateError};
 pub use liveness::{Interval, Liveness, compute_liveness};
 pub use options::PlanOptions;
-pub use oracle::{static_size, static_size_oracle};
+pub use oracle::{bounded_size, bounded_size_oracle, static_size, static_size_oracle};
 pub use plan::{
-    ActivationPlan, PlanStatus, SlotId, SlotInfo, plan_activations, plan_activations_static,
+    ActivationPlan, PlanStatus, SlotId, SlotInfo, peak_activation_bytes_at_bounds,
+    plan_activations, plan_activations_static,
 };
 pub use validate::{validate, validate_static};
 pub use view_map::ViewMap;

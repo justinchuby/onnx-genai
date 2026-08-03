@@ -246,3 +246,29 @@ pub fn plan_activations_static(
     let oracle = static_size_oracle(graph);
     plan_activations(graph, view_map, oracle, options)
 }
+
+/// Plan activations with symbolic dimensions resolved to caller-supplied upper
+/// bounds, and report the peak footprint that must be reserved.
+///
+/// This is the entry point for **admission control**, which needs a ceiling
+/// rather than an exact size. Planning from static shapes alone yields
+/// [`PlanStatus::Deferred`] for any model with a dynamic sequence length —
+/// which is every LLM — and a deferred plan reserves nothing. A zero
+/// reservation is indistinguishable from a model that does not allocate.
+///
+/// Returns `Ok(None)` when planning is still deferred because some symbol was
+/// left unbound. That is reported rather than treated as zero: a caller that
+/// silently reserved nothing would be making exactly the mistake this exists
+/// to prevent.
+pub fn peak_activation_bytes_at_bounds(
+    graph: &Graph,
+    view_map: &ViewMap,
+    bounds: &std::collections::HashMap<onnx_runtime_ir::SymbolId, usize>,
+    options: &PlanOptions,
+) -> Result<Option<usize>, PlanError> {
+    let oracle = crate::oracle::bounded_size_oracle(graph, bounds);
+    Ok(match plan_activations(graph, view_map, oracle, options)? {
+        PlanStatus::Complete(plan) => Some(plan.peak_bytes),
+        PlanStatus::Deferred { .. } => None,
+    })
+}
