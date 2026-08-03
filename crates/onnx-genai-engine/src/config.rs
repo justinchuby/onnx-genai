@@ -11,9 +11,6 @@ use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerCon
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[cfg(feature = "native-backend")]
-use crate::native_decode::NativeDecodeDevice;
-
 /// Error returned when a user-facing resource limit cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
