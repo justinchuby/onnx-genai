@@ -65,8 +65,8 @@ pub use onnx_genai_runtime_config::EpSelection;
 pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{
     CudaAttentionMode, EpCapabilities, HardwareKind, ResolvedEp, RunPhaseError, Session,
-    SessionOptions, TensorInfo, available_execution_providers, capability, ep_selection,
-    resolve_execution_provider, selectable_execution_providers,
+    SessionOptions, TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers, capability,
+    ep_selection, resolve_execution_provider, selectable_execution_providers,
 };
 pub use shared_kv_proposer::{
     SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,
