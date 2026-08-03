@@ -250,7 +250,7 @@ pub struct PipelineEngine {
     /// Decoder device requested via [`EngineConfig::native_device`] (e.g. from
     /// `--ep cuda`), honored by the native pipeline decoder when the
     /// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` override is unset.
-    native_device: Option<crate::native_decode::NativeDecodeDevice>,
+    native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
 }
 
 /// Paged KV storage for an autoregressive pipeline decoder.
@@ -463,7 +463,7 @@ fn build_step_component_session<'a>(
             // placement of the pipeline decoder is the later (inc2/inc3) work.
             let native = crate::native_component::NativeComponentSession::load(
                 path,
-                crate::native_decode::NativeDecodeDevice::Cpu,
+                crate::native_decode_device::NativeDecodeDevice::Cpu,
             )
             .with_context(|| format!("failed to load native every_step component '{component}'"))?;
             return Ok(Box::new(native));
@@ -496,7 +496,7 @@ fn build_step_component_session<'a>(
 fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
-    config_device: Option<&crate::native_decode::NativeDecodeDevice>,
+    config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
@@ -546,8 +546,8 @@ fn build_native_pipeline_decoder(
 /// `native_device` (so `--ep cuda` decodes on the GPU), else default to CPU.
 #[cfg(feature = "native-backend")]
 fn native_decoder_device(
-    config_device: Option<&crate::native_decode::NativeDecodeDevice>,
-) -> crate::native_decode::NativeDecodeDevice {
+    config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+) -> crate::native_decode_device::NativeDecodeDevice {
     let env = std::env::var("ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE").ok();
     resolve_native_decoder_device(env.as_deref(), config_device)
 }
@@ -558,9 +558,9 @@ fn native_decoder_device(
 #[cfg(feature = "native-backend")]
 fn resolve_native_decoder_device(
     env_value: Option<&str>,
-    config_device: Option<&crate::native_decode::NativeDecodeDevice>,
-) -> crate::native_decode::NativeDecodeDevice {
-    use crate::native_decode::NativeDecodeDevice;
+    config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+) -> crate::native_decode_device::NativeDecodeDevice {
+    use crate::native_decode_device::NativeDecodeDevice;
     match env_value {
         Some(value) => parse_native_decoder_device_value(value),
         None => config_device.cloned().unwrap_or(NativeDecodeDevice::Cpu),
@@ -570,8 +570,10 @@ fn resolve_native_decoder_device(
 /// Parse a `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` value: `cuda`,
 /// `cuda:<index>` / `cuda=<index>`, or anything else (→ CPU).
 #[cfg(feature = "native-backend")]
-fn parse_native_decoder_device_value(value: &str) -> crate::native_decode::NativeDecodeDevice {
-    use crate::native_decode::NativeDecodeDevice;
+fn parse_native_decoder_device_value(
+    value: &str,
+) -> crate::native_decode_device::NativeDecodeDevice {
+    use crate::native_decode_device::NativeDecodeDevice;
     let value = value.trim().to_ascii_lowercase();
     match value.strip_prefix("cuda") {
         Some(rest) => {
@@ -2559,7 +2561,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_decoder_device_prefers_config_when_env_unset() {
-        use crate::native_decode::NativeDecodeDevice;
+        use crate::native_decode_device::NativeDecodeDevice;
         // Env unset -> honor the engine-configured device (this is the `--ep cuda`
         // fix: the pipeline decoder must run on the configured GPU).
         assert_eq!(
@@ -2576,7 +2578,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_decoder_device_env_override_wins_over_config() {
-        use crate::native_decode::NativeDecodeDevice;
+        use crate::native_decode_device::NativeDecodeDevice;
         // A set env var wins over the configured device, in both directions, for
         // back-compat with the deterministic parity fixture.
         assert_eq!(
@@ -2599,7 +2601,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_decoder_device_value_parsing() {
-        use crate::native_decode::NativeDecodeDevice;
+        use crate::native_decode_device::NativeDecodeDevice;
         assert_eq!(
             parse_native_decoder_device_value("  CUDA=0 "),
             NativeDecodeDevice::Cuda { index: Some(0) }
