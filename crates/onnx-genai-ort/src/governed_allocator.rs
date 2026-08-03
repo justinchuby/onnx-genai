@@ -32,12 +32,13 @@
 //! budget while reporting that the budget held — the failure this whole
 //! contract exists to prevent.
 
-use std::alloc::{Layout, alloc, dealloc};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{
+    DeviceAllocator, HolderId, HostAllocator, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+};
 
 use crate::allocator::MemoryInfo;
 
@@ -126,6 +127,13 @@ impl Default for AllocationRoles {
 
 struct GovernedAllocatorState {
     governor: Arc<dyn MemoryGovernor + Send + Sync>,
+    /// Where the bytes come from.
+    ///
+    /// Swappable, so the same governance works over the system allocator, a
+    /// device arena, or something a caller brought — and so the allocator a
+    /// caller supplies serves the native backend too, rather than being an
+    /// ORT-shaped thing they have to write twice.
+    memory: Arc<dyn DeviceAllocator>,
     tier: Tier,
     roles: AllocationRoles,
     holder: HolderId,
@@ -219,6 +227,7 @@ impl GovernedAllocator {
             memory_info,
             state: Arc::new(GovernedAllocatorState {
                 governor,
+                memory: Arc::new(HostAllocator),
                 tier,
                 roles,
                 holder,
@@ -236,6 +245,42 @@ impl GovernedAllocator {
         Ok(allocator)
     }
 
+    /// Take bytes from `memory` instead of the system allocator.
+    ///
+    /// This is the seam a caller replaces. Governance is unchanged — the same
+    /// leases, roles and counters — only the source of the bytes moves.
+    ///
+    /// The allocator's [`DeviceKey`](onnx_runtime_memory_governor::DeviceKey)
+    /// must agree with the tier this allocator was built for. ONNX Runtime
+    /// decides from the memory info whether a pointer is a host address, so an
+    /// allocator returning device memory under host memory info turns a kernel
+    /// read into a wild access rather than an error.
+    ///
+    /// The same `Arc` can back the native execution provider, which is the
+    /// point: a caller writes one allocator, not one per backend.
+    pub fn with_memory(
+        mut self: Box<Self>,
+        memory: Arc<dyn DeviceAllocator>,
+    ) -> crate::error::Result<Box<Self>> {
+        let tier = self.state.tier;
+        if memory.device().tier != tier {
+            return Err(crate::error::OrtError::InvalidArgument(format!(
+                "this allocator is charged to {tier:?} but the supplied memory serves {:?}; \
+                 ONNX Runtime decides from the memory info whether a pointer may be read on \
+                 the host, so the two must agree",
+                memory.device().tier
+            )));
+        }
+        let state = Arc::get_mut(&mut self.state).ok_or_else(|| {
+            crate::error::OrtError::InvalidArgument(
+                "the memory source cannot be replaced once the allocator is shared; set it \
+                 before registering"
+                    .into(),
+            )
+        })?;
+        state.memory = memory;
+        Ok(self)
+    }
     /// The pointer to hand ORT's registration API.
     pub fn as_ort_allocator(&mut self) -> *mut onnx_genai_ort_sys::OrtAllocator {
         std::ptr::from_mut(&mut self.base)
@@ -326,9 +371,6 @@ unsafe fn governed_alloc_as(
     let Some(total) = size.checked_add(HEADER_BYTES) else {
         return std::ptr::null_mut();
     };
-    let Ok(layout) = Layout::from_size_align(total, ALLOCATION_ALIGNMENT) else {
-        return std::ptr::null_mut();
-    };
 
     // Lease first. A refusal must not allocate, or the budget is decorative.
     let Ok(lease) = state
@@ -339,13 +381,13 @@ unsafe fn governed_alloc_as(
     };
 
     // SAFETY: `layout` has a non-zero size and a valid power-of-two alignment.
-    let base = unsafe { alloc(layout) };
-    if base.is_null() {
+    let Ok(base) = state.memory.allocate(total, ALLOCATION_ALIGNMENT) else {
         // Dropping the lease returns the bytes; failing to would leak budget on
         // every allocation failure.
         drop(lease);
         return std::ptr::null_mut();
-    }
+    };
+    let base = base.as_ptr();
 
     // SAFETY: the header is the first `HEADER_BYTES` of an allocation we just
     // made, it is large enough and aligned enough for a `MemoryLease` (both
@@ -381,12 +423,13 @@ unsafe extern "C" fn governed_free(this: *mut onnx_genai_ort_sys::OrtAllocator, 
     let base = unsafe { p.cast::<u8>().sub(HEADER_BYTES) };
     let lease = unsafe { base.cast::<MemoryLease>().read() };
     let total = lease.bytes() as usize;
-    let Ok(layout) = Layout::from_size_align(total, ALLOCATION_ALIGNMENT) else {
+    let Some(base) = std::ptr::NonNull::new(base) else {
         return;
     };
-    // SAFETY: the pointer and layout are the pair `governed_alloc` created.
-    // The lease was moved out above, so nothing reads the header after this.
-    unsafe { dealloc(base, layout) };
+    // SAFETY: the pointer, size and alignment are the triple
+    // `governed_alloc_as` obtained from this same allocator. The lease was
+    // moved out above, so nothing reads the header after this.
+    unsafe { state.memory.deallocate(base, total, ALLOCATION_ALIGNMENT) };
     state.live_bytes.fetch_sub(total as u64, Ordering::Relaxed);
     state.live_count.fetch_sub(1, Ordering::Relaxed);
     // `lease` drops here, returning the bytes to the governor.
@@ -1124,5 +1167,131 @@ mod tests {
         // SAFETY: released exactly once, as the slot's contract requires.
         unsafe { (api.ReleaseKeyValuePairs.expect("ReleaseKeyValuePairs"))(pairs) };
         out
+    }
+    /// A caller's own allocator really serves ORT's vtable.
+    ///
+    /// This is the substitutability claim, and constructing one proves nothing:
+    /// an implementation that ignored `with_memory` and kept using the system
+    /// allocator would pass any test that only checks the memory works. So the
+    /// counting allocator asserts it was *called*, and that every block came
+    /// back to it.
+    #[test]
+    fn a_caller_supplied_allocator_backs_ort_allocations() {
+        let (_, governor) = allocator(1 << 20);
+        let counters = Arc::new(CountingAllocator::default());
+        let mut alloc = GovernedAllocator::new(
+            MemoryInfo::cpu_device().expect("cpu device memory info"),
+            Arc::new(governor),
+            Tier::Host,
+            AllocationRoles::split(),
+            HolderId::new(9),
+        )
+        .expect("host allocator")
+        .with_memory(Arc::clone(&counters) as Arc<dyn DeviceAllocator>)
+        .expect("host memory for a host tier");
+
+        let first = unsafe { governed_alloc(alloc.as_ort_allocator(), 256) };
+        let second = unsafe { governed_reserve(alloc.as_ort_allocator(), 512) };
+        assert_eq!(
+            counters.allocations.load(Ordering::Relaxed),
+            2,
+            "ORT's allocations must come from the supplied allocator, not the system one"
+        );
+
+        // The memory has to actually work, not merely be counted.
+        unsafe { std::ptr::write_bytes(first.cast::<u8>(), 0x5A, 256) };
+        unsafe { std::ptr::write_bytes(second.cast::<u8>(), 0xA5, 512) };
+
+        unsafe {
+            governed_free(alloc.as_ort_allocator(), first);
+            governed_free(alloc.as_ort_allocator(), second);
+        }
+        assert_eq!(
+            counters.deallocations.load(Ordering::Relaxed),
+            2,
+            "every block must be returned to the allocator that produced it"
+        );
+        assert_eq!(
+            counters.live_bytes.load(Ordering::Relaxed),
+            0,
+            "the supplied allocator must see its own bytes balance"
+        );
+    }
+
+    /// An allocator serving a different tier is refused, rather than handing ORT
+    /// device memory under host memory info.
+    #[test]
+    fn a_memory_source_from_the_wrong_tier_is_refused() {
+        let (_, governor) = allocator(1 << 20);
+        let error = GovernedAllocator::new(
+            MemoryInfo::cpu_device().expect("cpu device memory info"),
+            Arc::new(governor),
+            Tier::Host,
+            AllocationRoles::split(),
+            HolderId::new(9),
+        )
+        .expect("host allocator")
+        .with_memory(Arc::new(DeviceTierAllocator))
+        .err()
+        .expect("a device allocator cannot back a host-tier allocator");
+        assert!(
+            error.to_string().contains("Device"),
+            "the error must name the mismatch, got: {error}"
+        );
+    }
+
+    /// Counts what passes through it, so a test can tell "used" from "ignored".
+    #[derive(Debug, Default)]
+    struct CountingAllocator {
+        inner: HostAllocator,
+        allocations: AtomicU64,
+        deallocations: AtomicU64,
+        live_bytes: AtomicU64,
+    }
+
+    impl DeviceAllocator for CountingAllocator {
+        fn allocate(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError> {
+            let ptr = self.inner.allocate(bytes, align)?;
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            self.live_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            Ok(ptr)
+        }
+
+        unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, bytes: usize, align: usize) {
+            // SAFETY: forwarded unchanged from this method's own contract.
+            unsafe { self.inner.deallocate(ptr, bytes, align) };
+            self.deallocations.fetch_add(1, Ordering::Relaxed);
+            self.live_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        }
+
+        fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
+            onnx_runtime_memory_governor::DeviceKey::HOST
+        }
+    }
+
+    /// Claims to serve a device, so the tier check has something to refuse.
+    #[derive(Debug)]
+    struct DeviceTierAllocator;
+
+    impl DeviceAllocator for DeviceTierAllocator {
+        fn allocate(
+            &self,
+            _bytes: usize,
+            _align: usize,
+        ) -> Result<std::ptr::NonNull<u8>, onnx_runtime_memory_governor::MemoryError> {
+            unreachable!("the tier check must refuse this allocator before it is used")
+        }
+
+        unsafe fn deallocate(&self, _ptr: std::ptr::NonNull<u8>, _bytes: usize, _align: usize) {
+            unreachable!("the tier check must refuse this allocator before it is used")
+        }
+
+        fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
+            onnx_runtime_memory_governor::DeviceKey::device(0)
+        }
     }
 }
