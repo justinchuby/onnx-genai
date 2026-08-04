@@ -330,6 +330,16 @@ fn load_library(library: CudaLibrary) -> Result<Library, Vec<String>> {
             continue;
         }
         tried.push(path.display().to_string());
+        // A wheel component's own directory has to become searchable, not just
+        // this one file loadable. Two things need it and neither is under our
+        // control: `cublas64_*.dll` imports `cublasLt64_*.dll`, and NVRTC does
+        // its own `LoadLibrary` for `nvrtc-builtins64_*.dll` at compile time.
+        // Both resolve through the process search order, which does not include
+        // the directory a DLL was loaded from -- so loading by absolute path
+        // alone gets the first module in and then fails on its neighbour.
+        if let Some(directory) = path.parent() {
+            make_directory_searchable(directory);
+        }
         // SAFETY: paths are supplied by nxrt's installed package layout and the
         // handle is retained for the lifetime of the process below.
         if let Ok(handle) = unsafe { Library::new(&path) } {
@@ -349,6 +359,42 @@ fn load_library(library: CudaLibrary) -> Result<Library, Vec<String>> {
 
 pub(crate) fn is_available(library: CudaLibrary) -> bool {
     require(library).is_ok()
+}
+
+/// Make `directory` findable by the platform loader, once per directory.
+///
+/// Prepending to the process `PATH` is what NVIDIA's own Python packages do on
+/// Windows, and it is the only mechanism that also covers a library's *internal*
+/// `LoadLibrary` calls -- NVRTC opening `nvrtc-builtins64_*.dll` is not
+/// something an absolute path to `nvrtc64_*.dll` can help with.
+///
+/// Deliberately not `AddDllDirectory`: that only takes effect alongside
+/// `SetDefaultDllDirectories`, which changes resolution for the whole process
+/// including libraries that have nothing to do with CUDA.
+fn make_directory_searchable(directory: &Path) {
+    static ADDED: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let mut added = ADDED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("CUDA search-directory lock poisoned");
+    if added.iter().any(|existing| existing == directory) {
+        return;
+    }
+    added.push(directory.to_path_buf());
+
+    let variable = if cfg!(windows) {
+        "PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    let current = std::env::var_os(variable).unwrap_or_default();
+    let mut entries = vec![directory.to_path_buf()];
+    entries.extend(std::env::split_paths(&current));
+    if let Ok(joined) = std::env::join_paths(entries) {
+        // SAFETY: single-threaded with respect to this variable -- the mutex
+        // above serialises every writer, and the value is only ever extended.
+        unsafe { std::env::set_var(variable, joined) };
+    }
 }
 
 fn cuda_supported(os: TargetOs, arch: TargetArch) -> bool {
