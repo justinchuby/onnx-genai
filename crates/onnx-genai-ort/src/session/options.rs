@@ -53,9 +53,12 @@ pub struct SessionOptions {
     pub session_config_entries: Vec<(String, String)>,
     /// Whether the non-CPU execution provider was auto-selected for this platform
     /// (e.g. the macOS MLX/Metal default) rather than explicitly requested. An
-    /// auto-selected provider must fall back to CPU on load failure, even if the
-    /// provider would otherwise be strict.
+    /// auto-selected provider records that it was not a user request; it still
+    /// only retries on CPU when `allow_cpu_fallback` is explicitly set.
     pub auto_selected: bool,
+    /// Explicit opt-in to retry a failed non-CPU session on CPU. Off by default
+    /// so a requested EP cannot silently change semantics.
+    pub allow_cpu_fallback: bool,
 }
 
 /// ORT session config key that makes a session allocate through allocators
@@ -111,10 +114,11 @@ impl Default for SessionOptions {
 /// On macOS, when the MLX/Metal execution-provider plugin library is available
 /// (its path is exposed through `ONNX_GENAI_METAL_EP_LIB` /
 /// `ONNX_GENAI_MLX_EP_LIBRARY`, which the Python packages set automatically),
-/// prefer it over plain CPU for speed on Apple Silicon. The selection is
-/// non-strict: if the plugin fails to load, session creation falls back to CPU.
-/// On every other platform, or when no MLX library is configured, this returns
-/// `None` (keep the CPU default).
+/// prefer it over plain CPU for speed on Apple Silicon. If the plugin fails to
+/// load, session creation fails unless `ONNX_GENAI_EP_FALLBACK=1` or
+/// [`SessionOptions::with_cpu_fallback`] explicitly permits a visible CPU
+/// retry. On every other platform, or when no MLX library is configured, this
+/// returns `None` (keep the CPU default).
 pub(super) fn auto_default_execution_providers() -> Option<Vec<ResolvedEp>> {
     #[cfg(target_os = "macos")]
     {
@@ -146,6 +150,7 @@ impl SessionOptions {
             cuda_attention_mode: cuda_attention_mode_from_runtime_config(),
             session_config_entries: runtime_config().session_config_entries.clone(),
             auto_selected: false,
+            allow_cpu_fallback: runtime_config().ep_fallback,
         }
     }
 
@@ -159,6 +164,39 @@ impl SessionOptions {
         options
     }
 
+    /// Explicitly allow or disallow retrying session creation on CPU after a
+    /// requested non-CPU provider fails to initialize.
+    #[must_use]
+    pub fn with_cpu_fallback(mut self, allow: bool) -> Self {
+        self.allow_cpu_fallback = allow;
+        self
+    }
+
+    pub(super) fn for_execution_providers(
+        &self,
+        execution_providers: Vec<ResolvedEp>,
+        allow_cpu_fallback: bool,
+    ) -> Self {
+        let mut options = self.clone();
+        let preserves_qnn_provider = self.selects_qnn()
+            && execution_providers
+                .iter()
+                .any(|ep| ep.caps.name.eq_ignore_ascii_case("qnn"));
+        options.execution_providers = execution_providers;
+        options.auto_selected = false;
+        options.allow_cpu_fallback = allow_cpu_fallback;
+        options.session_config_entries = self
+            .session_config_entries
+            .iter()
+            .filter(|(key, _)| preserves_qnn_provider || !Self::provider_owned_session_config(key))
+            .cloned()
+            .collect();
+        options.webgpu_disable_validation = false;
+        options.graph_capture = false;
+        options.apply_provider_defaults();
+        options
+    }
+
     /// Capabilities of the first non-host EP, else the host provider.
     fn primary_caps(&self) -> EpCapabilities {
         self.execution_providers
@@ -166,6 +204,11 @@ impl SessionOptions {
             .find(|ep| !ep.caps.is_host())
             .map(|ep| ep.caps.clone())
             .unwrap_or_else(EpCapabilities::host)
+    }
+
+    fn provider_owned_session_config(key: &str) -> bool {
+        key.eq_ignore_ascii_case("session.disable_cpu_ep_fallback")
+            || key.to_ascii_lowercase().starts_with("ep.context_")
     }
 
     /// Whether the primary EP's provider-specific graph-capture env flag is set.
@@ -239,6 +282,12 @@ impl SessionOptions {
             self.session_config_entries
                 .push((key.to_string(), value.to_string()));
         }
+    }
+
+    pub(super) fn has_session_config(&self, key: &str) -> bool {
+        self.session_config_entries
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
     }
 
     /// Set the number of ORT intra-op threads.

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use onnx_genai::engine::EngineDecodeBackend;
-use onnx_genai::ort::{SessionOptions, profile::TraceVerbosity};
+use onnx_genai::ort::profile::TraceVerbosity;
 
 use super::interactive::{Backend, ReplInputMode, SessionSettings};
 
@@ -255,22 +255,6 @@ impl CommandCategory {
 /// user should be able to try `cuda`, be told it is unavailable, and carry on.
 pub(super) fn reload(settings: &SessionSettings) -> anyhow::Result<Backend> {
     Backend::open(settings)
-}
-
-/// Providers a default session resolves to, for commands that do not let the
-/// user choose one mid-run.
-pub(super) fn resolved_default_providers() -> String {
-    let options = SessionOptions::default();
-    let names = options
-        .execution_providers
-        .iter()
-        .map(|provider| provider.selection.name.as_str())
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        "cpu".to_string()
-    } else {
-        names.join(", ")
-    }
 }
 
 /// Execution providers this session can be switched to.

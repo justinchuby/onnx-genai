@@ -7,12 +7,29 @@ use crate::{Environment, OrtError, Result};
 use super::ep_compat::{self, EpCapabilities, HardwareKind, ResolvedEp};
 use super::providers::parse_hardware_device_type;
 
-pub(super) fn resolve_inline_plugin(spec: &PluginSpec) -> Option<ResolvedEp> {
-    if spec.library.as_os_str().is_empty() {
-        tracing::warn!("Ignoring inline plugin entry with an empty library path");
-        return None;
+pub(super) fn invalid_plugin_configuration(
+    selection: EpSelection,
+    message: impl Into<String>,
+) -> ResolvedEp {
+    ResolvedEp {
+        caps: EpCapabilities::new(selection.name.clone(), HardwareKind::Other, None, None, &[]),
+        selection,
+        strategy: ep_compat::AppendStrategy::InvalidConfiguration {
+            message: message.into(),
+        },
+        graph_capture_env: false,
+        transitional_webgpu: false,
     }
-    Some(resolve_plugin_selection(
+}
+
+pub(super) fn resolve_inline_plugin(spec: &PluginSpec) -> ResolvedEp {
+    if spec.library.as_os_str().is_empty() {
+        return invalid_plugin_configuration(
+            EpSelection::new("plugin"),
+            "Invalid ONNX_GENAI_EP inline plugin entry: plugin:<library> requires a non-empty library path",
+        );
+    }
+    resolve_plugin_selection(
         EpSelection::new("plugin"),
         spec.library.clone(),
         spec.registration_name
@@ -20,7 +37,7 @@ pub(super) fn resolve_inline_plugin(spec: &PluginSpec) -> Option<ResolvedEp> {
             .unwrap_or_else(|| plugin_registration_name_from_path(&spec.library)),
         spec.options.clone(),
         spec.device.clone(),
-    ))
+    )
 }
 
 pub(super) fn resolve_plugin_selection(

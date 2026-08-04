@@ -1177,6 +1177,18 @@ impl Engine {
         self.decode_backend
     }
 
+    /// Execution-provider placement reported by the loaded ORT session.
+    ///
+    /// This is intentionally read from the live session instead of reconstructing
+    /// it from requested settings, so explicit CPU fallbacks and skipped
+    /// providers are visible to status/profile output.
+    pub fn execution_provider_status(&self) -> String {
+        self.session.as_deref().map_or_else(
+            || "native".to_string(),
+            |session| session.execution_provider_status().summary(),
+        )
+    }
+
     /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
     pub fn fim_config(&self) -> Option<&FimConfig> {
         self.fim_config.as_ref()
