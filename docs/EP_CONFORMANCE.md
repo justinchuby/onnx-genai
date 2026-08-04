@@ -58,6 +58,9 @@ python3 conformance/run_onnx_tests.py \
 
 Scratch models and tensor files are written under ignored `target/ep-conformance`.
 Use `--json PATH` only when a disposable machine-readable report is wanted.
+The driver exits non-zero for any `MISMATCH`/`ERROR`, or when a required CPU-op
+baseline case is no longer `PASS`; `.github/workflows/ci.yml` runs this gate in
+the `EP conformance (Linux x86_64)` job.
 
 ## Results
 

@@ -518,6 +518,71 @@ jobs:
           -p onnx-std-python
           -- -D warnings
 
+  ep-conformance:
+    name: EP conformance (Linux x86_64)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install Rust stable toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-
+      - name: Cache conformance cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-ep-conformance-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-ep-conformance-rust-${{ steps.rust-toolchain.outputs.version }}-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check out onnx-tests conformance suite
+        uses: actions/checkout@v5
+        with:
+          repository: cbourjau/onnx-tests
+          path: external/onnx-tests
+      - name: Install conformance dependencies
+        run: >-
+          python -m pip install --upgrade
+          "hypothesis>=6.130.4"
+          "spox>=0.16"
+          "onnx>=1.21"
+          -e external/onnx-tests
+      - name: Check conformance exit-code self-test
+        run: python -m unittest conformance.test_run_onnx_tests
+      - name: Build conformance runner
+        run: cargo build --locked -p onnx-runtime-session --example conformance_runner
+      - name: Run EP conformance
+        run: >-
+          python conformance/run_onnx_tests.py
+          --onnx-tests external/onnx-tests
+          --runner target/debug/examples/conformance_runner
+
   cli-ort:
     name: CLI ORT (${{ matrix.name }})
     strategy:
