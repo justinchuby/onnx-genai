@@ -21,7 +21,57 @@ model-agnostic (RULES.md #2) — every op is shape-/dtype-/attribute-driven.
 
 ---
 
+## Running the GPU tests at all
+
+The suite is 45 `*_gpu.rs` files, and every one of them returns early when there
+is no usable GPU. That is correct, but it means a machine with no CUDA and a
+machine where everything passed report the same thing: `ok`. Printing a warning
+does not help either — `cargo test` captures the output of a *passing* test, so
+a `SKIPPED` line is invisible in exactly the runs where it matters.
+
+This is not hypothetical. All 44 files then in the tree skipped on a developer
+machine with a working RTX 4060, because nothing on the pure-Rust path
+discovered NVIDIA's pip wheels. Nothing was red. Two real defects were sitting
+behind it: a tensor-core kernel that could not compile, and an allocation
+counter that had silently stopped counting.
+
+### Point the loader at the wheels
+
+No system CUDA install is needed.
+
+```
+pip install nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 \
+            nvidia-cuda-nvrtc-cu12 nvidia-cuda-nvcc-cu12 nvidia-cudnn-cu12
+
+NXRT_CUDA_WHEEL_ROOTS=<the site-packages directory containing `nvidia/`>
+```
+
+`nvidia-cuda-nvcc` is easy to miss and separately required: `mma.h` includes
+`crt/mma.h`, which ships there rather than in `nvidia-cuda-runtime`, and without
+it the tensor-core kernels fail inside NVRTC with a message naming a header
+rather than a package.
+
+The component `bin` (Windows) or `lib` directories on the loader path work too;
+the environment variable is just the explicit form.
+
+### Make a skip visible
+
+```
+NXRT_REQUIRE_CUDA=1
+```
+
+Set it wherever a GPU is supposed to exist. `suite_canary_gpu.rs` then fails —
+with the likely cause and the fix — instead of the whole suite quietly passing.
+Left unset it is a no-op, so CPU-only machines are unaffected.
+
+There is no GPU runner in CI today; the CUDA lanes compile only. So this is a
+developer-machine guard, and the reason the flag exists rather than the check
+being unconditional.
+
+---
+
 ## Backend legend
+
 
 | Tag | Backend | When it is the right choice |
 |-----|---------|-----------------------------|
