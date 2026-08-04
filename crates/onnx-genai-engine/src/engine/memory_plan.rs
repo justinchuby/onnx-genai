@@ -309,9 +309,12 @@ impl ModelMemoryPlan {
     /// A live handle on the device KV pool bytes leased through this plan.
     ///
     /// Admission needs it to turn "bytes free on the device" into "bytes
-    /// available for KV": a pool's own grant is already spent from the ledger's
-    /// view, but it is exactly the memory admitted sequences run in, so it is
-    /// not competition for them.
+    /// available for KV": a device-tier pool's grant is already spent from the
+    /// ledger's view, but it is exactly the memory admitted sequences run in,
+    /// so it is not competition for them.
+    ///
+    /// Reads zero today -- every KV pool holder is `Tier::Host`. See the
+    /// tier tests below.
     pub(crate) fn kv_pool_bytes_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         std::sync::Arc::clone(&self.kv_pool_bytes)
     }
@@ -338,6 +341,68 @@ mod tests {
 
     fn governor(device_bytes: u64) -> LedgerGovernor {
         LedgerGovernor::new(LeaseLedger::new(device_bytes, 0, 0))
+    }
+
+    /// The admission ceiling adds device-tier KV pool grants back to
+    /// `available(Device)`, because a pool's own grant is the memory admitted
+    /// sequences run in rather than competition for them.
+    ///
+    /// Every KV pool holder is host-tier today, so that add-back is zero. This
+    /// pins it: if a pool moves to the device tier, the add-back starts
+    /// mattering, and whoever moves it should see that here rather than in a
+    /// halved admission rate under load.
+    #[test]
+    fn a_host_tier_pool_is_not_added_back() {
+        for holder in [Holder::KvPool, Holder::PipelineKvPool, Holder::DraftKvPool] {
+            assert_eq!(
+                holder.tier(),
+                Tier::Host,
+                "{} moved to the device tier -- the admission add-back in \
+                 LedgerAdmissionCeiling now applies to it, which is correct, but \
+                 confirm the ceiling still means what it says before deleting this",
+                holder.name()
+            );
+        }
+
+        let plan = ModelMemoryPlan::new(governor(1024));
+        assert_eq!(
+            plan.kv_pool_bytes_handle()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a plan with no device-tier pool has nothing to add back"
+        );
+    }
+
+    /// The add-back is driven by the holder's tier rather than by the call
+    /// site, so a device-tier pool is counted without anyone remembering to
+    /// report it.
+    #[test]
+    fn only_device_tier_holders_reach_the_add_back() {
+        // `kv_pool` guards on `holder.tier()`, so the set of holders that can
+        // ever contribute is exactly the device-tier ones. Stated as a test
+        // because the guard is one line inside a constructor and reads as an
+        // optimisation rather than as the correctness condition it is.
+        let device_holders: Vec<_> = [
+            Holder::KvPool,
+            Holder::PipelineKvPool,
+            Holder::DraftKvPool,
+            Holder::WeightResidency,
+            Holder::RecurrentState,
+            Holder::Activations,
+            Holder::FixedDeviceReservation,
+        ]
+        .into_iter()
+        .filter(|holder| holder.tier() == Tier::Device)
+        .collect();
+
+        assert!(
+            !device_holders.iter().any(|holder| matches!(
+                holder,
+                Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool
+            )),
+            "a KV pool is on the device tier, so the add-back is live: \
+             {device_holders:?}"
+        );
     }
 
     /// Holder identities do not collide.

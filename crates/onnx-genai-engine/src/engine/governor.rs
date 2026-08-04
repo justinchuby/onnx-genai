@@ -318,13 +318,19 @@ impl EngineResourceGovernor {
 ///
 /// [`ByteBudget`]: onnx_genai_scheduler::ByteBudget
 ///
-/// # Why the pool grants are added back
+/// # Why pool grants are added back
 ///
-/// `available(Device)` is what is free after *every* lease, and the KV pools'
-/// own grants are among them. But those grants are precisely the memory that
-/// admitted sequences run in, so charging admission for them would count the
-/// same bytes twice and admit roughly nothing. Adding them back leaves exactly
-/// the device memory that is not committed to something other than KV.
+/// `available(Device)` is what is free after *every* device lease. A KV pool
+/// charged to the device tier would be among them, and charging admission for
+/// it would count the same bytes twice -- that pool is precisely the memory
+/// admitted sequences run in -- so it is added back.
+///
+/// **Today that add-back is always zero**, because every KV pool holder is
+/// `Tier::Host`: the pools are host-allocated despite their `num_gpu_pages`
+/// lineage. The arithmetic is here so that moving a pool to the device tier
+/// cannot silently halve what admission will accept, which is the kind of
+/// change that looks local and is not. `a_host_tier_pool_is_not_added_back`
+/// and `a_device_tier_pool_is_added_back` in `memory_plan` pin both halves.
 #[derive(Debug)]
 struct LedgerAdmissionCeiling {
     memory: onnx_runtime_memory_governor::LedgerGovernor,
