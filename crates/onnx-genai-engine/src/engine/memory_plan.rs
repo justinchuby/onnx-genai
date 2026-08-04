@@ -152,6 +152,11 @@ impl Holder {
 pub(crate) struct ModelMemoryPlan {
     governor: onnx_runtime_memory_governor::LedgerGovernor,
     entries: Vec<PlanEntry>,
+    /// Device KV pool grants taken through [`ModelMemoryPlan::kv_pool`].
+    ///
+    /// Shared with the admission ceiling, which runs on the scheduler's path
+    /// and cannot take this plan's lock.
+    kv_pool_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -169,6 +174,7 @@ impl ModelMemoryPlan {
         Self {
             governor,
             entries: Vec::new(),
+            kv_pool_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -279,7 +285,7 @@ impl ModelMemoryPlan {
         layer_configs: Vec<onnx_genai_kv::LayerTensorConfig>,
         pages: usize,
     ) -> Result<onnx_genai_kv::PagedKvCache, onnx_genai_kv::KvError> {
-        onnx_genai_kv::PagedKvCache::new_leased(
+        let cache = onnx_genai_kv::PagedKvCache::new_leased(
             page_size,
             dtype,
             layer_configs,
@@ -287,7 +293,27 @@ impl ModelMemoryPlan {
             &self.governor,
             holder.tier(),
             holder.id(),
-        )
+        )?;
+        // Recorded here rather than at the call site because this is the only
+        // place a governed pool is built, so admission cannot be shown a stale
+        // figure by someone forgetting to report one.
+        if holder.tier() == Tier::Device {
+            self.kv_pool_bytes.fetch_add(
+                cache.pool_lease_bytes().unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(cache)
+    }
+
+    /// A live handle on the device KV pool bytes leased through this plan.
+    ///
+    /// Admission needs it to turn "bytes free on the device" into "bytes
+    /// available for KV": a pool's own grant is already spent from the ledger's
+    /// view, but it is exactly the memory admitted sequences run in, so it is
+    /// not competition for them.
+    pub(crate) fn kv_pool_bytes_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.kv_pool_bytes)
     }
 
     /// What is held, for diagnostics and for the profile report.

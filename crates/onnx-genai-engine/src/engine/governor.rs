@@ -290,12 +290,53 @@ impl EngineResourceGovernor {
     }
 
     pub(crate) fn byte_budget(&self) -> onnx_genai_scheduler::ByteBudget {
-        self.inner.byte_budget()
+        self.inner
+            .byte_budget()
+            .with_ceiling(std::sync::Arc::new(LedgerAdmissionCeiling {
+                memory: self.memory.clone(),
+                kv_pool_bytes: self.plan().kv_pool_bytes_handle(),
+            }))
     }
 
     #[cfg(feature = "native-backend")]
     pub(crate) fn weight_offload_host_cache(&self) -> onnx_runtime_ep_cpu::WeightOffloadHostCache {
         self.weight_offload_host_cache.clone()
+    }
+}
+
+/// Bounds admission by what the memory ledger says is actually free.
+///
+/// The scheduler's [`ByteBudget`] is seeded at load with the KV budget derived
+/// from the device limit less an *estimate* of everything that is not KV. The
+/// things that estimate subtracted are not constants: weight residency grows
+/// when a model touches more experts than its budget assumed, recurrent state
+/// is charged when a hybrid model loads, and a third-party provider may lease
+/// for reasons the engine cannot enumerate. A ceiling computed once at load
+/// does not see any of it, so admission would keep saying yes against room that
+/// had already been spent, and the failure would surface at an allocation far
+/// from the decision that caused it.
+///
+/// [`ByteBudget`]: onnx_genai_scheduler::ByteBudget
+///
+/// # Why the pool grants are added back
+///
+/// `available(Device)` is what is free after *every* lease, and the KV pools'
+/// own grants are among them. But those grants are precisely the memory that
+/// admitted sequences run in, so charging admission for them would count the
+/// same bytes twice and admit roughly nothing. Adding them back leaves exactly
+/// the device memory that is not committed to something other than KV.
+#[derive(Debug)]
+struct LedgerAdmissionCeiling {
+    memory: onnx_runtime_memory_governor::LedgerGovernor,
+    kv_pool_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl onnx_genai_scheduler::AdmissionCeiling for LedgerAdmissionCeiling {
+    fn ceiling_bytes(&self) -> u64 {
+        use onnx_runtime_memory_governor::MemoryGovernor as _;
+        self.memory
+            .available(onnx_runtime_memory_governor::Tier::Device)
+            .saturating_add(self.kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

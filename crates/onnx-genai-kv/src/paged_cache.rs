@@ -178,6 +178,18 @@ impl PagedKvCache {
     }
 
     /// Create a new sequence, returns its ID.
+    /// Bytes this pool holds a governor grant for, or `None` if it was built
+    /// without one.
+    ///
+    /// The pool leases its whole capacity at construction, so this is a
+    /// constant for the life of the cache rather than a running total. It is
+    /// what admission must add back when it asks the ledger how much room is
+    /// left for KV: the pool's own grant is not competition for the sequences
+    /// that will be served out of it.
+    pub fn pool_lease_bytes(&self) -> Option<u64> {
+        self.page_table.leased_bytes()
+    }
+
     pub fn create_sequence(&mut self) -> SequenceId {
         let id = self.next_seq_id;
         self.next_seq_id += 1;
