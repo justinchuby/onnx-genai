@@ -239,7 +239,8 @@ jobs:
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.
-      # mlas-sys is Linux-only, which is fine in this ubuntu quality job.
+      # mlas-sys is also checked by the Windows ARM64 job so MSVC/native
+      # build-script regressions do not hide behind the Linux quality lane.
       - name: Run clippy on all offline crates
         run: >-
           cargo clippy --locked --all-targets
@@ -401,8 +402,8 @@ jobs:
           flags: offline
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
-      # The vendored MLAS feasibility spike is offline, but its build script is
-      # intentionally x86_64 Linux-only (GAS assembly and Linux headers).
+      # Keep MLAS coverage on Linux; the Windows ARM64 lane below separately
+      # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
         run: cargo llvm-cov --locked --codecov --output-path codecov-mlas.json -p mlas-sys
@@ -421,6 +422,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
+      CMAKE_GENERATOR: "Visual Studio 17 2022"
 
     steps:
       - uses: actions/checkout@v5
@@ -454,9 +456,11 @@ jobs:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
-      # Platform execution is the signal here; coverage for these pure-Rust crates
-      # is already reported by x64/macOS lanes, and ARM64 instrumentation owned the
-      # critical path.
+      - name: Build mlas-sys on Windows ARM64
+        run: cargo build --locked --target aarch64-pc-windows-msvc -p mlas-sys
+      # Platform execution is the signal here; coverage for most of these
+      # offline crates is already reported by x64/macOS lanes, and ARM64
+      # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
         run: >-
           cargo test --locked
@@ -497,6 +501,7 @@ jobs:
           -p onnx-genai-runtime-config
           -p onnx-genai-scheduler
           -p onnx-runtime-protocol-trace
+          -p mlas-sys
           -p onnx-runtime-ir
           -p onnx-runtime-ep-api
           -p onnx-runtime-ep-cpu
