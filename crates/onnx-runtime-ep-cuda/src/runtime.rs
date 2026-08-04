@@ -258,10 +258,19 @@ impl CudaRuntime {
         // paths. CUDA component wheels live in sibling directories, so relying on
         // cuBLASLt's ambient dependency lookup would make `nxrt[cuda]` depend on
         // a system CUDA installation.
+        //
+        // Dependants last. `cublas64_*.dll` imports `cublasLt64_*.dll`, and
+        // Windows resolves that import through the default search order, which
+        // does not include the directory the importing DLL was loaded from. So
+        // loading cuBLAS first fails outright unless the wheel directory also
+        // happens to be on `PATH` -- which is exactly the case wheel discovery
+        // exists to stop depending on. Loading cuBLASLt first puts it in the
+        // process, and cuBLAS's import then resolves against the already-loaded
+        // module.
         for library in [
             CudaLibrary::Driver,
-            CudaLibrary::Cublas,
             CudaLibrary::CublasLt,
+            CudaLibrary::Cublas,
         ] {
             require(library).map_err(|message| {
                 EpError::KernelFailed(format!(

@@ -333,6 +333,27 @@ fn load_library(library: CudaLibrary) -> Result<Library, Vec<String>> {
         // SAFETY: paths are supplied by nxrt's installed package layout and the
         // handle is retained for the lifetime of the process below.
         if let Ok(handle) = unsafe { Library::new(&path) } {
+            // A wheel component is a self-contained set of libraries that load
+            // each other *by base name* at runtime: NVRTC opens
+            // `nvrtc-builtins` when it compiles, cuDNN opens its own engine
+            // libraries when a handle is created. Those go through the process
+            // search order, which does not include the directory the caller was
+            // loaded from -- so an absolute path to the entry point does not
+            // help with the loads it makes on its own behalf.
+            //
+            // Loading the siblings here, by absolute path, puts modules of
+            // those base names in the process, and the component's own requests
+            // resolve to them.
+            //
+            // Chosen over the alternatives deliberately. Mutating the process
+            // environment is unsound while another thread reads it, and on
+            // glibc it is also a no-op -- `LD_LIBRARY_PATH` is snapshotted at
+            // startup, so a later `dlopen` never sees the change.
+            // `AddDllDirectory` requires `SetDefaultDllDirectories`, which
+            // changes resolution for every library in the process, CUDA or not.
+            if let Some(directory) = path.parent() {
+                preload_component_siblings(directory, &path);
+            }
             return Ok(handle);
         }
     }
@@ -349,6 +370,55 @@ fn load_library(library: CudaLibrary) -> Result<Library, Vec<String>> {
 
 pub(crate) fn is_available(library: CudaLibrary) -> bool {
     require(library).is_ok()
+}
+
+/// Load the other libraries that live beside `loaded` in its wheel component.
+///
+/// An NVIDIA wheel component is a self-contained set whose members load each
+/// other by base name at runtime -- NVRTC opens `nvrtc-builtins` when it
+/// compiles, cuDNN opens its engine libraries when a handle is created. Those
+/// requests go through the process search order, which does not include the
+/// directory the caller was loaded from, so an absolute path to the entry point
+/// does not help with them. Loading the siblings puts modules of those base
+/// names in the process, and the requests resolve to them.
+///
+/// Best effort by design. A sibling that will not load is not necessarily
+/// needed, and if it is, the failure arrives later with the component's own
+/// message naming the file -- more precise than anything this could say in
+/// advance. What it must not do is fail the load that just succeeded.
+fn preload_component_siblings(directory: &Path, loaded: &Path) {
+    static SEEN: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("CUDA sibling-preload lock poisoned");
+    if seen.iter().any(|existing| existing == directory) {
+        return;
+    }
+    seen.push(directory.to_path_buf());
+
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let suffix = if cfg!(windows) { ".dll" } else { ".so" };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == loaded {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.contains(suffix) {
+            continue;
+        }
+        // SAFETY: an NVIDIA component from the same wheel directory as the
+        // library that was just loaded from it. The handle is leaked on
+        // purpose: these modules must outlive every use of that component,
+        // which is the life of the process.
+        if let Ok(handle) = unsafe { Library::new(&path) } {
+            std::mem::forget(handle);
+        }
+    }
 }
 
 fn cuda_supported(os: TargetOs, arch: TargetArch) -> bool {
