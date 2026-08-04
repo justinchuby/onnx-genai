@@ -15,6 +15,7 @@
 //! pass is worse than a failure, because nobody investigates it.
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::CudaContext;
@@ -30,7 +31,7 @@ use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier
 /// `cuMemAlloc`/`cuMemFree`, both driver entry points.
 fn allocator() -> Option<CudaDeviceAllocator> {
     match CudaContext::new(0) {
-        Ok(context) => Some(CudaDeviceAllocator::new(context, 0)),
+        Ok(context) => Some(CudaDeviceAllocator::new(context)),
         Err(error) => {
             eprintln!(
                 "SKIPPED (no CUDA driver): {error}. This test verifies device allocation \
@@ -204,5 +205,146 @@ fn concurrent_allocations_do_not_overlap() {
         // SAFETY: each address came from `allocate` above with this size and
         // alignment, and each appears once, so this is its single free.
         unsafe { allocator.deallocate(ptr, BYTES, 256) };
+    }
+}
+
+/// A zero-byte allocation reaches `deallocate` with the size it was allocated
+/// with.
+///
+/// The contract says `deallocate` is called with the same `bytes` as
+/// `allocate`, and that implementations may rely on it. `cuMemAlloc(0)` fails,
+/// so someone must round zero up. When the execution provider did that, the
+/// allocator saw 1 byte on the way in and 0 on the way out. `cuMemFree` ignores
+/// the size, so nothing broke -- but a size-classed arena, or any third-party
+/// allocator with a free list, would return the block to the wrong class.
+///
+/// `StrictSizes` below is what such an allocator would be: it remembers the
+/// size it was told per pointer and refuses a free that disagrees. The
+/// execution provider must therefore pass the size through unchanged and leave
+/// the rounding to the allocator.
+#[test]
+fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let Ok(provider) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+        eprintln!(
+            "SKIPPED (no CUDA runtime): the zero-byte size-agreement check did NOT run. It \
+             needs a full execution provider, so it needs cudart and cuBLAS as well as the \
+             driver."
+        );
+        return;
+    };
+    let Some(inner) = allocator() else { return };
+    let strict = Arc::new(StrictSizes::new(inner));
+    let provider = provider
+        .with_memory(Arc::clone(&strict) as Arc<dyn DeviceAllocator>)
+        .expect("an allocator for this EP's own device must be accepted");
+
+    let buffer = provider
+        .allocate(0, 256)
+        .expect("a zero-byte buffer must still be allocatable");
+    provider.deallocate(buffer).expect("and freeable");
+
+    assert_eq!(
+        strict.mismatches.load(Ordering::Relaxed),
+        0,
+        "the size passed to allocate and the size passed to deallocate disagree"
+    );
+    assert_eq!(
+        strict.unknown.load(Ordering::Relaxed),
+        0,
+        "a pointer was freed that this allocator never handed out"
+    );
+    assert_eq!(strict.live.lock().unwrap().len(), 0, "the buffer leaked");
+}
+
+/// An allocator that does not serve this EP's device is refused.
+///
+/// Pointers handed to `with_memory` are given to kernels as this device's
+/// addresses. A host allocator's pointer is a perfectly valid host address, so
+/// nothing detects the substitution until a kernel dereferences it on the
+/// device -- far from the call that caused it.
+#[test]
+fn an_allocator_for_the_wrong_device_is_refused() {
+    let Ok(provider) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+        eprintln!("SKIPPED (no CUDA runtime): the device-mismatch check did NOT run.");
+        return;
+    };
+    let error = provider
+        .with_memory(Arc::new(onnx_runtime_memory_governor::HostAllocator))
+        .err()
+        .expect("host memory is not CUDA device memory");
+    let message = error.to_string();
+    assert!(
+        message.contains("CUDA device 0"),
+        "the error must name the device that was expected: {message}"
+    );
+}
+
+/// The allocator reports the device its context actually belongs to.
+///
+/// Taking the ordinal as a separate argument let the two disagree, and nothing
+/// downstream can detect that: callers use `device()` to decide where a pointer
+/// is valid, so a wrong answer becomes an invalid address inside a kernel.
+#[test]
+fn the_reported_device_comes_from_the_context() {
+    let Ok(context) = CudaContext::new(0) else {
+        eprintln!("SKIPPED (no CUDA driver): device identity check did NOT run.");
+        return;
+    };
+    let ordinal = context.ordinal() as u32;
+    let allocator = CudaDeviceAllocator::new(context);
+    assert_eq!(allocator.device(), DeviceKey::device(ordinal));
+}
+
+/// Records the size it was told per pointer and reports any free that
+/// disagrees, the way a size-classed allocator would notice.
+#[derive(Debug)]
+struct StrictSizes {
+    inner: CudaDeviceAllocator,
+    live: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+    mismatches: AtomicU64,
+    unknown: AtomicU64,
+}
+
+impl StrictSizes {
+    fn new(inner: CudaDeviceAllocator) -> Self {
+        Self {
+            inner,
+            live: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mismatches: AtomicU64::new(0),
+            unknown: AtomicU64::new(0),
+        }
+    }
+}
+
+impl DeviceAllocator for StrictSizes {
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        let ptr = self.inner.allocate(bytes, align)?;
+        self.live
+            .lock()
+            .unwrap()
+            .insert(ptr.as_ptr() as usize, bytes);
+        Ok(ptr)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        match self.live.lock().unwrap().remove(&(ptr.as_ptr() as usize)) {
+            Some(allocated) if allocated == bytes => {}
+            Some(allocated) => {
+                self.mismatches.fetch_add(1, Ordering::Relaxed);
+                eprintln!("freed {bytes} bytes for a pointer allocated as {allocated}");
+            }
+            None => {
+                self.unknown.fetch_add(1, Ordering::Relaxed);
+                eprintln!("freed a pointer this allocator never handed out");
+            }
+        }
+        // SAFETY: forwarded unchanged from this method's own contract.
+        unsafe { self.inner.deallocate(ptr, bytes, align) };
+    }
+
+    fn device(&self) -> DeviceKey {
+        self.inner.device()
     }
 }

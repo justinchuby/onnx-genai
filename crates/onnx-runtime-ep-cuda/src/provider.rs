@@ -97,7 +97,6 @@ impl CudaExecutionProvider {
             device: DeviceId::cuda(ordinal),
             memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
                 runtime.cuda_context(),
-                ordinal,
             )),
             runtime,
             initialized: false,
@@ -116,12 +115,30 @@ impl CudaExecutionProvider {
     /// synchronising driver call in the microseconds, so unlike host memory,
     /// device memory genuinely needs one — and behind this seam it is written
     /// once rather than once per backend.
+    ///
+    /// # Errors
+    ///
+    /// If `memory` does not serve this EP's device. Pointers from it are handed
+    /// to kernels as this device's addresses, so a host allocator or another
+    /// device's allocator would produce an address that is invalid where it is
+    /// used. That fails inside a kernel launch, far from the substitution that
+    /// caused it, so it is rejected here instead.
     pub fn with_memory(
         mut self,
         memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let key = memory.device();
+        let expected = onnx_runtime_memory_governor::DeviceKey::device(self.device.index);
+        if key != expected {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: this execution provider serves CUDA device {}, but the allocator \
+                 offered serves {:?} {}; its pointers would not be valid where this EP uses \
+                 them. Supply an allocator for CUDA device {}.",
+                expected.index, key.tier, key.index, expected.index
+            )));
+        }
         self.memory = memory;
-        self
+        Ok(self)
     }
 
     /// Construct and initialize a CUDA execution provider with default settings.
@@ -472,13 +489,21 @@ impl ExecutionProvider for CudaExecutionProvider {
         // caller can install on the CPU EP or the ONNX Runtime side backs this
         // one. The default is `CudaDeviceAllocator`, which is the `cuMemAlloc`
         // this used to call directly.
-        let ptr =
-            self.memory
-                .allocate(size.max(1), alignment)
-                .map_err(|_| EpError::OutOfMemory {
-                    requested: size,
-                    available: 0,
-                })?;
+        //
+        // `size` is passed through unchanged so that `deallocate` can pass the
+        // same value; normalising a zero-byte request is the allocator's job,
+        // because the contract lets an implementation rely on the two sizes
+        // agreeing.
+        let ptr = self.memory.allocate(size, alignment).map_err(|error| {
+            // Keep what the allocator said. Reporting every failure as "out of
+            // memory" would describe an alignment rejection or a dead context
+            // as exhausted VRAM and send the reader looking in the wrong place.
+            EpError::KernelFailed(format!(
+                "cuda_ep: could not allocate {size} bytes aligned to {alignment} on CUDA device \
+                 {}: {error}",
+                self.device.index
+            ))
+        })?;
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in
         // `deallocate`. It is a device address, never dereferenced on the host.

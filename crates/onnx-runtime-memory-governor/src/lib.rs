@@ -199,6 +199,25 @@ pub enum MemoryError {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// The request was well formed and within budget, but the allocator behind
+    /// the tier refused it for a reason of its own.
+    ///
+    /// Distinct from [`MemoryError::TierExhausted`], which means *we* declined,
+    /// and from [`MemoryError::InvalidRequest`], which means the caller asked
+    /// for something impossible. This one carries the backing allocator's own
+    /// account of the failure, which is usually the only thing that identifies
+    /// it: a driver that is out of memory and a driver that has no context both
+    /// fail an allocation, and calling them both "out of memory" sends the next
+    /// person to read the log in the wrong direction.
+    #[error("cannot allocate {requested} bytes of {tier} memory: {reason}")]
+    AllocationFailed {
+        /// Which tier was addressed.
+        tier: &'static str,
+        /// What the caller asked for.
+        requested: u64,
+        /// What the backing allocator said.
+        reason: String,
+    },
 }
 
 /// Per-tier accounting shared by a governor and every lease it has granted.

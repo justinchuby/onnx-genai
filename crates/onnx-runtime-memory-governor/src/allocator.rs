@@ -89,19 +89,13 @@ impl DeviceKey {
 ///   All three take `&self`, and the `Send + Sync` bound is not decoration: one
 ///   allocator serves every session on its device, so concurrent sessions are
 ///   the normal case rather than an edge one. An implementation that needs
-///   exclusive state must carry its own lock. In particular two `allocate`
-///   calls that overlap in time must return disjoint regions, and a
-///   `deallocate` must not be observable by an `allocate` that has already
-///   returned.
-///
-/// # Concurrency and CUDA graph capture
-///
-/// On a device backend, `allocate` and `deallocate` are typically driver calls,
-/// and a driver allocation made *by a thread that is currently capturing a CUDA
-/// graph* invalidates that capture. This is a property of the caller's thread,
-/// not of this allocator, so the contract does not forbid it — but it is the
-/// reason a device implementation is expected to grow an arena that can serve a
-/// request without entering the driver.
+///   exclusive state must carry its own lock.
+/// * Every successful `allocate` owns a region that overlaps no other **live**
+///   allocation from this allocator. A region becomes reusable only once its
+///   matching `deallocate` has been called. Concurrent calls must behave as
+///   though they happened in some sequential order — an implementation whose
+///   locking lets two callers be handed the same region would let one session
+///   overwrite another's tensors, silently and only under load.
 pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
