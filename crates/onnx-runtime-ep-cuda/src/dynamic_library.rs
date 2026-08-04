@@ -203,8 +203,18 @@ fn wheel_roots_from_environment() -> Vec<PathBuf> {
     }
 
     roots.retain(|path| path.is_absolute());
-    roots.dedup();
-    roots
+    // `Vec::dedup` would only drop *consecutive* repeats, and one root is
+    // reached through every component directory on the path, which need not be
+    // adjacent. Duplicates are not incorrect, only repeated failed probes and a
+    // noisier candidate list on failure -- but the explicit path already rejects
+    // them this way, so both behave alike.
+    let mut unique = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+    }
+    unique
 }
 
 /// The root a `<root>/nvidia/<component>/{bin,lib}` entry belongs to.
@@ -231,19 +241,52 @@ fn loaded_libraries() -> &'static Mutex<Vec<(CudaLibrary, Library)>> {
     LIBRARIES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// How many entries at the front of the search list were configured
+/// explicitly rather than inferred from the environment.
+fn explicit_root_count() -> &'static std::sync::atomic::AtomicUsize {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &COUNT
+}
+
+/// Insert `paths` into `roots` at `at`, skipping relative and duplicate
+/// entries, and answer how many were added.
+///
+/// Split out from [`set_wheel_search_paths`] so the precedence rule can be
+/// tested without touching process-global state.
+fn insert_explicit_roots(
+    roots: &mut Vec<PathBuf>,
+    at: usize,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> usize {
+    let mut added = 0;
+    for path in paths {
+        if path.is_absolute() && !roots.contains(&path) {
+            roots.insert(at + added, path);
+            added += 1;
+        }
+    }
+    added
+}
+
 /// Add roots such as Python's `site-packages` directory to the CUDA wheel search
 /// path. NVIDIA's pip wheels install component libraries beneath
 /// `nvidia/<component>/{lib,bin}` relative to these roots. Relative roots are
 /// rejected so wheel libraries are never loaded relative to the process CWD.
+///
+/// These take precedence over roots inferred from the environment. The Python
+/// bindings pass the interpreter's own `site-packages`, and a different CUDA
+/// major version sitting on the machine's `PATH` must not outrank the
+/// environment the caller actually selected — loading components from two
+/// toolkits at once is worse than finding none.
 pub fn set_wheel_search_paths(paths: impl IntoIterator<Item = PathBuf>) {
+    use std::sync::atomic::Ordering;
+
     let mut configured = wheel_search_paths()
         .lock()
         .expect("CUDA wheel search-path lock poisoned");
-    for path in paths {
-        if path.is_absolute() && !configured.contains(&path) {
-            configured.push(path);
-        }
-    }
+    let at = explicit_root_count().load(Ordering::Relaxed);
+    let added = insert_explicit_roots(&mut configured, at, paths);
+    explicit_root_count().fetch_add(added, Ordering::Relaxed);
 }
 
 /// CUDA runtime-header directories owned by configured NVIDIA wheels.
@@ -420,16 +463,36 @@ mod tests {
     /// test` found `nvcuda.dll` -- which ships with the display driver -- but
     /// not cuBLAS, NVRTC or the CUDA headers, and 44 GPU test files skipped on
     /// a machine that could run them.
+    ///
+    /// Split by platform because `Path` parses with host semantics: a
+    /// backslash is an ordinary filename character on Unix, so a Windows
+    /// literal here would assert nothing there.
     #[test]
+    #[cfg(windows)]
     fn a_wheel_library_directory_identifies_its_root() {
-        // Windows wheels use `bin`, everything else `lib`.
+        // Windows wheels put their libraries in `bin`.
+        assert_eq!(
+            wheel_root_of(Path::new(r"C:\py\site-packages\nvidia\cuda_nvrtc\bin")),
+            Some(PathBuf::from(r"C:\py\site-packages"))
+        );
+        // Forward slashes are also separators on Windows.
+        assert_eq!(
+            wheel_root_of(Path::new("C:/py/site-packages/nvidia/cublas/lib")),
+            Some(PathBuf::from("C:/py/site-packages"))
+        );
+    }
+
+    /// See the Windows counterpart above.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_wheel_library_directory_identifies_its_root() {
         assert_eq!(
             wheel_root_of(Path::new("/opt/venv/site-packages/nvidia/cublas/lib")),
             Some(PathBuf::from("/opt/venv/site-packages"))
         );
         assert_eq!(
-            wheel_root_of(Path::new(r"C:\py\site-packages\nvidia\cuda_nvrtc\bin")),
-            Some(PathBuf::from(r"C:\py\site-packages"))
+            wheel_root_of(Path::new("/opt/venv/site-packages/nvidia/cuda_nvrtc/bin")),
+            Some(PathBuf::from("/opt/venv/site-packages"))
         );
     }
 
@@ -454,6 +517,42 @@ mod tests {
                 "{entry} is not a wheel component directory"
             );
         }
+    }
+
+    /// An explicitly configured root is searched before any the environment
+    /// merely implied.
+    ///
+    /// The Python bindings pass the interpreter's own `site-packages`. A
+    /// different CUDA major version sitting on the machine's `PATH` must not
+    /// take precedence over the environment the caller actually selected,
+    /// because mixing the two loads components from two different toolkits.
+    #[test]
+    fn an_explicit_root_outranks_one_derived_from_the_environment() {
+        // Built from an absolute base because "absolute" is platform-specific:
+        // a leading slash is not absolute on Windows.
+        let base = std::env::current_dir().expect("a current directory");
+        let derived = base.join("derived-from-path");
+        let explicit = base.join("chosen-by-the-caller");
+        let second = base.join("also-chosen");
+
+        let mut roots = vec![derived.clone()];
+        assert_eq!(insert_explicit_roots(&mut roots, 0, [explicit.clone()]), 1);
+        assert_eq!(roots.first(), Some(&explicit));
+
+        // A second explicit root follows the first, still ahead of the derived one.
+        assert_eq!(insert_explicit_roots(&mut roots, 1, [second.clone()]), 1);
+        assert_eq!(roots, vec![explicit.clone(), second, derived]);
+
+        // A repeat is not added again, and reports that it added nothing so the
+        // insertion point does not drift past the end.
+        assert_eq!(insert_explicit_roots(&mut roots, 2, [explicit]), 0);
+
+        // A relative root is refused, so a wheel is never loaded relative to
+        // the process working directory.
+        assert_eq!(
+            insert_explicit_roots(&mut roots, 2, [PathBuf::from("site-packages")]),
+            0
+        );
     }
 
     #[test]
