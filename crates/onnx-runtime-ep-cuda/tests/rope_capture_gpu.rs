@@ -145,9 +145,15 @@ fn read(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, bytes: usize) -> Vec<
     host
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standalone_rope_decode_captures_and_matches_eager_without_fallback() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let kernel = standalone_rope_kernel(&ep);
     let token_elements = HEADS * HEAD_DIM;

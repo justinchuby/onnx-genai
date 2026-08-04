@@ -1159,9 +1159,15 @@ fn run_forced_parity_case(ep: &CudaExecutionProvider, case: &ParityCase) {
     assert_eq!(fused[2], baseline[2]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_fused_causal_origin_matches_baseline_when_query_and_key_lengths_differ() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for (name, batch, totals, past_capacity, capacity, seed) in [
             ("fresh", 1usize, vec![4usize], 0usize, 4usize, 681u64),
@@ -1202,9 +1208,15 @@ fn gqa_gpu_fused_causal_origin_matches_baseline_when_query_and_key_lengths_diffe
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_forced_fused_matches_baseline_parity_matrix() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let mut cases = Vec::new();
     let mut seed = 701u64;
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
@@ -1311,9 +1323,15 @@ fn gqa_gpu_forced_fused_matches_baseline_parity_matrix() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_fp16_decode_split_k_long_context_is_deterministic_and_matches_baseline() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = ParityCase {
         name: "float16-gqa-decode-split-k-long-rope".into(),
         dtype: DataType::Float16,
@@ -1364,9 +1382,15 @@ fn gqa_gpu_fp16_decode_split_k_long_context_is_deterministic_and_matches_baselin
     assert_eq!(first[2], baseline[2]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for case in [
         ParityCase {
             name: "auto-decode-fallback".into(),
@@ -1639,9 +1663,15 @@ fn gqa_prefill_h200_benchmark() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_head_sharing_matches_manual_repeat_kv_reference() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let q = [
         1., 0., 1., 0., 0., 1., 0., 1., 0., 1., 0., 1., 1., 0., 1., 0.,
     ];
@@ -1684,9 +1714,15 @@ fn gqa_gpu_head_sharing_matches_manual_repeat_kv_reference() {
     close(&outputs[2], &v_bnsh);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_scalar_seqlens_requires_unit_batch_and_valid_value() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let mut inputs = base_inputs(
         &[1, 1, 8],
         &[1., 0., 1., 0., 0., 1., 0., 1.],
@@ -1731,10 +1767,16 @@ fn gqa_gpu_scalar_seqlens_requires_unit_batch_and_valid_value() {
     assert!(format!("{error}").contains("exceeds physical total_sequence_length"));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_unit_batch_scalar_matches_cpu_oracle_and_cuda_vector() {
     let Some(ep) = gpu() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let q = [1., 0., 1., 0., 0., 1., 0., 1.];
     let k = [1., 0., 0., 1.];
@@ -1758,9 +1800,15 @@ fn gqa_gpu_unit_batch_scalar_matches_cpu_oracle_and_cuda_vector() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_batch_trailing_singleton_seqlens_matches_vector_for_any_batch() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for case in [
         ParityCase {
             name: "seqlens-batch1".into(),
@@ -1814,9 +1862,15 @@ fn gqa_gpu_batch_trailing_singleton_seqlens_matches_vector_for_any_batch() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_rejects_noncanonical_seqlens_singleton_shapes_actionably() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = ParityCase {
         name: "seqlens-invalid-layouts".into(),
         dtype: DataType::Float32,
@@ -1848,10 +1902,16 @@ fn gqa_gpu_rejects_noncanonical_seqlens_singleton_shapes_actionably() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_scalar_rejects_multi_batch() {
     let Some(ep) = gpu() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let mut inputs = base_inputs(
         &[2, 1, 8],
@@ -1879,10 +1939,16 @@ fn gqa_gpu_scalar_rejects_multi_batch() {
     assert!(message.contains("contiguous int32 [batch_size] or [batch_size, 1]"));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_scalar_preserves_dtype_layout_value_and_shape_validation() {
     let Some(ep) = gpu() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let base = || {
         base_inputs(
@@ -1929,9 +1995,15 @@ fn gqa_gpu_scalar_preserves_dtype_layout_value_and_shape_validation() {
     assert!(message.contains("got shape [2]"));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let kernel =
         GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
@@ -2143,9 +2215,15 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_capture_detects_invalid_decode_metadata() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let kernel =
         GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
@@ -2284,9 +2362,15 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let kernel =
         GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
@@ -2497,9 +2581,15 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_decode_preserves_fixed_cache_capacity_and_write_offset() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let q = [1., 0., 1., 0., 0., 1., 0., 1.];
     let past_k = [
         1., 0., 0., 1., 91., 92., 93., 94., 95., 96., 10., 0., 0., 10., 81., 82., 83., 84., 85.,
@@ -2561,9 +2651,15 @@ fn gqa_gpu_decode_preserves_fixed_cache_capacity_and_write_offset() {
 // the present-cache write position, the batched output for each row must equal
 // that row run alone. This validates that BatchedSharedBufferDecodeSession is
 // possible.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_shared_buffer_batches_rows_of_different_lengths() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
 
     // Row 0: past_len = 2, capacity = 5.
     let q0 = [1., 0., 1., 0., 0., 1., 0., 1.];
@@ -2661,9 +2757,15 @@ fn gqa_gpu_shared_buffer_batches_rows_of_different_lengths() {
     close(&batched[2][20..40], &out_row1[2]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_rope_explicit_positions_rotate_query_and_key() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let q = [
         1., 2., 2., -1., -1., 3., 4., 2., 3., -2., 1., 4., -3., 1., 2., 5.,
     ];
@@ -2727,11 +2829,17 @@ fn gqa_gpu_rope_explicit_positions_rotate_query_and_key() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_partial_rope_supports_all_query_dtypes() {
     const HEAD_DIM: usize = 6;
     const ROTARY_DIM: usize = 4;
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let positions = [1_i64, 2];
     let mut cos = Vec::with_capacity(3 * ROTARY_DIM / 2);
     let mut sin = Vec::with_capacity(cos.capacity());
@@ -2819,9 +2927,15 @@ fn gqa_gpu_partial_rope_supports_all_query_dtypes() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_partial_rope_rejects_invalid_cache_shapes_actionably() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let q = [0.0; 16];
     let kv = [0.0; 8];
     let base = base_inputs(&[1, 1, 16], &q, &[1, 1, 8], &kv, &kv, None, None, &[0], 1);
@@ -2847,9 +2961,15 @@ fn gqa_gpu_partial_rope_rejects_invalid_cache_shapes_actionably() {
     assert!(message.contains("same rotary_dim"));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let q = [2., 0., 2., 0., 2., 0., 2., 0.];
     let past_k = [1., 0., 4., 0., 10., 0., 40., 0.];
     let past_v = [1., 0., 3., 0., 10., 0., 30., 0.];
@@ -2894,9 +3014,15 @@ fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_physical_capacity_can_exceed_valid_prefix() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     const VALID: usize = 5;
     const PAST: usize = VALID - 1;
     const CAPACITY: usize = 128;
@@ -2959,6 +3085,10 @@ fn gqa_gpu_physical_capacity_can_exceed_valid_prefix() {
     close(&fixed[0], &exact[0]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     const NUM_HEADS: usize = 14;
@@ -2966,7 +3096,9 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     const HEAD_DIM: usize = 64;
     const CAPACITY: usize = 64;
     const PREFILL: usize = 3;
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
 
     let mut cos = Vec::with_capacity(CAPACITY * HEAD_DIM / 2);
     let mut sin = Vec::with_capacity(cos.capacity());
@@ -3150,6 +3282,10 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
     ep.deallocate(step.cache_v).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_partial_rope_rotates_prefix_and_preserves_tail() {
     const NUM_HEADS: usize = 14;
@@ -3157,7 +3293,9 @@ fn gqa_gpu_partial_rope_rotates_prefix_and_preserves_tail() {
     const HEAD_DIM: usize = 64;
     const ROTARY_DIM: usize = 32;
     const CAPACITY: usize = 4;
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
 
     let mut cos = Vec::with_capacity(CAPACITY * ROTARY_DIM / 2);
     let mut sin = Vec::with_capacity(cos.capacity());
@@ -3298,6 +3436,10 @@ fn gqa_gpu_partial_rope_rotates_prefix_and_preserves_tail() {
     ep.deallocate(step.cache_v).unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
     // The fused single-token decode-prep launch must be byte-for-byte identical
@@ -3305,7 +3447,9 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
     // same decode step through both paths (fusion on vs. forced off) on cloned
     // device state and asserts the output and the appended KV cache match
     // exactly. Uses the 4-head/2-kv/dim-2/capacity-5 fixed decode signature.
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let fused =
         GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
@@ -3391,9 +3535,15 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_gpu_rejected_features_return_clear_errors() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let mut registered = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
     registered.domain = "com.microsoft".into();
     assert!(matches!(

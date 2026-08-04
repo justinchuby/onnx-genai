@@ -2692,6 +2692,10 @@ fn conformance_profile() -> Vec<ProfileEntry> {
 /// This is the highest-value guard: it fails the moment an op is added to
 /// `CUDA_COVERED_OPS` without a corresponding parity test — the "claimed but
 /// untested" defect class (e.g. the `ReduceLogSumExp` and bf16 misses).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn every_covered_op_has_a_conformance_entry() {
     let profile = conformance_profile();
@@ -2729,6 +2733,10 @@ fn every_covered_op_has_a_conformance_entry() {
 
 /// No op may appear twice in the profile, and every `Sweep` entry must carry at
 /// least one case.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn profile_has_no_duplicate_entries() {
     let profile = conformance_profile();
@@ -2752,6 +2760,10 @@ fn profile_has_no_duplicate_entries() {
 /// Each `Dedicated` suite file must exist and actually name its op, so a
 /// deleted, renamed, or gutted suite cannot silently leave an op unverified
 /// while it stays in `CUDA_COVERED_OPS`.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn dedicated_suites_exist_and_name_their_op() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
@@ -2838,9 +2850,15 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) {
 
 /// Execute every inline `Sweep` case against the CPU oracle on the real GPU.
 /// Skips cleanly on a host without a CUDA device.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn conformance_sweep_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let mut ran = 0usize;
     for entry in conformance_profile() {
         if let Coverage::Sweep(cases) = &entry.coverage {

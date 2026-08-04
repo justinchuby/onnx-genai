@@ -65,9 +65,15 @@ fn check(ep: &onnx_runtime_ep_cuda::CudaExecutionProvider, dtype: DataType, inte
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn contrib_rotary_matches_cpu() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for interleaved in [0, 1] {
             check(&ep, dtype, interleaved);

@@ -134,6 +134,10 @@ fn run_gather(
     got
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_gpu_embedding_i64_negative_index_exact() {
     let ep = gpu();
@@ -153,6 +157,10 @@ fn gather_gpu_embedding_i64_negative_index_exact() {
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_gpu_axis1_i32_exact() {
     let ep = gpu();
@@ -172,6 +180,10 @@ fn gather_gpu_axis1_i32_exact() {
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_gpu_two_dimensional_indices_exact() {
     let ep = gpu();
@@ -191,6 +203,10 @@ fn gather_gpu_two_dimensional_indices_exact() {
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
     let ep = gpu();
@@ -409,6 +425,10 @@ impl ClampEnd for i64 {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn shape_gpu_full_and_negative_slice_exact() {
     let ep = gpu();
@@ -448,6 +468,10 @@ fn run_constant(
     got
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn constant_gpu_fp32_and_i64_tensor_exact() {
     let ep = gpu();

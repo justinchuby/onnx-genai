@@ -193,9 +193,15 @@ fn cpu_reference(query: &[f32], key: &[f16], value: &[f16]) -> Vec<f32> {
     output
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn claim_accepts_fp16_zero_append_shared_cache_decode() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let (graph, node, shapes, dtypes) = gqa_node();
     assert!(
         matches!(
@@ -206,9 +212,15 @@ fn claim_accepts_fp16_zero_append_shared_cache_decode() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let kernel = GroupQueryAttentionKernel::new(
         runtime.clone(),

@@ -243,9 +243,15 @@ fn as_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn basic_gather_matches_cpu_and_expected() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     // cache [B=1,G=1,C=4,D=2], indices [1,1,1,4] selecting 2,0,2,3 (dup + order).
     let cache = HostTensor::f32(
         &[1, 1, 4, 2],
@@ -268,9 +274,15 @@ fn basic_gather_matches_cpu_and_expected() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn int32_indices_and_multibatch_group_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     // B=2, G=2, C=3, D=2; Q=2, K=3. Distinct values per (b,g) record.
     let mut cache_vals = Vec::new();
     for bg in 0..4 {
@@ -304,9 +316,15 @@ fn int32_indices_and_multibatch_group_match_cpu() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn valid_lengths_limits_gather_and_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let cache = HostTensor::f32(
         &[1, 1, 4, 2],
         &[0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
@@ -329,9 +347,15 @@ fn valid_lengths_limits_gather_and_matches_cpu() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn index_at_or_beyond_valid_length_errors() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     // valid_lengths=3 makes index 3 out of range even though cache has 4 rows.
     let cache = HostTensor::f32(&[1, 1, 4, 2], &[0.0; 8]);
     let indices = HostTensor::i64(&[1, 1, 1, 3], &[0, 1, 3]);
@@ -351,9 +375,15 @@ fn index_at_or_beyond_valid_length_errors() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn negative_index_errors() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let cache = HostTensor::f32(&[1, 1, 4, 2], &[0.0; 8]);
     let indices = HostTensor::i64(&[1, 1, 1, 3], &[0, -1, 2]);
     let out_shape = [1, 1, 1, 3, 2];
@@ -366,9 +396,15 @@ fn negative_index_errors() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn empty_selection_yields_empty_output() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     // K=0 -> zero selected records, a valid empty contiguous output.
     let cache = HostTensor::f32(&[1, 1, 1, 2], &[1.0, 2.0]);
     let indices = HostTensor::i64(&[1, 1, 3, 0], &[]);
@@ -379,9 +415,15 @@ fn empty_selection_yields_empty_output() {
     assert!(gpu_out.is_empty());
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn zero_dim_valid_indices_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
     let indices = HostTensor::i64(&[1, 1, 2, 2], &[0, 2, 1, 0]);
     let valid = HostTensor::i64(&[1], &[3]);
@@ -394,9 +436,15 @@ fn zero_dim_valid_indices_match_cpu() {
     assert_eq!(gpu_out, cpu_out);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn zero_dim_negative_index_errors_like_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
     let indices = HostTensor::i64(&[1, 1, 1, 2], &[0, -1]);
     let out_shape = [1, 1, 1, 2, 0];
@@ -415,9 +463,15 @@ fn zero_dim_negative_index_errors_like_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn zero_dim_indices_at_or_above_cache_length_error_like_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let out_shape = [1, 1, 1, 1, 0];
     for index in [3, 4] {
         let cache = HostTensor::f32(&[1, 1, 3, 0], &[]);
@@ -439,9 +493,15 @@ fn zero_dim_indices_at_or_above_cache_length_error_like_cpu() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_gather_matches_bit_exact_copy() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let values = [0.0f32, 1.5, -2.25, 3.0, 4.5, -5.5, 6.0, 7.75];
     let cache = HostTensor::f16(&[1, 1, 4, 2], &values);
     let indices = HostTensor::i64(&[1, 1, 1, 4], &[3, 0, 3, 1]);
@@ -457,9 +517,15 @@ fn f16_gather_matches_bit_exact_copy() {
     assert_eq!(got, [6.0, 7.75, 0.0, 1.5, 6.0, 7.75, -2.25, 3.0]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn bf16_gather_matches_bit_exact_copy() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let cache = HostTensor::bf16(&[1, 1, 3, 2], &values);
     let indices = HostTensor::i32(&[1, 1, 1, 3], &[2, 2, 0]);
@@ -474,9 +540,15 @@ fn bf16_gather_matches_bit_exact_copy() {
     assert_eq!(got, [5.0, 6.0, 5.0, 6.0, 1.0, 2.0]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn deepseek_kv_layout_shape_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     // Realistic compressed-sparse-attention decode geometry: a small head count
     // and head dim, a 130-wide candidate row (128 window + 2 compressed), and a
     // KV cache long enough to exercise the ring/compressed offset span.

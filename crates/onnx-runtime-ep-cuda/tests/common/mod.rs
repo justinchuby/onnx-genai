@@ -355,8 +355,8 @@ pub fn run_cpu(
     output_bytes
 }
 
-/// Construct the default CUDA EP, or `None` when no GPU / runtime is available
-/// so the caller can graceful-skip on a CPU-only host or CI runner.
+/// Construct the default CUDA EP, or `None` when no GPU / runtime is available.
+/// Callers must panic on `None`; CPU-only runs rely on the `gpu-tests` ignore gate.
 pub fn cuda_ep() -> Option<CudaExecutionProvider> {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => Some(ep),

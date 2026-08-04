@@ -748,18 +748,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
-      # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit,
-      # but ep-cuda tests require a CUDA runtime/GPU and must not join the
-      # portable test lane. This lane intentionally excludes macOS, where CUDA
-      # is unsupported. ORT-linked crates also stay out of portable tests because
-      # onnx-genai-ort-sys downloads native ORT; onnx-runtime-python's feature
-      # check here provides compile coverage for that integration path.
+      # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
+      # The CUDA integration tests are compiled and reported as ignored unless
+      # the `gpu-tests` feature is enabled on a real CUDA runner. ORT-linked
+      # crates stay out of portable tests because onnx-genai-ort-sys downloads
+      # native ORT; onnx-runtime-python's feature check here provides compile
+      # coverage for that integration path.
       - name: Check CUDA execution provider and Python feature
         run: >-
           cargo check --locked
           -p onnx-runtime-ep-cuda
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
+
+      - name: Verify CUDA test skip honesty
+        run: python .github/scripts/verify_cuda_test_honesty.py
+
+      - name: Test CUDA harness with GPU tests ignored
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda
 
       - name: Clippy CUDA execution provider
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings

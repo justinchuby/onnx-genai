@@ -150,10 +150,16 @@ fn cuda_ep() -> Option<CudaExecutionProvider> {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_maxpool_matches_cpu_for_f32_and_f16() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let input = [
         1.0, 3.0, 2.0, 0.0, 4.0, 6.0, 5.0, 1.0, 7.0, 8.0, 9.0, 2.0, 3.0, 4.0, 1.0, 0.0,
@@ -176,10 +182,16 @@ fn cudnn_maxpool_matches_cpu_for_f32_and_f16() {
     println!("cuDNN MaxPool 2x2 stride-2 f32/f16 cases passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_averagepool_padding_count_modes_match_cpu() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let input = [1.0, 2.0, 3.0, 4.0];
     for (count_include_pad, expected) in [
@@ -202,10 +214,16 @@ fn cudnn_averagepool_padding_count_modes_match_cpu() {
     println!("cuDNN AveragePool padded include/exclude-padding cases passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_averagepool_rejects_dilations() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let (mut graph, node) = build_pool_model(
         "AveragePool",

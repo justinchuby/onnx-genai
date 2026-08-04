@@ -218,7 +218,9 @@ fn varied(count: usize, seed: f32) -> Vec<f32> {
 /// assert the replayed output is byte-identical to the eager output and matches
 /// the f32 oracle. Runs several decode steps with fresh inputs each step.
 fn capture_matches_eager_and_oracle(op: &str, dtype: DataType, is_mean: bool) {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
 
     // Router-style shape: [1,5,8] reduce trailing axis -> [1,5,1], keepdims.
@@ -344,21 +346,37 @@ fn capture_matches_eager_and_oracle(op: &str, dtype: DataType, is_mean: bool) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_sum_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceSum", DataType::Float16, false);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_mean_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceMean", DataType::Float16, true);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f32_reduce_sum_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceSum", DataType::Float32, false);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f32_reduce_mean_captures_and_matches_eager() {
     capture_matches_eager_and_oracle("ReduceMean", DataType::Float32, true);
@@ -368,9 +386,15 @@ fn f32_reduce_mean_captures_and_matches_eager() {
 /// shape: warm shape A, then run shape B, then shape A again — each must be
 /// numerically correct (a shape-blind cache would reuse A's workspace/descriptor
 /// for B and corrupt the result).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];
@@ -430,9 +454,15 @@ fn float_reduce_same_kernel_alternating_shapes_stays_correct() {
 /// stale workspace/descriptor. Warm shape A, begin capture, then execute a
 /// different shape B: the cache miss during capture must error. The capture is
 /// then aborted cleanly.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn float_reduce_shape_change_under_capture_is_rejected() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];

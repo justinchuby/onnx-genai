@@ -24,9 +24,15 @@ fn assert_float_outputs(label: &str, dtype: DataType, cuda: &[Vec<u8>], cpu: &[V
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn affine_grid_matches_cpu_for_two_and_three_dimensional_grids() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for (theta_shape, theta, size, output_shape, align_corners) in [
             (
@@ -59,9 +65,15 @@ fn affine_grid_matches_cpu_for_two_and_three_dimensional_grids() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn batch_normalization_matches_cpu_across_float_storage_types() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let x = [-3.0, -1.0, 2.0, 4.0, 0.5, 1.5, -2.5, 8.0];
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         let inputs = vec![
@@ -79,9 +91,15 @@ fn batch_normalization_matches_cpu_across_float_storage_types() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn compress_matches_cpu_for_negative_axis_and_flattened_selection() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let axis_inputs = vec![
         input(DataType::Int32, &[2, 4], &[1i32, 2, 3, 4, 5, 6, 7, 8]),
         input(DataType::Bool, &[3], &[false, true, true]),
@@ -112,9 +130,15 @@ fn compress_matches_cpu_for_negative_axis_and_flattened_selection() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn dynamic_quantize_linear_matches_cpu_for_ranges_and_constants() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for values in [
         vec![-5.0f32, -1.25, 0.0, 0.5, 4.0, 12.0],
         vec![3.25f32; 7],
@@ -141,7 +165,9 @@ fn dynamic_quantize_linear_matches_cpu_for_ranges_and_constants() {
 }
 
 fn global_pool_case(op: &str, opset: u64, attributes: &[(&str, Attribute)]) {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let values = [
         -3.0f32, 1.0, 2.0, 8.0, -4.0, 0.5, 3.0, 7.0, 6.0, -2.0, 1.5, 0.25,
     ];
@@ -154,24 +180,42 @@ fn global_pool_case(op: &str, opset: u64, attributes: &[(&str, Attribute)]) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn global_average_pool_matches_cpu() {
     global_pool_case("GlobalAveragePool", 1, &[]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn global_max_pool_matches_cpu() {
     global_pool_case("GlobalMaxPool", 1, &[]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn global_lp_pool_matches_cpu_for_nondefault_p() {
     global_pool_case("GlobalLpPool", 2, &[("p", Attribute::Int(3))]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn lp_normalization_matches_cpu_for_negative_and_interior_axes() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let values = [
         1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0, -10.0, 11.0, 12.0,
     ];

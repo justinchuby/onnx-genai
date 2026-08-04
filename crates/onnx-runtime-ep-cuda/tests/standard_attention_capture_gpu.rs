@@ -193,9 +193,15 @@ fn read(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, bytes: usize) -> Vec<
     host
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let kernel = standard_attention_kernel(&ep);
     let max_seq = INITIAL_PAST + DECODE_STEPS;

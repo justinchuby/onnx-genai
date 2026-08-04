@@ -496,9 +496,15 @@ fn sequence(count: usize, offset: f32) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn selected_subset_and_trailing_padding_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -520,7 +526,9 @@ fn selected_subset_and_trailing_padding_match_cpu() {
 /// f32 CPU oracle fed the *exact* values obtained by rounding every input to
 /// the requested storage type first.
 fn low_precision_matches_exact_rounded_cpu(dtype: DataType, tolerance: f32) {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -571,19 +579,33 @@ fn low_precision_matches_exact_rounded_cpu(dtype: DataType, tolerance: f32) {
     eprintln!("{dtype:?} exact-rounded CPU parity: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_storage_matches_exact_rounded_cpu_oracle() {
     low_precision_matches_exact_rounded_cpu(DataType::Float16, 1e-3);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn bf16_storage_matches_exact_rounded_cpu_oracle() {
     low_precision_matches_exact_rounded_cpu(DataType::BFloat16, 1e-2);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gqa_shared_indices_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 4,
         kv_heads: 2,
@@ -610,9 +632,15 @@ fn gqa_shared_indices_match_cpu() {
     eprintln!("gqa_shared_indices: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn causal_and_padding_bias_composition_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 1,
         kv_heads: 1,
@@ -650,9 +678,15 @@ fn causal_and_padding_bias_composition_matches_cpu() {
     eprintln!("causal_padding_bias: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn int32_indices_and_broadcast_bias_match_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 1,
@@ -685,9 +719,15 @@ fn int32_indices_and_broadcast_bias_match_cpu() {
 /// single value everywhere), so the CUDA kernel must too. Guards against the
 /// claim-then-fail divergence where the gate (delegating to the CPU oracle)
 /// claims a scalar-bias node but the kernel rejects rank 0 at execution.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn scalar_bias_broadcasts_and_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -717,9 +757,15 @@ fn scalar_bias_broadcasts_and_matches_cpu() {
 
 /// prefill → decode → decode, threading present_key/present_value into the next
 /// step's past_key/past_value. Every step is checked against the CPU oracle.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn prefill_then_two_decodes_thread_present_to_past() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let head_size = 4;
     let q_heads = 4;
     let kv_heads = 2;
@@ -810,9 +856,15 @@ fn prefill_then_two_decodes_thread_present_to_past() {
     assert_eq!(past_seq, 8);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn single_output_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -831,9 +883,15 @@ fn single_output_matches_cpu() {
     eprintln!("single_output: Y max|Δ|={delta}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_f16_replay_is_byte_identical_to_eager_and_preserves_latch() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1059,9 +1117,15 @@ fn run_gpu_capture_replay(
 /// AND bit-parity (present cache) / tight-tolerance (`Y`) against the independent
 /// CPU oracle at every step. Threads each step's present_key/present_value into
 /// the next step's past_key/past_value, exactly like the eager sequence test.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let head_size = 4;
     let q_heads = 4;
     let kv_heads = 2;
@@ -1190,9 +1254,15 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
 /// Eager execution rejects a malformed `selected_indices` row (an index that
 /// follows trailing `-1` padding) exactly like the CPU oracle, and the CUDA EP
 /// surfaces the same hard error rather than silently producing garbage.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn eager_rejects_invalid_indices() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1221,6 +1291,10 @@ fn eager_rejects_invalid_indices() {
 /// issuing an out-of-bounds device load. Warmup uses a **valid** row (so capture
 /// is eligible and the scratch is sized); the captured replay then observes an
 /// out-of-range index written into the same stable index buffer.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn captured_replay_latches_capture_error_on_invalid_index() {
     use cudarc::driver::sys::{
@@ -1228,7 +1302,9 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture,
     };
 
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1403,9 +1479,15 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
 /// `attention_bias` frontier. The CUDA kernel derives that frontier on-device
 /// (capture-safe) and must reproduce the CPU oracle: `Y` within tolerance and
 /// the aliased present bit-exact.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn capacity_present_aliases_past_matches_cpu() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     // Fixed capacity 5, one current token, logical valid length 4 (bias finite
     // for k in [0,4), -inf at k=4). write_pos = valid_len - current_seq = 3, so
     // the current token overwrites capacity row 3; row 4 is never gathered.

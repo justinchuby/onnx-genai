@@ -224,10 +224,16 @@ fn cuda_ep() -> Option<CudaExecutionProvider> {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_matmul_bias_matches_matmul_then_bias() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let a = [0.5, -1.0, 2.0, 1.5, 0.25, -0.75];
     let b = [1.0, 0.5, -2.0, -1.0, 3.0, 0.25, 2.0, -0.5, 1.25];
@@ -239,10 +245,16 @@ fn fused_matmul_bias_matches_matmul_then_bias() {
     assert_close("FusedMatMulBias", &got, &expected, 1e-5);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let a = [0.5, -1.0, 2.0, 1.5, -0.25, 0.75];
     let b = [
@@ -265,10 +277,16 @@ fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
     assert_close("FusedGemm RELU_BIAS", &got, &expected, 1e-5);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fused_gemm_gelu_bias_matches_tanh_reference() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let a = [0.5, -1.0, 2.0, -0.75, 1.25, 0.25];
     let b = [1.0, -0.5, 0.25, -1.5, 0.75, 2.0];
@@ -288,10 +306,16 @@ fn fused_gemm_gelu_bias_matches_tanh_reference() {
     assert_close("FusedGemm GELU_BIAS (tanh)", &got, &expected, 2e-6);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn placement_declines_broadcast_bias_and_batched_matmul() {
     let Some(ep) = cuda_ep() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     for op_type in ["FusedMatMulBias", "FusedGemm"] {

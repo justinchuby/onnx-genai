@@ -6,7 +6,8 @@
 //! flat buffer first. It is also a claim about the CUDA driver, not about our
 //! code, so it is checked against a real device rather than assumed.
 //!
-//! Skips when no GPU is present, in the same way the other `*_gpu` tests do.
+//! CPU-only CI reports this as ignored unless `gpu-tests` is enabled; an
+//! enabled run fails if no GPU is present.
 
 use std::sync::Arc;
 
@@ -69,9 +70,15 @@ fn cuda_context() -> Option<std::sync::Arc<CudaContext>> {
 ///
 /// Everything else rounds to this, so a wrong answer here misaligns every
 /// subsequent request and the driver rejects them.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn the_device_reports_a_sane_allocation_granularity() {
-    let Some(backing) = backing() else { return };
+    let Some(backing) = backing() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let granularity = backing.granularity();
     assert!(granularity > 0, "granularity must be positive");
     assert!(
@@ -87,9 +94,15 @@ fn the_device_reports_a_sane_allocation_granularity() {
 /// The design reserves generously — for the largest a KV buffer could ever be —
 /// and that is only safe if reserving is free. A reservation far larger than
 /// the card's 8 GiB proves it is address space, not memory.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reserving_far_more_than_vram_succeeds_because_nothing_is_committed() {
-    let Some(backing) = backing() else { return };
+    let Some(backing) = backing() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let huge = 64usize << 30; // 64 GiB, well past any consumer card
     let reservation = backing
         .reserve(huge)
@@ -105,9 +118,15 @@ fn reserving_far_more_than_vram_succeeds_because_nothing_is_committed() {
 /// it — so it writes *across* the join rather than into each block, which is
 /// the only pattern that distinguishes real contiguity from two buffers that
 /// happen to be adjacent in a table.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn one_address_spans_two_separate_physical_allocations() {
-    let Some(backing) = backing() else { return };
+    let Some(backing) = backing() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let granule = backing.granularity();
 
     let mut reservation = backing.reserve(granule * 4).expect("address space");
@@ -155,9 +174,15 @@ fn one_address_spans_two_separate_physical_allocations() {
 ///
 /// The stable address is what keeps a captured CUDA graph valid across growth,
 /// which is the reason to do any of this rather than reallocating.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn a_device_buffer_grows_without_moving() {
-    let Some(backing) = backing() else { return };
+    let Some(backing) = backing() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let granule = backing.granularity();
     let governor = LedgerGovernor::new(LeaseLedger::new(64 << 20, 0, 0));
 

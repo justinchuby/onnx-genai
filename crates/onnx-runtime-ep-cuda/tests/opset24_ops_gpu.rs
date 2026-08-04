@@ -120,9 +120,15 @@ fn decode_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn constantofshape_opset24_fills_float_and_int_outputs() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let shape = tensor(DataType::Int64, &[2], &[2_i64, 3]);
 
     let mut float_node = Node::new(NodeId(0), "ConstantOfShape", vec![], vec![]);
@@ -175,9 +181,15 @@ fn gelu_tanh(x: f32) -> f32 {
                 .tanh())
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gelu_opset24_exact_and_tanh_include_fp16_and_bf16() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let x = [-3.0_f32, -1.0, -0.25, 0.0, 0.5, 2.0];
 
     let exact_node = Node::new(NodeId(0), "Gelu", vec![], vec![]);
@@ -247,9 +259,15 @@ fn gelu_opset24_exact_and_tanh_include_fp16_and_bf16() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn onehot_opset24_matches_scalar_oracle_with_negative_indices() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let mut node = Node::new(NodeId(0), "OneHot", vec![], vec![]);
     node.attributes.insert("axis".into(), Attribute::Int(1));
     let got = decode_f32(&run(

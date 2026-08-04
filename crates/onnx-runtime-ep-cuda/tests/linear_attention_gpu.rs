@@ -141,7 +141,9 @@ fn tolerance(dtype: DataType) -> f32 {
 fn check(cfg: &Config, dtype: DataType) {
     let Some(ep) = cuda_ep() else {
         eprintln!("skip {}: no CUDA GPU", cfg.label);
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     run_check(&ep, cfg, dtype, DOMAIN);
 }
@@ -292,6 +294,10 @@ fn configs() -> Vec<Config> {
     ]
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_f32_parity() {
     for cfg in configs() {
@@ -299,6 +305,10 @@ fn linear_attention_f32_parity() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_f16_parity() {
     for cfg in configs() {
@@ -306,6 +316,10 @@ fn linear_attention_f16_parity() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_bf16_parity() {
     for cfg in configs() {
@@ -316,11 +330,17 @@ fn linear_attention_bf16_parity() {
 /// The standard ONNX-domain spelling (`""`) must dispatch to the SAME fused
 /// kernel and match the CPU oracle exactly like the `com.microsoft` spelling —
 /// proving the dual-domain registration (onnx/onnx#7689) is wired end to end.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_standard_domain_parity() {
     let Some(ep) = cuda_ep() else {
         eprintln!("skip: no CUDA GPU");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for cfg in configs() {
@@ -332,11 +352,17 @@ fn linear_attention_standard_domain_parity() {
 /// The two domain spellings are semantically identical: for the same inputs the
 /// standard-domain (`""`) and `com.microsoft` ops must produce byte-identical
 /// CUDA outputs (same kernel, no numeric drift).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_both_domains_identical() {
     let Some(ep) = cuda_ep() else {
         eprintln!("skip: no CUDA GPU");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for cfg in configs() {
@@ -372,11 +398,17 @@ fn linear_attention_both_domains_identical() {
 /// half-sequences chained through `past_state` must equal one full-sequence
 /// run. This proves the CUDA present_state is a faithful continuation state,
 /// not just a per-step artifact.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn linear_attention_state_carry_matches_chained() {
     let Some(ep) = cuda_ep() else {
         eprintln!("skip: no CUDA GPU");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let dtype = DataType::Float32;
     let (batch, d_k, d_v, heads) = (1usize, 5usize, 4usize, 2usize);

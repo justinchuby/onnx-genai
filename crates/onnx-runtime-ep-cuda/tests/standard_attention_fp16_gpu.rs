@@ -361,11 +361,17 @@ fn assert_fp16_matches_f32(label: &str, got: &[u8], expected: &[u8], tolerance: 
     maximum_error
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_fp16_matches_exact_rounded_f32_oracle() {
     let Ok(_ep) = CudaExecutionProvider::new_default() else {
         eprintln!("skip: no CUDA GPU available");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     const QUERY_HEADS: usize = 4;

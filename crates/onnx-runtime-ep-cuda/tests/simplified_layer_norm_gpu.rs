@@ -162,9 +162,15 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32]) {
     assert!(error <= 1e-5, "{label}: {got:?} vs {expected:?}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_simplified_layer_norm_matches_contrib_and_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let shape = [2, 4];
     let input = [1.0, 2.0, 3.0, 4.0, -2.0, 0.0, 2.0, 4.0];
     let scale = [1.0, 2.0, 0.5, 1.5];
@@ -188,9 +194,15 @@ fn standard_simplified_layer_norm_matches_contrib_and_reference() {
     assert_close("domain invstd parity", &standard.1, &contrib.1);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn simplified_layer_norm_does_not_contract_square_accumulation() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let input = [-0.09129826, -1.0101787, 3.0318594, 5.774467];
     let scale = [1.0; 4];
     let expected = reference(&input, &scale, 4, 1e-5);

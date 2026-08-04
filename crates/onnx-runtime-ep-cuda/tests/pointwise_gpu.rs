@@ -312,9 +312,15 @@ fn cuda_ep() -> Option<CudaExecutionProvider> {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_bf16_arithmetic_matches_cpu_compute_domain() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let a = [-3.0, -1.5, 0.5, 2.0, 5.0, 8.0];
     let b = [0.5, 2.0, -4.0, 0.25, 2.0, -2.0];
     for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -344,9 +350,15 @@ fn f16_bf16_arithmetic_matches_cpu_compute_domain() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn f16_bf16_numpy_broadcast_matches_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let a = (0..12).map(|i| i as f32 * 0.25 - 1.0).collect::<Vec<_>>();
     let b = (0..15).map(|i| i as f32 * 0.1 + 0.5).collect::<Vec<_>>();
     for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -378,9 +390,15 @@ fn f16_bf16_numpy_broadcast_matches_cpu_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn half_unary_and_activation_families_match_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let x = [-3.0, -1.0, -0.0, 0.5, 2.0];
     for dtype in [DataType::Float16, DataType::BFloat16] {
         let xq = quantize(&x, dtype);
@@ -406,9 +424,15 @@ fn half_unary_and_activation_families_match_cpu_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn logical_family_numpy_broadcast_matches_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let a = [0_u8, 1];
     let b = [0_u8, 1, 1];
     let expected = [
@@ -425,9 +449,15 @@ fn logical_family_numpy_broadcast_matches_cpu_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn comparison_family_numpy_broadcast_matches_cpu_reference() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let a = [1.0_f32, 3.0];
     let b = [2.0_f32, 3.0, 4.0];
     let a_bytes =
@@ -490,16 +520,28 @@ where
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn integer_comparisons_broadcast_match_cpu_oracle() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     assert_integer_comparisons(&ep, DataType::Int64, &[1_i64, 3], &[2_i64, 3, 4]);
     assert_integer_comparisons(&ep, DataType::Int32, &[1_i32, 3], &[2_i32, 3, 4]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn integer_comparisons_cover_glm_like_masks_and_are_deterministic() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let position_ids = [-2_i64, -1, 0, 1, 2, 3];
     let zero = [0_i64];
     let expected = cpu_predicate(&position_ids, &[2, 3], &zero, &[], &[2, 3], |a, b| a >= b);
@@ -550,9 +592,15 @@ fn integer_comparisons_cover_glm_like_masks_and_are_deterministic() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let node = Node::new(NodeId(0), "Equal", vec![], vec![]);
     let shapes = [static_shape([2]), static_shape([2])];
     for dtype in [DataType::Int64, DataType::Int32] {
@@ -574,9 +622,15 @@ fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
     ));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let runtime = ep.runtime();
     let device = ep.device_id();
     let decode_shape = [1, 1, 4];

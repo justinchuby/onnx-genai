@@ -622,7 +622,9 @@ fn error_metrics(actual: &[f32], expected: &[f32]) -> (f32, u32) {
 }
 
 fn compare(case: Case, dtype: DataType) -> (f32, u32) {
-    let Some(ep) = gpu() else { return (0.0, 0) };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let gpu_inputs = case_inputs(case, dtype);
     let cpu_inputs = rounded_cpu_inputs(&gpu_inputs, dtype);
     let expected = run_cpu(case, &cpu_inputs);
@@ -659,7 +661,9 @@ fn compare_gemv_gemm_and_cpu(case: Case) {
     assert_eq!(case.rows, 6);
     assert_eq!(case.experts, 4);
     assert_eq!(case.top_k, 2);
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let mut inputs = case_inputs(case, DataType::Float32);
     inputs[1] = Some(HostTensor::f32(
         &[case.rows, case.experts],
@@ -698,6 +702,10 @@ fn activation_case(activation: &'static str, swiglu_fusion: usize, fc3: bool) ->
 
 macro_rules! activation_path_test {
     ($name:ident, $activation:literal, $fusion:expr, $separate_gate:expr) => {
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
         #[test]
         fn $name() {
             compare_gemv_gemm_and_cpu(activation_case($activation, $fusion, $separate_gate));
@@ -719,6 +727,10 @@ activation_path_test!(
 activation_path_test!(qmoe_swiglu_split_gemv_gemm_matches_cpu, "swiglu", 2, false);
 activation_path_test!(qmoe_identity_gemv_gemm_matches_cpu, "identity", 0, false);
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_biases_gemv_gemm_match_cpu() {
     compare_gemv_gemm_and_cpu(Case {
@@ -738,6 +750,10 @@ fn qmoe_biases_gemv_gemm_match_cpu() {
     });
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_separate_router_weights_gemv_gemm_match_cpu() {
     compare_gemv_gemm_and_cpu(Case {
@@ -757,6 +773,10 @@ fn qmoe_separate_router_weights_gemv_gemm_match_cpu() {
     });
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_glm_silu_fc3_biases_separate_router_matches_cpu_all_dtypes() {
     let case = Case {
@@ -781,6 +801,10 @@ fn qmoe_glm_silu_fc3_biases_separate_router_matches_cpu_all_dtypes() {
 
 macro_rules! sub_byte_path_test {
     ($name:ident, $bits:expr, $affine:expr) => {
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
         #[test]
         fn $name() {
             compare_gemv_gemm_and_cpu(Case {
@@ -807,6 +831,10 @@ sub_byte_path_test!(qmoe_int1_affine_gemv_gemm_matches_cpu, 1, true);
 sub_byte_path_test!(qmoe_int2_symmetric_gemv_gemm_matches_cpu, 2, false);
 sub_byte_path_test!(qmoe_int2_affine_gemv_gemm_matches_cpu, 2, true);
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_int4_top2_symmetric_matches_cpu() {
     let (max_abs, max_ulp) = compare(
@@ -830,19 +858,33 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
     eprintln!("QMoE int4 top-2 CPU/CUDA max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_fp16_decode_and_prefill_match_cpu() {
     compare_64expert_decode_and_prefill(DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_bf16_decode_and_prefill_match_cpu() {
     compare_64expert_decode_and_prefill(DataType::BFloat16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = qmoe_64expert_case(16);
     let mut inputs = case_inputs(case, DataType::Float16);
     inputs[1] = Some(router_with_hot_expert(case));
@@ -853,9 +895,15 @@ fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
     assert_conforms(&actual, &expected, case, DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_capture_replay_reresolves_changed_router_probs() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         experts: 4,
         rows: 3,
@@ -911,9 +959,15 @@ fn qmoe_capture_replay_reresolves_changed_router_probs() {
     assert_conforms(&replay, &eager, case, DataType::Float32);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = qmoe_64expert_case(8);
     let mut capture_inputs = case_inputs(case, DataType::Float16);
     capture_inputs[1] = Some(router_with_top_experts(case, 0));
@@ -947,11 +1001,19 @@ fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
     assert_conforms(&replay, &expected, case, DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_64experts_top6_worst_case_scratch_sizing_matches_cpu() {
     compare(qmoe_64expert_case(64), DataType::Float16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_int8_top1_affine_bias_matches_cpu() {
     compare(
@@ -974,6 +1036,10 @@ fn qmoe_int8_top1_affine_bias_matches_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_single_expert_top1_matches_cpu() {
     compare(
@@ -996,6 +1062,10 @@ fn qmoe_single_expert_top1_matches_cpu() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
     let case = Case {
@@ -1017,6 +1087,10 @@ fn qmoe_fp16_and_bf16_storage_match_rounded_cpu_reference() {
     compare(case, DataType::BFloat16);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
     let case = Case {
@@ -1037,9 +1111,15 @@ fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
     compare_gemv_gemm_and_cpu(case);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
-    let Some(ep) = gpu() else { return };
+    let Some(ep) = gpu() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let case = Case {
         experts: 4,
         rows: 5,

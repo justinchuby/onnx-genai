@@ -123,9 +123,15 @@ fn assert_half_reduce_matches_f32_oracle(
 
 /// The exact blocker node's shape: `[1,5,8] -> [1,5,1]`, reduce last axis,
 /// keepdims, for both `ReduceSum` and `ReduceMean` in fp16 and bf16.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn half_reduce_router_shape_matches_f32_oracle() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for dtype in [DataType::Float16, DataType::BFloat16] {
         for op in ["ReduceSum", "ReduceMean"] {
             assert_half_reduce_matches_f32_oracle(&ep, op, dtype, &[1, 5, 8], &[2], true);
@@ -136,9 +142,15 @@ fn half_reduce_router_shape_matches_f32_oracle() {
 /// A non-trivial multi-axis, non-keepdims reduction (`[2,3,4]` over axes `[0,2]`
 /// → `[3]`) in fp16 and bf16, to cover rank/stride handling beyond the router
 /// node's trailing-axis case.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn half_reduce_multi_axis_no_keepdims_matches_f32_oracle() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     for dtype in [DataType::Float16, DataType::BFloat16] {
         for op in ["ReduceSum", "ReduceMean"] {
             assert_half_reduce_matches_f32_oracle(&ep, op, dtype, &[2, 3, 4], &[0, 2], false);
@@ -151,9 +163,15 @@ fn half_reduce_multi_axis_no_keepdims_matches_f32_oracle() {
 /// `[60000, 60000, -60000, -60000, 5]`. An fp16-compute-type accumulator would
 /// saturate to `+inf`/`-inf` mid-reduction and lose the result; an f32
 /// accumulator (the fix) returns 5.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_reduce_sum_accumulates_in_f32_without_overflow() {
-    let Some(ep) = cuda_ep() else { return };
+    let Some(ep) = cuda_ep() else {
+        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
+    };
     let in_shape = [1usize, 5];
     let values = [60000.0_f32, 60000.0, -60000.0, -60000.0, 5.0];
     let half_input = float_input(DataType::Float16, &in_shape, &values);

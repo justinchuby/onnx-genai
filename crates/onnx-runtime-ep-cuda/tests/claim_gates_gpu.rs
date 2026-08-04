@@ -75,6 +75,10 @@ fn assert_supported(
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -157,6 +161,10 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
     assert_rejected(&ep, "Expand", 24, &[DataType::Float32, DataType::Int32], 1);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn optional_glm_inputs_distinguish_omission_from_wrong_dtype() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -192,6 +200,10 @@ fn optional_glm_inputs_distinguish_omission_from_wrong_dtype() {
     ));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn claim_gates_reject_attributes_cuda_would_otherwise_silently_coerce() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -248,11 +260,17 @@ fn claim_gates_reject_attributes_cuda_would_otherwise_silently_coerce() {
 /// global nibble addressing for zero points; CPU/ORT pack per row). The claim
 /// gate must decline an ODD blocks-per-row layout explicitly, and must still
 /// claim the even layout.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn gather_block_quantized_odd_blocks_per_row_with_zero_points_declines() {
     let Ok(ep) = CudaExecutionProvider::new_default() else {
         eprintln!("skip: no CUDA GPU available");
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
 
     // Build a GBQ node: data, indices, scales, zero_points (bits=4, block_size=16).
