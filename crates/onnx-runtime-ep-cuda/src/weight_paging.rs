@@ -705,6 +705,40 @@ impl CudaWeightResidency {
             return Ok(existing);
         }
         inner.evict_to_fit(bytes);
+        // Eviction is best effort: a page larger than the whole budget, or
+        // pinned pages that cannot be evicted, both leave no room. Admitting
+        // anyway is what this used to do, and it left the cache physically
+        // holding more than it leased -- a total the governor reported as
+        // correct while it was not.
+        //
+        // So ask for the difference first. Growing is a fresh claim and obeys
+        // G4, so a refusal leaves the tier and the lease exactly as they were,
+        // and the page-in fails instead of the accounting quietly going wrong.
+        if let Some(over) = inner
+            .resident_bytes
+            .saturating_add(bytes)
+            .checked_sub(inner.budget)
+            .filter(|over| *over > 0)
+        {
+            match inner.lease.as_mut() {
+                Some(lease) => {
+                    lease.grow(over).map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!(
+                            "the weight-residency cache needs {over} bytes beyond its \
+                             {} byte budget for a {bytes} byte page, and eviction could not \
+                             free them: {error}",
+                            inner.budget
+                        ))
+                    })?;
+                    inner.budget = inner.budget.saturating_add(over);
+                }
+                // No lease means no governor knows about this cache, so there is
+                // nothing to ask and nothing whose total this would falsify.
+                // Keep the previous behaviour rather than inventing a refusal
+                // the operator never asked for.
+                None => inner.budget = inner.budget.saturating_add(over),
+            }
+        }
         inner.insert_page(key, Arc::clone(&page), bytes);
         Ok(page)
     }

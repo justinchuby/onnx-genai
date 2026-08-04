@@ -789,4 +789,27 @@ mod tests {
         );
         assert_eq!(gov.ledger().used(Tier::Device), LIMIT);
     }
+
+    /// Dropping a grown lease returns everything it ended up holding.
+    ///
+    /// The bytes released come from the lease's own count, so a lease that grew
+    /// and then released only its original size would leak the difference on
+    /// every page-in that needed room.
+    #[test]
+    fn dropping_a_grown_lease_returns_the_grown_total() {
+        let ledger = LeaseLedger::new(1000, 0, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        {
+            let mut lease = governor
+                .reserve(Tier::Device, 100, MemoryRole::Weights, HolderId::new(1))
+                .expect("fits");
+            lease.grow(300).expect("fits");
+            assert_eq!(ledger.used(Tier::Device), 400);
+        }
+        assert_eq!(
+            ledger.used(Tier::Device),
+            0,
+            "the grown portion was not returned"
+        );
+    }
 }
