@@ -431,6 +431,26 @@ impl NativeDecodeSession {
         self.trace = trace;
     }
 
+    /// Place any long-lived device memory this session's provider holds under
+    /// `governor`.
+    ///
+    /// The execution provider is built before the engine's governor exists, so
+    /// a provider that keeps a standing pool -- the CUDA weight-residency cache
+    /// is the one that does -- sizes it for itself. Until this is called that
+    /// size is a second claim on memory the governor is already dividing up, and
+    /// neither side can see the other.
+    ///
+    /// Returns the bytes now governed; zero means the provider holds no standing
+    /// pool, which is the common case and not a failure.
+    pub fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> anyhow::Result<u64> {
+        Ok(self.session.adopt_memory_governor(governor, tier, holder)?)
+    }
+
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK
     /// captured verify graph and retain the captured graph across `rewind`. No-op
     /// on non-CUDA sessions. Not wired into any live decode path yet; exercised

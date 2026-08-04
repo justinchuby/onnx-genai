@@ -1367,6 +1367,22 @@ impl InferenceSession {
         self.exec.device_allocation_counts()
     }
 
+    /// Place any long-lived device memory this session's provider holds under
+    /// `governor`.
+    ///
+    /// A provider that keeps a standing pool -- the CUDA weight-residency cache
+    /// is one -- otherwise sizes it for itself, which is a second claim on
+    /// memory the governor is already dividing up. Returns the bytes now
+    /// governed; zero means this provider holds no standing pool.
+    pub fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<u64> {
+        Ok(self.exec.adopt_memory_governor(governor, tier, holder)?)
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }

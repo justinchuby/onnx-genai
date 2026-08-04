@@ -242,6 +242,16 @@ impl Executor {
             .map(|(allocations, frees)| DeviceAllocationCounts { allocations, frees })
     }
 
+    /// Place any long-lived device memory the provider holds under `governor`.
+    pub(crate) fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> onnx_runtime_ep_api::Result<u64> {
+        self.ep.adopt_memory_governor(governor, tier, holder)
+    }
+
     pub(super) fn binding_signature(bindings: &[DeviceIoBinding]) -> Vec<DeviceBindingSignature> {
         bindings
             .iter()

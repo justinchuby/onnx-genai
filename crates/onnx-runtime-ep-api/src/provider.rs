@@ -627,6 +627,37 @@ pub trait ExecutionProvider: Send + Sync {
         None
     }
 
+    /// Place any long-lived device memory this provider holds under `governor`.
+    ///
+    /// Some providers keep a standing pool for as long as a model is loaded --
+    /// the CUDA weight-residency cache is one. A pool that picks its own size is
+    /// a second claim on memory the governor is already dividing up, and neither
+    /// side can see the other: grant the KV pool most of a card, let a residency
+    /// cache default to some fraction of it, and both are individually satisfied
+    /// while the device is oversubscribed.
+    ///
+    /// This is the seam that ends that. It is on the provider contract rather
+    /// than on one backend because it is not a CUDA question: any provider with
+    /// a standing pool has it, and a third-party provider should be able to join
+    /// the same accounting rather than run a ledger of its own.
+    ///
+    /// Returns the bytes now governed. The default is zero -- most providers
+    /// hold no standing pool, and saying so is not a failure.
+    ///
+    /// # Errors
+    ///
+    /// If the tier cannot afford what the provider already holds. That is worth
+    /// failing on: it says the model does not fit *before* the pool is used,
+    /// rather than at an allocation somewhere unrelated later.
+    fn adopt_memory_governor(
+        &self,
+        _governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        _tier: onnx_runtime_memory_governor::Tier,
+        _holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Synchronously upload host bytes into a buffer owned by this EP.
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
         if !dst.device().is_host_accessible() {

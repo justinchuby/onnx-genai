@@ -284,6 +284,32 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
+        // End the second budget. The execution provider was built before this
+        // governor existed, so a standing pool it keeps -- the CUDA
+        // weight-residency cache -- sized itself from an operator figure or a
+        // default. Until now that size answered to nobody: grant the KV pool
+        // most of a card, let residency default to a fraction of it, and both
+        // are individually satisfied while the device is oversubscribed.
+        //
+        // A refusal here is the point. It says the model does not fit while
+        // there is still a load to fail, rather than at an allocation somewhere
+        // unrelated later.
+        let governed_pool_bytes = native_session
+            .adopt_memory_governor(
+                governor.memory(),
+                onnx_runtime_memory_governor::Tier::Device,
+                crate::engine::memory_plan::Holder::WeightResidency.id(),
+            )
+            .context(
+                "the native execution provider holds a standing device pool the governor cannot \
+                 grant; lower ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES or raise the device limit",
+            )?;
+        if governed_pool_bytes > 0 {
+            tracing::debug!(
+                bytes = governed_pool_bytes,
+                "native execution provider pool is now governed"
+            );
+        }
         // Join the runtime and its execution providers to the engine's timeline.
         // Without this their spans are recorded into a disabled context and
         // `native.session_run` exports as one opaque block.

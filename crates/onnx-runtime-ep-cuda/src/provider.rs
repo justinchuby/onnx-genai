@@ -787,6 +787,28 @@ impl ExecutionProvider for CudaExecutionProvider {
         ))
     }
 
+    fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<u64> {
+        // The weight-residency cache is the standing pool this EP keeps. With
+        // offload disabled there is none, and zero is the honest answer rather
+        // than a failure.
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(0);
+        };
+        residency
+            .adopt_governed_budget(governor, tier, holder)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: the device weight-residency cache holds a budget the governor \
+                     cannot grant on {tier:?}: {error}"
+                ))
+            })
+    }
+
     fn sync(&self) -> Result<()> {
         self.runtime.synchronize()
     }
