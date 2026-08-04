@@ -30,12 +30,20 @@ when in fact it is 1955 lines.
 | L3b HostGovernor | §5 | **implemented; adapter in `HostLeaseGovernor`** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
-| Allocator contract | §1.2, §1.3, §1.5 | **native side implemented; ORT side open in #609** | `crates/onnx-genai-ort/src/governed_allocator.rs`, `Session::device_binding_from_external_memory` |
-| Virtual contiguity | §1.6 | **open in #607** | `crates/onnx-runtime-virtual-memory` |
+| Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
+| Virtual contiguity | §1.6 | **implemented, no production consumer** | `crates/onnx-runtime-virtual-memory`; `VirtualBuffer` appears only in `virtual_memory_gpu.rs`, a test |
+| Activation planning | — | **crate exists, no consumer** | `crates/onnx-runtime-memory`, 1269 lines, zero dependency declarations; the engine reports `activations_bytes: 0` (#514) |
+| Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
 
-The last three rows are newer than the layers above them and move fastest, so
-each says where it actually is. "Decided" and "in `main` are different states
+The last five rows are newer than the layers above them and move fastest, so
+each says where it actually is. "Decided" and "in `main`" are different states
 and a reader should not have to guess which one a row means.
+
+Two rows deliberately record something working as *not finished*. A contract with
+no caller and a planner with no consumer are both easy to read as done — the
+type is there, the tests pass — and both were found that way rather than
+reported. `VirtualBuffer` is exercised only by a GPU test; nothing on the KV path
+maps through it yet.
 
 Two things follow that are worth stating plainly, because both are the kind of
 gap that reads as "already handled" from the prose:
@@ -65,7 +73,8 @@ turn "weights do not fit" into "stream them" instead turns it into "pretend they
 are free". §3 is the design that fixes this, and it is unimplemented.
 
 Related: #596 (decisions taken while implementing the first slice of L3), #598,
-#608.
+#608, #514 (wire the activation planner), #628 (native KV page size unit),
+#620 (how this plugs into ORT and the native runtime).
 
 ---
 
