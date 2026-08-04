@@ -63,7 +63,13 @@ fn nvrtc_include_paths() -> Vec<String> {
     candidates.dedup();
     candidates
         .into_iter()
-        .filter(|path| path.join("cuda_fp16.h").is_file())
+        // A directory earns its place by carrying headers NVRTC actually needs.
+        // Two different ones qualify: `cuda_fp16.h` for the half-precision
+        // kernels, and `crt/mma.h` for the tensor-core ones. They live in one
+        // directory in a toolkit install but in two separate wheels
+        // (`nvidia-cuda-runtime` and `nvidia-cuda-nvcc`), so testing only for
+        // `cuda_fp16.h` would silently drop the half that `mma.h` needs.
+        .filter(|path| path.join("cuda_fp16.h").is_file() || path.join("crt/mma.h").is_file())
         .map(|path| path.to_string_lossy().into_owned())
         .collect()
 }
@@ -254,7 +260,6 @@ impl CudaRuntime {
         // a system CUDA installation.
         for library in [
             CudaLibrary::Driver,
-            CudaLibrary::Runtime,
             CudaLibrary::Cublas,
             CudaLibrary::CublasLt,
         ] {
@@ -264,6 +269,23 @@ impl CudaRuntime {
                 ))
             })?;
         }
+        // cudart is preloaded when present but is not required, because nothing
+        // here calls it. Measured with `dumpbin /dependents` on the NVIDIA cu12
+        // wheels: `cublasLt64_12.dll` imports only `KERNEL32.dll`, and
+        // `cublas64_12.dll` only cuBLASLt and `KERNEL32.dll` -- NVIDIA links the
+        // runtime statically into its redistributables. No `cudaXxx` symbol is
+        // resolved anywhere in this crate either.
+        //
+        // Requiring it therefore only turned "works" into "fails" on machines
+        // that could run us. Nothing becomes silent: if cuBLAS genuinely needs
+        // cudart on some platform, `require(Cublas)` above already fails, and it
+        // names the library that could not load rather than a proxy for it.
+        //
+        // The wheel is still a real dependency -- NVRTC compiles our f16/bf16
+        // kernels against `cuda_fp16.h` and `cuda_bf16.h`, which ship in
+        // `nvidia/cuda_runtime/include`. That is a *header* dependency, checked
+        // where those kernels are built, not a reason to demand the DLL here.
+        let _ = require(CudaLibrary::Runtime);
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let major = context
@@ -801,7 +823,14 @@ impl CudaRuntime {
     }
 
     pub fn require_nvrtc_half_headers(&self, op: &str) -> Result<()> {
-        if nvrtc_include_paths().is_empty() {
+        // Ask for the header this actually needs rather than for a non-empty
+        // include list. The list may be non-empty because the `crt/` tree from
+        // `nvidia-cuda-nvcc` was found while `cuda_fp16.h` is still missing, and
+        // then this would wave the kernel through to fail inside NVRTC instead.
+        if !nvrtc_include_paths()
+            .iter()
+            .any(|path| Path::new(path).join("cuda_fp16.h").is_file())
+        {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {op}: f16/bf16 NVRTC kernels require cuda_fp16.h and cuda_bf16.h. \
                  Install the CUDA runtime headers (for pip CUDA 13: `pip install \
@@ -811,9 +840,29 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// Bind this runtime's context to the calling thread. Required before any
-    /// driver call (`malloc`, `memcpy`, cuBLASLt) that targets the current
-    /// context.
+    /// Headers the tensor-core kernels need on top of the half-precision ones.
+    ///
+    /// `mma.h` ships in `nvidia-cuda-runtime`, but it includes `crt/mma.h`,
+    /// which ships in `nvidia-cuda-nvcc`. Installing only the first gets as far
+    /// as NVRTC and then fails with
+    /// `catastrophic error: cannot open source file "crt/mma.h"` — an error
+    /// that names a file rather than the wheel that carries it, which is a long
+    /// detour from the fix.
+    pub fn require_nvrtc_tensor_core_headers(&self, op: &str) -> Result<()> {
+        self.require_nvrtc_half_headers(op)?;
+        if !nvrtc_include_paths()
+            .iter()
+            .any(|path| Path::new(path).join("crt/mma.h").is_file())
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: tensor-core NVRTC kernels include <mma.h>, which needs the crt/ \
+                 headers. These are packaged separately from the CUDA runtime headers: `pip \
+                 install nvidia-cuda-nvcc` (alternatively set CUDA_HOME/CUDA_PATH to a full \
+                 toolkit, which carries both)."
+            )));
+        }
+        Ok(())
+    }
     pub fn bind(&self) -> Result<()> {
         self.context
             .bind_to_thread()
@@ -1281,13 +1330,23 @@ mod tests {
         );
     }
 
+    /// Nothing is offered to NVRTC that is not a CUDA header directory.
+    ///
+    /// Two headers qualify a directory, not one. A toolkit install keeps them
+    /// together, but the pip wheels split them: `cuda_fp16.h` ships in
+    /// `nvidia-cuda-runtime` and the `crt/` tree that `mma.h` includes ships in
+    /// `nvidia-cuda-nvcc`. Requiring `cuda_fp16.h` of every directory dropped
+    /// the second, and the tensor-core kernels then failed inside NVRTC with
+    /// `cannot open source file "crt/mma.h"`.
     #[test]
     fn nvrtc_include_paths_only_returns_cuda_header_dirs() {
-        assert!(
-            nvrtc_include_paths()
-                .iter()
-                .all(|path| Path::new(path).join("cuda_fp16.h").is_file())
-        );
+        for path in nvrtc_include_paths() {
+            let path = Path::new(&path);
+            assert!(
+                path.join("cuda_fp16.h").is_file() || path.join("crt/mma.h").is_file(),
+                "{path:?} carries neither cuda_fp16.h nor crt/mma.h"
+            );
+        }
     }
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {

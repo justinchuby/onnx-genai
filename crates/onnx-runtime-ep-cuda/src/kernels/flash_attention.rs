@@ -558,6 +558,14 @@ pub(super) fn run(
         }
     };
 
+    // The half-precision source includes <mma.h>, which in turn includes
+    // crt/mma.h from a separately packaged wheel. Say so here rather than let
+    // NVRTC report a missing file whose name identifies neither the kernel nor
+    // the package that carries it.
+    if source == FLASH_HALF_SOURCE.as_str() {
+        runtime.require_nvrtc_tensor_core_headers("fused Attention")?;
+    }
+
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
             EpError::KernelFailed(format!(
@@ -751,10 +759,12 @@ mod tests {
             return;
         }
         if runtime
-            .require_nvrtc_half_headers("flash_attention_f16_tc")
+            .require_nvrtc_tensor_core_headers("flash_attention_f16_tc")
             .is_err()
         {
-            eprintln!("skipping CUDA flash TC parity test: fp16 NVRTC headers unavailable");
+            eprintln!(
+                "skipping CUDA flash TC parity test: fp16/tensor-core NVRTC headers unavailable"
+            );
             return;
         }
 
