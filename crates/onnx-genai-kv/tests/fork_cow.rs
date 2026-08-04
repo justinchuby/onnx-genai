@@ -1,4 +1,6 @@
-use onnx_genai_kv::{KvCacheOps, KvDType, LayerKv, PageTensorConfig, PagedKvCache};
+use onnx_genai_kv::{
+    KvCacheOps, KvDType, LayerKv, LayerTensorConfig, PageTensorConfig, PagedKvCache,
+};
 
 fn config() -> PageTensorConfig {
     PageTensorConfig {
@@ -120,6 +122,106 @@ fn forked_tensor_sequences_share_then_diverge_with_copy_on_write() {
         assert_eq!(
             child_materialized.layers[layer_idx].value,
             expected_layer(&child_tokens, layer_idx, false)
+        );
+    }
+}
+
+/// Rewinding one sequence leaves a fork that shares its pages untouched.
+///
+/// `fork` shares every page up to the fork point by reference count, including
+/// the last one when it is only partially filled. `rewind_to` then writes
+/// `page.filled` in place on that shared page without copying it, which reads
+/// like a sequence reaching into another's storage.
+///
+/// It is safe, but not for that reason: writes copy-on-write before touching a
+/// page with more than one reference, so the holder that did not rewind keeps
+/// its own length, its own bytes, and — after it appends past the fork point —
+/// its own tokens. This pins that down, because the reasoning is not local to
+/// either function and the rewind path had no coverage of it.
+#[test]
+fn rewinding_one_sequence_does_not_disturb_a_fork_sharing_its_last_page() {
+    let head_dim = 4;
+    let mut cache = PagedKvCache::new_with_layer_tensor_configs(
+        8,
+        KvDType::F32,
+        vec![LayerTensorConfig {
+            num_kv_heads: 2,
+            head_dim,
+        }],
+        16,
+    );
+
+    let token = |index: usize| -> (Vec<f32>, Vec<f32>) {
+        let key = (0..8).map(|i| (index * 100 + i) as f32).collect();
+        let value = (0..8).map(|i| (index * 100 + i) as f32 + 0.5).collect();
+        (key, value)
+    };
+
+    let a = cache.create_sequence();
+    // 20 tokens over 16-token pages: the second page is partially filled, so a
+    // fork at 20 shares a page that is still being written into.
+    for index in 0..20 {
+        let (key, value) = token(index);
+        cache
+            .append_token_kv(
+                a,
+                &[LayerKv {
+                    key: &key,
+                    value: &value,
+                }],
+            )
+            .expect("the pool has capacity");
+    }
+
+    let b = cache
+        .fork(a, 20)
+        .expect("fork at the end of a partial page");
+    let before = cache.materialize_sequence(b).expect("materialize the fork");
+
+    cache
+        .rewind_to(a, 18)
+        .expect("rewind into the shared partial page");
+
+    assert_eq!(cache.len(b).expect("the fork still exists"), 20);
+    let after = cache.materialize_sequence(b).expect("materialize again");
+    assert_eq!(
+        before.layers[0].key, after.layers[0].key,
+        "rewinding one sequence rewrote another's keys"
+    );
+    assert_eq!(
+        before.layers[0].value, after.layers[0].value,
+        "rewinding one sequence rewrote another's values"
+    );
+
+    // The fork can still grow past the fork point without losing what it had.
+    let (key, value) = token(99);
+    cache
+        .append_token_kv(
+            b,
+            &[LayerKv {
+                key: &key,
+                value: &value,
+            }],
+        )
+        .expect("the fork appends");
+    let grown = cache
+        .materialize_sequence(b)
+        .expect("materialize after append");
+    assert_eq!(cache.len(b).expect("the fork grew"), 21);
+
+    // Head-major layout: [head][token][head_dim]. Indexing it as
+    // [token][heads * head_dim] reads the wrong head and makes this pass or
+    // fail for the wrong reason.
+    let tokens = 21;
+    for head in 0..2 {
+        let base = head * tokens * head_dim + 19 * head_dim;
+        let expected: Vec<f32> = (0..head_dim)
+            .map(|d| (19 * 100 + head * head_dim + d) as f32)
+            .collect();
+        assert_eq!(
+            &grown.layers[0].key[base..base + head_dim],
+            expected.as_slice(),
+            "the fork's own token 19 was clobbered in head {head}"
         );
     }
 }
