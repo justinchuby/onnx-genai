@@ -477,11 +477,6 @@ fn build_governor_and_scheduler(
     Ok((governor, scheduler))
 }
 
-/// Identifies the draft model's KV page pool, a second pool the engine holds
-/// that was previously sized and allocated without consulting any budget.
-const DRAFT_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(3);
-
 fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
@@ -539,7 +534,7 @@ fn load_draft_model(
                 draft_pages,
                 governor.memory(),
                 KV_POOL_TIER,
-                DRAFT_KV_POOL_HOLDER,
+                crate::engine::memory_plan::Holder::DraftKvPool.id(),
             )
             .context(
                 "cannot allocate the draft model's KV page pool within the device KV budget; a \
@@ -626,10 +621,6 @@ pub(crate) fn kv_pages_for_budget(
 /// Only the configured path holds storage worth leasing. Without per-layer
 /// geometry a pool is pure bookkeeping and occupies nothing, so it is built
 /// ungoverned rather than taking a lease of zero that implies otherwise.
-/// Identifies the KV page pool to the memory governor, so a pool asked to
-/// release under pressure can be told apart from any other holder.
-const KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(1);
 
 fn allocate_kv_cache(
     config: &EngineConfig,
@@ -663,7 +654,7 @@ fn allocate_kv_cache(
             num_pages,
             governor.memory(),
             KV_POOL_TIER,
-            KV_POOL_HOLDER,
+            crate::engine::memory_plan::Holder::KvPool.id(),
         )
         .with_context(|| {
             format!(

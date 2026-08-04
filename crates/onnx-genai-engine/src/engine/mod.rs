@@ -62,6 +62,7 @@ pub(crate) use crate::speculative::{
 mod decode_backend;
 mod governor;
 mod load;
+mod memory_plan;
 mod metadata;
 mod model;
 mod runtime;
