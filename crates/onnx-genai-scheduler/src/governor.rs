@@ -158,8 +158,11 @@ impl ModelKvConfig {
     }
 
     pub fn bytes_per_token(&self) -> Option<u64> {
+        if self.tokens_per_page == 0 {
+            return None;
+        }
         self.page_size_bytes
-            .map(|page_size_bytes| page_size_bytes.div_ceil(self.tokens_per_page.max(1)))
+            .map(|page_size_bytes| page_size_bytes.div_ceil(self.tokens_per_page))
     }
 
     pub fn pages_for_bytes(&self, bytes: u64) -> Option<u64> {

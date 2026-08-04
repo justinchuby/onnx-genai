@@ -36,7 +36,8 @@ pub(crate) use onnx_genai_ort::{
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
     GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
-    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, Scheduler, VramBreakdown,
+    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, ScheduledRequest, Scheduler,
+    VramBreakdown,
 };
 pub(crate) use onnx_std::{MetadataHints, MetadataWarning, PlacementStrength};
 pub(crate) use std::collections::HashMap;

@@ -264,7 +264,14 @@ impl Engine {
             )
             .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
-        let governor_kv_config = governor_kv_config(kv_model.as_ref(), &config)?;
+        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let governor_kv_config = match kv_model.as_ref() {
+            Some(kv_model) => governor_kv_config(Some(kv_model), &config)?,
+            None if model_io_declares_only_fixed_state(model_io) => {
+                governor_no_paged_kv_config(&config)?
+            }
+            None => governor_kv_config(None, &config)?,
+        };
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
         #[cfg(feature = "cuda")]
         let cuda_offload_resolution =
