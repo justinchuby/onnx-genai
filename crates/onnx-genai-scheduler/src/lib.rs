@@ -466,17 +466,7 @@ impl Scheduler {
 
         let mut retained_candidate = None;
         if self.should_retain_fair_share_preemption_candidate() {
-            let fair_share_before = self.fair_share.clone();
-            let candidate = self.pop_next_fair_share_candidate();
-            if let Some(candidate) = candidate {
-                self.apply_preemption_for_priority(candidate.priority(), &mut decision);
-                if self.has_capacity_for_candidate() {
-                    retained_candidate = Some(candidate);
-                } else {
-                    self.restore_candidate(candidate);
-                    self.fair_share = fair_share_before;
-                }
-            }
+            retained_candidate = self.retain_fair_share_preemption_candidate(&mut decision);
         } else {
             self.apply_preemption(&mut decision);
         }
@@ -644,6 +634,58 @@ impl Scheduler {
             decision.preempt.push(victim.seq_id);
             self.swapped.push(victim);
         }
+    }
+
+    fn retain_fair_share_preemption_candidate(
+        &mut self,
+        decision: &mut ScheduleDecision,
+    ) -> Option<Candidate> {
+        let candidate_count = self.waiting.len().saturating_add(self.swapped.len());
+        let mut skipped = Vec::new();
+
+        for _ in 0..candidate_count {
+            let Some(candidate) = self.pop_next_fair_share_candidate() else {
+                break;
+            };
+            if self.can_make_capacity_by_preempting(candidate.priority()) {
+                self.apply_preemption_for_priority(candidate.priority(), decision);
+                for skipped_candidate in skipped {
+                    self.restore_candidate(skipped_candidate);
+                }
+                return Some(candidate);
+            }
+            skipped.push(candidate);
+        }
+
+        for skipped_candidate in skipped {
+            self.restore_candidate(skipped_candidate);
+        }
+        None
+    }
+
+    fn can_make_capacity_by_preempting(&self, candidate_priority: Priority) -> bool {
+        let mut running_len = self.running.len();
+        let mut token_budget = self.running_token_budget();
+        if running_len < self.config.max_batch_size && token_budget < self.config.max_total_tokens {
+            return true;
+        }
+
+        for sequence in self
+            .running
+            .iter()
+            .filter(|sequence| candidate_priority > sequence.priority)
+        {
+            running_len = running_len.saturating_sub(1);
+            token_budget =
+                token_budget.saturating_sub(sequence.prompt_tokens + sequence.generated_tokens);
+            if running_len < self.config.max_batch_size
+                && token_budget < self.config.max_total_tokens
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn should_retain_fair_share_preemption_candidate(&self) -> bool {
@@ -997,6 +1039,39 @@ mod tests {
             assert!(!decision.decode.contains(preempted));
         }
         assert_eq!(scheduler.waiting_count(), 0);
+        assert_eq!(scheduler.running_count(), 2);
+        assert_eq!(scheduler.swapped_count(), 1);
+    }
+
+    #[test]
+    fn fair_share_skips_ineligible_preemption_candidate_so_high_does_not_starve() {
+        let mut fair_config = config();
+        fair_config.max_batch_size = 2;
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Swap;
+        let mut scheduler = Scheduler::new(fair_config).with_fair_share_weights(3, 1, 1);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        scheduler.enqueue_generate_request(20, 3, 4, Priority::Normal);
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill, vec![10, 20]);
+        scheduler.advance(10);
+        scheduler.advance(20);
+
+        scheduler.enqueue_generate_request(30, 3, 2, Priority::Low);
+        scheduler.enqueue_generate_request(40, 3, 2, Priority::High);
+        let decision = scheduler.schedule();
+
+        assert_eq!(decision.preempt, vec![10]);
+        assert_eq!(decision.prefill, vec![40]);
+        assert!(decision.swap_in.is_empty());
+        assert_eq!(decision.decode, vec![20]);
+        for preempted in &decision.preempt {
+            assert!(!decision.prefill.contains(preempted));
+            assert!(!decision.swap_in.contains(preempted));
+            assert!(!decision.decode.contains(preempted));
+        }
+        assert_eq!(scheduler.waiting_count(), 1);
         assert_eq!(scheduler.running_count(), 2);
         assert_eq!(scheduler.swapped_count(), 1);
     }
