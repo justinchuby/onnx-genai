@@ -157,6 +157,9 @@ pub(crate) struct ModelMemoryPlan {
 #[derive(Debug)]
 struct PlanEntry {
     holder: Holder,
+    /// Set when the tier was a fact about the running system rather than about
+    /// the holder -- see [`ModelMemoryPlan::reserve_on`].
+    tier: Option<Tier>,
     lease: onnx_runtime_memory_governor::MemoryLease,
 }
 
@@ -182,7 +185,11 @@ impl ModelMemoryPlan {
             .governor
             .reserve(holder.tier(), bytes, holder.role(), holder.id())?;
         let granted = lease.bytes();
-        self.entries.push(PlanEntry { holder, lease });
+        self.entries.push(PlanEntry {
+            holder,
+            tier: None,
+            lease,
+        });
         Ok(granted)
     }
 
@@ -200,11 +207,39 @@ impl ModelMemoryPlan {
         session.adopt_memory_governor(&self.governor, holder.tier(), holder.id())
     }
 
+    /// Reserve `bytes` for `holder` on a tier the caller determined.
+    ///
+    /// Only for holders whose tier is a fact about the running system rather
+    /// than about the holder: recurrent state lives on the host for a CPU
+    /// session and on the device for a CUDA one, so `Holder::tier()` cannot
+    /// answer for it. Everything else uses [`Self::reserve`], which does not let
+    /// a call site pick.
+    pub(crate) fn reserve_on(
+        &mut self,
+        holder: Holder,
+        tier: Tier,
+        bytes: u64,
+    ) -> Result<u64, MemoryError> {
+        if bytes == 0 {
+            return Ok(0);
+        }
+        let lease = self
+            .governor
+            .reserve(tier, bytes, holder.role(), holder.id())?;
+        let granted = lease.bytes();
+        self.entries.push(PlanEntry {
+            holder,
+            tier: Some(tier),
+            lease,
+        });
+        Ok(granted)
+    }
+
     /// Bytes held on `tier`, across every holder.
     pub(crate) fn bytes_on(&self, tier: Tier) -> u64 {
         self.entries
             .iter()
-            .filter(|entry| entry.holder.tier() == tier)
+            .filter(|entry| entry.tier.unwrap_or_else(|| entry.holder.tier()) == tier)
             .map(|entry| entry.lease.bytes())
             .sum()
     }
@@ -243,7 +278,7 @@ impl ModelMemoryPlan {
             .map(|entry| {
                 (
                     entry.holder.name(),
-                    entry.holder.tier(),
+                    entry.tier.unwrap_or_else(|| entry.holder.tier()),
                     entry.lease.bytes(),
                 )
             })

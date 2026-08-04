@@ -316,33 +316,34 @@ impl Engine {
                 "native execution provider pool is now governed"
             );
         }
-        // Charge the fixed-size recurrent state a hybrid decoder keeps per
-        // sequence -- `conv_state` and `recurrent_state` for the
-        // linear-attention layers.
+        // Charge the fixed-size recurrent state a hybrid decoder keeps --
+        // `conv_state` and `recurrent_state` for the linear-attention layers.
         //
-        // It is a per-sequence cost that scales exactly the way KV does, and it
-        // was invisible to the thing deciding how many sequences fit. The
-        // governor could therefore admit a batch that does not fit, and the
-        // failure landed as an allocation error mid-generation rather than as a
-        // refusal at admission -- which is the failure mode leasing the KV pool
-        // exists to avoid.
+        // Unlike KV it cannot be rewound, recomputed or shared, so a sequence
+        // either keeps it or ends. It was allocated and charged to nothing.
+        //
+        // One instance, not one per concurrent sequence: native decode runs a
+        // single serialized session, and other sequences retain tokens and are
+        // re-prefilled rather than each holding a live state tensor. Multiplying
+        // by the scheduler's batch size would reserve up to 32x memory that is
+        // never allocated, and refuse models that fit.
+        //
+        // The tier comes from the session, because it is a fact about the
+        // running system rather than about the holder: CPU state is host memory,
+        // a CUDA session's fixed-state bindings are on the device.
         //
         // Zero for a decoder with no recurrent layers, which is most of them,
         // and takes no lease.
-        let recurrent_per_sequence = native_session
-            .recurrent_state_bytes_per_sequence()
+        let (recurrent_bytes, recurrent_tier) = native_session
+            .recurrent_state_reservation()
             .context("sizing the decoder's fixed recurrent state")?;
-        let recurrent_total =
-            recurrent_per_sequence.saturating_mul(config.scheduler.max_batch_size.max(1) as u64);
         governor
             .plan()
-            .reserve(Holder::RecurrentState, recurrent_total)
+            .reserve_on(Holder::RecurrentState, recurrent_tier, recurrent_bytes)
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "cannot reserve {recurrent_total} bytes of recurrent state for \
-                     {} concurrent sequence(s) at {recurrent_per_sequence} bytes each: {error}; \
-                     lower the batch size or raise the device limit",
-                    config.scheduler.max_batch_size.max(1)
+                    "cannot reserve {recurrent_bytes} bytes of recurrent state on \
+                     {recurrent_tier:?}: {error}; raise the limit for that tier"
                 )
             })?;
         // Join the runtime and its execution providers to the engine's timeline.

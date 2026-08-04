@@ -431,14 +431,37 @@ impl NativeDecodeSession {
         self.trace = trace;
     }
 
-    /// Bytes of fixed-size recurrent state one sequence needs.
+    /// Bytes of fixed-size recurrent state this decoder keeps, and the tier they
+    /// live on.
     ///
-    /// Zero for a decoder with no recurrent layers, which is the common case and
-    /// not a failure. Non-zero for the hybrid linear-attention decoders, where
-    /// it is a per-sequence cost that scales the way KV does and had never been
-    /// charged to anything.
-    pub fn recurrent_state_bytes_per_sequence(&self) -> anyhow::Result<u64> {
-        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&self.session)
+    /// Zero for a decoder with no recurrent layers, which is most of them, and
+    /// not a failure.
+    ///
+    /// One instance, not one per concurrent sequence. Native decode runs a
+    /// single serialized session: other sequences retain tokens and are
+    /// re-prefilled rather than each holding a live state tensor, so multiplying
+    /// by the scheduler's batch size would reserve up to 32x memory that is
+    /// never allocated and refuse models that fit.
+    ///
+    /// The tier comes from where the state actually is rather than from the
+    /// caller. On the CPU backend it is built through `shared_cpu_ep()` and is
+    /// host memory; a CUDA session's fixed-state bindings genuinely occupy the
+    /// device. Charging the wrong one is the same class of mistake as the KV
+    /// pool being charged to `Device` in the pipeline while the engine charged
+    /// it to `Host`.
+    pub fn recurrent_state_reservation(
+        &self,
+    ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
+        let bytes = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(
+            &self.session,
+            &self.present_to_past,
+        )?;
+        let tier = if self.session.device_id().is_host_accessible() {
+            onnx_runtime_memory_governor::Tier::Host
+        } else {
+            onnx_runtime_memory_governor::Tier::Device
+        };
+        Ok((bytes, tier))
     }
 
     /// Place any long-lived device memory this session's provider holds under

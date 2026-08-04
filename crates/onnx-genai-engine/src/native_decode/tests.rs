@@ -2684,8 +2684,20 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
 #[test]
 fn recurrent_state_is_sized_per_sequence_from_the_graph() {
     let session = tiny_hybrid_decoder();
-    let bytes = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session)
-        .expect("the fixture pins every non-batch axis");
+    // The decoder declares layer 0's state pair; layer 1 is dense KV.
+    let declared = std::collections::HashMap::from([
+        (
+            "present.0.conv_state".to_string(),
+            "past_key_values.0.conv_state".to_string(),
+        ),
+        (
+            "present.0.recurrent_state".to_string(),
+            "past_key_values.0.recurrent_state".to_string(),
+        ),
+    ]);
+    let bytes =
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared)
+            .expect("the fixture pins every non-batch axis");
     assert_eq!(bytes, 176, "12 + 32 f32 elements is 176 bytes");
 }
 
@@ -2696,7 +2708,43 @@ fn recurrent_state_is_sized_per_sequence_from_the_graph() {
 #[test]
 fn a_decoder_without_recurrent_layers_needs_no_recurrent_state() {
     let session = tiny_decoder(false);
-    let bytes = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session)
-        .expect("a dense decoder is sizeable");
+    let declared = std::collections::HashMap::new();
+    let bytes =
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared)
+            .expect("a dense decoder is sizeable");
     assert_eq!(bytes, 0);
+}
+
+/// An input that merely looks like recurrent state is not charged as it.
+///
+/// `is_recurrent_state_shape` only asks whether the penultimate axis is static,
+/// which is also true of a fixed-length KV input and of any unrelated
+/// fixed-shape input. Discovering state by that test alone would charge memory
+/// the decoder never keeps -- and this reservation refuses a load when it does
+/// not fit, so an over-count rejects models that work.
+///
+/// The declared pairs are the authority; the shape test only classifies what
+/// they name.
+#[test]
+fn an_undeclared_input_of_the_same_shape_is_not_charged() {
+    let session = tiny_hybrid_decoder();
+    let declared_none = std::collections::HashMap::new();
+    assert_eq!(
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared_none)
+            .expect("sizeable"),
+        0,
+        "nothing is declared, so nothing is state, whatever the shapes look like"
+    );
+
+    // Declaring only the conv pair charges only the conv pair: 4 * 3 f32 = 48.
+    let conv_only = std::collections::HashMap::from([(
+        "present.0.conv_state".to_string(),
+        "past_key_values.0.conv_state".to_string(),
+    )]);
+    assert_eq!(
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &conv_only)
+            .expect("sizeable"),
+        48,
+        "the recurrent_state input is present in the graph but was not declared"
+    );
 }

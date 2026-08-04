@@ -290,10 +290,19 @@ pub(crate) fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
 /// a geometry this can size, and is reported rather than guessed at.
 pub(crate) fn recurrent_state_bytes_per_sequence(
     session: &InferenceSession,
+    present_to_past: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<u64> {
+    // Only inputs the resolved I/O actually declares as loop-carried state.
+    // Rediscovering that from shape alone -- "the penultimate axis is static" --
+    // also matches a fixed-length KV input and any unrelated fixed-shape input,
+    // which would charge memory the decoder never keeps, multiplied by the batch
+    // size. `is_recurrent_state_shape` is the right test for *classifying* a
+    // declared state input; it is not a test for *finding* them.
+    let declared: std::collections::HashSet<&str> =
+        present_to_past.values().map(String::as_str).collect();
     let mut total: u64 = 0;
     for meta in session.inputs() {
-        if !is_recurrent_state_shape(&meta.shape) {
+        if !declared.contains(meta.name.as_str()) || !is_recurrent_state_shape(&meta.shape) {
             continue;
         }
         let mut elements: u64 = 1;
