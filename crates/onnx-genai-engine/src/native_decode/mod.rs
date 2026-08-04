@@ -431,6 +431,16 @@ impl NativeDecodeSession {
         self.trace = trace;
     }
 
+    /// Bytes of fixed-size recurrent state one sequence needs.
+    ///
+    /// Zero for a decoder with no recurrent layers, which is the common case and
+    /// not a failure. Non-zero for the hybrid linear-attention decoders, where
+    /// it is a per-sequence cost that scales the way KV does and had never been
+    /// charged to anything.
+    pub fn recurrent_state_bytes_per_sequence(&self) -> anyhow::Result<u64> {
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&self.session)
+    }
+
     /// Place any long-lived device memory this session's provider holds under
     /// `governor`.
     ///

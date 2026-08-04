@@ -273,6 +273,58 @@ pub(crate) fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
     shape.len() >= 2 && shape[shape.len() - 2].is_static()
 }
 
+/// Bytes of fixed-size recurrent state one sequence needs.
+///
+/// The hybrid decoders (`conv_state`, `recurrent_state`) keep one of these per
+/// recurrent layer for as long as a sequence lives, which makes it a
+/// per-sequence cost that scales exactly the way KV does -- and unlike KV it was
+/// never charged to anything. Admission decides how many sequences fit while
+/// this is invisible to it, so the governor can admit a batch that does not fit
+/// and the failure lands as an allocation error mid-generation.
+///
+/// Counted from the graph's own metadata, so a model with no recurrent layers
+/// answers zero without being asked about by name (RULES.md §2).
+///
+/// The batch axis is counted as one: the reservation is per sequence, and the
+/// scheduler multiplies. A symbolic non-batch axis means the export did not pin
+/// a geometry this can size, and is reported rather than guessed at.
+pub(crate) fn recurrent_state_bytes_per_sequence(
+    session: &InferenceSession,
+) -> anyhow::Result<u64> {
+    let mut total: u64 = 0;
+    for meta in session.inputs() {
+        if !is_recurrent_state_shape(&meta.shape) {
+            continue;
+        }
+        let mut elements: u64 = 1;
+        for (axis, dim) in meta.shape.iter().copied().enumerate() {
+            let extent = match dim {
+                Dim::Static(value) => u64::try_from(value).unwrap_or(0),
+                // Axis 0 is batch, and this figure is per sequence.
+                Dim::Symbolic(_) if axis == 0 => 1,
+                Dim::Symbolic(_) => bail!(
+                    "cannot size recurrent state '{}': dimension {axis} of {:?} is symbolic and \
+                     is not the batch axis, so the export did not pin a geometry to reserve for",
+                    meta.name,
+                    meta.shape
+                ),
+            };
+            elements = elements.saturating_mul(extent);
+        }
+        let bytes = meta
+            .dtype
+            .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
+            .with_context(|| {
+                format!(
+                    "unsupported recurrent-state dtype {:?} for '{}'",
+                    meta.dtype, meta.name
+                )
+            })?;
+        total = total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(total)
+}
+
 pub(crate) fn make_empty_input_tensor(
     session: &InferenceSession,
     name: &str,

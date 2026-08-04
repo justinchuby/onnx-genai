@@ -2669,3 +2669,34 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
         false
     ));
 }
+
+/// Fixed recurrent state is sized from the graph, per sequence.
+///
+/// It is a per-sequence cost that scales exactly the way KV does, and it was
+/// invisible to the thing deciding how many sequences fit -- so the governor
+/// could admit a batch that does not fit, and the failure landed as an
+/// allocation error mid-generation rather than a refusal at admission.
+///
+/// The fixture's layer 0 carries `conv_state [batch, 4, 3]` and
+/// `recurrent_state [batch, 2, 4, 4]`: 12 + 32 = 44 f32 elements, 176 bytes,
+/// with the batch axis counted as one because the figure is per sequence and
+/// the scheduler multiplies.
+#[test]
+fn recurrent_state_is_sized_per_sequence_from_the_graph() {
+    let session = tiny_hybrid_decoder();
+    let bytes = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session)
+        .expect("the fixture pins every non-batch axis");
+    assert_eq!(bytes, 176, "12 + 32 f32 elements is 176 bytes");
+}
+
+/// A decoder with no recurrent layers asks for nothing.
+///
+/// Most decoders are this, and it must not read as a failure or as a
+/// reservation of zero that implies something was measured.
+#[test]
+fn a_decoder_without_recurrent_layers_needs_no_recurrent_state() {
+    let session = tiny_decoder(false);
+    let bytes = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session)
+        .expect("a dense decoder is sizeable");
+    assert_eq!(bytes, 0);
+}

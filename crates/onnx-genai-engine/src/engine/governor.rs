@@ -104,7 +104,7 @@ pub struct EngineResourceGovernor {
     /// lease rather than subtracted before the ledger sees it.
     ///
     /// Kept for its Drop: unloading the model returns these bytes to the tier.
-    plan: ModelMemoryPlan,
+    plan: std::sync::Mutex<ModelMemoryPlan>,
     #[cfg(feature = "native-backend")]
     weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
 }
@@ -201,7 +201,7 @@ impl EngineResourceGovernor {
             inner,
             allow_runtime_override,
             memory,
-            plan,
+            plan: std::sync::Mutex::new(plan),
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
         })
@@ -213,8 +213,8 @@ impl EngineResourceGovernor {
     /// holds bytes takes a lease here so the tier totals reflect what is
     /// actually occupied rather than what was planned.
     /// Every claim this model makes, in one place.
-    pub(crate) fn plan(&self) -> &ModelMemoryPlan {
-        &self.plan
+    pub(crate) fn plan(&self) -> std::sync::MutexGuard<'_, ModelMemoryPlan> {
+        self.plan.lock().expect("model memory plan lock poisoned")
     }
 
     /// What this model actually holds, per holder, as leases rather than as the
@@ -226,12 +226,12 @@ impl EngineResourceGovernor {
     /// something holds memory the plan did not predict, or the plan predicted
     /// memory nothing took.
     pub fn leased_breakdown(&self) -> Vec<(&'static str, onnx_runtime_memory_governor::Tier, u64)> {
-        self.plan.breakdown()
+        self.plan().breakdown()
     }
 
     /// Bytes leased on `tier`, across every holder this model has.
     pub fn leased_bytes_on(&self, tier: onnx_runtime_memory_governor::Tier) -> u64 {
-        self.plan.bytes_on(tier)
+        self.plan().bytes_on(tier)
     }
 
     pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {

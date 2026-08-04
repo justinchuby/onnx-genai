@@ -316,6 +316,35 @@ impl Engine {
                 "native execution provider pool is now governed"
             );
         }
+        // Charge the fixed-size recurrent state a hybrid decoder keeps per
+        // sequence -- `conv_state` and `recurrent_state` for the
+        // linear-attention layers.
+        //
+        // It is a per-sequence cost that scales exactly the way KV does, and it
+        // was invisible to the thing deciding how many sequences fit. The
+        // governor could therefore admit a batch that does not fit, and the
+        // failure landed as an allocation error mid-generation rather than as a
+        // refusal at admission -- which is the failure mode leasing the KV pool
+        // exists to avoid.
+        //
+        // Zero for a decoder with no recurrent layers, which is most of them,
+        // and takes no lease.
+        let recurrent_per_sequence = native_session
+            .recurrent_state_bytes_per_sequence()
+            .context("sizing the decoder's fixed recurrent state")?;
+        let recurrent_total =
+            recurrent_per_sequence.saturating_mul(config.scheduler.max_batch_size.max(1) as u64);
+        governor
+            .plan()
+            .reserve(Holder::RecurrentState, recurrent_total)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot reserve {recurrent_total} bytes of recurrent state for \
+                     {} concurrent sequence(s) at {recurrent_per_sequence} bytes each: {error}; \
+                     lower the batch size or raise the device limit",
+                    config.scheduler.max_batch_size.max(1)
+                )
+            })?;
         // Join the runtime and its execution providers to the engine's timeline.
         // Without this their spans are recorded into a disabled context and
         // `native.session_run` exports as one opaque block.
