@@ -254,7 +254,6 @@ impl CudaRuntime {
         // a system CUDA installation.
         for library in [
             CudaLibrary::Driver,
-            CudaLibrary::Runtime,
             CudaLibrary::Cublas,
             CudaLibrary::CublasLt,
         ] {
@@ -264,6 +263,23 @@ impl CudaRuntime {
                 ))
             })?;
         }
+        // cudart is preloaded when present but is not required, because nothing
+        // here calls it. Measured with `dumpbin /dependents` on the NVIDIA cu12
+        // wheels: `cublasLt64_12.dll` imports only `KERNEL32.dll`, and
+        // `cublas64_12.dll` only cuBLASLt and `KERNEL32.dll` -- NVIDIA links the
+        // runtime statically into its redistributables. No `cudaXxx` symbol is
+        // resolved anywhere in this crate either.
+        //
+        // Requiring it therefore only turned "works" into "fails" on machines
+        // that could run us. Nothing becomes silent: if cuBLAS genuinely needs
+        // cudart on some platform, `require(Cublas)` above already fails, and it
+        // names the library that could not load rather than a proxy for it.
+        //
+        // The wheel is still a real dependency -- NVRTC compiles our f16/bf16
+        // kernels against `cuda_fp16.h` and `cuda_bf16.h`, which ship in
+        // `nvidia/cuda_runtime/include`. That is a *header* dependency, checked
+        // where those kernels are built, not a reason to demand the DLL here.
+        let _ = require(CudaLibrary::Runtime);
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let major = context

@@ -8,8 +8,6 @@ use libloading::Library;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CudaLibrary {
     Driver,
-    // Kept for the crate-local loader surface; no production caller probes cudart yet.
-    #[allow(dead_code)]
     Runtime,
     // Kept for the crate-local loader surface; kernels currently load cuBLASLt instead.
     #[allow(dead_code)]
@@ -166,9 +164,66 @@ fn wheel_candidates_for(root: &Path, os: TargetOs, library: CudaLibrary) -> Vec<
         .collect()
 }
 
+/// Wheel roots the process environment already implies.
+///
+/// The Python bindings call [`set_wheel_search_paths`] with `site-packages`,
+/// which is how `nxrt[cuda]` finds NVIDIA's wheels without a system CUDA
+/// install. Nothing on the pure-Rust path did that, so `cargo test` found
+/// `nvcuda.dll` — which ships with the display driver — but not cuBLAS, NVRTC
+/// or the CUDA headers, and every GPU test skipped on a machine that could run
+/// them perfectly well.
+///
+/// Two sources, in order of authority:
+///
+/// * `NXRT_CUDA_WHEEL_ROOTS`, for saying so explicitly. Same syntax as `PATH`.
+/// * The platform's own loader path. Anyone who can load these wheels already
+///   has `<root>/nvidia/<component>/{bin,lib}` on it, and the layout is fixed,
+///   so the root is recoverable from any single entry. This generalises a
+///   heuristic that already existed for `LD_LIBRARY_PATH` but had no Windows
+///   counterpart, where the directory is `bin` rather than `lib`.
+///
+/// Relative entries are dropped for the same reason [`set_wheel_search_paths`]
+/// drops them: a wheel must never be loaded relative to the process CWD.
+fn wheel_roots_from_environment() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(value) = std::env::var_os("NXRT_CUDA_WHEEL_ROOTS") {
+        roots.extend(std::env::split_paths(&value));
+    }
+
+    for variable in ["PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        let Some(value) = std::env::var_os(variable) else {
+            continue;
+        };
+        for entry in std::env::split_paths(&value) {
+            if let Some(root) = wheel_root_of(&entry) {
+                roots.push(root);
+            }
+        }
+    }
+
+    roots.retain(|path| path.is_absolute());
+    roots.dedup();
+    roots
+}
+
+/// The root a `<root>/nvidia/<component>/{bin,lib}` entry belongs to.
+fn wheel_root_of(entry: &Path) -> Option<PathBuf> {
+    let library_directory = entry.file_name()?;
+    if library_directory != "bin" && library_directory != "lib" {
+        return None;
+    }
+    let component = entry.parent()?;
+    let nvidia = component.parent()?;
+    if nvidia.file_name()? != "nvidia" {
+        return None;
+    }
+    Some(nvidia.parent()?.to_path_buf())
+}
+
 fn wheel_search_paths() -> &'static Mutex<Vec<PathBuf>> {
     static PATHS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-    PATHS.get_or_init(|| Mutex::new(Vec::new()))
+    PATHS.get_or_init(|| Mutex::new(wheel_roots_from_environment()))
 }
 
 fn loaded_libraries() -> &'static Mutex<Vec<(CudaLibrary, Library)>> {
@@ -356,6 +411,49 @@ mod tests {
     #[test]
     fn unsupported_platform_has_no_candidates() {
         assert!(candidates_for(TargetOs::Other, CudaLibrary::Driver).is_empty());
+    }
+
+    /// A wheel library directory on the loader path identifies its root.
+    ///
+    /// This is what lets the pure-Rust path find NVIDIA's wheels at all. Only
+    /// the Python bindings ever called `set_wheel_search_paths`, so `cargo
+    /// test` found `nvcuda.dll` -- which ships with the display driver -- but
+    /// not cuBLAS, NVRTC or the CUDA headers, and 44 GPU test files skipped on
+    /// a machine that could run them.
+    #[test]
+    fn a_wheel_library_directory_identifies_its_root() {
+        // Windows wheels use `bin`, everything else `lib`.
+        assert_eq!(
+            wheel_root_of(Path::new("/opt/venv/site-packages/nvidia/cublas/lib")),
+            Some(PathBuf::from("/opt/venv/site-packages"))
+        );
+        assert_eq!(
+            wheel_root_of(Path::new(r"C:\py\site-packages\nvidia\cuda_nvrtc\bin")),
+            Some(PathBuf::from(r"C:\py\site-packages"))
+        );
+    }
+
+    /// Directories that merely resemble the layout are not treated as roots.
+    ///
+    /// The loader path is full of unrelated `bin` and `lib` directories. Taking
+    /// a grandparent from one of those would add a bogus search root and make
+    /// every later failure report the wrong path.
+    #[test]
+    fn a_directory_that_is_not_a_wheel_component_is_not_a_root() {
+        for entry in [
+            "/usr/local/lib",
+            "/usr/bin",
+            "/opt/nvidia/lib",
+            "/opt/site-packages/nvidia/cublas",
+            "/opt/site-packages/nvidia/cublas/lib64",
+            "/opt/notnvidia/cublas/lib",
+        ] {
+            assert_eq!(
+                wheel_root_of(Path::new(entry)),
+                None,
+                "{entry} is not a wheel component directory"
+            );
+        }
     }
 
     #[test]
