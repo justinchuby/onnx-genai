@@ -189,10 +189,7 @@ mod tests {
         let governor = EngineResourceGovernor::new(
             ResourceLimits::default(),
             false,
-            ModelKvConfig {
-                page_size_bytes: 1,
-                tokens_per_page: 1,
-            },
+            ModelKvConfig::known(1, 1),
             0,
         )?;
 
@@ -1299,10 +1296,7 @@ mod tests {
             limits.clone(),
             true,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1334,10 +1328,7 @@ mod tests {
             },
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1348,10 +1339,7 @@ mod tests {
             },
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1380,16 +1368,8 @@ mod tests {
             host_ram_limit: ResourceLimit::Fraction(0.5),
             disk_spill_limit: Some(ResourceLimit::Auto),
         };
-        let governor = EngineResourceGovernor::new(
-            limits,
-            false,
-            ModelKvConfig {
-                page_size_bytes: 1,
-                tokens_per_page: 1,
-            },
-            0,
-        )
-        .unwrap();
+        let governor =
+            EngineResourceGovernor::new(limits, false, ModelKvConfig::known(1, 1), 0).unwrap();
         let snapshot = governor.snapshot();
         assert_eq!(
             snapshot.resolved_limits.vram_bytes,
@@ -1422,10 +1402,7 @@ mod tests {
             },
             false,
             capacities,
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1477,10 +1454,7 @@ mod tests {
             ResourceLimits::default(),
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();

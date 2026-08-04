@@ -440,10 +440,7 @@ pub(crate) fn governor_kv_config(
         .context("KV page size does not fit the Resource Governor's u64 accounting")?
         .max(1);
     let Some(kv_model) = kv_model else {
-        return Ok(ModelKvConfig {
-            page_size_bytes: tokens_per_page,
-            tokens_per_page,
-        });
+        return Ok(ModelKvConfig::unknown(tokens_per_page));
     };
 
     let page_size = u64::try_from(config.page_size)
@@ -477,10 +474,17 @@ pub(crate) fn governor_kv_config(
             .checked_add(layer_bytes)
             .context("total KV page byte size overflowed Resource Governor accounting")?;
     }
-    Ok(ModelKvConfig {
-        page_size_bytes: page_size_bytes.max(1),
+    Ok(ModelKvConfig::known(
+        page_size_bytes.max(1),
         tokens_per_page,
-    })
+    ))
+}
+
+pub(crate) fn governor_no_paged_kv_config(config: &EngineConfig) -> anyhow::Result<ModelKvConfig> {
+    let tokens_per_page = u64::try_from(config.page_size)
+        .context("KV page size does not fit the Resource Governor's u64 accounting")?
+        .max(1);
+    Ok(ModelKvConfig::no_paged_cache(tokens_per_page))
 }
 
 /// Build a governor for a component that owns memory but is not the engine.
@@ -494,13 +498,34 @@ pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
 ) -> anyhow::Result<EngineResourceGovernor> {
+    let kv_config = match kv_model {
+        Some(kv_model) => governor_kv_config(Some(kv_model), config)?,
+        None => governor_no_paged_kv_config(config)?,
+    };
     EngineResourceGovernor::new(
         config.limits.clone(),
         config.allow_runtime_override,
-        governor_kv_config(kv_model, config)?,
+        kv_config,
         // This resolves ceilings only; the model path is not in scope here, so
         // the weight reservation is left at zero.
         0,
     )
     .context("failed to resolve the engine memory budget for decoder fixed state")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_kv_geometry_is_unknown_not_a_token_count_byte_size() {
+        let mut config = EngineConfig::default();
+        config.page_size = 16;
+
+        let kv_config = governor_kv_config(None, &config).unwrap();
+
+        assert_eq!(kv_config.tokens_per_page, 16);
+        assert_eq!(kv_config.page_size_bytes, None);
+        assert_eq!(kv_config.bytes_per_token(), None);
+    }
 }
