@@ -713,12 +713,13 @@ pub(crate) fn rewind_decode_state_to_len(
         return Ok(());
     }
     let kv_model = kv_model.context("missing KV model after rewind check")?;
-    let mut validated_cache = kv_cache.clone();
-    validated_cache
-        .rewind_to(seq, len)
-        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
-    let materialized = validated_cache
-        .materialize_sequence(seq)
+    // Materialize the rewound view *before* mutating anything. The previous
+    // shape cloned the entire page pool, rewound the copy, and read from it --
+    // duplicating every page's storage to answer a question about one
+    // sequence. Reading first gives the same guarantee (a failed read leaves
+    // the sequence untouched) without the copy.
+    let materialized = kv_cache
+        .materialize_sequence_to(seq, len)
         .map_err(|e| anyhow::anyhow!("Failed to materialize rewound KV sequence {seq}: {e}"))?;
     let past = materialized_past_values(session, kv_model, &materialized)?;
     kv_cache

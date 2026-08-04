@@ -279,6 +279,29 @@ impl PagedKvCache {
 
     /// Materialize a sequence's paged K/V data into contiguous per-layer buffers.
     pub fn materialize_sequence(&self, seq: SequenceId) -> Result<MaterializedKv, KvError> {
+        self.materialize_sequence_to(seq, self.len(seq)?)
+    }
+
+    /// Materialize a sequence's paged K/V as it would look after rewinding to
+    /// `end`, without touching the sequence.
+    ///
+    /// Exists so a caller wanting "rewind, then read" does not have to mutate
+    /// first and hope the read succeeds. The alternative was cloning the entire
+    /// page pool to rewind a copy, which duplicates every page's storage —
+    /// transiently doubling KV memory to answer a question about one sequence.
+    ///
+    /// **Mirrors only rewinds that stay at or above the pinned sink prefix.**
+    /// A real [`KvCacheOps::rewind_to`] below the sink resets the sequence's
+    /// window bookkeeping and returns tokens `[0, end)`; this function refuses
+    /// that case rather than reporting a view it would not produce. Refusing is
+    /// the safe direction — it never green-lights a position a rewind would
+    /// reject — but it is a narrower contract than the name suggests, so it is
+    /// stated rather than left to be discovered.
+    pub fn materialize_sequence_to(
+        &self,
+        seq: SequenceId,
+        end: usize,
+    ) -> Result<MaterializedKv, KvError> {
         if self.page_table.tensor_config.is_none() {
             return Err(KvError::TensorStorageNotConfigured);
         }
@@ -286,7 +309,32 @@ impl PagedKvCache {
         let page_size = self.page_table.page_size;
         let start = self.retained_start(seq)?;
         let sink = self.sink_len(seq)?;
-        let end = self.len(seq)?;
+        let current = self.len(seq)?;
+        if end > current {
+            return Err(KvError::InvalidPosition {
+                position: end,
+                length: current,
+            });
+        }
+        // Rewinding below the pinned sink prefix resets the sequence's window
+        // bookkeeping, which this read cannot reproduce without mutating. Say so
+        // rather than returning a view that does not match what the rewind would
+        // leave behind.
+        if sink > 0 && end < sink {
+            return Err(KvError::RewindBelowSinkNotMaterializable {
+                position: end,
+                sink_len: sink,
+            });
+        }
+        // Reading below the retained window would silently produce zeros for
+        // tokens that were evicted, so it is refused the same way a rewind to
+        // that position is.
+        if end < start {
+            return Err(KvError::PositionEvicted {
+                position: end,
+                retained_start: start,
+            });
+        }
         // Contiguous buffer holds the pinned sink prefix followed by the window.
         let len = sink + (end - start);
         let pages = self
@@ -2426,5 +2474,153 @@ mod accounting_contract_tests {
     #[test]
     fn a_paged_store_does_not_claim_contiguity_it_cannot_provide() {
         assert_eq!(cache().view(), KvViewKind::Paged);
+    }
+}
+
+#[cfg(test)]
+mod materialize_to_tests {
+    use super::*;
+    use crate::KvCacheOps;
+
+    fn configs() -> Vec<crate::LayerTensorConfig> {
+        vec![crate::LayerTensorConfig {
+            num_kv_heads: 2,
+            head_dim: 4,
+        }]
+    }
+
+    fn filled_cache(tokens: usize) -> (PagedKvCache, SequenceId) {
+        let mut cache =
+            PagedKvCache::new_with_layer_tensor_configs(4, crate::KvDType::F32, configs(), 16);
+        let seq = cache.create_sequence();
+        for token in 0..tokens {
+            let key: Vec<f32> = (0..8).map(|i| (token * 100 + i) as f32).collect();
+            let value: Vec<f32> = (0..8).map(|i| (token * 100 + i) as f32 + 0.5).collect();
+            cache
+                .append_token_kv(
+                    seq,
+                    &[LayerKv {
+                        key: &key,
+                        value: &value,
+                    }],
+                )
+                .expect("pool has capacity");
+        }
+        (cache, seq)
+    }
+
+    /// Reading at a rewind target must equal rewinding and then reading.
+    ///
+    /// This is what lets the ORT rewind path drop its whole-pool clone: the
+    /// clone existed only so the rewind could be applied to a copy before the
+    /// read. If these two ever disagree, that swap silently changes what the
+    /// decoder is handed after a rewind.
+    #[test]
+    fn materializing_at_a_target_equals_rewinding_first_then_materializing() {
+        for target in [1usize, 3, 5, 8] {
+            let (ahead, seq) = filled_cache(8);
+            let read_first = ahead
+                .materialize_sequence_to(seq, target)
+                .expect("target is within the sequence");
+
+            let (mut rewound, seq2) = filled_cache(8);
+            rewound.rewind_to(seq2, target).expect("target is valid");
+            let rewind_first = rewound
+                .materialize_sequence(seq2)
+                .expect("rewound sequence materializes");
+
+            assert_eq!(
+                read_first.sequence_len, rewind_first.sequence_len,
+                "target {target}: lengths differ"
+            );
+            assert_eq!(
+                read_first.layers[0].key, rewind_first.layers[0].key,
+                "target {target}: key data differs"
+            );
+            assert_eq!(
+                read_first.layers[0].value, rewind_first.layers[0].value,
+                "target {target}: value data differs"
+            );
+        }
+    }
+
+    /// Reading past the end is refused rather than returning zeros.
+    #[test]
+    fn materializing_beyond_the_sequence_is_refused() {
+        let (cache, seq) = filled_cache(4);
+        let error = cache
+            .materialize_sequence_to(seq, 5)
+            .expect_err("5 exceeds a 4 token sequence");
+        assert!(
+            matches!(
+                error,
+                KvError::InvalidPosition {
+                    position: 5,
+                    length: 4
+                }
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A refused read leaves the sequence exactly as it was.
+    ///
+    /// This is the guarantee the clone was providing, so it has to survive the
+    /// clone's removal.
+    #[test]
+    fn a_refused_read_does_not_disturb_the_sequence() {
+        let (cache, seq) = filled_cache(4);
+        let before = cache.len(seq).expect("sequence exists");
+        let _ = cache.materialize_sequence_to(seq, 99);
+        assert_eq!(
+            cache.len(seq).expect("sequence exists"),
+            before,
+            "a refused read changed the sequence length"
+        );
+    }
+    /// A read below the pinned sink prefix is refused with a reason.
+    ///
+    /// The rewind itself would be legal, but it resets the window bookkeeping,
+    /// so a non-mutating read cannot reproduce its result. Refusing is the safe
+    /// direction -- this function never green-lights a position a rewind would
+    /// reject -- but a generic "evicted" error would misdescribe it, since
+    /// nothing was evicted.
+    #[test]
+    fn a_read_below_the_pinned_sink_prefix_says_why_it_cannot_be_answered() {
+        // Sinks only activate once the window has moved clear of the pinned
+        // prefix, so the sequence has to be long enough for a gap to open.
+        let (mut cache, seq) = filled_cache(16);
+        cache
+            .apply_sliding_window_with_sinks(seq, 4, 4)
+            .expect("window applies to a 16 token sequence");
+        let sink = cache.sink_len(seq).expect("sequence exists");
+        assert!(sink > 0, "test needs a sequence with a pinned sink prefix");
+
+        let error = cache
+            .materialize_sequence_to(seq, sink - 1)
+            .expect_err("a read inside the sink prefix must be refused");
+        assert!(
+            matches!(error, KvError::RewindBelowSinkNotMaterializable { .. }),
+            "expected a sink-specific refusal, got {error}"
+        );
+        assert!(
+            !error.to_string().contains("evicted"),
+            "the message calls it an eviction, but nothing was evicted: {error}"
+        );
+    }
+
+    /// Delegating at the sequence's own length is never refused.
+    ///
+    /// `materialize_sequence` forwards with `end = len(seq)`, so the new bounds
+    /// checks must be unreachable there or existing callers would start failing.
+    #[test]
+    fn materializing_a_whole_sequence_is_never_refused_by_the_new_bounds() {
+        let (mut cache, seq) = filled_cache(16);
+        cache
+            .apply_sliding_window_with_sinks(seq, 4, 4)
+            .expect("window applies");
+        cache
+            .materialize_sequence(seq)
+            .expect("a whole-sequence read must still work with a window applied");
     }
 }
