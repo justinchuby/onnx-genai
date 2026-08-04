@@ -336,7 +336,10 @@ impl onnx_genai_scheduler::AdmissionCeiling for LedgerAdmissionCeiling {
         use onnx_runtime_memory_governor::MemoryGovernor as _;
         self.memory
             .available(onnx_runtime_memory_governor::Tier::Device)
-            .saturating_add(self.kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_add(
+                self.kv_pool_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
     }
 }
 
