@@ -295,13 +295,15 @@ impl ExecutionProvider for CpuExecutionProvider {
         // allocator is written once rather than once per backend. The default
         // is `HostAllocator`, which is the `std::alloc` code this used to
         // inline.
-        let ptr = self
-            .memory
-            .allocate(size, alignment)
-            .map_err(|_| EpError::OutOfMemory {
-                requested: size,
-                available: 0,
-            })?;
+        let ptr = self.memory.allocate(size, alignment).map_err(|error| {
+            // Keep what the allocator said. Reporting every failure as "out of
+            // memory" describes an alignment rejection, or a substituted
+            // allocator refusing for its own reason, as exhausted RAM and sends
+            // the reader looking in the wrong place.
+            EpError::KernelFailed(format!(
+                "cpu_ep: could not allocate {size} bytes aligned to {alignment}: {error}"
+            ))
+        })?;
         // SAFETY: `ptr` is a fresh, unique, non-null allocation of at least
         // `size` bytes aligned to `alignment`, owned by this EP and freed
         // exactly once in `deallocate` (invariant #2). No other handle aliases

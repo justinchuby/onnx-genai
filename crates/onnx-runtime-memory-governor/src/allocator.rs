@@ -139,11 +139,13 @@ impl DeviceAllocator for HostAllocator {
         // SAFETY: `layout` has a non-zero size and a valid power-of-two
         // alignment.
         let ptr = unsafe { std::alloc::alloc(layout) };
-        NonNull::new(ptr).ok_or(MemoryError::InvalidRequest {
+        NonNull::new(ptr).ok_or_else(|| MemoryError::AllocationFailed {
             tier: Tier::Host.name(),
             requested: bytes as u64,
-            reason: "the system allocator refused bytes the governor had granted; the process \
-                     is out of address space or the host is out of memory",
+            reason: String::from(
+                "the system allocator refused bytes the governor had granted; the process is \
+                 out of address space or the host is out of memory",
+            ),
         })
     }
 
