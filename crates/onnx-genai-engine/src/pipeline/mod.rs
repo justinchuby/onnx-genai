@@ -716,8 +716,19 @@ impl PipelineEngine {
             // autoregressive are not yet wired for native and are rejected once
             // the plan is known (below), rather than at construction.
         }
-        let models = PipelineModels::load_with_options(pipeline_dir, session_options)
-            .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {e}"))?;
+        let models = if backend == PipelineBackend::Native {
+            // The native backend drives every component through the native nxrt
+            // `ComponentSession` seam, so an ORT `Session` for any of them would
+            // be redundant — and a native-only operator (for example a QMoE
+            // artifact whose fp16 I/O + fp32 scales ORT's op type-checker rejects
+            // at load) would abort the whole pipeline load. Skip ORT session
+            // construction and resolve each component's decode contract from its
+            // session-free graph metadata instead (see `PipelineModels::graph_io`).
+            PipelineModels::load_with_ort_session_filter(pipeline_dir, session_options, |_| false)
+        } else {
+            PipelineModels::load_with_options(pipeline_dir, session_options)
+        }
+        .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {e}"))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
         // GAP-3 Inc-A wires native decode only for the flat autoregressive plan.
         // Any other strategy on the native backend is surfaced with a precise,
@@ -735,7 +746,7 @@ impl PipelineEngine {
         let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
-                    .session(&ar.decoder)
+                    .graph_io(&ar.decoder)
                     .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
                 let decoder_io = models
                     .directory
@@ -1064,7 +1075,7 @@ impl PipelineEngine {
         })?;
         let session = self
             .models
-            .session(component)
+            .graph_io(component)
             .with_context(|| format!("final image component '{component}' was not loaded"))?;
         let outputs = session.output_names();
         if outputs.len() != 1 {

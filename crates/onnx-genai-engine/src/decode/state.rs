@@ -29,7 +29,7 @@ pub(crate) struct DecodeState {
 impl DecodeState {
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
-        session: &Session,
+        session: &dyn GraphIo,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
     ) -> anyhow::Result<Self> {
         Self::new_with_io_and_positions(session, io, None)
@@ -38,7 +38,7 @@ impl DecodeState {
     /// Construct generic decoder state from explicit graph I/O and the pipeline's
     /// declared position program.
     pub(crate) fn new_with_io_and_positions(
-        session: &Session,
+        session: &dyn GraphIo,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
@@ -46,18 +46,17 @@ impl DecodeState {
     }
 
     pub(crate) fn new_with_io_positions_and_state_budget(
-        session: &Session,
+        session: &dyn GraphIo,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
         positions: Option<&PositionProgram>,
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {
         let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
         validate_fixed_state_budget(session, &resolved.state_pairs, fixed_state_budget_bytes)?;
-        Self::from_resolved(session, resolved, positions.cloned())
+        Self::from_resolved(resolved, positions.cloned())
     }
 
     fn from_resolved(
-        _session: &Session,
         resolved: ResolvedIo,
         positions: Option<PositionProgram>,
     ) -> anyhow::Result<Self> {

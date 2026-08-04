@@ -19,8 +19,8 @@ use onnx_genai_kv::{KvCacheOps, PagedKvCache};
 use onnx_genai_metadata::{InferenceMetadata, LoopStatePair, PositionProgram};
 use onnx_genai_ort::decode_contract::name_contains_past_key_value;
 use onnx_genai_ort::{
-    DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams, Session,
-    StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
+    DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams, GraphIo,
+    Session, StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
 };
 use std::collections::{HashMap, HashSet};
 

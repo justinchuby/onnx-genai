@@ -54,6 +54,91 @@ pub struct TensorInfo {
     pub shape: Vec<i64>,
 }
 
+/// Backend-neutral view of a graph's declared input/output tensor metadata.
+///
+/// An ORT [`Session`] and a native (nxrt) component expose the exact same
+/// name/dtype/shape records, so the decode-time contract (I/O port roles, paged
+/// KV layout, and fixed-state budget) can be resolved from either backend
+/// through this seam. This is what lets a pipeline whose decoder carries
+/// native-only operators — a QMoE artifact that ORT's op type-checker rejects at
+/// load, for example — resolve its decode contract from the native loader
+/// instead of a redundant ORT session that would never execute.
+pub trait GraphIo {
+    /// Declared input tensor metadata.
+    fn inputs(&self) -> &[TensorInfo];
+    /// Declared output tensor metadata.
+    fn outputs(&self) -> &[TensorInfo];
+    /// Declared input names, in graph order.
+    fn input_names(&self) -> &[String];
+    /// Declared output names, in graph order.
+    fn output_names(&self) -> &[String];
+}
+
+/// A standalone, session-free [`GraphIo`] carrying only a graph's declared
+/// input/output tensor metadata.
+///
+/// Built from a native component (or straight from an ONNX graph's value-info)
+/// so decode resolution can run without instantiating an ORT session for a
+/// component the ORT backend will never execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphIoMetadata {
+    input_names: Vec<String>,
+    output_names: Vec<String>,
+    inputs: Vec<TensorInfo>,
+    outputs: Vec<TensorInfo>,
+}
+
+impl GraphIoMetadata {
+    /// Build from declared input and output tensor metadata; names are derived
+    /// from each record in graph order.
+    pub fn new(inputs: Vec<TensorInfo>, outputs: Vec<TensorInfo>) -> Self {
+        let input_names = inputs.iter().map(|info| info.name.clone()).collect();
+        let output_names = outputs.iter().map(|info| info.name.clone()).collect();
+        Self {
+            input_names,
+            output_names,
+            inputs,
+            outputs,
+        }
+    }
+}
+
+impl GraphIo for GraphIoMetadata {
+    fn inputs(&self) -> &[TensorInfo] {
+        &self.inputs
+    }
+
+    fn outputs(&self) -> &[TensorInfo] {
+        &self.outputs
+    }
+
+    fn input_names(&self) -> &[String] {
+        &self.input_names
+    }
+
+    fn output_names(&self) -> &[String] {
+        &self.output_names
+    }
+}
+
+impl GraphIo for Session {
+    fn inputs(&self) -> &[TensorInfo] {
+        &self.inputs
+    }
+
+    fn outputs(&self) -> &[TensorInfo] {
+        &self.outputs
+    }
+
+    fn input_names(&self) -> &[String] {
+        &self.input_names
+    }
+
+    fn output_names(&self) -> &[String] {
+        &self.output_names
+    }
+}
+
 /// A run failure tagged with whether the model was actually invoked.
 #[derive(Debug)]
 pub enum RunPhaseError {

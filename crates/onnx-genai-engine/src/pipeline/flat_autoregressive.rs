@@ -214,10 +214,6 @@ impl PipelineEngine {
             .clone();
         let static_cross_kv = self.static_cross_kv_bindings(&cross_kv_pairs, &tensors)?;
 
-        let decoder = self
-            .models
-            .session(&ar.decoder)
-            .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
         // Pair every `every_step` binding with a backend-neutral component
         // session. By default this borrows the already-loaded ORT session
         // (behaviour unchanged); components selected natively — every component
@@ -260,6 +256,14 @@ impl PipelineEngine {
                 // Built (and, on a shared prefix, already KV-seeded) up front.
                 native
             } else {
+                // The ORT decode path needs the component's ORT session. Native
+                // decoders run without one (the loader skips it), so the session
+                // is only resolved on this branch to avoid requiring a session a
+                // native-only artifact never built.
+                let decoder = self
+                    .models
+                    .session(&ar.decoder)
+                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
                 Box::new(OrtPipelineDecoder::new(
                     decoder,
                     self.decoder_state
@@ -357,7 +361,7 @@ impl PipelineEngine {
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<DecodeState> {
         let session = models
-            .session(decoder)
+            .graph_io(decoder)
             .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
         let decoder_io = models
             .directory

@@ -23,7 +23,7 @@ impl PipelineEngine {
             };
             let session = self
                 .models
-                .session(component)
+                .graph_io(component)
                 .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
             for (port, optional) in &io.optional_inputs {
                 let endpoint = format!("{component}.{port}");
@@ -108,7 +108,7 @@ impl PipelineEngine {
             };
             let session = self
                 .models
-                .session(component)
+                .graph_io(component)
                 .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
             for (port, optional) in &io.optional_inputs {
                 if present.contains(&optional.presence) {
@@ -408,7 +408,7 @@ impl PipelineEngine {
         {
             let session = self
                 .models
-                .session(decoder)
+                .graph_io(decoder)
                 .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
             for port in optional_inputs.keys() {
                 if exclude_input == Some(port.as_str()) || bound.contains(port) {
@@ -594,7 +594,7 @@ impl PipelineEngine {
             if !self.plan.component_is_present(component, present) {
                 continue;
             }
-            let session = self.models.session(component).with_context(|| {
+            let session = self.models.graph_io(component).with_context(|| {
                 format!("pipeline every_step component '{component}' was not loaded")
             })?;
             let token_input = self

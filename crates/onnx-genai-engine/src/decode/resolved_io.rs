@@ -39,7 +39,7 @@ pub(crate) struct ResolvedIo {
 }
 
 fn resolve_state_pairs(
-    session: &Session,
+    session: &dyn GraphIo,
     declared: Option<&[LoopStatePair]>,
     kv_pairs: &[(String, String)],
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -182,7 +182,7 @@ fn resolve_state_pairs(
 /// changes across decode steps, which is why it is carried separately from the
 /// growing self-attention `kv_pairs`.
 fn resolve_cross_kv_pairs(
-    session: &Session,
+    session: &dyn GraphIo,
     inputs: Option<&[String]>,
     outputs: Option<&[String]>,
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -217,7 +217,7 @@ fn resolve_cross_kv_pairs(
 }
 
 fn resolve_position_program(
-    session: &Session,
+    session: &dyn GraphIo,
     io: &onnx_genai_metadata::ModelIoSpec,
     positions: Option<&PositionProgram>,
 ) -> anyhow::Result<Option<String>> {
@@ -329,7 +329,7 @@ pub(super) fn validate_position_shape(info: &TensorInfo, rank: usize) -> anyhow:
 impl ResolvedIo {
     /// Resolve port bindings from explicit metadata or unambiguous tensor shape.
     pub(crate) fn resolve_with_positions(
-        session: &Session,
+        session: &dyn GraphIo,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
@@ -346,7 +346,7 @@ impl ResolvedIo {
         }
     }
 
-    fn from_structure(session: &Session) -> anyhow::Result<Self> {
+    fn from_structure(session: &dyn GraphIo) -> anyhow::Result<Self> {
         let input =
             |role: &str, structural: fn(&TensorInfo) -> bool| -> anyhow::Result<Option<String>> {
                 resolve_port(session.inputs(), None, role, structural)
@@ -395,7 +395,7 @@ impl ResolvedIo {
     }
 
     fn from_spec(
-        session: &Session,
+        session: &dyn GraphIo,
         io: &onnx_genai_metadata::ModelIoSpec,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
