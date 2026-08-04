@@ -330,19 +330,30 @@ fn load_library(library: CudaLibrary) -> Result<Library, Vec<String>> {
             continue;
         }
         tried.push(path.display().to_string());
-        // A wheel component's own directory has to become searchable, not just
-        // this one file loadable. Two things need it and neither is under our
-        // control: `cublas64_*.dll` imports `cublasLt64_*.dll`, and NVRTC does
-        // its own `LoadLibrary` for `nvrtc-builtins64_*.dll` at compile time.
-        // Both resolve through the process search order, which does not include
-        // the directory a DLL was loaded from -- so loading by absolute path
-        // alone gets the first module in and then fails on its neighbour.
-        if let Some(directory) = path.parent() {
-            make_directory_searchable(directory);
-        }
         // SAFETY: paths are supplied by nxrt's installed package layout and the
         // handle is retained for the lifetime of the process below.
         if let Ok(handle) = unsafe { Library::new(&path) } {
+            // A wheel component is a self-contained set of libraries that load
+            // each other *by base name* at runtime: NVRTC opens
+            // `nvrtc-builtins` when it compiles, cuDNN opens its own engine
+            // libraries when a handle is created. Those go through the process
+            // search order, which does not include the directory the caller was
+            // loaded from -- so an absolute path to the entry point does not
+            // help with the loads it makes on its own behalf.
+            //
+            // Loading the siblings here, by absolute path, puts modules of
+            // those base names in the process, and the component's own requests
+            // resolve to them.
+            //
+            // Chosen over the alternatives deliberately. Mutating the process
+            // environment is unsound while another thread reads it, and on
+            // glibc it is also a no-op -- `LD_LIBRARY_PATH` is snapshotted at
+            // startup, so a later `dlopen` never sees the change.
+            // `AddDllDirectory` requires `SetDefaultDllDirectories`, which
+            // changes resolution for every library in the process, CUDA or not.
+            if let Some(directory) = path.parent() {
+                preload_component_siblings(directory, &path);
+            }
             return Ok(handle);
         }
     }
@@ -361,39 +372,52 @@ pub(crate) fn is_available(library: CudaLibrary) -> bool {
     require(library).is_ok()
 }
 
-/// Make `directory` findable by the platform loader, once per directory.
+/// Load the other libraries that live beside `loaded` in its wheel component.
 ///
-/// Prepending to the process `PATH` is what NVIDIA's own Python packages do on
-/// Windows, and it is the only mechanism that also covers a library's *internal*
-/// `LoadLibrary` calls -- NVRTC opening `nvrtc-builtins64_*.dll` is not
-/// something an absolute path to `nvrtc64_*.dll` can help with.
+/// An NVIDIA wheel component is a self-contained set whose members load each
+/// other by base name at runtime -- NVRTC opens `nvrtc-builtins` when it
+/// compiles, cuDNN opens its engine libraries when a handle is created. Those
+/// requests go through the process search order, which does not include the
+/// directory the caller was loaded from, so an absolute path to the entry point
+/// does not help with them. Loading the siblings puts modules of those base
+/// names in the process, and the requests resolve to them.
 ///
-/// Deliberately not `AddDllDirectory`: that only takes effect alongside
-/// `SetDefaultDllDirectories`, which changes resolution for the whole process
-/// including libraries that have nothing to do with CUDA.
-fn make_directory_searchable(directory: &Path) {
-    static ADDED: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-    let mut added = ADDED
+/// Best effort by design. A sibling that will not load is not necessarily
+/// needed, and if it is, the failure arrives later with the component's own
+/// message naming the file -- more precise than anything this could say in
+/// advance. What it must not do is fail the load that just succeeded.
+fn preload_component_siblings(directory: &Path, loaded: &Path) {
+    static SEEN: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let mut seen = SEEN
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .expect("CUDA search-directory lock poisoned");
-    if added.iter().any(|existing| existing == directory) {
+        .expect("CUDA sibling-preload lock poisoned");
+    if seen.iter().any(|existing| existing == directory) {
         return;
     }
-    added.push(directory.to_path_buf());
+    seen.push(directory.to_path_buf());
 
-    let variable = if cfg!(windows) {
-        "PATH"
-    } else {
-        "LD_LIBRARY_PATH"
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
     };
-    let current = std::env::var_os(variable).unwrap_or_default();
-    let mut entries = vec![directory.to_path_buf()];
-    entries.extend(std::env::split_paths(&current));
-    if let Ok(joined) = std::env::join_paths(entries) {
-        // SAFETY: single-threaded with respect to this variable -- the mutex
-        // above serialises every writer, and the value is only ever extended.
-        unsafe { std::env::set_var(variable, joined) };
+    let suffix = if cfg!(windows) { ".dll" } else { ".so" };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == loaded {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.contains(suffix) {
+            continue;
+        }
+        // SAFETY: an NVIDIA component from the same wheel directory as the
+        // library that was just loaded from it. The handle is leaked on
+        // purpose: these modules must outlive every use of that component,
+        // which is the life of the process.
+        if let Ok(handle) = unsafe { Library::new(&path) } {
+            std::mem::forget(handle);
+        }
     }
 }
 
