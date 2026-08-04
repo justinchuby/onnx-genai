@@ -43,6 +43,32 @@ fn tiny_sharedbuffer_llm() -> PathBuf {
         .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx")
 }
 
+/// The graph-port roles the fixture beside the model already declares.
+///
+/// `Session::new` is handed a model file, not a model directory, so it never
+/// reads `inference_metadata.yaml`. Without it the resolver has three `Int64`
+/// `[-1, -1]` inputs -- `input_ids`, `attention_mask`, `position_ids` -- and
+/// since #380 and #412 it refuses to guess between them rather than picking by
+/// name. Declaring the roles is what those changes asked callers to do; these
+/// tests were simply never updated, because this crate's tests do not run in CI.
+fn declared_io(fixture: &str) -> onnx_genai_metadata::ModelIoSpec {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(fixture)
+        .join("inference_metadata.yaml");
+    let metadata = onnx_genai_metadata::load_metadata(&path)
+        .unwrap_or_else(|error| panic!("loading {}: {error}", path.display()));
+    metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.io.clone())
+        .unwrap_or_else(|| panic!("{fixture} declares no model.io block"))
+}
+
+fn tiny_llm_io() -> onnx_genai_metadata::ModelIoSpec {
+    declared_io("tiny-llm")
+}
+
 fn deterministic_session_options() -> SessionOptions {
     SessionOptions::default().with_intra_op_threads(1)
 }
@@ -113,8 +139,12 @@ fn bound_decode_logits_match_naive_repass() {
     let tokens = [1_i64, 5, 7];
     let naive = naive_logits(&session, &tokens);
 
-    let mut decode =
-        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
+    let mut decode = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&tiny_llm_io()),
+    )
+    .expect("decode session");
     assert_eq!(decode.mode(), DecodeKvMode::ZeroCopyRebind);
 
     for (index, token) in tokens.iter().enumerate() {
@@ -151,7 +181,12 @@ fn shared_buffer_decode_matches_naive_repass() {
         past_present_share_buffer: Some(true),
         ..DecodeSessionOptions::default()
     };
-    let mut decode = DecodeSession::new(&session, options).expect("shared-buffer decode session");
+    let mut decode = DecodeSession::new_with_io(
+        &session,
+        options,
+        Some(&declared_io("tiny-llm-sharedbuffer")),
+    )
+    .expect("shared-buffer decode session");
     assert_eq!(decode.mode(), DecodeKvMode::SharedBuffer);
 
     for (index, token) in tokens.iter().enumerate() {
@@ -179,8 +214,12 @@ fn exported_kv_handoff_continues_decode_identically() {
     let continuation = [9_i64, 3];
 
     // Reference: one session runs prefill + continuation.
-    let mut reference =
-        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("reference session");
+    let mut reference = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&tiny_llm_io()),
+    )
+    .expect("reference session");
     let prompt_mask = vec![1_i64; prompt.len()];
     let prompt_pos = (0..prompt.len() as i64).collect::<Vec<_>>();
     reference
@@ -197,16 +236,24 @@ fn exported_kv_handoff_continues_decode_identically() {
     }
 
     // Hybrid: session A does prefill, exports KV; session B imports and decodes.
-    let mut prefill =
-        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("prefill session");
+    let mut prefill = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&tiny_llm_io()),
+    )
+    .expect("prefill session");
     prefill
         .step(&prompt, &prompt_mask, &prompt_pos)
         .expect("handoff prefill");
     let handoff = prefill.export_kv().expect("export kv");
     assert_eq!(handoff.len(), reference_kv_len(&session));
 
-    let mut decode =
-        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
+    let mut decode = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&tiny_llm_io()),
+    )
+    .expect("decode session");
     decode.import_kv(prompt.len(), handoff).expect("import kv");
     assert_eq!(decode.past_len(), prompt.len());
 
@@ -235,8 +282,12 @@ fn reference_kv_len(session: &Session) -> usize {
 fn bound_decode_rewind_matches_replay() {
     let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = load_session();
-    let mut decode =
-        DecodeSession::new(&session, DecodeSessionOptions::default()).expect("decode session");
+    let mut decode = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&tiny_llm_io()),
+    )
+    .expect("decode session");
 
     let first = decode.step(&[1], &[1], &[0]).expect("first step");
     let first_logits = first.to_vec_f32().expect("first logits");

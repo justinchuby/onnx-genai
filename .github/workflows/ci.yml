@@ -621,16 +621,11 @@ jobs:
       # anywhere in CI: every other lane must stay offline, and this lane -- the
       # only one with a downloaded ONNX Runtime -- named just the CLI. A loader
       # change silently left one of its unit assertions stale for that whole
-      # time. The ORT distribution is already downloaded and on PATH by this
-      # point, so covering the crate that needs it costs a step, not a download.
-      #
-      # `--lib` only for now: the crate's `decode_session` integration tests
-      # currently fail for an unrelated reason (see the issue linked in the PR),
-      # and gating on them would mean landing a red pipeline. Locking in the 112
-      # unit tests today is what stops the next stale assertion; the integration
-      # tests get added back when they pass.
+      # time, and its decode_session tests had been failing since #380/#412. The
+      # ORT distribution is already downloaded and on PATH by this point, so
+      # covering the crate that needs it costs a step, not a download.
       - name: Test onnx-genai-ort
-        run: cargo test --locked -p onnx-genai-ort --lib
+        run: cargo test --locked -p onnx-genai-ort
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
