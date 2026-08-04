@@ -96,7 +96,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -127,7 +126,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -158,7 +156,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -267,7 +264,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -391,7 +387,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -485,7 +480,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -516,7 +510,6 @@ jobs:
           -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor
-          -p onnx-runtime-memory -p onnx-runtime-memory-governor
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -624,6 +617,20 @@ jobs:
           $ort.DirectoryName >> $env:GITHUB_PATH
       - name: Test onnx-genai-cli with coverage
         run: cargo llvm-cov --locked --no-clean --codecov --output-path codecov-cli-ort.json -p onnx-genai-cli
+      # `onnx-genai-ort` is the ORT backend itself, and its tests had never run
+      # anywhere in CI: every other lane must stay offline, and this lane -- the
+      # only one with a downloaded ONNX Runtime -- named just the CLI. A loader
+      # change silently left one of its unit assertions stale for that whole
+      # time. The ORT distribution is already downloaded and on PATH by this
+      # point, so covering the crate that needs it costs a step, not a download.
+      #
+      # `--lib` only for now: the crate's `decode_session` integration tests
+      # currently fail for an unrelated reason (see the issue linked in the PR),
+      # and gating on them would mean landing a red pipeline. Locking in the 112
+      # unit tests today is what stops the next stale assertion; the integration
+      # tests get added back when they pass.
+      - name: Test onnx-genai-ort
+        run: cargo test --locked -p onnx-genai-ort --lib
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
