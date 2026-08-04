@@ -242,6 +242,20 @@ impl MemoryGovernor for HostLeaseGovernor {
         ))
     }
 
+    fn used(&self, tier: Tier) -> u64 {
+        if tier != Tier::Host {
+            return 0;
+        }
+        // What the host governor has actually granted. Unlike the ledger's
+        // count this is a claim on a machine-wide resource, so it is read from
+        // the governor rather than accumulated here.
+        self.accounting
+            .governor
+            .snapshot()
+            .map(|snapshot| snapshot.claimed_bytes)
+            .unwrap_or(0)
+    }
+
     fn available(&self, tier: Tier) -> u64 {
         if tier != Tier::Host {
             return 0;

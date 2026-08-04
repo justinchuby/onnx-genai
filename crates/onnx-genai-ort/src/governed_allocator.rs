@@ -1130,6 +1130,10 @@ mod tests {
         fn available(&self, tier: Tier) -> u64 {
             self.inner.available(tier)
         }
+
+        fn used(&self, tier: Tier) -> u64 {
+            self.inner.used(tier)
+        }
     }
 
     fn read_stats(allocator: &mut GovernedAllocator) -> std::collections::HashMap<String, String> {

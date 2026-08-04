@@ -474,6 +474,20 @@ pub trait MemoryGovernor {
 
     /// Bytes currently grantable on `tier`.
     fn available(&self, tier: Tier) -> u64;
+
+    /// Bytes currently leased on `tier`, across every holder.
+    ///
+    /// The counterpart to `available`, and the only exact answer to "what does
+    /// this tier hold": leases are owned by the components that must outlive
+    /// them -- a KV pool holds its own, an execution provider holds its pool's
+    /// -- so no single caller can sum them up. The governor can, because
+    /// everything went through it.
+    ///
+    /// Not itemised by holder. A governor that wanted to answer that would have
+    /// to track attribution, which the reference implementation deliberately
+    /// does not: `MemoryLease`'s `Drop` has to stay infallible and
+    /// allocation-free.
+    fn used(&self, tier: Tier) -> u64;
 }
 
 /// A governor backed by a [`LeaseLedger`].
@@ -518,6 +532,10 @@ impl MemoryGovernor for LedgerGovernor {
 
     fn available(&self, tier: Tier) -> u64 {
         self.ledger.available(tier)
+    }
+
+    fn used(&self, tier: Tier) -> u64 {
+        self.ledger.used(tier)
     }
 }
 

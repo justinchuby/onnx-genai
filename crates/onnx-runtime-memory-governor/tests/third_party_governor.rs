@@ -24,6 +24,9 @@ use onnx_runtime_memory_governor::{
 #[derive(Debug)]
 struct MyOwnManager {
     free: AtomicU64,
+    /// What this manager started with, so the trait's `used` can be answered
+    /// from what it already tracks rather than needing a second counter.
+    capacity: u64,
     releases: AtomicU64,
 }
 
@@ -31,6 +34,7 @@ impl MyOwnManager {
     fn new(capacity: u64) -> Arc<Self> {
         Arc::new(Self {
             free: AtomicU64::new(capacity),
+            capacity,
             releases: AtomicU64::new(0),
         })
     }
@@ -102,6 +106,20 @@ impl MemoryGovernor for MyOwnGovernor {
             0
         } else {
             self.accounting.free.load(Ordering::Acquire)
+        }
+    }
+
+    /// A third-party governor answers this from whatever it already tracks.
+    ///
+    /// Here that is the granted total, which is what a caller asking "what does
+    /// this tier hold" wants -- and the point of the method being on the trait
+    /// is that no caller can work it out for itself: leases are owned by the
+    /// components that must outlive them.
+    fn used(&self, tier: Tier) -> u64 {
+        if tier == Tier::Device {
+            0
+        } else {
+            self.accounting.capacity - self.accounting.free.load(Ordering::Acquire)
         }
     }
 }

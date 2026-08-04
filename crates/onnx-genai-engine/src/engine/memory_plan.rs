@@ -452,4 +452,40 @@ mod tests {
             .expect("nothing to charge is not a failure");
         assert_eq!(governor.available(Tier::Device), 1000);
     }
+
+    /// The tier total sees leases the plan does not hold.
+    ///
+    /// The KV pool's lease lives inside `PagedKvCache` and the weight-residency
+    /// pool's inside the execution provider, because each is held by the thing
+    /// that must outlive it. Summing the plan's own entries therefore misses
+    /// them -- and they are the two largest holders, so a total that omitted
+    /// them would be read as the whole picture and be wrong by most of it.
+    #[test]
+    fn the_tier_total_counts_leases_the_plan_does_not_hold() {
+        let governor = governor(1000);
+        let mut plan = ModelMemoryPlan::new(governor.clone());
+
+        plan.reserve(Holder::FixedDeviceReservation, 100)
+            .expect("fits");
+
+        // Something else takes a lease from the same governor and keeps it --
+        // exactly what `PagedKvCache` and the CUDA residency cache do.
+        let held_elsewhere = governor
+            .reserve(Tier::Device, 400, MemoryRole::KvCache, Holder::KvPool.id())
+            .expect("fits");
+
+        assert_eq!(
+            plan.bytes_on(Tier::Device),
+            100,
+            "the plan only knows what it holds itself"
+        );
+        assert_eq!(
+            governor.used(Tier::Device),
+            500,
+            "the ledger knows both, which is why the total is read from it"
+        );
+
+        drop(held_elsewhere);
+        assert_eq!(governor.used(Tier::Device), 100);
+    }
 }

@@ -225,13 +225,30 @@ impl EngineResourceGovernor {
     /// what was *granted*. A gap between them is the interesting case -- either
     /// something holds memory the plan did not predict, or the plan predicted
     /// memory nothing took.
+    /// What this model holds *through the plan*, per holder.
+    ///
+    /// **Not every lease.** The KV pool's lease lives inside `PagedKvCache` and
+    /// the weight-residency pool's inside the execution provider, because each
+    /// is held by the thing that must outlive it. Those bytes went through the
+    /// same ledger and are in [`Self::leased_bytes_on`], but they are not
+    /// itemised here: the ledger tracks per-tier usage, not per-holder
+    /// attribution, so there is nothing to itemise them from.
+    ///
+    /// Said plainly because a breakdown that quietly omitted the two largest
+    /// holders would be read as the whole picture -- which is how
+    /// `activations_bytes: 0` came to be published as fact.
     pub fn leased_breakdown(&self) -> Vec<(&'static str, onnx_runtime_memory_governor::Tier, u64)> {
         self.plan().breakdown()
     }
 
     /// Bytes leased on `tier`, across every holder this model has.
+    ///
+    /// Read from the ledger rather than summed from the plan, so it includes the
+    /// leases the plan does not itself hold: the KV pool's lives inside
+    /// `PagedKvCache` and the weight-residency pool's inside the execution
+    /// provider, because each is held by the thing that must outlive it.
     pub fn leased_bytes_on(&self, tier: onnx_runtime_memory_governor::Tier) -> u64 {
-        self.plan().bytes_on(tier)
+        onnx_runtime_memory_governor::MemoryGovernor::used(&self.memory, tier)
     }
 
     pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {
