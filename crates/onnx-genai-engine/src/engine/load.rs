@@ -242,7 +242,7 @@ impl Engine {
                 config.limits.clone(),
                 config.allow_runtime_override,
                 governor_kv_config,
-                onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
+                device_weight_reservation_bytes(&model_directory.model_path),
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
@@ -523,7 +523,7 @@ fn build_governor_and_scheduler(
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
-            onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
+            device_weight_reservation_bytes(&model_directory.model_path),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
     };
@@ -674,6 +674,54 @@ pub(crate) fn kv_pages_for_budget(
 /// Only the configured path holds storage worth leasing. Without per-layer
 /// geometry a pool is pure bookkeeping and occupies nothing, so it is built
 /// ungoverned rather than taking a lease of zero that implies otherwise.
+/// Device bytes to reserve for model weights.
+///
+/// The whole package, normally: with every weight resident, that is what the
+/// device holds.
+///
+/// **Not** the whole package when weight offload is on. Offload exists because
+/// the weights do not fit, and it keeps only a bounded residency cache on the
+/// device while the rest stays on the host. Reserving the full package *and*
+/// letting that cache hold a slice of it counts the same bytes twice: on an
+/// 8 GiB card a 6 GiB model reserves 6 GiB, leaving 2 GiB for KV, while the
+/// residency cache separately holds up to its own budget of the same weights.
+///
+/// So with offload on, the reservation is what the device will actually hold --
+/// the residency budget -- capped at the package size, because a budget larger
+/// than the model cannot be filled.
+///
+/// The budget itself stays the operator's to set (#649): this only stops the
+/// same bytes being counted on both sides of the ledger.
+fn device_weight_reservation_bytes(model_path: &std::path::Path) -> u64 {
+    let package = onnx_genai_ort::model_weight_bytes(model_path);
+    #[cfg(feature = "cuda")]
+    let offload_budget = {
+        let policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
+        policy.enabled.then(|| {
+            policy
+                .device_budget_bytes
+                .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+        })
+    };
+    #[cfg(not(feature = "cuda"))]
+    let offload_budget = None;
+    weight_reservation_for(package, offload_budget)
+}
+
+/// The reservation, given the package size and the offload budget when offload
+/// is on.
+///
+/// Split from the environment read so the rule can be tested without a process
+/// variable that every other test would then race against.
+fn weight_reservation_for(package_bytes: u64, offload_budget: Option<u64>) -> u64 {
+    match offload_budget {
+        // A budget larger than the model cannot be filled, so the device still
+        // holds at most the package.
+        Some(budget) => budget.min(package_bytes),
+        None => package_bytes,
+    }
+}
+
 fn allocate_kv_cache(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
@@ -1250,5 +1298,39 @@ mod pool_sizing_tests {
             pages, 64,
             "a binding budget should be taken in full, not reduced further"
         );
+    }
+
+    /// With offload off, the device holds the whole package.
+    ///
+    /// With it on, it does not -- that is what offload is for -- so reserving
+    /// the package *and* letting the residency cache hold a slice of it counts
+    /// the same bytes twice. On an 8 GiB card a 6 GiB model would reserve 6 GiB,
+    /// leaving 2 GiB for KV, while the residency cache separately held up to
+    /// its own budget of the same weights.
+    #[test]
+    fn offload_reserves_what_the_device_holds_not_the_whole_package() {
+        let package = 6u64 << 30;
+
+        assert_eq!(
+            weight_reservation_for(package, None),
+            package,
+            "with offload off every weight is resident"
+        );
+        assert_eq!(
+            weight_reservation_for(package, Some(2 << 30)),
+            2 << 30,
+            "with offload on the device holds the residency budget, not the package"
+        );
+    }
+
+    /// A budget larger than the model cannot be filled.
+    ///
+    /// The default is 4 GiB, so any model smaller than that would otherwise
+    /// reserve more than it could possibly occupy -- and the reservation comes
+    /// straight out of what KV is offered.
+    #[test]
+    fn a_budget_larger_than_the_model_reserves_only_the_model() {
+        let package = 1u64 << 30;
+        assert_eq!(weight_reservation_for(package, Some(4 << 30)), package);
     }
 }
