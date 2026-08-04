@@ -116,7 +116,6 @@ fn priority_from_index(index: usize) -> Priority {
     }
 }
 
-// TODO: Implement preemption policies (recompute vs swap)
 // TODO: SLA-aware deadline scheduling
 
 #[cfg(test)]
