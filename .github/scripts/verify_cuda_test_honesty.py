@@ -15,9 +15,15 @@ ROOT = Path(__file__).resolve().parents[2]
 CUDA_CRATE = ROOT / "crates" / "onnx-runtime-ep-cuda"
 TESTS = CUDA_CRATE / "tests"
 SUMMARY = re.compile(
-    r"test result: ok\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
+    r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
 )
+
+
+@dataclass(frozen=True)
+class FeatureConfig:
+    name: str
+    features: str
 
 
 @dataclass(frozen=True)
@@ -27,12 +33,25 @@ class TestBinary:
 
 
 @dataclass(frozen=True)
-class TargetResult:
+class IgnoredResult:
     target: str
     inventory: int
     passed: int
     failed: int
     ignored: int
+
+
+@dataclass(frozen=True)
+class ActiveResult:
+    target: str
+    inventory: int
+    passed: int
+    failed: int
+    ignored: int
+
+
+BASE_CONFIG = FeatureConfig("without-gpu-tests", "cuda")
+GPU_CONFIG = FeatureConfig("with-gpu-tests", "cuda,gpu-tests")
 
 
 def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -45,28 +64,9 @@ def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def build_test_binaries() -> list[TestBinary]:
-    result = run(
-        [
-            "cargo",
-            "test",
-            "--locked",
-            "-p",
-            "onnx-runtime-ep-cuda",
-            "--features",
-            "cuda",
-            "--tests",
-            "--no-run",
-            "--message-format=json",
-        ]
-    )
-    if result.returncode != 0:
-        print(result.stdout, file=sys.stderr, end="")
-        print(result.stderr, file=sys.stderr, end="")
-        raise RuntimeError("cargo test --no-run failed")
-
+def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
     binaries: dict[str, Path] = {}
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             message = json.loads(line)
         except json.JSONDecodeError:
@@ -90,33 +90,78 @@ def build_test_binaries() -> list[TestBinary]:
     return [TestBinary(target, binaries[target]) for target in sorted(binaries)]
 
 
-def list_inventory(binary: TestBinary) -> int:
+def build_test_binaries(config: FeatureConfig) -> list[TestBinary]:
+    result = run(
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "onnx-runtime-ep-cuda",
+            "--features",
+            config.features,
+            "--tests",
+            "--no-run",
+            "--message-format=json",
+        ]
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr, end="")
+        print(result.stderr, file=sys.stderr, end="")
+        raise RuntimeError(f"cargo test --no-run failed for {config.name}")
+    return parse_test_binaries_from_json(result.stdout)
+
+
+def list_inventory(binary: TestBinary) -> frozenset[str]:
     result = run([binary.executable, "--list"])
     if result.returncode != 0:
         print(result.stdout, file=sys.stderr, end="")
         print(result.stderr, file=sys.stderr, end="")
         raise RuntimeError(f"{binary.target} --list failed")
-    return sum(1 for line in result.stdout.splitlines() if line.endswith(": test"))
+    return frozenset(line.removesuffix(": test") for line in result.stdout.splitlines() if line.endswith(": test"))
 
 
-def run_ignored_check(binary: TestBinary) -> tuple[int, int, int]:
+def run_libtest(binary: TestBinary) -> tuple[int, int, int, int]:
     result = run([binary.executable, "--color", "never"])
     output = result.stdout + result.stderr
-    if result.returncode != 0:
-        print(output, file=sys.stderr, end="")
-        raise RuntimeError(f"{binary.target} failed while checking ignored status")
     matches = list(SUMMARY.finditer(output))
     if not matches:
+        print(output, file=sys.stderr, end="")
         raise RuntimeError(f"{binary.target} did not print a libtest summary")
     summary = matches[-1]
     return (
+        result.returncode,
         int(summary.group("passed")),
         int(summary.group("failed")),
         int(summary.group("ignored")),
     )
 
 
-def validate_result(result: TargetResult) -> list[str]:
+def collect_inventories(binaries: list[TestBinary]) -> dict[str, frozenset[str]]:
+    return {binary.target: list_inventory(binary) for binary in binaries}
+
+
+def compare_inventories(
+    base: dict[str, frozenset[str]], gpu: dict[str, frozenset[str]]
+) -> list[str]:
+    errors: list[str] = []
+    base_targets = set(base)
+    gpu_targets = set(gpu)
+    for target in sorted(gpu_targets - base_targets):
+        errors.append(f"{target}: exists only with gpu-tests enabled; CUDA tests must not hide from CPU inventory")
+    for target in sorted(base_targets - gpu_targets):
+        errors.append(f"{target}: exists only without gpu-tests enabled; inventories must stay reconciled")
+    for target in sorted(base_targets & gpu_targets):
+        base_only = base[target] - gpu[target]
+        gpu_only = gpu[target] - base[target]
+        for test in sorted(gpu_only):
+            errors.append(f"{target}::{test}: test exists only with gpu-tests enabled")
+        for test in sorted(base_only):
+            errors.append(f"{target}::{test}: test exists only without gpu-tests enabled")
+    return errors
+
+
+def validate_ignored_result(result: IgnoredResult) -> list[str]:
     errors: list[str] = []
     if result.inventory == 0:
         errors.append(f"{result.target}: Cargo reported no integration tests")
@@ -133,16 +178,73 @@ def validate_result(result: TargetResult) -> list[str]:
     return errors
 
 
+def validate_active_no_cuda_result(result: ActiveResult) -> list[str]:
+    errors: list[str] = []
+    if result.inventory == 0:
+        errors.append(f"{result.target}: Cargo reported no gpu-tests integration tests")
+    if result.passed:
+        errors.append(
+            f"{result.target}: {result.passed} tests passed with gpu-tests on a no-CUDA host; CUDA tests must fail loud or remain ignored"
+        )
+    if result.failed + result.ignored != result.inventory:
+        errors.append(
+            f"{result.target}: Cargo inventory has {result.inventory} tests but active no-CUDA run reported "
+            f"{result.failed} failed + {result.ignored} ignored"
+        )
+    return errors
+
+
 def self_test() -> None:
-    good = TargetResult("fixture_good", inventory=2, passed=0, failed=0, ignored=2)
-    silent_skip = TargetResult("fixture_silent_skip", inventory=1, passed=1, failed=0, ignored=0)
-    drift = TargetResult("fixture_drift", inventory=3, passed=0, failed=0, ignored=2)
-    if validate_result(good):
-        raise AssertionError("good fixture should pass")
-    if not any("executed without gpu-tests" in error for error in validate_result(silent_skip)):
-        raise AssertionError("silent-skip fixture should fail when a test passes instead of being ignored")
-    if not any("inventory has 3 tests" in error for error in validate_result(drift)):
-        raise AssertionError("inventory drift fixture should fail")
+    fixture_stdout = "\n".join(
+        [
+            "not json",
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "target": {
+                        "name": "fixture_gpu",
+                        "kind": ["test"],
+                        "src_path": str(TESTS / "fixture_gpu.rs"),
+                    },
+                    "executable": str(ROOT / "target" / "debug" / "deps" / "fixture_gpu.exe"),
+                }
+            ),
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "target": {
+                        "name": "onnx_runtime_ep_cuda",
+                        "kind": ["lib"],
+                        "src_path": str(CUDA_CRATE / "src" / "lib.rs"),
+                    },
+                    "executable": str(ROOT / "target" / "debug" / "deps" / "lib.exe"),
+                }
+            ),
+        ]
+    )
+    parsed = parse_test_binaries_from_json(fixture_stdout)
+    if parsed != [TestBinary("fixture_gpu", ROOT / "target" / "debug" / "deps" / "fixture_gpu.exe")]:
+        raise AssertionError(f"JSON parser fixture returned {parsed!r}")
+
+    if compare_inventories({"target": frozenset({"a"})}, {"target": frozenset({"a"})}):
+        raise AssertionError("matching inventories should pass")
+    hidden = compare_inventories({"target": frozenset({"a"})}, {"target": frozenset({"a", "gpu_only"})})
+    if not any("gpu_only" in error for error in hidden):
+        raise AssertionError("gpu-tests-only inventory drift should be caught")
+
+    good_ignored = IgnoredResult("fixture_good", inventory=2, passed=0, failed=0, ignored=2)
+    silent_without_feature = IgnoredResult("fixture_silent_skip", inventory=1, passed=1, failed=0, ignored=0)
+    if validate_ignored_result(good_ignored):
+        raise AssertionError("good ignored fixture should pass")
+    if not any("executed without gpu-tests" in error for error in validate_ignored_result(silent_without_feature)):
+        raise AssertionError("without-gpu-tests silent pass should fail")
+
+    good_active = ActiveResult("fixture_active", inventory=2, passed=0, failed=2, ignored=0)
+    silent_with_feature = ActiveResult("fixture_active_silent", inventory=1, passed=1, failed=0, ignored=0)
+    if validate_active_no_cuda_result(good_active):
+        raise AssertionError("active fail-loud fixture should pass")
+    if not any("passed with gpu-tests" in error for error in validate_active_no_cuda_result(silent_with_feature)):
+        raise AssertionError("gpu-tests-enabled silent pass should fail")
 
 
 def main() -> int:
@@ -160,18 +262,35 @@ def main() -> int:
     if "gpu-tests = []" not in cargo_toml:
         errors.append("crates/onnx-runtime-ep-cuda/Cargo.toml must define a gpu-tests feature")
 
-    binaries = build_test_binaries()
-    results: list[TargetResult] = []
-    for binary in binaries:
-        inventory = list_inventory(binary)
-        passed, failed, ignored = run_ignored_check(binary)
-        target_result = TargetResult(binary.target, inventory, passed, failed, ignored)
-        results.append(target_result)
-        errors.extend(validate_result(target_result))
+    base_binaries = build_test_binaries(BASE_CONFIG)
+    gpu_binaries = build_test_binaries(GPU_CONFIG)
+    base_inventory = collect_inventories(base_binaries)
+    gpu_inventory = collect_inventories(gpu_binaries)
+    errors.extend(compare_inventories(base_inventory, gpu_inventory))
 
-    total_inventory = sum(result.inventory for result in results)
-    total_ignored = sum(result.ignored for result in results)
-    if total_inventory == 0:
+    base_by_target = {binary.target: binary for binary in base_binaries}
+    gpu_by_target = {binary.target: binary for binary in gpu_binaries}
+
+    ignored_results: list[IgnoredResult] = []
+    for target, inventory in sorted(base_inventory.items()):
+        _, passed, failed, ignored = run_libtest(base_by_target[target])
+        result = IgnoredResult(target, len(inventory), passed, failed, ignored)
+        ignored_results.append(result)
+        errors.extend(validate_ignored_result(result))
+
+    active_results: list[ActiveResult] = []
+    for target, inventory in sorted(gpu_inventory.items()):
+        _, passed, failed, ignored = run_libtest(gpu_by_target[target])
+        result = ActiveResult(target, len(inventory), passed, failed, ignored)
+        active_results.append(result)
+        errors.extend(validate_active_no_cuda_result(result))
+
+    total_base_inventory = sum(len(inventory) for inventory in base_inventory.values())
+    total_gpu_inventory = sum(len(inventory) for inventory in gpu_inventory.values())
+    total_ignored = sum(result.ignored for result in ignored_results)
+    total_active_failed = sum(result.failed for result in active_results)
+    total_active_ignored = sum(result.ignored for result in active_results)
+    if total_base_inventory == 0 or total_gpu_inventory == 0:
         errors.append("Cargo reported no CUDA integration tests")
 
     if errors:
@@ -181,8 +300,10 @@ def main() -> int:
         return 1
 
     print(
-        f"CUDA test honesty check passed for {total_inventory} Cargo-discovered integration tests "
-        f"across {len(results)} targets ({total_ignored} ignored without gpu-tests)"
+        "CUDA test honesty check passed: "
+        f"{total_base_inventory} tests/{len(base_inventory)} targets without gpu-tests "
+        f"({total_ignored} ignored), {total_gpu_inventory} tests/{len(gpu_inventory)} targets with gpu-tests "
+        f"({total_active_failed} fail-loud, {total_active_ignored} ignored, 0 passed on this no-CUDA host)"
     )
     return 0
 
