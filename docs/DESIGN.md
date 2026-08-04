@@ -298,7 +298,7 @@ pub struct Scheduler {
 pub struct SchedulerConfig {
     pub max_batch_size: usize,
     pub max_total_tokens: usize,       // total KV budget across all sequences
-    pub preemption_policy: PreemptionPolicy,  // recompute | swap
+    pub preemption_policy: PreemptionPolicy,  // disabled | swap
     pub priority_policy: PriorityPolicy,      // fcfs | priority | fair_share
 }
 
