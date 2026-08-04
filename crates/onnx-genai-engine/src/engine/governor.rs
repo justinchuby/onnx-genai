@@ -99,6 +99,11 @@ pub struct EngineResourceGovernor {
     /// ledger; a per-caller governor would let each holder believe it had the
     /// whole tier to itself.
     memory: onnx_runtime_memory_governor::LedgerGovernor,
+    /// The fixed device reservation -- weights and runtime overhead -- held as a
+    /// lease rather than subtracted before the ledger sees it.
+    ///
+    /// Kept for its Drop: unloading the model returns these bytes to the tier.
+    _fixed_device_reservation: Option<onnx_runtime_memory_governor::MemoryLease>,
     #[cfg(feature = "native-backend")]
     weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
 }
@@ -145,18 +150,55 @@ impl EngineResourceGovernor {
             },
             kv_config,
         )?;
-        // The ledger is seeded from the *KV* budget rather than the raw device
-        // ceiling: the ceiling still has to cover weights, activations and
-        // runtime overhead, so leasing against it would let KV claim memory
-        // that is already spoken for.
+        // The ledger's device tier is the *device*, not a sub-budget of it.
+        //
+        // It used to be seeded with `derived_budget.kv_bytes`, which made the
+        // tier mean "bytes KV may have". That was safe for the one holder there
+        // was, and it is exactly why nothing else could join: a weight-residency
+        // pool or an activation reservation leased from it would have been
+        // charged a second time and taken the room out of KV's allowance.
+        //
+        // So the tier is the resolved ceiling, and the fixed reservation the
+        // ceiling already accounts for -- weights and runtime overhead, per
+        // `VramBreakdown` -- is taken as a lease instead of a subtraction. The
+        // bytes left for KV are identical; the difference is that they are now
+        // what remains after a claim the ledger can see, rather than after
+        // arithmetic it cannot.
         let snapshot = inner.snapshot();
         let memory = onnx_runtime_memory_governor::LedgerGovernor::new(
             onnx_runtime_memory_governor::LeaseLedger::new(
-                snapshot.derived_budget.kv_bytes,
+                snapshot.resolved_limits.vram_bytes,
                 snapshot.resolved_limits.host_ram_bytes,
                 snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
             ),
         );
+        // `reservation_applied` is false when honouring the reservation would
+        // have left no room for even one KV page. It is an estimate over a
+        // ceiling that may itself be provisional, so it must never be the reason
+        // a model refuses to start -- and when it was not applied there is
+        // nothing to charge.
+        let fixed_reservation = if snapshot.derived_budget.reservation_applied {
+            snapshot.derived_budget.reserved_bytes
+        } else {
+            0
+        };
+        let fixed_device_reservation = if fixed_reservation > 0 {
+            Some(
+                onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                    &memory,
+                    onnx_runtime_memory_governor::Tier::Device,
+                    fixed_reservation,
+                    onnx_runtime_memory_governor::MemoryRole::Weights,
+                    crate::engine::memory_plan::Holder::FixedDeviceReservation.id(),
+                )
+                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                    operation: "charging the fixed device reservation to the memory ledger",
+                    reason: error.to_string(),
+                })?,
+            )
+        } else {
+            None
+        };
         #[cfg(feature = "native-backend")]
         let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new(
             inner.snapshot().resolved_limits.host_ram_bytes,
@@ -169,6 +211,7 @@ impl EngineResourceGovernor {
             inner,
             allow_runtime_override,
             memory,
+            _fixed_device_reservation: fixed_device_reservation,
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
         })

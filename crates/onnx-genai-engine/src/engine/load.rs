@@ -284,14 +284,21 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
-        // End the second budget. The execution provider was built before this
-        // governor existed, so a standing pool it keeps -- the CUDA
-        // weight-residency cache -- sized itself from an operator figure or a
-        // default. Until now that size answered to nobody: grant the KV pool
-        // most of a card, let residency default to a fraction of it, and both
-        // are individually satisfied while the device is oversubscribed.
+        // End the second budget.
         //
-        // A refusal here is the point. It says the model does not fit while
+        // The execution provider is built before this governor exists, so a
+        // standing pool it keeps -- the CUDA weight-residency cache -- sized
+        // itself from an operator figure or a default that answered to nobody.
+        // Grant the KV pool most of a card, let residency default to a fraction
+        // of it, and both are individually satisfied while the device is
+        // oversubscribed.
+        //
+        // This is only correct because the ledger's device tier is now the
+        // device rather than the KV sub-budget. Charging a weights pool to a
+        // tier that meant "bytes KV may have" would have taken the room out of
+        // KV's allowance and counted weights twice.
+        //
+        // A refusal here is the point: it says the model does not fit while
         // there is still a load to fail, rather than at an allocation somewhere
         // unrelated later.
         let governed_pool_bytes = native_session
@@ -302,7 +309,8 @@ impl Engine {
             )
             .context(
                 "the native execution provider holds a standing device pool the governor cannot \
-                 grant; lower ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES or raise the device limit",
+                 grant alongside the model's other claims; lower \
+                 ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES or raise the device limit",
             )?;
         if governed_pool_bytes > 0 {
             tracing::debug!(

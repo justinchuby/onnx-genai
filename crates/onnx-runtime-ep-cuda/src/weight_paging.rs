@@ -412,12 +412,6 @@ pub struct CudaWeightResidency {
 
 struct ResidencyInner {
     budget: u64,
-    /// The governor grant this budget came from, when it came from one.
-    ///
-    /// Held for its `Drop`: releasing the lease is how the tier learns these
-    /// bytes are available again. `None` means the budget was chosen locally and
-    /// no governor knows about it.
-    lease: Option<onnx_runtime_memory_governor::MemoryLease>,
     resident_bytes: u64,
     peak_resident_bytes: u64,
     page_ins: u64,
@@ -426,6 +420,23 @@ struct ResidencyInner {
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
+    /// The governor grant this budget came from, when it came from one.
+    ///
+    /// Held for its `Drop`: releasing the lease is how the tier learns these
+    /// bytes are available again. `None` means the budget was chosen locally and
+    /// no governor knows about it.
+    ///
+    /// **Declared after `pages` on purpose.** Rust drops fields in declaration
+    /// order, so this releases the entitlement only once the pages holding the
+    /// VRAM have been dropped. The other order tells the governor those bytes
+    /// are free while they are still held, and hands them to the next requester
+    /// on top of memory that has not been returned yet.
+    ///
+    /// Note this only orders the pages *this cache* still holds. An
+    /// `Arc<CudaWeightPage>` handed to a caller keeps its page alive
+    /// independently, so a caller outliving the cache still outlives the lease.
+    /// See `residency_holds_its_lease_until_its_pages_are_gone`.
+    lease: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 
 impl CudaWeightResidency {

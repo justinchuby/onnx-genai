@@ -52,6 +52,13 @@ pub(crate) enum Holder {
     RecurrentState,
     /// Intermediate activations for one graph execution.
     Activations,
+    /// The fixed device reservation the engine's ceiling already accounts for --
+    /// model weights and runtime overhead.
+    ///
+    /// Charged as a lease so the ledger's device tier can be the device itself.
+    /// Seeding that tier with the KV sub-budget instead was what stopped every
+    /// other holder from joining it.
+    FixedDeviceReservation,
 }
 
 impl Holder {
@@ -67,6 +74,7 @@ impl Holder {
             Holder::WeightResidency => 4,
             Holder::RecurrentState => 5,
             Holder::Activations => 6,
+            Holder::FixedDeviceReservation => 7,
         })
     }
 
@@ -82,6 +90,7 @@ impl Holder {
             // lives and dies with its sequence, like KV.
             Holder::RecurrentState => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
+            Holder::FixedDeviceReservation => MemoryRole::Weights,
         }
     }
 
@@ -94,6 +103,7 @@ impl Holder {
             Holder::WeightResidency => "device weight residency cache",
             Holder::RecurrentState => "recurrent state",
             Holder::Activations => "activations",
+            Holder::FixedDeviceReservation => "fixed device reservation",
         }
     }
 }
@@ -187,6 +197,7 @@ mod tests {
             Holder::WeightResidency,
             Holder::RecurrentState,
             Holder::Activations,
+            Holder::FixedDeviceReservation,
         ];
         for (index, holder) in holders.iter().enumerate() {
             for other in &holders[index + 1..] {
@@ -254,5 +265,64 @@ mod tests {
             1000,
             "unloading a model must return its memory"
         );
+    }
+
+    /// The engine's device tier is the device, and the fixed reservation is a
+    /// claim on it rather than arithmetic done before it.
+    ///
+    /// The ledger used to be seeded with `derived_budget.kv_bytes`, so its
+    /// device tier meant "bytes KV may have". Safe for the one holder there was,
+    /// and precisely why nothing else could join: a weight-residency pool leased
+    /// from it would have been charged twice and taken the room out of KV.
+    ///
+    /// This asserts the shape that unblocked it -- ceiling in, reservation
+    /// charged, remainder available to everyone else -- without needing a real
+    /// engine.
+    #[test]
+    fn charging_the_fixed_reservation_leaves_the_rest_for_every_other_holder() {
+        let ceiling = 1000;
+        let reservation = 300;
+        let governor = governor(ceiling);
+
+        let mut plan = ModelMemoryPlan::new();
+        plan.reserve(
+            &governor,
+            Holder::FixedDeviceReservation,
+            Tier::Device,
+            reservation,
+        )
+        .expect("the reservation fits its own ceiling");
+
+        assert_eq!(
+            governor.available(Tier::Device),
+            ceiling - reservation,
+            "what is left must be the ceiling less the reservation"
+        );
+
+        // A KV pool and a weight-residency pool now compete for the same
+        // remainder, which is the entire point.
+        plan.reserve(&governor, Holder::KvPool, Tier::Device, 500)
+            .expect("500 of the remaining 700 fits");
+        let refused = plan
+            .reserve(&governor, Holder::WeightResidency, Tier::Device, 500)
+            .expect_err("only 200 is left");
+        assert!(matches!(refused, MemoryError::TierExhausted { .. }));
+
+        assert_eq!(plan.bytes_on(Tier::Device), reservation + 500);
+    }
+
+    /// A reservation that was not applied is not charged.
+    ///
+    /// The scheduler drops it when honouring it would leave no room for even one
+    /// KV page, because it is an estimate over a possibly provisional ceiling
+    /// and must never be the reason a model refuses to start. Charging it anyway
+    /// would reintroduce that refusal through the ledger.
+    #[test]
+    fn a_reservation_that_was_not_applied_is_not_charged() {
+        let governor = governor(1000);
+        let mut plan = ModelMemoryPlan::new();
+        plan.reserve(&governor, Holder::FixedDeviceReservation, Tier::Device, 0)
+            .expect("nothing to charge is not a failure");
+        assert_eq!(governor.available(Tier::Device), 1000);
     }
 }
