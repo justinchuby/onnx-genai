@@ -21,6 +21,7 @@
 //!    exactly as [`onnx_runtime_ep_api::DeviceBuffer`] documents for CUDA.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
@@ -55,6 +56,19 @@ pub struct CudaExecutionProvider {
     /// Defaults to CudaDeviceAllocator, which is the cuMemAlloc call this
     /// EP used to make directly.
     memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    /// Allocations and frees this EP made through `memory`.
+    ///
+    /// Kept here rather than asked of the allocator, because the allocator is
+    /// the part a caller replaces and counting is not something the shared
+    /// contract should require of them. The EP knows every call it makes.
+    ///
+    /// These exist because roughly twenty-five tests assert that a warmed,
+    /// capture-safe path performs no further allocations, and they assert it by
+    /// reading a counter. Before the allocator seam those went through
+    /// `CudaRuntime::alloc_raw`, which counted them; afterwards they did not,
+    /// and every one of those assertions silently became "0 == 0".
+    ep_allocations: Arc<AtomicU64>,
+    ep_frees: Arc<AtomicU64>,
     initialized: bool,
     registry: OpRegistry,
     csa_metrics: Arc<CsaMetrics>,
@@ -98,6 +112,8 @@ impl CudaExecutionProvider {
             memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
                 runtime.cuda_context(),
             )),
+            ep_allocations: Arc::new(AtomicU64::new(0)),
+            ep_frees: Arc::new(AtomicU64::new(0)),
             runtime,
             initialized: false,
             registry,
@@ -504,6 +520,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 self.device.index
             ))
         })?;
+        self.ep_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in
         // `deallocate`. It is a device address, never dereferenced on the host.
@@ -535,6 +552,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // from `self.memory` in `allocate`; `into_raw` consumed the owning
         // handle so no alias remains, and this is its single free.
         unsafe { self.memory.deallocate(ptr, size, align) };
+        self.ep_frees.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -757,8 +775,16 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
+        // The sum of both paths. Kernels still reach the driver through
+        // `CudaRuntime::alloc_raw` for their own workspaces, while buffers this
+        // EP hands out go through the replaceable allocator. Reporting only one
+        // of them is how the capture-safety assertions stopped observing
+        // anything without ever going red.
         let counts = self.runtime.allocation_counts();
-        Some((counts.allocations, counts.frees))
+        Some((
+            counts.allocations + self.ep_allocations.load(Ordering::Relaxed),
+            counts.frees + self.ep_frees.load(Ordering::Relaxed),
+        ))
     }
 
     fn sync(&self) -> Result<()> {
