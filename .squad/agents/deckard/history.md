@@ -31,3 +31,28 @@
 - 2026-07-28: 1x1 Conv routing PR #347 merged after replacing a magic threshold with spatial-size-dependent evidence and measuring EfficientNet-B0 (-8.9%). Fitted constants are acceptable only when labelled as fitted and bracketed by measured data; a false rationale is worse than no rationale.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-02T10:05:00+0000 — #594 lockout revisions
+
+- Took over #594 after Harry's reviewer lockout, ran `cargo fmt --all`, and produced a formatting-only fix for the new E2E test code.
+- After rebasing #594 onto main, fixed pinned shape-inference registry counts to account for standard-domain LinearAttention (operator_count 217→218, entry_count 262→263).
+
+## 2026-08-02T11:40:00+0000 — #595 profile_native bench fix
+
+- Authored and merged #595, restoring `reset_exec_phase_profile` so `profile_native --steady` bench binaries compile on main.
+- Fix stayed scoped to reset plumbing/re-export/test coverage and preserved the disabled hot path.
+
+## 2026-08-02T19:00:00+0000 — PR #602 lockout revision
+
+- Took over #602 after Harry's rejection under author-lockout and pushed `788dc609`.
+- Added conservative `function_has_attribute_parameters` fail-closed behavior for formal attrs, body `ref_attr_name`, and call-site attrs; preserved `ModelFunction.attributes`/`has_attribute_refs` in the loader; added mutation-proven `ParamLeakyRelu` regression coverage.
+
+## 2026-08-02T19:50:00+0000 — PR #604 phase-profile flake fix
+
+- Authored and merged #604, a test-only fix for the pre-existing #595 `phase_profile_gating_and_accumulation` parallel-runner flake seen after #602.
+- Replaced racing global `all_stats().is_empty()` reset assertions with phase-scoped `snapshot(enabled_phase).is_some()` / `.is_none()` checks on the test's unique phase name; validated 30/30 full-parallel lib runs plus fmt/clippy clean.
+
+## 2026-08-03T03:10:00+0000 — mobius PR #449 PackedMHA bias slot
+
+- Authored mobius PR #449, adding `bias` as the 4th formal to the `PackedMultiHeadAttention` fallback while keeping it inert in the body.
+- Added positional/admissibility tests covering full input order, bias at index 3, and 6-input calls; ruff clean, 3/3 new tests passed, and 30/30 `ep_optimization_test` regression passed. Awaiting Justin merge.

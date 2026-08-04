@@ -4,6 +4,35 @@ Last consolidated: 2026-07-31T10:24:07Z (Scribe round 9 — 27B decode profile S
 
 Standing governance rules and constraints. Dated wave records and historical ledger updates
 are archived to `.squad/decisions-archive/2026-07.md`.
+Last compacted: 2026-08-04T00:40:00Z (Scribe #625/QMoE batch; July operational narrative compacted by size gate)
+
+This file is the resolution of two concurrent Scribe compactions that rewrote it in the same
+minutes: #427 ("consolidate CUDA parity 161 state", 04:10:00Z) and this round-2 tidy
+(04:30:00Z). Both were merged; where the two sides disagreed on a single entry (one kept it
+live, one archived it) the entry was kept live, because a wrongly-archived rule silently stops
+governing while a wrongly-kept record only costs bytes.
+
+Full historical ledger archived to `.squad/decisions-archive/2026-07.md`:
+- "Full decisions snapshot archived by size gate — 2026-07-28T11:30:55Z"
+- "Post-rebase decisions archived by size gate — 2026-07-28T11:35:49Z"
+- "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" (first run)
+- "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z" (merge resolution)
+- "Post-rebase narrative tail compacted by size gate — 2026-07-30T04:10:00Z" (#427)
+- "Narrative entries compacted by size gate — 2026-07-30T04:30:00Z (Scribe tidy round 2)"
+  — CUDA op-parity wave records (Kuato/Doug), native-KV benchmark record, PTY-harness
+  technique notes, the reasoning-fixture review narrative, and the spent round-2 checklist.
+- "Narrative tail compacted by size gate — 2026-08-02T10:05:00+0000 (Scribe fused LinearAttention batch)" — moved the July DeepSeek/QMoE/R1/Qwen/Foundry/native-state tail to `.squad/decisions-archive/2026-07.md`; processed August fused-LinearAttention drops are in `.squad/decisions-archive/2026-08.md`.
+- "CUDA parity 161 live narrative compacted — 2026-08-02T19:00:00+0000" — full PR #423/#424 CUDA parity wave text remains in `.squad/decisions-archive/2026-07.md`; live file keeps the active rank/deferred-fact rule.
+- "Thread-3 hetero inlining relocation — 2026-08-02T19:00:00+0000" — full Cohaagen design/scoping drop and Coordinator Phase 0+1 decision archived to `.squad/decisions-archive/2026-08.md`; compact live directive retained below.
+- "Thread-3 Phase 3 fail-closed hetero scaffold — 2026-08-03T02:40:00+0000" — PR #606 merged; live directive records opt-in guard semantics, stale option-flip resolution, and pivot to 35B-A3B admission root cause.
+- "35B-A3B PackedMHA admission fix — 2026-08-03T03:10:00+0000" — mobius PR #449 adds the missing PackedMultiHeadAttention bias formal; onnx-genai arity rejection was spec-correct.
+- "35B-A3B validation and native-vs-ORT fairness vet — 2026-08-03T06:40:00+0000" — issue #610 uses the vetted apples-to-apples table; 35B-A3B is a capability gap on both engines; fp16 TopK enablement is in flight.
+- "fp16 TopK conformance merge and GAP-3 kickoff — 2026-08-03T07:40:00+0000" — PR #612 merged test-only coverage for fp16/bf16 TopK already on main via #445; GAP-3 native pipeline decode scoping is in flight.
+- "35B-A3B origin/main revalidation correction — 2026-08-03T09:00:00Z" — GAP-3/rank-3/TopK blockers were stale; native pipeline decode is correct on fresh origin/main, GPU throughput now waits on cuDNN f16/bf16 ReduceSum comp-type + device wiring; ORT still crashes.
+- "35B-A3B native GPU decode unblocked — 2026-08-03T10:00:00Z" — PR #616 merged cuDNN reduce comp-type + native device wiring; 35B native GPU measured 2726 ms/tok (0.37 tok/s), correct, ORT still crashes.
+- "35B-A3B Lever A reduce capture — 2026-08-03T12:30:00Z" — PR #618 merged cuDNN float ReduceSum/Mean capture eligibility; 35B native decode improved 2725→405 ms/tok (0.37→2.47 tok/s), byte-exact; Lever B next.
+
+Older archives: `.squad/decisions/archive/`.
 
 ## Ledger health rule
 
@@ -87,6 +116,107 @@ Fetch large external models only when needed, measure, and delete immediately �
 benchmark models in `models/` or worktrees (the archived ResNet/Whisper run used
 fetch-measure-delete and restored the disk baseline).
 
+## 2026-08-02 — Thread-3 hetero inlining relocation: bounded Phase 0+1 now
+
+**By:** Cohaagen (design), Coordinator (scope), Deckard (revision), Harry (review)
+
+**What:** The multi-EP hetero correctness hole is latent, not on the default session path: `SessionBuilder` still selects one EP and `place_graph` does whole-session selected-EP-or-CPU fallback; `hetero.rs` exists but is not wired as the normal public session executor. PR #602 implements only the bounded safe slice: post-assignment legalization in `hetero::plan`, using a bounded fixpoint to inline kept model-local function calls when the **assigned** provider declines them with real graph metadata. Ambiguous `(domain, op_type)` function identity fails closed.
+
+**Why:** Load-time #594 keep-as-op is correct for the single selected EP, but a future public multi-EP planner can assign a kept fused function op to a different provider. The planning invariant is now: after hetero legalization, every executable node is either non-function or supported by its assigned EP; otherwise the exact ONNX function body expansion is used. CPU-only fake-provider tests cover load-time claim vs assignment-time decline.
+
+**Review outcome:** Harry rejected round 1 because attribute-parameterized functions could fail open when formal/call-site/ref_attr_name attributes were dropped. Deckard revised under author lockout: `function_has_attribute_parameters` now fails closed on formal attrs, body `ref_attr_name`, or call-site attrs with an actionable Phase-2 TODO; loader preserves `ModelFunction.attributes`/`has_attribute_refs` metadata before IR drops it; `ParamLeakyRelu` mutation regression proves the guard. Harry approved round 2; #602 auto-merge armed.
+
+**Deferred:** Phase 2 first-class `FunctionLibrary` + overload-safe IR identity; Phase 3 public multi-EP session wiring and child hetero plans for If/Loop/Scan; Phase 4 capture/kernel-cache keying after legalization plus perf counters. Full design/scoping record is archived in `.squad/decisions-archive/2026-08.md`.
+
+## 2026-08-03 — Thread-3 Phase 3 scaffold and option-flip resolution
+
+**By:** Cohaagen (PR #606), Harry (review), Coordinator (scope/default decision)
+
+**What:** PR #606 merged the first Phase-3 increment without pretending stateful per-op hetero execution exists. Cross-EP tensor movement is currently only in standalone `hetero::execute` (host-staged), not integrated with the stateful session `Executor` that owns KV, capture, and decode memoization. The shipped scaffold adds `classify_placement`, `placement_summary`, and `guard_heterogeneous_fallback` in `hetero.rs`, wired into `place_graph`'s CUDA-fallback branch behind opt-in `ONNX_GENAI_HETERO` (default OFF), plus `SessionError::HeterogeneousExecutionUnsupported` and C API mapping. With the flag off, the single-EP path remains byte-identical; with a genuine mixed split under the flag, the guard returns an actionable error naming fallback ops and never silently executes wrong bytes.
+
+**Review outcome:** Harry approved after verifying flag-off byte identity, fail-closed mixed-plan behavior, that `hetero::execute` cannot be reached from the stateful executor, mutation proof (`Heterogeneous` arm returning `Ok` makes `guard_enabled_mixed_fails_closed` fail), and clean fmt/clippy/C API checks.
+
+**Coordinator decisions:**
+- The pending "default-flip `ONNX_GENAI_DECODE_INLINE_SCAN` -> ON" item is stale: #592 removed that engine flag and made decode-inline automatic/graph-property-gated via `DecodeInlineState`, `route_decode_inline_decision`, and `maybe_enable_decode_inline`. The perf default is already ON when an inlineable single-trip Scan exists.
+- Justin authorized flipping "that option" on, but the only residual default-off knob is `ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP` in session `control_flow.rs` `exec_scan` Slice-1a. It is host-only, no-capture, byte-exact for a one-iteration loop, gives approximately zero perf gain, and is superseded by the automatic engine path. Decision: do **not** flip it; leave the on/off regression undisturbed and consider dead-flag removal later.
+- Strategic pivot: integrated per-op Phase-3 execution has no current consuming model because native CUDA runs target models fully and whole-session fallback does not trip. Defer integrated execution to issue #603 and pivot to concrete model-support value: Qwen3.6-35B-A3B `vision_encoder` `PackedMultiHeadAttention` 6-vs-5 admission bug (Cohaagen-21 root cause in flight).
+
+**Deferred:** #603 tracks correct attr-binding/FunctionLibrary, public multi-EP session wiring, and capture re-keying.
+
+## 2026-08-03 — 35B-A3B PackedMHA admission fix belongs in mobius
+
+**By:** Cohaagen (root cause), Deckard (mobius PR #449), Harry (review)
+
+**What:** The Qwen3.6/Qwen3.5 35B-A3B `vision_encoder` admission failure is a mobius export bug, not an onnx-genai loader bug. ORT `com.microsoft::PackedMultiHeadAttention` has 6–7 positional inputs: `query, key, value, bias, token_offset, cumulative_sequence_length, attention_bias`. Because `token_offset` and `cumulative_sequence_length` occupy slots 5/6, the optional `bias` slot 4 must still exist as a formal, even when absent at call sites. mobius call sites correctly emitted 6 inputs with `None` in slot 4, but its model-local fallback function declared only 5 formals by dropping `bias`. onnx-genai `function_inline.rs` correctly rejected `6 > 5`; do not loosen that arity check.
+
+**Fix:** Deckard authored mobius PR #449 (`squad/packed-mha-bias-slot`), adding `bias` as the 4th formal in `functions/packed_multi_head_attention.py`, keeping it inert in the fallback body, updating docs, and adding `tests/packed_multi_head_attention_function_test.py` to lock positional order and 6-input admissibility. mobius validation: ruff clean, 3/3 new tests pass, 30/30 `ep_optimization_test` regression pass. Justin merges mobius PRs; do not self-merge.
+
+**Review outcome:** Harry approved #449 after verifying positional wiring, inert bias behavior, all three call sites emit `None` in slot 4, and mutation proof (moving `bias` formal to the end makes the new test fail). No onnx-genai product changes were needed.
+
+## 2026-08-03 — 35B-A3B validation and native-vs-ORT fairness rule
+
+**By:** Cohaagen (validation/fairness vet), Coordinator (issue #610)
+
+**What:** Qwen3.6-35B-A3B is a capability gap on both engines today, not a throughput comparison. ORT-CUDA hard-crashes during graph optimization with the same `std::vector::operator[]` assertion seen on 27B. Native-CUDA loads farther but cannot produce a GPU decode number with current tooling because the dense_fallback MoE router has 40 fp16 `TopK` nodes with no CUDA kernel, the hybrid needs rank-3 mRoPE positions, and native pipeline decode is still unimplemented.
+
+**Fairness rule:** native-vs-ORT performance claims must compare the same artifact/quantization/accuracy level under steady-state methodology and oracle-correct output. If one engine crashes, rejects the graph, or falls back to CPU/different kernels, report a capability gap rather than a multiplier. Issue #610 records the vetted two-section table: legitimate apples-to-apples wins are Qwen2.5-0.5B 1.75×, Qwen2.5-1.5B 1.66× (native oracle-correct, PR #597), Phi-4-mini 1.35×, Qwen2.5-7B 1.14×, and DeepSeek-R1-1.5B ~1.70× with a quick-profile caveat. Capability gaps include 27B (ORT crashes; 3.5× was native-vs-native-baseline), DeepSeek-V2-Lite QMoE (ORT CUDA lacks QMoE and CPU-fallbacks), GLM-4-9B (ORT rejects graph), and 35B-A3B (both blocked).
+
+**Next work:** Cohaagen-23 is authoring fp16 `TopK` CUDA support (`squad/cuda-fp16-topk`) to unblock dense_fallback MoE routers from whole-session CPU fallback; leave the in-flight inbox drop for the next batch.
+
+## 2026-08-03 — fp16 TopK conformance coverage and GAP-3 kickoff
+
+**By:** Cohaagen (PR #612), Harry (review), Coordinator (merge)
+
+**What:** fp16/bf16 CUDA `TopK` support was already on main via PR #445 (`d2333664`), so Cohaagen did not duplicate the kernel. PR #612 merged test-only conformance coverage required by the parity convention: fp16 router-shape `[2,256]`, `k=8` byte-exact GPU==CPU coverage, a non-final-axis test, and an EP-claim test in `ep-cuda` indexing tests. Validation: 15/15 GPU tests passed, CUDA clippy `-D warnings` clean, fmt clean.
+
+**Review outcome:** Harry approved after verifying the kernel writes back the original raw fp16 element while only upcasting for total-order compare, mutation-proofing tie-break behavior, and confirming the CUDA k-major non-final-axis order is ONNX-spec-correct. The review also identified a latent CPU EP non-final-axis TopK ordering bug (CPU push-order outer,inner,k vs CUDA/ONNX k-major outer,k,inner); treat it as a separate low-priority follow-up, not a #612 blocker.
+
+**Next work:** GAP-3 native pipeline decode scoping is in flight (Cohaagen-24): replace ORT-specific `DecodeState` / `PipelineDecodeLoopBackend` ownership with backend-neutral tensors/component sessions, then invoke the native target step. Qwen3.6-35B-A3B is the consuming model.
+
+## 2026-08-03 — 35B-A3B origin/main revalidation correction
+
+**By:** Cohaagen-24/25; Coordinator updated issue #610
+
+**What changed:** The earlier 35B-A3B native blockers were stale-build artifacts from a local main 74 commits behind. On fresh `origin/main` @ `0a5ac3c5`, GAP-3 native pipeline decode was already landed (#479/#565 family), rank-3 mRoPE support was landed (#543), and fp16 TopK/Softmax execute on the CUDA EP (#612/#445). Full Qwen3.6-35B-A3B native pipeline decode runs end-to-end and is output-correct against the native-CPU oracle.
+
+**Current truth:** Native GPU throughput is blocked by one new CUDA EP op bug: cuDNN `reduce_t` sets the reduction compute type to the half/bf16 I/O dtype, causing `CUDNN_STATUS_NOT_SUPPORTED` on MoE-router fp16 `ReduceSum`; it must use `CUDNN_DATA_FLOAT` compute for half/bf16 I/O. This is also a claim/runtime mismatch because CUDA claims f16/bf16 `ReduceSum`. Secondary bug: native pipeline decode ignores `--ep cuda` unless `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` is set, so benchmarks can silently run the decoder on CPU. ORT-CUDA still hard-crashes on the artifact with the same `std::vector<NodeArg*>` optimizer assertion, so 35B remains an ORT capability gap and any native GPU tok/s will be a standalone native number, not a native-vs-ORT ratio.
+
+**Actions:** PR #613 merged as docs truth-up/design note after Cohaagen-24 found GAP-3 already landed. Cohaagen-26 is in flight to fix the cuDNN comp-type and device-wiring bugs and then measure real 35B native GPU throughput; do not log its outcome yet. Issue #610 received interim and final correction comments.
+
+## 2026-08-03 — 35B-A3B native GPU decode unblocked by PR #616
+
+**By:** Cohaagen (PR #616), Harry (review), Coordinator (merge/#610 update)
+
+**What:** PR #616 merged both fixes from the 35B revalidation: f16 CUDA reductions now use raw cuDNN FFI with `CUDNN_DATA_FLOAT` compute type while keeping f16 descriptors and f32 alpha/beta; bf16 reductions route to the f32-accumulating NVRTC block kernel because cuDNN rejects bf16 reductions even with f32 compute. The EP claim gate now matches runtime for f32/f16/bf16 Sum/Mean and a latent no-op stub was removed. `build_native_pipeline_decoder` now honors `config.native_device` when `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` is unset; the env override still wins.
+
+**Review outcome:** Harry approved after mutation-verifying the cuDNN compute-type failure and device-preference fallback, checking FFI soundness (error-checked calls, RAII descriptors, sized workspace, null indices for no-indices, serialized handle), confirming f32 byte-identity and bf16 NVRTC f32 accumulation, and rerunning fmt/clippy plus GPU/engine/EP reduce suites.
+
+**Measured result:** Qwen3.6-35B-A3B int4 native GPU decode on H200 now runs correctly: steady median 2726 ms/tok (0.37 tok/s), prefill about 18.5s, greedy output matches the native-CPU oracle prefix, and the run is GPU-confirmed (21.5GB, 19–31% utilization). This is a standalone native capability number, not a native-vs-ORT ratio: ORT-CUDA still hard-crashes on the artifact. The remaining performance issue is host/sync overhead / low GPU utilization, a follow-up optimization track rather than a correctness unblock.
+
+## 2026-08-03 — 35B-A3B Lever A reduce capture lands
+
+**By:** Cohaagen (profile + PR #618), Harry (review), Coordinator (merge/#610 update)
+
+**Profile finding:** 35B-A3B native CUDA decode after #616 was host/sync-bound at ~2725 ms/tok with CUDA graph capture shredded into 10424 segments / 10423 eager seams. The root cause was 10240 fp16 `ReduceSum` seams (256 dense_fallback MoE experts × 40 layers): the cuDNN float reduce path allocated workspace per call, synchronized unconditionally, and never marked the call capture-safe.
+
+**Lever A shipped:** PR #618 made cuDNN float `ReduceSum`/`ReduceMean` capture-eligible by caching descriptors/workspace, rejecting cache misses during capture, gating sync on `!capturing`, reusing warmed axes metadata, and setting capture-safe only after a shape-stable warm call. Numerics are unchanged: f32 remains byte-identical, f16 keeps the #616 f32-comp cuDNN path, and bf16 stays on NVRTC. Harry approved after mutation-verifying cache-key shape coverage and sync gating, checking warm/shape-change behavior, and rerunning fmt/clippy plus 6/6 capture and 3/3 parity GPU tests.
+
+**Measured result:** Qwen3.6-35B-A3B native CUDA decode improved from 2725 ms/tok / 0.37 tok/s to 405 ms/tok / 2.47 tok/s (~6.7×), byte-exact vs CPU oracle. Captured graph fragmentation dropped from 10424 segments / 10423 seams to 184 / 183, and fp16 `ReduceSum` seams dropped 10240 → 0. Remaining follow-up is Lever B: RMSNorm `ReduceSumSquare`, Split host-sync, and LinearAttention capture-abort seams in the linear-attn hybrid path.
+
+
+## 2026-08-04 — Loader/QMoE current state (#621/#625 and Mobius queue)
+
+**By:** Scribe, from processed inbox drops and spawn manifest at 2026-08-04T00:40:00Z
+
+Full processed inbox drops for this batch are archived in `.squad/decisions-archive/2026-08.md`; merged and deleted drop files: cohaagen-35b-configC-ortgenai.md, cohaagen-35b-qmoe-measure.md, cohaagen-leverB-nvrtc-reduce-capture.md, cohaagen-native-loader-fix.md, cohaagen-qmoe-sparse-decode-design.md, deckard-446-451-444-review.md, deckard-447-450-review.md, deckard-glm404-review.md, deckard-qwen35-qmoe-export.md, harry-625-loader-rereview.md, harry-625-loader-review.md.
+
+- PR #621 (Lever B) merged: NVRTC `ReduceSumSquare`/RMSNorm capture work reduces 35B native CUDA graph seams beyond Lever A.
+- PR #625 native loader fix: GraphIo / GraphIoMetadata lets native loading bypass ORT Session creation. Harry rejected rev1 for an initializer-input leak; Quaid revised under Cohaagen lockout with initializer exclusion mirroring `graph_builder.rs` and metadata/Session KV-geometry parity coverage, after which Harry approved. HEAD `3b615953`; auto-merge enabled/mergeable.
+- ORT 1.28 still rejects the fp16-activation + fp32-scale QMoE artifact, so config-B remains an ORT capability gap rather than a loader bug.
+- 35B QMoE sparse graph rewrite/export is done with 40 QMoE nodes. Config-C ORT-GenAI validation used dense_fallback (0 QMoE) and is not a sparse-QMoE proof.
+- Seven Mobius PRs (#446, #447, #450, #451, #444, plus GLM/Qwen export reviews) are review-resolved and await Justin merge.
+- Config-A GPU measurement is blocked by external vLLM GPU occupancy; Cohaagen left watcher PID 1060559 for the measurement.
+
 ## Active historical pointers
 
 For per-PR narrative use `.squad/decisions-archive/2026-07.md`. Archived there: consolidation
@@ -95,6 +225,11 @@ native-pipeline + CUDA-hybrid wave records; prior `.squad/decisions/archive/`); 
 (#227 roofline, load-adaptive opt-in, Apple Silicon portability, BNNS prefill/deprecation,
 benchmark-CI rule, dispatch-manifest lint, 1×1 Conv + SDPA corrections, GEMV notes); Wave 8/9
 (CUDA coverage batches 8/9, shape-inference catalog batches 3/4, NCHWc gating, reviewer-lockout).
+For detailed per-PR narrative, use the archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md` for the pre-August ledger, CUDA parity waves, Mac CPU EP/perf methodology, and July CLI/runtime records; `.squad/decisions-archive/2026-08.md` for fused LinearAttention, Thread-3 hetero legalization, and August Scribe batches; older material remains under `.squad/decisions/archive/`.
+
+## CUDA standard-domain parity — current state (through 161 ops)
+
+Full narrative for PRs #423/#424 and the 161-op parity wave is archived in `.squad/decisions-archive/2026-07.md` under the 2026-07-30 compaction entries. Live rule: CUDA shape/rank claim gates must distinguish unsupported static shapes from deferred rank facts; deferred facts preserve CPU fallback instead of falsely declining the graph. Current tractable parity is 161 ops; remaining heavy gaps include NonMaxSuppression and Resize-cubic.
 
 ## CLI charter — standing directives
 
@@ -334,3 +469,44 @@ Fixture: `tiny-gemma4-vlm-cuda-f16` (Concat-KV, FLOAT16 KV) — KV must be arith
 **Author:** Mary · **Status:** implemented, tests green, MERGED.
 
 Slice 1a (foundation for 1b): make single-trip Scan (`trip_count==1`, decode step) execute straight-line instead of generic loop (prefill stays looped). Runtime dual-path in `exec_scan`: flag-gated `ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP` (default OFF), keyed at **execution time** on observed `trip_count`, not static rewrite (shared prefill+decode plan = correctness guarantee). Both loop and inline paths share `run_scan_body_step` + finishing code → byte-exact by construction. Counter `scan_inline_single_trip_count` (OFF=0, ON at trip_count==1). CPU byte-exact test + CUDA regression; on-model 27B (qwen3.6-27b int4, ~6.1 tok/s) token-identical flag-OFF vs flag-ON over prefill (~790 ms) and 48 decode steps. Regressions: session-reuse + async-fence + control-flow all green.
+## 2026-08-04 — Scribe size compaction before #625/QMoE inbox merge
+
+July 29-30 operational narrative entries were moved to `.squad/decisions-archive/2026-07.md` under `2026-08-04T00:40:00Z` to keep the live decision file focused on standing directives and current constraints. The coordinator prompt requested an age cutoff, but Scribe's charter treats size as the binding gate; the complete record was preserved in the archive.
+
+## 2026-08-02 — Fused LinearAttention and Inc-1b current state
+
+**By:** Scribe, from processed inbox drops and spawn manifest at 2026-08-02T10:05:00+0000
+
+- PR #592 removed `ONNX_GENAI_DECODE_INLINE_SCAN`; Inc-1b decode-inline is now automatic and graph-property-gated. Dense/no-Scan models build no sibling, while genuine inlineable single-trip Scans keep the byte-exact ~2.03× decode win.
+- PR #594 landed the EP-driven keep-as-op hook and dual-domain `LinearAttention` dispatch. On the 27B export the plan has 48 fused `LinearAttention` ops, 0 Scans, byte-exact greedy tokens, and about 41.3 ms/tok decode.
+- The two levers compose: fused LinearAttention removes Scans where a kernel claims the function; Inc-1b remains for generic single-trip Scans with no fused kernel.
+- Harry approved #592, rejected #594 only for rustfmt, and named Deckard as revision author. Deckard cleared the fmt-only blocker and later fixed pinned shape-inference registry counts after rebasing (#594 operator_count 217→218, entry_count 262→263 for the new standard-domain LinearAttention rule).
+- Full processed inbox drops for this batch are archived in `.squad/decisions-archive/2026-08.md`; the July native-CUDA drops remain archived in `.squad/decisions-archive/2026-07.md`.
+
+## 2026-08-02 — Final fused LinearAttention validation and #595 bench fix
+
+**By:** Scribe, from processed inbox drops and spawn manifest at 2026-08-02T11:40:00+0000
+
+- Cohaagen validated final merged main for the #592 + #594 composition gate: 27B greedy oracle PASS (CUDA == CPU == expected ids) and structural 48 fused `LinearAttention` / 0 Scans PASS.
+- Follow-up steady decode measurement on merged main confirmed 40.8 ms/tok (24.5 tok/s). The fused-LinearAttention lane is complete; multi-EP hetero inlining relocation remains future work.
+- Deckard authored and merged #595, restoring `reset_exec_phase_profile` so `profile_native --steady` bench binaries compile on main.
+- Harry independently approved #595 after mutation-verifying the reset test, checking hot-path behavior, and confirming bench builds.
+
+### 2026-08-02: #592+#594 composition oracle on main
+**By:** Cohaagen
+**What:** Ran 27b byte-exact greedy oracle + structural 0-Scan/48-fused lock on final main (0700c0fb) with BOTH merged PRs composed. Result: PASS, decode timing not emitted by the oracle harness; CUDA generate wall-clock was 14.39659273s for the 16-token greedy sequence (full test 5128.79s including CPU oracle).
+**Why:** Neither PR's oracle ran with the other present; Justin is regression-sensitive. This is the composition integration gate.
+
+### 2026-08-02: Review of PR #595 (profile_native compile fix)
+**By:** Harry (independent reviewer)
+**Verdict:** APPROVE
+**Rationale:** Dangling `reset_exec_phase_profile` call on main confirmed; fix re-exports it, `profile_native` builds with `bench-native,cuda`, hot paths unchanged, reset test non-vacuous (mutation-verified), fmt/clippy clean, scope limited to reset plumbing + re-export + test. Minor non-blocking note: test does not assert PRINTED-guard reset.
+
+
+## 2026-08-02 — Foundry native-vs-ORT CUDA sweep and #597 correctness lock
+
+Full sweep tables and review notes are archived in `.squad/decisions-archive/2026-08.md` under the 2026-08-03T06:40 size-gate compaction. Live outcome: native CUDA beat ORT CUDA on every dense Foundry model measured (0.5B, 1.5B, Phi-4-mini, 7B); Qwen2.5-1.5B divergence was locked as native-correct in merged #597; hybrid 35B-A3B was blocked by the PackedMHA function-signature issue later fixed in mobius PR #449 and by subsequent capability gaps.
+
+## 2026-08-02 — DeepSeek/GLM validation and post-#434 metadata regeneration
+
+Full matrix is archived in `.squad/decisions-archive/2026-08.md` under August size-gate compactions. Live outcome: initial broad DeepSeek/GLM failures were stale or incomplete artifact metadata, not native numeric bugs; regenerated current Mobius #434 metadata admitted DeepSeek-V2 tiny, DeepSeek-V2-Lite real int4 native/ORT token match, and GLM-4-9B native golden lock. GLM-5.2 tiny/q4/qmoe remained blocked on unmerged Mobius #404 at the time.

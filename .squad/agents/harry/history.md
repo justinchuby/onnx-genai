@@ -34,3 +34,56 @@
 
 - Revised #544 flaky `async_pagein_fence_orders_weight_page_in_consumer` test (bf345904): root cause was the NEGATIVE poison-arm — pure wall-clock race. Fix: event-orders negative transfer after consumer via `record_compute_fence`+`copy_wait_fence`. Test green 5/5 parallel, fails 3/3 without the fix. Production code unchanged.
 - Independent APPROVE for PR #554 (Mary's session-reuse recurrent-state fix). MERGED.
+## 2026-08-02T10:05:00+0000 — Reviews for #592 and #594
+
+- Approved #592 after verifying the removed flag stayed gone and the no-Scan/no-sibling graph-property gate was mutation-proven.
+- Rejected #594 only for rustfmt, confirmed logic/design were otherwise good, and assigned Deckard as revision author under reviewer lockout.
+
+## 2026-08-02T11:40:00+0000 — #595 review
+
+- Independently reviewed #595 and approved it after confirming the dangling reset caller, mutation-verifying reset coverage, checking hot-path behavior, and confirming bench builds.
+
+## 2026-08-02T15:45:00+0000 — PR #597 review
+
+- Approved #597 after independently rebuilding the fp32 acc-1 oracle, confirming native token 1909 matches oracle while ORT device-greedy token 821 is a near-tie artifact.
+- Verified the 27-token stream lock is non-vacuous, resolved the ORT-logits-vs-stream puzzle, and merged the regression-lock PR.
+
+## 2026-08-02T19:00:00+0000 — PR #602 review
+
+- Rejected round 1 because the IR inliner failed open for attribute-parameterized functions by not binding call-site/ref_attr_name attrs; Add/Relu tests hid the byte-identity defect.
+- Approved round 2 after Deckard added fail-closed attribute-parameter guards, metadata preservation, and mutation-proven `ParamLeakyRelu` coverage; #602 auto-merge armed.
+
+## 2026-08-02T19:50:00+0000 — PR #604 review
+
+- Approved #604 after confirming the phase-profile flake fix was test-only and scoped assertions to a unique phase name instead of the process-global stats map.
+- Mutation-proved reset coverage by making `reg.clear()` a no-op and seeing the test fail; reproduced 30/30 clean full-parallel lib runs plus fmt/clippy clean.
+
+## 2026-08-03T02:40:00+0000 — PR #606 review
+
+- Approved #606 after verifying flag-off byte identity, fail-closed mixed-plan behavior, no stateful call path to standalone `hetero::execute`, and honest deferral of integrated execution to #603.
+- Mutation-proved the guard by making the `Heterogeneous` arm return `Ok` and seeing `guard_enabled_mixed_fails_closed` fail; fmt, clippy, and C API checks were clean.
+
+## 2026-08-03T03:10:00+0000 — mobius PR #449 review
+
+- Approved #449 after verifying positional wiring, inert bias behavior, and all three call sites passing `None` in slot 4.
+- Mutation-proved the new test by moving the bias formal to the end and seeing it fail; confirmed the diff is mobius-only with no onnx-genai changes.
+
+## 2026-08-03T07:40:00+0000 — PR #612 review
+
+- Approved #612 after verifying fp16 TopK writes back original raw fp16 values and only upcasts for total-order compare.
+- Confirmed CUDA k-major non-final-axis order is ONNX-spec-correct and mutation-proved tie-break coverage; CPU non-final-axis ordering is a latent separate bug.
+
+## 2026-08-03T10:00:00Z — PR #616 review
+
+- Approved #616 after mutation-verifying both the cuDNN comp-type bug and native device fallback, and checking FFI safety, f32 byte-identity, bf16 NVRTC fallback, and shared dispatch generality.
+- Gates clean: fmt/clippy for both crates, GPU parity, engine device tests, and EP reduce lib tests.
+
+## 2026-08-03T12:30:00Z — PR #618 review
+
+- Approved Lever A after mutation-verifying cache-key shape coverage and sync gating, and checking miss-during-capture, warm-before-capture, shape-change aborts, f32/f16 byte behavior, and bf16 NVRTC exclusion.
+- Verified fmt/clippy clean and 6/6 capture + 3/3 parity GPU tests; noted non-blocking need for no-cuDNN test guards.
+
+## 2026-08-04T00:40:00Z — PR #625 loader review
+
+- Rejected #625 rev1 for a major initializer-input leak in the native loader metadata path and assigned revision away from the locked-out author.
+- Approved rev2 after Quaid added initializer exclusion mirroring `graph_builder.rs` plus metadata==Session KV-geometry parity coverage.
