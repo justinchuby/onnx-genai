@@ -1,9 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use onnx_genai_ort::{PipelineModelDirectory, PipelineModels, SessionOptions};
+use onnx_genai_ort::{
+    DataType as OrtDataType, Environment, GraphIo, PipelineModelDirectory, PipelineModels, Session,
+    SessionOptions, graph_io_from_model_path,
+};
 use onnx_std::Model;
-use onnx_std::ir::{Attribute, DataType, Graph, Node, NodeId};
+use onnx_std::ir::{Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -260,4 +263,188 @@ fn native_only_component_loads_without_ort_session() {
         models.graph_io("encoder").is_some(),
         "an ORT-backed component resolves graph I/O through the same seam"
     );
+}
+
+/// Author a small decoder ONNX with realistic paged-KV I/O AND a weight tensor
+/// that is listed in `graph.input` while also being a `graph.initializer` — the
+/// pre-IR-4 pattern ONNX still permits in IR>=4. `graph_io_from_model_path` must
+/// exclude that initializer from its declared inputs (exactly as ORT's `Session`
+/// and this repo's native graph loader do), so `GraphIoMetadata` never leaks a
+/// weight as a graph input port.
+///
+/// The KV state is rank-4 fp16 `[batch, heads, seq, head_dim]` so the metadata
+/// carries the geometry the engine's `infer_kv_model_info`/`resolve_kv_layers`
+/// read structurally (num_kv_heads=2, head_dim=4), not just names. Every node
+/// uses an ORT-loadable operator (`Identity`, `Cast`) so the SAME model can be
+/// parsed both session-free (metadata) and through a real ORT `Session`, letting
+/// the test prove metadata geometry == session geometry byte-for-byte.
+fn write_kv_decoder_with_leaked_initializer(path: &Path) {
+    const HEADS: usize = 2;
+    const HEAD_DIM: usize = 4;
+    const VOCAB: usize = 8;
+
+    let mut decoder = Graph::new();
+    decoder.opset_imports.insert(String::new(), 13);
+    let batch = decoder.intern_symbol("batch");
+    let sequence = decoder.intern_symbol("sequence");
+
+    let input_ids = decoder.create_named_value(
+        "input_ids",
+        DataType::Int64,
+        vec![batch.into(), sequence.into()],
+    );
+    decoder.add_input(input_ids);
+
+    // A weight that is BOTH a `graph.initializer` and listed in `graph.input`.
+    // A correct loader must treat it as a constant and NOT surface it as a port.
+    let embed = decoder.create_named_value(
+        "model.embed_tokens.weight",
+        DataType::Float16,
+        vec![VOCAB.into(), HEAD_DIM.into()],
+    );
+    decoder.add_input(embed);
+    decoder.set_initializer(
+        embed,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float16,
+            vec![VOCAB, HEAD_DIM],
+            vec![0u8; VOCAB * HEAD_DIM * 2],
+        )),
+    );
+
+    let kv_shape = || vec![batch.into(), HEADS.into(), sequence.into(), HEAD_DIM.into()];
+    let past_key =
+        decoder.create_named_value("past_key_values.0.key", DataType::Float16, kv_shape());
+    let past_value =
+        decoder.create_named_value("past_key_values.0.value", DataType::Float16, kv_shape());
+    decoder.add_input(past_key);
+    decoder.add_input(past_value);
+
+    let present_key = decoder.create_named_value("present.0.key", DataType::Float16, kv_shape());
+    let present_value =
+        decoder.create_named_value("present.0.value", DataType::Float16, kv_shape());
+    decoder.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(past_key)],
+        vec![present_key],
+    ));
+    decoder.insert_node(Node::new(
+        NodeId(1),
+        "Identity",
+        vec![Some(past_value)],
+        vec![present_value],
+    ));
+
+    // logits = Cast(input_ids -> fp16); an ORT-loadable op that gives the graph a
+    // real producer for its declared logits output.
+    let logits = decoder.create_named_value(
+        "logits",
+        DataType::Float16,
+        vec![batch.into(), sequence.into()],
+    );
+    let mut cast = Node::new(NodeId(2), "Cast", vec![Some(input_ids)], vec![logits]);
+    cast.attributes.insert("to".to_string(), Attribute::Int(10)); // FLOAT16 elem_type
+    decoder.insert_node(cast);
+
+    decoder.add_output(logits);
+    decoder.add_output(present_key);
+    decoder.add_output(present_value);
+
+    let model = Model::new(decoder);
+    model.to_proto().unwrap();
+    onnx_std::save_model(&model, path).unwrap();
+}
+
+/// The session-free `GraphIoMetadata` a native-backend component resolves must
+/// recover the SAME KV/IO geometry a real ORT `Session` would — including
+/// excluding weights that ONNX lets a graph list in both `graph.input` and
+/// `graph.initializer`. A leaked weight would otherwise be routed as a spurious
+/// port and would trip the decode float-rank>=3 native-load guard, falsely
+/// rejecting a valid decoder.
+#[test]
+fn graph_io_metadata_excludes_initializers_and_matches_session_geometry() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/pipeline-loader-tests")
+        .join(format!("kv-decoder-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("decoder_kv.onnx");
+    write_kv_decoder_with_leaked_initializer(&path);
+
+    // Session-free parse: the fixed loader excludes the initializer-backed input.
+    let metadata = graph_io_from_model_path(&path).expect("graph I/O parses without a session");
+
+    let input_names: Vec<&str> = metadata.input_names().iter().map(String::as_str).collect();
+    assert!(
+        !input_names.contains(&"model.embed_tokens.weight"),
+        "a weight listed in graph.input but also a graph.initializer must NOT leak as an input port"
+    );
+    assert_eq!(
+        input_names,
+        [
+            "input_ids",
+            "past_key_values.0.key",
+            "past_key_values.0.value"
+        ],
+        "declared inputs must be the real graph inputs, in graph order, with initializers excluded"
+    );
+    let output_names: Vec<&str> = metadata.output_names().iter().map(String::as_str).collect();
+    assert_eq!(output_names, ["logits", "present.0.key", "present.0.value"]);
+
+    // Dtypes must be recovered structurally: fp16 (elem_type 10), not fp32.
+    let past_key = metadata
+        .inputs()
+        .iter()
+        .find(|info| info.name == "past_key_values.0.key")
+        .expect("past key input is present");
+    assert_eq!(past_key.dtype, OrtDataType::Float16);
+    assert_ne!(past_key.dtype, OrtDataType::Float32);
+
+    // KV geometry the engine reads structurally: `[batch, heads, seq, head_dim]`
+    // with symbolic batch/seq as -1 and static heads=2, head_dim=4.
+    let present_key = metadata
+        .outputs()
+        .iter()
+        .find(|info| info.name == "present.0.key")
+        .expect("present key output is present");
+    assert_eq!(present_key.dtype, OrtDataType::Float16);
+    assert_eq!(
+        present_key.shape,
+        [-1, 2, -1, 4],
+        "present-KV shape must expose num_kv_heads=2 and head_dim=4 for KV inference"
+    );
+
+    // Cross-check: a real ORT `Session` over the SAME model must recover the
+    // identical geometry — proving the session-free metadata is a faithful
+    // stand-in (and that ORT also excludes the initializer-backed input).
+    let environment = Environment::new("kv-metadata-geometry-test").expect("ort environment");
+    let session = Session::new(
+        &environment,
+        &path,
+        SessionOptions::default().with_intra_op_threads(1),
+    )
+    .expect("ORT loads the twin decoder");
+
+    assert_eq!(
+        session.input_names(),
+        metadata.input_names(),
+        "session and metadata must declare the same input ports (both exclude initializers)"
+    );
+    assert_eq!(
+        session.output_names(),
+        metadata.output_names(),
+        "session and metadata must declare the same output ports"
+    );
+    assert_eq!(
+        session.inputs(),
+        metadata.inputs(),
+        "session and metadata input dtypes/shapes must match exactly"
+    );
+    assert_eq!(
+        session.outputs(),
+        metadata.outputs(),
+        "session and metadata output dtypes/shapes (KV geometry) must match exactly"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

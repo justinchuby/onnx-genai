@@ -1,6 +1,6 @@
 //! Model directory resolution for Phase 1 runtime loading.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_genai_config::{
@@ -448,11 +448,28 @@ pub fn graph_io_from_model_path(path: &Path) -> Result<GraphIoMetadata> {
     let graph = model.graph.as_ref().ok_or_else(|| {
         OrtError::InvalidArgument(format!("ONNX model {} has no graph", path.display()))
     })?;
+    // Names that are also initializers are constants (weights), not real graph
+    // inputs (invariant §3.5.3). ONNX allows an initializer to be listed in
+    // `graph.input` — mandatory pre-IR-4, still legal in IR>=4 — but ORT's
+    // `Session` (GetInputCount) and this repo's own native loader
+    // (`onnx-runtime-loader::graph_builder`, §2) both exclude them. Mirror that
+    // exclusion here so `GraphIoMetadata` never leaks weight tensors as ports:
+    // a leaked fp16/fp32 MoE/attention weight would otherwise falsely trip the
+    // decode float-rank>=3 native-load guard and route as a spurious port.
+    let initializer_names: HashSet<&str> = graph
+        .initializer
+        .iter()
+        .map(|initializer| initializer.name.as_str())
+        .collect();
     let inputs = graph
         .input
         .iter()
+        .filter(|value_info| !initializer_names.contains(value_info.name.as_str()))
         .map(value_info_to_tensor_info)
         .collect::<Result<Vec<_>>>()?;
+    // A graph output that lacks a declared dense tensor type is a hard error
+    // below (via `value_info_to_tensor_info`): fail loud rather than silently
+    // dropping an output whose contract we cannot recover without an ORT session.
     let outputs = graph
         .output
         .iter()
