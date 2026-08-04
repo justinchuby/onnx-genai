@@ -58,6 +58,7 @@
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
+pub mod device_allocator;
 mod dynamic_library;
 pub mod error;
 mod graph;

@@ -129,3 +129,49 @@ fn the_default_execution_provider_still_allocates() {
     let buffer = ep.allocate(128, 64).expect("granted");
     ep.deallocate(buffer).expect("returned");
 }
+
+/// A refusal keeps the allocator's own account of why.
+///
+/// Every failure used to be reported as `OutOfMemory { available: 0 }`. A
+/// substituted allocator that refuses for a reason of its own -- a budget, an
+/// alignment it will not serve, a device it does not own -- was described to the
+/// caller as exhausted RAM, which sends whoever reads the log looking in the
+/// wrong place. That matters most for exactly the allocators this seam exists
+/// to admit, because their reasons are ones this crate has never heard of.
+#[test]
+fn a_refusal_from_the_supplied_allocator_keeps_its_reason() {
+    #[derive(Debug)]
+    struct AlwaysRefuses;
+
+    impl DeviceAllocator for AlwaysRefuses {
+        fn allocate(&self, bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
+            Err(MemoryError::AllocationFailed {
+                tier: "host",
+                requested: bytes as u64,
+                reason: String::from("the tenant quota for this model is already spent"),
+            })
+        }
+
+        unsafe fn deallocate(&self, _ptr: NonNull<u8>, _bytes: usize, _align: usize) {
+            unreachable!("nothing was ever allocated");
+        }
+
+        fn device(&self) -> DeviceKey {
+            DeviceKey::HOST
+        }
+    }
+
+    let ep = CpuExecutionProvider::new().with_memory(Arc::new(AlwaysRefuses));
+    let error = ep
+        .allocate(4096, 64)
+        .expect_err("the allocator refused, so the EP must not hand back a buffer");
+    let message = error.to_string();
+    assert!(
+        message.contains("the tenant quota for this model is already spent"),
+        "the allocator's own reason must survive: {message}"
+    );
+    assert!(
+        message.contains("4096"),
+        "the request must be named too: {message}"
+    );
+}

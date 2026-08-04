@@ -89,3 +89,5 @@ onnx-genai-session.perfetto.json
 # message file has reached a PR before.
 CM*.txt
 PR*.md
+# Issue and review bodies staged the same way, for gh issue create --body-file.
+.issue-*.md

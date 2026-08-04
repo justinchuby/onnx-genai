@@ -85,6 +85,17 @@ impl DeviceKey {
 /// * `device` is constant for the life of the allocator. Callers use it to
 ///   decide whether a pointer may be dereferenced on the host, so an allocator
 ///   that lies here turns a host read into a wild access rather than an error.
+/// * **Every method may be called concurrently from any number of threads.**
+///   All three take `&self`, and the `Send + Sync` bound is not decoration: one
+///   allocator serves every session on its device, so concurrent sessions are
+///   the normal case rather than an edge one. An implementation that needs
+///   exclusive state must carry its own lock.
+/// * Every successful `allocate` owns a region that overlaps no other **live**
+///   allocation from this allocator. A region becomes reusable only once its
+///   matching `deallocate` has been called. Concurrent calls must behave as
+///   though they happened in some sequential order — an implementation whose
+///   locking lets two callers be handed the same region would let one session
+///   overwrite another's tensors, silently and only under load.
 pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
@@ -128,11 +139,13 @@ impl DeviceAllocator for HostAllocator {
         // SAFETY: `layout` has a non-zero size and a valid power-of-two
         // alignment.
         let ptr = unsafe { std::alloc::alloc(layout) };
-        NonNull::new(ptr).ok_or(MemoryError::InvalidRequest {
+        NonNull::new(ptr).ok_or_else(|| MemoryError::AllocationFailed {
             tier: Tier::Host.name(),
             requested: bytes as u64,
-            reason: "the system allocator refused bytes the governor had granted; the process \
-                     is out of address space or the host is out of memory",
+            reason: String::from(
+                "the system allocator refused bytes the governor had granted; the process is \
+                 out of address space or the host is out of memory",
+            ),
         })
     }
 

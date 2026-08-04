@@ -366,6 +366,15 @@ impl CudaRuntime {
     }
 
     /// The CUDA device ordinal this runtime drives.
+    /// The CUDA context this runtime is bound to.
+    ///
+    /// Exposed so driver-only components -- the device allocator and the
+    /// virtual-memory backing -- can share the context without depending on the
+    /// runtime's cudart and cuBLAS preconditions.
+    pub fn cuda_context(&self) -> std::sync::Arc<cudarc::driver::CudaContext> {
+        std::sync::Arc::clone(&self.context)
+    }
+
     pub fn ordinal(&self) -> u32 {
         self.ordinal
     }
