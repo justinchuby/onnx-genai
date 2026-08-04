@@ -1023,14 +1023,35 @@ impl RunProfile {
             .composition
             .filter(DeviceComposition::fixed_reservation_measured)
         {
+            // Mirror the text form: an unmeasured component is omitted rather
+            // than emitted as 0, and the gap is named. Emitting a bare 0 tells a
+            // machine reader "this model has no activations", which is a
+            // confident wrong answer -- and it disagreed with the text output
+            // rendered from the same data.
+            let mut parts = vec![format!(
+                "\"model_weights_bytes\":{}",
+                composition.model_weights_bytes
+            )];
+            let mut unmeasured = Vec::new();
+            for (key, bytes) in [
+                ("activations_bytes", composition.activations_bytes),
+                ("runtime_overhead_bytes", composition.runtime_overhead_bytes),
+            ] {
+                if bytes == 0 {
+                    unmeasured.push(format!("\"{key}\""));
+                } else {
+                    parts.push(format!("\"{key}\":{bytes}"));
+                }
+            }
+            parts.push(format!("\"kv_bytes\":{}", composition.kv_bytes));
+            parts.push(format!("\"kv_pages\":{}", composition.kv_pages));
+            parts.push(format!("\"kv_page_bytes\":{}", composition.kv_page_bytes));
+            if !unmeasured.is_empty() {
+                parts.push(format!("\"unmeasured\":[{}]", unmeasured.join(",")));
+            }
             fields.push(format!(
-                "\"device_memory_breakdown\":{{\"model_weights_bytes\":{},\"activations_bytes\":{},\"runtime_overhead_bytes\":{},\"kv_bytes\":{},\"kv_pages\":{},\"kv_page_bytes\":{}}}",
-                composition.model_weights_bytes,
-                composition.activations_bytes,
-                composition.runtime_overhead_bytes,
-                composition.kv_bytes,
-                composition.kv_pages,
-                composition.kv_page_bytes
+                "\"device_memory_breakdown\":{{{}}}",
+                parts.join(",")
             ));
         }
         format!("{{{}}}", fields.join(","))
@@ -1292,6 +1313,11 @@ mod tests {
         let breakdown = &value["device_memory_breakdown"];
         assert_eq!(breakdown["model_weights_bytes"], 2u64 * 1024 * 1024 * 1024);
         assert_eq!(breakdown["kv_pages"], 2048);
+        // Everything was measured here, so nothing is withheld and no gap is
+        // named -- the counterpart to the unmeasured case below.
+        assert_eq!(breakdown["activations_bytes"], 512u64 * 1024 * 1024);
+        assert_eq!(breakdown["runtime_overhead_bytes"], 256u64 * 1024 * 1024);
+        assert!(breakdown.get("unmeasured").is_none(), "{breakdown}");
     }
 
     #[test]
@@ -1319,6 +1345,32 @@ mod tests {
         assert!(
             text.contains("activations and runtime overhead not yet measured"),
             "the gap must be named:\n{text}"
+        );
+
+        // The JSON is rendered from the same data and must not contradict it.
+        // It used to emit "activations_bytes":0 unconditionally, so a machine
+        // reader was told "this model has no activations" while a human reading
+        // the text output was told the figure was never measured. This test
+        // previously only looked at the text, which is how that survived.
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        let breakdown = &value["device_memory_breakdown"];
+        assert_eq!(breakdown["model_weights_bytes"], 1024u64 * 1024 * 1024);
+        assert!(
+            breakdown.get("activations_bytes").is_none(),
+            "an unmeasured component must be absent, not zero: {breakdown}"
+        );
+        assert!(
+            breakdown.get("runtime_overhead_bytes").is_none(),
+            "an unmeasured component must be absent, not zero: {breakdown}"
+        );
+        let unmeasured = breakdown["unmeasured"]
+            .as_array()
+            .expect("the gap must be named for machine readers too");
+        assert!(unmeasured.iter().any(|name| name == "activations_bytes"));
+        assert!(
+            unmeasured
+                .iter()
+                .any(|name| name == "runtime_overhead_bytes")
         );
     }
 
