@@ -449,13 +449,30 @@ impl NativeDecodeSession {
     /// device. Charging the wrong one is the same class of mistake as the KV
     /// pool being charged to `Device` in the pipeline while the engine charged
     /// it to `Host`.
+    /// How many recurrent-state instances physically exist at once.
+    ///
+    /// One: native decode runs a single serialized session, and other sequences
+    /// retain tokens and are re-prefilled rather than each holding a live state
+    /// tensor.
+    ///
+    /// Explicit rather than a bare `1` in the arithmetic, because the number
+    /// that belongs here is *how many rows exist*, not *how many sequences the
+    /// scheduler admits*. Reserving `max_batch_size` of them over-counts by up
+    /// to 32x against memory that is never allocated, which is what the first
+    /// version of this did. If native decode later keeps several rows live,
+    /// this is the one place to change, and the caller's arithmetic stays right.
+    pub fn concurrent_state_rows(&self) -> usize {
+        1
+    }
+
     pub fn recurrent_state_reservation(
         &self,
     ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
-        let bytes = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(
+        let per_row = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(
             &self.session,
             &self.present_to_past,
         )?;
+        let bytes = per_row.saturating_mul(self.concurrent_state_rows() as u64);
         let tier = if self.session.device_id().is_host_accessible() {
             onnx_runtime_memory_governor::Tier::Host
         } else {

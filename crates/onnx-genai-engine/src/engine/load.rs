@@ -617,9 +617,6 @@ fn load_draft_model(
     Ok(draft)
 }
 
-/// The tier a `PagedKvCache` page pool actually lives on.
-///
-
 /// Pages retained by a pool that holds no KV data.
 ///
 /// Without per-layer geometry a page carries no storage, so this bounds only
@@ -677,7 +674,6 @@ pub(crate) fn kv_pages_for_budget(
 /// Only the configured path holds storage worth leasing. Without per-layer
 /// geometry a pool is pure bookkeeping and occupies nothing, so it is built
 /// ungoverned rather than taking a lease of zero that implies otherwise.
-
 fn allocate_kv_cache(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,

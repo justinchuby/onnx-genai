@@ -213,7 +213,10 @@ impl ModelMemoryPlan {
     /// than about the holder: recurrent state lives on the host for a CPU
     /// session and on the device for a CUDA one, so `Holder::tier()` cannot
     /// answer for it. Everything else uses [`Self::reserve`], which does not let
-    /// a call site pick.
+    /// a call site pick -- a tier that can be passed is a tier that can be
+    /// passed wrong, which is how the pipeline came to charge a host-allocated
+    /// KV pool to the device.
+    #[cfg(feature = "native-backend")]
     pub(crate) fn reserve_on(
         &mut self,
         holder: Holder,
@@ -235,7 +238,23 @@ impl ModelMemoryPlan {
         Ok(granted)
     }
 
-    /// Bytes held on `tier`, across every holder.
+    /// Bytes held on `tier` **by the plan itself**.
+    ///
+    /// Deliberately not the tier total: the KV pool's lease lives inside
+    /// `PagedKvCache` and the weight-residency pool's inside the execution
+    /// provider, so this misses both. `EngineResourceGovernor::leased_bytes_on`
+    /// reads the ledger, which sees everything.
+    ///
+    /// Kept because the difference between the two is the property worth
+    /// asserting -- see `the_tier_total_counts_leases_the_plan_does_not_hold`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the tier total is read from the ledger; this exists to show that the \
+                      plan's own view is the partial one, and is asserted against it"
+        )
+    )]
     pub(crate) fn bytes_on(&self, tier: Tier) -> u64 {
         self.entries
             .iter()
