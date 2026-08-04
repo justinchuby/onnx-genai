@@ -289,7 +289,14 @@ pub fn set_wheel_search_paths(paths: impl IntoIterator<Item = PathBuf>) {
     explicit_root_count().fetch_add(added, Ordering::Relaxed);
 }
 
-/// CUDA runtime-header directories owned by configured NVIDIA wheels.
+/// CUDA header directories owned by configured NVIDIA wheels.
+///
+/// Two components, because the headers NVRTC needs are split across two wheels.
+/// `nvidia-cuda-runtime` carries `cuda_fp16.h`, `cuda_bf16.h` and `mma.h`; the
+/// `crt/` tree that `mma.h` itself includes ships in `nvidia-cuda-nvcc`.
+/// Offering only the first gets as far as `mma.h` and then fails with
+/// `cannot open source file "crt/mma.h"`, which is a long way from naming the
+/// wheel that is missing.
 pub(crate) fn wheel_cuda_include_paths() -> Vec<PathBuf> {
     let roots = wheel_search_paths()
         .lock()
@@ -297,7 +304,12 @@ pub(crate) fn wheel_cuda_include_paths() -> Vec<PathBuf> {
         .clone();
     roots
         .into_iter()
-        .map(|root| root.join("nvidia").join("cuda_runtime").join("include"))
+        .flat_map(|root| {
+            let nvidia = root.join("nvidia");
+            ["cuda_runtime", "cuda_nvcc"]
+                .into_iter()
+                .map(move |component| nvidia.join(component).join("include"))
+        })
         .collect()
 }
 
