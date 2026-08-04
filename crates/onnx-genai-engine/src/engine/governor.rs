@@ -146,11 +146,27 @@ impl EngineResourceGovernor {
             capacities,
             VramBreakdown {
                 model_weights_bytes,
-                activations_bytes: 0,
-                ort_overhead_bytes: 0,
+                // Not measured. `None` rather than `0`, so nothing downstream
+                // can mistake the absence of a number for a number.
+                activations_bytes: None,
+                ort_overhead_bytes: None,
             },
             kv_config,
         )?;
+        // Say it once, out loud. These two are not measured, and a zero in a
+        // breakdown is indistinguishable from a measurement of zero -- which is
+        // how `activations_bytes: 0` came to be published as fact in the profile
+        // JSON until #629.
+        //
+        // Not a refusal: neither is required to build anything, so being wrong
+        // about them makes admission optimistic rather than impossible, and the
+        // house rule for that case is to run and say so (#649). A quantity whose
+        // absence makes a buffer unbuildable is a different case and does refuse.
+        tracing::warn!(
+            model_weights_bytes,
+            "device memory breakdown: activations and runtime overhead are not measured and are \
+             reported as unknown, not as zero; admission is correspondingly optimistic (#514)"
+        );
         // The ledger's device tier is the *device*, not a sub-budget of it.
         //
         // It used to be seeded with `derived_budget.kv_bytes`, which made the

@@ -572,8 +572,10 @@ pub(crate) struct MemoryUsage {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DeviceComposition {
     pub(crate) model_weights_bytes: u64,
-    pub(crate) activations_bytes: u64,
-    pub(crate) runtime_overhead_bytes: u64,
+    /// None when the engine never measured it, which is not zero.
+    pub(crate) activations_bytes: Option<u64>,
+    /// None when the engine never measured it, which is not zero.
+    pub(crate) runtime_overhead_bytes: Option<u64>,
     pub(crate) kv_bytes: u64,
     pub(crate) kv_pages: u64,
     pub(crate) kv_page_bytes: u64,
@@ -589,8 +591,8 @@ impl DeviceComposition {
     /// are still reported.
     fn fixed_reservation_measured(&self) -> bool {
         self.model_weights_bytes > 0
-            || self.activations_bytes > 0
-            || self.runtime_overhead_bytes > 0
+            || self.activations_bytes.is_some()
+            || self.runtime_overhead_bytes.is_some()
     }
 }
 
@@ -818,16 +820,18 @@ impl RunProfile {
             {
                 let _ = writeln!(out, "device memory breakdown:");
                 for (label, bytes) in [
-                    ("  model weights", composition.model_weights_bytes),
+                    ("  model weights", Some(composition.model_weights_bytes)),
                     ("  activations", composition.activations_bytes),
                     ("  runtime overhead", composition.runtime_overhead_bytes),
-                    ("  kv cache", composition.kv_bytes),
+                    ("  kv cache", Some(composition.kv_bytes)),
                 ] {
                     // An unmeasured component is omitted: "0 B" beside a real
                     // figure reads as "this model has none", which is wrong.
-                    if bytes == 0 {
+                    // `None` now says that outright, so a genuine measurement of
+                    // zero is printed rather than swallowed with it.
+                    let Some(bytes) = bytes.filter(|bytes| *bytes > 0) else {
                         continue;
-                    }
+                    };
                     let share = self
                         .memory
                         .device_limit_bytes
@@ -850,7 +854,7 @@ impl RunProfile {
                     ("runtime overhead", composition.runtime_overhead_bytes),
                 ]
                 .into_iter()
-                .filter(|(_, bytes)| *bytes == 0)
+                .filter(|(_, bytes)| bytes.is_none())
                 .map(|(label, _)| label)
                 .collect();
                 if !unmeasured.is_empty() {
@@ -1037,10 +1041,13 @@ impl RunProfile {
                 ("activations_bytes", composition.activations_bytes),
                 ("runtime_overhead_bytes", composition.runtime_overhead_bytes),
             ] {
-                if bytes == 0 {
-                    unmeasured.push(format!("\"{key}\""));
-                } else {
-                    parts.push(format!("\"{key}\":{bytes}"));
+                match bytes {
+                    // Absent, not zero. A machine reader told "0" concludes the
+                    // model has no activations; the distinction now survives
+                    // from the engine all the way here rather than being
+                    // reconstructed from a sentinel.
+                    None => unmeasured.push(format!("\"{key}\"")),
+                    Some(bytes) => parts.push(format!("\"{key}\":{bytes}")),
                 }
             }
             parts.push(format!("\"kv_bytes\":{}", composition.kv_bytes));
@@ -1288,8 +1295,8 @@ mod tests {
         profile.memory.device_limit_bytes = Some(8 * 1024 * 1024 * 1024);
         profile.memory.composition = Some(DeviceComposition {
             model_weights_bytes: 2 * 1024 * 1024 * 1024,
-            activations_bytes: 512 * 1024 * 1024,
-            runtime_overhead_bytes: 256 * 1024 * 1024,
+            activations_bytes: Some(512 * 1024 * 1024),
+            runtime_overhead_bytes: Some(256 * 1024 * 1024),
             kv_bytes: 4 * 1024 * 1024 * 1024,
             kv_pages: 2048,
             kv_page_bytes: 2 * 1024 * 1024,
@@ -1328,8 +1335,8 @@ mod tests {
         // What the engine reports today: weights and KV measured, the rest not.
         profile.memory.composition = Some(DeviceComposition {
             model_weights_bytes: 1024 * 1024 * 1024,
-            activations_bytes: 0,
-            runtime_overhead_bytes: 0,
+            activations_bytes: None,
+            runtime_overhead_bytes: None,
             kv_bytes: 3 * 1024 * 1024 * 1024,
             kv_pages: 100,
             kv_page_bytes: 32 * 1024 * 1024,
@@ -1383,8 +1390,8 @@ mod tests {
         // still a zeroed placeholder.
         profile.memory.composition = Some(DeviceComposition {
             model_weights_bytes: 0,
-            activations_bytes: 0,
-            runtime_overhead_bytes: 0,
+            activations_bytes: None,
+            runtime_overhead_bytes: None,
             kv_bytes: 1024,
             kv_pages: 4,
             kv_page_bytes: 256,
@@ -1597,5 +1604,56 @@ mod tests {
         );
         assert_eq!(json["budget_cap"]["requested_max_new_tokens"], 3584);
         assert_eq!(json["budget_cap"]["admitted_max_new_tokens"], 128);
+    }
+
+    /// A measured zero and an unmeasured component are different things.
+    ///
+    /// They used to be the same `u64`, so the reports reconstructed the
+    /// distinction from `== 0` -- which meant a component genuinely measured at
+    /// zero was reported as "not yet measured", and before #629 an unmeasured
+    /// one was published to machine readers as a hard `0`. The type now carries
+    /// it, so neither reconstruction is needed.
+    #[test]
+    fn a_measured_zero_is_not_reported_as_unmeasured() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.device_limit_bytes = Some(4 * 1024 * 1024 * 1024);
+        profile.memory.composition = Some(DeviceComposition {
+            model_weights_bytes: 1024 * 1024 * 1024,
+            // Measured, and genuinely zero.
+            activations_bytes: Some(0),
+            // Never measured.
+            runtime_overhead_bytes: None,
+            kv_bytes: 2 * 1024 * 1024 * 1024,
+            kv_pages: 100,
+            kv_page_bytes: 32 * 1024 * 1024,
+        });
+
+        let text = profile.to_text();
+        assert!(
+            text.contains("runtime overhead not yet measured"),
+            "the unmeasured one must be named:\n{text}"
+        );
+        assert!(
+            !text.contains("activations and runtime overhead not yet measured"),
+            "activations were measured, so they must not be listed as unmeasured:\n{text}"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        let breakdown = &value["device_memory_breakdown"];
+        assert_eq!(
+            breakdown["activations_bytes"], 0,
+            "a measured zero is a number and belongs in the JSON"
+        );
+        let unmeasured = breakdown["unmeasured"].as_array().expect("named");
+        assert!(
+            unmeasured
+                .iter()
+                .any(|name| name == "runtime_overhead_bytes")
+        );
+        assert!(
+            !unmeasured.iter().any(|name| name == "activations_bytes"),
+            "activations were measured: {breakdown}"
+        );
     }
 }

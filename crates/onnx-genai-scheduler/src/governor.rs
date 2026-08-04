@@ -82,15 +82,45 @@ pub struct CapacityProviders {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VramBreakdown {
     pub model_weights_bytes: u64,
-    pub activations_bytes: u64,
-    pub ort_overhead_bytes: u64,
+    /// Intermediate activations, when they have been measured.
+    ///
+    /// `None` means *not measured*, which is not the same as zero and must not
+    /// be reported as it. Nothing sizes activations yet: the liveness planner in
+    /// `onnx-runtime-memory` has no consumer (#514), so the engine cannot answer
+    /// and says so rather than answering `0`.
+    ///
+    /// A `u64` here is how `activations_bytes: 0` came to be published as a
+    /// measured fact in the profile JSON until #629. The type now refuses to let
+    /// the two be confused.
+    pub activations_bytes: Option<u64>,
+    /// Runtime overhead, when it has been measured. `None` as above.
+    pub ort_overhead_bytes: Option<u64>,
 }
 
 impl VramBreakdown {
+    /// The fixed reservation, counting only what was actually measured.
+    ///
+    /// An unmeasured component contributes nothing, which makes the reservation
+    /// an under-estimate and admission optimistic. That is the house rule for a
+    /// quantity whose absence does not stop anything being built (#649): run,
+    /// and be loud about it -- the alternative is refusing to load over a number
+    /// nobody has ever computed.
     fn reserved_bytes(self) -> Option<u64> {
         self.model_weights_bytes
-            .checked_add(self.activations_bytes)?
-            .checked_add(self.ort_overhead_bytes)
+            .checked_add(self.activations_bytes.unwrap_or(0))?
+            .checked_add(self.ort_overhead_bytes.unwrap_or(0))
+    }
+
+    /// Which components of this breakdown were never measured.
+    pub fn unmeasured(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.activations_bytes.is_none() {
+            names.push("activations");
+        }
+        if self.ort_overhead_bytes.is_none() {
+            names.push("runtime overhead");
+        }
+        names
     }
 }
 
@@ -619,8 +649,8 @@ mod tests {
     fn breakdown() -> VramBreakdown {
         VramBreakdown {
             model_weights_bytes: 100,
-            activations_bytes: 50,
-            ort_overhead_bytes: 50,
+            activations_bytes: Some(50),
+            ort_overhead_bytes: Some(50),
         }
     }
 
@@ -728,8 +758,8 @@ mod tests {
         // genuine configuration error and still fails.
         let no_reservation = VramBreakdown {
             model_weights_bytes: 0,
-            activations_bytes: 0,
-            ort_overhead_bytes: 0,
+            activations_bytes: Some(0),
+            ort_overhead_bytes: Some(0),
         };
 
         let error = derive_kv_budget(5, &no_reservation, &kv_config()).unwrap_err();
@@ -762,8 +792,8 @@ mod tests {
     fn derive_rejects_overflowing_fixed_reservations() {
         let breakdown = VramBreakdown {
             model_weights_bytes: u64::MAX,
-            activations_bytes: 1,
-            ort_overhead_bytes: 0,
+            activations_bytes: Some(1),
+            ort_overhead_bytes: Some(0),
         };
 
         let error = derive_kv_budget(u64::MAX, &breakdown, &kv_config()).unwrap_err();
