@@ -1,4 +1,9 @@
 //! CPU parity oracle for frozen `pkg.nxrt::BlockQuantizedMoE` v1.
+//!
+//! This CPU kernel is memory-format-only today: it keeps expert weights in the
+//! native block-quantized wire layout at the operator boundary, then dequantizes
+//! each routed expert to dense f32 and runs the dense grouped MoE path. It does
+//! not perform quantized-domain expert compute.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -24,6 +29,10 @@ const INPUT_NAMES: [&str; 9] = [
     "fc3_experts_bias",
     "router_weights",
 ];
+
+#[cfg(test)]
+static BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub struct BlockQuantizedMoEFactory;
 
@@ -124,6 +133,8 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
 
         let mut output = vec![0.0f32; rows * hidden];
+        #[cfg(test)]
+        BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for (expert, expert_tasks) in tasks {
             let fc1 =
                 dequantize_expert(self.format, &fc1_packed, expert, fc1_size, hidden, experts)?;
@@ -1190,6 +1201,36 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn block_quantized_moe_manifest_counter_proves_dense_f32_expert_dispatch() {
+        let before =
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let input = vec![1.0f32; H];
+        let fc1 = identity_projection([2, 4]);
+        let fc2 = identity_projection([2, 2]);
+
+        let actual = run(
+            "identity",
+            1,
+            true,
+            0,
+            &input,
+            &[3.0, -3.0],
+            &fc1,
+            H,
+            &fc2,
+            None,
+        );
+
+        let after =
+            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "dispatch manifest counter must prove BlockQuantizedMoE ran the dense-f32 expert path"
+        );
+        assert_close(&actual, &[1.0; H]);
     }
 
     fn claim_fixture() -> (Graph, NodeId, Vec<Shape>, Vec<DataType>) {
