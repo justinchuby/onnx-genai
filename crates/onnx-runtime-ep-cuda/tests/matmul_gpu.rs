@@ -1,8 +1,8 @@
 //! On-GPU integration test for the cuBLASLt MatMul kernel.
 //!
-//! Gated on a real device: if no CUDA GPU is present (or the driver / cuBLASLt
-//! can't be loaded), the test prints `skip` and returns, so the crate still
-//! tests cleanly on non-GPU machines. On a GPU it runs f32 (integer, fractional,
+//! Gated on a real device: CPU-only CI reports these as ignored unless
+//! `gpu-tests` is enabled. Feature-enabled runs fail loudly if CUDA cannot run.
+//! On a GPU it runs f32 (integer, fractional,
 //! and batched) MatMuls and checks the numerics against an independently
 //! computed CPU reference.
 //!

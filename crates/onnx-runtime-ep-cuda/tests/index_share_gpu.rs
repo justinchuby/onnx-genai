@@ -18,7 +18,7 @@
 //!   patterns — including ±inf — always pass, and the observed max |Δ| is
 //!   printed for the record.
 //!
-//! Tests skip cleanly when no CUDA device is present.
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
@@ -104,13 +104,15 @@ struct OutputSpec {
     shape: Vec<usize>,
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -502,9 +504,7 @@ fn sequence(count: usize, offset: f32) -> Vec<f32> {
 )]
 #[test]
 fn selected_subset_and_trailing_padding_match_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -526,9 +526,7 @@ fn selected_subset_and_trailing_padding_match_cpu() {
 /// f32 CPU oracle fed the *exact* values obtained by rounding every input to
 /// the requested storage type first.
 fn low_precision_matches_exact_rounded_cpu(dtype: DataType, tolerance: f32) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -603,9 +601,7 @@ fn bf16_storage_matches_exact_rounded_cpu_oracle() {
 )]
 #[test]
 fn gqa_shared_indices_match_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 4,
         kv_heads: 2,
@@ -638,9 +634,7 @@ fn gqa_shared_indices_match_cpu() {
 )]
 #[test]
 fn causal_and_padding_bias_composition_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 1,
         kv_heads: 1,
@@ -684,9 +678,7 @@ fn causal_and_padding_bias_composition_matches_cpu() {
 )]
 #[test]
 fn int32_indices_and_broadcast_bias_match_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 1,
@@ -725,9 +717,7 @@ fn int32_indices_and_broadcast_bias_match_cpu() {
 )]
 #[test]
 fn scalar_bias_broadcasts_and_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -763,9 +753,7 @@ fn scalar_bias_broadcasts_and_matches_cpu() {
 )]
 #[test]
 fn prefill_then_two_decodes_thread_present_to_past() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let head_size = 4;
     let q_heads = 4;
     let kv_heads = 2;
@@ -862,9 +850,7 @@ fn prefill_then_two_decodes_thread_present_to_past() {
 )]
 #[test]
 fn single_output_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -889,9 +875,7 @@ fn single_output_matches_cpu() {
 )]
 #[test]
 fn captured_f16_replay_is_byte_identical_to_eager_and_preserves_latch() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1123,9 +1107,7 @@ fn run_gpu_capture_replay(
 )]
 #[test]
 fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let head_size = 4;
     let q_heads = 4;
     let kv_heads = 2;
@@ -1260,9 +1242,7 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
 )]
 #[test]
 fn eager_rejects_invalid_indices() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1302,9 +1282,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture,
     };
 
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         q_heads: 2,
         kv_heads: 2,
@@ -1485,9 +1463,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
 )]
 #[test]
 fn capacity_present_aliases_past_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // Fixed capacity 5, one current token, logical valid length 4 (bias finite
     // for k in [0,4), -inf at k=4). write_pos = valid_len - current_seq = 3, so
     // the current token overwrites capacity row 3; row 4 is never gathered.

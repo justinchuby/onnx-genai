@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 const OP: &str = "CausalConvWithState";
@@ -88,9 +88,7 @@ fn check(
 )]
 #[test]
 fn causal_conv_with_state_matches_cpu_across_configs() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // B=1, C=3, K=4. Weights per channel (depthwise [C,1,K]).
     let weight = [
         0.1f32, 0.2, -0.3, 0.5, // c0
@@ -155,9 +153,7 @@ fn causal_conv_with_state_matches_cpu_across_configs() {
 )]
 #[test]
 fn causal_conv_with_state_matches_cpu_for_batched_decode() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // B=2, C=2, K=3.
     let weight = [0.3f32, -0.6, 0.9, 0.2, 0.5, -0.4];
     let bias = [0.1f32, -0.2];

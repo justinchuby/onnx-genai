@@ -9,7 +9,7 @@
 //! The reference is a from-scratch oracle — it does not call any GPU kernel — so
 //! the comparison is meaningful rather than tautological.
 //!
-//! Tests skip cleanly when no CUDA device is present. Run with:
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled. Run with:
 //! `CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda \
 //!   --test varlen_attention_gpu -- --nocapture`
 
@@ -84,13 +84,15 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -452,9 +454,7 @@ fn check(
     scale: Option<f32>,
     softcap: f32,
 ) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let got = batch.run(&ep, is_causal, fp16, rank4, scale, softcap);
     let want = batch.cpu_reference(is_causal, fp16, scale, softcap);
     let tol = if fp16 { 3e-2 } else { 2e-4 };
@@ -466,9 +466,7 @@ fn check(
 }
 
 fn check_dtype(batch: &Batch, is_causal: bool, dtype: DataType, tolerance: f32) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let got = batch.run_dtype(&ep, is_causal, dtype, true, None, 0.0);
     let want = batch.cpu_reference_dtype(is_causal, dtype, None, 0.0);
     let diff = max_abs_diff(&got, &want);

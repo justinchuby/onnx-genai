@@ -29,16 +29,12 @@ use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier
 /// one here would make these tests skip on a machine that can run them
 /// perfectly well. Nothing on this path calls either: allocation is
 /// `cuMemAlloc`/`cuMemFree`, both driver entry points.
-fn allocator() -> Option<CudaDeviceAllocator> {
+fn require_cuda_allocator() -> CudaDeviceAllocator {
     match CudaContext::new(0) {
-        Ok(context) => Some(CudaDeviceAllocator::new(context)),
-        Err(error) => {
-            eprintln!(
-                "SKIPPED (no CUDA driver): {error}. This test verifies device allocation \
-                 through the shared contract and did NOT run."
-            );
-            None
-        }
+        Ok(context) => CudaDeviceAllocator::new(context),
+        Err(error) => panic!(
+            "CUDA allocator test requires a CUDA driver; CPU-only runs must leave this test ignored: {error}"
+        ),
     }
 }
 /// Counts what passes through it, so a test can tell "used" from "ignored".
@@ -81,9 +77,7 @@ impl DeviceAllocator for CountingAllocator {
 )]
 #[test]
 fn allocated_device_memory_round_trips_and_is_returned() {
-    let Some(inner) = allocator() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let inner = require_cuda_allocator();
     let counters = CountingAllocator {
         inner,
         allocations: AtomicU64::new(0),
@@ -135,9 +129,7 @@ fn allocated_device_memory_round_trips_and_is_returned() {
 )]
 #[test]
 fn the_cuda_allocator_reports_a_device_tier() {
-    let Some(allocator) = allocator() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let allocator = require_cuda_allocator();
     let key = allocator.device();
     assert_eq!(key.tier, Tier::Device, "CUDA memory is not host memory");
     assert_eq!(key.index, 0);
@@ -155,9 +147,7 @@ fn the_cuda_allocator_reports_a_device_tier() {
 )]
 #[test]
 fn an_alignment_cuda_does_not_guarantee_is_refused() {
-    let Some(allocator) = allocator() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let allocator = require_cuda_allocator();
     let error = allocator
         .allocate(4096, 4096)
         .expect_err("4096-byte alignment is beyond what cuMemAlloc guarantees");
@@ -183,9 +173,7 @@ fn an_alignment_cuda_does_not_guarantee_is_refused() {
 )]
 #[test]
 fn concurrent_allocations_do_not_overlap() {
-    let Some(allocator) = allocator() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let allocator = require_cuda_allocator();
     let allocator = std::sync::Arc::new(allocator);
 
     const THREADS: usize = 8;
@@ -264,9 +252,7 @@ fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
             "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
         );
     };
-    let Some(inner) = allocator() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let inner = require_cuda_allocator();
     let strict = Arc::new(StrictSizes::new(inner));
     let provider = provider
         .with_memory(Arc::clone(&strict) as Arc<dyn DeviceAllocator>)

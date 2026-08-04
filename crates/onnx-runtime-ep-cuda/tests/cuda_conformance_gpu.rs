@@ -26,8 +26,8 @@
 //!   cannot silently leave an op unverified.
 //! * [`profile_has_no_duplicate_entries`].
 //!
-//! The GPU sweep ([`conformance_sweep_matches_cpu`]) graceful-skips without a
-//! CUDA device. Run it on a GPU box with:
+//! The GPU sweep ([`conformance_sweep_matches_cpu`]) is ignored unless
+//! `gpu-tests` is enabled. Run it on a GPU box with:
 //!
 //! ```bash
 //! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda \
@@ -41,7 +41,9 @@ mod common;
 use std::collections::HashSet;
 use std::path::Path;
 
-use common::{Tensor, assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{
+    Tensor, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
+};
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
 use onnx_runtime_ir::{Attribute, DataType};
 
@@ -2790,7 +2792,7 @@ fn dedicated_suites_exist_and_name_their_op() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GPU parity sweep (graceful-skips without a CUDA device)
+// GPU parity sweep (ignored unless `gpu-tests` is enabled)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run one inline case on CUDA and compare to the CPU oracle.
@@ -2856,9 +2858,7 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) {
 )]
 #[test]
 fn conformance_sweep_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let mut ran = 0usize;
     for entry in conformance_profile() {
         if let Coverage::Sweep(cases) = &entry.coverage {

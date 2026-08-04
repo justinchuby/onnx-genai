@@ -6,8 +6,8 @@
 //! *byte-identical* to the same weight uploaded the ordinary resident way.
 //! Offload is an optimization, never an output change.
 //!
-//! Gated on a real device: prints `skip` and returns when no CUDA GPU is
-//! present, so the crate still tests cleanly on non-GPU machines.
+//! Gated on a real device: CPU-only CI reports this as ignored unless
+//! `gpu-tests` is enabled; feature-enabled runs fail loudly without CUDA.
 //!
 //! Run pinned to a free GPU, e.g.:
 //!   CUDA_VISIBLE_DEVICES=0 taskset -c 1 \

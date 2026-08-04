@@ -26,13 +26,15 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -298,11 +300,7 @@ fn assert_f64_reference(label: &str, got: f32, reference: f64, sequential_f32: f
 #[test]
 fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
     let _guard = GPU_SERIAL.lock().unwrap();
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let input_shape = [2, 3, 4];
     let skip_shape = [3, 4];
     let input = [
@@ -353,11 +351,7 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
 #[test]
 fn skip_simplified_layer_norm_matches_f64_reference_within_one_ulp() {
     let _guard = GPU_SERIAL.lock().unwrap();
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let input = [-0.09129826, -1.0101787, 3.0318594, 5.774467];
     let skip = [0.0; 4];
     let gamma = [1.0; 4];
@@ -412,11 +406,7 @@ fn skip_simplified_layer_norm_matches_f64_reference_within_one_ulp() {
 #[test]
 fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
     let _guard = GPU_SERIAL.lock().unwrap();
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let input_shape = [1, 1, 4];
     let skip_shape = [1, 4];
     let output_shape = input_shape;

@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 /// Output shape for a keepdims-honouring reduction over `axes` (negative axes
@@ -129,9 +129,7 @@ fn assert_half_reduce_matches_f32_oracle(
 )]
 #[test]
 fn half_reduce_router_shape_matches_f32_oracle() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float16, DataType::BFloat16] {
         for op in ["ReduceSum", "ReduceMean"] {
             assert_half_reduce_matches_f32_oracle(&ep, op, dtype, &[1, 5, 8], &[2], true);
@@ -148,9 +146,7 @@ fn half_reduce_router_shape_matches_f32_oracle() {
 )]
 #[test]
 fn half_reduce_multi_axis_no_keepdims_matches_f32_oracle() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float16, DataType::BFloat16] {
         for op in ["ReduceSum", "ReduceMean"] {
             assert_half_reduce_matches_f32_oracle(&ep, op, dtype, &[2, 3, 4], &[0, 2], false);
@@ -169,9 +165,7 @@ fn half_reduce_multi_axis_no_keepdims_matches_f32_oracle() {
 )]
 #[test]
 fn fp16_reduce_sum_accumulates_in_f32_without_overflow() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let in_shape = [1usize, 5];
     let values = [60000.0_f32, 60000.0, -60000.0, -60000.0, 5.0];
     let half_input = float_input(DataType::Float16, &in_shape, &values);

@@ -304,17 +304,15 @@ fn run_cpu(
     output_bytes
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -336,9 +334,7 @@ fn assert_close(op: &str, dtype: DataType, got: &[f32], expected: &[f32], tolera
 )]
 #[test]
 fn trig_hyperbolic_unary_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // (op, domain-safe inputs).
     let cases: &[(&str, &[f32])] = &[
         ("Tan", &[-1.2, -0.4, 0.0, 0.5, 1.1]),
@@ -386,9 +382,7 @@ fn trig_hyperbolic_unary_matches_cpu() {
 )]
 #[test]
 fn identity_and_flatten_match_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let f32_values: Vec<f32> = (0..12).map(|v| v as f32 * 0.5 - 3.0).collect();
     let i64_values: Vec<i64> = (0..12).map(|v| (v as i64) * 7 - 5).collect();
 
@@ -425,9 +419,7 @@ fn identity_and_flatten_match_cpu() {
 )]
 #[test]
 fn size_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let values: Vec<f32> = (0..24).map(|v| v as f32).collect();
     let inputs = [input(DataType::Float32, &[2, 3, 4], &values)];
     let outputs = [(DataType::Int64, vec![])];
@@ -448,9 +440,7 @@ fn size_matches_cpu() {
 )]
 #[test]
 fn trilu_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // A batch of two 3x4 matrices with distinct values.
     let f32_values: Vec<f32> = (0..24).map(|v| v as f32 + 1.0).collect();
     let i64_values: Vec<i64> = (0..24).map(|v| (v as i64) + 1).collect();
@@ -533,9 +523,7 @@ fn reduce_out_shape(in_shape: &[usize], axes: &[i64], keepdims: bool) -> Vec<usi
 )]
 #[test]
 fn extended_reductions_match_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let in_shape = vec![2usize, 3, 4];
     let count: usize = in_shape.iter().product();
     // Positive, mildly varied magnitudes keep every reduction well conditioned.
@@ -586,9 +574,7 @@ fn extended_reductions_match_cpu() {
 )]
 #[test]
 fn reduce_log_sum_exp_axes_input_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let in_shape = vec![2usize, 3, 4];
     let count: usize = in_shape.iter().product();
     let values: Vec<f32> = (0..count).map(|v| (v as f32 * 0.17) - 2.0).collect();
@@ -619,9 +605,7 @@ fn reduce_log_sum_exp_axes_input_matches_cpu() {
 )]
 #[test]
 fn reduce_log_sum_exp_large_values_match_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // Row 0: the classic overflow case `[90, 91, 92, 93]` (naive exp -> +inf).
     // Row 1: a wide spread mixing large negatives and positives; exp(120) also
     // overflows f32 (~3.4e38) without max-subtraction.
@@ -661,9 +645,7 @@ fn reduce_log_sum_exp_large_values_match_cpu() {
 )]
 #[test]
 fn extended_activations_match_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let values: &[f32] = &[-3.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0];
     type ActivationCase = (&'static str, u64, Vec<(&'static str, Attribute)>);
     let cases: Vec<ActivationCase> = vec![
@@ -710,9 +692,7 @@ fn extended_activations_match_cpu() {
 )]
 #[test]
 fn variadic_sum_mean_match_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // Three operands with distinct broadcastable shapes -> output [2,3].
     let a: &[f32] = &[1.0, -2.0, 3.0, -4.0, 5.0, -6.0];
     let b: &[f32] = &[10.0, 20.0, 30.0];
@@ -776,9 +756,7 @@ fn decode_i64(bytes: &[u8]) -> Vec<i64> {
 )]
 #[test]
 fn mod_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
 
     // Float Mod requires fmod=1 per ONNX.
     let fa: &[f32] = &[5.3, -5.3, 7.5, -7.5, 2.0, -2.0];
@@ -854,9 +832,7 @@ fn mod_matches_cpu() {
 )]
 #[test]
 fn is_inf_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     // +inf, -inf, NaN, finite positive, finite negative, zero, -0.0.
     let values: &[f32] = &[
         f32::INFINITY,
@@ -905,9 +881,7 @@ fn is_inf_matches_cpu() {
 )]
 #[test]
 fn is_nan_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let values: &[f32] = &[
         f32::NAN,
         f32::INFINITY,
@@ -953,9 +927,7 @@ fn is_nan_matches_cpu() {
 )]
 #[test]
 fn prelu_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
 
     // X shape [2,3,4] with a mix of negative, zero, and positive lanes.
     let x_shape = vec![2usize, 3, 4];

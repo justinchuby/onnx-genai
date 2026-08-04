@@ -9,11 +9,12 @@
 //! the four `update_rule` variants, standard and inverse GQA, key-head sharing
 //! (`n_k < H_kv`), per-head vs per-key-dim decay, per-head vs shared beta,
 //! multi-timestep recurrence (state carry), a non-trivial past_state, and the
-//! Float32 / Float16 / BFloat16 dtypes. All cases graceful-skip without a GPU.
+//! Float32 / Float16 / BFloat16 dtypes. CPU-only runs report these as ignored
+//! unless `gpu-tests` is enabled.
 
 mod common;
 
-use common::{Tensor, assert_close, cuda_ep, decode_floats, float_input, run_cpu, run_cuda};
+use common::{Tensor, assert_close, decode_floats, float_input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType};
 
@@ -139,12 +140,7 @@ fn tolerance(dtype: DataType) -> f32 {
 
 /// Run one config on CUDA and the CPU oracle, comparing every output.
 fn check(cfg: &Config, dtype: DataType) {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip {}: no CUDA GPU", cfg.label);
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     run_check(&ep, cfg, dtype, DOMAIN);
 }
 
@@ -336,12 +332,7 @@ fn linear_attention_bf16_parity() {
 )]
 #[test]
 fn linear_attention_standard_domain_parity() {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip: no CUDA GPU");
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for cfg in configs() {
             run_check(&ep, &cfg, dtype, "");
@@ -358,12 +349,7 @@ fn linear_attention_standard_domain_parity() {
 )]
 #[test]
 fn linear_attention_both_domains_identical() {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip: no CUDA GPU");
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for cfg in configs() {
             let inputs = build_inputs(&cfg, dtype);
@@ -404,12 +390,7 @@ fn linear_attention_both_domains_identical() {
 )]
 #[test]
 fn linear_attention_state_carry_matches_chained() {
-    let Some(ep) = cuda_ep() else {
-        eprintln!("skip: no CUDA GPU");
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let dtype = DataType::Float32;
     let (batch, d_k, d_v, heads) = (1usize, 5usize, 4usize, 2usize);
     let a = vec![

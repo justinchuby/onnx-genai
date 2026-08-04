@@ -376,7 +376,7 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
 static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A live CUDA EP plus the held [`GPU_SERIAL`] guard. Derefs to the EP so every
-/// existing `gpu()` call site is unchanged.
+/// existing `require_cuda()` call site is unchanged.
 struct GpuGuard {
     ep: CudaExecutionProvider,
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -389,19 +389,21 @@ impl std::ops::Deref for GpuGuard {
     }
 }
 
-fn gpu() -> Option<GpuGuard> {
+fn require_cuda() -> GpuGuard {
     // Ignore poisoning: a panicking test still leaves the device usable, and we
     // must not cascade one failure into spurious lock failures elsewhere.
     let serial = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(GpuGuard {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => GpuGuard {
             ep,
             _serial: serial,
-        }),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+        },
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -622,9 +624,7 @@ fn error_metrics(actual: &[f32], expected: &[f32]) -> (f32, u32) {
 }
 
 fn compare(case: Case, dtype: DataType) -> (f32, u32) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let gpu_inputs = case_inputs(case, dtype);
     let cpu_inputs = rounded_cpu_inputs(&gpu_inputs, dtype);
     let expected = run_cpu(case, &cpu_inputs);
@@ -661,9 +661,7 @@ fn compare_gemv_gemm_and_cpu(case: Case) {
     assert_eq!(case.rows, 6);
     assert_eq!(case.experts, 4);
     assert_eq!(case.top_k, 2);
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let mut inputs = case_inputs(case, DataType::Float32);
     inputs[1] = Some(HostTensor::f32(
         &[case.rows, case.experts],
@@ -882,9 +880,7 @@ fn qmoe_64experts_top6_bf16_decode_and_prefill_match_cpu() {
 )]
 #[test]
 fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = qmoe_64expert_case(16);
     let mut inputs = case_inputs(case, DataType::Float16);
     inputs[1] = Some(router_with_hot_expert(case));
@@ -901,9 +897,7 @@ fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
 )]
 #[test]
 fn qmoe_capture_replay_reresolves_changed_router_probs() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         experts: 4,
         rows: 3,
@@ -965,9 +959,7 @@ fn qmoe_capture_replay_reresolves_changed_router_probs() {
 )]
 #[test]
 fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = qmoe_64expert_case(8);
     let mut capture_inputs = case_inputs(case, DataType::Float16);
     capture_inputs[1] = Some(router_with_top_experts(case, 0));
@@ -1117,9 +1109,7 @@ fn qmoe_prefill_gemm_matches_gemv_and_cpu_oracle() {
 )]
 #[test]
 fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let case = Case {
         experts: 4,
         rows: 5,

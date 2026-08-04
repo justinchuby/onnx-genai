@@ -412,11 +412,7 @@ fn cudnn_conv_matches_cpu_for_dilation() {
 )]
 #[test]
 fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
-    let Some(ep) = common::cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = common::require_cuda();
     let cases = [
         (
             "basic",

@@ -136,17 +136,15 @@ fn assert_close(got: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -156,11 +154,7 @@ fn cuda_ep() -> Option<CudaExecutionProvider> {
 )]
 #[test]
 fn cudnn_maxpool_matches_cpu_for_f32_and_f16() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let input = [
         1.0, 3.0, 2.0, 0.0, 4.0, 6.0, 5.0, 1.0, 7.0, 8.0, 9.0, 2.0, 3.0, 4.0, 1.0, 0.0,
     ];
@@ -188,11 +182,7 @@ fn cudnn_maxpool_matches_cpu_for_f32_and_f16() {
 )]
 #[test]
 fn cudnn_averagepool_padding_count_modes_match_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let input = [1.0, 2.0, 3.0, 4.0];
     for (count_include_pad, expected) in [
         (0, [2.5, 2.5, 2.5, 2.5]),
@@ -220,11 +210,7 @@ fn cudnn_averagepool_padding_count_modes_match_cpu() {
 )]
 #[test]
 fn cudnn_averagepool_rejects_dilations() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let (mut graph, node) = build_pool_model(
         "AveragePool",
         DataType::Float32,

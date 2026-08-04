@@ -46,13 +46,15 @@ fn bytes<T: Copy>(values: &[T]) -> Vec<u8> {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -226,9 +228,7 @@ fn sumsquare_capture_matches_eager_and_oracle(
     rows: usize,
     cols: usize,
 ) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let runtime = ep.runtime();
 
     let n = rows * cols;
@@ -434,9 +434,7 @@ fn fp16_reduce_sumsquare_multi_axis_captures_and_matches_eager() {
 )]
 #[test]
 fn nvrtc_reduce_sumsquare_alternating_shapes_stays_correct() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];
@@ -501,9 +499,7 @@ fn nvrtc_reduce_sumsquare_alternating_shapes_stays_correct() {
 )]
 #[test]
 fn nvrtc_reduce_sumsquare_shape_change_under_capture_is_rejected() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let runtime = ep.runtime();
     let dtype = DataType::Float16;
     let axes_values = [1i64];

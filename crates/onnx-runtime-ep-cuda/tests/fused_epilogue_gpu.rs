@@ -210,17 +210,15 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32], tolerance: f32) {
     assert!(error <= tolerance, "{label}: {got:?} vs {expected:?}");
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
+fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -230,11 +228,7 @@ fn cuda_ep() -> Option<CudaExecutionProvider> {
 )]
 #[test]
 fn fused_matmul_bias_matches_matmul_then_bias() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let a = [0.5, -1.0, 2.0, 1.5, 0.25, -0.75];
     let b = [1.0, 0.5, -2.0, -1.0, 3.0, 0.25, 2.0, -0.5, 1.25];
     let bias = [0.25, -1.5, 2.0];
@@ -251,11 +245,7 @@ fn fused_matmul_bias_matches_matmul_then_bias() {
 )]
 #[test]
 fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let a = [0.5, -1.0, 2.0, 1.5, -0.25, 0.75];
     let b = [
         1.0, -2.0, 0.5, -1.0, 0.25, 2.0, 0.75, -0.5, 1.5, -2.0, 1.0, 0.25,
@@ -283,11 +273,7 @@ fn fused_gemm_relu_bias_matches_reference_with_transpose_and_alpha() {
 )]
 #[test]
 fn fused_gemm_gelu_bias_matches_tanh_reference() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
     let a = [0.5, -1.0, 2.0, -0.75, 1.25, 0.25];
     let b = [1.0, -0.5, 0.25, -1.5, 0.75, 2.0];
     let bias = [-0.25, 0.5];
@@ -312,11 +298,7 @@ fn fused_gemm_gelu_bias_matches_tanh_reference() {
 )]
 #[test]
 fn placement_declines_broadcast_bias_and_batched_matmul() {
-    let Some(ep) = cuda_ep() else {
-        panic!(
-            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
-        );
-    };
+    let ep = require_cuda();
 
     for op_type in ["FusedMatMulBias", "FusedGemm"] {
         for (a_shape, b_shape, bias_shape, out_shape, expected) in [

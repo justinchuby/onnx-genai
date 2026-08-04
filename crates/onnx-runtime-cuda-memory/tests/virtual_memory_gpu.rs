@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_cuda_memory::virtual_memory::CudaVirtualBacking;
+use onnx_runtime_ep_cuda::virtual_memory::CudaVirtualBacking;
 use onnx_runtime_memory_governor::{
     HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
 };
@@ -26,43 +26,12 @@ const HOLDER: HolderId = HolderId::new(11);
 /// execution provider additionally needs cudart and cuBLAS, and requiring those
 /// here would make these tests skip on a machine that can run them perfectly
 /// well, which is how a suite ends up green while proving nothing.
-fn backing() -> Option<CudaVirtualBacking> {
-    cuda_context().map(|context| CudaVirtualBacking::new(context, 0))
-}
-
-/// A CUDA context, or `None` when the driver cannot be loaded.
-///
-/// # Why this catches a panic
-///
-/// `CudaContext::new` does not return `Err` when the driver library is
-/// missing -- cudarc's dynamic loading panics. So a `match` on its `Result`
-/// never reaches the error arm on a machine with no GPU, and the test fails
-/// instead of skipping.
-///
-/// That went unnoticed because these tests lived in `onnx-runtime-ep-cuda`,
-/// which CI runs clippy over but deliberately does not test. They ran for the
-/// first time when this crate joined the test list, and failed immediately.
-/// The skip guard had never actually been exercised.
-fn cuda_context() -> Option<std::sync::Arc<CudaContext>> {
-    let attempt = std::panic::catch_unwind(|| CudaContext::new(0));
-    match attempt {
-        Ok(Ok(context)) => Some(context),
-        // Loud on purpose: a skip that reads like a pass is worse than a
-        // failure, because nobody investigates it (#636).
-        Ok(Err(error)) => {
-            eprintln!(
-                "SKIPPED (no CUDA device): {error}. These tests verify device \
-                 virtual memory and did NOT run."
-            );
-            None
-        }
-        Err(_) => {
-            eprintln!(
-                "SKIPPED (no CUDA driver library): cudarc panicked loading libcuda. \
-                 These tests verify device virtual memory and did NOT run."
-            );
-            None
-        }
+fn require_cuda_backing() -> CudaVirtualBacking {
+    match CudaContext::new(0) {
+        Ok(context) => CudaVirtualBacking::new(context, 0),
+        Err(error) => panic!(
+            "CUDA virtual-memory test requires a CUDA driver; CPU-only runs must leave this test ignored: {error}"
+        ),
     }
 }
 
@@ -76,9 +45,7 @@ fn cuda_context() -> Option<std::sync::Arc<CudaContext>> {
 )]
 #[test]
 fn the_device_reports_a_sane_allocation_granularity() {
-    let Some(backing) = backing() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let backing = require_cuda_backing();
     let granularity = backing.granularity();
     assert!(granularity > 0, "granularity must be positive");
     assert!(
@@ -100,9 +67,7 @@ fn the_device_reports_a_sane_allocation_granularity() {
 )]
 #[test]
 fn reserving_far_more_than_vram_succeeds_because_nothing_is_committed() {
-    let Some(backing) = backing() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let backing = require_cuda_backing();
     let huge = 64usize << 30; // 64 GiB, well past any consumer card
     let reservation = backing
         .reserve(huge)
@@ -124,9 +89,7 @@ fn reserving_far_more_than_vram_succeeds_because_nothing_is_committed() {
 )]
 #[test]
 fn one_address_spans_two_separate_physical_allocations() {
-    let Some(backing) = backing() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let backing = require_cuda_backing();
     let granule = backing.granularity();
 
     let mut reservation = backing.reserve(granule * 4).expect("address space");
@@ -180,9 +143,7 @@ fn one_address_spans_two_separate_physical_allocations() {
 )]
 #[test]
 fn a_device_buffer_grows_without_moving() {
-    let Some(backing) = backing() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let backing = require_cuda_backing();
     let granule = backing.granularity();
     let governor = LedgerGovernor::new(LeaseLedger::new(64 << 20, 0, 0));
 

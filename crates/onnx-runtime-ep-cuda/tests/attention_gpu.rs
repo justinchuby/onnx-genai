@@ -1,9 +1,9 @@
 //! On-GPU integration test for the Phase-2a SDPA/GQA attention kernel
 //! (`docs/ORT2.md` §13 + §15.5).
 //!
-//! Gated on a real device: if no CUDA GPU is present (or the driver / cuBLASLt /
-//! NVRTC can't be loaded), the test prints `skip` and returns, so the crate
-//! still tests cleanly on non-GPU machines. On a GPU it runs several attention
+//! Gated on a real device: CPU-only CI reports these as ignored unless
+//! `gpu-tests` is enabled. Feature-enabled runs fail loudly if CUDA cannot run.
+//! On a GPU it runs several attention
 //! shapes — non-causal MHA, causal MHA, and grouped-query (GQA) with a causal
 //! mask, plus an additive-mask case — and checks the numerics against an
 //! independent CPU reference implementing naive softmax attention.

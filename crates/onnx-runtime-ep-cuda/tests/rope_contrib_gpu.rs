@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{assert_close, cuda_ep, decode_floats, float_input, input, run_cpu, run_cuda};
+use common::{assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda};
 use onnx_runtime_ir::{Attribute, DataType};
 
 const OP: &str = "RotaryEmbedding";
@@ -71,9 +71,7 @@ fn check(ep: &onnx_runtime_ep_cuda::CudaExecutionProvider, dtype: DataType, inte
 )]
 #[test]
 fn contrib_rotary_matches_cpu() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
         for interleaved in [0, 1] {
             check(&ep, dtype, interleaved);

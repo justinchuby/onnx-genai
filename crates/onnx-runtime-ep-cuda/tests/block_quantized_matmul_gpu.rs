@@ -40,13 +40,15 @@ impl HostTensor {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -289,9 +291,7 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
 )]
 #[test]
 fn block_quantized_gemv_random_supported_formats_match_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (1003usize, 37usize);
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
@@ -318,9 +318,7 @@ fn block_quantized_gemv_random_supported_formats_match_cpu() {
 )]
 #[test]
 fn block_quantized_gemm_prefill_matches_cpu_for_partial_and_grid_stride_tiles() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for (format, a_shape, k, n, with_bias) in [
         ("mxfp4", vec![3, 99], 99usize, 13usize, true),
         ("iq4_xs", vec![1, 7, 515], 515usize, 11usize, false),
@@ -359,9 +357,7 @@ fn block_quantized_gemm_prefill_matches_cpu_for_partial_and_grid_stride_tiles() 
 )]
 #[test]
 fn block_quantized_gemv_dequant_is_bit_exact_against_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let n = 2usize;
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
@@ -398,9 +394,7 @@ fn block_quantized_gemv_dequant_is_bit_exact_against_cpu() {
 )]
 #[test]
 fn block_quantized_known_blocks_match_cpu_semantics_on_gpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for (format, packed, depth, expected) in [
         (
             "mxfp4",
@@ -492,9 +486,7 @@ fn block_quantized_known_blocks_match_cpu_semantics_on_gpu() {
 )]
 #[test]
 fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let cases = [
         (
             "iq1_s",
@@ -546,9 +538,7 @@ fn block_quantized_iq1_known_blocks_match_cpu_semantics_on_gpu() {
 )]
 #[test]
 fn supported_formats_and_prefill_route_to_cuda() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for format in [
         "mxfp4", "iq4_nl", "iq4_xs", "iq2_xxs", "iq3_xxs", "iq2_xs", "iq2_s", "iq3_s", "iq1_s",
         "iq1_m",

@@ -14,7 +14,7 @@
 //! decode step crosses a 128-position block boundary, exercising the stateful
 //! compression / FP8 quantized-cache write and carry reset during decode.
 //!
-//! Tests skip cleanly when no CUDA device is present.
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch,
@@ -106,7 +106,7 @@ impl HostTensor {
 static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A live CUDA EP plus the held [`GPU_SERIAL`] guard. Derefs to the EP so every
-/// existing `gpu()` call site is unchanged.
+/// existing `require_cuda()` call site is unchanged.
 struct GpuGuard {
     ep: CudaExecutionProvider,
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -119,19 +119,21 @@ impl std::ops::Deref for GpuGuard {
     }
 }
 
-fn gpu() -> Option<GpuGuard> {
+fn require_cuda() -> GpuGuard {
     // Ignore poisoning: a panicking test still leaves the device usable, and we
     // must not cascade one failure into spurious lock failures elsewhere.
     let serial = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(GpuGuard {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => GpuGuard {
             ep,
             _serial: serial,
-        }),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+        },
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -825,9 +827,7 @@ fn run_step(ep: &CudaExecutionProvider, inputs: &[HostTensor], next_records: usi
 )]
 #[test]
 fn ratio128_prefill_then_two_decodes_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
@@ -868,9 +868,7 @@ fn ratio128_prefill_then_two_decodes_matches_cpu() {
 )]
 #[test]
 fn ratio128_device_compression_crosses_two_blocks_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
         &[DIM],
@@ -900,9 +898,7 @@ fn ratio128_device_compression_crosses_two_blocks_matches_cpu() {
 )]
 #[test]
 fn ratio128_fp8_decode_capture_replay_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
         &[DIM],
@@ -1133,9 +1129,7 @@ fn run_step_f32(
 )]
 #[test]
 fn ratio128_f32_device_attention_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
@@ -1177,9 +1171,7 @@ fn ratio128_f32_device_attention_matches_cpu() {
 )]
 #[test]
 fn ratio128_f32_device_attention_sink_material_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(
@@ -1238,9 +1230,7 @@ fn ratio128_f32_device_attention_sink_material_matches_cpu() {
 )]
 #[test]
 fn ratio4_prefill_claim_and_execute_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (graph, node) = ratio4_node(&inputs);
     let (shapes, dtypes) = claim_metadata(&inputs);
@@ -1422,9 +1412,7 @@ fn ratio4_topk_output_specs(sequence: usize, records: usize, topk: usize) -> Vec
 )]
 #[test]
 fn ratio4_device_topk_selection_multi_record_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const SEQ: usize = 16;
     let index_query = ratio4_values(SEQ * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM, 17, 0.0015);
     let index_weight = ratio4_values(SEQ * RATIO4_INDEX_HEADS, 19, 0.01);
@@ -1467,9 +1455,7 @@ fn ratio4_device_topk_selection_multi_record_matches_cpu() {
 )]
 #[test]
 fn ratio4_device_topk_tie_break_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const SEQ: usize = 12;
     // Near-constant, tiny index queries make every `dot` tiny and the per-record
     // scores cluster in the last mantissa bits — the worst case for tie order.
@@ -1510,9 +1496,7 @@ fn ratio4_sequence_slice(tensor: &HostTensor, first: usize, count: usize) -> Hos
 )]
 #[test]
 fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let full = ratio4_inputs();
     let mut prefill = full.clone();
     for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
@@ -1621,9 +1605,7 @@ fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
 )]
 #[test]
 fn ratio4_device_fused_attention_prefill_then_two_decodes_with_bias_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 2,
@@ -1707,9 +1689,7 @@ fn ratio4_device_fused_attention_prefill_then_two_decodes_with_bias_matches_cpu(
 )]
 #[test]
 fn ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 2,
@@ -1789,9 +1769,7 @@ fn ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact() {
 )]
 #[test]
 fn supports_op_rejects_unsupported_configs() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
 
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
@@ -1878,9 +1856,7 @@ fn supports_op_rejects_unsupported_configs() {
 )]
 #[test]
 fn supports_op_rejects_non_query_fixed_input_dtype() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (graph, node) = ratio4_node(&inputs);
     let (shapes, mut dtypes) = claim_metadata(&inputs);
@@ -1900,9 +1876,7 @@ fn supports_op_rejects_non_query_fixed_input_dtype() {
 )]
 #[test]
 fn supports_op_rejects_ratio4_non_128_index_head_dim() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (mut graph, node) = ratio4_node(&inputs);
     graph
@@ -1925,9 +1899,7 @@ fn supports_op_rejects_ratio4_non_128_index_head_dim() {
 )]
 #[test]
 fn supports_op_rejects_ratio4_missing_index_inputs() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (mut graph, node) = ratio4_node(&inputs);
     graph.node_mut(node).inputs.truncate(11);
@@ -1949,9 +1921,7 @@ fn supports_op_rejects_ratio4_missing_index_inputs() {
 )]
 #[test]
 fn supports_op_rejects_ratio4_wrong_output_count() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let inputs = ratio4_inputs();
     let (mut graph, node) = ratio4_node(&inputs);
     graph.node_mut(node).outputs.truncate(4);
@@ -1971,9 +1941,7 @@ fn supports_op_rejects_ratio4_wrong_output_count() {
 )]
 #[test]
 fn supports_op_rejects_ratio128_fp4_cache_format() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -2003,9 +1971,7 @@ fn supports_op_rejects_ratio128_fp4_cache_format() {
 )]
 #[test]
 fn supports_op_rejects_ratio128_ratio4_only_input() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -2040,9 +2006,7 @@ fn supports_op_rejects_ratio128_ratio4_only_input() {
 )]
 #[test]
 fn supports_op_validates_ratio128_attention_bias_at_input_19() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -2103,9 +2067,7 @@ fn supports_op_validates_ratio128_attention_bias_at_input_19() {
 )]
 #[test]
 fn supports_op_claims_omitted_ratio128_attention_bias() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
     let norm = HostTensor::f32(&[DIM], &vec![0.8f32; DIM]);
     let sink = HostTensor::f32(&[1], &[-0.375]);
@@ -2347,9 +2309,7 @@ fn run_gpu_capture_replay(
 )]
 #[test]
 fn ratio4_capture_replay_decode_is_byte_identical_to_eager_and_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 1,
@@ -2465,9 +2425,7 @@ fn download_device(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, len: usize
 )]
 #[test]
 fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     // Two positions past the prefill: one to establish the accepted prefix
     // (decode at PREFILL), one to draft-then-reject (decode at PREFILL+1).
@@ -2656,9 +2614,7 @@ fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
 )]
 #[test]
 fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     const ACCEPTED: u64 = 13;
     let full = ratio4_inputs_prefill(
@@ -2875,9 +2831,7 @@ fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
 )]
 #[test]
 fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 2,
@@ -3002,9 +2956,7 @@ fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
 )]
 #[test]
 fn ratio4_device_default_populates_observability_metrics() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     const PREFILL: usize = 12;
     let full = ratio4_inputs_prefill(
         PREFILL + 1,
@@ -3066,9 +3018,7 @@ fn ratio4_device_default_populates_observability_metrics() {
 )]
 #[test]
 fn csa_composite_checkpoint_rolls_back_all_layers() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let committed_a = vec![0.25f32; 64];
     let committed_b = vec![-1.5f32; 96];
     let bytes_a: Vec<u8> = committed_a.iter().flat_map(|v| v.to_ne_bytes()).collect();

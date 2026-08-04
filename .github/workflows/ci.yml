@@ -761,11 +761,8 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
-      - name: Verify CUDA test skip honesty
+      - name: Verify CUDA test inventory and skip honesty
         run: python .github/scripts/verify_cuda_test_honesty.py
-
-      - name: Test CUDA harness with GPU tests ignored
-        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda
 
       - name: Clippy CUDA execution provider
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings

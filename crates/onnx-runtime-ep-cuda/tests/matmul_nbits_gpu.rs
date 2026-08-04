@@ -33,13 +33,15 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> HostTensor
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -800,9 +802,7 @@ fn int8_f64_reference(
 }
 
 fn run_int8_f64_reference_parity(explicit_zero_points: bool) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size, bits) = (1usize, 77usize, 19usize, 32usize, 8usize);
     let blocks = k.div_ceil(block_size);
     let mut state = if explicit_zero_points {
@@ -930,9 +930,7 @@ fn matmul_nbits_gpu_int8_block32_explicit_zero_points_match_f64_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_int8_block32_batched_fallback_matches_cpu() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size, bits) = (3usize, 77usize, 19usize, 32usize, 8usize);
     let blocks = k.div_ceil(block_size);
     let mut state = 0xd2c7_406e_1ab9_f853u64;
@@ -983,9 +981,7 @@ fn matmul_nbits_gpu_int8_block32_batched_fallback_matches_cpu() {
 )]
 #[test]
 fn matmul_nbits_gpu_int8_block32_capture_replay_is_bit_exact() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n, block_size) = (77usize, 19usize, 32usize);
     let blocks = k.div_ceil(block_size);
     let mut state = 0x9da3_51e7_24bc_08f6u64;
@@ -1148,9 +1144,7 @@ fn matmul_nbits_gpu_int8_block32_capture_replay_is_bit_exact() {
 )]
 #[test]
 fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size) = (1usize, 1003usize, 37usize, 32usize);
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size / 2;
@@ -1191,9 +1185,7 @@ fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
 )]
 #[test]
 fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n, block_size) = (1003usize, 37usize, 32usize);
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size / 2;
@@ -1350,9 +1342,7 @@ fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
 )]
 #[test]
 fn matmul_nbits_gpu_block32_decode_symmetric_non_multiple_k() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size) = (1, 45, 7, 32);
     let activations: Vec<f32> = (0..m * k)
         .map(|index| ((index * 17 % 29) as f32 - 14.0) / 11.0)
@@ -1392,9 +1382,7 @@ fn matmul_nbits_gpu_block32_decode_symmetric_non_multiple_k() {
 )]
 #[test]
 fn matmul_nbits_gpu_block128_batched_asymmetric_non_multiple_k() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size) = (6, 173, 5, 128);
     let activations: Vec<f32> = (0..m * k)
         .map(|index| ((index * 7 % 37) as f32 - 11.0) / 13.0)
@@ -1443,9 +1431,7 @@ fn matmul_nbits_gpu_block128_batched_asymmetric_non_multiple_k() {
 )]
 #[test]
 fn matmul_nbits_gpu_accuracy4_block32_decode_matches_quantized_reference() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size) = (1, 77, 19, 32);
     let activations: Vec<f32> = (0..k)
         .map(|index| ((index * 23 % 53) as f32 - 26.0) / 17.0)
@@ -1491,9 +1477,7 @@ fn matmul_nbits_gpu_accuracy4_block32_decode_matches_quantized_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_accuracy4_block128_uses_fp32_activations() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     for &(k, n) in &[(256usize, 37usize), (300, 19), (896, 1152)] {
         let block_size = 128usize;
         let activations: Vec<f32> = (0..k)
@@ -1559,9 +1543,7 @@ fn matmul_nbits_gpu_accuracy4_block128_uses_fp32_activations() {
 )]
 #[test]
 fn matmul_nbits_gpu_accuracy4_offending_decode_shape_stays_within_cpu_vnni_tolerance() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (m, k, n, block_size) = (1usize, 4864usize, 896usize, 32usize);
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size / 2;
@@ -1608,9 +1590,7 @@ fn matmul_nbits_gpu_accuracy4_offending_decode_shape_stays_within_cpu_vnni_toler
 )]
 #[test]
 fn matmul_nbits_gpu_accuracy4_real_decode_widths_match_current_algorithm() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let mut state = 0x2c91_a560_18f4_7b3du64;
     for (k, n) in [
         (4864usize, 896usize),
@@ -1771,9 +1751,7 @@ fn f16_prefill_reference(
 }
 
 fn run_fp16_prefill_parity(bits: usize) {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (77usize, 35usize);
     let blocks = k.div_ceil(32);
     let blob_size = 32 * bits / 8;
@@ -1899,9 +1877,7 @@ fn matmul_nbits_gpu_int4_fp16_prefill_matches_f64_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_int4_fp16_explicit_zero_points_match_cpu_reference() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (77usize, 37usize);
     let blocks = k.div_ceil(32);
     let zp_row_bytes = blocks.div_ceil(2);
@@ -1969,9 +1945,7 @@ fn matmul_nbits_gpu_int8_fp16_prefill_matches_f64_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_int8_fp16_block32_explicit_zero_points_match_reference() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (77usize, 73usize);
     let blocks = k.div_ceil(32);
     let activations: Vec<f16> = (0..k)
@@ -2016,9 +1990,7 @@ fn matmul_nbits_gpu_int8_fp16_block32_explicit_zero_points_match_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_int8_fp16_block32_default_zero_point_matches_reference() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (77usize, 73usize);
     let blocks = k.div_ceil(32);
     let activations: Vec<f16> = (0..k)
@@ -2058,9 +2030,7 @@ fn matmul_nbits_gpu_int8_fp16_block32_default_zero_point_matches_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_fp16_vectorized_block32_matches_reference() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (4096usize, 73usize);
     let blocks = k / 32;
     let activations: Vec<f16> = (0..k)
@@ -2090,9 +2060,7 @@ fn matmul_nbits_gpu_fp16_vectorized_block32_matches_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_fp16_symmetric_splitk_matches_f64_reference() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (896usize, 1152usize);
     let blocks = k / 32;
     let activations: Vec<f16> = (0..k)
@@ -2132,9 +2100,7 @@ fn matmul_nbits_gpu_fp16_symmetric_splitk_matches_f64_reference() {
 )]
 #[test]
 fn matmul_nbits_gpu_fp16_lm_head_width_is_deterministic() {
-    let Some(ep) = gpu() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let (k, n) = (64usize, 151_936usize);
     let blocks = k / 32;
     let activations: Vec<f16> = (0..k)

@@ -22,13 +22,15 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn cuda_ep() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -168,9 +170,7 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32]) {
 )]
 #[test]
 fn standard_simplified_layer_norm_matches_contrib_and_reference() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let shape = [2, 4];
     let input = [1.0, 2.0, 3.0, 4.0, -2.0, 0.0, 2.0, 4.0];
     let scale = [1.0, 2.0, 0.5, 1.5];
@@ -200,9 +200,7 @@ fn standard_simplified_layer_norm_matches_contrib_and_reference() {
 )]
 #[test]
 fn simplified_layer_norm_does_not_contract_square_accumulation() {
-    let Some(ep) = cuda_ep() else {
-        panic!("CUDA test path did not run; this must be reported as a failed GPU test, not a pass")
-    };
+    let ep = require_cuda();
     let input = [-0.09129826, -1.0101787, 3.0318594, 5.774467];
     let scale = [1.0; 4];
     let expected = reference(&input, &scale, 4, 1e-5);
