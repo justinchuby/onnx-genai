@@ -449,11 +449,14 @@ pub(crate) fn make_empty_input_tensor(
         };
         shape.push(value);
     }
-    let bytes = meta
-        .dtype
-        .checked_storage_bytes(shape.iter().product())
+    let numel: usize = shape.iter().product();
+    // Sized rather than built: `from_raw` with a zeroed `Vec` allocates these
+    // bytes twice and memcpys between them, and a hybrid decoder seeds one of
+    // these per recurrent layer per sequence.
+    meta.dtype
+        .checked_storage_bytes(numel)
         .with_context(|| format!("unsupported KV dtype {:?} for '{name}'", meta.dtype))?;
-    Tensor::from_raw(meta.dtype, shape, &vec![0; bytes])
+    Tensor::zeros(meta.dtype, shape)
         .with_context(|| format!("create empty native KV tensor '{name}'"))
 }
 

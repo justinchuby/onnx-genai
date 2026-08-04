@@ -2335,6 +2335,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
+ "onnx-runtime-memory-governor",
  "onnx-runtime-shape-inference",
  "thiserror 2.0.19",
 ]
