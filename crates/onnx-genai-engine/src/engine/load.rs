@@ -1,6 +1,7 @@
 //! `Engine` construction: ORT and native model directory constructors.
 
 use super::*;
+use crate::engine::memory_plan::Holder;
 
 impl Engine {
     /// Load a model from a directory.
@@ -301,12 +302,9 @@ impl Engine {
         // A refusal here is the point: it says the model does not fit while
         // there is still a load to fail, rather than at an allocation somewhere
         // unrelated later.
-        let governed_pool_bytes = native_session
-            .adopt_memory_governor(
-                governor.memory(),
-                onnx_runtime_memory_governor::Tier::Device,
-                crate::engine::memory_plan::Holder::WeightResidency.id(),
-            )
+        let governed_pool_bytes = governor
+            .plan()
+            .adopt_provider_pool(&native_session, Holder::WeightResidency)
             .context(
                 "the native execution provider holds a standing device pool the governor cannot \
                  grant alongside the model's other claims; lower \
@@ -552,31 +550,30 @@ fn load_draft_model(
             config.page_size,
             onnx_genai_kv::KvDType::F32,
         )?;
-        let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
-            let draft_pages = kv_pages_for_budget(
-                governor.snapshot().derived_budget.kv_bytes,
-                governor.snapshot().resolved_limits.host_ram_bytes,
-                config.scheduler.max_total_tokens,
-                kv_model.tensor_config.page_size,
-                kv_model.tensor_config.dtype,
-                &kv_model.layer_configs,
-            );
-            PagedKvCache::new_leased(
+        let draft_kv_cache =
+            if let Some(kv_model) = &draft_kv_model {
+                let draft_pages = kv_pages_for_budget(
+                    governor.snapshot().derived_budget.kv_bytes,
+                    governor.snapshot().resolved_limits.host_ram_bytes,
+                    config.scheduler.max_total_tokens,
+                    kv_model.tensor_config.page_size,
+                    kv_model.tensor_config.dtype,
+                    &kv_model.layer_configs,
+                );
+                governor.plan().kv_pool(
+                Holder::DraftKvPool,
                 kv_model.tensor_config.page_size,
                 kv_model.tensor_config.dtype,
                 kv_model.layer_configs.clone(),
                 draft_pages,
-                governor.memory(),
-                KV_POOL_TIER,
-                crate::engine::memory_plan::Holder::DraftKvPool.id(),
             )
             .context(
                 "cannot allocate the draft model's KV page pool within the device KV budget; a \
                  draft model needs its own pages alongside the target model's",
             )?
-        } else {
-            PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES)
-        };
+            } else {
+                PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES)
+            };
         Some(DraftModel {
             session: Box::new(draft_session),
             decode_path: draft_decode_path,
@@ -592,11 +589,6 @@ fn load_draft_model(
 
 /// The tier a `PagedKvCache` page pool actually lives on.
 ///
-/// `Page` holds `Vec<f32>` — host memory, whatever the pool's `num_gpu_pages`
-/// lineage suggests. Charging it to `Tier::Device` would let the pool exhaust
-/// host RAM while the device ledger still reported headroom, which is the
-/// governor failing at the one thing it exists to do.
-const KV_POOL_TIER: onnx_runtime_memory_governor::Tier = onnx_runtime_memory_governor::Tier::Host;
 
 /// Pages retained by a pool that holds no KV data.
 ///
@@ -681,14 +673,12 @@ fn allocate_kv_cache(
         // Per-layer geometry (heterogeneous head_dim across layers, e.g. the
         // Gemma-4 sliding/full split) is fed from the model's own KV output
         // shapes so mixed-geometry models page correctly.
-        PagedKvCache::new_leased(
+        governor.plan().kv_pool(
+            Holder::KvPool,
             kv_model.tensor_config.page_size,
             kv_model.tensor_config.dtype,
             kv_model.layer_configs.clone(),
             num_pages,
-            governor.memory(),
-            KV_POOL_TIER,
-            crate::engine::memory_plan::Holder::KvPool.id(),
         )
         .with_context(|| {
             format!(

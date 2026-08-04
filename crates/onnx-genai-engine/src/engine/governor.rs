@@ -1,6 +1,7 @@
 //! Device resolution and the engine-owned resource governor.
 
 use super::*;
+use crate::engine::memory_plan::{Holder, ModelMemoryPlan};
 
 #[cfg(feature = "native-backend")]
 pub(crate) fn resolve_native_decode_device(
@@ -103,7 +104,7 @@ pub struct EngineResourceGovernor {
     /// lease rather than subtracted before the ledger sees it.
     ///
     /// Kept for its Drop: unloading the model returns these bytes to the tier.
-    _fixed_device_reservation: Option<onnx_runtime_memory_governor::MemoryLease>,
+    plan: ModelMemoryPlan,
     #[cfg(feature = "native-backend")]
     weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
 }
@@ -177,28 +178,17 @@ impl EngineResourceGovernor {
         // ceiling that may itself be provisional, so it must never be the reason
         // a model refuses to start -- and when it was not applied there is
         // nothing to charge.
-        let fixed_reservation = if snapshot.derived_budget.reservation_applied {
-            snapshot.derived_budget.reserved_bytes
-        } else {
-            0
-        };
-        let fixed_device_reservation = if fixed_reservation > 0 {
-            Some(
-                onnx_runtime_memory_governor::MemoryGovernor::reserve(
-                    &memory,
-                    onnx_runtime_memory_governor::Tier::Device,
-                    fixed_reservation,
-                    onnx_runtime_memory_governor::MemoryRole::Weights,
-                    crate::engine::memory_plan::Holder::FixedDeviceReservation.id(),
-                )
-                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
-                    operation: "charging the fixed device reservation to the memory ledger",
-                    reason: error.to_string(),
-                })?,
+        let mut plan = ModelMemoryPlan::new(memory.clone());
+        if snapshot.derived_budget.reservation_applied {
+            plan.reserve(
+                Holder::FixedDeviceReservation,
+                snapshot.derived_budget.reserved_bytes,
             )
-        } else {
-            None
-        };
+            .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                operation: "charging the fixed device reservation to the memory ledger",
+                reason: error.to_string(),
+            })?;
+        }
         #[cfg(feature = "native-backend")]
         let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new(
             inner.snapshot().resolved_limits.host_ram_bytes,
@@ -211,7 +201,7 @@ impl EngineResourceGovernor {
             inner,
             allow_runtime_override,
             memory,
-            _fixed_device_reservation: fixed_device_reservation,
+            plan,
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
         })
@@ -222,6 +212,28 @@ impl EngineResourceGovernor {
     /// Separate from [`Self::snapshot`], which only *reports*. Anything that
     /// holds bytes takes a lease here so the tier totals reflect what is
     /// actually occupied rather than what was planned.
+    /// Every claim this model makes, in one place.
+    pub(crate) fn plan(&self) -> &ModelMemoryPlan {
+        &self.plan
+    }
+
+    /// What this model actually holds, per holder, as leases rather than as the
+    /// estimate `GovernorSnapshot::breakdown` reports.
+    ///
+    /// The two answer different questions and it is worth being able to compare
+    /// them: `breakdown` is what the ceiling was divided up *expecting*, this is
+    /// what was *granted*. A gap between them is the interesting case -- either
+    /// something holds memory the plan did not predict, or the plan predicted
+    /// memory nothing took.
+    pub fn leased_breakdown(&self) -> Vec<(&'static str, onnx_runtime_memory_governor::Tier, u64)> {
+        self.plan.breakdown()
+    }
+
+    /// Bytes leased on `tier`, across every holder this model has.
+    pub fn leased_bytes_on(&self, tier: onnx_runtime_memory_governor::Tier) -> u64 {
+        self.plan.bytes_on(tier)
+    }
+
     pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {
         &self.memory
     }

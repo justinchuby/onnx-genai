@@ -39,6 +39,16 @@ use onnx_runtime_memory_governor::{HolderId, MemoryError, MemoryGovernor, Memory
 /// An enum rather than scattered constants: the previous arrangement was three
 /// `HolderId::new(N)` definitions in two files, unique by inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "RecurrentState and Activations name claims that are not charged yet -- \
+                  see #639 and #514. They are defined here rather than added later so the \
+                  identity space is decided in one place, which is the whole reason this \
+                  enum replaced three hand-picked constants."
+    )
+)]
 pub(crate) enum Holder {
     /// The target model's KV page pool.
     KvPool,
@@ -106,6 +116,25 @@ impl Holder {
             Holder::FixedDeviceReservation => "fixed device reservation",
         }
     }
+
+    /// Which tier this holder's bytes come from.
+    ///
+    /// A property of the holder, not a choice at the call site. Every caller
+    /// used to pass it, which meant every caller could pass the wrong one --
+    /// and the KV pools genuinely are `Host` while the rest are `Device`, so it
+    /// is the kind of thing that gets copied from the wrong neighbour.
+    pub(crate) const fn tier(self) -> Tier {
+        match self {
+            // The pool is host-allocated despite its `num_gpu_pages` lineage.
+            // Charging it to `Device` would let it exhaust host RAM while the
+            // device ledger still reported headroom.
+            Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
+            Holder::WeightResidency
+            | Holder::RecurrentState
+            | Holder::Activations
+            | Holder::FixedDeviceReservation => Tier::Device,
+        }
+    }
 }
 
 /// The leases a loaded model holds, beyond the KV pool.
@@ -113,22 +142,31 @@ impl Holder {
 /// The KV pool's lease lives inside `PagedKvCache`, which takes it at
 /// construction so the pool cannot exist without it. Everything else is held
 /// here.
-#[derive(Debug, Default)]
+///
+/// Owns the governor handle so a call site says what it wants and how much,
+/// and nothing else. The alternative -- every caller passing
+/// `(governor, tier, holder)` -- is three chances to pass the wrong thing at
+/// every site, and the tier in particular is not a choice: it belongs to the
+/// holder.
+#[derive(Debug)]
 pub(crate) struct ModelMemoryPlan {
+    governor: onnx_runtime_memory_governor::LedgerGovernor,
     entries: Vec<PlanEntry>,
 }
 
 #[derive(Debug)]
 struct PlanEntry {
     holder: Holder,
-    tier: Tier,
     lease: onnx_runtime_memory_governor::MemoryLease,
 }
 
 impl ModelMemoryPlan {
-    /// Nothing reserved yet.
-    pub(crate) fn new() -> Self {
-        Self::default()
+    /// A plan that leases from `governor`.
+    pub(crate) fn new(governor: onnx_runtime_memory_governor::LedgerGovernor) -> Self {
+        Self {
+            governor,
+            entries: Vec::new(),
+        }
     }
 
     /// Reserve `bytes` for `holder`, or fail saying what could not be granted.
@@ -136,40 +174,79 @@ impl ModelMemoryPlan {
     /// Zero is not an error and takes no lease: a model with no recurrent
     /// layers asks for no recurrent state, and that is a fact about the model
     /// rather than a failure.
-    pub(crate) fn reserve(
-        &mut self,
-        governor: &dyn MemoryGovernor,
-        holder: Holder,
-        tier: Tier,
-        bytes: u64,
-    ) -> Result<u64, MemoryError> {
+    pub(crate) fn reserve(&mut self, holder: Holder, bytes: u64) -> Result<u64, MemoryError> {
         if bytes == 0 {
             return Ok(0);
         }
-        let lease = governor.reserve(tier, bytes, holder.role(), holder.id())?;
+        let lease = self
+            .governor
+            .reserve(holder.tier(), bytes, holder.role(), holder.id())?;
         let granted = lease.bytes();
-        self.entries.push(PlanEntry {
-            holder,
-            tier,
-            lease,
-        });
+        self.entries.push(PlanEntry { holder, lease });
         Ok(granted)
+    }
+
+    #[cfg(feature = "native-backend")]
+    /// Put a provider's standing pool on this plan's governor.
+    ///
+    /// A provider built before the governor existed sized its pool for itself.
+    /// This is where that becomes a claim the rest of the plan can see. The
+    /// provider keeps the lease, because it is the thing that must outlive it.
+    pub(crate) fn adopt_provider_pool(
+        &self,
+        session: &crate::native_decode::NativeDecodeSession,
+        holder: Holder,
+    ) -> anyhow::Result<u64> {
+        session.adopt_memory_governor(&self.governor, holder.tier(), holder.id())
     }
 
     /// Bytes held on `tier`, across every holder.
     pub(crate) fn bytes_on(&self, tier: Tier) -> u64 {
         self.entries
             .iter()
-            .filter(|entry| entry.tier == tier)
+            .filter(|entry| entry.holder.tier() == tier)
             .map(|entry| entry.lease.bytes())
             .sum()
+    }
+
+    /// Build a KV page pool that leases from this plan's governor.
+    ///
+    /// The pool holds its own lease -- `PagedKvCache` takes one at construction
+    /// so it cannot exist without one -- which is why this hands the governor
+    /// over rather than reserving here. What it does own is the
+    /// `(governor, tier, holder)` triple, so a call site says what pool it wants
+    /// and how big, and cannot pass the device tier for a pool that is
+    /// host-allocated.
+    pub(crate) fn kv_pool(
+        &self,
+        holder: Holder,
+        page_size: usize,
+        dtype: onnx_genai_kv::KvDType,
+        layer_configs: Vec<onnx_genai_kv::LayerTensorConfig>,
+        pages: usize,
+    ) -> Result<onnx_genai_kv::PagedKvCache, onnx_genai_kv::KvError> {
+        onnx_genai_kv::PagedKvCache::new_leased(
+            page_size,
+            dtype,
+            layer_configs,
+            pages,
+            &self.governor,
+            holder.tier(),
+            holder.id(),
+        )
     }
 
     /// What is held, for diagnostics and for the profile report.
     pub(crate) fn breakdown(&self) -> Vec<(&'static str, Tier, u64)> {
         self.entries
             .iter()
-            .map(|entry| (entry.holder.name(), entry.tier, entry.lease.bytes()))
+            .map(|entry| {
+                (
+                    entry.holder.name(),
+                    entry.holder.tier(),
+                    entry.lease.bytes(),
+                )
+            })
             .collect()
     }
 }
@@ -220,12 +297,12 @@ mod tests {
     #[test]
     fn two_holders_cannot_both_be_granted_more_than_the_tier_has() {
         let governor = governor(1000);
-        let mut plan = ModelMemoryPlan::new();
+        let mut plan = ModelMemoryPlan::new(governor.clone());
 
-        plan.reserve(&governor, Holder::WeightResidency, Tier::Device, 700)
+        plan.reserve(Holder::WeightResidency, 700)
             .expect("the first claim fits");
         let refused = plan
-            .reserve(&governor, Holder::RecurrentState, Tier::Device, 700)
+            .reserve(Holder::RecurrentState, 700)
             .expect_err("700 more does not fit in what is left of 1000");
 
         assert!(
@@ -240,9 +317,9 @@ mod tests {
     #[test]
     fn a_zero_byte_claim_takes_no_lease() {
         let governor = governor(1000);
-        let mut plan = ModelMemoryPlan::new();
+        let mut plan = ModelMemoryPlan::new(governor.clone());
         assert_eq!(
-            plan.reserve(&governor, Holder::RecurrentState, Tier::Device, 0)
+            plan.reserve(Holder::RecurrentState, 0)
                 .expect("zero is not a failure"),
             0
         );
@@ -255,9 +332,8 @@ mod tests {
     fn releasing_the_plan_returns_the_bytes_to_the_tier() {
         let governor = governor(1000);
         {
-            let mut plan = ModelMemoryPlan::new();
-            plan.reserve(&governor, Holder::WeightResidency, Tier::Device, 800)
-                .expect("fits");
+            let mut plan = ModelMemoryPlan::new(governor.clone());
+            plan.reserve(Holder::WeightResidency, 800).expect("fits");
             assert_eq!(governor.available(Tier::Device), 200);
         }
         assert_eq!(
@@ -284,14 +360,9 @@ mod tests {
         let reservation = 300;
         let governor = governor(ceiling);
 
-        let mut plan = ModelMemoryPlan::new();
-        plan.reserve(
-            &governor,
-            Holder::FixedDeviceReservation,
-            Tier::Device,
-            reservation,
-        )
-        .expect("the reservation fits its own ceiling");
+        let mut plan = ModelMemoryPlan::new(governor.clone());
+        plan.reserve(Holder::FixedDeviceReservation, reservation)
+            .expect("the reservation fits its own ceiling");
 
         assert_eq!(
             governor.available(Tier::Device),
@@ -299,16 +370,37 @@ mod tests {
             "what is left must be the ceiling less the reservation"
         );
 
-        // A KV pool and a weight-residency pool now compete for the same
-        // remainder, which is the entire point.
-        plan.reserve(&governor, Holder::KvPool, Tier::Device, 500)
+        // A weight-residency pool and a recurrent-state reservation now compete
+        // for the same remainder, which is the entire point. Both are device
+        // holders; `Holder::KvPool` is deliberately not used here because its
+        // tier is Host -- the pool is host-allocated despite its `num_gpu_pages`
+        // lineage, and the holder now carries that rather than each call site.
+        plan.reserve(Holder::WeightResidency, 500)
             .expect("500 of the remaining 700 fits");
         let refused = plan
-            .reserve(&governor, Holder::WeightResidency, Tier::Device, 500)
+            .reserve(Holder::RecurrentState, 500)
             .expect_err("only 200 is left");
         assert!(matches!(refused, MemoryError::TierExhausted { .. }));
 
         assert_eq!(plan.bytes_on(Tier::Device), reservation + 500);
+    }
+
+    /// A holder's tier is a property of the holder, not a call-site argument.
+    ///
+    /// The KV pools are `Host` -- the pool is host-allocated despite its
+    /// `num_gpu_pages` lineage, and charging it to `Device` would let it exhaust
+    /// host RAM while the device ledger still reported headroom. Every caller
+    /// used to pass the tier, which is one chance per site to copy the wrong one
+    /// from a neighbour.
+    #[test]
+    fn a_holders_tier_comes_from_the_holder() {
+        assert_eq!(Holder::KvPool.tier(), Tier::Host);
+        assert_eq!(Holder::PipelineKvPool.tier(), Tier::Host);
+        assert_eq!(Holder::DraftKvPool.tier(), Tier::Host);
+        assert_eq!(Holder::WeightResidency.tier(), Tier::Device);
+        assert_eq!(Holder::RecurrentState.tier(), Tier::Device);
+        assert_eq!(Holder::Activations.tier(), Tier::Device);
+        assert_eq!(Holder::FixedDeviceReservation.tier(), Tier::Device);
     }
 
     /// A reservation that was not applied is not charged.
@@ -320,8 +412,8 @@ mod tests {
     #[test]
     fn a_reservation_that_was_not_applied_is_not_charged() {
         let governor = governor(1000);
-        let mut plan = ModelMemoryPlan::new();
-        plan.reserve(&governor, Holder::FixedDeviceReservation, Tier::Device, 0)
+        let mut plan = ModelMemoryPlan::new(governor.clone());
+        plan.reserve(Holder::FixedDeviceReservation, 0)
             .expect("nothing to charge is not a failure");
         assert_eq!(governor.available(Tier::Device), 1000);
     }

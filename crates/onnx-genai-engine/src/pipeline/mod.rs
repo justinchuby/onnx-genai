@@ -14,10 +14,6 @@ use crate::kv_bridge::{
 };
 use crate::logits::TokenId;
 
-/// Identifies the pipeline's KV page pool to the memory governor, distinct from
-/// the engine's own pool so pressure can be directed at the right holder.
-const PIPELINE_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(2);
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
     RetainedContext, absorb_value, digest_named_values, graph_is_deterministic, prefix_key,
@@ -743,50 +739,49 @@ impl PipelineEngine {
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
         let mut paged: Option<PipelinePagedKv> = None;
-        let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
-            PipelinePlan::Autoregressive(ar) => {
-                let decoder = models
-                    .graph_io(&ar.decoder)
-                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-                let decoder_io = models
-                    .directory
-                    .spec
-                    .models
-                    .get(&ar.decoder)
-                    .and_then(|component| component.io.as_ref());
-                let kv_model = infer_kv_model_info(
-                    decoder,
-                    decoder_io,
-                    config.page_size,
-                    config.kv_cache_dtype,
-                )?;
-                let component_governor = component_governor(&config, kv_model.as_ref())?;
-                let fixed_state_budget_bytes =
-                    component_governor.snapshot().resolved_limits.host_ram_bytes;
-                let pipeline_pages = match kv_model.as_ref() {
-                    Some(kv_model) => crate::engine::kv_pages_for_budget(
-                        component_governor.snapshot().derived_budget.kv_bytes,
-                        component_governor.snapshot().resolved_limits.host_ram_bytes,
-                        config.scheduler.max_total_tokens,
-                        kv_model.tensor_config.page_size,
-                        kv_model.tensor_config.dtype,
-                        &kv_model.layer_configs,
-                    ),
-                    None => 0,
-                };
-                // A zero page size makes `div_ceil` panic and the page-boundary
-                // walk below produce zeros forever, so it is refused rather than
-                // carried into arithmetic that assumes it is positive.
-                paged = match kv_model.filter(|kv_model| kv_model.tensor_config.page_size > 0) {
+        let (decoder_state, tokenizer_component, fixed_state_budget_bytes) =
+            match &plan {
+                PipelinePlan::Autoregressive(ar) => {
+                    let decoder = models.graph_io(&ar.decoder).with_context(|| {
+                        format!("pipeline decoder '{}' was not loaded", ar.decoder)
+                    })?;
+                    let decoder_io = models
+                        .directory
+                        .spec
+                        .models
+                        .get(&ar.decoder)
+                        .and_then(|component| component.io.as_ref());
+                    let kv_model = infer_kv_model_info(
+                        decoder,
+                        decoder_io,
+                        config.page_size,
+                        config.kv_cache_dtype,
+                    )?;
+                    let component_governor = component_governor(&config, kv_model.as_ref())?;
+                    let fixed_state_budget_bytes =
+                        component_governor.snapshot().resolved_limits.host_ram_bytes;
+                    let pipeline_pages = match kv_model.as_ref() {
+                        Some(kv_model) => crate::engine::kv_pages_for_budget(
+                            component_governor.snapshot().derived_budget.kv_bytes,
+                            component_governor.snapshot().resolved_limits.host_ram_bytes,
+                            config.scheduler.max_total_tokens,
+                            kv_model.tensor_config.page_size,
+                            kv_model.tensor_config.dtype,
+                            &kv_model.layer_configs,
+                        ),
+                        None => 0,
+                    };
+                    // A zero page size makes `div_ceil` panic and the page-boundary
+                    // walk below produce zeros forever, so it is refused rather than
+                    // carried into arithmetic that assumes it is positive.
+                    paged = match kv_model.filter(|kv_model| kv_model.tensor_config.page_size > 0) {
                     Some(kv_model) => Some(PipelinePagedKv {
-                        cache: PagedKvCache::new_leased(
+                        cache: component_governor.plan().kv_pool(
+                            crate::engine::memory_plan::Holder::PipelineKvPool,
                             kv_model.tensor_config.page_size,
                             kv_model.tensor_config.dtype,
                             kv_model.layer_configs.clone(),
                             pipeline_pages,
-                            component_governor.memory(),
-                            onnx_runtime_memory_governor::Tier::Device,
-                            PIPELINE_KV_POOL_HOLDER,
                         )
                         .with_context(|| {
                             format!(
@@ -801,45 +796,45 @@ impl PipelineEngine {
                     }),
                     None => None,
                 };
-                let decoder_io = models
-                    .directory
-                    .spec
-                    .models
-                    .get(&ar.decoder)
-                    .and_then(|component| component.io.as_ref());
-                let positions = models.directory.spec.positions.as_ref();
-                (
-                    Some(DecodeState::new_with_io_positions_and_state_budget(
-                        decoder,
-                        decoder_io,
-                        positions,
+                    let decoder_io = models
+                        .directory
+                        .spec
+                        .models
+                        .get(&ar.decoder)
+                        .and_then(|component| component.io.as_ref());
+                    let positions = models.directory.spec.positions.as_ref();
+                    (
+                        Some(DecodeState::new_with_io_positions_and_state_budget(
+                            decoder,
+                            decoder_io,
+                            positions,
+                            fixed_state_budget_bytes,
+                        )?),
+                        ar.decoder.clone(),
                         fixed_state_budget_bytes,
-                    )?),
-                    ar.decoder.clone(),
-                    fixed_state_budget_bytes,
-                )
-            }
-            // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
-            // decode loops with per-loop `DecodeState`s built inside the driver,
-            // so no shared decode state is created here. The tokenizer component
-            // is the outer decoder (talker).
-            PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone(), 0),
-            PipelinePlan::SinglePass(sp) => (None, sp.model.clone(), 0),
-            PipelinePlan::Iterative(it) => (None, it.denoiser.clone(), 0),
-            // A pure composite produces tensors (run_pipeline), not text; it has
-            // no autoregressive decode state. Use the last stage's model as the
-            // nominal tokenizer component (unused unless a tokenizer is queried).
-            PipelinePlan::Composite(c) => (
-                None,
-                c.stages
-                    .last()
-                    .map(|stage| match &stage.kind {
-                        CompositeStageKind::SinglePass { model } => model.clone(),
-                    })
-                    .unwrap_or_default(),
-                0,
-            ),
-        };
+                    )
+                }
+                // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
+                // decode loops with per-loop `DecodeState`s built inside the driver,
+                // so no shared decode state is created here. The tokenizer component
+                // is the outer decoder (talker).
+                PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone(), 0),
+                PipelinePlan::SinglePass(sp) => (None, sp.model.clone(), 0),
+                PipelinePlan::Iterative(it) => (None, it.denoiser.clone(), 0),
+                // A pure composite produces tensors (run_pipeline), not text; it has
+                // no autoregressive decode state. Use the last stage's model as the
+                // nominal tokenizer component (unused unless a tokenizer is queried).
+                PipelinePlan::Composite(c) => (
+                    None,
+                    c.stages
+                        .last()
+                        .map(|stage| match &stage.kind {
+                            CompositeStageKind::SinglePass { model } => model.clone(),
+                        })
+                        .unwrap_or_default(),
+                    0,
+                ),
+            };
         Ok(Self {
             models,
             plan,
