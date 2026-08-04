@@ -33,14 +33,16 @@ ONNX reference evaluator, invokes the Rust bridge, and classifies each case:
 
 Spox adds output-only `Identity` wrappers to generated graphs. The driver
 removes those wrappers before execution so an unimplemented `Identity` does not
-hide the target operator's result. Eighteen CPU-op cases and the `Abs` and
-`Sigmoid` negative cases come directly from `onnx-tests`. Focused ONNX models
-cover seven CPU registrations not suitable for this first generator slice:
+hide the target operator's result. The property-generated cases, including
+`Abs` and `Sigmoid`, come directly from `onnx-tests`. Focused ONNX models
+cover CPU registrations not suitable for this first generator slice:
 `LayerNormalization`, `Shape`, `Constant`, and `Gemm` have no corresponding
 suite generator; `ReduceMean` and `Unsqueeze` currently exercise nxrt's legacy
 attribute-form kernels; and the upstream `Gather` strategy can raise while
 constructing an empty-axis case before the driver's non-empty predicate applies.
-`Conv` is the third focused negative case.
+`Conv` is a focused passing case. A synthetic focused `Celu` model is expected to
+remain `UNSUPPORTED` so the unsupported-op classification is exercised without
+allowing any current passing operator to regress silently.
 
 ## Run
 
@@ -58,41 +60,41 @@ python3 conformance/run_onnx_tests.py \
 
 Scratch models and tensor files are written under ignored `target/ep-conformance`.
 Use `--json PATH` only when a disposable machine-readable report is wanted.
-The driver exits non-zero for any `MISMATCH`/`ERROR`, or when a required CPU-op
-baseline case is no longer `PASS`; `.github/workflows/ci.yml` runs this gate in
-the `EP conformance (Linux x86_64)` job.
+The driver exits non-zero when any operator's exact expected status changes:
+the 28 current baseline cases must stay `PASS`, and only the synthetic `Celu`
+case is expected to stay `UNSUPPORTED`. `.github/workflows/ci.yml` runs this
+gate in the `EP conformance (Linux x86_64)` job.
 
 ## Results
 
-Run on 2026-07-14 against `cbourjau/onnx-tests` commit `856e89b`, with nxrt
-branch `squad/nxrt-ep-conformance`.
+Current CI baseline against `cbourjau/onnx-tests` commit `856e89b`.
 
 | Result | Cases |
 |---|---:|
-| PASS | 25 |
-| UNSUPPORTED | 3 |
+| PASS | 28 |
+| UNSUPPORTED | 1 |
 | MISMATCH | 0 |
 | ERROR | 0 |
-| **Total** | **28** |
+| **Total** | **29** |
 
 | Status | Operators |
 |---|---|
-| PASS | MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNormalization, Sub, Mul, Div, Pow, Min, Max, Sqrt, Erf, Tanh, Cast, ReduceMean, Softmax, Shape, Unsqueeze, Expand, Slice, Constant, Gemm |
-| UNSUPPORTED | Abs, Conv, Sigmoid |
+| PASS | MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNormalization, Sub, Mul, Div, Pow, Min, Max, Sqrt, Erf, Tanh, Cast, ReduceMean, Softmax, Shape, Unsqueeze, Expand, Slice, Constant, Gemm, Abs, Conv, Sigmoid |
+| UNSUPPORTED | SyntheticUnsupportedCelu (`Celu`) |
 | MISMATCH | None |
 | ERROR | None |
 
 Each operator has one baseline case. This proves the end-to-end harness,
 enumerates every default-domain op in `PHASE1_OPS`, and proves unsupported
-classification; it does not yet cover all dtypes, shapes, attributes, opsets,
-optional inputs, or contrib-domain fused kernels.
+classification with a synthetic `Celu` case; it does not yet cover all dtypes,
+shapes, attributes, opsets, optional inputs, or contrib-domain fused kernels.
 
 ## Diagnostic finding
 
 The runner preserves the current nxrt diagnostic:
 
 ```text
-op type not supported by any available EP: Abs
+op type not supported by any available EP: Celu
 ```
 
 and adds that the selected EP has no registered kernel. The underlying session

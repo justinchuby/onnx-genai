@@ -43,8 +43,12 @@ CPU_OPS = [
     "Constant",
     "Gemm",
 ]
-UNSUPPORTED_OPS = ["Abs", "Conv", "Sigmoid"]
-FAIL_STATUSES = {"MISMATCH", "ERROR"}
+ADDITIONAL_PASS_OPS = ["Abs", "Conv", "Sigmoid"]
+SYNTHETIC_UNSUPPORTED_OP = "SyntheticUnsupportedCelu"
+EXPECTED_STATUS = {
+    **{op: "PASS" for op in CPU_OPS + ADDITIONAL_PASS_OPS},
+    SYNTHETIC_UNSUPPORTED_OP: "UNSUPPORTED",
+}
 
 
 @dataclass
@@ -55,21 +59,33 @@ class Result:
     detail: str
 
 
-def conformance_failures(results: list[Result]) -> list[str]:
-    expected_unsupported = set(UNSUPPORTED_OPS)
+def conformance_failures(
+    results: list[Result], expected_status: dict[str, str] | None = None
+) -> list[str]:
+    if expected_status is None:
+        expected_status = EXPECTED_STATUS
+    by_op = {result.op: result for result in results}
     failures = []
-    for result in results:
-        if result.status in FAIL_STATUSES:
-            failures.append(f"{result.op}: {result.status} ({result.detail})")
-        elif result.op not in expected_unsupported and result.status != "PASS":
+    for op, expected in expected_status.items():
+        result = by_op.get(op)
+        if result is None:
+            failures.append(f"{op}: missing result; expected {expected}")
+        elif result.status != expected:
             failures.append(
-                f"{result.op}: expected PASS, got {result.status} ({result.detail})"
+                f"{op}: expected {expected}, got {result.status} ({result.detail})"
+            )
+    for result in results:
+        if result.op not in expected_status:
+            failures.append(
+                f"{result.op}: unexpected result {result.status} ({result.detail})"
             )
     return failures
 
 
-def exit_code_for_results(results: list[Result]) -> int:
-    return 1 if conformance_failures(results) else 0
+def exit_code_for_results(
+    results: list[Result], expected_status: dict[str, str] | None = None
+) -> int:
+    return 1 if conformance_failures(results, expected_status) else 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,6 +156,7 @@ def generated_cases(onnx_tests: Path) -> dict[str, Callable[[], onnx.ModelProto]
         "Abs": lambda: draw(elementwise_ops.abs(f32, op17)),
         "Conv": lambda: manual_model("Conv"),
         "Sigmoid": lambda: draw(elementwise_ops.sigmoid(f32, op17)),
+        SYNTHETIC_UNSUPPORTED_OP: lambda: manual_model(SYNTHETIC_UNSUPPORTED_OP),
     }
 
 
@@ -202,6 +219,7 @@ def manual_model(op: str) -> onnx.ModelProto:
         "ReduceMean": np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
         "Unsqueeze": np.array([[1.0, 2.0]], dtype=np.float32),
         "Conv": np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3),
+        SYNTHETIC_UNSUPPORTED_OP: np.array([0.25, -0.5], dtype=np.float32),
     }
     if op == "Constant":
         node = helper.make_node(
@@ -286,6 +304,16 @@ def manual_model(op: str) -> onnx.ModelProto:
             [],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1, 2, 2])],
             [x, w],
+        )
+    elif op == SYNTHETIC_UNSUPPORTED_OP:
+        x = numpy_helper.from_array(values[op], "X")
+        node = helper.make_node("Celu", ["X"], ["Y"])
+        graph = helper.make_graph(
+            [node],
+            op,
+            [],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2])],
+            [x],
         )
     else:
         raise KeyError(op)
@@ -377,8 +405,12 @@ def main() -> int:
     generators = generated_cases(args.onnx_tests)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for op in CPU_OPS + UNSUPPORTED_OPS:
-        source = "onnx-tests" if op in generators and op != "Conv" else "focused ONNX"
+    for op in EXPECTED_STATUS:
+        source = (
+            "onnx-tests"
+            if op in generators and op not in {"Conv", SYNTHETIC_UNSUPPORTED_OP}
+            else "focused ONNX"
+        )
         try:
             model = generators[op]() if op in generators else manual_model(op)
             result = run_case(op, source, model, args.runner, args.work_dir)
@@ -398,6 +430,7 @@ def main() -> int:
                 {
                     "counts": counts,
                     "failures": conformance_failures(results),
+                    "expected_status": EXPECTED_STATUS,
                     "results": [vars(result) for result in results],
                 },
                 indent=2,
@@ -409,7 +442,7 @@ def main() -> int:
         print("CONFORMANCE FAILURES:")
         for failure in failures:
             print(f"  {failure}")
-    return 1 if failures else 0
+    return exit_code_for_results(results)
 
 
 if __name__ == "__main__":
