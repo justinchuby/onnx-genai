@@ -4,6 +4,7 @@ use common::{FloatDType, Tensor, float_values, make_kernel};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
+use onnx_runtime_ep_cpu::kernels::block_dequant::{decode_e2m1, decode_e8m0_scale};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -245,6 +246,26 @@ fn packed_mxfp4_experts(experts: usize, out_features: usize, in_features: usize)
     packed_mxfp4(experts * out_features, in_features)
 }
 
+fn dequantize_mxfp4_kn(n: usize, k: usize, packed: &[u8]) -> Vec<f32> {
+    const QK: usize = 32;
+    const BLOCK_BYTES: usize = 17;
+    let blocks = k.div_ceil(QK);
+    assert_eq!(packed.len(), n * blocks * BLOCK_BYTES);
+    let mut dense = vec![0.0f32; k * n];
+    for output in 0..n {
+        for block in 0..blocks {
+            let packed_block = &packed[(output * blocks + block) * BLOCK_BYTES..][..BLOCK_BYTES];
+            let scale = decode_e8m0_scale(packed_block[0]);
+            for offset in 0..QK.min(k - block * QK) {
+                let byte = packed_block[1 + offset % 16];
+                let code = if offset < 16 { byte } else { byte >> 4 };
+                dense[(block * QK + offset) * n + output] = decode_e2m1(code) * scale;
+            }
+        }
+    }
+    dense
+}
+
 fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
     let mut group = c.benchmark_group("block_quantized_matmul_cached_dense");
     group.sample_size(15);
@@ -255,6 +276,8 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
     let b = Tensor::u8(&[n, blocks, 17], &packed);
     group.throughput(Throughput::Elements((m * n) as u64));
 
+    // Forced-cold payload path: setup is outside Criterion, but every measured
+    // iteration treats packed_B as nonconstant and re-expands it.
     let mut uncached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
     let uncached_kernel = block_quantized_matmul_kernel(k, n);
     group.bench_function(
@@ -271,9 +294,42 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
         },
     );
 
+    // Proxy for the pre-patch OnceLock steady state: the packed weight is
+    // expanded before timing, the dense MatMul kernel is prewarmed, and measured
+    // iterations perform no quantized cache lookup/hash/copy/dequantization.
+    let dense_b_values = dequantize_mxfp4_kn(n, k, &packed);
+    let dense_b = Tensor::floats(FloatDType::F32, &[k, n], &dense_b_values);
+    let mut once_like_output = Tensor::zeros(FloatDType::F32, &[m, n]);
+    let mut once_like_kernel = make_kernel("MatMul", [], &[vec![m, k], vec![k, n]], 13);
+    once_like_kernel.set_constant_inputs(&[false, true]);
+    once_like_kernel
+        .execute(
+            &[a.view(), dense_b.view()],
+            &mut [once_like_output.view_mut()],
+        )
+        .expect("prewarm pre-expanded dense MatMul baseline");
+    group.bench_function(
+        BenchmarkId::new(
+            "mxfp4_preexpanded_dense_oncelock_like_proxy",
+            format!("{m}x{k}x{n}"),
+        ),
+        |bencher| {
+            bencher.iter(|| {
+                once_like_kernel
+                    .execute(
+                        black_box(&[a.view(), dense_b.view()]),
+                        black_box(&mut [once_like_output.view_mut()]),
+                    )
+                    .unwrap()
+            });
+        },
+    );
+
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
     let mut cached_kernel = block_quantized_matmul_kernel(k, n);
     cached_kernel.set_constant_inputs(&[false, true]);
+    // Warm boundary: the first hash/dequant/cache insertion completes before
+    // Criterion starts; every measured iteration is a stable-identity LRU hit.
     cached_kernel
         .execute(&[a.view(), b.view()], &mut [cached_output.view_mut()])
         .expect("prewarm cached dense weight");
@@ -329,6 +385,7 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
     let fc2 = Tensor::u8(&[experts, hidden, inter_blocks, 17], &fc2_values);
     group.throughput(Throughput::Elements((rows * hidden) as u64));
 
+    // Every measured iteration re-expands the routed expert projections.
     let mut uncached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
     let uncached_kernel = block_quantized_moe_kernel(top_k);
     group.bench_function(
@@ -357,6 +414,7 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
     let mut cached_kernel = block_quantized_moe_kernel(top_k);
     cached_kernel.set_constant_inputs(&[false, false, true, false, true]);
+    // Prewarm the routed expert before Criterion; measured calls are cache hits.
     cached_kernel
         .execute(
             &[

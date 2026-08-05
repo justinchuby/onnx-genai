@@ -169,7 +169,7 @@ platform = "all"
 minimum_tier = "tier3"
 counter = "BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs"
-description = "CPU BlockQuantizedMoE uses the shared bounded LRU cache for routed constant expert projections after the first dense f32 expansion; this is cached-dense reuse, not direct quantized-domain expert compute"
+description = "CPU BlockQuantizedMoE uses a kernel-local bounded LRU cache for routed constant expert projections after the first dense f32 expansion; this is cached-dense reuse, not direct quantized-domain expert compute"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MaxPool — aarch64-apple-darwin (#324)

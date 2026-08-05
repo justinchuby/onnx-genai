@@ -261,6 +261,16 @@ IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M are implemented
 using the pinned llama.cpp layouts and dequantization math
 [L1][L2][L3][L4][L5][L6][L7][L8][L9][L13].
 
+The cache budget is **per compiled kernel instance**, not per session, model, or
+process. Each `(session, node, resolved input shapes)` kernel owns an independent
+LRU with that ceiling. Consequently, a model containing many block-quantized
+projections can retain close to the aggregate size of all of their f32 dense
+expansions (or up to the per-kernel limit for each active kernel); the default
+does **not** impose a model-wide 256 MiB cap. Accounting covers resident dense
+f32 payload bytes, not key/`Arc` metadata, and an in-flight `Arc` remains alive
+after eviction until the current compute finishes, so short-lived aggregate
+memory can be higher. Set the environment variable to `0` to disable retention.
+
 For MXFP4 interoperability, also support a lowering between this GGUF-native
 layout and ORT's current `QMoE(quant_type="fp4")` representation, which uses
 packed E2M1 weights, separate float8e8m0 block-scale tensors, and per-expert
