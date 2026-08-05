@@ -155,6 +155,25 @@ A component does not "allocate". It **leases**: it asks a `MemoryGovernor` for
 bytes on a tier for a stated role, and holds a `MemoryLease` for as long as it
 occupies them. Dropping the lease returns them.
 
+**The ledger accounts for reservations, not allocations.** This is a deliberate
+boundary rather than an unfinished edge, so it belongs here before anyone goes
+looking for a bug that is not there: `used(Device)` will read lower than
+`nvidia-smi`, and that is correct.
+
+What is charged is a *standing claim* — something taken once and held: the
+fixed weight and overhead reservation, weight residency, KV page pools, the
+native decode path's KV tensors, recurrent state. What is not charged is
+per-inference transients: workspaces, scratch buffers, an execution provider's
+internals. Those appear and disappear inside one kernel, they are bounded by the
+activation budget, and counting them exactly would put a governor round-trip on
+every `Alloc` an execution provider makes — including ONNX Runtime's, which
+allocates far more often than "once per tensor" suggests.
+
+The rule that follows: **charge a claim at the point it becomes standing, never
+per allocation.** Implementing `DeviceAllocator` therefore does *not* make an
+allocator governed; that trait is about how you obtain device memory, not about
+who is charged for it.
+
 ```rust
 trait MemoryGovernor {
     fn reserve(&self, tier: Tier, bytes: u64, role: MemoryRole, holder: HolderId)

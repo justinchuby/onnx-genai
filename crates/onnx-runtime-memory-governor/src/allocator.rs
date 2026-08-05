@@ -96,6 +96,22 @@ impl DeviceKey {
 ///   though they happened in some sequential order — an implementation whose
 ///   locking lets two callers be handed the same region would let one session
 ///   overwrite another's tensors, silently and only under load.
+///
+/// # This trait does not make memory governed
+///
+/// It lives in the memory-governor crate, so implementing it reads as "this
+/// allocator's memory is on the ledger". It is not. This trait is about *how
+/// you obtain* device memory; [`MemoryGovernor`] is about *who is charged* for
+/// it, and an implementation of one says nothing about the other.
+///
+/// That is deliberate. The ledger accounts for standing claims, taken once and
+/// held, and charging every `allocate` would put a governor round-trip on a
+/// path an execution provider walks constantly. A component with a standing
+/// claim should hold a [`MemoryLease`] alongside its allocator rather than
+/// expect the allocator to account for it.
+///
+/// [`MemoryGovernor`]: crate::MemoryGovernor
+/// [`MemoryLease`]: crate::MemoryLease
 pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
