@@ -64,9 +64,24 @@ use cudarc::driver::CudaContext;
 
 /// Environment switch selecting the VMM arena over `cuMemAlloc`.
 ///
-/// Opt-in while it is new. The intent is that it becomes the default once it
-/// has been measured against the `cuMemAlloc` path on real models -- an
-/// allocator change is exactly the kind that looks free and is not.
+/// # Currently inert on the native CUDA path
+///
+/// Enabling this today reserves address space and allocates nothing through
+/// it. The arena installs when the execution provider adopts a memory
+/// governor, and on the native path that happens *after* the session has
+/// built every tensor it will use -- so nothing is left to ask it for memory.
+/// Measured: `committed 0 B of 7732199424 B reserved` after a full generation
+/// (#659).
+///
+/// The allocator itself is correct and tested; what is missing is a caller.
+/// Until #659 is fixed, turning this on costs one address-space reservation
+/// and changes nothing else, so it must not become the default.
+///
+/// # Why it is opt-in regardless
+///
+/// An allocator change is exactly the kind that looks free and is not. The
+/// default should move only after it is measured against `cuMemAlloc` on real
+/// models -- and after there is something to measure.
 pub const CUDA_VMM_ENV: &str = "ONNX_GENAI_CUDA_VMM";
 
 /// Whether the VMM arena is enabled. Any of `1`/`true`/`yes`/`on`.
