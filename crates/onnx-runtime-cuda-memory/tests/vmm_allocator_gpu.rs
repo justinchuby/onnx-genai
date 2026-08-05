@@ -164,6 +164,91 @@ fn small_allocations_share_granules_instead_of_each_taking_one() {
     assert_eq!(governor.used(Tier::Device), 0);
 }
 
+/// Repeated allocate/free cycles leave nothing behind.
+///
+/// The property a leak breaks quietly. A granule that stays mapped after its
+/// last user leaves, or a lease that is not shrunk when one is released, drifts
+/// by a little on every cycle -- invisible in a test that runs one, fatal in a
+/// session that runs millions.
+///
+/// Checks both the physical side (granules unmapped) and the accounting side
+/// (the ledger returned to zero), because they can fail independently: a
+/// granule can be unmapped while the ledger still believes it is held, which
+/// reads as exhausted memory that `nvidia-smi` says is free.
+#[test]
+fn repeated_allocation_cycles_leak_neither_granules_nor_ledger_bytes() {
+    let Some((allocator, governor)) = allocator(64 << 20, 8 << 30) else {
+        return;
+    };
+
+    for round in 0..200usize {
+        // Sizes that straddle the granule boundary in both directions, so
+        // rounds share granules, split them, and span several.
+        let size = match round % 4 {
+            0 => 64,
+            1 => 4096,
+            2 => (2 << 20) + 7,
+            _ => (2 << 20) - 7,
+        };
+        let pointer = allocator
+            .allocate(size, 256)
+            .unwrap_or_else(|error| panic!("round {round} of {size} B: {error}"));
+        // SAFETY: from this allocator, live, freed exactly once.
+        unsafe { allocator.deallocate(pointer, size, 256) };
+
+        assert_eq!(
+            allocator.committed_and_reserved().0,
+            0,
+            "round {round}: a granule stayed mapped after its last user left"
+        );
+        assert_eq!(
+            governor.used(Tier::Device),
+            0,
+            "round {round}: the ledger still holds bytes nothing is using"
+        );
+    }
+}
+
+/// Freeing in an order that interleaves still returns everything.
+///
+/// Allocations rarely die in the order they were born. Granule reference counts
+/// have to survive that, or a granule shared by two spans is released when the
+/// first leaves and the second is left reading unmapped memory -- or is never
+/// released at all.
+#[test]
+fn out_of_order_frees_return_every_granule() {
+    let Some((allocator, governor)) = allocator(64 << 20, 8 << 30) else {
+        return;
+    };
+
+    let sizes = [4096usize, 1 << 20, 64, (3 << 20) + 11, 512, 2 << 20];
+    let mut live: Vec<_> = sizes
+        .iter()
+        .map(|&size| (allocator.allocate(size, 256).expect("fits"), size))
+        .collect();
+
+    assert!(
+        allocator.committed_and_reserved().0 > 0,
+        "the fixture should have committed something to test the release of"
+    );
+
+    // Free middle-out rather than in order.
+    for index in [3usize, 0, 5, 1, 4, 2] {
+        let (pointer, size) = live[index];
+        // SAFETY: from this allocator, live, freed exactly once -- each index
+        // appears once in the order above.
+        unsafe { allocator.deallocate(pointer, size, 256) };
+    }
+    live.clear();
+
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        0,
+        "every granule should be unmapped once its last span is gone"
+    );
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
 /// Distinct live allocations never overlap.
 ///
 /// The `DeviceAllocator` contract's central safety promise, and the one whose

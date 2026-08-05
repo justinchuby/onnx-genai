@@ -245,6 +245,31 @@ impl ModelMemoryPlan {
     /// A provider built before the governor existed sized its pool for itself.
     /// This is where that becomes a claim the rest of the plan can see. The
     /// provider keeps the lease, because it is the thing that must outlive it.
+    /// Give back `bytes` of `holder`'s claim, returning what was actually
+    /// released.
+    ///
+    /// # When a reservation stops being needed
+    ///
+    /// A reservation exists because nothing else accounts for the bytes. When
+    /// something starts to -- a device allocator that commits physically on
+    /// demand and leases each granule -- the reservation and the allocator
+    /// charge the same memory twice, and the tier reads high by that amount.
+    ///
+    /// Releasing rather than never taking it is deliberate. At the moment the
+    /// reservation is made no session exists, so nobody can yet say whether the
+    /// allocator commits on demand. Taking it and giving it back keeps the
+    /// conservative answer for the window where the question is unanswerable.
+    ///
+    /// Returns the bytes released, which may be less than asked for if the
+    /// holder never held that many -- a caller correcting a double count needs
+    /// to know what it actually corrected.
+    pub(crate) fn release(&mut self, holder: Holder, bytes: u64) -> u64 {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.holder == holder) else {
+            return 0;
+        };
+        entry.lease.shrink(bytes)
+    }
+
     pub(crate) fn adopt_provider_pool(
         &self,
         session: &crate::native_decode::NativeDecodeSession,
