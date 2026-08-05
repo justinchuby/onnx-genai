@@ -286,7 +286,7 @@ pub fn reset_exec_phase_profile() {
     phase_profile::reset();
 }
 
-/// Activation-memory planner metrics from the most recent static materialize or run.
+/// Activation-memory planner metrics from the most recent measured top-level run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ActivationMemoryPlanStats {
     /// `true` when every activation owner had a concrete byte size and the
@@ -294,7 +294,9 @@ pub struct ActivationMemoryPlanStats {
     pub complete: bool,
     /// Concurrent peak bytes after liveness-based slot sharing.
     pub peak_bytes: usize,
-    /// One-buffer-per-value activation baseline currently used by the executor.
+    /// Planner upper bound that counts one buffer-owner allocation per activation.
+    /// This is not the executor's exact baseline: in-place aliases and sequence
+    /// storage can make the current executor allocate less.
     pub naive_bytes: usize,
     /// Fraction saved vs. the naive baseline: `1 - peak / naive`.
     pub savings_ratio: f64,

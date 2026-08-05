@@ -6,6 +6,17 @@ struct Stage2RunState {
     excluded: Option<HashSet<ValueId>>,
 }
 
+fn activation_memory_planning_enabled() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        phase_profile::enabled()
+    }
+}
+
 impl Executor {
     /// Execute the graph with `inputs` bound by name, plus an `outer_scope` of
     /// enclosing named values a nested control-flow subgraph body may capture.
@@ -67,6 +78,10 @@ impl Executor {
         let mut resolved =
             self.prepare_resolved_shapes(&bindings, external, mode, nested, decode_memo_eligible);
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
+        let measure_activation_plan = !nested
+            && mode == RunMode::Eager
+            && stage2.plan.is_none()
+            && activation_memory_planning_enabled();
         self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
         drop(_phase_setup);
 
@@ -79,16 +94,28 @@ impl Executor {
             decode_memo_eligible,
             stage2,
         )? {
-            self.update_activation_memory_plan_stats(&resolved);
+            self.finish_activation_memory_plan_measurement(measure_activation_plan, &resolved);
             return Ok(result);
         }
 
-        self.update_activation_memory_plan_stats(&resolved);
+        self.finish_activation_memory_plan_measurement(measure_activation_plan, &resolved);
         self.collect_run_outputs(external, &mut resolved, nested, decode_memo_eligible)
     }
 
     pub(crate) fn activation_memory_plan_stats(&self) -> Option<ActivationMemoryPlanStats> {
         self.activation_memory_plan
+    }
+
+    fn finish_activation_memory_plan_measurement(
+        &mut self,
+        measure: bool,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) {
+        if measure {
+            self.update_activation_memory_plan_stats(resolved);
+        } else {
+            self.activation_memory_plan = None;
+        }
     }
 
     pub(super) fn update_activation_memory_plan_stats(
@@ -107,7 +134,7 @@ impl Executor {
             let numel = dims
                 .iter()
                 .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
-            self.value_dtypes[&vid].checked_storage_bytes(numel)
+            self.value_dtypes.get(&vid)?.checked_storage_bytes(numel)
         };
         let stats = match plan_activations(&self.graph, &view_map, oracle, &options) {
             Ok(PlanStatus::Complete(plan)) => ActivationMemoryPlanStats {
@@ -130,10 +157,15 @@ impl Executor {
                 view_edges: view_map.len(),
                 unknown_sizes: unknown_sizes.len(),
             },
-            Err(_) => return,
+            Err(_) => {
+                self.activation_memory_plan = None;
+                return;
+            }
         };
-        phase_profile::record("activation_plan.peak_bytes", stats.peak_bytes as u128);
-        phase_profile::record("activation_plan.naive_bytes", stats.naive_bytes as u128);
+        if stats.complete {
+            phase_profile::record("activation_plan.peak_bytes", stats.peak_bytes as u128);
+            phase_profile::record("activation_plan.naive_bytes", stats.naive_bytes as u128);
+        }
         if let Some(span) = span.as_mut() {
             span.set_args(
                 Args::new()

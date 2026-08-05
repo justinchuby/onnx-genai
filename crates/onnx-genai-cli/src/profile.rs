@@ -923,14 +923,42 @@ impl RunProfile {
             let _ = writeln!(out, "\nnative executor phases:");
             let _ = writeln!(out, "{:<34} {:>12} {:>10}", "phase", "total_ms", "calls");
             let _ = writeln!(out, "{}", "-".repeat(58));
-            for (phase, total_ns, calls) in executor_phases {
+            for (phase, total_ns, calls) in &executor_phases {
+                if !is_executor_phase_time_row(phase) {
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "{:<34} {:>12.3} {:>10}",
                     phase,
-                    total_ns as f64 / 1e6,
+                    *total_ns as f64 / 1e6,
                     calls
                 );
+            }
+            let byte_rows = executor_phases
+                .iter()
+                .filter(|(phase, _, _)| !is_executor_phase_time_row(phase))
+                .collect::<Vec<_>>();
+            if !byte_rows.is_empty() {
+                let _ = writeln!(out, "\nnative executor byte counters:");
+                let _ = writeln!(
+                    out,
+                    "{:<34} {:>12} {:>10} {:>12}",
+                    "counter", "total_mb", "calls", "mb/call"
+                );
+                let _ = writeln!(out, "{}", "-".repeat(72));
+                for (phase, total_bytes, calls) in byte_rows {
+                    let total_mb = *total_bytes as f64 / (1024.0 * 1024.0);
+                    let mb_per_call = if *calls > 0 {
+                        total_mb / *calls as f64
+                    } else {
+                        0.0
+                    };
+                    let _ = writeln!(
+                        out,
+                        "{phase:<34} {total_mb:>12.3} {calls:>10} {mb_per_call:>12.3}"
+                    );
+                }
             }
         }
 
@@ -1125,6 +1153,10 @@ fn json_string(value: &str) -> String {
     escaped
 }
 
+fn is_executor_phase_time_row(phase: &str) -> bool {
+    !phase.ends_with("_bytes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,6 +1260,15 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.9), 4.0);
         assert_eq!(percentile(&sorted, 1.0), 4.0);
         assert_eq!(percentile(&[], 0.5), 0.0);
+    }
+
+    #[test]
+    fn executor_phase_table_excludes_byte_counters_from_millisecond_rows() {
+        assert!(is_executor_phase_time_row("run_scoped.setup_total.top"));
+        assert!(!is_executor_phase_time_row("activation_plan.peak_bytes"));
+        assert!(!is_executor_phase_time_row(
+            "collect_outputs.top_host_bytes"
+        ));
     }
 
     #[test]

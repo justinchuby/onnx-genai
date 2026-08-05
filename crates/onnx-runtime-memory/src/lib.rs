@@ -22,10 +22,11 @@
 //! only on [`onnx_runtime_ir`], contains no `unsafe`, and is free of PyO3 / EP /
 //! session dependencies so it is trivially testable in isolation.
 //!
-//! `onnx-runtime-session` consumes this crate to measure the activation peak
-//! implied by concrete run shapes and zero-copy views. The executor still owns
-//! one buffer per value today; the planner measurement is the production call
-//! site that de-risks the later allocator rework.
+//! `onnx-runtime-session` consumes this crate, behind the native executor phase
+//! profiler, to measure the activation peak implied by concrete run shapes and
+//! zero-copy views. The executor still owns its existing buffers today; the
+//! planner measurement is the production call site that de-risks the later
+//! allocator rework.
 //!
 //! ## What it computes
 //!

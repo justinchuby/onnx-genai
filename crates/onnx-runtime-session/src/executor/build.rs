@@ -557,7 +557,6 @@ impl Executor {
             let resolved = exec.resolve_all(&empty)?;
             exec.compile_all(&resolved)?;
             exec.size_buffers(&resolved)?;
-            exec.update_activation_memory_plan_stats(&resolved);
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()

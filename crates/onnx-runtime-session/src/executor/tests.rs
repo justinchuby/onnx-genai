@@ -361,6 +361,62 @@ fn decode_shaped_residual_graph() -> Graph {
     graph
 }
 
+fn view_shaped_activation_graph() -> Graph {
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+
+    let owned = graph.create_named_value("owned", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![owned]));
+
+    let shape = graph.create_named_value("shape", DataType::Int64, static_shape([2]));
+    graph.set_initializer(
+        shape,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![2],
+            [2i64, 2].into_iter().flat_map(i64::to_le_bytes).collect(),
+        )),
+    );
+    let view = graph.create_named_value("view", DataType::Float32, static_shape([2, 2]));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Reshape",
+        vec![Some(owned), Some(shape)],
+        vec![view],
+    ));
+
+    let live_use = graph.create_named_value("live_use", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Tanh",
+        vec![Some(owned)],
+        vec![live_use],
+    ));
+
+    let live_use_2d =
+        graph.create_named_value("live_use_2d", DataType::Float32, static_shape([2, 2]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Reshape",
+        vec![Some(live_use), Some(shape)],
+        vec![live_use_2d],
+    ));
+
+    let merged = graph.create_named_value("merged", DataType::Float32, static_shape([2, 2]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "Add",
+        vec![Some(view), Some(live_use_2d)],
+        vec![merged],
+    ));
+    graph.add_output(merged);
+    graph
+}
+
 /// Regression guard for the issue #85 class the reported native/CUDA decode
 /// scare pointed at: a still-live value (a residual input or a long-lived
 /// KV/cache carry) must never be aliased away by an earlier in-place op on a
@@ -412,20 +468,42 @@ fn activation_memory_planner_reports_static_decode_graph_savings() {
     let ep = auto_detect_cpu_ep().unwrap();
     let mut exec = Executor::build(decode_shaped_residual_graph(), weights, ep).unwrap();
 
-    let load_stats = exec
-        .activation_memory_plan_stats()
-        .expect("static graph should be planned during executor build");
-    assert!(load_stats.complete);
-    assert!(load_stats.naive_bytes > load_stats.peak_bytes);
-    assert!(load_stats.savings_ratio > 0.0);
+    assert_eq!(
+        exec.activation_memory_plan_stats(),
+        None,
+        "build-time planning would be view-blind, so it must not publish stats"
+    );
 
     exec.run(&[("x", &values)]).unwrap();
     let run_stats = exec
         .activation_memory_plan_stats()
         .expect("run should refresh activation memory plan stats");
     assert!(run_stats.complete, "run stats were deferred: {run_stats:?}");
-    assert_eq!(run_stats.naive_bytes, load_stats.naive_bytes);
-    assert_eq!(run_stats.peak_bytes, load_stats.peak_bytes);
+    assert!(run_stats.naive_bytes > run_stats.peak_bytes);
+    assert!(run_stats.savings_ratio > 0.0);
+}
+
+#[test]
+fn activation_memory_planner_uses_runtime_view_edges() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+    let mut exec = Executor::build(view_shaped_activation_graph(), weights, ep).unwrap();
+
+    assert_eq!(
+        exec.activation_memory_plan_stats(),
+        None,
+        "load-time stats would see an empty ViewMap for this Reshape fixture"
+    );
+
+    exec.run(&[("x", &values)]).unwrap();
+    let run_stats = exec
+        .activation_memory_plan_stats()
+        .expect("run should measure after Reshape has reported view outputs");
+    assert!(run_stats.complete, "run stats were deferred: {run_stats:?}");
+    assert_eq!(run_stats.view_edges, 2);
+    assert_eq!(run_stats.assignments, 3);
+    assert_eq!(run_stats.naive_bytes, 48);
 }
 
 struct CaptureDecliningKernel;
