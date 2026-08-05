@@ -302,6 +302,32 @@ impl Engine {
         // A refusal here is the point: it says the model does not fit while
         // there is still a load to fail, rather than at an allocation somewhere
         // unrelated later.
+        // End the double count.
+        //
+        // The fixed reservation covers weights *and* activations *and* runtime
+        // overhead, taken before any session existed because nothing else
+        // accounted for them. An allocator that commits on demand accounts for
+        // the weights itself, granule by granule, as they are actually
+        // allocated -- so holding a reservation for them too charges the same
+        // memory twice and the tier reads high by the weight size.
+        //
+        // Only the weight portion is released. Activations and ONNX Runtime's
+        // internal overhead do not flow through our allocator, so nothing else
+        // is accounting for those and the reservation is still the only thing
+        // that knows about them.
+        if native_session.commits_on_demand() {
+            let weights = governor.snapshot().breakdown.model_weights_bytes;
+            let released = governor
+                .plan()
+                .release(Holder::FixedDeviceReservation, weights);
+            if released > 0 {
+                tracing::debug!(
+                    "released {released} bytes of the fixed device reservation: the allocator \
+                     commits on demand and charges the ledger for the model's weights as it \
+                     maps them, so reserving for them as well counted the same memory twice"
+                );
+            }
+        }
         let governed_pool_bytes = governor
             .plan()
             .adopt_provider_pool(&native_session, Holder::WeightResidency)
@@ -310,6 +336,7 @@ impl Engine {
                  grant alongside the model's other claims; lower \
                  ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES or raise the device limit",
             )?;
+
         if governed_pool_bytes > 0 {
             tracing::debug!(
                 bytes = governed_pool_bytes,
