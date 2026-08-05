@@ -844,6 +844,15 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .saturating_add(governor.used(onnx_runtime_memory_governor::Tier::Device));
             match self.build_vmm_arena(capacity, governor, holder) {
                 Ok(arena) => {
+                    // Say so. A feature whose only signal is the absence of a
+                    // warning cannot be distinguished from one whose hook was
+                    // never called -- which is precisely what I could not tell
+                    // when first running this end to end.
+                    eprintln!(
+                        "cuda_ep: device allocations now go through a VMM arena over \
+                         {capacity} bytes of reserved address space; physical granules are \
+                         leased from the memory ledger as they are mapped"
+                    );
                     let _ = self.vmm.set(arena);
                 }
                 // Falling back to `cuMemAlloc` keeps the model running, which
