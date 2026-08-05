@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_ep_cuda::device_allocator::CudaDeviceAllocator;
+use onnx_runtime_cuda_memory::device_allocator::CudaDeviceAllocator;
 use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier};
 
 /// A CUDA device allocator, or `None` on a machine with no driver.
@@ -226,7 +226,7 @@ fn concurrent_allocations_do_not_overlap() {
 fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
     use onnx_runtime_ep_api::ExecutionProvider;
 
-    let Ok(provider) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+    let Ok(provider) = onnx_runtime_ep_cuda::provider::CudaExecutionProvider::new(0) else {
         eprintln!(
             "SKIPPED (no CUDA runtime): the zero-byte size-agreement check did NOT run. It \
              needs a full execution provider, so it needs cudart and cuBLAS as well as the \
@@ -266,7 +266,7 @@ fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
 /// device -- far from the call that caused it.
 #[test]
 fn an_allocator_for_the_wrong_device_is_refused() {
-    let Ok(provider) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+    let Ok(provider) = onnx_runtime_ep_cuda::provider::CudaExecutionProvider::new(0) else {
         eprintln!("SKIPPED (no CUDA runtime): the device-mismatch check did NOT run.");
         return;
     };

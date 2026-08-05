@@ -1,0 +1,33 @@
+[package]
+name = "onnx-runtime-cuda-memory"
+description = "CUDA device memory for the ORT 2.0 runtime: allocators, virtual memory, and governor accounting, separate from operator implementations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cuda", "memory", "allocator", "runtime"]
+categories = ["memory-management", "hardware-support"]
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-virtual-memory = { workspace = true }
+thiserror = { workspace = true }
+
+# Same pin and feature set as the execution provider: the driver is dlopen'd,
+# so building this crate needs no CUDA toolkit. `cublaslt`/`cudnn`/`nvrtc` are
+# deliberately absent -- those are operator concerns and this crate has none.
+[dependencies.cudarc]
+version = "0.19"
+default-features = false
+features = ["std", "driver", "cuda-13000", "dynamic-loading"]
+
+[dev-dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+
+[lints]
+workspace = true

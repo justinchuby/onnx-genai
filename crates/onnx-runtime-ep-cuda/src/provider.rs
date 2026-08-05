@@ -56,6 +56,13 @@ pub struct CudaExecutionProvider {
     /// Defaults to CudaDeviceAllocator, which is the cuMemAlloc call this
     /// EP used to make directly.
     memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    /// Installed by `adopt_memory_governor` when VMM is enabled, and read in
+    /// place of `memory` from then on.
+    ///
+    /// A `OnceLock` rather than a lock because this is set once, before any
+    /// allocation, and read on every one: `get` is a relaxed atomic load, so
+    /// the hot path pays nothing for the option to swap.
+    vmm: std::sync::OnceLock<Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>>,
     /// Allocations and frees this EP made through `memory`.
     ///
     /// Kept here rather than asked of the allocator, because the allocator is
@@ -112,6 +119,7 @@ impl CudaExecutionProvider {
             memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
                 runtime.cuda_context(),
             )),
+            vmm: std::sync::OnceLock::new(),
             ep_allocations: Arc::new(AtomicU64::new(0)),
             ep_frees: Arc::new(AtomicU64::new(0)),
             runtime,
@@ -123,9 +131,38 @@ impl CudaExecutionProvider {
         })
     }
 
+    /// The allocator in force: the VMM arena once installed, otherwise the one
+    /// this provider was built with.
+    ///
+    /// `OnceLock::get` is a relaxed atomic load, so the allocation path pays
+    /// nothing for the option to swap.
+    fn memory(&self) -> &Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> {
+        self.vmm.get().unwrap_or(&self.memory)
+    }
+
+    /// Build a VMM arena over `capacity` bytes of address space, leasing from
+    /// `governor`.
+    fn build_vmm_arena(
+        &self,
+        capacity: u64,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>> {
+        let arena = crate::vmm_allocator::CudaVmmAllocator::new(
+            self.runtime.cuda_context(),
+            onnx_runtime_memory_governor::DeviceKey::device(self.device.index),
+            self.device.index as i32,
+            usize::try_from(capacity).unwrap_or(usize::MAX),
+            governor,
+            holder,
+            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        )
+        .map_err(|error| EpError::KernelFailed(format!("cuda_ep: VMM arena: {error}")))?;
+        Ok(Arc::new(arena))
+    }
+
     /// Take device buffers from `memory` instead of calling `cuMemAlloc`
     /// directly.
-    ///
     /// The same `DeviceAllocator` a caller installs on the CPU EP or the ONNX
     /// Runtime side. This is where a CUDA arena belongs: `cudaMalloc` is a
     /// synchronising driver call in the microseconds, so unlike host memory,
@@ -510,7 +547,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // same value; normalising a zero-byte request is the allocator's job,
         // because the contract lets an implementation rely on the two sizes
         // agreeing.
-        let ptr = self.memory.allocate(size, alignment).map_err(|error| {
+        let ptr = self.memory().allocate(size, alignment).map_err(|error| {
             // Keep what the allocator said. Reporting every failure as "out of
             // memory" would describe an alignment rejection or a dead context
             // as exhausted VRAM and send the reader looking in the wrong place.
@@ -551,7 +588,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // SAFETY: `ptr`, `size` and `align` are the triple this EP obtained
         // from `self.memory` in `allocate`; `into_raw` consumed the owning
         // handle so no alias remains, and this is its single free.
-        unsafe { self.memory.deallocate(ptr, size, align) };
+        unsafe { self.memory().deallocate(ptr, size, align) };
         self.ep_frees.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -793,6 +830,33 @@ impl ExecutionProvider for CudaExecutionProvider {
         tier: onnx_runtime_memory_governor::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
+        // This is the first moment a governor exists -- the execution provider
+        // is built before the engine's -- so it is where a VMM arena can be
+        // installed. Every allocation from here on is leased before its
+        // granule is mapped, which is what makes the device tier a fact rather
+        // than a lower bound (#652).
+        if crate::vmm_allocator::vmm_enabled() && self.vmm.get().is_none() {
+            // Address space costs nothing, so reserve the whole tier: running
+            // out of *reservation* is a hard failure, while leaving it unmapped
+            // is free.
+            let capacity = governor
+                .available(onnx_runtime_memory_governor::Tier::Device)
+                .saturating_add(governor.used(onnx_runtime_memory_governor::Tier::Device));
+            match self.build_vmm_arena(capacity, governor, holder) {
+                Ok(arena) => {
+                    let _ = self.vmm.set(arena);
+                }
+                // Falling back to `cuMemAlloc` keeps the model running, which
+                // matters more than the accounting; but say so, because a
+                // silent fallback is how a feature reads as enabled while
+                // doing nothing.
+                Err(error) => eprintln!(
+                    "cuda_ep: WARNING: could not build the VMM arena, falling back to cuMemAlloc; \
+                     device allocations will not be charged to the ledger: {error}"
+                ),
+            }
+        }
+
         // The weight-residency cache is the standing pool this EP keeps. With
         // offload disabled there is none, and zero is the honest answer rather
         // than a failure.

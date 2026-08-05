@@ -22,6 +22,7 @@ members = [
     "crates/onnx-runtime-ir",
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
+    "crates/onnx-runtime-cuda-memory",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
@@ -82,6 +83,7 @@ default-members = [
     "crates/onnx-runtime-ir",
     "crates/onnx-runtime-memory",
     "crates/onnx-runtime-virtual-memory",
+    "crates/onnx-runtime-cuda-memory",
     "crates/onnx-runtime-memory-governor",
     "crates/onnx-runtime-cpuinfo",
     "crates/onnx-runtime-loader",
@@ -143,6 +145,7 @@ onnx-genai-server = { path = "crates/onnx-genai-server", version = "=0.1.0-dev.5
 onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.5" }
 onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-virtual-memory = { path = "crates/onnx-runtime-virtual-memory", version = "=0.1.0-dev.5" }
+onnx-runtime-cuda-memory = { path = "crates/onnx-runtime-cuda-memory", version = "=0.1.0-dev.5" }
 onnx-runtime-memory-governor = { path = "crates/onnx-runtime-memory-governor", version = "=0.1.0-dev.5" }
 onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.5" }
 onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.5" }

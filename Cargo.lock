@@ -2325,6 +2325,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-cuda-memory"
+version = "0.1.0-dev.5"
+dependencies = [
+ "cudarc",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-memory-governor",
+ "onnx-runtime-virtual-memory",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "onnx-runtime-dlpack"
 version = "0.1.0-dev.5"
 
@@ -2386,6 +2397,7 @@ dependencies = [
  "cudarc",
  "half",
  "libloading 0.8.9",
+ "onnx-runtime-cuda-memory",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
