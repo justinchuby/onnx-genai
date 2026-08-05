@@ -367,7 +367,10 @@ impl Engine {
                         anyhow::anyhow!(
                             "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
                              {max_context} tokens of context on {native_kv_tier:?}: {error}; \
-                             lower the context length or raise the limit for that tier"
+                             {max_context} is the model's declared max_sequence_length, and \
+                             --max-context will not lower it because the declared value takes \
+                             precedence -- raise the limit for that tier, or re-export the model \
+                             with a shorter declared context"
                         )
                     })?;
             }
