@@ -47,7 +47,7 @@ fn allocator(capacity: usize, device_bytes: u64) -> Option<(CudaVmmAllocator, Le
         DeviceKey::device(0),
         0,
         capacity,
-        Arc::new(governor.clone()),
+        &governor,
         HOLDER,
         MemoryRole::Workspace { step_scoped: false },
     )

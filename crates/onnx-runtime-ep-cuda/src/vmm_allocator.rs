@@ -62,6 +62,22 @@ use onnx_runtime_virtual_memory::VirtualBacking;
 use crate::virtual_memory::CudaVirtualBacking;
 use cudarc::driver::CudaContext;
 
+/// Environment switch selecting the VMM arena over `cuMemAlloc`.
+///
+/// Opt-in while it is new. The intent is that it becomes the default once it
+/// has been measured against the `cuMemAlloc` path on real models -- an
+/// allocator change is exactly the kind that looks free and is not.
+pub const CUDA_VMM_ENV: &str = "ONNX_GENAI_CUDA_VMM";
+
+/// Whether the VMM arena is enabled. Any of `1`/`true`/`yes`/`on`.
+pub fn vmm_enabled() -> bool {
+    std::env::var(CUDA_VMM_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 /// The device tier name used in errors raised before a governor is consulted.
 const TIER: &str = "device";
 
@@ -181,7 +197,13 @@ struct Arena {
     reservation: <CudaVirtualBacking as VirtualBacking>::Reservation,
     spans: Spans,
     /// The ledger claim covering every committed granule.
-    lease: Option<MemoryLease>,
+    /// The ledger claim covering every committed granule.
+    ///
+    /// Taken at construction at zero bytes so every commit is a `grow` on an
+    /// existing claim. That keeps the governor out of this type: a lease is
+    /// owned, a `&dyn` borrow is not, and the execution-provider contract
+    /// hands over the latter.
+    lease: MemoryLease,
 }
 
 /// Device memory carved out of one reserved address range, with physical
@@ -189,7 +211,6 @@ struct Arena {
 pub struct CudaVmmAllocator {
     backing: CudaVirtualBacking,
     arena: Mutex<Arena>,
-    governor: Arc<dyn MemoryGovernor + Send + Sync>,
     holder: HolderId,
     role: MemoryRole,
     device: DeviceKey,
@@ -225,7 +246,7 @@ impl CudaVmmAllocator {
         device: DeviceKey,
         device_ordinal: i32,
         capacity: usize,
-        governor: Arc<dyn MemoryGovernor + Send + Sync>,
+        governor: &dyn MemoryGovernor,
         holder: HolderId,
         role: MemoryRole,
     ) -> Result<Self, MemoryError> {
@@ -247,9 +268,8 @@ impl CudaVmmAllocator {
             arena: Mutex::new(Arena {
                 reservation,
                 spans: Spans::new(granularity, capacity),
-                lease: None,
+                lease: governor.reserve(Tier::Device, 0, role, holder)?,
             }),
-            governor,
             holder,
             role,
             device,
@@ -328,24 +348,11 @@ impl CudaVmmAllocator {
     }
 
     fn take(&self, arena: &mut Arena, bytes: usize) -> Result<(), MemoryError> {
-        match arena.lease.as_mut() {
-            Some(lease) => lease.grow(bytes as u64),
-            None => {
-                arena.lease = Some(self.governor.reserve(
-                    Tier::Device,
-                    bytes as u64,
-                    self.role,
-                    self.holder,
-                )?);
-                Ok(())
-            }
-        }
+        arena.lease.grow(bytes as u64)
     }
 
     fn give_back_lease(&self, arena: &mut Arena, bytes: usize) {
-        if let Some(lease) = arena.lease.as_mut() {
-            lease.shrink(bytes as u64);
-        }
+        arena.lease.shrink(bytes as u64);
     }
 
     /// Drop this call's claim on `range`, unmapping whatever it was the last
@@ -454,9 +461,12 @@ impl Drop for CudaVmmAllocator {
     fn drop(&mut self) {
         // The reservation's own `Drop` unmaps and frees every block, so the
         // only thing left is to stop the ledger believing the granules are
-        // still held. Taking the lease out drops it here.
+        // still held. Shrinking to zero does that; the lease's own `Drop`
+        // would too, but doing it here keeps the two in step if a field is
+        // ever reordered.
         let mut arena = self.lock();
-        arena.lease.take();
+        let held = arena.spans.committed as u64;
+        arena.lease.shrink(held);
         arena.spans.committed = 0;
     }
 }
