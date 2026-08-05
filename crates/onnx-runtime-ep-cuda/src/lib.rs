@@ -58,7 +58,6 @@
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
-pub mod device_allocator;
 mod dynamic_library;
 pub mod error;
 mod graph;
@@ -67,8 +66,11 @@ mod optimizer;
 pub mod provider;
 pub mod runtime;
 mod trace;
-pub mod virtual_memory;
-pub mod vmm_allocator;
+// Device memory moved to `onnx-runtime-cuda-memory`: an execution provider is
+// about operators, and where the memory came from is a separate question that
+// a caller with no interest in kernels may need to answer. Re-exported so the
+// move is not a breaking change for anyone already reaching for these paths.
+pub use onnx_runtime_cuda_memory::{device_allocator, virtual_memory, vmm_allocator};
 pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};

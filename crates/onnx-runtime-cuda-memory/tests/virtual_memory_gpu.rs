@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_ep_cuda::virtual_memory::CudaVirtualBacking;
+use onnx_runtime_cuda_memory::virtual_memory::CudaVirtualBacking;
 use onnx_runtime_memory_governor::{
     HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
 };

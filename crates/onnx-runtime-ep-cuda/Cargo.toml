@@ -10,12 +10,15 @@ categories = ["science", "hardware-support"]
 
 [features]
 default = []
-cuda = []
+# Forwarded so the device-memory crate is built for the same target as the
+# kernels that allocate from it.
+cuda = ["onnx-runtime-cuda-memory/cuda"]
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-virtual-memory = { workspace = true }
+onnx-runtime-cuda-memory = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
@@ -40,6 +43,7 @@ features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "cuda-13000", 
 
 [dev-dependencies]
 onnx-runtime-loader = { workspace = true }
+onnx-runtime-cuda-memory = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 
 [lints]
