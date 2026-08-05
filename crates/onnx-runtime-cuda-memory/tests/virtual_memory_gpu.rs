@@ -6,7 +6,8 @@
 //! flat buffer first. It is also a claim about the CUDA driver, not about our
 //! code, so it is checked against a real device rather than assumed.
 //!
-//! Skips when no GPU is present, in the same way the other `*_gpu` tests do.
+//! CPU-only CI reports this as ignored unless `gpu-tests` is enabled; an
+//! enabled run fails if no GPU is present.
 
 use std::sync::Arc;
 
@@ -25,43 +26,12 @@ const HOLDER: HolderId = HolderId::new(11);
 /// execution provider additionally needs cudart and cuBLAS, and requiring those
 /// here would make these tests skip on a machine that can run them perfectly
 /// well, which is how a suite ends up green while proving nothing.
-fn backing() -> Option<CudaVirtualBacking> {
-    cuda_context().map(|context| CudaVirtualBacking::new(context, 0))
-}
-
-/// A CUDA context, or `None` when the driver cannot be loaded.
-///
-/// # Why this catches a panic
-///
-/// `CudaContext::new` does not return `Err` when the driver library is
-/// missing -- cudarc's dynamic loading panics. So a `match` on its `Result`
-/// never reaches the error arm on a machine with no GPU, and the test fails
-/// instead of skipping.
-///
-/// That went unnoticed because these tests lived in `onnx-runtime-ep-cuda`,
-/// which CI runs clippy over but deliberately does not test. They ran for the
-/// first time when this crate joined the test list, and failed immediately.
-/// The skip guard had never actually been exercised.
-fn cuda_context() -> Option<std::sync::Arc<CudaContext>> {
-    let attempt = std::panic::catch_unwind(|| CudaContext::new(0));
-    match attempt {
-        Ok(Ok(context)) => Some(context),
-        // Loud on purpose: a skip that reads like a pass is worse than a
-        // failure, because nobody investigates it (#636).
-        Ok(Err(error)) => {
-            eprintln!(
-                "SKIPPED (no CUDA device): {error}. These tests verify device \
-                 virtual memory and did NOT run."
-            );
-            None
-        }
-        Err(_) => {
-            eprintln!(
-                "SKIPPED (no CUDA driver library): cudarc panicked loading libcuda. \
-                 These tests verify device virtual memory and did NOT run."
-            );
-            None
-        }
+fn require_cuda_backing() -> CudaVirtualBacking {
+    match CudaContext::new(0) {
+        Ok(context) => CudaVirtualBacking::new(context, 0),
+        Err(error) => panic!(
+            "CUDA virtual-memory test requires a CUDA driver; CPU-only runs must leave this test ignored: {error}"
+        ),
     }
 }
 
@@ -69,9 +39,13 @@ fn cuda_context() -> Option<std::sync::Arc<CudaContext>> {
 ///
 /// Everything else rounds to this, so a wrong answer here misaligns every
 /// subsequent request and the driver rejects them.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn the_device_reports_a_sane_allocation_granularity() {
-    let Some(backing) = backing() else { return };
+    let backing = require_cuda_backing();
     let granularity = backing.granularity();
     assert!(granularity > 0, "granularity must be positive");
     assert!(
@@ -87,9 +61,13 @@ fn the_device_reports_a_sane_allocation_granularity() {
 /// The design reserves generously — for the largest a KV buffer could ever be —
 /// and that is only safe if reserving is free. A reservation far larger than
 /// the card's 8 GiB proves it is address space, not memory.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reserving_far_more_than_vram_succeeds_because_nothing_is_committed() {
-    let Some(backing) = backing() else { return };
+    let backing = require_cuda_backing();
     let huge = 64usize << 30; // 64 GiB, well past any consumer card
     let reservation = backing
         .reserve(huge)
@@ -105,9 +83,13 @@ fn reserving_far_more_than_vram_succeeds_because_nothing_is_committed() {
 /// it — so it writes *across* the join rather than into each block, which is
 /// the only pattern that distinguishes real contiguity from two buffers that
 /// happen to be adjacent in a table.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn one_address_spans_two_separate_physical_allocations() {
-    let Some(backing) = backing() else { return };
+    let backing = require_cuda_backing();
     let granule = backing.granularity();
 
     let mut reservation = backing.reserve(granule * 4).expect("address space");
@@ -155,9 +137,13 @@ fn one_address_spans_two_separate_physical_allocations() {
 ///
 /// The stable address is what keeps a captured CUDA graph valid across growth,
 /// which is the reason to do any of this rather than reallocating.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn a_device_buffer_grows_without_moving() {
-    let Some(backing) = backing() else { return };
+    let backing = require_cuda_backing();
     let granule = backing.granularity();
     let governor = LedgerGovernor::new(LeaseLedger::new(64 << 20, 0, 0));
 

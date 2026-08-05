@@ -8,7 +8,7 @@
 //! (`cuda_conformance_gpu.rs`) and future suites can reuse it instead of
 //! copy-pasting the boilerplate per op.
 //!
-//! The harness skips cleanly when no CUDA runtime is present (see [`cuda_ep`]),
+//! The harness skips cleanly when no CUDA runtime is present (see [`require_cuda`]),
 //! so a host without a GPU still passes.
 
 // Integration tests are separate crates; a shared `tests/common` module is
@@ -355,19 +355,17 @@ pub fn run_cpu(
     output_bytes
 }
 
-/// Construct the default CUDA EP, or `None` when no GPU / runtime is available
-/// so the caller can graceful-skip on a CPU-only host or CI runner.
-pub fn cuda_ep() -> Option<CudaExecutionProvider> {
+/// Construct the default CUDA EP or panic. CPU-only runs rely on the `gpu-tests`
+/// ignore gate; feature-enabled runs must fail loudly if CUDA is unavailable.
+pub fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
-        Ok(Ok(ep)) => Some(ep),
-        Ok(Err(error)) => {
-            eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            None
-        }
-        Err(_) => {
-            eprintln!("skip: CUDA runtime library loading panicked");
-            None
-        }
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 

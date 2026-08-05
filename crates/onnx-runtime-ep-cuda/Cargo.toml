@@ -13,6 +13,8 @@ default = []
 # Forwarded so the device-memory crate is built for the same target as the
 # kernels that allocate from it.
 cuda = ["onnx-runtime-cuda-memory/cuda"]
+# Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
+gpu-tests = []
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }

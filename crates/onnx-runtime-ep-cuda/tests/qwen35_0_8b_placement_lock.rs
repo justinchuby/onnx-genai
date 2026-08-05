@@ -174,13 +174,17 @@ fn tally_file(dir: &std::path::Path, file: &str, ep: &CudaExecutionProvider) -> 
 #[ignore = "requires the real qwen3.5-0.8b hybrid model via QWEN35_0_8B_DIR (or the default foundry cache path) and a CUDA device"]
 fn qwen35_0_8b_hybrid_graph_places_on_cuda() {
     let Some(dir) = model_dir() else {
-        return;
+        panic!(
+            "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+        );
     };
     let ep = match CudaExecutionProvider::new(0) {
         Ok(ep) => ep,
         Err(error) => {
             eprintln!("skipping qwen3.5-0.8b placement lock: CUDA unavailable: {error}");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
