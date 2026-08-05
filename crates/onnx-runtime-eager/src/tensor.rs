@@ -146,15 +146,43 @@ impl Tensor {
     /// Allocate a zero-initialized tensor of `shape`/`dtype` using `allocator`.
     ///
     /// Used by dispatch to materialise output tensors before kernel execution
-    /// (`docs/EAGER.md` §10.1 step 6).
+    /// (`docs/EAGER.md` §10.1 step 6), and to seed the fixed-size recurrent
+    /// states of hybrid decoders.
+    ///
+    /// Zeroes the buffer in place. Building a zeroed `Vec` and copying it in
+    /// would allocate the same bytes twice and then memcpy between them, which
+    /// on a large output or a per-sequence `conv_state` is the whole cost of the
+    /// call.
     pub fn zeros_in(
         allocator: Arc<dyn ExecutionProvider>,
         dtype: DataType,
         shape: Vec<usize>,
     ) -> Result<Self> {
         let numel: usize = shape.iter().product();
-        let bytes = vec![0u8; dtype.storage_bytes(numel)];
-        Self::from_raw_in(allocator, dtype, shape, &bytes)
+        let expected = dtype.storage_bytes(numel);
+        let layout = TensorLayout::contiguous();
+        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
+        assert!(
+            buffer.device().is_host_accessible(),
+            "zeros_in on non-host device {:?}",
+            buffer.device()
+        );
+        if expected > 0 {
+            let dst = buffer.as_mut_ptr() as *mut u8;
+            // SAFETY: host-accessible device (asserted); `dst` is a unique
+            // writable host pointer obtained via `&mut buffer` with no alias,
+            // and the allocation is at least `expected` bytes because that is
+            // what was requested.
+            unsafe { std::ptr::write_bytes(dst, 0, expected) };
+        }
+        Ok(Self {
+            dtype,
+            shape,
+            layout,
+            device: buffer.device(),
+            buffer: Some(buffer),
+            allocator,
+        })
     }
 
     /// Build a tensor from raw little-endian bytes on the shared CPU device.

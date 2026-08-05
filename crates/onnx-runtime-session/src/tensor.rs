@@ -697,6 +697,33 @@ impl Tensor {
         Self::from_raw_in(shared_cpu_ep(), dtype, shape, bytes)
     }
 
+    /// Allocate a zero-initialised tensor on the shared CPU device.
+    ///
+    /// Zeroes the buffer in place. `from_raw` with a zeroed `Vec` allocates
+    /// these bytes twice and memcpys between them, which on a hybrid decoder's
+    /// per-layer `conv_state`/`recurrent_state` is the whole cost of the call.
+    pub fn zeros(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
+        let allocator = shared_cpu_ep();
+        let numel: usize = shape.iter().product();
+        let expected = dtype.storage_bytes(numel);
+        let layout = TensorLayout::contiguous();
+        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
+        assert!(
+            buffer.device().is_host_accessible(),
+            "zeros on non-host device {:?}",
+            buffer.device()
+        );
+        if expected > 0 {
+            let dst = buffer.as_mut_ptr() as *mut u8;
+            // SAFETY: host-accessible device (asserted); `dst` is a unique
+            // writable host pointer obtained via `&mut buffer` with no alias,
+            // and the allocation is at least `expected` bytes because that is
+            // what was requested.
+            unsafe { std::ptr::write_bytes(dst, 0, expected) };
+        }
+        Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
+    }
+
     /// Take ownership of an already-allocated, contiguous `buffer` (allocated by
     /// `allocator`) and wrap it as a row-major tensor **without copying**. The
     /// executor uses this to hand a produced output's host buffer straight to
@@ -1174,5 +1201,38 @@ mod tests {
         assert_eq!(physical_mask.kernel_input_shape(), &[1, 4096]);
         physical_mask.set_logical_shape(vec![1, 4096]).unwrap();
         assert!(!physical_mask.exposes_logical_input_shape());
+    }
+
+    /// A zeroed tensor is zero even when the allocation is not.
+    ///
+    /// `zeros` writes the bytes in place instead of copying a zeroed `Vec` in,
+    /// which is cheaper and just as correct -- but it moves the guarantee from
+    /// obvious to asserted. Freshly mapped pages are usually already zero, so a
+    /// test that only allocated would pass whether or not the zeroing happened.
+    /// This dirties the buffer first, through the same public surface.
+    #[test]
+    fn a_zeroed_tensor_is_zero_even_over_dirty_memory() {
+        // Allocate, poison, drop: the allocator is very likely to hand the same
+        // block back to the next request of the same size.
+        let poison = Tensor::from_raw(DataType::Float32, vec![2, 8], &[0xABu8; 64])
+            .expect("a poisoned tensor");
+        drop(poison);
+
+        let zeroed = Tensor::zeros(DataType::Float32, vec![2, 8]).expect("a zeroed tensor");
+        let values = zeroed.to_vec_f32();
+        assert_eq!(values.len(), 16);
+        assert!(
+            values.iter().all(|value| *value == 0.0),
+            "zeros() returned {values:?}"
+        );
+    }
+
+    /// A growable KV input starts with an empty sequence axis, so this shape is
+    /// reached on a hybrid decoder's first step.
+    #[test]
+    fn a_zeroed_tensor_of_no_elements_is_valid() {
+        let empty = Tensor::zeros(DataType::Float32, vec![1, 8, 0, 4]).expect("allocatable");
+        assert_eq!(empty.shape, vec![1, 8, 0, 4]);
+        assert!(empty.to_vec_f32().is_empty());
     }
 }
