@@ -79,10 +79,75 @@ impl Executor {
             decode_memo_eligible,
             stage2,
         )? {
+            self.update_activation_memory_plan_stats(&resolved);
             return Ok(result);
         }
 
+        self.update_activation_memory_plan_stats(&resolved);
         self.collect_run_outputs(external, &mut resolved, nested, decode_memo_eligible)
+    }
+
+    pub(crate) fn activation_memory_plan_stats(&self) -> Option<ActivationMemoryPlanStats> {
+        self.activation_memory_plan
+    }
+
+    pub(super) fn update_activation_memory_plan_stats(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) {
+        let mut span = trace_span("session.activation_memory_plan", "session");
+        let _phase = phase_span!("run_scoped.activation_memory_plan");
+        let view_map =
+            ViewMap::from_pairs(self.views.iter().map(|(&view, meta)| (view, meta.source)));
+        let options = PlanOptions::new();
+        let oracle = |vid: ValueId| {
+            let dims = resolved
+                .get(&vid)
+                .or_else(|| self.buffer_shapes.get(&vid))?;
+            let numel = dims
+                .iter()
+                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+            self.value_dtypes[&vid].checked_storage_bytes(numel)
+        };
+        let stats = match plan_activations(&self.graph, &view_map, oracle, &options) {
+            Ok(PlanStatus::Complete(plan)) => ActivationMemoryPlanStats {
+                complete: true,
+                peak_bytes: plan.peak_bytes,
+                naive_bytes: plan.naive_bytes,
+                savings_ratio: plan.savings_ratio,
+                num_slots: plan.num_slots,
+                assignments: plan.assignments.len(),
+                view_edges: view_map.len(),
+                unknown_sizes: 0,
+            },
+            Ok(PlanStatus::Deferred { unknown_sizes }) => ActivationMemoryPlanStats {
+                complete: false,
+                peak_bytes: 0,
+                naive_bytes: 0,
+                savings_ratio: 0.0,
+                num_slots: 0,
+                assignments: 0,
+                view_edges: view_map.len(),
+                unknown_sizes: unknown_sizes.len(),
+            },
+            Err(_) => return,
+        };
+        phase_profile::record("activation_plan.peak_bytes", stats.peak_bytes as u128);
+        phase_profile::record("activation_plan.naive_bytes", stats.naive_bytes as u128);
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("complete", stats.complete)
+                    .with("peak_bytes", stats.peak_bytes as u64)
+                    .with("naive_bytes", stats.naive_bytes as u64)
+                    .with("savings_ratio", stats.savings_ratio)
+                    .with("num_slots", stats.num_slots as u64)
+                    .with("assignments", stats.assignments as u64)
+                    .with("view_edges", stats.view_edges as u64)
+                    .with("unknown_sizes", stats.unknown_sizes as u64),
+            );
+        }
+        self.activation_memory_plan = Some(stats);
     }
 
     fn reset_run_state(&mut self) -> Result<()> {

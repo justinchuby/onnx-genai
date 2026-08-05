@@ -518,6 +518,7 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
@@ -556,6 +557,7 @@ impl Executor {
             let resolved = exec.resolve_all(&empty)?;
             exec.compile_all(&resolved)?;
             exec.size_buffers(&resolved)?;
+            exec.update_activation_memory_plan_stats(&resolved);
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()

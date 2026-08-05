@@ -135,6 +135,11 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     pub(super) sequence_values: HashSet<ValueId>,
+    /// Most recent activation-memory planner result. Static models populate it
+    /// at load; dynamic models refresh it after each run once shapes and view
+    /// aliases are concrete. Observational only: the executor still owns one
+    /// buffer per value until issue #514's allocator surgery lands.
+    pub(super) activation_memory_plan: Option<ActivationMemoryPlanStats>,
     /// Allocation owners promoted into ref-counted storage when a tensor enters
     /// an ONNX Sequence. `buffers` retains a non-owning dispatch alias, while
     /// sequence elements clone the owner Arc. At the next run boundary, after

@@ -2500,6 +2500,7 @@ dependencies = [
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-memory",
  "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
  "onnx-runtime-shape-inference",

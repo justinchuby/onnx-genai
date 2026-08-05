@@ -15,6 +15,7 @@ mlas = ["onnx-runtime-ep-cpu/mlas"]
 
 [dependencies]
 onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-memory = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }

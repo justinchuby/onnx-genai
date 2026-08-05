@@ -405,6 +405,29 @@ fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
     );
 }
 
+#[test]
+fn activation_memory_planner_reports_static_decode_graph_savings() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+    let mut exec = Executor::build(decode_shaped_residual_graph(), weights, ep).unwrap();
+
+    let load_stats = exec
+        .activation_memory_plan_stats()
+        .expect("static graph should be planned during executor build");
+    assert!(load_stats.complete);
+    assert!(load_stats.naive_bytes > load_stats.peak_bytes);
+    assert!(load_stats.savings_ratio > 0.0);
+
+    exec.run(&[("x", &values)]).unwrap();
+    let run_stats = exec
+        .activation_memory_plan_stats()
+        .expect("run should refresh activation memory plan stats");
+    assert!(run_stats.complete, "run stats were deferred: {run_stats:?}");
+    assert_eq!(run_stats.naive_bytes, load_stats.naive_bytes);
+    assert_eq!(run_stats.peak_bytes, load_stats.peak_bytes);
+}
+
 struct CaptureDecliningKernel;
 
 impl Kernel for CaptureDecliningKernel {
