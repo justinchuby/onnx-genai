@@ -21,6 +21,18 @@ MEMORY_CRATE = ROOT / "crates" / "onnx-runtime-cuda-memory"
 CUDA_CRATES = (CUDA_CRATE, MEMORY_CRATE)
 TESTS = CUDA_CRATE / "tests"
 TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
+# Targets that must run in every configuration, and so cannot be held to the
+# "ignored, not passed" rule the rest of the suite is checked against.
+#
+# `suite_canary_gpu` is the test that exists because the rest of the suite can
+# skip silently. It is a no-op unless `NXRT_REQUIRE_CUDA` says a GPU is meant to
+# be present, and where that is set it fails loudly. Giving it the `gpu-tests`
+# ignore would remove it from exactly the runs it was written to police -- a
+# CPU-only machine that believes it tested a GPU.
+#
+# Anything added here needs the same argument: not "this one is awkward" but
+# "this one is checking the checker".
+ALWAYS_RUN = frozenset({"suite_canary_gpu"})
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
@@ -92,7 +104,11 @@ def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
         if executable:
             binaries[target["name"]] = Path(executable)
 
-    return [TestBinary(target, binaries[target]) for target in sorted(binaries)]
+    return [
+        TestBinary(target, binaries[target])
+        for target in sorted(binaries)
+        if target not in ALWAYS_RUN
+    ]
 
 
 def build_test_binaries(config: FeatureConfig) -> list[TestBinary]:
