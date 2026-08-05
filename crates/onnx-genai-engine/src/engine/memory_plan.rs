@@ -351,6 +351,11 @@ impl ModelMemoryPlan {
     /// Read from the ledger rather than from this plan's own entries, so it
     /// accounts for every holder rather than the ones this plan happens to
     /// carry.
+    ///
+    /// Gated with its only caller: the native decode path is what needs to
+    /// compare a worst case against real headroom, and an ungated helper is
+    /// dead code in every other build.
+    #[cfg(feature = "native-backend")]
     pub(crate) fn available_on(&self, tier: Tier) -> u64 {
         self.governor.available(tier)
     }
