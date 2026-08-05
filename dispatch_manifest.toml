@@ -150,6 +150,28 @@ file = "crates/onnx-runtime-session/src/executor/kernel_cache.rs"
 description = "Static-shape graphs use pre-bound kernel path, not hash-lookup"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Block-quantized CPU kernels — memory-format-only dense f32 baselines (#491)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "BlockQuantizedMatMul"
+variant = "dense_f32_dequant"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs"
+description = "CPU BlockQuantizedMatMul preserves packed storage at the op boundary, then dequantizes packed_B to dense f32 and runs dense GEMM; this is not quantized-domain compute"
+
+[[claim]]
+op = "BlockQuantizedMoE"
+variant = "dense_f32_expert_dequant"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs"
+description = "CPU BlockQuantizedMoE dequantizes routed experts to dense f32 and runs the dense grouped MoE path; this is not quantized-domain expert compute"
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MaxPool — aarch64-apple-darwin (#324)
 # ═══════════════════════════════════════════════════════════════════════════════
 

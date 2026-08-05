@@ -3,6 +3,9 @@
 //! The packed weight tensor keeps llama.cpp's serialized block layout. MXFP4
 //! decoding follows OCP MX E2M1/E8M0 and llama.cpp's `block_mxfp4`; IQ
 //! decoding follows llama.cpp's native super-block layouts and audited grids.
+//! This CPU kernel is a memory-format baseline: it dequantizes `packed_B` to a
+//! dense f32 matrix, caches that f32 expansion only for constant weights, and
+//! runs dense GEMM. It does not perform quantized-domain matmul compute.
 
 use std::sync::OnceLock;
 
@@ -38,6 +41,10 @@ const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
 const IQ1_S_DELTA: f32 = 0.125;
 const IQ1_M_DELTA: f32 = 0.125;
+
+#[cfg(test)]
+static BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 // SIMD decoder uses doubled E2M1 integers with half the shared E8M0 scale.
 #[cfg(target_arch = "x86_64")]
@@ -250,6 +257,9 @@ impl Kernel for BlockQuantizedMatMulKernel {
             .checked_mul(self.n)
             .ok_or_else(|| error("Y element count overflow"))?;
         let mut result = vec![0.0f32; result_elements];
+        #[cfg(test)]
+        BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         gemm(&activations, weight_kn, &mut result, m, self.k, self.n)?;
         if let Some(bias) = bias {
             for row in result.chunks_exact_mut(self.n) {
@@ -928,6 +938,31 @@ mod tests {
         for (actual, expected) in y.to_f32().iter().zip(expected) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn block_quantized_matmul_manifest_counter_proves_dense_f32_dequant_dispatch() {
+        let before =
+            BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let (graph, node) = model_node("mxfp4", &[1, 32], &[1, 1, 17], &[1, 1], 32, 1, false);
+        let kernel = kernel(&graph, node);
+        let mut packed = vec![127u8];
+        packed.extend([0u8; 16]);
+        let a = Owned::f32(&[1, 32], &[1.0; 32]);
+        let b = Owned::u8(&[1, 1, 17], &packed);
+        let mut y = Owned::zeros_f32(&[1, 1]);
+
+        kernel
+            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        let after =
+            BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "dispatch manifest counter must prove BlockQuantizedMatMul ran the dense-f32 dequant path"
+        );
+        assert_eq!(y.to_f32(), vec![0.0]);
     }
 
     #[test]

@@ -244,7 +244,11 @@ uses `(QK, block_bytes)=(32,18)` and GGUF MXFP4 uses `(32,17)`. Keeping the
 exact native block makes external-data slices mmap-able and avoids
 separating/recombining embedded metadata. The kernel defines unused values in
 the final native block as padding, validates the exact shape and byte count,
-and owns the codebook.
+and owns the codebook. The in-tree CPU EP implementation is a memory-format
+baseline: it dequantizes `packed_B` to a dense f32 matrix and runs dense GEMM
+(caching the dense f32 expansion only for constant weights). It does **not**
+provide quantized-domain compute; `dispatch_manifest.toml` claims this CPU path
+as tier3 so tests can prove the actual dense-f32 dispatch.
 
 The op name intentionally says “block quantized”, not “NBits”: MXFP4 and IQ
 indices are semantic formats, not merely bit widths. A future schema can add
