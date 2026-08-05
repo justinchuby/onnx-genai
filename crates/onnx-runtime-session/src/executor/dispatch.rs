@@ -7,6 +7,8 @@ use onnx_runtime_ep_api::ExecutionProviderCapabilities;
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
 impl Executor {
+    const DENSE_WEIGHT_PREFETCH_LOOKAHEAD: usize = 1;
+
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
     /// leaf kernel). Shared by the eager loop and the segmented runner.
     ///
@@ -116,6 +118,7 @@ impl Executor {
                 if elided.is_some_and(|set| set.contains(&pi)) {
                     continue;
                 }
+                self.prefetch_lazy_weights_after(pi)?;
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
                 let start = Instant::now();
                 let result =
@@ -132,7 +135,30 @@ impl Executor {
                 if elided.is_some_and(|set| set.contains(&pi)) {
                     continue;
                 }
+                self.prefetch_lazy_weights_after(pi)?;
                 self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prefetch_lazy_weights_after(&self, pi: usize) -> Result<()> {
+        let Some(lookahead) = pi.checked_add(Self::DENSE_WEIGHT_PREFETCH_LOOKAHEAD) else {
+            return Ok(());
+        };
+        let Some(next) = self.plan.get(lookahead) else {
+            return Ok(());
+        };
+        for vid in &next.lazy_weight_inputs {
+            if self.plan[pi].lazy_weight_inputs.contains(vid) {
+                continue;
+            }
+            if let Some(lazy) = self
+                .weight_handles
+                .get(vid)
+                .and_then(|handle| handle.as_lazy())
+            {
+                self.ep.prefetch_lazy_weight(vid.0 as u64, lazy)?;
             }
         }
         Ok(())

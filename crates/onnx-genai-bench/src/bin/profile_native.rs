@@ -397,6 +397,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
     profile::reset();
     onnx_runtime_session::reset_exec_phase_profile();
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
 
     let mut prefills_ms = Vec::with_capacity(args.runs);
     let mut decode_ms_per_token = Vec::with_capacity(args.runs);
@@ -462,6 +463,16 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
     }
+    let offload = onnx_runtime_ep_cuda::global_offload_stats();
+    println!(
+        "weight_offload_prefetch: issued={} declined_guard={} joined={} page_ins={} hits={} evictions={}",
+        offload.prefetch_issued,
+        offload.prefetch_declined_guard,
+        offload.prefetch_joined,
+        offload.page_ins,
+        offload.hits,
+        offload.evictions
+    );
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }
@@ -786,6 +797,7 @@ fn main() -> Result<()> {
         )?);
     }
     profile::reset();
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
 
     let stats_before = session.cuda_kv_debug_stats();
     let mut generated = 0usize;
@@ -847,6 +859,16 @@ fn main() -> Result<()> {
                 .context("decode generated tokens")?
         );
     }
+    let offload = onnx_runtime_ep_cuda::global_offload_stats();
+    println!(
+        "weight_offload_prefetch: issued={} declined_guard={} joined={} page_ins={} hits={} evictions={}",
+        offload.prefetch_issued,
+        offload.prefetch_declined_guard,
+        offload.prefetch_joined,
+        offload.page_ins,
+        offload.hits,
+        offload.evictions
+    );
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }

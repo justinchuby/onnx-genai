@@ -332,6 +332,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         )))
     }
 
+    fn prefetch_lazy_weight(&self, key: u64, weight: &LazyWeight) -> Result<()> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(());
+        };
+        residency
+            .prefetch_materialized(key, weight)
+            .map_err(|error| EpError::KernelFailed(format!("weight offload prefetch: {error}")))
+    }
+
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
         // The context, stream, and cuBLASLt handle are created eagerly in
         // `new`; binding here confirms the device is reachable on this thread.

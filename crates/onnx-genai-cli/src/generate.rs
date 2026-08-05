@@ -127,6 +127,7 @@ fn generate_text(
         profile.memory = memory;
     }
     let pages_before = backend.page_stats();
+    let offload_before = cuda_offload_stats();
     let mut reasoning = detect_reasoning(template.as_ref());
     backend.bind_reasoning_marker_tokens(&mut reasoning);
     match run_generation_turn(
@@ -144,6 +145,7 @@ fn generate_text(
             if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
                 profile.pages = Some(profile::PageActivity::since(before, after));
             }
+            record_cuda_offload_counters(&mut profile, offload_before);
             profiling.emit(&mut profile)?;
             emit_stats_line(show_stats, profiling.profile, &mut profile);
             Ok(())
@@ -154,6 +156,74 @@ fn generate_text(
             std::process::exit(EXIT_INTERRUPTED);
         }
         Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaOffloadSnapshot {
+    page_ins: u64,
+    hits: u64,
+    evictions: u64,
+    prefetch_issued: u64,
+    prefetch_declined_guard: u64,
+    prefetch_joined: u64,
+}
+
+fn cuda_offload_stats() -> CudaOffloadSnapshot {
+    #[cfg(feature = "native-cuda")]
+    {
+        let stats = onnx_runtime_ep_cuda::global_offload_stats();
+        CudaOffloadSnapshot {
+            page_ins: stats.page_ins,
+            hits: stats.hits,
+            evictions: stats.evictions,
+            prefetch_issued: stats.prefetch_issued,
+            prefetch_declined_guard: stats.prefetch_declined_guard,
+            prefetch_joined: stats.prefetch_joined,
+        }
+    }
+    #[cfg(not(feature = "native-cuda"))]
+    {
+        CudaOffloadSnapshot::default()
+    }
+}
+
+fn record_cuda_offload_counters(profile: &mut RunProfile, before: CudaOffloadSnapshot) {
+    #[cfg(feature = "native-cuda")]
+    let after = onnx_runtime_ep_cuda::global_offload_stats();
+    #[cfg(not(feature = "native-cuda"))]
+    let after = CudaOffloadSnapshot::default();
+
+    let page_ins = after.page_ins.saturating_sub(before.page_ins);
+    let hits = after.hits.saturating_sub(before.hits);
+    let evictions = after.evictions.saturating_sub(before.evictions);
+    let prefetch_issued = after.prefetch_issued.saturating_sub(before.prefetch_issued);
+    let prefetch_declined_guard = after
+        .prefetch_declined_guard
+        .saturating_sub(before.prefetch_declined_guard);
+    let prefetch_joined = after.prefetch_joined.saturating_sub(before.prefetch_joined);
+    if page_ins > 0
+        || hits > 0
+        || evictions > 0
+        || prefetch_issued > 0
+        || prefetch_declined_guard > 0
+        || prefetch_joined > 0
+    {
+        profile.counter(
+            "weight offload prefetch issued",
+            prefetch_issued as f64,
+            "prefetches",
+        );
+        profile.counter(
+            "weight offload prefetch declined guard",
+            prefetch_declined_guard as f64,
+            "prefetches",
+        );
+        profile.counter(
+            "weight offload prefetch joined",
+            prefetch_joined as f64,
+            "prefetches",
+        );
     }
 }
 

@@ -334,6 +334,8 @@ pub(crate) struct NodePlan {
     /// Inputs consumed for the final time by this node and therefore eligible for
     /// a kernel-authorized in-place overwrite after additional runtime guards.
     pub inplace_dead_inputs: Vec<bool>,
+    /// Lazy weight inputs this node may ask the EP to page at dispatch time.
+    pub lazy_weight_inputs: Vec<ValueId>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.

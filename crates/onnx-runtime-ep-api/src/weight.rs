@@ -93,6 +93,9 @@ fn checked_shape_product(shape: &[usize]) -> Result<usize, WeightHandleError> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LazyWeightBoundary {
+    /// `ai.onnx::MatMul`, the ordinary dense GEMM boundary used by unquantized
+    /// decoder exports.
+    MatMul,
     /// `pkg.nxrt::BlockQuantizedMoE`, the Phase-3 offload binding boundary.
     BlockQuantizedMoe,
     /// `com.microsoft::QMoE`, the boundary real DeepSeek/GLM/Qwen exports use.
@@ -104,12 +107,17 @@ pub enum LazyWeightBoundary {
 
 impl LazyWeightBoundary {
     /// Every op boundary at which a lazy weight may be device-paged.
-    pub const ALL: [LazyWeightBoundary; 3] =
-        [Self::BlockQuantizedMoe, Self::QMoe, Self::MatMulNBits];
+    pub const ALL: [LazyWeightBoundary; 4] = [
+        Self::MatMul,
+        Self::BlockQuantizedMoe,
+        Self::QMoe,
+        Self::MatMulNBits,
+    ];
 
     /// Canonical (domain, op_type) this boundary binds at.
     fn identity(self) -> (&'static str, &'static str) {
         match self {
+            Self::MatMul => ("", "MatMul"),
             Self::BlockQuantizedMoe => ("pkg.nxrt", "BlockQuantizedMoE"),
             Self::QMoe => ("com.microsoft", "QMoE"),
             Self::MatMulNBits => ("com.microsoft", "MatMulNBits"),
@@ -466,7 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn offload_boundary_recognizes_block_quantized_moe_and_qmoe() {
+    fn offload_boundary_recognizes_dense_and_moe_boundaries() {
+        assert_eq!(
+            LazyWeightBoundary::for_op("", "MatMul"),
+            Some(LazyWeightBoundary::MatMul)
+        );
         assert_eq!(
             LazyWeightBoundary::for_op("pkg.nxrt", "BlockQuantizedMoE"),
             Some(LazyWeightBoundary::BlockQuantizedMoe)
@@ -480,6 +492,7 @@ mod tests {
             "pkg.nxrt",
             "BlockQuantizedMoE"
         ));
+        assert!(LazyWeightBoundary::matches_any("", "MatMul"));
         // Wrong domain/op pairings and unrelated ops are not offload boundaries.
         assert_eq!(LazyWeightBoundary::for_op("pkg.nxrt", "QMoE"), None);
         assert_eq!(

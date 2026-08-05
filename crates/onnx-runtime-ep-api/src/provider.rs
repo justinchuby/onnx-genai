@@ -381,6 +381,14 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Best-effort lookahead page-in for a lazy weight the executor knows will be
+    /// needed by a later node. The default is a no-op so providers that do not
+    /// own a residency cache do not need to participate.
+    fn prefetch_lazy_weight(&self, key: u64, weight: &crate::LazyWeight) -> Result<()> {
+        let _ = (key, weight);
+        Ok(())
+    }
+
     /// Initialize device resources / load libraries.
     fn initialize(&mut self, config: &EpConfig) -> Result<()>;
     /// Release device resources.

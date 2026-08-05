@@ -37,6 +37,9 @@ use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_ISSUED: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_DECLINED_GUARD: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_JOINED: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the process-global weight-offload counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -44,6 +47,9 @@ pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
     pub evictions: u64,
+    pub prefetch_issued: u64,
+    pub prefetch_declined_guard: u64,
+    pub prefetch_joined: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -52,6 +58,9 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
+        prefetch_issued: GLOBAL_PREFETCH_ISSUED.load(Ordering::Relaxed),
+        prefetch_declined_guard: GLOBAL_PREFETCH_DECLINED_GUARD.load(Ordering::Relaxed),
+        prefetch_joined: GLOBAL_PREFETCH_JOINED.load(Ordering::Relaxed),
     }
 }
 
@@ -60,6 +69,9 @@ pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_ISSUED.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_DECLINED_GUARD.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_JOINED.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -160,6 +172,12 @@ pub struct CudaResidencyStats {
     pub hits: u64,
     /// LRU evictions that freed a page's VRAM.
     pub evictions: u64,
+    /// Lookahead page-ins issued on the transfer stream.
+    pub prefetch_issued: u64,
+    /// Lookahead requests declined because admitting them would evict or grow.
+    pub prefetch_declined_guard: u64,
+    /// Demand page-ins that consumed an in-flight lookahead page.
+    pub prefetch_joined: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -417,9 +435,13 @@ struct ResidencyInner {
     page_ins: u64,
     hits: u64,
     evictions: u64,
+    prefetch_issued: u64,
+    prefetch_declined_guard: u64,
+    prefetch_joined: u64,
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
+    in_flight: HashMap<u64, InFlightPage>,
     /// The governor grant this budget came from, when it came from one.
     ///
     /// Held for its `Drop`: releasing the lease is how the tier learns these
@@ -437,6 +459,11 @@ struct ResidencyInner {
     /// independently, so a caller outliving the cache still outlives the lease.
     /// See `residency_holds_its_lease_until_its_pages_are_gone`.
     lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+}
+
+struct InFlightPage {
+    page: Arc<CudaWeightPage>,
+    copy_fence: u64,
 }
 
 impl CudaWeightResidency {
@@ -458,8 +485,12 @@ impl CudaWeightResidency {
                 page_ins: 0,
                 hits: 0,
                 evictions: 0,
+                prefetch_issued: 0,
+                prefetch_declined_guard: 0,
+                prefetch_joined: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
+                in_flight: HashMap::new(),
             }),
         }
     }
@@ -508,8 +539,12 @@ impl CudaWeightResidency {
                 page_ins: 0,
                 hits: 0,
                 evictions: 0,
+                prefetch_issued: 0,
+                prefetch_declined_guard: 0,
+                prefetch_joined: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
+                in_flight: HashMap::new(),
             }),
         })
     }
@@ -601,6 +636,9 @@ impl CudaWeightResidency {
         key: u64,
         weight: &LazyWeight,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        if let Some(prefetched) = self.join_in_flight(key)? {
+            return Ok(prefetched);
+        }
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
         }
@@ -636,9 +674,102 @@ impl CudaWeightResidency {
         }
     }
 
+    /// Best-effort single-weight lookahead page-in. It only engages for the
+    /// asynchronous path and only when the new page fits inside the current
+    /// residency budget without evicting or growing the lease.
+    pub fn prefetch_materialized(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+    ) -> Result<(), WeightHandleError> {
+        if !self.async_pagein {
+            return Ok(());
+        }
+        {
+            let inner = self.lock();
+            if inner.pages.contains_key(&key) || inner.in_flight.contains_key(&key) {
+                return Ok(());
+            }
+        }
+        let bytes = weight
+            .regions
+            .iter()
+            .try_fold(0_u64, |total, region| total.checked_add(region.len as u64))
+            .ok_or_else(|| {
+                WeightHandleError::InvalidResident("prefetch weight byte count overflow".into())
+            })?;
+        {
+            let inner = self.lock();
+            if inner.pages.contains_key(&key)
+                || inner.in_flight.contains_key(&key)
+                || inner.resident_bytes.saturating_add(bytes) > inner.budget
+            {
+                if inner.resident_bytes.saturating_add(bytes) > inner.budget {
+                    drop(inner);
+                    self.record_prefetch_declined_guard();
+                }
+                return Ok(());
+            }
+        }
+        let resident = weight.materialize()?;
+        let (page, copy_fence) = CudaWeightPage::upload_async(
+            &self.runtime,
+            resident.dtype,
+            resident.shape.clone(),
+            resident.bytes(),
+        )?;
+        let page = Arc::new(page);
+        let mut inner = self.lock();
+        if inner.pages.contains_key(&key)
+            || inner.in_flight.contains_key(&key)
+            || inner.resident_bytes.saturating_add(bytes) > inner.budget
+        {
+            let declined_by_guard = inner.resident_bytes.saturating_add(bytes) > inner.budget;
+            drop(inner);
+            self.drain_copy_stream()?;
+            if declined_by_guard {
+                self.record_prefetch_declined_guard();
+            }
+            return Ok(());
+        }
+        inner.insert_page(key, Arc::clone(&page), bytes);
+        inner.record_prefetch_issued();
+        inner
+            .in_flight
+            .insert(key, InFlightPage { page, copy_fence });
+        Ok(())
+    }
+
+    fn join_in_flight(&self, key: u64) -> Result<Option<Arc<CudaWeightPage>>, WeightHandleError> {
+        let mut inner = self.lock();
+        let Some(prefetch) = inner.in_flight.get(&key) else {
+            return Ok(None);
+        };
+        let page = Arc::clone(&prefetch.page);
+        let copy_fence = prefetch.copy_fence;
+        inner.touch(key);
+        self.runtime
+            .compute_wait_fence(copy_fence)
+            .map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("prefetch fence wait: {error}"))
+            })?;
+        inner.in_flight.remove(&key);
+        inner.record_prefetch_joined();
+        Ok(Some(page))
+    }
+
+    fn record_prefetch_declined_guard(&self) {
+        let mut inner = self.lock();
+        inner.prefetch_declined_guard += 1;
+        GLOBAL_PREFETCH_DECLINED_GUARD.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Look up `key`, marking it most-recently-used and counting a hit.
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
+        if inner.in_flight.contains_key(&key) {
+            return None;
+        }
         if let Some(page) = inner.pages.get(&key).cloned() {
             inner.record_hit(key);
             Some(page)
@@ -754,6 +885,9 @@ impl CudaWeightResidency {
             page_ins: inner.page_ins,
             hits: inner.hits,
             evictions: inner.evictions,
+            prefetch_issued: inner.prefetch_issued,
+            prefetch_declined_guard: inner.prefetch_declined_guard,
+            prefetch_joined: inner.prefetch_joined,
         }
     }
 
@@ -799,6 +933,16 @@ impl ResidencyInner {
         self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
         self.page_ins += 1;
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefetch_issued(&mut self) {
+        self.prefetch_issued += 1;
+        GLOBAL_PREFETCH_ISSUED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefetch_joined(&mut self) {
+        self.prefetch_joined += 1;
+        GLOBAL_PREFETCH_JOINED.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Evict least-recently-used, currently-unreferenced pages until admitting
@@ -936,5 +1080,109 @@ mod tests {
             600,
             "the same budget was charged twice"
         );
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+    fn prefetched_materialized_weight_is_joined_by_demand_page_in() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): prefetch join check did NOT run.");
+            return;
+        };
+        let residency =
+            CudaWeightResidency::new(Arc::clone(&runtime), 1024).with_async_pagein(true);
+        let payload: Arc<[u8]> = Arc::from([9_u8, 8, 7, 6]);
+        let materialized = Arc::clone(&payload);
+        let weight = LazyWeight::new(
+            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
+            DataType::Uint8,
+            vec![4],
+            vec![onnx_runtime_ep_api::ExternalMmapRegion {
+                mapping_id: 0,
+                offset: 0,
+                len: 4,
+            }],
+            move || {
+                onnx_runtime_ep_api::ResidentWeight::new(
+                    DataType::Uint8,
+                    vec![4],
+                    Arc::clone(&materialized),
+                )
+            },
+        )
+        .unwrap();
+
+        residency.prefetch_materialized(7, &weight).unwrap();
+        let prefetched = residency.stats();
+        assert_eq!(prefetched.page_ins, 1);
+        assert_eq!(prefetched.prefetch_issued, 1);
+        assert_eq!(prefetched.prefetch_declined_guard, 0);
+        let page = residency.resident_materialized(7, &weight).unwrap();
+        let joined = residency.stats();
+        assert_eq!(
+            joined.page_ins, 1,
+            "demand page-in must join the prefetch fence, not start a second copy"
+        );
+        assert_eq!(joined.prefetch_joined, 1);
+        let mut observed = [0_u8; 4];
+        unsafe { runtime.dtoh(&mut observed, page.ptr) }.unwrap();
+        assert_eq!(&observed, payload.as_ref());
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+    fn prefetch_guard_declines_when_admission_would_evict() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): prefetch guard check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), 4).with_async_pagein(true);
+        let payload: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
+        let materialized = Arc::clone(&payload);
+        let weight = LazyWeight::new(
+            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
+            DataType::Uint8,
+            vec![4],
+            vec![onnx_runtime_ep_api::ExternalMmapRegion {
+                mapping_id: 0,
+                offset: 0,
+                len: 4,
+            }],
+            move || {
+                onnx_runtime_ep_api::ResidentWeight::new(
+                    DataType::Uint8,
+                    vec![4],
+                    Arc::clone(&materialized),
+                )
+            },
+        )
+        .unwrap();
+        let other_payload: Arc<[u8]> = Arc::from([5_u8, 6, 7, 8]);
+        let other_materialized = Arc::clone(&other_payload);
+        let other = LazyWeight::new(
+            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
+            DataType::Uint8,
+            vec![4],
+            vec![onnx_runtime_ep_api::ExternalMmapRegion {
+                mapping_id: 1,
+                offset: 0,
+                len: 4,
+            }],
+            move || {
+                onnx_runtime_ep_api::ResidentWeight::new(
+                    DataType::Uint8,
+                    vec![4],
+                    Arc::clone(&other_materialized),
+                )
+            },
+        )
+        .unwrap();
+
+        let _resident = residency.resident_materialized(1, &weight).unwrap();
+        residency.prefetch_materialized(2, &other).unwrap();
+        let stats = residency.stats();
+        assert_eq!(stats.prefetch_issued, 0);
+        assert_eq!(stats.prefetch_declined_guard, 1);
+        assert_eq!(stats.evictions, 0, "prefetch guard must not evict");
     }
 }
