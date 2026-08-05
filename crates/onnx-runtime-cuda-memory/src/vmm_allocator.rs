@@ -248,6 +248,70 @@ impl std::fmt::Debug for CudaVmmAllocator {
 }
 
 impl CudaVmmAllocator {
+    /// Reserve `capacity` bytes of device address space, accounting against a
+    /// ledger of this allocator's own.
+    ///
+    /// # Why this exists
+    ///
+    /// The arena has to be in place before anything allocates, and on the
+    /// native path everything allocates while the session loads -- which is
+    /// before the engine's governor reaches the execution provider. An arena
+    /// built at adoption time is installed at the one moment after which
+    /// nothing will ask it for memory, which is what #659 measured as
+    /// `committed 0 B`.
+    ///
+    /// So it starts with a private ledger sized to the device, and
+    /// [`adopt_governor`] moves the claim to the real one once it arrives.
+    /// Allocations before adoption are unguarded, which is exactly what
+    /// `cuMemAlloc` did in that window, so nothing is lost by it.
+    ///
+    /// [`adopt_governor`]: Self::adopt_governor
+    pub fn detached(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+    ) -> Result<Self, MemoryError> {
+        // Sized to the reservation rather than to the device: this ledger is
+        // bookkeeping until the real one arrives, and a limit it could refuse
+        // at would refuse allocations `cuMemAlloc` would have served.
+        let private = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new(u64::MAX, 0, 0),
+        );
+        Self::new(
+            context,
+            device,
+            device_ordinal,
+            capacity,
+            &private,
+            holder,
+            role,
+        )
+    }
+
+    /// Move this arena's claim onto `governor`, reporting the bytes it now
+    /// holds there.
+    ///
+    /// Takes a lease for everything currently committed. If the governor
+    /// refuses, the arena keeps its previous claim and the caller learns the
+    /// shortfall -- the memory is already mapped, so failing here must not
+    /// unmap it.
+    pub fn adopt_governor(
+        &self,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+    ) -> Result<u64, MemoryError> {
+        let mut arena = self.lock();
+        let committed = arena.spans.committed as u64;
+        let lease = governor.reserve(Tier::Device, committed, self.role, holder)?;
+        // Replacing the lease drops the private one, which returns the bytes to
+        // a ledger nobody reads. The real governor now holds them.
+        arena.lease = lease;
+        Ok(committed)
+    }
+
     /// Reserve `capacity` bytes of device address space to allocate from.
     ///
     /// `capacity` costs nothing but address space, so it should be the largest
