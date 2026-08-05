@@ -1374,6 +1374,15 @@ impl InferenceSession {
     /// is one -- otherwise sizes it for itself, which is a second claim on
     /// memory the governor is already dividing up. Returns the bytes now
     /// governed; zero means this provider holds no standing pool.
+    /// Whether the memory behind this session commits physically as it is used.
+    ///
+    /// Answered by the allocator rather than by the backend, so a caller does
+    /// not need to know whether it is holding a native session or an ONNX
+    /// Runtime one -- both reach the same `DeviceAllocator` seam.
+    pub fn commits_on_demand(&self) -> bool {
+        self.exec.commits_on_demand()
+    }
+
     pub fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,

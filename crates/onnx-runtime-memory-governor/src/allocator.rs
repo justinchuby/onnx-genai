@@ -116,6 +116,42 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
 
+    /// Whether this allocator commits physical memory as it is used rather
+    /// than when it is requested.
+    ///
+    /// # Why a consumer needs to know
+    ///
+    /// A component holding memory whose size it knows only as a worst case --
+    /// a KV cache sized at the model's full context, say -- has to choose
+    /// between two bad options when the allocator commits eagerly. Reserve the
+    /// worst case and refuse models that a short conversation would never grow
+    /// into; or reserve nothing and discover the shortfall at an allocation
+    /// mid-generation.
+    ///
+    /// When the allocator commits on demand the choice goes away: memory is
+    /// charged as it is genuinely taken, so the worst case becomes a *ceiling
+    /// to check* rather than a claim to hold. On a small machine that is the
+    /// difference between "this model does not fit" and "this model fits until
+    /// it actually needs the memory".
+    ///
+    /// # Why it lives here and not on an execution provider
+    ///
+    /// The allocator is the thing that commits, and it is the piece every
+    /// backend has. Asking a provider would answer only for the paths that go
+    /// through one; asking the allocator answers for ONNX Runtime too, whose
+    /// `OrtAllocator` seam wraps one of these.
+    ///
+    /// # Contract
+    ///
+    /// `false` is the safe answer and the default: a consumer that believes
+    /// this will under-reserve. Return `true` only when the allocator really
+    /// does map physical memory lazily **and** charges a governor as it does
+    /// so. Saying `true` without the second half turns an accounting question
+    /// into an out-of-memory crash.
+    fn commits_on_demand(&self) -> bool {
+        false
+    }
+
     /// Give back memory this allocator returned.
     ///
     /// # Safety
@@ -185,6 +221,74 @@ impl DeviceAllocator for HostAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `commits_on_demand` is opaque: a caller asks the allocator, not the
+    /// backend.
+    ///
+    /// It lives on this trait rather than on an execution provider because the
+    /// allocator is the thing that commits, and it is the piece every backend
+    /// has. `GovernedAllocator` forwards it, so a session running on ONNX
+    /// Runtime answers the same question the native path does -- which is what
+    /// lets a consumer size a KV cache without knowing which backend it got.
+    #[test]
+    fn an_allocator_reports_whether_it_commits_on_demand() {
+        #[derive(Debug)]
+        struct Stub(bool);
+
+        // SAFETY: never allocates, so the non-overlap and validity guarantees
+        // hold vacuously.
+        impl DeviceAllocator for Stub {
+            fn allocate(&self, _bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
+                Err(MemoryError::InvalidRequest {
+                    tier: "device",
+                    requested: 0,
+                    reason: "test double",
+                })
+            }
+
+            unsafe fn deallocate(&self, _ptr: NonNull<u8>, _bytes: usize, _align: usize) {}
+
+            fn device(&self) -> DeviceKey {
+                DeviceKey::device(0)
+            }
+
+            fn commits_on_demand(&self) -> bool {
+                self.0
+            }
+        }
+
+        #[derive(Debug)]
+        struct Silent;
+
+        // SAFETY: as above.
+        impl DeviceAllocator for Silent {
+            fn allocate(&self, _bytes: usize, _align: usize) -> Result<NonNull<u8>, MemoryError> {
+                Err(MemoryError::InvalidRequest {
+                    tier: "device",
+                    requested: 0,
+                    reason: "test double",
+                })
+            }
+
+            unsafe fn deallocate(&self, _ptr: NonNull<u8>, _bytes: usize, _align: usize) {}
+
+            fn device(&self) -> DeviceKey {
+                DeviceKey::device(0)
+            }
+        }
+
+        assert!(
+            !Silent.commits_on_demand(),
+            "an allocator that says nothing must be treated as committing eagerly: a consumer \
+             that believes otherwise will under-reserve"
+        );
+
+        // Through a trait object, which is how every real consumer holds one.
+        let lazy: &dyn DeviceAllocator = &Stub(true);
+        let eager: &dyn DeviceAllocator = &Stub(false);
+        assert!(lazy.commits_on_demand());
+        assert!(!eager.commits_on_demand());
+    }
 
     /// The host allocator honours the alignment it is asked for, whatever the
     /// size. Kernels are entitled to assume it.
