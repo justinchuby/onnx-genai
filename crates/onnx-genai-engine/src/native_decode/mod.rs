@@ -481,6 +481,15 @@ impl NativeDecodeSession {
         Ok((bytes, tier))
     }
 
+    /// Whether this session's execution provider commits device memory as it
+    /// is used rather than when it is requested.
+    ///
+    /// Decides whether a worst-case figure -- KV at the model's full context,
+    /// for instance -- has to be *held* or merely *checked*.
+    pub fn commits_on_demand(&self) -> bool {
+        self.session.commits_on_demand()
+    }
+
     /// Bytes of KV this session's past/present tensors hold at full context,
     /// with the tier they are actually allocated on.
     ///
