@@ -29,14 +29,28 @@ const HOLDER: HolderId = HolderId::new(21);
 /// An allocator over `capacity` bytes of address space, and the ledger behind
 /// it, or `None` on a machine with no driver.
 fn allocator(capacity: usize, device_bytes: u64) -> Option<(CudaVmmAllocator, LedgerGovernor)> {
-    let context = match CudaContext::new(0) {
-        Ok(context) => context,
-        Err(error) => {
-            eprintln!(
-                "SKIPPED (no CUDA driver): {error}. These tests verify the VMM device \
-                 allocator and did NOT run."
-            );
-            return None;
+    let context = {
+        // `CudaContext::new` panics rather than returning `Err` when cudarc
+        // cannot load the driver library, so a `match` on its `Result` never
+        // reaches the error arm on a machine with no GPU. See the note in
+        // `virtual_memory_gpu.rs`.
+        let attempt = std::panic::catch_unwind(|| CudaContext::new(0));
+        match attempt {
+            Ok(Ok(context)) => context,
+            Ok(Err(error)) => {
+                eprintln!(
+                    "SKIPPED (no CUDA device): {error}. These tests verify the VMM device \
+                     allocator and did NOT run."
+                );
+                return None;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIPPED (no CUDA driver library): cudarc panicked loading libcuda. \
+                     These tests verify the VMM device allocator and did NOT run."
+                );
+                return None;
+            }
         }
     };
     let governor = LedgerGovernor::new(LeaseLedger::new(device_bytes, 0, 0));

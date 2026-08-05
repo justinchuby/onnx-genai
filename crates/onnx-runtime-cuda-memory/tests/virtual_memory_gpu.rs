@@ -26,14 +26,39 @@ const HOLDER: HolderId = HolderId::new(11);
 /// here would make these tests skip on a machine that can run them perfectly
 /// well, which is how a suite ends up green while proving nothing.
 fn backing() -> Option<CudaVirtualBacking> {
-    match CudaContext::new(0) {
-        Ok(context) => Some(CudaVirtualBacking::new(context, 0)),
-        Err(error) => {
-            // Loud on purpose: a skip that reads like a pass is worse than a
-            // failure, because nobody investigates it.
+    cuda_context().map(|context| CudaVirtualBacking::new(context, 0))
+}
+
+/// A CUDA context, or `None` when the driver cannot be loaded.
+///
+/// # Why this catches a panic
+///
+/// `CudaContext::new` does not return `Err` when the driver library is
+/// missing -- cudarc's dynamic loading panics. So a `match` on its `Result`
+/// never reaches the error arm on a machine with no GPU, and the test fails
+/// instead of skipping.
+///
+/// That went unnoticed because these tests lived in `onnx-runtime-ep-cuda`,
+/// which CI runs clippy over but deliberately does not test. They ran for the
+/// first time when this crate joined the test list, and failed immediately.
+/// The skip guard had never actually been exercised.
+fn cuda_context() -> Option<std::sync::Arc<CudaContext>> {
+    let attempt = std::panic::catch_unwind(|| CudaContext::new(0));
+    match attempt {
+        Ok(Ok(context)) => Some(context),
+        // Loud on purpose: a skip that reads like a pass is worse than a
+        // failure, because nobody investigates it (#636).
+        Ok(Err(error)) => {
             eprintln!(
-                "SKIPPED (no CUDA driver): {error}. These tests verify device \
+                "SKIPPED (no CUDA device): {error}. These tests verify device \
                  virtual memory and did NOT run."
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "SKIPPED (no CUDA driver library): cudarc panicked loading libcuda. \
+                 These tests verify device virtual memory and did NOT run."
             );
             None
         }
