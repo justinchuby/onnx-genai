@@ -113,8 +113,6 @@ impl Executor {
     ) {
         if measure {
             self.update_activation_memory_plan_stats(resolved);
-        } else {
-            self.activation_memory_plan = None;
         }
     }
 

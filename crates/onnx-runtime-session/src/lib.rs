@@ -1101,10 +1101,12 @@ impl InferenceSession {
 
     /// Most recent activation-memory planner measurement.
     ///
-    /// Populated only by measured top-level runs, after concrete shapes and
-    /// zero-copy view aliases are known. The planner's `naive_bytes` is an
-    /// upper-bound activation-owner baseline, not the executor's exact current
-    /// allocation behavior (in-place aliases and sequences can allocate less).
+    /// Populated only by measured top-level eager runs, after concrete shapes
+    /// and zero-copy view aliases are known. Stage-2 replay and nested runs skip
+    /// re-planning and leave the last measured result. The planner's
+    /// `naive_bytes` is an upper-bound activation-owner baseline, not the
+    /// executor's exact current allocation behavior (in-place aliases and
+    /// sequences can allocate less).
     pub fn activation_memory_plan_stats(&self) -> Option<ActivationMemoryPlanStats> {
         self.exec.activation_memory_plan_stats()
     }
