@@ -5,8 +5,8 @@
 //! asserts the CUDA `BlockQuantizedMoE` kernel reproduces it within tolerance.
 //! The suite covers multiple experts, top-k routing (`k=1` and `k>1`), a single
 //! expert, optional biases, router-weight aggregation, and the relu/gelu/silu/
-//! identity/swiglu activation paths (fused and unfused). All cases graceful-skip
-//! when no CUDA device is available.
+//! identity/swiglu activation paths (fused and unfused). CPU-only CI reports
+//! these as ignored unless `gpu-tests` is enabled.
 
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
@@ -52,13 +52,15 @@ impl HostTensor {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -391,9 +393,13 @@ fn check_case(ep: &CudaExecutionProvider, config: &Config, seed: u64, label: &st
     assert_close(&actual, &expected, label);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_moe_matches_cpu_across_activations() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let base = Config {
         rows: 5,
         hidden: 64,
@@ -420,9 +426,13 @@ fn block_quantized_moe_matches_cpu_across_activations() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_moe_matches_cpu_for_swiglu_variants() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // Unfused SwiGLU (fc1 gate + fc3 linear) and both fused layouts.
     for (fusion, label) in [
         (0usize, "swiglu-unfused"),
@@ -445,9 +455,13 @@ fn block_quantized_moe_matches_cpu_for_swiglu_variants() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_moe_matches_cpu_for_routing_edge_cases() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
 
     // k = 1 top-1 routing across several experts.
     check_case(
@@ -507,9 +521,13 @@ fn block_quantized_moe_matches_cpu_for_routing_edge_cases() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_moe_matches_cpu_with_router_weight_aggregation() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     check_case(
         &ep,
         &Config {
@@ -529,9 +547,13 @@ fn block_quantized_moe_matches_cpu_with_router_weight_aggregation() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn block_quantized_moe_claim_gate_matches_implemented_config() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let config = Config {
         rows: 2,
         hidden: 64,

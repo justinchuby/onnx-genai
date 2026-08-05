@@ -17,7 +17,7 @@
 //!   `nonpad_kv_seqlen` input, demonstrating the packed `cu_seqlens` is the
 //!   exclusive prefix sum of the padded per-batch valid lengths.
 //!
-//! Tests skip cleanly when no CUDA device is present. Run with:
+//! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled. Run with:
 //! `CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda \
 //!   --test packed_varlen_attention_gpu -- --nocapture`
 
@@ -89,13 +89,15 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
+fn require_cuda() -> CudaExecutionProvider {
+    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => panic!(
+            "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
+        ),
+        Err(_) => panic!(
+            "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
+        ),
     }
 }
 
@@ -365,9 +367,13 @@ impl Batch {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_matches_per_sequence_reference_causal() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // Mixed lengths including a length-1 (degenerate single-token) sequence.
     let batch = Batch::new(3, 3, 8, 8, &[3, 1, 5, 2]);
     let packed = batch.run_packed(&ep, true, false);
@@ -380,9 +386,13 @@ fn packed_matches_per_sequence_reference_causal() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_matches_per_sequence_reference_non_causal() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     let batch = Batch::new(2, 2, 6, 6, &[4, 2, 3]);
     let packed = batch.run_packed(&ep, false, false);
     let reference = batch.run_per_sequence_reference(&ep, false);
@@ -394,9 +404,13 @@ fn packed_matches_per_sequence_reference_non_causal() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_single_sequence_degenerate() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // A single sequence must behave exactly like plain single-batch attention.
     let batch = Batch::new(4, 4, 8, 8, &[7]);
     let packed = batch.run_packed(&ep, true, false);
@@ -409,9 +423,13 @@ fn packed_single_sequence_degenerate() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_gqa_non_causal() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // Grouped-query attention: 4 query heads share 2 KV heads (group = 2).
     let batch = Batch::new(4, 2, 8, 8, &[5, 3, 4]);
     let packed = batch.run_packed(&ep, false, false);
@@ -421,9 +439,13 @@ fn packed_gqa_non_causal() {
     assert!(diff < 1e-4, "packed GQA attention diverged: {diff}");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_all_equal_lengths_match_dense_batched_padded() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // All sequences the same length: the packed batch equals a dense
     // (padding-free) rectangular batch, so it must match the padded kernel run
     // as one `[B, L, hidden]` batched Attention.
@@ -470,9 +492,13 @@ fn packed_all_equal_lengths_match_dense_batched_padded() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_matches_padded_nonpad_kv_seqlen_non_causal() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // Demonstrate consuming the opset-24 `nonpad_kv_seqlen`: build a PADDED
     // batch whose per-sequence valid lengths are the packed cu_seqlens deltas,
     // run the padded `Attention` with `nonpad_kv_seqlen`, and compare its VALID
@@ -552,9 +578,13 @@ fn packed_matches_padded_nonpad_kv_seqlen_non_causal() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn packed_fp16_matches_per_sequence_reference_causal() {
-    let Some(ep) = gpu() else { return };
+    let ep = require_cuda();
     // fp16 storage with fp32 accumulation: compare against the f32 per-sequence
     // reference within an fp16 attention tolerance.
     let batch = Batch::new(2, 2, 8, 8, &[4, 2, 3]);
