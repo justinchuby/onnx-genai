@@ -697,6 +697,15 @@ impl Backend {
                         kv_pages: budget.total_pages,
                         kv_page_bytes: budget.kv_bytes.checked_div(budget.total_pages).unwrap_or(0),
                     }),
+                    activation_plan: engine.activation_memory_plan_stats().map(|stats| {
+                        profile::ActivationPlanMemory {
+                            complete: stats.complete,
+                            peak_bytes: stats.peak_bytes,
+                            naive_bytes: stats.naive_bytes,
+                            savings_ratio: stats.savings_ratio,
+                            unknown_sizes: stats.unknown_sizes,
+                        }
+                    }),
                 })
             }
             Self::Pipeline(_) => None,

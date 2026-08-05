@@ -1177,6 +1177,21 @@ impl Engine {
         self.decode_backend
     }
 
+    /// Latest native activation-memory planner measurement, if the current
+    /// backend is native and has executed far enough to resolve concrete shapes.
+    pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.native_session
+                .as_ref()
+                .and_then(crate::native_decode::NativeDecodeSession::activation_memory_plan_stats)
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
     /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
     pub fn fim_config(&self) -> Option<&FimConfig> {
         self.fim_config.as_ref()

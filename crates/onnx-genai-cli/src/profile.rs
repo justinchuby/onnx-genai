@@ -566,6 +566,19 @@ pub(crate) struct MemoryUsage {
     /// "how much" but never "why", which is the question when a model does not
     /// fit: weights are fixed, but the KV budget is what a longer context eats.
     pub(crate) composition: Option<DeviceComposition>,
+    /// Latest native activation planner result. This is separate from the
+    /// device-reservation breakdown: it measures what activation sharing would
+    /// save inside the executor, even before the allocator uses it.
+    pub(crate) activation_plan: Option<ActivationPlanMemory>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ActivationPlanMemory {
+    pub(crate) complete: bool,
+    pub(crate) peak_bytes: u64,
+    pub(crate) naive_bytes: u64,
+    pub(crate) savings_ratio: f64,
+    pub(crate) unknown_sizes: usize,
 }
 
 /// How the device memory ceiling is divided.
@@ -608,6 +621,7 @@ impl MemoryUsage {
             && self.host_ram_used_bytes.is_none()
             && self.device_used_bytes.is_none()
             && self.composition.is_none()
+            && self.activation_plan.is_none()
     }
 }
 
@@ -879,6 +893,24 @@ impl RunProfile {
                     format_bytes(device)
                 );
             }
+            if let Some(plan) = self.memory.activation_plan {
+                if plan.complete {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} vs {} ({:.1}% saved)",
+                        "activation plan",
+                        format_bytes(plan.peak_bytes),
+                        format_bytes(plan.naive_bytes),
+                        plan.savings_ratio * 100.0
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} deferred ({} unknown sizes)",
+                        "activation plan", plan.unknown_sizes
+                    );
+                }
+            }
         }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
@@ -1059,6 +1091,16 @@ impl RunProfile {
             fields.push(format!(
                 "\"device_memory_breakdown\":{{{}}}",
                 parts.join(",")
+            ));
+        }
+        if let Some(plan) = self.memory.activation_plan {
+            fields.push(format!(
+                "\"activation_memory_plan\":{{\"complete\":{},\"peak_bytes\":{},\"naive_bytes\":{},\"savings_ratio\":{:.6},\"unknown_sizes\":{}}}",
+                plan.complete,
+                plan.peak_bytes,
+                plan.naive_bytes,
+                plan.savings_ratio,
+                plan.unknown_sizes
             ));
         }
         format!("{{{}}}", fields.join(","))
