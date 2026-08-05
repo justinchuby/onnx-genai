@@ -17,8 +17,6 @@
 //! tests do — a skip that reads like a pass is how 44 tests went unnoticed
 //! (#636).
 
-use std::sync::Arc;
-
 use cudarc::driver::CudaContext;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
