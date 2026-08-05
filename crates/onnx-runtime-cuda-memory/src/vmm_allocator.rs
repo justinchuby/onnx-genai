@@ -459,6 +459,25 @@ impl DeviceAllocator for CudaVmmAllocator {
 
 impl Drop for CudaVmmAllocator {
     fn drop(&mut self) {
+        // Report what was actually mapped. Without this the arena's whole
+        // premise -- that reserved address space is large and committed memory
+        // is small -- is unfalsifiable from outside: `committed_and_reserved`
+        // exists but nothing calls it, so "is this doing anything?" has no
+        // answer short of a debugger.
+        let (committed, reserved, granularity) = {
+            let arena = self.lock();
+            (
+                arena.spans.committed,
+                arena.spans.capacity(),
+                arena.spans.granularity,
+            )
+        };
+        eprintln!(
+            "cuda_ep: VMM arena closing: committed {committed} B of {reserved} B reserved \
+             ({} granules of {granularity} B)",
+            committed / granularity.max(1),
+        );
+
         // The reservation's own `Drop` unmaps and frees every block, so the
         // only thing left is to stop the ledger believing the granules are
         // still held. Shrinking to zero does that; the lease's own `Drop`
