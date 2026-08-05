@@ -2,7 +2,9 @@ mod common;
 
 use common::{FloatDType, Tensor, float_values, make_kernel};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use onnx_runtime_ir::Attribute;
+use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
+use onnx_runtime_ep_cpu::CpuExecutionProvider;
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 const FLOAT_DTYPES: [FloatDType; 3] = [FloatDType::F32, FloatDType::F16, FloatDType::Bf16];
@@ -207,11 +209,198 @@ fn bench_matmul(c: &mut Criterion) {
     group.finish();
 }
 
+fn block_quantized_matmul_kernel(k: usize, n: usize) -> Box<dyn Kernel> {
+    let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
+    node.domain = "pkg.nxrt".into();
+    node.attributes.insert("K".into(), Attribute::Int(k as i64));
+    node.attributes.insert("N".into(), Attribute::Int(n as i64));
+    node.attributes
+        .insert("format".into(), Attribute::String(b"mxfp4".to_vec()));
+    node.attributes
+        .insert("block_layout_version".into(), Attribute::Int(1));
+    CpuExecutionProvider::new()
+        .get_kernel(&node, &[], 1)
+        .expect("CPU EP must register BlockQuantizedMatMul")
+}
+
+fn packed_mxfp4(n: usize, k: usize) -> Vec<u8> {
+    const MXFP4_BLOCK_BYTES: usize = 17;
+    let blocks = k.div_ceil(32);
+    let mut packed = vec![0u8; n * blocks * MXFP4_BLOCK_BYTES];
+    for output in 0..n {
+        for block in 0..blocks {
+            let start = (output * blocks + block) * MXFP4_BLOCK_BYTES;
+            packed[start] = 127;
+            for byte in 0..16 {
+                let low = ((output + block + byte) & 0x0f) as u8;
+                let high = ((output * 3 + block + byte) & 0x0f) as u8;
+                packed[start + 1 + byte] = low | (high << 4);
+            }
+        }
+    }
+    packed
+}
+
+fn packed_mxfp4_experts(experts: usize, out_features: usize, in_features: usize) -> Vec<u8> {
+    packed_mxfp4(experts * out_features, in_features)
+}
+
+fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block_quantized_matmul_cached_dense");
+    group.sample_size(15);
+    let (m, k, n) = (1usize, 1_024usize, 1_024usize);
+    let blocks = k.div_ceil(32);
+    let packed = packed_mxfp4(n, k);
+    let a = Tensor::floats(FloatDType::F32, &[m, k], &float_values(m * k));
+    let b = Tensor::u8(&[n, blocks, 17], &packed);
+    group.throughput(Throughput::Elements((m * n) as u64));
+
+    let mut uncached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
+    let uncached_kernel = block_quantized_matmul_kernel(k, n);
+    group.bench_function(
+        BenchmarkId::new("mxfp4_uncached_dequant_each_call", format!("{m}x{k}x{n}")),
+        |bencher| {
+            bencher.iter(|| {
+                uncached_kernel
+                    .execute(
+                        black_box(&[a.view(), b.view()]),
+                        black_box(&mut [uncached_output.view_mut()]),
+                    )
+                    .unwrap()
+            });
+        },
+    );
+
+    let mut cached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
+    let mut cached_kernel = block_quantized_matmul_kernel(k, n);
+    cached_kernel.set_constant_inputs(&[false, true]);
+    cached_kernel
+        .execute(&[a.view(), b.view()], &mut [cached_output.view_mut()])
+        .expect("prewarm cached dense weight");
+    group.bench_function(
+        BenchmarkId::new("mxfp4_cached_dense_repeated_call", format!("{m}x{k}x{n}")),
+        |bencher| {
+            bencher.iter(|| {
+                cached_kernel
+                    .execute(
+                        black_box(&[a.view(), b.view()]),
+                        black_box(&mut [cached_output.view_mut()]),
+                    )
+                    .unwrap()
+            });
+        },
+    );
+    group.finish();
+}
+
+fn block_quantized_moe_kernel(top_k: usize) -> Box<dyn Kernel> {
+    let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", vec![], vec![]);
+    node.domain = "pkg.nxrt".into();
+    node.attributes
+        .insert("k".into(), Attribute::Int(top_k as i64));
+    node.attributes.insert(
+        "activation_type".into(),
+        Attribute::String(b"identity".to_vec()),
+    );
+    node.attributes
+        .insert("format".into(), Attribute::String(b"mxfp4".to_vec()));
+    node.attributes
+        .insert("block_layout_version".into(), Attribute::Int(1));
+    CpuExecutionProvider::new()
+        .get_kernel(&node, &[], 1)
+        .expect("CPU EP must register BlockQuantizedMoE")
+}
+
+fn bench_block_quantized_moe_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block_quantized_moe_cached_dense");
+    group.sample_size(15);
+    let (rows, hidden, inter, experts, top_k) = (1usize, 256usize, 256usize, 4usize, 1usize);
+    let hidden_blocks = hidden.div_ceil(32);
+    let inter_blocks = inter.div_ceil(32);
+    let input = Tensor::floats(
+        FloatDType::F32,
+        &[rows, hidden],
+        &float_values(rows * hidden),
+    );
+    let logits = Tensor::floats(FloatDType::F32, &[rows, experts], &[4.0, -1.0, -2.0, -3.0]);
+    let fc1_values = packed_mxfp4_experts(experts, inter, hidden);
+    let fc2_values = packed_mxfp4_experts(experts, hidden, inter);
+    let fc1 = Tensor::u8(&[experts, inter, hidden_blocks, 17], &fc1_values);
+    let fc2 = Tensor::u8(&[experts, hidden, inter_blocks, 17], &fc2_values);
+    group.throughput(Throughput::Elements((rows * hidden) as u64));
+
+    let mut uncached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
+    let uncached_kernel = block_quantized_moe_kernel(top_k);
+    group.bench_function(
+        BenchmarkId::new(
+            "mxfp4_uncached_expert_dequant_each_call",
+            format!("rows={rows},H={hidden},I={inter},E={experts},top_k={top_k}"),
+        ),
+        |bencher| {
+            bencher.iter(|| {
+                uncached_kernel
+                    .execute(
+                        black_box(&[
+                            input.view(),
+                            logits.view(),
+                            fc1.view(),
+                            onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+                            fc2.view(),
+                        ]),
+                        black_box(&mut [uncached_output.view_mut()]),
+                    )
+                    .unwrap()
+            });
+        },
+    );
+
+    let mut cached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
+    let mut cached_kernel = block_quantized_moe_kernel(top_k);
+    cached_kernel.set_constant_inputs(&[false, false, true, false, true]);
+    cached_kernel
+        .execute(
+            &[
+                input.view(),
+                logits.view(),
+                fc1.view(),
+                onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+                fc2.view(),
+            ],
+            &mut [cached_output.view_mut()],
+        )
+        .expect("prewarm cached expert weights");
+    group.bench_function(
+        BenchmarkId::new(
+            "mxfp4_cached_dense_expert_repeated_call",
+            format!("rows={rows},H={hidden},I={inter},E={experts},top_k={top_k}"),
+        ),
+        |bencher| {
+            bencher.iter(|| {
+                cached_kernel
+                    .execute(
+                        black_box(&[
+                            input.view(),
+                            logits.view(),
+                            fc1.view(),
+                            onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+                            fc2.view(),
+                        ]),
+                        black_box(&mut [cached_output.view_mut()]),
+                    )
+                    .unwrap()
+            });
+        },
+    );
+    group.finish();
+}
+
 criterion_group!(
     kernel_benches,
     bench_add,
     bench_reduce_mean,
     bench_gather,
-    bench_matmul
+    bench_matmul,
+    bench_block_quantized_matmul_cache,
+    bench_block_quantized_moe_cache
 );
 criterion_main!(kernel_benches);

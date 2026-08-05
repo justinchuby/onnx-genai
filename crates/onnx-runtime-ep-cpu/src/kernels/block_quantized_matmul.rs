@@ -4,9 +4,12 @@
 //! decoding follows OCP MX E2M1/E8M0 and llama.cpp's `block_mxfp4`; IQ
 //! decoding follows llama.cpp's native super-block layouts and audited grids.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_quantization::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XS_SIGNS, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID,
@@ -38,6 +41,11 @@ const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
 const IQ1_S_DELTA: f32 = 0.125;
 const IQ1_M_DELTA: f32 = 0.125;
+const DEFAULT_DENSE_WEIGHT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const DENSE_WEIGHT_CACHE_BYTES_ENV: &str = "ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES";
+
+pub static BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
+pub static BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
 
 // SIMD decoder uses doubled E2M1 integers with half the shared E8M0 scale.
 #[cfg(target_arch = "x86_64")]
@@ -50,7 +58,7 @@ const IQ4_NL_CODEBOOK: [i8; 16] = [
 
 // Vendored byte-for-byte from llama.cpp commit b15ca938, ggml-common.h.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum BlockFormat {
     Mxfp4,
     Iq4Nl,
@@ -147,7 +155,7 @@ pub struct BlockQuantizedMatMulKernel {
     n: usize,
     format: BlockFormat,
     packed_b_constant: bool,
-    weight_kn: OnceLock<Vec<f32>>,
+    weight_cache: DenseWeightCache,
 }
 
 pub struct BlockQuantizedMatMulFactory;
@@ -175,7 +183,7 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             n,
             format,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         }))
     }
 }
@@ -229,19 +237,30 @@ impl Kernel for BlockQuantizedMatMulKernel {
         };
 
         let activations = to_dense_f32_widen(OP, &inputs[0])?;
+        let packed_b = to_dense_bytes(&inputs[1])?;
         let owned_weight;
+        let cached_weight;
         let weight_kn = if self.packed_b_constant {
-            if let Some(weight) = self.weight_kn.get() {
-                weight
-            } else {
-                let weight = self.dequantize_weight_kn(&inputs[1])?;
-                let _ = self.weight_kn.set(weight);
-                self.weight_kn
-                    .get()
-                    .expect("constant block-quantized weight was just initialized")
+            let key = DenseWeightCacheKey::from_tensor(
+                &inputs[1],
+                &packed_b,
+                self.format,
+                self.k,
+                self.n,
+                0,
+            );
+            let (weight, status) = self.weight_cache.get_or_insert_with(key, || {
+                BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+                dequantize_weight_kn(self.format, self.k, self.n, &packed_b)
+            })?;
+            if matches!(status, DenseWeightCacheStatus::Hit) {
+                BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
             }
+            cached_weight = weight;
+            cached_weight.as_slice()
         } else {
-            owned_weight = self.dequantize_weight_kn(&inputs[1])?;
+            BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+            owned_weight = dequantize_weight_kn(self.format, self.k, self.n, &packed_b)?;
             &owned_weight
         };
 
@@ -282,10 +301,217 @@ fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
 }
 
 impl BlockQuantizedMatMulKernel {
+    #[cfg(test)]
     fn dequantize_weight_kn(&self, packed: &TensorView) -> Result<Vec<f32>> {
         let packed = to_dense_bytes(packed)?;
+        BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
         dequantize_weight_kn(self.format, self.k, self.n, &packed)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DenseWeightCacheKey {
+    format: BlockFormat,
+    in_features: usize,
+    out_features: usize,
+    role: u8,
+    shape: Vec<usize>,
+    byte_len: usize,
+    content_hash: u64,
+    source: DenseWeightSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DenseWeightSource {
+    ExternalMmap {
+        mapping_id: usize,
+        offset: usize,
+        len: usize,
+    },
+    HostView {
+        ptr: usize,
+        byte_offset: usize,
+        len: usize,
+    },
+}
+
+impl DenseWeightCacheKey {
+    pub(super) fn from_tensor(
+        view: &TensorView,
+        dense_bytes: &[u8],
+        format: BlockFormat,
+        in_features: usize,
+        out_features: usize,
+        role: u8,
+    ) -> Self {
+        let source = match view.backing {
+            TensorBacking::ExternalMmap(region) => DenseWeightSource::ExternalMmap {
+                mapping_id: region.mapping_id,
+                offset: region.offset.saturating_add(view.byte_offset),
+                len: region.len,
+            },
+            TensorBacking::Opaque => DenseWeightSource::HostView {
+                ptr: view.data_ptr::<u8>() as usize,
+                byte_offset: view.byte_offset,
+                len: view.byte_size(),
+            },
+        };
+        Self {
+            format,
+            in_features,
+            out_features,
+            role,
+            shape: view.shape.to_vec(),
+            byte_len: dense_bytes.len(),
+            content_hash: stable_bytes_hash(dense_bytes),
+            source,
+        }
+    }
+
+    pub(super) fn for_expert(
+        &self,
+        role: u8,
+        expert: usize,
+        in_features: usize,
+        out_features: usize,
+        expert_bytes: &[u8],
+    ) -> Self {
+        let mut key = self.clone();
+        key.role = role;
+        key.in_features = in_features;
+        key.out_features = out_features;
+        key.shape = vec![expert, out_features, in_features.div_ceil(key.format.qk())];
+        key.byte_len = expert_bytes.len();
+        key.content_hash = stable_bytes_hash(expert_bytes);
+        key
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DenseWeightCacheStatus {
+    Hit,
+    MissStored,
+    MissNotStored,
+}
+
+#[derive(Default)]
+pub(super) struct DenseWeightCache {
+    max_bytes: Option<usize>,
+    inner: Mutex<DenseWeightCacheInner>,
+}
+
+#[derive(Default)]
+struct DenseWeightCacheInner {
+    used_bytes: usize,
+    tick: u64,
+    entries: Vec<DenseWeightCacheEntry>,
+}
+
+struct DenseWeightCacheEntry {
+    key: DenseWeightCacheKey,
+    value: Arc<Vec<f32>>,
+    bytes: usize,
+    last_used: u64,
+}
+
+impl DenseWeightCache {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_limit(limit_bytes: usize) -> Self {
+        Self {
+            max_bytes: Some(limit_bytes),
+            inner: Mutex::new(DenseWeightCacheInner {
+                used_bytes: 0,
+                tick: 0,
+                entries: Vec::new(),
+            }),
+        }
+    }
+
+    pub(super) fn get_or_insert_with(
+        &self,
+        key: DenseWeightCacheKey,
+        build: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Result<(Arc<Vec<f32>>, DenseWeightCacheStatus)> {
+        let max_bytes = self.max_bytes.unwrap_or_else(dense_weight_cache_bytes);
+        self.get_or_insert_with_limit(key, max_bytes, build)
+    }
+
+    fn get_or_insert_with_limit(
+        &self,
+        key: DenseWeightCacheKey,
+        max_bytes: usize,
+        build: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Result<(Arc<Vec<f32>>, DenseWeightCacheStatus)> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("BlockQuantized dense cache lock poisoned");
+        let next_tick = inner.tick.wrapping_add(1);
+        inner.tick = next_tick;
+        if let Some(index) = inner.entries.iter().position(|entry| entry.key == key) {
+            let entry = &mut inner.entries[index];
+            entry.last_used = next_tick;
+            return Ok((Arc::clone(&entry.value), DenseWeightCacheStatus::Hit));
+        }
+
+        let value = Arc::new(build()?);
+        let bytes = value
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| error("cached dense weight byte count overflow"))?;
+        if max_bytes == 0 || bytes > max_bytes {
+            return Ok((value, DenseWeightCacheStatus::MissNotStored));
+        }
+        while inner.used_bytes.saturating_add(bytes) > max_bytes {
+            let Some((oldest, _)) = inner
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                break;
+            };
+            let removed = inner.entries.remove(oldest);
+            inner.used_bytes = inner.used_bytes.saturating_sub(removed.bytes);
+        }
+        inner.used_bytes = inner.used_bytes.saturating_add(bytes);
+        inner.entries.push(DenseWeightCacheEntry {
+            key,
+            value: Arc::clone(&value),
+            bytes,
+            last_used: next_tick,
+        });
+        Ok((value, DenseWeightCacheStatus::MissStored))
+    }
+
+    #[cfg(test)]
+    pub(super) fn stats(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.entries.len(), inner.used_bytes)
+    }
+}
+
+fn dense_weight_cache_bytes() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var(DENSE_WEIGHT_CACHE_BYTES_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_DENSE_WEIGHT_CACHE_BYTES)
+    })
+}
+
+fn stable_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 pub(super) fn dequantize_weight_kn(
@@ -858,7 +1084,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = kernel.dequantize_weight_kn(&view.view()).unwrap();
         let values = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -949,7 +1175,7 @@ mod tests {
             n,
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let weight = kernel.dequantize_weight_kn(&packed_weight.view()).unwrap();
 
@@ -1005,7 +1231,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq4Nl,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let expected: Vec<f32> = IQ4_NL_CODEBOOK
@@ -1044,7 +1270,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq4Xs,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = Vec::with_capacity(IQ_SUPER_QK);
@@ -1071,7 +1297,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq3S,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = vec![0.0; IQ_SUPER_QK];
@@ -1103,7 +1329,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq3Xxs,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let group = [
@@ -1135,7 +1361,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq2S,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let group = [
@@ -1168,7 +1394,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq2Xs,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let group = [
@@ -1199,7 +1425,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq2Xxs,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let sign_masks = [0u8, 129, 130, 3];
@@ -1240,7 +1466,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq1S,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = vec![-1.75; IQ_SUPER_QK];
@@ -1266,7 +1492,7 @@ mod tests {
             n: 1,
             format: BlockFormat::Iq1M,
             packed_b_constant: false,
-            weight_kn: OnceLock::new(),
+            weight_cache: DenseWeightCache::new(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = vec![-1.75; IQ_SUPER_QK];
@@ -1382,6 +1608,243 @@ mod tests {
         }
     }
 
+    fn packed_smoke_matrix(format: BlockFormat, n: usize) -> (usize, Vec<u8>) {
+        let k = format.qk();
+        let block_bytes = format.block_bytes();
+        let mut packed = vec![0u8; n * block_bytes];
+        for output in 0..n {
+            let block = &mut packed[output * block_bytes..][..block_bytes];
+            match format {
+                BlockFormat::Mxfp4 => {
+                    block[0] = 127;
+                    for (index, byte) in block[1..].iter_mut().enumerate() {
+                        *byte = ((index as u8) & 0x0f) | (((15 - index as u8) & 0x0f) << 4);
+                    }
+                }
+                BlockFormat::Iq1M => {}
+                _ => block[..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes()),
+            }
+        }
+        (k, packed)
+    }
+
+    #[test]
+    fn cached_dense_matches_uncached_for_supported_formats_and_activation_dtypes() {
+        let n = 2usize;
+        for format in [
+            BlockFormat::Mxfp4,
+            BlockFormat::Iq4Nl,
+            BlockFormat::Iq4Xs,
+            BlockFormat::Iq3S,
+            BlockFormat::Iq3Xxs,
+            BlockFormat::Iq2S,
+            BlockFormat::Iq2Xs,
+            BlockFormat::Iq2Xxs,
+            BlockFormat::Iq1S,
+            BlockFormat::Iq1M,
+        ] {
+            let (k, packed) = packed_smoke_matrix(format, n);
+            let activations: Vec<f32> = (0..k)
+                .map(|index| ((index * 7 % 23) as f32 - 11.0) / 16.0)
+                .collect();
+            let packed_b = Owned::u8(&[n, 1, format.block_bytes()], &packed);
+            for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+                let activation = match dtype {
+                    DataType::Float32 => Owned::f32(&[1, k], &activations),
+                    DataType::Float16 => Owned::f16(&[1, k], &activations),
+                    DataType::BFloat16 => Owned::bf16(&[1, k], &activations),
+                    _ => unreachable!(),
+                };
+                let uncached = BlockQuantizedMatMulKernel {
+                    k,
+                    n,
+                    format,
+                    packed_b_constant: false,
+                    weight_cache: DenseWeightCache::new(),
+                };
+                let mut expected = Owned::zeros(dtype, &[1, n]);
+                uncached
+                    .execute(
+                        &[activation.view(), packed_b.view()],
+                        &mut [expected.view_mut()],
+                    )
+                    .unwrap();
+
+                let mut cached = BlockQuantizedMatMulKernel {
+                    k,
+                    n,
+                    format,
+                    packed_b_constant: false,
+                    weight_cache: DenseWeightCache::new(),
+                };
+                cached.set_constant_inputs(&[false, true]);
+                let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
+                let mut actual = Owned::zeros(dtype, &[1, n]);
+                cached
+                    .execute(
+                        &[activation.view(), packed_b.view()],
+                        &mut [actual.view_mut()],
+                    )
+                    .unwrap();
+                cached
+                    .execute(
+                        &[activation.view(), packed_b.view()],
+                        &mut [actual.view_mut()],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    cached.weight_cache.stats().0,
+                    1,
+                    "{format:?}/{dtype:?} should reuse one cached dense matrix"
+                );
+                assert!(
+                    BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed) > hits_before,
+                    "{format:?}/{dtype:?} should hit cached-dense on the second call"
+                );
+                for (index, (actual, expected)) in actual
+                    .to_f32()
+                    .into_iter()
+                    .zip(expected.to_f32())
+                    .enumerate()
+                {
+                    assert!(
+                        actual.to_bits() == expected.to_bits() || (actual - expected).abs() <= 1e-5,
+                        "{format:?}/{dtype:?} element {index}: cached {actual} != uncached {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constant_mxfp4_weight_uses_bounded_cached_dense_path() {
+        let (m, k, n) = (2usize, 32usize, 2usize);
+        let mut packed = vec![0u8; n * MXFP4_BLOCK_BYTES];
+        for output in 0..n {
+            let block = &mut packed[output * MXFP4_BLOCK_BYTES..][..MXFP4_BLOCK_BYTES];
+            block[0] = 127;
+            for byte in &mut block[1..] {
+                *byte = if output == 0 { 0x22 } else { 0x33 };
+            }
+        }
+        let activations: Vec<f32> = (0..m * k)
+            .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, 1, MXFP4_BLOCK_BYTES], &packed);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        let mut kernel = BlockQuantizedMatMulKernel {
+            k,
+            n,
+            format: BlockFormat::Mxfp4,
+            packed_b_constant: true,
+            weight_cache: DenseWeightCache::new(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+
+        let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .unwrap();
+        kernel
+            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_eq!(
+            kernel.weight_cache.stats().0,
+            1,
+            "constant packed_B should occupy one bounded dense cache entry across repeated calls"
+        );
+        assert!(
+            BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed) > hits_before,
+            "second execution must prove the cached-dense optimized path"
+        );
+    }
+
+    #[test]
+    fn dense_weight_cache_is_bounded_and_lru_evicts() {
+        let cache = DenseWeightCache::with_limit(16);
+        let packed1 = Owned::u8(&[4], &[1, 2, 3, 4]);
+        let packed2 = Owned::u8(&[4], &[5, 6, 7, 8]);
+        let key1 = DenseWeightCacheKey::from_tensor(
+            &packed1.view(),
+            &[1, 2, 3, 4],
+            BlockFormat::Mxfp4,
+            4,
+            1,
+            0,
+        );
+        let key2 = DenseWeightCacheKey::from_tensor(
+            &packed2.view(),
+            &[5, 6, 7, 8],
+            BlockFormat::Mxfp4,
+            4,
+            1,
+            0,
+        );
+        let _ = cache
+            .get_or_insert_with(key1.clone(), || Ok(vec![1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        assert_eq!(cache.stats(), (1, 16));
+        let (_, status) = cache
+            .get_or_insert_with(key1.clone(), || unreachable!("cache hit"))
+            .unwrap();
+        assert_eq!(status, DenseWeightCacheStatus::Hit);
+        let _ = cache
+            .get_or_insert_with(key2, || Ok(vec![5.0, 6.0, 7.0, 8.0]))
+            .unwrap();
+        assert_eq!(
+            cache.stats(),
+            (1, 16),
+            "second 16-byte entry must evict the older first entry under a 16-byte bound"
+        );
+        let (_, status) = cache
+            .get_or_insert_with(key1, || Ok(vec![9.0, 10.0, 11.0, 12.0]))
+            .unwrap();
+        assert_eq!(status, DenseWeightCacheStatus::MissStored);
+    }
+
+    #[test]
+    fn dense_weight_cache_concurrent_miss_builds_once() {
+        use std::sync::Barrier;
+
+        let cache = std::sync::Arc::new(DenseWeightCache::with_limit(1024));
+        let packed = Owned::u8(&[4], &[9, 8, 7, 6]);
+        let key = DenseWeightCacheKey::from_tensor(
+            &packed.view(),
+            &[9, 8, 7, 6],
+            BlockFormat::Mxfp4,
+            4,
+            1,
+            0,
+        );
+        let builds = std::sync::Arc::new(AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(Barrier::new(4));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let cache = std::sync::Arc::clone(&cache);
+                let builds = std::sync::Arc::clone(&builds);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let key = key.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let _ = cache
+                        .get_or_insert_with(key, || {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            Ok(vec![1.0, 2.0, 3.0, 4.0])
+                        })
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "concurrent cache miss for the same immutable weight must build once"
+        );
+    }
+
     #[test]
     #[ignore = "representative CPU throughput benchmark; run with --release -- --ignored"]
     fn benchmark_prefill_4096x4096_m64() {
@@ -1417,7 +1880,7 @@ mod tests {
                 n: N,
                 format,
                 packed_b_constant: false,
-                weight_kn: OnceLock::new(),
+                weight_cache: DenseWeightCache::new(),
             };
 
             let decode_start = Instant::now();

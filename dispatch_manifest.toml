@@ -150,6 +150,28 @@ file = "crates/onnx-runtime-session/src/executor/kernel_cache.rs"
 description = "Static-shape graphs use pre-bound kernel path, not hash-lookup"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Block-quantized CPU kernels — bounded cached-dense reuse (#645)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "BlockQuantizedMatMul"
+variant = "cached_dense"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs"
+description = "CPU BlockQuantizedMatMul uses a bounded LRU cache for constant packed weights after the first dense f32 expansion; this is cached-dense reuse, not direct quantized-domain compute"
+
+[[claim]]
+op = "BlockQuantizedMoE"
+variant = "cached_dense_expert"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs"
+description = "CPU BlockQuantizedMoE uses the shared bounded LRU cache for routed constant expert projections after the first dense f32 expansion; this is cached-dense reuse, not direct quantized-domain expert compute"
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MaxPool — aarch64-apple-darwin (#324)
 # ═══════════════════════════════════════════════════════════════════════════════
 

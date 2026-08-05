@@ -1,9 +1,10 @@
 # First-Class Mixture-of-Experts Support
 
-**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP registers
-grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`; quantized kernels
-dequantize active experts route-first. CUDA grouped MoE and the broader Phase 3
-streaming/scheduling work are not claimed complete.
+**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP
+registers grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`;
+quantized kernels dequantize active experts route-first and cache constant
+dense expert expansions under a bounded per-kernel LRU. CUDA grouped MoE and
+the broader Phase 3 streaming/scheduling work are not claimed complete.
 
 ## 1. Executive recommendation
 
@@ -529,6 +530,10 @@ and invokes one expert computation per active expert. Multi-row expert groups us
 the CPU EP's shared GEMM backend; decode groups of one use the scalar GEMV path
 without issuing a per-token GEMM. `QMoE` and `BlockQuantizedMoE` dequantize only
 active experts, one expert at a time, then consume all rows routed to that expert.
+`BlockQuantizedMoE` stores constant routed expert dense expansions in the shared
+bounded cached-dense LRU (`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`, default
+256 MiB) so hot experts do not re-expand every token. This is not direct
+quantized-domain expert compute, and dispatch evidence labels it cached-dense.
 They do not materialize a full all-expert dequantization buffer.
 
 CPU differential coverage:
