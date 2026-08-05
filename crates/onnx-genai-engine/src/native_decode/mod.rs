@@ -481,6 +481,35 @@ impl NativeDecodeSession {
         Ok((bytes, tier))
     }
 
+    /// Bytes of KV this session's past/present tensors hold at full context,
+    /// with the tier they are actually allocated on.
+    ///
+    /// The native path's page table is bookkeeping only, so unlike the ONNX
+    /// Runtime path there is no pool whose construction leases the KV. Without
+    /// this the ledger's largest per-sequence cost is simply missing, and every
+    /// consumer that reads a tier total -- admission, the profile breakdown, a
+    /// third-party governor deciding whether to grant -- works from a number
+    /// that is low by an unknown amount.
+    pub fn kv_reservation(
+        &self,
+        max_context: usize,
+    ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
+        let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
+            &self.session,
+            &self.present_to_past,
+            max_context,
+        )?;
+        // Same reasoning as `recurrent_state_reservation`: where these live is a
+        // fact about the running system, not about the holder. A CPU EP session
+        // holds them in host memory.
+        let tier = if self.session.device_id().is_host_accessible() {
+            onnx_runtime_memory_governor::Tier::Host
+        } else {
+            onnx_runtime_memory_governor::Tier::Device
+        };
+        Ok((bytes, tier))
+    }
+
     /// Place any long-lived device memory this session's provider holds under
     /// `governor`.
     ///

@@ -346,6 +346,42 @@ impl Engine {
                      {recurrent_tier:?}: {error}; raise the limit for that tier"
                 )
             })?;
+        // The KV the native path actually uses. Its page table carries no
+        // storage, so unlike the ONNX Runtime path nothing else leases this.
+        // Sized at full context because a lease is a reservation: charging the
+        // current length would admit a sequence the device cannot carry to its
+        // limit and discover that mid-generation.
+        match metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length)
+        {
+            Some(max_context) => {
+                let (native_kv_bytes, native_kv_tier) = native_session
+                    .kv_reservation(max_context)
+                    .context("sizing the decoder's KV tensors")?;
+                governor
+                    .plan()
+                    .reserve_on(Holder::NativeKvCache, native_kv_tier, native_kv_bytes)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
+                             {max_context} tokens of context on {native_kv_tier:?}: {error}; \
+                             lower the context length or raise the limit for that tier"
+                        )
+                    })?;
+            }
+            // Refusing to load would be the strict reading, but the model runs
+            // fine and the only loss is that this holder is missing from the
+            // ledger -- which is where it was before this existed. Warn rather
+            // than reserve a guessed figure, which would be worse than a known
+            // gap because it would look accounted for.
+            None => tracing::warn!(
+                "inference metadata declares no max_sequence_length, so the decoder's KV \
+                 tensors cannot be sized and are not charged to the memory ledger; tier \
+                 totals will understate device use by one sequence's KV"
+            ),
+        }
         // Join the runtime and its execution providers to the engine's timeline.
         // Without this their spans are recorded into a disabled context and
         // `native.session_run` exports as one opaque block.

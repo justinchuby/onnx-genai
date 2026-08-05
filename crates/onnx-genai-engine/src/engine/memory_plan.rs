@@ -60,6 +60,13 @@ pub(crate) enum Holder {
     WeightResidency,
     /// Fixed-size recurrent state for hybrid decoders.
     RecurrentState,
+    /// The native decode path's past/present KV tensors.
+    ///
+    /// Distinct from the `*KvPool` holders: those are page pools that lease
+    /// their capacity when constructed. The native path's page table carries no
+    /// storage, so its real KV is the session's own tensors, which the
+    /// execution provider allocates without telling the ledger.
+    NativeKvCache,
     /// Intermediate activations for one graph execution.
     Activations,
     /// The fixed device reservation the engine's ceiling already accounts for --
@@ -72,6 +79,31 @@ pub(crate) enum Holder {
 }
 
 impl Holder {
+    /// Every holder, so a list of them is maintained in one place.
+    ///
+    /// Two hand-copied lists in the tests below drifted apart the moment a
+    /// variant was added, and the drift is silent: a uniqueness test that does
+    /// not mention a holder still passes. `all_covers_every_holder_id` ties
+    /// this to the id space so a new variant cannot be left out quietly.
+    ///
+    /// Production code matches on holders exhaustively and the compiler
+    /// enforces that, so nothing outside the tests iterates this today. It is
+    /// still the registry rather than test scaffolding -- the id space is
+    /// recorded in traces and must not shift with build features, which is why
+    /// the variants are unconditional even when only one build configuration
+    /// constructs them.
+    #[allow(dead_code)]
+    pub(crate) const ALL: [Holder; 8] = [
+        Holder::KvPool,
+        Holder::PipelineKvPool,
+        Holder::DraftKvPool,
+        Holder::WeightResidency,
+        Holder::RecurrentState,
+        Holder::NativeKvCache,
+        Holder::Activations,
+        Holder::FixedDeviceReservation,
+    ];
+
     /// The identifier the governor accounts against.
     ///
     /// The first three values are pinned to what the previous constants used, so
@@ -83,6 +115,7 @@ impl Holder {
             Holder::DraftKvPool => 3,
             Holder::WeightResidency => 4,
             Holder::RecurrentState => 5,
+            Holder::NativeKvCache => 8,
             Holder::Activations => 6,
             Holder::FixedDeviceReservation => 7,
         })
@@ -99,6 +132,7 @@ impl Holder {
             // demotion candidate and not step-scoped `Workspace` either. It
             // lives and dies with its sequence, like KV.
             Holder::RecurrentState => MemoryRole::KvCache,
+            Holder::NativeKvCache => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
         }
@@ -112,6 +146,7 @@ impl Holder {
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
             Holder::RecurrentState => "recurrent state",
+            Holder::NativeKvCache => "native decode KV tensors",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
         }
@@ -131,6 +166,11 @@ impl Holder {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
+            // The native decode session allocates these through its execution
+            // provider, so a CPU-EP session holds them in host memory. The call
+            // site supplies the real tier via `reserve_on`; this is the default
+            // for a device session.
+            | Holder::NativeKvCache
             | Holder::Activations
             | Holder::FixedDeviceReservation => Tier::Device,
         }
@@ -382,18 +422,10 @@ mod tests {
         // ever contribute is exactly the device-tier ones. Stated as a test
         // because the guard is one line inside a constructor and reads as an
         // optimisation rather than as the correctness condition it is.
-        let device_holders: Vec<_> = [
-            Holder::KvPool,
-            Holder::PipelineKvPool,
-            Holder::DraftKvPool,
-            Holder::WeightResidency,
-            Holder::RecurrentState,
-            Holder::Activations,
-            Holder::FixedDeviceReservation,
-        ]
-        .into_iter()
-        .filter(|holder| holder.tier() == Tier::Device)
-        .collect();
+        let device_holders: Vec<_> = Holder::ALL
+            .into_iter()
+            .filter(|holder| holder.tier() == Tier::Device)
+            .collect();
 
         assert!(
             !device_holders.iter().any(|holder| matches!(
@@ -405,6 +437,27 @@ mod tests {
         );
     }
 
+    /// `ALL` covers every holder.
+    ///
+    /// `id()` is an exhaustive match, so the compiler makes sure a new variant
+    /// gets an id. Nothing makes sure it gets added to `ALL`, and a holder
+    /// missing from `ALL` silently drops out of every test that iterates it --
+    /// including the uniqueness check below, which would then pass while not
+    /// checking the new holder at all.
+    ///
+    /// Ids are consecutive from 1, so a gap in that range means a variant is
+    /// missing here.
+    #[test]
+    fn all_covers_every_holder_id() {
+        for id in 1..=Holder::ALL.len() as u64 {
+            assert!(
+                Holder::ALL.iter().any(|holder| holder.id().get() == id),
+                "no holder in Holder::ALL has id {id}; a variant was given an id but not \
+                 added to ALL, so nothing that iterates holders covers it"
+            );
+        }
+    }
+
     /// Holder identities do not collide.
     ///
     /// They were three hand-picked constants in two files, unique by
@@ -412,15 +465,7 @@ mod tests {
     /// one's bytes to the other and ask the wrong component to release.
     #[test]
     fn every_holder_has_its_own_identity() {
-        let holders = [
-            Holder::KvPool,
-            Holder::PipelineKvPool,
-            Holder::DraftKvPool,
-            Holder::WeightResidency,
-            Holder::RecurrentState,
-            Holder::Activations,
-            Holder::FixedDeviceReservation,
-        ];
+        let holders = Holder::ALL;
         for (index, holder) in holders.iter().enumerate() {
             for other in &holders[index + 1..] {
                 assert_ne!(
