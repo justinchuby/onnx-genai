@@ -360,19 +360,40 @@ impl Engine {
                 let (native_kv_bytes, native_kv_tier) = native_session
                     .kv_reservation(max_context)
                     .context("sizing the decoder's KV tensors")?;
-                governor
-                    .plan()
-                    .reserve_on(Holder::NativeKvCache, native_kv_tier, native_kv_bytes)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
-                             {max_context} tokens of context on {native_kv_tier:?}: {error}; \
-                             {max_context} is the model's declared max_sequence_length, and \
-                             --max-context will not lower it because the declared value takes \
-                             precedence -- raise the limit for that tier, or re-export the model \
-                             with a shorter declared context"
-                        )
-                    })?;
+                if native_session.commits_on_demand() {
+                    // The allocator maps physical memory as the sequence grows
+                    // and charges the ledger for each granule, so the worst
+                    // case is a ceiling to check rather than a claim to hold.
+                    //
+                    // Holding it would refuse models a short conversation never
+                    // grows into -- 768 MiB per sequence on a 32K-context 0.5B
+                    // model -- which on a small machine is the difference
+                    // between running and not.
+                    let headroom = governor.plan().available_on(native_kv_tier);
+                    if native_kv_bytes > headroom {
+                        tracing::warn!(
+                            "one sequence at {max_context} tokens of context needs \
+                             {native_kv_bytes} bytes of KV on {native_kv_tier:?} but only \
+                             {headroom} bytes are free; the allocator commits on demand so this \
+                             loads, and a conversation that grows into the full context will be \
+                             refused a page at a time rather than at load"
+                        );
+                    }
+                } else {
+                    governor
+                        .plan()
+                        .reserve_on(Holder::NativeKvCache, native_kv_tier, native_kv_bytes)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
+                                 {max_context} tokens of context on {native_kv_tier:?}: {error}; \
+                                 {max_context} is the model's declared max_sequence_length, and \
+                                 --max-context will not lower it because the declared value takes \
+                                 precedence -- raise the limit for that tier, or re-export the \
+                                 model with a shorter declared context"
+                            )
+                        })?;
+                }
             }
             // Refusing to load would be the strict reading, but the model runs
             // fine and the only loss is that this holder is missing from the

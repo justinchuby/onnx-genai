@@ -282,6 +282,16 @@ impl GovernedAllocator {
         Ok(self)
     }
     /// The pointer to hand ORT's registration API.
+    /// Whether the memory behind this allocator commits physically as it is
+    /// used.
+    ///
+    /// Forwards to whatever `with_memory` installed. This is what lets the
+    /// ONNX Runtime path answer the same question the native path does: the
+    /// `OrtAllocator` seam is a wrapper, and the property belongs to the
+    /// allocator underneath it rather than to the backend on top.
+    pub fn commits_on_demand(&self) -> bool {
+        self.state.memory.commits_on_demand()
+    }
     pub fn as_ort_allocator(&mut self) -> *mut onnx_genai_ort_sys::OrtAllocator {
         std::ptr::from_mut(&mut self.base)
     }

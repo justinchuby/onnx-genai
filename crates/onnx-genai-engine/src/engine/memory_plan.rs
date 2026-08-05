@@ -346,6 +346,15 @@ impl ModelMemoryPlan {
         Ok(cache)
     }
 
+    /// Bytes free on `tier` right now.
+    ///
+    /// Read from the ledger rather than from this plan's own entries, so it
+    /// accounts for every holder rather than the ones this plan happens to
+    /// carry.
+    pub(crate) fn available_on(&self, tier: Tier) -> u64 {
+        self.governor.available(tier)
+    }
+
     /// A live handle on the device KV pool bytes leased through this plan.
     ///
     /// Admission needs it to turn "bytes free on the device" into "bytes

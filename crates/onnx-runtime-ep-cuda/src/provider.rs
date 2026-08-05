@@ -849,6 +849,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         ))
     }
 
+    /// True when the VMM arena is in use: it maps 2 MiB granules as spans are
+    /// handed out and leases each one before mapping it, so committed memory
+    /// tracks real use rather than the largest request anyone might make.
+    ///
+    /// False on the `cuMemAlloc` path, which takes physical memory at the
+    /// moment it is asked for.
+    fn commits_on_demand(&self) -> bool {
+        self.memory().commits_on_demand()
+    }
+
     fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
