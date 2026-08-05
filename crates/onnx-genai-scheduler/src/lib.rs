@@ -13,7 +13,7 @@ pub mod policy;
 pub mod pressure;
 
 pub use byte_budget::{
-    BudgetSnapshot, ByteBudget, ByteBudgetError, ByteBudgetReservation,
+    AdmissionCeiling, BudgetSnapshot, ByteBudget, ByteBudgetError, ByteBudgetReservation,
     ReconfigureOutcome as ByteBudgetReconfigureOutcome,
 };
 pub use governor::{

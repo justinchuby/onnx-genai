@@ -88,7 +88,7 @@ pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
-pub use provider::CudaExecutionProvider;
+pub use provider::{CudaExecutionProvider, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES};
 pub use weight_paging::{
     CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,
     GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV,

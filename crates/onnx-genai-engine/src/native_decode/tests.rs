@@ -2669,3 +2669,160 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
         false
     ));
 }
+
+/// Fixed recurrent state is sized from the graph, per sequence.
+///
+/// It is a per-sequence cost that scales exactly the way KV does, and it was
+/// invisible to the thing deciding how many sequences fit -- so the governor
+/// could admit a batch that does not fit, and the failure landed as an
+/// allocation error mid-generation rather than a refusal at admission.
+///
+/// The fixture's layer 0 carries `conv_state [batch, 4, 3]` and
+/// `recurrent_state [batch, 2, 4, 4]`: 12 + 32 = 44 f32 elements, 176 bytes,
+/// with the batch axis counted as one because the figure is per sequence and
+/// the scheduler multiplies.
+#[test]
+fn recurrent_state_is_sized_per_sequence_from_the_graph() {
+    let session = tiny_hybrid_decoder();
+    // The decoder declares layer 0's state pair; layer 1 is dense KV.
+    let declared = std::collections::HashMap::from([
+        (
+            "present.0.conv_state".to_string(),
+            "past_key_values.0.conv_state".to_string(),
+        ),
+        (
+            "present.0.recurrent_state".to_string(),
+            "past_key_values.0.recurrent_state".to_string(),
+        ),
+    ]);
+    let bytes =
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared)
+            .expect("the fixture pins every non-batch axis");
+    assert_eq!(bytes, 176, "12 + 32 f32 elements is 176 bytes");
+}
+
+/// A decoder with no recurrent layers asks for nothing.
+///
+/// Most decoders are this, and it must not read as a failure or as a
+/// reservation of zero that implies something was measured.
+#[test]
+fn a_decoder_without_recurrent_layers_needs_no_recurrent_state() {
+    let session = tiny_decoder(false);
+    let declared = std::collections::HashMap::new();
+    let bytes =
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared)
+            .expect("a dense decoder is sizeable");
+    assert_eq!(bytes, 0);
+}
+
+/// KV is sized at full context, per sequence, from the declared pairs.
+///
+/// The native path's page table carries no storage, so nothing else leases
+/// this: without it the ledger was missing the largest per-sequence cost the
+/// decoder has, and every tier total read low by that amount.
+///
+/// The fixture's layer 1 carries `key` and `value`, each `[batch, 1, past, 1]`
+/// f32. At 128 tokens that is 128 elements each, 512 bytes each, 1024 together,
+/// with the batch axis counted as one because the figure is per sequence.
+#[test]
+fn kv_is_sized_at_full_context_per_sequence() {
+    let session = tiny_hybrid_decoder();
+    let declared = std::collections::HashMap::from([
+        (
+            "present.1.key".to_string(),
+            "past_key_values.1.key".to_string(),
+        ),
+        (
+            "present.1.value".to_string(),
+            "past_key_values.1.value".to_string(),
+        ),
+    ]);
+    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(&session, &declared, 128)
+        .expect("the fixture pins every axis but the growable one");
+    assert_eq!(bytes, 1024, "2 tensors x 128 f32 elements is 1024 bytes");
+}
+
+/// Recurrent state is not charged again as KV.
+///
+/// Both are loop-carried and both appear in `present_to_past`, so a helper that
+/// merely walked the declared pairs would charge the recurrent tensors twice --
+/// once at their real fixed size and once multiplied by the context length,
+/// which for a long context is wrong by orders of magnitude and in the
+/// direction that refuses models that fit.
+#[test]
+fn recurrent_state_is_not_charged_as_kv() {
+    let session = tiny_hybrid_decoder();
+    // Everything the hybrid decoder declares: layer 0's state pair *and*
+    // layer 1's KV.
+    let all = std::collections::HashMap::from([
+        (
+            "present.0.conv_state".to_string(),
+            "past_key_values.0.conv_state".to_string(),
+        ),
+        (
+            "present.0.recurrent_state".to_string(),
+            "past_key_values.0.recurrent_state".to_string(),
+        ),
+        (
+            "present.1.key".to_string(),
+            "past_key_values.1.key".to_string(),
+        ),
+        (
+            "present.1.value".to_string(),
+            "past_key_values.1.value".to_string(),
+        ),
+    ]);
+    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(&session, &all, 128)
+        .expect("the fixture is sizeable");
+    assert_eq!(
+        bytes, 1024,
+        "only layer 1's KV counts; layer 0's state is charged at its own fixed size"
+    );
+}
+
+/// A decoder that declares no loop-carried tensors asks for no KV.
+///
+/// Zero here is a fact about the graph, not a failure and not an unmeasured
+/// value standing in for one.
+#[test]
+fn a_decoder_declaring_no_pairs_needs_no_kv_reservation() {
+    let session = tiny_hybrid_decoder();
+    let none = std::collections::HashMap::new();
+    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(&session, &none, 4096)
+        .expect("an empty declaration is sizeable");
+    assert_eq!(bytes, 0);
+}
+
+/// An input that merely looks like recurrent state is not charged as it.
+///
+/// `is_recurrent_state_shape` only asks whether the penultimate axis is static,
+/// which is also true of a fixed-length KV input and of any unrelated
+/// fixed-shape input. Discovering state by that test alone would charge memory
+/// the decoder never keeps -- and this reservation refuses a load when it does
+/// not fit, so an over-count rejects models that work.
+///
+/// The declared pairs are the authority; the shape test only classifies what
+/// they name.
+#[test]
+fn an_undeclared_input_of_the_same_shape_is_not_charged() {
+    let session = tiny_hybrid_decoder();
+    let declared_none = std::collections::HashMap::new();
+    assert_eq!(
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &declared_none)
+            .expect("sizeable"),
+        0,
+        "nothing is declared, so nothing is state, whatever the shapes look like"
+    );
+
+    // Declaring only the conv pair charges only the conv pair: 4 * 3 f32 = 48.
+    let conv_only = std::collections::HashMap::from([(
+        "present.0.conv_state".to_string(),
+        "past_key_values.0.conv_state".to_string(),
+    )]);
+    assert_eq!(
+        crate::native_decode::tensor::recurrent_state_bytes_per_sequence(&session, &conv_only)
+            .expect("sizeable"),
+        48,
+        "the recurrent_state input is present in the graph but was not declared"
+    );
+}

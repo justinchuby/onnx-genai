@@ -91,3 +91,5 @@ CM*.txt
 PR*.md
 # Issue and review bodies staged the same way, for gh issue create --body-file.
 .issue-*.md
+# Scratch buffers used when moving a block of code between files.
+.block.txt

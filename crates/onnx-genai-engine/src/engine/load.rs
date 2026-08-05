@@ -1,6 +1,7 @@
 //! `Engine` construction: ORT and native model directory constructors.
 
 use super::*;
+use crate::engine::memory_plan::Holder;
 
 impl Engine {
     /// Load a model from a directory.
@@ -241,7 +242,7 @@ impl Engine {
                 config.limits.clone(),
                 config.allow_runtime_override,
                 governor_kv_config,
-                onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
+                device_weight_reservation_bytes(&model_directory.model_path),
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
@@ -284,6 +285,106 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
+        // End the second budget.
+        //
+        // The execution provider is built before this governor exists, so a
+        // standing pool it keeps -- the CUDA weight-residency cache -- sized
+        // itself from an operator figure or a default that answered to nobody.
+        // Grant the KV pool most of a card, let residency default to a fraction
+        // of it, and both are individually satisfied while the device is
+        // oversubscribed.
+        //
+        // This is only correct because the ledger's device tier is now the
+        // device rather than the KV sub-budget. Charging a weights pool to a
+        // tier that meant "bytes KV may have" would have taken the room out of
+        // KV's allowance and counted weights twice.
+        //
+        // A refusal here is the point: it says the model does not fit while
+        // there is still a load to fail, rather than at an allocation somewhere
+        // unrelated later.
+        let governed_pool_bytes = governor
+            .plan()
+            .adopt_provider_pool(&native_session, Holder::WeightResidency)
+            .context(
+                "the native execution provider holds a standing device pool the governor cannot \
+                 grant alongside the model's other claims; lower \
+                 ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES or raise the device limit",
+            )?;
+        if governed_pool_bytes > 0 {
+            tracing::debug!(
+                bytes = governed_pool_bytes,
+                "native execution provider pool is now governed"
+            );
+        }
+        // Charge the fixed-size recurrent state a hybrid decoder keeps --
+        // `conv_state` and `recurrent_state` for the linear-attention layers.
+        //
+        // Unlike KV it cannot be rewound, recomputed or shared, so a sequence
+        // either keeps it or ends. It was allocated and charged to nothing.
+        //
+        // One instance, not one per concurrent sequence: native decode runs a
+        // single serialized session, and other sequences retain tokens and are
+        // re-prefilled rather than each holding a live state tensor. Multiplying
+        // by the scheduler's batch size would reserve up to 32x memory that is
+        // never allocated, and refuse models that fit.
+        //
+        // The tier comes from the session, because it is a fact about the
+        // running system rather than about the holder: CPU state is host memory,
+        // a CUDA session's fixed-state bindings are on the device.
+        //
+        // Zero for a decoder with no recurrent layers, which is most of them,
+        // and takes no lease.
+        let (recurrent_bytes, recurrent_tier) = native_session
+            .recurrent_state_reservation()
+            .context("sizing the decoder's fixed recurrent state")?;
+        governor
+            .plan()
+            .reserve_on(Holder::RecurrentState, recurrent_tier, recurrent_bytes)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot reserve {recurrent_bytes} bytes of recurrent state on \
+                     {recurrent_tier:?}: {error}; raise the limit for that tier"
+                )
+            })?;
+        // The KV the native path actually uses. Its page table carries no
+        // storage, so unlike the ONNX Runtime path nothing else leases this.
+        // Sized at full context because a lease is a reservation: charging the
+        // current length would admit a sequence the device cannot carry to its
+        // limit and discover that mid-generation.
+        match metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length)
+        {
+            Some(max_context) => {
+                let (native_kv_bytes, native_kv_tier) = native_session
+                    .kv_reservation(max_context)
+                    .context("sizing the decoder's KV tensors")?;
+                governor
+                    .plan()
+                    .reserve_on(Holder::NativeKvCache, native_kv_tier, native_kv_bytes)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
+                             {max_context} tokens of context on {native_kv_tier:?}: {error}; \
+                             {max_context} is the model's declared max_sequence_length, and \
+                             --max-context will not lower it because the declared value takes \
+                             precedence -- raise the limit for that tier, or re-export the model \
+                             with a shorter declared context"
+                        )
+                    })?;
+            }
+            // Refusing to load would be the strict reading, but the model runs
+            // fine and the only loss is that this holder is missing from the
+            // ledger -- which is where it was before this existed. Warn rather
+            // than reserve a guessed figure, which would be worse than a known
+            // gap because it would look accounted for.
+            None => tracing::warn!(
+                "inference metadata declares no max_sequence_length, so the decoder's KV \
+                 tensors cannot be sized and are not charged to the memory ledger; tier \
+                 totals will understate device use by one sequence's KV"
+            ),
+        }
         // Join the runtime and its execution providers to the engine's timeline.
         // Without this their spans are recorded into a disabled context and
         // `native.session_run` exports as one opaque block.
@@ -461,7 +562,7 @@ fn build_governor_and_scheduler(
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
-            onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
+            device_weight_reservation_bytes(&model_directory.model_path),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
     };
@@ -476,11 +577,6 @@ fn build_governor_and_scheduler(
     let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
     Ok((governor, scheduler))
 }
-
-/// Identifies the draft model's KV page pool, a second pool the engine holds
-/// that was previously sized and allocated without consulting any budget.
-const DRAFT_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(3);
 
 fn load_draft_model(
     config: &EngineConfig,
@@ -523,31 +619,30 @@ fn load_draft_model(
             config.page_size,
             onnx_genai_kv::KvDType::F32,
         )?;
-        let draft_kv_cache = if let Some(kv_model) = &draft_kv_model {
-            let draft_pages = kv_pages_for_budget(
-                governor.snapshot().derived_budget.kv_bytes,
-                governor.snapshot().resolved_limits.host_ram_bytes,
-                config.scheduler.max_total_tokens,
-                kv_model.tensor_config.page_size,
-                kv_model.tensor_config.dtype,
-                &kv_model.layer_configs,
-            );
-            PagedKvCache::new_leased(
+        let draft_kv_cache =
+            if let Some(kv_model) = &draft_kv_model {
+                let draft_pages = kv_pages_for_budget(
+                    governor.snapshot().derived_budget.kv_bytes,
+                    governor.snapshot().resolved_limits.host_ram_bytes,
+                    config.scheduler.max_total_tokens,
+                    kv_model.tensor_config.page_size,
+                    kv_model.tensor_config.dtype,
+                    &kv_model.layer_configs,
+                );
+                governor.plan().kv_pool(
+                Holder::DraftKvPool,
                 kv_model.tensor_config.page_size,
                 kv_model.tensor_config.dtype,
                 kv_model.layer_configs.clone(),
                 draft_pages,
-                governor.memory(),
-                KV_POOL_TIER,
-                DRAFT_KV_POOL_HOLDER,
             )
             .context(
                 "cannot allocate the draft model's KV page pool within the device KV budget; a \
                  draft model needs its own pages alongside the target model's",
             )?
-        } else {
-            PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES)
-        };
+            } else {
+                PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES)
+            };
         Some(DraftModel {
             session: Box::new(draft_session),
             decode_path: draft_decode_path,
@@ -560,14 +655,6 @@ fn load_draft_model(
     };
     Ok(draft)
 }
-
-/// The tier a `PagedKvCache` page pool actually lives on.
-///
-/// `Page` holds `Vec<f32>` — host memory, whatever the pool's `num_gpu_pages`
-/// lineage suggests. Charging it to `Tier::Device` would let the pool exhaust
-/// host RAM while the device ledger still reported headroom, which is the
-/// governor failing at the one thing it exists to do.
-const KV_POOL_TIER: onnx_runtime_memory_governor::Tier = onnx_runtime_memory_governor::Tier::Host;
 
 /// Pages retained by a pool that holds no KV data.
 ///
@@ -626,10 +713,53 @@ pub(crate) fn kv_pages_for_budget(
 /// Only the configured path holds storage worth leasing. Without per-layer
 /// geometry a pool is pure bookkeeping and occupies nothing, so it is built
 /// ungoverned rather than taking a lease of zero that implies otherwise.
-/// Identifies the KV page pool to the memory governor, so a pool asked to
-/// release under pressure can be told apart from any other holder.
-const KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(1);
+/// Device bytes to reserve for model weights.
+///
+/// The whole package, normally: with every weight resident, that is what the
+/// device holds.
+///
+/// **Not** the whole package when weight offload is on. Offload exists because
+/// the weights do not fit, and it keeps only a bounded residency cache on the
+/// device while the rest stays on the host. Reserving the full package *and*
+/// letting that cache hold a slice of it counts the same bytes twice: on an
+/// 8 GiB card a 6 GiB model reserves 6 GiB, leaving 2 GiB for KV, while the
+/// residency cache separately holds up to its own budget of the same weights.
+///
+/// So with offload on, the reservation is what the device will actually hold --
+/// the residency budget -- capped at the package size, because a budget larger
+/// than the model cannot be filled.
+///
+/// The budget itself stays the operator's to set (#649): this only stops the
+/// same bytes being counted on both sides of the ledger.
+fn device_weight_reservation_bytes(model_path: &std::path::Path) -> u64 {
+    let package = onnx_genai_ort::model_weight_bytes(model_path);
+    #[cfg(feature = "cuda")]
+    let offload_budget = {
+        let policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
+        policy.enabled.then(|| {
+            policy
+                .device_budget_bytes
+                .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+        })
+    };
+    #[cfg(not(feature = "cuda"))]
+    let offload_budget = None;
+    weight_reservation_for(package, offload_budget)
+}
+
+/// The reservation, given the package size and the offload budget when offload
+/// is on.
+///
+/// Split from the environment read so the rule can be tested without a process
+/// variable that every other test would then race against.
+fn weight_reservation_for(package_bytes: u64, offload_budget: Option<u64>) -> u64 {
+    match offload_budget {
+        // A budget larger than the model cannot be filled, so the device still
+        // holds at most the package.
+        Some(budget) => budget.min(package_bytes),
+        None => package_bytes,
+    }
+}
 
 fn allocate_kv_cache(
     config: &EngineConfig,
@@ -656,14 +786,12 @@ fn allocate_kv_cache(
         // Per-layer geometry (heterogeneous head_dim across layers, e.g. the
         // Gemma-4 sliding/full split) is fed from the model's own KV output
         // shapes so mixed-geometry models page correctly.
-        PagedKvCache::new_leased(
+        governor.plan().kv_pool(
+            Holder::KvPool,
             kv_model.tensor_config.page_size,
             kv_model.tensor_config.dtype,
             kv_model.layer_configs.clone(),
             num_pages,
-            governor.memory(),
-            KV_POOL_TIER,
-            KV_POOL_HOLDER,
         )
         .with_context(|| {
             format!(
@@ -1209,5 +1337,39 @@ mod pool_sizing_tests {
             pages, 64,
             "a binding budget should be taken in full, not reduced further"
         );
+    }
+
+    /// With offload off, the device holds the whole package.
+    ///
+    /// With it on, it does not -- that is what offload is for -- so reserving
+    /// the package *and* letting the residency cache hold a slice of it counts
+    /// the same bytes twice. On an 8 GiB card a 6 GiB model would reserve 6 GiB,
+    /// leaving 2 GiB for KV, while the residency cache separately held up to
+    /// its own budget of the same weights.
+    #[test]
+    fn offload_reserves_what_the_device_holds_not_the_whole_package() {
+        let package = 6u64 << 30;
+
+        assert_eq!(
+            weight_reservation_for(package, None),
+            package,
+            "with offload off every weight is resident"
+        );
+        assert_eq!(
+            weight_reservation_for(package, Some(2 << 30)),
+            2 << 30,
+            "with offload on the device holds the residency budget, not the package"
+        );
+    }
+
+    /// A budget larger than the model cannot be filled.
+    ///
+    /// The default is 4 GiB, so any model smaller than that would otherwise
+    /// reserve more than it could possibly occupy -- and the reservation comes
+    /// straight out of what KV is offered.
+    #[test]
+    fn a_budget_larger_than_the_model_reserves_only_the_model() {
+        let package = 1u64 << 30;
+        assert_eq!(weight_reservation_for(package, Some(4 << 30)), package);
     }
 }

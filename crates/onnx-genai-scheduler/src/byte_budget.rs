@@ -85,6 +85,40 @@ struct BudgetState {
     used: u64,
 }
 
+/// A live ceiling on admission, read from whatever actually owns the memory.
+///
+/// # Why the configured limit is not enough
+///
+/// [`ByteBudget::new`] takes the KV budget derived at load: the device limit
+/// less an estimate of everything that is not KV. That is a *snapshot*, and the
+/// things it subtracted are not constants. Weight residency grows when a model
+/// touches more experts than its budget assumed; recurrent state is charged when
+/// a hybrid model loads; a third-party execution provider may lease for reasons
+/// this crate cannot enumerate. Every one of those shrinks the memory available
+/// for KV, and none of them is visible to a number computed once at load.
+///
+/// The failure that produces is not a rejected request, which would be fine. It
+/// is admission succeeding against a ceiling that no longer exists, and the
+/// allocation failing later, further from the decision that caused it.
+///
+/// So the ceiling is a question asked at admission time rather than an answer
+/// remembered from load. Implement this over the memory governor to have
+/// admission and allocation consult one book.
+///
+/// # Contract
+///
+/// `ceiling_bytes` returns the total bytes admission may reserve *including*
+/// what this budget has already reserved -- an absolute ceiling, not headroom.
+/// The effective limit is the smaller of this and the configured limit, so an
+/// implementation can only ever tighten what the operator configured.
+///
+/// It is called on the admission path, so it must not block. It is called
+/// without any of this budget's locks held, so it may take its own.
+pub trait AdmissionCeiling: Send + Sync + std::fmt::Debug {
+    /// Total bytes admission may hold right now.
+    fn ceiling_bytes(&self) -> u64;
+}
+
 /// A shared, dynamic, cross-session KV byte budget.
 ///
 /// Clone to share the *same* budget across multiple [`crate::Scheduler`]
@@ -93,6 +127,10 @@ struct BudgetState {
 #[derive(Debug, Clone)]
 pub struct ByteBudget {
     state: Arc<Mutex<BudgetState>>,
+    /// Tightens `state.limit` to what the memory governor says is actually
+    /// there. `None` keeps the configured limit as the only ceiling, which is
+    /// what a standalone scheduler with no governor wants.
+    ceiling: Option<Arc<dyn AdmissionCeiling>>,
 }
 
 impl ByteBudget {
@@ -103,7 +141,27 @@ impl ByteBudget {
                 limit: limit_bytes,
                 used: 0,
             })),
+            ceiling: None,
         }
+    }
+
+    /// The same budget, additionally bounded by a live [`AdmissionCeiling`].
+    ///
+    /// Clones share the ceiling, because they share the running total: a budget
+    /// whose clones disagreed about the limit would not be one budget.
+    #[must_use]
+    pub fn with_ceiling(mut self, ceiling: Arc<dyn AdmissionCeiling>) -> Self {
+        self.ceiling = Some(ceiling);
+        self
+    }
+
+    /// The governor's ceiling, if one is attached.
+    ///
+    /// Read *before* taking the budget lock so the admission critical section
+    /// stays free of foreign code, and so an implementation is free to take its
+    /// own locks without ordering against this one.
+    fn live_ceiling(&self) -> Option<u64> {
+        self.ceiling.as_ref().map(|ceiling| ceiling.ceiling_bytes())
     }
 
     /// Try to reserve `bytes` against the shared budget.
@@ -112,13 +170,15 @@ impl ByteBudget {
     /// it calls [`ByteBudget::release`] with the same amount. On failure nothing
     /// changes and the caller learns the exact shortfall.
     pub fn try_reserve(&self, bytes: u64) -> Result<(), ByteBudgetError> {
+        let live = self.live_ceiling();
         let mut state = self.lock();
-        let available = state.limit.saturating_sub(state.used);
+        let limit = live.map_or(state.limit, |live| state.limit.min(live));
+        let available = limit.saturating_sub(state.used);
         if bytes > available {
             return Err(ByteBudgetError {
                 requested: bytes,
                 used: state.used,
-                limit: state.limit,
+                limit,
                 available,
                 shortfall: bytes - available,
             });
@@ -139,8 +199,10 @@ impl ByteBudget {
         minimum: u64,
         unit: u64,
     ) -> Result<ByteBudgetReservation, ByteBudgetError> {
+        let live = self.live_ceiling();
         let mut state = self.lock();
-        let available = state.limit.saturating_sub(state.used);
+        let limit = live.map_or(state.limit, |live| state.limit.min(live));
+        let available = limit.saturating_sub(state.used);
         let reserved = if requested <= available {
             requested
         } else if unit == 0 {
@@ -152,7 +214,7 @@ impl ByteBudget {
             return Err(ByteBudgetError {
                 requested,
                 used: state.used,
-                limit: state.limit,
+                limit,
                 available,
                 shortfall: minimum.saturating_sub(available),
             });
@@ -178,14 +240,19 @@ impl ByteBudget {
     /// via [`ReconfigureOutcome::overage`] so the caller can drive eviction. New
     /// reservations observe the tightened ceiling immediately.
     pub fn reconfigure(&self, new_limit_bytes: u64) -> ReconfigureOutcome {
+        let live = self.live_ceiling();
         let mut state = self.lock();
         let old_limit = state.limit;
         state.limit = new_limit_bytes;
+        // Overage is what the caller must evict, so it is measured against the
+        // ceiling that actually binds -- a raised configured limit frees
+        // nothing if the governor is the tighter of the two.
+        let effective = live.map_or(new_limit_bytes, |live| new_limit_bytes.min(live));
         ReconfigureOutcome {
             old_limit,
             new_limit: new_limit_bytes,
             used: state.used,
-            overage: state.used.saturating_sub(new_limit_bytes),
+            overage: state.used.saturating_sub(effective),
         }
     }
 
@@ -194,24 +261,31 @@ impl ByteBudget {
         self.lock().used
     }
 
-    /// The active byte ceiling.
+    /// The byte ceiling in force: the configured limit, tightened by the
+    /// [`AdmissionCeiling`] if one is attached.
     pub fn limit(&self) -> u64 {
-        self.lock().limit
+        let live = self.live_ceiling();
+        let state = self.lock();
+        live.map_or(state.limit, |live| state.limit.min(live))
     }
 
     /// Bytes free (`limit - used`, saturating).
     pub fn available(&self) -> u64 {
+        let live = self.live_ceiling();
         let state = self.lock();
-        state.limit.saturating_sub(state.used)
+        let limit = live.map_or(state.limit, |live| state.limit.min(live));
+        limit.saturating_sub(state.used)
     }
 
     /// Point-in-time view of limit/used/available.
     pub fn snapshot(&self) -> BudgetSnapshot {
+        let live = self.live_ceiling();
         let state = self.lock();
+        let limit = live.map_or(state.limit, |live| state.limit.min(live));
         BudgetSnapshot {
-            limit: state.limit,
+            limit,
             used: state.used,
-            available: state.limit.saturating_sub(state.used),
+            available: limit.saturating_sub(state.used),
         }
     }
 
@@ -228,6 +302,87 @@ impl ByteBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ceiling that reports whatever it is told, standing in for the ledger.
+    #[derive(Debug)]
+    struct FixedCeiling(std::sync::atomic::AtomicU64);
+
+    impl AdmissionCeiling for FixedCeiling {
+        fn ceiling_bytes(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn ceiling(bytes: u64) -> Arc<FixedCeiling> {
+        Arc::new(FixedCeiling(std::sync::atomic::AtomicU64::new(bytes)))
+    }
+
+    #[test]
+    fn a_governor_ceiling_tightens_admission_below_the_configured_limit() {
+        let budget = ByteBudget::new(1000).with_ceiling(ceiling(400));
+
+        assert_eq!(budget.limit(), 400, "the tighter of the two must bind");
+        budget.try_reserve(400).unwrap();
+        let error = budget.try_reserve(1).unwrap_err();
+        assert_eq!(error.limit, 400);
+        assert_eq!(error.shortfall, 1);
+    }
+
+    #[test]
+    fn a_configured_limit_below_the_ceiling_still_binds() {
+        // The ceiling only ever tightens: an operator who asked for 300 B of KV
+        // does not get 900 just because the device happens to be empty.
+        let budget = ByteBudget::new(300).with_ceiling(ceiling(900));
+
+        assert_eq!(budget.limit(), 300);
+        assert!(budget.try_reserve(301).is_err());
+    }
+
+    #[test]
+    fn admission_shrinks_when_another_holder_takes_device_memory() {
+        // The regression this exists for: residency grows after load, the
+        // ledger knows, and admission kept saying yes against the ceiling it
+        // was seeded with. Now the next reservation sees the smaller number.
+        let live = ceiling(1000);
+        let budget = ByteBudget::new(1000).with_ceiling(live.clone());
+        budget.try_reserve(600).unwrap();
+        assert_eq!(budget.available(), 400);
+
+        // Another holder leases 700 B, leaving 300 B for KV.
+        live.0.store(300, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(budget.limit(), 300);
+        assert_eq!(
+            budget.available(),
+            0,
+            "already over the new ceiling, so nothing more is admissible"
+        );
+        assert!(budget.try_reserve(1).is_err());
+    }
+
+    #[test]
+    fn reconfigure_reports_overage_against_the_ceiling_that_binds() {
+        // Raising the configured limit frees nothing while the governor is the
+        // tighter of the two, so the caller must still be told to evict.
+        let budget = ByteBudget::new(1000).with_ceiling(ceiling(400));
+        budget.try_reserve(400).unwrap();
+
+        let outcome = budget.reconfigure(2000);
+
+        assert_eq!(outcome.new_limit, 2000, "the configured limit did change");
+        assert_eq!(outcome.overage, 0, "400 used is within the 400 B ceiling");
+
+        let outcome = budget.reconfigure(100);
+        assert_eq!(outcome.overage, 300, "the configured limit now binds");
+    }
+
+    #[test]
+    fn an_ungoverned_budget_is_unchanged() {
+        let budget = ByteBudget::new(1000);
+        assert_eq!(budget.limit(), 1000);
+        budget.try_reserve(1000).unwrap();
+        assert_eq!(budget.available(), 0);
+    }
 
     #[test]
     fn reserve_within_limit_then_release_restores_headroom() {

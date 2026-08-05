@@ -175,3 +175,81 @@ fn a_refusal_from_the_supplied_allocator_keeps_its_reason() {
         "the request must be named too: {message}"
     );
 }
+
+/// A provider with a standing pool can join the governor's accounting.
+///
+/// The seam is on the provider contract rather than on one backend because it
+/// is not a CUDA question. A third-party provider that keeps its own pool
+/// should be able to put it on the same ledger instead of running a second one
+/// -- which is exactly what the CUDA weight-residency cache did, with a 4 GiB
+/// default reconciled against nothing.
+#[test]
+fn a_third_party_provider_can_put_its_standing_pool_on_the_governor() {
+    use onnx_runtime_memory_governor::{
+        HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
+    };
+
+    #[derive(Debug)]
+    struct PoolingProvider {
+        pool_bytes: u64,
+        lease: std::sync::Mutex<Option<onnx_runtime_memory_governor::MemoryLease>>,
+    }
+
+    impl DeviceAllocator for PoolingProvider {
+        fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+            HostAllocator.allocate(bytes, align)
+        }
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            // SAFETY: forwarded unchanged from this method's own contract.
+            unsafe { HostAllocator.deallocate(ptr, bytes, align) };
+        }
+        fn device(&self) -> DeviceKey {
+            DeviceKey::HOST
+        }
+    }
+
+    let provider = PoolingProvider {
+        pool_bytes: 600,
+        lease: std::sync::Mutex::new(None),
+    };
+    let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+
+    // What `adopt_memory_governor` does for a provider that has a pool.
+    let lease = governor
+        .reserve(
+            Tier::Device,
+            provider.pool_bytes,
+            MemoryRole::Weights,
+            HolderId::new(4),
+        )
+        .expect("600 of 1000 is affordable");
+    *provider.lease.lock().unwrap() = Some(lease);
+
+    assert_eq!(governor.available(Tier::Device), 400);
+    assert!(
+        governor
+            .reserve(Tier::Device, 600, MemoryRole::KvCache, HolderId::new(1))
+            .is_err(),
+        "the provider's pool must be visible to the next holder"
+    );
+
+    // Releasing it returns the bytes, so unloading a model frees its pool.
+    *provider.lease.lock().unwrap() = None;
+    assert_eq!(governor.available(Tier::Device), 1000);
+}
+
+/// A provider with no standing pool reports zero rather than failing.
+#[test]
+fn a_provider_without_a_standing_pool_adopts_nothing() {
+    use onnx_runtime_memory_governor::{
+        HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+    };
+
+    let ep = CpuExecutionProvider::new();
+    let governor = LedgerGovernor::new(LeaseLedger::new(0, 1000, 0));
+    let governed = ep
+        .adopt_memory_governor(&governor, Tier::Host, HolderId::new(4))
+        .expect("holding no pool is not a failure");
+    assert_eq!(governed, 0);
+    assert_eq!(governor.available(Tier::Host), 1000);
+}

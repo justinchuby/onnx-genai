@@ -273,6 +273,143 @@ pub(crate) fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
     shape.len() >= 2 && shape[shape.len() - 2].is_static()
 }
 
+/// Bytes of fixed-size recurrent state one sequence needs.
+///
+/// The hybrid decoders (`conv_state`, `recurrent_state`) keep one of these per
+/// recurrent layer for as long as a sequence lives, which makes it a
+/// per-sequence cost that scales exactly the way KV does -- and unlike KV it was
+/// never charged to anything. Admission decides how many sequences fit while
+/// this is invisible to it, so the governor can admit a batch that does not fit
+/// and the failure lands as an allocation error mid-generation.
+///
+/// Counted from the graph's own metadata, so a model with no recurrent layers
+/// answers zero without being asked about by name (RULES.md §2).
+///
+/// The batch axis is counted as one: the reservation is per sequence, and the
+/// scheduler multiplies. A symbolic non-batch axis means the export did not pin
+/// a geometry this can size, and is reported rather than guessed at.
+pub(crate) fn recurrent_state_bytes_per_sequence(
+    session: &InferenceSession,
+    present_to_past: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<u64> {
+    // Only inputs the resolved I/O actually declares as loop-carried state.
+    // Rediscovering that from shape alone -- "the penultimate axis is static" --
+    // also matches a fixed-length KV input and any unrelated fixed-shape input,
+    // which would charge memory the decoder never keeps, multiplied by the batch
+    // size. `is_recurrent_state_shape` is the right test for *classifying* a
+    // declared state input; it is not a test for *finding* them.
+    let declared: std::collections::HashSet<&str> =
+        present_to_past.values().map(String::as_str).collect();
+    let mut total: u64 = 0;
+    for meta in session.inputs() {
+        if !declared.contains(meta.name.as_str()) || !is_recurrent_state_shape(&meta.shape) {
+            continue;
+        }
+        let mut elements: u64 = 1;
+        for (axis, dim) in meta.shape.iter().copied().enumerate() {
+            let extent = match dim {
+                Dim::Static(value) => u64::try_from(value).unwrap_or(0),
+                // Axis 0 is batch, and this figure is per sequence.
+                Dim::Symbolic(_) if axis == 0 => 1,
+                Dim::Symbolic(_) => bail!(
+                    "cannot size recurrent state '{}': dimension {axis} of {:?} is symbolic and \
+                     is not the batch axis, so the export did not pin a geometry to reserve for",
+                    meta.name,
+                    meta.shape
+                ),
+            };
+            elements = elements.saturating_mul(extent);
+        }
+        let bytes = meta
+            .dtype
+            .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
+            .with_context(|| {
+                format!(
+                    "unsupported recurrent-state dtype {:?} for '{}'",
+                    meta.dtype, meta.name
+                )
+            })?;
+        total = total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(total)
+}
+
+/// Bytes of KV cache one sequence holds at full context, from the declared
+/// `present_to_past` pairs.
+///
+/// # Why this is charged at all
+///
+/// On the ONNX Runtime path the KV pool leases its capacity at construction, so
+/// the ledger sees it. The native path's page table is deliberately bookkeeping
+/// only -- without per-layer geometry a page carries no storage -- and the real
+/// KV lives in the session's own past/present tensors, which are allocated
+/// through the execution provider and never reach the ledger. So the tier that
+/// admission and every other consumer read was understated by the largest
+/// per-sequence cost the decoder has.
+///
+/// # Why full context rather than current length
+///
+/// A lease is a reservation, and the point of reserving is that the memory is
+/// there when the sequence grows into it. Charging the current length would
+/// admit a sequence the device cannot actually carry to its context limit, and
+/// discover that at a `cuMemAlloc` mid-generation -- which is the failure the
+/// ledger exists to convert into a refusal at admission.
+///
+/// # Why the declared pairs rather than shape discovery
+///
+/// Same reason as [`recurrent_state_bytes_per_sequence`]: `present_to_past` is
+/// what the resolved I/O says is loop-carried. Anything else that happens to
+/// look like a KV tensor is not one, and charging it would reserve memory the
+/// decoder never keeps.
+pub(crate) fn kv_cache_bytes_per_sequence(
+    session: &InferenceSession,
+    present_to_past: &std::collections::HashMap<String, String>,
+    max_context: usize,
+) -> anyhow::Result<u64> {
+    let declared: std::collections::HashSet<&str> =
+        present_to_past.values().map(String::as_str).collect();
+    let context = u64::try_from(max_context).unwrap_or(0);
+    let mut total: u64 = 0;
+    for meta in session.inputs() {
+        // Recurrent state is loop-carried too, and is charged separately at its
+        // own fixed size. Sizing it by context would be wrong by orders of
+        // magnitude -- its whole point is that it does not grow.
+        if !declared.contains(meta.name.as_str()) || is_recurrent_state_shape(&meta.shape) {
+            continue;
+        }
+        let mut elements: u64 = 1;
+        let mut sequence_axes = 0;
+        for (axis, dim) in meta.shape.iter().copied().enumerate() {
+            let extent = match dim {
+                Dim::Static(value) => u64::try_from(value).unwrap_or(0),
+                // Axis 0 is batch, and this figure is per sequence.
+                Dim::Symbolic(_) if axis == 0 => 1,
+                Dim::Symbolic(_) => {
+                    sequence_axes += 1;
+                    context
+                }
+            };
+            elements = elements.saturating_mul(extent);
+        }
+        if sequence_axes > 1 {
+            bail!(
+                "cannot size KV input '{}': {:?} has {sequence_axes} symbolic non-batch axes, so \
+                 which one grows with context is ambiguous and a reservation would be a guess",
+                meta.name,
+                meta.shape
+            );
+        }
+        let bytes = meta
+            .dtype
+            .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
+            .with_context(|| {
+                format!("unsupported KV dtype {:?} for '{}'", meta.dtype, meta.name)
+            })?;
+        total = total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(total)
+}
+
 pub(crate) fn make_empty_input_tensor(
     session: &InferenceSession,
     name: &str,

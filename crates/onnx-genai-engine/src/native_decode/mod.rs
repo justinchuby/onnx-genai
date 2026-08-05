@@ -431,6 +431,105 @@ impl NativeDecodeSession {
         self.trace = trace;
     }
 
+    /// Bytes of fixed-size recurrent state this decoder keeps, and the tier they
+    /// live on.
+    ///
+    /// Zero for a decoder with no recurrent layers, which is most of them, and
+    /// not a failure.
+    ///
+    /// One instance, not one per concurrent sequence. Native decode runs a
+    /// single serialized session: other sequences retain tokens and are
+    /// re-prefilled rather than each holding a live state tensor, so multiplying
+    /// by the scheduler's batch size would reserve up to 32x memory that is
+    /// never allocated and refuse models that fit.
+    ///
+    /// The tier comes from where the state actually is rather than from the
+    /// caller. On the CPU backend it is built through `shared_cpu_ep()` and is
+    /// host memory; a CUDA session's fixed-state bindings genuinely occupy the
+    /// device. Charging the wrong one is the same class of mistake as the KV
+    /// pool being charged to `Device` in the pipeline while the engine charged
+    /// it to `Host`.
+    /// How many recurrent-state instances physically exist at once.
+    ///
+    /// One: native decode runs a single serialized session, and other sequences
+    /// retain tokens and are re-prefilled rather than each holding a live state
+    /// tensor.
+    ///
+    /// Explicit rather than a bare `1` in the arithmetic, because the number
+    /// that belongs here is *how many rows exist*, not *how many sequences the
+    /// scheduler admits*. Reserving `max_batch_size` of them over-counts by up
+    /// to 32x against memory that is never allocated, which is what the first
+    /// version of this did. If native decode later keeps several rows live,
+    /// this is the one place to change, and the caller's arithmetic stays right.
+    pub fn concurrent_state_rows(&self) -> usize {
+        1
+    }
+
+    pub fn recurrent_state_reservation(
+        &self,
+    ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
+        let per_row = crate::native_decode::tensor::recurrent_state_bytes_per_sequence(
+            &self.session,
+            &self.present_to_past,
+        )?;
+        let bytes = per_row.saturating_mul(self.concurrent_state_rows() as u64);
+        let tier = if self.session.device_id().is_host_accessible() {
+            onnx_runtime_memory_governor::Tier::Host
+        } else {
+            onnx_runtime_memory_governor::Tier::Device
+        };
+        Ok((bytes, tier))
+    }
+
+    /// Bytes of KV this session's past/present tensors hold at full context,
+    /// with the tier they are actually allocated on.
+    ///
+    /// The native path's page table is bookkeeping only, so unlike the ONNX
+    /// Runtime path there is no pool whose construction leases the KV. Without
+    /// this the ledger's largest per-sequence cost is simply missing, and every
+    /// consumer that reads a tier total -- admission, the profile breakdown, a
+    /// third-party governor deciding whether to grant -- works from a number
+    /// that is low by an unknown amount.
+    pub fn kv_reservation(
+        &self,
+        max_context: usize,
+    ) -> anyhow::Result<(u64, onnx_runtime_memory_governor::Tier)> {
+        let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
+            &self.session,
+            &self.present_to_past,
+            max_context,
+        )?;
+        // Same reasoning as `recurrent_state_reservation`: where these live is a
+        // fact about the running system, not about the holder. A CPU EP session
+        // holds them in host memory.
+        let tier = if self.session.device_id().is_host_accessible() {
+            onnx_runtime_memory_governor::Tier::Host
+        } else {
+            onnx_runtime_memory_governor::Tier::Device
+        };
+        Ok((bytes, tier))
+    }
+
+    /// Place any long-lived device memory this session's provider holds under
+    /// `governor`.
+    ///
+    /// The execution provider is built before the engine's governor exists, so
+    /// a provider that keeps a standing pool -- the CUDA weight-residency cache
+    /// is the one that does -- sizes it for itself. Until this is called that
+    /// size is a second claim on memory the governor is already dividing up, and
+    /// neither side can see the other.
+    ///
+    /// Returns the bytes now governed; zero means the provider holds no standing
+    /// pool, which is the common case and not a failure.
+    pub fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> anyhow::Result<u64> {
+        Ok(self.session.adopt_memory_governor(governor, tier, holder)?)
+    }
+
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK
     /// captured verify graph and retain the captured graph across `rewind`. No-op
     /// on non-CUDA sessions. Not wired into any live decode path yet; exercised

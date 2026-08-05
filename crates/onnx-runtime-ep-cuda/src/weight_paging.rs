@@ -420,17 +420,39 @@ struct ResidencyInner {
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
+    /// The governor grant this budget came from, when it came from one.
+    ///
+    /// Held for its `Drop`: releasing the lease is how the tier learns these
+    /// bytes are available again. `None` means the budget was chosen locally and
+    /// no governor knows about it.
+    ///
+    /// **Declared after `pages` on purpose.** Rust drops fields in declaration
+    /// order, so this releases the entitlement only once the pages holding the
+    /// VRAM have been dropped. The other order tells the governor those bytes
+    /// are free while they are still held, and hands them to the next requester
+    /// on top of memory that has not been returned yet.
+    ///
+    /// Note this only orders the pages *this cache* still holds. An
+    /// `Arc<CudaWeightPage>` handed to a caller keeps its page alive
+    /// independently, so a caller outliving the cache still outlives the lease.
+    /// See `residency_holds_its_lease_until_its_pages_are_gone`.
+    lease: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 
 impl CudaWeightResidency {
     /// Build a residency cache with an explicit VRAM `budget_bytes`. Page-in is
     /// synchronous by default; chain [`Self::with_async_pagein`] to opt into async.
+    ///
+    /// Prefer [`Self::new_leased`] where a governor exists. A budget invented
+    /// here is a second claim on the same VRAM the governor is already handing
+    /// out, and neither side can see the other's.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         Self {
             runtime,
             async_pagein: false,
             inner: Mutex::new(ResidencyInner {
                 budget: budget_bytes,
+                lease: None,
                 resident_bytes: 0,
                 peak_resident_bytes: 0,
                 page_ins: 0,
@@ -440,6 +462,108 @@ impl CudaWeightResidency {
                 pages: HashMap::new(),
             }),
         }
+    }
+
+    /// Build a residency cache whose budget is *leased* from `governor` rather
+    /// than chosen here.
+    ///
+    /// This cache holds device memory for as long as a model is loaded, so a
+    /// budget it picks for itself is a second ledger over the same VRAM the
+    /// governor is dividing between KV and everything else. Nothing reconciles
+    /// the two: grant KV most of an 8 GiB card and let this default to 4 GiB,
+    /// and both are individually satisfied while the card is oversubscribed.
+    ///
+    /// The lease is taken under [`MemoryRole::Weights`], which is what these
+    /// bytes are and which already carries the right eviction semantics --
+    /// immutable, shareable, and re-readable from the package on disk, so the
+    /// cheapest thing to demote under pressure.
+    ///
+    /// # Errors
+    ///
+    /// If the tier cannot grant `budget_bytes`. Failing here is the point: it
+    /// says the model does not fit *before* pages start being admitted, rather
+    /// than letting two budgets agree separately and discovering it at a
+    /// `cuMemAlloc` in the middle of generation.
+    pub fn new_leased(
+        runtime: Arc<CudaRuntime>,
+        budget_bytes: u64,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<Self, onnx_runtime_memory_governor::MemoryError> {
+        let lease = governor.reserve(
+            tier,
+            budget_bytes,
+            onnx_runtime_memory_governor::MemoryRole::Weights,
+            holder,
+        )?;
+        Ok(Self {
+            runtime,
+            async_pagein: false,
+            inner: Mutex::new(ResidencyInner {
+                budget: lease.bytes(),
+                lease: Some(lease),
+                resident_bytes: 0,
+                peak_resident_bytes: 0,
+                page_ins: 0,
+                hits: 0,
+                evictions: 0,
+                order: Vec::new(),
+                pages: HashMap::new(),
+            }),
+        })
+    }
+
+    /// Bytes this cache is entitled to, and whether that came from a governor.
+    ///
+    /// `false` means the budget was chosen locally and nothing reconciles it
+    /// with any other claim on the same device.
+    pub fn budget(&self) -> (u64, bool) {
+        let inner = self.inner.lock().expect("residency lock poisoned");
+        (inner.budget, inner.lease.is_some())
+    }
+
+    /// Replace a locally chosen budget with one leased from `governor`.
+    ///
+    /// The execution provider is built before the engine's governor exists, so
+    /// the cache starts with the operator's figure or a default. This is where
+    /// that becomes a claim the rest of the system can see. Nothing has paged in
+    /// yet at that point, so no resident bytes are stranded by the swap.
+    ///
+    /// Asks for the budget it already had. That figure is what the operator
+    /// pinned or what the EP defaulted to; the governor's job here is to say
+    /// whether the device can actually afford it alongside everything else, not
+    /// to invent a different number.
+    ///
+    /// # Errors
+    ///
+    /// If the tier cannot grant it. The budget is left as it was, so a caller
+    /// that chooses to continue ungoverned is no worse off than before -- but it
+    /// now knows.
+    pub fn adopt_governed_budget(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
+        let requested = {
+            let inner = self.inner.lock().expect("residency lock poisoned");
+            if inner.lease.is_some() {
+                return Ok(inner.budget);
+            }
+            inner.budget
+        };
+        let lease = governor.reserve(
+            tier,
+            requested,
+            onnx_runtime_memory_governor::MemoryRole::Weights,
+            holder,
+        )?;
+        let granted = lease.bytes();
+        let mut inner = self.inner.lock().expect("residency lock poisoned");
+        inner.budget = granted;
+        inner.lease = Some(lease);
+        Ok(granted)
     }
 
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
@@ -581,6 +705,40 @@ impl CudaWeightResidency {
             return Ok(existing);
         }
         inner.evict_to_fit(bytes);
+        // Eviction is best effort: a page larger than the whole budget, or
+        // pinned pages that cannot be evicted, both leave no room. Admitting
+        // anyway is what this used to do, and it left the cache physically
+        // holding more than it leased -- a total the governor reported as
+        // correct while it was not.
+        //
+        // So ask for the difference first. Growing is a fresh claim and obeys
+        // G4, so a refusal leaves the tier and the lease exactly as they were,
+        // and the page-in fails instead of the accounting quietly going wrong.
+        if let Some(over) = inner
+            .resident_bytes
+            .saturating_add(bytes)
+            .checked_sub(inner.budget)
+            .filter(|over| *over > 0)
+        {
+            match inner.lease.as_mut() {
+                Some(lease) => {
+                    lease.grow(over).map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!(
+                            "the weight-residency cache needs {over} bytes beyond its \
+                             {} byte budget for a {bytes} byte page, and eviction could not \
+                             free them: {error}",
+                            inner.budget
+                        ))
+                    })?;
+                    inner.budget = inner.budget.saturating_add(over);
+                }
+                // No lease means no governor knows about this cache, so there is
+                // nothing to ask and nothing whose total this would falsify.
+                // Keep the previous behaviour rather than inventing a refusal
+                // the operator never asked for.
+                None => inner.budget = inner.budget.saturating_add(over),
+            }
+        }
         inner.insert_page(key, Arc::clone(&page), bytes);
         Ok(page)
     }
@@ -708,5 +866,75 @@ mod tests {
         assert_eq!(parse_budget_bytes(""), None);
         assert_eq!(parse_budget_bytes("lots"), None);
         assert_eq!(parse_budget_bytes("-5"), None);
+    }
+
+    /// A locally chosen budget becomes a claim the rest of the system can see.
+    ///
+    /// This cache used to carry its own budget -- 4 GiB by default, or whatever
+    /// `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` said -- reconciled with nothing.
+    /// Grant the KV pool most of an 8 GiB card and let this default to 4 GiB and
+    /// both are individually satisfied while the card is oversubscribed. Nobody
+    /// finds out until an allocation fails somewhere unrelated.
+    #[test]
+    fn adopting_a_governed_budget_makes_the_claim_visible_to_other_holders() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
+        };
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the governed weight-budget check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 700);
+        assert_eq!(
+            residency.budget(),
+            (700, false),
+            "before adoption the budget answers to nobody"
+        );
+
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+        let granted = residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(4))
+            .expect("700 of 1000 is affordable");
+        assert_eq!(granted, 700);
+        assert_eq!(residency.budget(), (700, true));
+
+        // The point: another holder now sees those bytes are spoken for.
+        assert_eq!(governor.available(Tier::Device), 300);
+        let refused = governor
+            .reserve(Tier::Device, 700, MemoryRole::KvCache, HolderId::new(1))
+            .expect_err("the weights already hold 700 of the 1000");
+        assert!(matches!(
+            refused,
+            onnx_runtime_memory_governor::MemoryError::TierExhausted { .. }
+        ));
+    }
+
+    /// Adopting twice does not charge twice.
+    #[test]
+    fn a_budget_already_governed_is_not_reserved_again() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the double-adoption check did NOT run.");
+            return;
+        };
+        let residency = CudaWeightResidency::new(runtime, 400);
+        let governor = LedgerGovernor::new(LeaseLedger::new(1000, 0, 0));
+
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(4))
+            .expect("first adoption");
+        residency
+            .adopt_governed_budget(&governor, Tier::Device, HolderId::new(4))
+            .expect("second adoption is a no-op, not a second charge");
+
+        assert_eq!(
+            governor.available(Tier::Device),
+            600,
+            "the same budget was charged twice"
+        );
     }
 }
