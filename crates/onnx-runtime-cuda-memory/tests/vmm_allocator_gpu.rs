@@ -28,30 +28,12 @@ const HOLDER: HolderId = HolderId::new(21);
 
 /// An allocator over `capacity` bytes of address space, and the ledger behind
 /// it, or `None` on a machine with no driver.
-fn allocator(capacity: usize, device_bytes: u64) -> Option<(CudaVmmAllocator, LedgerGovernor)> {
-    let context = {
-        // `CudaContext::new` panics rather than returning `Err` when cudarc
-        // cannot load the driver library, so a `match` on its `Result` never
-        // reaches the error arm on a machine with no GPU. See the note in
-        // `virtual_memory_gpu.rs`.
-        let attempt = std::panic::catch_unwind(|| CudaContext::new(0));
-        match attempt {
-            Ok(Ok(context)) => context,
-            Ok(Err(error)) => {
-                eprintln!(
-                    "SKIPPED (no CUDA device): {error}. These tests verify the VMM device \
-                     allocator and did NOT run."
-                );
-                return None;
-            }
-            Err(_) => {
-                eprintln!(
-                    "SKIPPED (no CUDA driver library): cudarc panicked loading libcuda. \
-                     These tests verify the VMM device allocator and did NOT run."
-                );
-                return None;
-            }
-        }
+fn allocator(capacity: usize, device_bytes: u64) -> (CudaVmmAllocator, LedgerGovernor) {
+    let context = match CudaContext::new(0) {
+        Ok(context) => context,
+        Err(error) => panic!(
+            "VMM allocator test requires a CUDA driver; CPU-only runs must leave this test ignored: {error}"
+        ),
     };
     let governor = LedgerGovernor::new(LeaseLedger::new(device_bytes, 0, 0));
     let allocator = CudaVmmAllocator::new(
@@ -64,7 +46,7 @@ fn allocator(capacity: usize, device_bytes: u64) -> Option<(CudaVmmAllocator, Le
         MemoryRole::Workspace { step_scoped: false },
     )
     .expect("reserving device address space");
-    Some((allocator, governor))
+    (allocator, governor)
 }
 
 /// Reserving address space commits nothing, so the ledger stays empty until
@@ -73,11 +55,13 @@ fn allocator(capacity: usize, device_bytes: u64) -> Option<(CudaVmmAllocator, Le
 /// This is the whole premise: address space is free, physical memory is not.
 /// If reservation charged the ledger, a large arena would refuse to start on a
 /// small card and the approach would be pointless.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn reserving_an_arena_charges_nothing() {
-    let Some((allocator, governor)) = allocator(256 << 20, 8 << 30) else {
-        return;
-    };
+    let (allocator, governor) = allocator(256 << 20, 8 << 30);
 
     let (committed, reserved) = allocator.committed_and_reserved();
     assert_eq!(committed, 0, "nothing is mapped yet");
@@ -93,11 +77,13 @@ fn reserving_an_arena_charges_nothing() {
 }
 
 /// A single allocation commits one granule and the ledger is told about it.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn an_allocation_commits_a_granule_and_the_ledger_sees_it() {
-    let Some((allocator, governor)) = allocator(64 << 20, 8 << 30) else {
-        return;
-    };
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
 
     let pointer = allocator.allocate(4096, 256).expect("4 KiB fits");
 
@@ -130,11 +116,13 @@ fn an_allocation_commits_a_granule_and_the_ledger_sees_it() {
 /// The property that makes 2 MiB granularity affordable for a runtime that
 /// does not patch the CUDA driver. 512 allocations of 4 KiB is 2 MiB of
 /// demand; without sharing it would commit 1 GiB.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn small_allocations_share_granules_instead_of_each_taking_one() {
-    let Some((allocator, governor)) = allocator(64 << 20, 8 << 30) else {
-        return;
-    };
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
 
     let count = 512;
     let size = 4096;
@@ -169,11 +157,13 @@ fn small_allocations_share_granules_instead_of_each_taking_one() {
 /// The `DeviceAllocator` contract's central safety promise, and the one whose
 /// violation would be silent: two sessions would write over each other's
 /// tensors and produce wrong numbers rather than a crash.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn live_allocations_do_not_overlap() {
-    let Some((allocator, _governor)) = allocator(64 << 20, 8 << 30) else {
-        return;
-    };
+    let (allocator, _governor) = allocator(64 << 20, 8 << 30);
 
     let sizes = [64usize, 4096, 100_000, 8, 1 << 20, 300];
     let mut live: Vec<(usize, usize)> = Vec::new();
@@ -203,12 +193,14 @@ fn live_allocations_do_not_overlap() {
 /// A budget that can be exceeded is not a budget (G1). The important half is
 /// the second: an allocation that was refused must not have committed memory
 /// on its way to failing, or the tier drifts upward on every refusal.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn a_refused_allocation_commits_nothing() {
     // Four granules of address space, but only ~2 granules of device budget.
-    let Some((allocator, governor)) = allocator(8 << 20, 4 << 20) else {
-        return;
-    };
+    let (allocator, governor) = allocator(8 << 20, 4 << 20);
 
     let mut pointers = Vec::new();
     let mut refusals = 0;

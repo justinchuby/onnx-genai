@@ -256,6 +256,10 @@ fn test_values(norm_size: usize) -> (Vec<f16>, Vec<f16>, Vec<f32>, Vec<f16>, Vec
     (input, scale_half, scale_f32, bias_half, bias_f32)
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_rmsnorm_parallel_reduction_matches_serial_f32_reference() {
     let norm_size = 896;
@@ -299,6 +303,10 @@ fn fp16_rmsnorm_parallel_reduction_matches_serial_f32_reference() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_rmsnorm_fixed_multigroup_qk_shape_is_capture_supported() {
     // Qwen3 applies RMSNorm per attention head, so a single decode-step Q/K norm
@@ -356,6 +364,10 @@ fn fp16_rmsnorm_fixed_multigroup_qk_shape_is_capture_supported() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn fp16_layernorm_matches_serial_f32_reference_for_half_and_float_affine() {
     let norm_size = 1024;
