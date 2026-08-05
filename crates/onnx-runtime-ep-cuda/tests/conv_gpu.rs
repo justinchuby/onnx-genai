@@ -220,17 +220,25 @@ fn assert_close(got: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -343,17 +351,25 @@ fn cudnn_conv_matches_cpu_for_padding_groups_and_f16() {
     println!("cuDNN Conv f32/f16 padded and grouped-strided cases passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cudnn_conv_matches_cpu_for_dilation() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => {
             eprintln!("skip: no CUDA GPU/runtime available ({error})");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked");
-            return;
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
         }
     };
 
@@ -390,11 +406,13 @@ fn cudnn_conv_matches_cpu_for_dilation() {
     println!("cuDNN Conv dilations=[2, 2] case passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
-    let Some(ep) = common::cuda_ep() else {
-        return;
-    };
+    let ep = common::require_cuda();
     let cases = [
         (
             "basic",

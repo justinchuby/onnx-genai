@@ -894,9 +894,12 @@ types documented there become concrete instances:
 | IQ4_NL | `onnx-community:iq4_nl/v1` | LOOKUP_TABLE (16-entry codebook) |
 | MXFP4 | `onnx:mxfp4-block32/v1` | AFFINE (microscaling) |
 
-The `MatMulNBits`/`BlockQuantizedMatMul` ops remain valid as concrete accelerated paths.
-EPs that recognize these ops continue to use them; the extensible type system provides
-the *fallback* and *extensibility* story.
+The `MatMulNBits`/`BlockQuantizedMatMul` ops remain valid as concrete dispatch
+boundaries. They are accelerated only on EPs that implement direct
+quantized-domain compute for the recognized format; the current CPU
+`BlockQuantizedMatMul` path is a tier3 memory-format baseline that dequantizes
+to dense f32 before running GEMM. The extensible type system provides the
+*fallback* and *extensibility* story.
 
 ## 13. Open Questions
 

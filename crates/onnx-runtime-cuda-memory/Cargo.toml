@@ -11,6 +11,8 @@ categories = ["memory-management", "hardware-support"]
 [features]
 default = []
 cuda = []
+# Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
+gpu-tests = []
 
 [dependencies]
 onnx-runtime-memory-governor = { workspace = true }

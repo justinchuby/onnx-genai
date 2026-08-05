@@ -3,8 +3,12 @@
 **Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP
 registers grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`;
 quantized kernels dequantize active experts route-first and cache constant
-dense expert expansions under a bounded per-kernel LRU. CUDA grouped MoE and
-the broader Phase 3 streaming/scheduling work are not claimed complete.
+dense expert expansions under a bounded per-kernel LRU. The CPU
+`BlockQuantizedMoE` path remains memory-format-only: routed experts are
+dequantized to dense f32 before grouped compute, rather than computed directly
+in the quantized domain. Both the dense-f32 dispatch and cached-dense hit path
+are claimed as tier3 in `dispatch_manifest.toml`. CUDA grouped MoE and the
+broader Phase 3 streaming/scheduling work are not claimed complete.
 
 ## 1. Executive recommendation
 
@@ -161,6 +165,8 @@ Relevant existing seams are:
   ([`attention.rs` lines 21-49](../crates/onnx-runtime-ep-cuda/src/kernels/attention.rs#L21-L49)).
 - The in-tree CPU EP registers `MatMulNBits`, grouped float `MoE`, integer `QMoE`,
   and `BlockQuantizedMoE`. Its quantized MoE paths dequantize only routed experts.
+  `BlockQuantizedMoE` then runs dense f32 grouped expert compute; it is not a
+  quantized-domain CPU compute kernel.
   The in-tree CUDA EP does not yet register grouped `MoE`/`QMoE` kernels; this
   document makes no CUDA completion claim.
 - The engine owns generation, KV integration, and the Resource Governor

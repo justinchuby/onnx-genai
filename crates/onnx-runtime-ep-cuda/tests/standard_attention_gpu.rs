@@ -33,6 +33,10 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inputs() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -188,6 +192,10 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_claim_requires_homogeneous_floating_input_dtypes() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -271,6 +279,10 @@ fn standard_attention_claim_requires_homogeneous_floating_input_dtypes() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_claim_distinguishes_omitted_and_wrong_typed_past_cache() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -756,6 +768,10 @@ fn rotary_embedding_reference_fp16(
     y
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_prefill_gqa_bool_mask_is_deterministic() {
     let inputs = [
@@ -802,6 +818,10 @@ fn standard_attention_prefill_gqa_bool_mask_is_deterministic() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn rotary_embedding_interleaved_partial_position_ids_is_deterministic() {
     let inputs = [
@@ -839,6 +859,10 @@ fn rotary_embedding_interleaved_partial_position_ids_is_deterministic() {
     assert_close(&f32s(&once[0]), &[1_f32, 2., 3., 4., -6., 5., 7., 8.]);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn rotary_embedding_3d_rotate_half_direct_cache_broadcasts_across_heads() {
     // [B, S, H*D] with two heads. Each cache row is shared by both heads.
@@ -880,6 +904,10 @@ fn rotary_embedding_3d_rotate_half_direct_cache_broadcasts_across_heads() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn rotary_embedding_4d_multi_batch_multi_head_position_ids_matches_reference() {
     // Each (batch, sequence) position must select one cache row, then broadcast
@@ -907,6 +935,10 @@ fn rotary_embedding_4d_multi_batch_multi_head_position_ids_matches_reference() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn rotary_embedding_fp16_matches_fp32_reference_for_both_rotation_layouts() {
     let (batch, heads, seq, head_size) = (2, 2, 3, 8);
@@ -974,6 +1006,10 @@ fn rotary_embedding_fp16_matches_fp32_reference_for_both_rotation_layouts() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn rotary_embedding_negative_position_ids_return_error() {
     let inputs = [
@@ -995,6 +1031,10 @@ fn rotary_embedding_negative_position_ids_return_error() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn rotary_embedding_out_of_range_position_ids_return_error() {
     let inputs = [
@@ -1476,16 +1516,28 @@ fn asymmetric_3d_prefill_decode_cpu_cuda_case(kv_heads: usize) {
     assert_close(&f32s(&full_gpu[2]), &f32s(&decode_gpu[2]));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_asymmetric_3d_prefill_decode_gqa_matches_cpu() {
     asymmetric_3d_prefill_decode_cpu_cuda_case(2);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_asymmetric_3d_prefill_decode_mqa_matches_cpu() {
     asymmetric_3d_prefill_decode_cpu_cuda_case(1);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_basic_mha_matches_reference() {
     let (b, h, sq, d) = (1usize, 2usize, 3usize, 4usize);
@@ -1527,6 +1579,10 @@ fn standard_attention_basic_mha_matches_reference() {
     assert_close(&f32s(&out[0]), &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_gqa_multi_batch_multi_head_matches_reference() {
     let (b, hq, hkv, sq, d) = (2usize, 4usize, 2usize, 3usize, 4usize);
@@ -1569,6 +1625,10 @@ fn standard_attention_gqa_multi_batch_multi_head_matches_reference() {
     assert_close(&f32s(&out[0]), &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_3d_input_reshape_matches_reference() {
     // 3D (batch, seq, heads*dim) input; reference consumes the equivalent 4D
@@ -1648,6 +1708,10 @@ fn standard_attention_3d_input_reshape_matches_reference() {
     assert_close(&f32s(&out[0]), &y_ref3);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_in_op_past_cache_matches_reference_and_present() {
     // Causal decode step: past cache of length 2, current step of length 1.
@@ -1726,6 +1790,10 @@ fn standard_attention_in_op_past_cache_matches_reference_and_present() {
     assert_close(&f32s(&out[2]), &present_v);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_present_value_uses_its_own_concat_geometry() {
     // Key and value use different past/current splits but the same present
@@ -1796,6 +1864,10 @@ fn standard_attention_present_value_uses_its_own_concat_geometry() {
     assert_close(&f32s(&out[0]), &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_opset24_nonpad_kv_seqlen_masks_padding_and_offsets_causal() {
     let (b, h, q_seq, kv_seq, d) = (1usize, 1usize, 2usize, 4usize, 2usize);
@@ -1897,6 +1969,10 @@ fn standard_attention_opset24_nonpad_kv_seqlen_masks_padding_and_offsets_causal(
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_float_mask_add_matches_reference() {
     let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
@@ -1940,6 +2016,10 @@ fn standard_attention_float_mask_add_matches_reference() {
     assert_close(&f32s(&out[0]), &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_bool_mask_matches_reference() {
     let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
@@ -1983,6 +2063,10 @@ fn standard_attention_bool_mask_matches_reference() {
     assert_close(&f32s(&out[0]), &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_softcap_matches_reference() {
     let (b, h, sq, d) = (1usize, 2usize, 3usize, 4usize);
@@ -2029,6 +2113,10 @@ fn standard_attention_softcap_matches_reference() {
     assert_close(&f32s(&out[0]), &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_explicit_scale_matches_reference() {
     let (b, h, sq, d) = (1usize, 1usize, 3usize, 4usize);
@@ -2092,6 +2180,10 @@ fn standard_attention_explicit_scale_matches_reference() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_fully_masked_row_is_zero() {
     // A bool mask row that is entirely `false` must yield an all-zero output row
@@ -2144,6 +2236,10 @@ fn standard_attention_fully_masked_row_is_zero() {
     assert_close(&y, &y_ref);
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn standard_attention_qk_matmul_output_modes_match_reference() {
     let (b, h, sq, d) = (1usize, 2usize, 2usize, 2usize);
