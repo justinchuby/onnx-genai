@@ -15,12 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-import numpy as np
-import onnx
-from hypothesis import find, settings
-from onnx import TensorProto, helper, numpy_helper
-from onnx.reference import ReferenceEvaluator
-
 MAGIC = b"NXRTCF01"
 CPU_OPS = [
     "MatMul",
@@ -49,7 +43,12 @@ CPU_OPS = [
     "Constant",
     "Gemm",
 ]
-UNSUPPORTED_OPS = ["Abs", "Conv", "Sigmoid"]
+ADDITIONAL_PASS_OPS = ["Abs", "Conv", "Sigmoid"]
+SYNTHETIC_UNSUPPORTED_OP = "SyntheticUnsupportedCelu"
+EXPECTED_STATUS = {
+    **{op: "PASS" for op in CPU_OPS + ADDITIONAL_PASS_OPS},
+    SYNTHETIC_UNSUPPORTED_OP: "UNSUPPORTED",
+}
 
 
 @dataclass
@@ -58,6 +57,35 @@ class Result:
     source: str
     status: str
     detail: str
+
+
+def conformance_failures(
+    results: list[Result], expected_status: dict[str, str] | None = None
+) -> list[str]:
+    if expected_status is None:
+        expected_status = EXPECTED_STATUS
+    by_op = {result.op: result for result in results}
+    failures = []
+    for op, expected in expected_status.items():
+        result = by_op.get(op)
+        if result is None:
+            failures.append(f"{op}: missing result; expected {expected}")
+        elif result.status != expected:
+            failures.append(
+                f"{op}: expected {expected}, got {result.status} ({result.detail})"
+            )
+    for result in results:
+        if result.op not in expected_status:
+            failures.append(
+                f"{result.op}: unexpected result {result.status} ({result.detail})"
+            )
+    return failures
+
+
+def exit_code_for_results(
+    results: list[Result], expected_status: dict[str, str] | None = None
+) -> int:
+    return 1 if conformance_failures(results, expected_status) else 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +107,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def generated_cases(onnx_tests: Path) -> dict[str, Callable[[], onnx.ModelProto]]:
+    import numpy as np
+    from hypothesis import find, settings
+
     sys.path.insert(0, str(onnx_tests.resolve()))
     import spox.opset.ai.onnx.v17 as op17
     from onnx_tests import (
@@ -125,10 +156,13 @@ def generated_cases(onnx_tests: Path) -> dict[str, Callable[[], onnx.ModelProto]
         "Abs": lambda: draw(elementwise_ops.abs(f32, op17)),
         "Conv": lambda: manual_model("Conv"),
         "Sigmoid": lambda: draw(elementwise_ops.sigmoid(f32, op17)),
+        SYNTHETIC_UNSUPPORTED_OP: lambda: manual_model(SYNTHETIC_UNSUPPORTED_OP),
     }
 
 
 def is_small_nonempty_case(state) -> bool:
+    import numpy as np
+
     def arrays(value):
         if isinstance(value, np.ndarray):
             yield value
@@ -140,8 +174,9 @@ def is_small_nonempty_case(state) -> bool:
                 yield from arrays(item)
 
     values = list(arrays(state.inputs))
-    return all(
-        value.size > 0
+    return bool(values) and all(
+        value.ndim > 0
+        and value.size > 0
         and value.size <= 256
         and (value.dtype.kind != "f" or np.isfinite(value).all())
         for value in values
@@ -172,6 +207,9 @@ def strip_identity_nodes(model: onnx.ModelProto) -> onnx.ModelProto:
 
 
 def manual_model(op: str) -> onnx.ModelProto:
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+
     values: dict[str, np.ndarray] = {
         "LayerNormalization": np.array([[1.0, 2.0, 4.0]], dtype=np.float32),
         "Shape": np.zeros((2, 3, 4), dtype=np.float32),
@@ -181,6 +219,7 @@ def manual_model(op: str) -> onnx.ModelProto:
         "ReduceMean": np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
         "Unsqueeze": np.array([[1.0, 2.0]], dtype=np.float32),
         "Conv": np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3),
+        SYNTHETIC_UNSUPPORTED_OP: np.array([0.25, -0.5], dtype=np.float32),
     }
     if op == "Constant":
         node = helper.make_node(
@@ -266,6 +305,16 @@ def manual_model(op: str) -> onnx.ModelProto:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1, 2, 2])],
             [x, w],
         )
+    elif op == SYNTHETIC_UNSUPPORTED_OP:
+        x = numpy_helper.from_array(values[op], "X")
+        node = helper.make_node("Celu", ["X"], ["Y"])
+        graph = helper.make_graph(
+            [node],
+            op,
+            [],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2])],
+            [x],
+        )
     else:
         raise KeyError(op)
     opset = 12 if op in {"ReduceMean", "Unsqueeze"} else 17
@@ -273,6 +322,9 @@ def manual_model(op: str) -> onnx.ModelProto:
 
 
 def write_tensor(path: Path, array: np.ndarray) -> None:
+    from onnx import helper
+    import numpy as np
+
     array = np.ascontiguousarray(array)
     dtype_code = helper.np_dtype_to_tensor_dtype(array.dtype)
     payload = array.tobytes()
@@ -286,6 +338,9 @@ def write_tensor(path: Path, array: np.ndarray) -> None:
 
 
 def read_tensor(path: Path) -> np.ndarray:
+    from onnx import helper
+    import numpy as np
+
     with path.open("rb") as file:
         if file.read(8) != MAGIC:
             raise ValueError("bad nxrt tensor magic")
@@ -301,6 +356,9 @@ def read_tensor(path: Path) -> np.ndarray:
 def run_case(
     op: str, source: str, model: onnx.ModelProto, runner: Path, work_dir: Path
 ) -> Result:
+    import numpy as np
+    from onnx.reference import ReferenceEvaluator
+
     case_dir = work_dir / op
     shutil.rmtree(case_dir, ignore_errors=True)
     case_dir.mkdir(parents=True)
@@ -347,8 +405,12 @@ def main() -> int:
     generators = generated_cases(args.onnx_tests)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for op in CPU_OPS + UNSUPPORTED_OPS:
-        source = "onnx-tests" if op in generators and op != "Conv" else "focused ONNX"
+    for op in EXPECTED_STATUS:
+        source = (
+            "onnx-tests"
+            if op in generators and op not in {"Conv", SYNTHETIC_UNSUPPORTED_OP}
+            else "focused ONNX"
+        )
         try:
             model = generators[op]() if op in generators else manual_model(op)
             result = run_case(op, source, model, args.runner, args.work_dir)
@@ -365,12 +427,22 @@ def main() -> int:
     if args.json:
         args.json.write_text(
             json.dumps(
-                {"counts": counts, "results": [vars(result) for result in results]},
+                {
+                    "counts": counts,
+                    "failures": conformance_failures(results),
+                    "expected_status": EXPECTED_STATUS,
+                    "results": [vars(result) for result in results],
+                },
                 indent=2,
             )
             + "\n"
         )
-    return 0
+    failures = conformance_failures(results)
+    if failures:
+        print("CONFORMANCE FAILURES:")
+        for failure in failures:
+            print(f"  {failure}")
+    return exit_code_for_results(results)
 
 
 if __name__ == "__main__":
