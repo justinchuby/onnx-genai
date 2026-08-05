@@ -163,11 +163,13 @@ fn small_allocations_share_granules_instead_of_each_taking_one() {
 /// (the ledger returned to zero), because they can fail independently: a
 /// granule can be unmapped while the ledger still believes it is held, which
 /// reads as exhausted memory that `nvidia-smi` says is free.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn repeated_allocation_cycles_leak_neither_granules_nor_ledger_bytes() {
-    let Some((allocator, governor)) = allocator(64 << 20, 8 << 30) else {
-        return;
-    };
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
 
     for round in 0..200usize {
         // Sizes that straddle the granule boundary in both directions, so
@@ -203,11 +205,13 @@ fn repeated_allocation_cycles_leak_neither_granules_nor_ledger_bytes() {
 /// have to survive that, or a granule shared by two spans is released when the
 /// first leaves and the second is left reading unmapped memory -- or is never
 /// released at all.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn out_of_order_frees_return_every_granule() {
-    let Some((allocator, governor)) = allocator(64 << 20, 8 << 30) else {
-        return;
-    };
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
 
     let sizes = [4096usize, 1 << 20, 64, (3 << 20) + 11, 512, 2 << 20];
     let mut live: Vec<_> = sizes
