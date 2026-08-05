@@ -13,7 +13,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CUDA_CRATE = ROOT / "crates" / "onnx-runtime-ep-cuda"
+# Device memory moved to its own crate so that using an allocator does not drag
+# in every kernel. Its GPU tests moved with it, and a check naming only the
+# execution provider would stop seeing them -- which is precisely the hole this
+# script exists to close.
+MEMORY_CRATE = ROOT / "crates" / "onnx-runtime-cuda-memory"
+CUDA_CRATES = (CUDA_CRATE, MEMORY_CRATE)
 TESTS = CUDA_CRATE / "tests"
+TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
@@ -79,9 +86,7 @@ def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
         src_path = Path(target.get("src_path", ""))
         if not src_path.is_absolute():
             src_path = ROOT / src_path
-        try:
-            src_path.relative_to(TESTS)
-        except ValueError:
+        if not any(src_path.is_relative_to(tests) for tests in TEST_DIRS):
             continue
         executable = message.get("executable")
         if executable:
@@ -98,6 +103,8 @@ def build_test_binaries(config: FeatureConfig) -> list[TestBinary]:
             "--locked",
             "-p",
             "onnx-runtime-ep-cuda",
+            "-p",
+            "onnx-runtime-cuda-memory",
             "--features",
             config.features,
             "--tests",
@@ -257,10 +264,11 @@ def main() -> int:
         print("CUDA honesty checker self-test passed")
         return 0
 
-    cargo_toml = (CUDA_CRATE / "Cargo.toml").read_text(encoding="utf-8")
     errors: list[str] = []
-    if "gpu-tests = []" not in cargo_toml:
-        errors.append("crates/onnx-runtime-ep-cuda/Cargo.toml must define a gpu-tests feature")
+    for crate in CUDA_CRATES:
+        manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
+        if "gpu-tests = []" not in manifest:
+            errors.append(f"crates/{crate.name}/Cargo.toml must define a gpu-tests feature")
 
     base_binaries = build_test_binaries(BASE_CONFIG)
     gpu_binaries = build_test_binaries(GPU_CONFIG)
