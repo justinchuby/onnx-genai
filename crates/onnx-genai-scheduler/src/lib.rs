@@ -475,7 +475,7 @@ impl Scheduler {
         while self.has_capacity_for_candidate() {
             let Some(candidate) = retained_candidate
                 .take()
-                .or_else(|| self.pop_next_candidate())
+                .or_else(|| self.pop_next_candidate_excluding(&decision.preempt))
             else {
                 break;
             };
@@ -759,14 +759,6 @@ impl Scheduler {
             .sum()
     }
 
-    fn best_waiting_index(&self) -> Option<usize> {
-        self.waiting
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| self.cmp_request(a, b))
-            .map(|(idx, _)| idx)
-    }
-
     fn lowest_priority_running_index(&self) -> Option<usize> {
         self.running
             .iter()
@@ -780,13 +772,13 @@ impl Scheduler {
             .map(|(idx, _)| idx)
     }
 
-    fn pop_next_candidate(&mut self) -> Option<Candidate> {
+    fn pop_next_candidate_excluding(&mut self, unavailable: &[SequenceId]) -> Option<Candidate> {
         if matches!(self.config.priority_policy, PriorityPolicy::FairShare) {
-            return self.pop_next_fair_share_candidate();
+            return self.pop_next_fair_share_candidate_excluding(unavailable);
         }
 
-        let waiting = self.best_waiting_index();
-        let swapped = self.best_swapped_index();
+        let waiting = self.best_waiting_index_excluding(unavailable);
+        let swapped = self.best_swapped_index_excluding(unavailable);
         match (waiting, swapped) {
             (None, None) => None,
             (Some(idx), None) => Some(Candidate::Waiting(self.waiting.remove(idx))),
@@ -804,25 +796,54 @@ impl Scheduler {
     }
 
     fn pop_next_fair_share_candidate(&mut self) -> Option<Candidate> {
+        self.pop_next_fair_share_candidate_excluding(&[])
+    }
+
+    fn pop_next_fair_share_candidate_excluding(
+        &mut self,
+        unavailable: &[SequenceId],
+    ) -> Option<Candidate> {
+        if self
+            .waiting
+            .iter()
+            .all(|request| unavailable.contains(&request.seq_id))
+            && self
+                .swapped
+                .iter()
+                .all(|sequence| unavailable.contains(&sequence.seq_id))
+        {
+            return None;
+        }
+
         let selected_priority = self.fair_share.select(
             self.waiting
                 .iter()
+                .filter(|request| !unavailable.contains(&request.seq_id))
                 .map(|request| request.priority)
-                .chain(self.swapped.iter().map(|sequence| sequence.priority)),
+                .chain(
+                    self.swapped
+                        .iter()
+                        .filter(|sequence| !unavailable.contains(&sequence.seq_id))
+                        .map(|sequence| sequence.priority),
+                ),
         )?;
 
         let waiting = self
             .waiting
             .iter()
             .enumerate()
-            .filter(|(_, request)| request.priority == selected_priority)
+            .filter(|(_, request)| {
+                request.priority == selected_priority && !unavailable.contains(&request.seq_id)
+            })
             .min_by_key(|(_, request)| (request.arrived_at, request.id))
             .map(|(index, request)| (index, request.arrived_at, request.id));
         let swapped = self
             .swapped
             .iter()
             .enumerate()
-            .filter(|(_, sequence)| sequence.priority == selected_priority)
+            .filter(|(_, sequence)| {
+                sequence.priority == selected_priority && !unavailable.contains(&sequence.seq_id)
+            })
             .min_by_key(|(_, sequence)| (sequence.arrived_at, sequence.request_id))
             .map(|(index, sequence)| (index, sequence.arrived_at, sequence.request_id));
 
@@ -843,10 +864,20 @@ impl Scheduler {
         }
     }
 
-    fn best_swapped_index(&self) -> Option<usize> {
+    fn best_waiting_index_excluding(&self, unavailable: &[SequenceId]) -> Option<usize> {
+        self.waiting
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| !unavailable.contains(&request.seq_id))
+            .min_by(|(_, a), (_, b)| self.cmp_request(a, b))
+            .map(|(idx, _)| idx)
+    }
+
+    fn best_swapped_index_excluding(&self, unavailable: &[SequenceId]) -> Option<usize> {
         self.swapped
             .iter()
             .enumerate()
+            .filter(|(_, sequence)| !unavailable.contains(&sequence.seq_id))
             .min_by(|(_, a), (_, b)| {
                 self.cmp_candidate_key(CandidateKey::from_running(a), CandidateKey::from_running(b))
             })
@@ -1072,6 +1103,39 @@ mod tests {
             assert!(!decision.decode.contains(preempted));
         }
         assert_eq!(scheduler.waiting_count(), 1);
+        assert_eq!(scheduler.running_count(), 2);
+        assert_eq!(scheduler.swapped_count(), 1);
+    }
+
+    #[test]
+    fn token_budget_preemption_does_not_re_admit_same_step_victim() {
+        let mut fair_config = config();
+        fair_config.max_batch_size = 3;
+        fair_config.max_total_tokens = 8;
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Swap;
+        let mut scheduler = Scheduler::new(fair_config);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        scheduler.enqueue_generate_request(20, 3, 4, Priority::Normal);
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill, vec![10, 20]);
+        scheduler.advance(10);
+        scheduler.advance(20);
+
+        scheduler.enqueue_generate_request(30, 3, 2, Priority::High);
+        let decision = scheduler.schedule();
+
+        assert_eq!(decision.preempt, vec![10]);
+        assert_eq!(decision.prefill, vec![30]);
+        assert!(decision.swap_in.is_empty());
+        assert_eq!(decision.decode, vec![20]);
+        for preempted in &decision.preempt {
+            assert!(!decision.prefill.contains(preempted));
+            assert!(!decision.swap_in.contains(preempted));
+            assert!(!decision.decode.contains(preempted));
+        }
+        assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(scheduler.running_count(), 2);
         assert_eq!(scheduler.swapped_count(), 1);
     }
