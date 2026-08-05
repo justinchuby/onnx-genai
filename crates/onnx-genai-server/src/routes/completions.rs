@@ -1288,6 +1288,18 @@ fn prepare_generate_request(
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     let mut options = build_generate_options_with_tokenizer(request, tokenizer);
+    if !session
+        && chat_template.is_none()
+        && let Some(prefix) = build_default_system_prefix(request)
+    {
+        let boundary = tokenizer
+            .encode(&prefix)
+            .map_err(|e| anyhow::anyhow!("Failed to tokenize system prefix: {e}"))?
+            .len();
+        if boundary > 0 && boundary < token_ids.len() {
+            options.semantic_prefix_len = Some(boundary);
+        }
+    }
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(generation_defaults, &chat_sampling_overrides(request));
@@ -1554,6 +1566,34 @@ fn render_prompt(
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
     Ok(build_prompt(request))
+}
+
+fn build_default_system_prefix(request: &ChatCompletionRequest) -> Option<String> {
+    let mut prompt = String::new();
+    if let Some(tools) = tools_offered_to_model(request) {
+        prompt.push_str("<|tools|>\n");
+        prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
+        prompt.push('\n');
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        prompt.push_str("<|tool_choice|>\n");
+        prompt.push_str(&tool_choice_prompt(tool_choice));
+        prompt.push('\n');
+    }
+    let mut saw_system = false;
+    for message in request
+        .messages
+        .iter()
+        .take_while(|message| message.role.trim() == "system")
+    {
+        saw_system = true;
+        prompt.push_str("<|system|>\n");
+        if let Some(content) = &message.content {
+            prompt.push_str(&content.text());
+        }
+        prompt.push('\n');
+    }
+    (saw_system || !prompt.is_empty()).then_some(prompt)
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:

@@ -177,6 +177,8 @@ impl Engine {
             native_max_sessions: config.native_max_sessions,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft,
             mtp,
             eagle3,
@@ -442,6 +444,7 @@ impl Engine {
             native_default_session: None,
             native_max_sessions: config.native_max_sessions,
             native_shared_kv_proposer,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,

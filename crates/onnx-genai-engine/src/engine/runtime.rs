@@ -384,6 +384,11 @@ impl Engine {
         self.connector.stats().clone()
     }
 
+    #[cfg(feature = "native-backend")]
+    pub fn recurrent_prefix_cache_stats(&self) -> RecurrentPrefixCacheStats {
+        self.native_recurrent_prefix_stats
+    }
+
     /// Generate the middle text for a fill-in-the-middle request.
     pub fn generate_fim(
         &mut self,
@@ -1854,6 +1859,9 @@ impl Engine {
         }
 
         let active_matches = self.native_active_session == Some(session_id);
+        let semantic_prefix_len = options
+            .semantic_prefix_len
+            .filter(|&len| len > 0 && len < prompt_tokens.len());
         if !active_matches {
             let native = self
                 .native_session
@@ -1871,13 +1879,85 @@ impl Engine {
             common_prefix_len(&state.tokens, &prompt_tokens)
         };
 
+        let mut restored_prefix_len = None;
+        let mut should_store_semantic_snapshot = false;
+        if !active_matches && let Some(boundary) = semantic_prefix_len {
+            self.native_recurrent_prefix_stats.lookups += 1;
+            if let Some((matched, snapshot)) = self
+                .prefix_cache
+                .lookup_snapshot::<NativePrefixSnapshot>(&prompt_tokens)
+                .filter(|(matched, _)| *matched == boundary && *matched < prompt_tokens.len())
+            {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.restore_past_snapshot(&snapshot.snapshot)?;
+                self.native_recurrent_prefix_stats.hits += 1;
+                self.native_recurrent_prefix_stats.restored_tokens += matched as u64;
+                restored_prefix_len = Some(matched);
+            } else {
+                should_store_semantic_snapshot = true;
+            }
+        }
+
+        if should_store_semantic_snapshot && let Some(boundary) = semantic_prefix_len {
+            let snapshot = {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.prefill_prefix(&prompt_tokens[..boundary])?;
+                native.snapshot_past()?
+            };
+            let reserve_snapshot = || {
+                onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                    self.governor.memory(),
+                    onnx_runtime_memory_governor::Tier::Host,
+                    snapshot.bytes(),
+                    Holder::RecurrentPrefixSnapshot.role(),
+                    Holder::RecurrentPrefixSnapshot.id(),
+                )
+            };
+            let lease = match reserve_snapshot() {
+                Ok(lease) => lease,
+                Err(first_error) if self.prefix_cache.evict_lru_snapshot() => reserve_snapshot()
+                    .with_context(|| {
+                        format!(
+                            "cannot reserve {} bytes for native recurrent prefix snapshot after \
+                             evicting an older snapshot: {first_error}",
+                            snapshot.bytes()
+                        )
+                    })?,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot reserve {} bytes for native recurrent prefix snapshot",
+                            snapshot.bytes()
+                        )
+                    });
+                }
+            };
+            self.prefix_cache.insert_snapshot(
+                &prompt_tokens[..boundary],
+                Arc::new(NativePrefixSnapshot {
+                    snapshot,
+                    _lease: lease,
+                }),
+            );
+            self.native_recurrent_prefix_stats.stores += 1;
+            restored_prefix_len = Some(boundary);
+        }
+
         let result = {
             let native = self
                 .native_session
                 .as_mut()
                 .context("native decoder session is unavailable")?;
 
-            let mut resume_from = if active_matches {
+            let mut resume_from = if let Some(restored) = restored_prefix_len {
+                restored
+            } else if active_matches {
                 prefix_len.min(native.current_len())
             } else {
                 0

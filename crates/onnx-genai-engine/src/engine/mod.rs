@@ -49,9 +49,9 @@ pub use crate::config::{
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
     KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
     MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
+    RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival,
+    SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition, SharedKvBinding,
+    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -72,6 +72,8 @@ pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor};
 pub(crate) use load::kv_pages_for_budget;
+#[cfg(feature = "native-backend")]
+pub(crate) use memory_plan::Holder;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
@@ -86,6 +88,8 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+    #[cfg(feature = "native-backend")]
+    use onnx_runtime_ir::{Attribute, DataType as IrDataType, Graph, Node, NodeId, Shape};
     use proptest::prelude::*;
     use std::collections::HashMap;
 
@@ -212,6 +216,8 @@ mod tests {
             native_max_sessions: 8,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
@@ -224,6 +230,228 @@ mod tests {
             connector: ConnectorBridge::null(),
             _environment: None,
         })
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn insert_test_op(
+        graph: &mut Graph,
+        op_type: &str,
+        inputs: Vec<onnx_runtime_ir::ValueId>,
+        output: onnx_runtime_ir::ValueId,
+        attributes: &[(&str, Attribute)],
+    ) {
+        let mut node = Node::new(
+            NodeId(0),
+            op_type,
+            inputs.into_iter().map(Some).collect(),
+            vec![output],
+        );
+        for (name, value) in attributes {
+            node.attributes.insert((*name).to_string(), value.clone());
+        }
+        graph.insert_node(node);
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_hybrid_native_decoder() -> onnx_runtime_session::InferenceSession {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 11);
+        let batch = graph.intern_symbol("batch");
+        let sequence = graph.intern_symbol("sequence");
+        let total = graph.intern_symbol("total");
+        let past = graph.intern_symbol("past");
+        let shape = |dims: &[onnx_runtime_ir::Dim]| -> Shape { dims.to_vec() };
+
+        let input_ids = graph.create_named_value(
+            "input_ids",
+            IrDataType::Int64,
+            shape(&[batch.into(), sequence.into()]),
+        );
+        let attention_mask = graph.create_named_value(
+            "attention_mask",
+            IrDataType::Int64,
+            shape(&[batch.into(), total.into()]),
+        );
+        let position_ids = graph.create_named_value(
+            "position_ids",
+            IrDataType::Int64,
+            shape(&[batch.into(), sequence.into()]),
+        );
+        let conv_state = graph.create_named_value(
+            "past_key_values.0.conv_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 4.into(), 3.into()]),
+        );
+        let recurrent_state = graph.create_named_value(
+            "past_key_values.0.recurrent_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+        );
+        let past_key = graph.create_named_value(
+            "past_key_values.1.key",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+        );
+        let past_value = graph.create_named_value(
+            "past_key_values.1.value",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), past.into(), 1.into()]),
+        );
+        for input in [
+            input_ids,
+            attention_mask,
+            position_ids,
+            conv_state,
+            recurrent_state,
+            past_key,
+            past_value,
+        ] {
+            graph.add_input(input);
+        }
+
+        let cast = graph.create_value(IrDataType::Float32, shape(&[batch.into(), sequence.into()]));
+        insert_test_op(
+            &mut graph,
+            "Cast",
+            vec![input_ids],
+            cast,
+            &[("to", Attribute::Int(1))],
+        );
+        let current_kv = graph.create_value(
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), sequence.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Unsqueeze",
+            vec![cast],
+            current_kv,
+            &[("axes", Attribute::Ints(vec![1, 3]))],
+        );
+        let logits = graph.create_named_value(
+            "logits",
+            IrDataType::Float32,
+            shape(&[batch.into(), sequence.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Unsqueeze",
+            vec![cast],
+            logits,
+            &[("axes", Attribute::Ints(vec![2]))],
+        );
+        let present_conv = graph.create_named_value(
+            "present.0.conv_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 4.into(), 3.into()]),
+        );
+        insert_test_op(&mut graph, "Identity", vec![conv_state], present_conv, &[]);
+        let present_recurrent = graph.create_named_value(
+            "present.0.recurrent_state",
+            IrDataType::Float32,
+            shape(&[batch.into(), 2.into(), 4.into(), 4.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Identity",
+            vec![recurrent_state],
+            present_recurrent,
+            &[],
+        );
+        let present_key = graph.create_named_value(
+            "present.1.key",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![past_key, current_kv],
+            present_key,
+            &[("axis", Attribute::Int(2))],
+        );
+        let present_value = graph.create_named_value(
+            "present.1.value",
+            IrDataType::Float32,
+            shape(&[batch.into(), 1.into(), total.into(), 1.into()]),
+        );
+        insert_test_op(
+            &mut graph,
+            "Concat",
+            vec![past_value, current_kv],
+            present_value,
+            &[("axis", Attribute::Int(2))],
+        );
+        for output in [
+            logits,
+            present_conv,
+            present_recurrent,
+            present_key,
+            present_value,
+        ] {
+            graph.add_output(output);
+        }
+        onnx_runtime_session::InferenceSession::from_graph(graph).expect("tiny hybrid")
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_prefix_snapshot_test_engine() -> anyhow::Result<Engine> {
+        let mut engine = model_free_rewind_test_engine(PagedKvCache::new(1, 1), HashMap::new())?;
+        engine.decode_backend = EngineDecodeBackend::Native;
+        engine.native_session = Some(crate::native_decode::NativeDecodeSession::from_session(
+            tiny_hybrid_native_decoder(),
+        )?);
+        Ok(engine)
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_recurrent_prefix_hit_matches_cold_output() -> anyhow::Result<()> {
+        let prompt = vec![1, 2, 3, 4, 5];
+        let mut cold = native_prefix_snapshot_test_engine()?;
+        let mut cold_options = GenerateOptions {
+            max_new_tokens: 2,
+            stop_on_eos: false,
+            cold_start: true,
+            ..GenerateOptions::default()
+        };
+        let cold_result = cold.generate(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(prompt.clone()),
+            options: cold_options.clone(),
+        })?;
+
+        let mut cached = native_prefix_snapshot_test_engine()?;
+        cold_options.cold_start = false;
+        cold_options.semantic_prefix_len = Some(3);
+        let first = cached.create_session()?;
+        let second = cached.create_session()?;
+        cached.generate_in_session(
+            first,
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt.clone()),
+                options: cold_options.clone(),
+            },
+        )?;
+        let hit_result = cached.generate_in_session(
+            second,
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt),
+                options: cold_options,
+            },
+        )?;
+
+        assert_eq!(hit_result.token_ids, cold_result.token_ids);
+        assert_eq!(hit_result.text, cold_result.text);
+        assert_eq!(
+            cached.recurrent_prefix_cache_stats(),
+            RecurrentPrefixCacheStats {
+                lookups: 2,
+                hits: 1,
+                stores: 1,
+                restored_tokens: 3,
+            }
+        );
+        Ok(())
     }
 
     #[test]

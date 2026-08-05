@@ -60,6 +60,8 @@ pub(crate) enum Holder {
     WeightResidency,
     /// Fixed-size recurrent state for hybrid decoders.
     RecurrentState,
+    /// Semantic-prefix snapshots of recurrent/native loop-carried state.
+    RecurrentPrefixSnapshot,
     /// The native decode path's past/present KV tensors.
     ///
     /// Distinct from the `*KvPool` holders: those are page pools that lease
@@ -93,12 +95,13 @@ impl Holder {
     /// the variants are unconditional even when only one build configuration
     /// constructs them.
     #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 8] = [
+    pub(crate) const ALL: [Holder; 9] = [
         Holder::KvPool,
         Holder::PipelineKvPool,
         Holder::DraftKvPool,
         Holder::WeightResidency,
         Holder::RecurrentState,
+        Holder::RecurrentPrefixSnapshot,
         Holder::NativeKvCache,
         Holder::Activations,
         Holder::FixedDeviceReservation,
@@ -115,6 +118,7 @@ impl Holder {
             Holder::DraftKvPool => 3,
             Holder::WeightResidency => 4,
             Holder::RecurrentState => 5,
+            Holder::RecurrentPrefixSnapshot => 9,
             Holder::NativeKvCache => 8,
             Holder::Activations => 6,
             Holder::FixedDeviceReservation => 7,
@@ -131,7 +135,7 @@ impl Holder {
             // rewound, recomputed or shared, so it is not a `Weights`-style
             // demotion candidate and not step-scoped `Workspace` either. It
             // lives and dies with its sequence, like KV.
-            Holder::RecurrentState => MemoryRole::KvCache,
+            Holder::RecurrentState | Holder::RecurrentPrefixSnapshot => MemoryRole::KvCache,
             Holder::NativeKvCache => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
@@ -146,6 +150,7 @@ impl Holder {
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
             Holder::RecurrentState => "recurrent state",
+            Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
             Holder::NativeKvCache => "native decode KV tensors",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
@@ -166,6 +171,7 @@ impl Holder {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
+            | Holder::RecurrentPrefixSnapshot
             // The native decode session allocates these through its execution
             // provider, so a CPU-EP session holds them in host memory. The call
             // site supplies the real tier via `reserve_on`; this is the default
