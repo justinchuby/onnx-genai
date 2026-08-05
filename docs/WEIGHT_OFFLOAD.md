@@ -493,8 +493,10 @@ verify no cache thrash under rare routes.
 ### Phase 3 — device cache and partial GPU offload
 
 **Status:** Phase 3a has landed the CPU-testable byte-budget placement planner,
-coordinated weight/KV/scratch arbitration, `WeightHandle`/`nxrt` capability seam,
-resident fallback, and quant-block-aligned tile sizing. Phase 3b remains responsible
+the `WeightHandle`/`nxrt` capability seam, resident fallback, and
+quant-block-aligned tile sizing. Its VRAM sub-budget arbitration has since been
+removed in favour of the memory governor's ledger, which arbitrates for every
+holder on a tier rather than for these three. Phase 3b remains responsible
 for live device allocation, H2D transfer, lazy `pkg.nxrt::BlockQuantizedMoE` binding,
 and device execution.
 
@@ -505,7 +507,13 @@ and device execution.
 - [x] implement `gpu_layers:N`/byte-budget planning and quant-block-aligned tile sizing;
 - [ ] implement bounded live VRAM expert pages and device binding (Phase 3b);
 - [ ] connect CPU execution for planned non-GPU layers or waves (Phase 3b);
-- [x] enforce pure coordinated weight/KV/scratch VRAM sub-budget arbitration;
+- [x] enforce coordinated weight/KV/scratch VRAM sub-budget arbitration — **now
+  served by the memory governor's ledger** (`onnx-runtime-memory-governor`),
+  not by this module. Phase 3a landed its own arbitration here; the ledger
+  answers the same question for every holder on a tier, and two authorities
+  dividing the same memory is what that work exists to end. The arbitration
+  types were removed; `plan_placement` stays and takes its weight budget as an
+  argument, so Phase 3b should ask the governor for it rather than deriving one;
 - [ ] connect the plan and arbitration decisions to live device execution (Phase 3b).
 
 **Measure:** models larger than VRAM complete without whole-session CPU fallback or
