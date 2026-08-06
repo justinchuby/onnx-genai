@@ -1442,6 +1442,61 @@ impl SplitKernel {
         }
         Ok(())
     }
+
+    /// Derive the split plan from the already-resolved output shapes.
+    ///
+    /// The executor pre-allocates each Split output at its statically-inferred
+    /// shape, so the split sizes are fully determined by `outputs[i].shape[axis]`
+    /// — no host read of the split-size input and no trailing synchronization are
+    /// required. Returns `None` (falling back to the host-read path) whenever the
+    /// outputs are not concretely and consistently sized, e.g. a genuinely
+    /// data-dependent split whose output shapes shape-inference could not resolve;
+    /// such regions are structurally declined for capture anyway.
+    ///
+    /// This is byte-identical to the host-read path: `launch_copies` performs the
+    /// same per-output stream-ordered copies with the same offsets.
+    fn plan_from_outputs(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+    ) -> Option<(usize, Vec<usize>)> {
+        if outputs.is_empty() {
+            return None;
+        }
+        let in_shape = &inputs[0].shape;
+        let rank = in_shape.len();
+        if rank == 0 {
+            return None;
+        }
+        let axis = if self.axis < 0 {
+            self.axis + rank as i64
+        } else {
+            self.axis
+        };
+        if !(0..rank as i64).contains(&axis) {
+            return None;
+        }
+        let axis = axis as usize;
+        let mut sizes = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            if output.shape.len() != rank {
+                return None;
+            }
+            // Every non-split dimension must match the input; only `axis` differs.
+            for (dim, (&out_extent, &in_extent)) in
+                output.shape.iter().zip(in_shape.iter()).enumerate()
+            {
+                if dim != axis && out_extent != in_extent {
+                    return None;
+                }
+            }
+            sizes.push(output.shape[axis]);
+        }
+        if sizes.iter().sum::<usize>() != in_shape[axis] {
+            return None;
+        }
+        Some((axis, sizes))
+    }
 }
 impl Kernel for SplitKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
@@ -1455,6 +1510,23 @@ impl Kernel for SplitKernel {
         }
         require_dense("Split", inputs, outputs)?;
         let rank = inputs[0].shape.len();
+        // Capture-safe fast path: when the outputs are concretely sized (the
+        // common case, including this model's GatedDeltaNet Split whose sizes come
+        // from a `Constant` node rather than a graph initializer), the split sizes
+        // are fully determined by the output shapes. Copying from them avoids the
+        // host read of the split-size input and the trailing synchronization that
+        // otherwise de-captures the surrounding decode block. Caching the derived
+        // plan lets `capture_support` report `Supported` once the shape is warmed.
+        if let Some((axis, sizes)) = self.plan_from_outputs(inputs, outputs) {
+            *self.static_plan.lock().map_err(|_| {
+                EpError::KernelFailed("cuda_ep Split: static plan lock was poisoned".into())
+            })? = Some(StaticSplitPlan {
+                axis,
+                axis_extent: inputs[0].shape[axis],
+                sizes: sizes.clone(),
+            });
+            return self.launch_copies(inputs, outputs, axis, &sizes);
+        }
         // Capturable fast path: the static, single-data-input form was planned
         // at build time, so no host read of split sizes and no trailing
         // synchronization are needed. Copies are ordered on the stream, which is
