@@ -206,12 +206,27 @@ impl EngineResourceGovernor {
             })?;
         }
         #[cfg(feature = "native-backend")]
-        let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new(
-            inner.snapshot().resolved_limits.host_ram_bytes,
+        // A host-cache lease is a standing claim on RAM. Take it only when the
+        // offload path can actually admit experts; otherwise a disabled cache
+        // would consume the host tier before recurrent state or host KV get a
+        // chance to fit.
+        let weight_offload_host_budget =
+            if std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV)
+                .is_some_and(|value| value == "1")
+            {
+                snapshot.resolved_limits.host_ram_bytes
+            } else {
+                0
+            };
+        #[cfg(feature = "native-backend")]
+        let weight_offload_host_cache = onnx_runtime_ep_cpu::WeightOffloadHostCache::new_leased(
+            weight_offload_host_budget,
+            &memory,
+            Holder::WeightOffloadHostCache.id(),
         )
         .map_err(|reason| ResourceError::BudgetArithmeticOverflow {
-            operation: "configuring the native weight-offload host-cache sub-budget",
-            reason: reason.into(),
+            operation: "leasing the native weight-offload host-cache budget",
+            reason: reason.to_string(),
         })?;
         Ok(Self {
             inner,
