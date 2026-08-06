@@ -1,6 +1,9 @@
 # Weight Offload and Paging for Huge MoE Models
 
-> **Status:** Approved — Phase 1 cleared to implement (owner @justinchuby, 2026-07-14). Open questions resolved; see §11.
+> **Status:** Design approved 2026-07-14 (owner @justinchuby); Phase 1 partially
+> implemented. **§0 records what is measured to work today and what does not** —
+> read it before relying on anything in this document. Open questions resolved;
+> see §11.
 >
 > **Primary targets:** GLM-5.2 and DeepSeek-V4-Flash-class sparse MoE models.
 >
@@ -9,6 +12,88 @@
 > automatically keep more weights resident.
 >
 > **Date:** 2026-07-14
+
+## 0. North star
+
+**One model package runs on any machine that can physically hold one activation
+set, and gets faster as the machine gets bigger — without a different build, a
+different file, or a different code path.**
+
+That is the whole objective. Everything else in this document is a means to it,
+and any part of it can be replaced by something that serves it better.
+
+### 0.1 What that commits us to
+
+Four properties, in priority order. When they conflict, the earlier one wins.
+
+1. **Capacity degrades into latency, never into failure.** A model that does not
+   fit should get slower, not refuse to load. The floor is one activation set
+   plus one bounded weight tile — not the whole model, not a whole expert.
+2. **The user states one number: how much of their device they are willing to
+   give up.** Everything else is derived. A knob that must be discovered,
+   enabled, and then sized again elsewhere is a design failure even when each
+   piece works.
+3. **We must beat the operating system.** Every platform already has a way to
+   overflow device memory — WDDM shared memory, UVM, swap. Ours is only worth
+   having if it is *faster*, and it should be, because we know the access
+   schedule in advance and the OS does not. **If we are slower than doing
+   nothing, the honest recommendation is to do nothing.**
+4. **One authority accounts for every byte.** Any path that allocates without
+   the ledger seeing it is a second set of books, and a system with two sets of
+   books cannot make an admission decision.
+
+### 0.2 What would falsify this design
+
+Stated up front so it stays testable rather than becoming a slogan:
+
+- A model that fits in host RAM but cannot be made to load at all.
+- Our managed offload measured slower than the platform's own overflow mechanism
+  on the same model and machine (property 3 — this is a **quantitative** bar, and
+  it is currently failing; see §0.4).
+- A user needing to know more than one memory number to run a model that fits.
+- Any allocation the governor cannot see.
+
+### 0.3 What is deliberately out of scope
+
+- Making a model fit that cannot fit — there is a physical floor and this design
+  does not pretend otherwise.
+- Beating a machine that has enough memory. When everything is resident, the
+  right behaviour is to get out of the way entirely: allocate once, use stable
+  pointers, and add no per-token cost.
+- Changing numerics to save memory. Quantization is chosen by the model package,
+  not by the residency system.
+
+### 0.4 Current state
+
+**This subsection is a snapshot and is expected to rot. The rest of §0 is not.**
+It is kept deliberately short and links out rather than restating numbers, so
+that stale figures live in issue threads where they can be superseded, not in
+the design.
+
+| north-star property | status |
+|---|---|
+| 1. degrades into latency | **holds** — a model exceeding the card loads and answers correctly |
+| 2. one number | **fails** — `--vram-limit` does not bound weights, and offload needs two further opt-ins ([#712]) |
+| 3. beats the OS | **fails** — measurably slower than WDDM demand paging ([#705]) |
+| 4. one authority | **holds on the paths that are wired**; the platform itself can allocate behind our back on Windows ([#704]) |
+
+Two structural notes that are not merely "not done yet":
+
+- **The memory paths do not compose.** Some combinations of the arena, offload
+  and the baseline fail to load ([#704]). Until that is fixed, any A/B that
+  toggles one of them may be comparing against a broken configuration.
+- **The platform is part of the system.** On Windows WDDM, `cudaMalloc` spills
+  past dedicated VRAM into system RAM and `cuMemGetInfo` cannot see it. Device
+  capacity is therefore not a number we can read, and floor comparisons taken on
+  such a machine do not mean what they appear to ([#704]).
+
+What is confirmed working, and worth not re-litigating: **prefix reuse**, and
+**multi-request concurrency** up to the point where admission becomes the limit.
+See `MEMORY_ARCHITECTURE.md` for the per-component status table.
+
+[#704]: https://github.com/justinchuby/onnx-genai/issues/704
+[#705]: https://github.com/justinchuby/onnx-genai/issues/705
+[#712]: https://github.com/justinchuby/onnx-genai/issues/712
 
 ## 1. Executive recommendation
 

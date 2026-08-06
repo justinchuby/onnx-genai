@@ -31,11 +31,37 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it; still opt-in** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM`. **It has not earned the default**: measured throughput is indistinguishable from `cuMemAlloc` and the apparent VRAM-floor advantage did not survive scrutiny — see "How this area fails" below. The KV cache still has no virtually contiguous layout (#656) |
+| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it; still opt-in** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM`. **It has not earned the default**, and on Windows it is currently *worse*: `cuMemCreate` cannot exceed dedicated VRAM while `cudaMalloc` silently spills into WDDM shared memory, so enabling the arena can turn a working load into an OOM (#704). The KV cache still has no virtually contiguous layout (#656) |
+| Composability of the memory paths | — | **broken: 2 of 4 configurations fail to load** | The VMM arena, weight offload and the baseline do not compose. Measured on qwen2.5-14b int4: neither → 6.01 tok/s; arena only → OOM; offload only → double-counted budget (fixed by #707); both → 0.22 tok/s. Every A/B that toggled one of these compared a working configuration against a broken one (#704) |
+| Weight offload vs the OS | — | **27x slower than doing nothing** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
+| `--vram-limit` | — | **does not limit VRAM** | Bounds only the KV budget derivation. A 2 GB ceiling on a model needing ~15.5 GB still generates successfully, warning and proceeding. #712 proposes making it the single knob that also drives offload automatically |
 | Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
-| Prefix reuse | — | **implemented and measured** | The one part of this document with an unambiguous end-to-end win. On qwen2.5-0.5b with a 5,122-token shared prefix, a warm request prefilled **9 tokens instead of 5,131** and TTFT fell from 137,850 ms to **2,758 ms** — a 44x reduction. Served by native-session KV rewind; the recurrent-state snapshots of #650/#672 are a separate path that native CUDA does not currently hit (`lookups=0`) |
+| Governor integration, server path | — | **fixed 2026-08-06** | `/metrics` reported `vram_used_bytes = 0` while a 14B was loaded and generating, because the server read the scheduler's `ByteBudget` rather than the engine's lease ledger. Admission therefore saw a permanently empty card and never applied back-pressure: 16 concurrent requests cost **12.8x** the wall clock of 8, with zero rejections. Fixed in #711 (16-concurrent 472.8 s → 126.4 s median); the tail is still bad (#706) |
+| Prefix reuse | — | **implemented and measured** | The one part of this document with an unambiguous end-to-end win. On qwen2.5-0.5b with a 5,122-token shared prefix, a warm request prefilled **9 tokens instead of 5,131** and TTFT fell from 137,850 ms to **2,758 ms** — a 44x reduction. Served by native-session KV rewind; the recurrent-state snapshots of #650/#672 are a separate path that native CUDA does not currently hit (`lookups=0`). Confirmed on the HTTP server too: hit rate **0.9886** across a concurrency sweep |
 | Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
+
+### The platform is part of the memory system
+
+On Windows WDDM, `cudaMalloc` does not fail when it exceeds dedicated VRAM — the
+driver spills into "Shared GPU Memory" backed by system RAM (47.8 GB on the
+development machine, against 8 GiB of real VRAM). `cuMemGetInfo` reports only the
+8 GiB, so **nothing in our code can see that it happened**.
+
+Three consequences worth internalising before measuring anything here:
+
+- **VRAM-floor comparisons are invalid on WDDM.** The non-arena arm is not bounded
+  by VRAM, so "the arena needs a higher limit" says nothing about the arena.
+  Measure **committed bytes**, which the driver bounds on both paths.
+- **A load that "works" may be running out of system RAM.** That is a latency
+  cliff, not a capability, and the governor cannot account for it.
+- **The arena failing where the baseline succeeds is the arena being correct.**
+  `cuMemCreate` allocates physical device pages and cannot pretend otherwise.
+
+Users can opt out via NVIDIA Control Panel → *CUDA — Sysmem Fallback Policy* →
+*Prefer No Sysmem Fallback*, which makes floors measurable again. The better
+long-term answer is #712: enforce our own limit before the driver ever reaches
+its spill threshold, which works identically on every platform.
 
 ### How this area fails
 
