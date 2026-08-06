@@ -1545,11 +1545,11 @@ async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
     assert!(body.contains("onnx_genai_batch_size_current"));
     assert!(body.contains("onnx_genai_prefix_cache_hit_rate"));
     assert!(body.contains("onnx_genai_rejections_total"));
-    assert!(body.contains("onnxgenai_vram_used_bytes"));
-    assert!(body.contains("onnxgenai_vram_limit_bytes"));
-    assert!(body.contains("onnxgenai_host_ram_used_bytes"));
-    assert!(body.contains("onnxgenai_host_ram_limit_bytes"));
-    assert!(body.contains("onnxgenai_kv_budget_bytes"));
+    assert!(body.contains("onnx_genai_vram_used_bytes"));
+    assert!(body.contains("onnx_genai_vram_limit_bytes"));
+    assert!(body.contains("onnx_genai_host_ram_used_bytes"));
+    assert!(body.contains("onnx_genai_host_ram_limit_bytes"));
+    assert!(body.contains("onnx_genai_kv_budget_bytes"));
     let after_health = prometheus_sample(
         &body,
         "onnx_genai_requests_total{endpoint=\"/health\",status=\"200\"}",
@@ -1561,7 +1561,7 @@ async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
 /// absent.
 ///
 /// The handler previously used `if let Ok(snapshot) = ...`, so an unreadable
-/// governor dropped the whole `onnxgenai_*` family with no trace. In Prometheus
+/// governor dropped the whole `onnx_genai_*` family with no trace. In Prometheus
 /// a series that simply stops is indistinguishable from a scrape gap, a
 /// restart, or a relabel -- the graph just ends, which is the one shape an
 /// operator reads as "nothing to see". An absent resource ceiling is exactly
@@ -1614,7 +1614,7 @@ async fn metrics_states_governor_availability_rather_than_dropping_the_family() 
 
     // The family and its marker must agree in BOTH directions, which is what
     // makes this a guard rather than a spelling check.
-    let family_present = body.contains("onnxgenai_vram_limit_bytes");
+    let family_present = body.contains("onnx_genai_vram_limit_bytes");
     match available {
         1 => assert!(
             family_present,
@@ -1658,7 +1658,7 @@ fn an_unreadable_governor_is_published_as_absent_not_omitted() {
 
     // The disclaimer must not be accompanied by the readings it disclaims.
     assert!(
-        !output.contains("onnxgenai_vram_limit_bytes"),
+        !output.contains("onnx_genai_vram_limit_bytes"),
         "the unavailable path emitted governor gauges; a 0 marker beside real \
          readings would make operators discard good data:\n{output}"
     );
