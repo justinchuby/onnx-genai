@@ -103,3 +103,7 @@
 - Approved PR #684 after verifying the parallel `qmoe_route` top-k reduction is byte-exact with the old serial total-order scan and leaves softmax aggregation in original order.
 - Found the pre-existing #676 oracle-test defect: reused-engine teacher forcing in the hybrid-Mamba model produced argmax 279 instead of oracle token 33803.
 - Approved PR #692 and independently confirmed the underlying prefix-cache-reuse engine bug; issue #695 now tracks missing Mamba conv/recurrent state restoration.
+
+## 2026-08-06T19:40:00Z — PR #708 review
+
+- Approved #708 after verifying capture-safe Split sizes are statically inferred and byte-equivalent to the old host-read path; left nits for dead fallback docs and redundant re-locking.

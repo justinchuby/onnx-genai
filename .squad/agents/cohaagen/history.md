@@ -117,3 +117,7 @@ _Entries before 2026-07-31T03:03:15Z archived to `history-archive.md` (Scribe ro
 - Cohaagen-37 profiled 35B-A3B QMoE decode and proved `qmoe_route` was the roofline limiter: 65.3% GPU time, rows=1 row-parallel top-k, GPU effectively idle.
 - Authored merged PR #684: block-cooperative byte-exact top-k router, 27/27 qmoe GPU tests, decode improved 30.99 → 16.14 ms/tok (1.92×, ~62 tok/s).
 - Updated issue #610 scorecard to ~24× over dense and ~28.6× over the ORT-GenAI dense-fallback ceiling; next levers are CUDA-graph capture repair and norm/pointwise fusion.
+
+## 2026-08-06T19:40:00Z — 35B-A3B CUDA-graph capture C3 shipped
+
+- Shipped PR #708/C3 making GatedDeltaNet Split capture-safe (resolved output-shape sizes, no host-read/sync): 13.415 → 12.132 ms/tok, 184 → 154 segments, token@119 `33803`; rejected unsafe C2 sync elision and moved on to pinned-vs-growing symbol classification after strict-C1 proved a no-op.
