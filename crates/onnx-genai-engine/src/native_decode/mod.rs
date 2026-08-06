@@ -661,6 +661,22 @@ impl NativeDecodeSession {
         Ok(self.session.adopt_memory_governor(governor, tier, holder)?)
     }
 
+    /// Resize a provider-owned weight-residency budget before governor adoption.
+    ///
+    /// The native CUDA loader initially knows only the explicit VRAM limit. Once
+    /// the session has loaded, it can size KV/recurrent state and leave those
+    /// bytes out of the weight budget instead of reproducing #712 by letting
+    /// weights consume the whole ceiling.
+    pub fn set_weight_residency_budget(&self, budget_bytes: u64) -> anyhow::Result<Option<u64>> {
+        Ok(self.session.set_weight_residency_budget(budget_bytes)?)
+    }
+
+    /// Largest set of lazy weights one native executor node may need resident
+    /// at the same time.
+    pub fn max_lazy_weight_working_set_bytes(&self) -> u64 {
+        self.session.max_lazy_weight_working_set_bytes()
+    }
+
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK
     /// captured verify graph and retain the captured graph across `rewind`. No-op
     /// on non-CUDA sessions. Not wired into any live decode path yet; exercised

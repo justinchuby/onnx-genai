@@ -571,6 +571,25 @@ impl CudaWeightResidency {
         (inner.budget, inner.lease.is_some())
     }
 
+    /// Replace the locally chosen budget before the cache is governed.
+    ///
+    /// Automatic `--vram-limit` offload must leave room for native KV and fixed
+    /// state. The CUDA EP is constructed before those bytes are known, so the
+    /// engine corrects the provisional residency budget after sizing the
+    /// session but before adoption. Refusing once governed prevents silently
+    /// shrinking a lease while pages may already be resident.
+    pub fn set_ungoverned_budget(
+        &self,
+        budget_bytes: u64,
+    ) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
+        let mut inner = self.inner.lock().expect("residency lock poisoned");
+        if inner.lease.is_some() {
+            return Ok(inner.budget);
+        }
+        inner.budget = budget_bytes;
+        Ok(inner.budget)
+    }
+
     /// Replace a locally chosen budget with one leased from `governor`.
     ///
     /// The execution provider is built before the engine's governor exists, so

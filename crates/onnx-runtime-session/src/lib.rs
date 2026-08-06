@@ -1436,6 +1436,14 @@ impl InferenceSession {
         Ok(self.exec.adopt_memory_governor(governor, tier, holder)?)
     }
 
+    pub fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
+        Ok(self.exec.set_weight_residency_budget(budget_bytes)?)
+    }
+
+    pub fn max_lazy_weight_working_set_bytes(&self) -> u64 {
+        self.exec.max_lazy_weight_working_set_bytes()
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }

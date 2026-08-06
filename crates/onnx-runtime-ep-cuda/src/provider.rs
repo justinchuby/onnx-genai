@@ -966,6 +966,21 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.memory().commits_on_demand()
     }
 
+    fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(None);
+        };
+        residency
+            .set_ungoverned_budget(budget_bytes)
+            .map(Some)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: cannot set the device weight-residency budget to \
+                     {budget_bytes} bytes before governor adoption: {error}"
+                ))
+            })
+    }
+
     fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,

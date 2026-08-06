@@ -261,6 +261,28 @@ impl Executor {
         self.ep.adopt_memory_governor(governor, tier, holder)
     }
 
+    pub(crate) fn set_weight_residency_budget(
+        &self,
+        budget_bytes: u64,
+    ) -> onnx_runtime_ep_api::Result<Option<u64>> {
+        self.ep.set_weight_residency_budget(budget_bytes)
+    }
+
+    pub(crate) fn max_lazy_weight_working_set_bytes(&self) -> u64 {
+        self.plan
+            .iter()
+            .map(|node| {
+                node.lazy_weight_inputs
+                    .iter()
+                    .filter_map(|value_id| self.weight_handles.get(value_id))
+                    .filter_map(|handle| handle.as_lazy())
+                    .map(|weight| weight.region_bytes_len() as u64)
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(super) fn binding_signature(bindings: &[DeviceIoBinding]) -> Vec<DeviceBindingSignature> {
         bindings
             .iter()
