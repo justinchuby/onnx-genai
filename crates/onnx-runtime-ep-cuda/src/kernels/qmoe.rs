@@ -1066,14 +1066,7 @@ impl Kernel for QMoEKernel {
             &input_shape[..input_shape.len() - 1],
             "flattened input row count",
         )?;
-        require_rank("router_probs", inputs[1].shape, 2)?;
-        if inputs[1].shape[0] != rows {
-            return Err(error(format!(
-                "router_probs rows {} must equal flattened input rows {rows}",
-                inputs[1].shape[0]
-            )));
-        }
-        let experts = inputs[1].shape[1];
+        let experts = router_probs_experts(inputs[1].shape, rows)?;
         if self.attributes.k > experts {
             return Err(error(format!(
                 "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
@@ -1971,6 +1964,29 @@ fn require_rank(name: &str, shape: &[usize], rank: usize) -> Result<()> {
     Ok(())
 }
 
+/// Validates `router_probs` shape against the flattened input `rows` and returns
+/// the trailing `num_experts` dimension.
+///
+/// `router_probs` mirrors the `input` handling: any rank is accepted as long as
+/// the final dimension is `num_experts` and the leading dimensions multiply to
+/// the flattened token count `rows`. This treats the tensor as a row-major
+/// `[rows, num_experts]` buffer, matching the device route kernel and ORT's QMoE
+/// semantics where `num_rows` is the flattened token count. It is byte-identical
+/// to the previous 2-D `[rows, num_experts]` contract while additionally
+/// accepting 3-D `[batch, sequence, num_experts]` decode inputs.
+fn router_probs_experts(shape: &[usize], rows: usize) -> Result<usize> {
+    let (&experts, leading) = shape.split_last().ok_or_else(|| {
+        error("router_probs must have at least rank 1 ending in num_experts, got shape []")
+    })?;
+    let router_rows = checked_product(leading, "flattened router_probs row count")?;
+    if router_rows != rows {
+        return Err(error(format!(
+            "router_probs rows {router_rows} (from shape {shape:?}) must equal flattened input rows {rows}"
+        )));
+    }
+    Ok(experts)
+}
+
 fn require_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
     if got != expected {
         return Err(error(format!(
@@ -2095,6 +2111,53 @@ mod tests {
             ]);
             assert!(unsupported_reason(&unsupported).is_some(), "{quant_type}");
         }
+    }
+
+    #[test]
+    fn router_probs_accepts_two_dimensional_prefill_shape() {
+        // Byte-identical to the previous rank-2 [rows, num_experts] contract.
+        assert_eq!(router_probs_experts(&[4, 256], 4).unwrap(), 256);
+        assert_eq!(router_probs_experts(&[1, 256], 1).unwrap(), 256);
+    }
+
+    #[test]
+    fn router_probs_accepts_three_dimensional_decode_shape() {
+        // Qwen3.6-35B-A3B QMoE fusion emits [batch, sequence, num_experts] for a
+        // decode step; the leading dims flatten to the single input row.
+        assert_eq!(router_probs_experts(&[1, 1, 256], 1).unwrap(), 256);
+        // A multi-token prefill window [batch, sequence, num_experts] flattens to
+        // batch * sequence rows.
+        assert_eq!(router_probs_experts(&[2, 3, 256], 6).unwrap(), 256);
+    }
+
+    #[test]
+    fn router_probs_rejects_row_count_mismatch() {
+        let error = router_probs_experts(&[2, 256], 1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("router_probs rows 2"), "{message}");
+        assert!(message.contains("flattened input rows 1"), "{message}");
+
+        let error = router_probs_experts(&[1, 1, 256], 2).unwrap_err();
+        assert!(
+            error.to_string().contains("flattened input rows 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn router_probs_reports_trailing_experts_for_k_bound_check() {
+        // The trailing dimension is the num_experts value the caller compares
+        // against top-k, so a too-small last dim is caught as k > num_experts.
+        let experts = router_probs_experts(&[1, 1, 4], 1).unwrap();
+        assert_eq!(experts, 4);
+        let k = 8usize;
+        assert!(k > experts, "k must exceed a smaller trailing experts dim");
+    }
+
+    #[test]
+    fn router_probs_rejects_rank_zero_shape() {
+        let error = router_probs_experts(&[], 1).unwrap_err();
+        assert!(error.to_string().contains("at least rank 1"), "{error}");
     }
 
     #[test]
