@@ -112,3 +112,8 @@ _Entries before 2026-07-31T03:03:15Z archived to `history-archive.md` (Scribe ro
 - Fixed #695 by disabling native host/device KV-mirror prefix reuse whenever `has_recurrent_state()` is true, forcing full recompute for hybrid Mamba/attention decoders.
 - Kept single-shot byte identity and added always-on gate coverage plus an env-gated GPU continuation regression where reused argmax matches the fresh oracle token `33803`.
 - PR #700 merged and closed #695; ORT paged-reuse residual tracked separately as #701.
+## 2026-08-06T12:30:27Z — PR #684 QMoE router parallelization
+
+- Cohaagen-37 profiled 35B-A3B QMoE decode and proved `qmoe_route` was the roofline limiter: 65.3% GPU time, rows=1 row-parallel top-k, GPU effectively idle.
+- Authored merged PR #684: block-cooperative byte-exact top-k router, 27/27 qmoe GPU tests, decode improved 30.99 → 16.14 ms/tok (1.92×, ~62 tok/s).
+- Updated issue #610 scorecard to ~24× over dense and ~28.6× over the ORT-GenAI dense-fallback ceiling; next levers are CUDA-graph capture repair and norm/pointwise fusion.

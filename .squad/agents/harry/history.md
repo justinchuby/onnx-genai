@@ -98,3 +98,8 @@
 - Approved #700 after verifying the recurrent-state gate disables host/device KV-mirror reuse for hybrid decoders without regressing single-shot behavior.
 - Confirmed the env-gated GPU continuation regression compares reused continuation argmax against the fresh oracle (`33803`).
 - Flagged a minor residual on the ORT paged-reuse path (`kv_bridge.rs:407`); coordinator filed #701.
+## 2026-08-06T12:30:27Z — Reviews #684/#692 and cache-reuse bug
+
+- Approved PR #684 after verifying the parallel `qmoe_route` top-k reduction is byte-exact with the old serial total-order scan and leaves softmax aggregation in original order.
+- Found the pre-existing #676 oracle-test defect: reused-engine teacher forcing in the hybrid-Mamba model produced argmax 279 instead of oracle token 33803.
+- Approved PR #692 and independently confirmed the underlying prefix-cache-reuse engine bug; issue #695 now tracks missing Mamba conv/recurrent state restoration.
