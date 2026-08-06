@@ -316,6 +316,18 @@ impl Engine {
         self.governor.snapshot()
     }
 
+    /// Static weight placement computed from `device_policy` at model load.
+    pub fn weight_placement_report(&self) -> Option<&WeightPlacementReport> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.weight_placement.as_ref()
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
     /// Change the live VRAM ceiling when runtime overrides are enabled.
     pub fn set_vram_limit(
         &self,

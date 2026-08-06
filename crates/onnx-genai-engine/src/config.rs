@@ -122,6 +122,11 @@ pub enum EngineConfigError {
         #[source]
         source: LimitParseError,
     },
+    #[error("failed to parse serving.memory.weights.device_policy: {source}")]
+    DevicePolicy {
+        #[source]
+        source: DevicePolicyParseError,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +167,13 @@ struct LimitsYaml {
 struct MemoryYaml {
     #[serde(default)]
     limits: LimitsYaml,
+    #[serde(default)]
+    weights: WeightsYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WeightsYaml {
+    device_policy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -521,6 +533,112 @@ pub enum EngineDecodeBackend {
     Native,
 }
 
+/// User-selected static weight placement policy.
+///
+/// This is deliberately a loud parse surface. A misspelled `gpu_layers` setting
+/// used to be accepted by nobody and ignored by everybody, which is the exact
+/// "documented but unreachable" failure mode this configuration prevents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DevicePolicy {
+    /// Let the engine use the governor-coordinated device weight budget.
+    #[default]
+    Auto,
+    /// Keep planned layers on the host.
+    Cpu,
+    /// Compatibility override matching llama.cpp's `-ngl`: translate the layer
+    /// prefix to bytes, then cap it by the governor's weight budget.
+    GpuLayers(usize),
+    /// Request a byte ceiling for static placement, still capped by the
+    /// governor's coordinated weight budget.
+    DeviceBytes(u64),
+}
+
+/// Error returned when `device_policy` cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "invalid device_policy {input:?}: {reason}; use auto, cpu, gpu_layers:<N>, \
+     or device_bytes:<SIZE>"
+)]
+pub struct DevicePolicyParseError {
+    input: String,
+    reason: String,
+}
+
+impl std::str::FromStr for DevicePolicy {
+    type Err = DevicePolicyParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_device_policy(input)
+    }
+}
+
+/// Parse the `serving.memory.weights.device_policy` value.
+pub fn parse_device_policy(input: &str) -> Result<DevicePolicy, DevicePolicyParseError> {
+    let input = input.trim();
+    if input.eq_ignore_ascii_case("auto") {
+        return Ok(DevicePolicy::Auto);
+    }
+    if input.eq_ignore_ascii_case("cpu") {
+        return Ok(DevicePolicy::Cpu);
+    }
+    if let Some(value) = input.strip_prefix("gpu_layers:") {
+        let layers = value.trim().parse::<usize>().map_err(|_| {
+            device_policy_error(
+                input,
+                "gpu_layers requires a non-negative integer layer count",
+            )
+        })?;
+        return Ok(DevicePolicy::GpuLayers(layers));
+    }
+    if let Some(value) = input.strip_prefix("device_bytes:") {
+        let bytes = match parse_resource_limit(value).map_err(|error| {
+            device_policy_error(
+                input,
+                format!("device_bytes has invalid size syntax: {error}"),
+            )
+        })? {
+            ResourceLimit::Bytes(bytes) => bytes,
+            ResourceLimit::Auto => {
+                return Err(device_policy_error(
+                    input,
+                    "device_bytes requires an explicit size, not auto",
+                ));
+            }
+            ResourceLimit::Fraction(_) => {
+                return Err(device_policy_error(
+                    input,
+                    "device_bytes requires a byte size, not a fraction",
+                ));
+            }
+        };
+        return Ok(DevicePolicy::DeviceBytes(bytes));
+    }
+    Err(device_policy_error(
+        input,
+        "the value does not match any supported policy",
+    ))
+}
+
+fn device_policy_error(
+    input: impl Into<String>,
+    reason: impl Into<String>,
+) -> DevicePolicyParseError {
+    DevicePolicyParseError {
+        input: input.into(),
+        reason: reason.into(),
+    }
+}
+
+/// Profile-facing summary of the static weight placement computed at load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightPlacementReport {
+    pub coordinated_weight_budget_bytes: u64,
+    pub effective_budget_bytes: u64,
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+    pub explanation: String,
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -568,6 +686,8 @@ pub struct EngineConfig {
     pub limits: ResourceLimits,
     /// Permit programmatic resource-limit changes after engine initialization.
     pub allow_runtime_override: bool,
+    /// Static device/host weight placement policy.
+    pub device_policy: DevicePolicy,
     /// Byte budget for a pipeline's memoized prompt-phase (encoder) outputs.
     ///
     /// Re-asking about the same picture should not re-run the vision encoder,
@@ -602,6 +722,7 @@ impl Default for EngineConfig {
             kv_connector: KvConnectorConfig::default(),
             limits: ResourceLimits::default(),
             allow_runtime_override: false,
+            device_policy: DevicePolicy::Auto,
             // One encoder output for a handful of attachments. Big enough that
             // a conversation about a few images keeps all of them, small enough
             // to be an unremarkable line in a process's memory profile.
@@ -618,6 +739,7 @@ impl EngineConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, EngineConfigError> {
         let document: EngineConfigYaml = serde_yaml::from_str(yaml)?;
         let yaml_limits = document.serving.memory.limits;
+        let yaml_weights = document.serving.memory.weights;
         let mut config = Self::default();
         if let Some(limit) = yaml_limits.vram_limit {
             config.limits.vram_limit = limit.parse("vram_limit")?;
@@ -629,6 +751,10 @@ impl EngineConfig {
             config.limits.disk_spill_limit = Some(limit.parse("disk_spill_limit")?);
         }
         config.allow_runtime_override = yaml_limits.allow_runtime_override;
+        if let Some(device_policy) = yaml_weights.device_policy {
+            config.device_policy = parse_device_policy(&device_policy)
+                .map_err(|source| EngineConfigError::DevicePolicy { source })?;
+        }
         Ok(config)
     }
 }
@@ -754,6 +880,25 @@ mod resource_limit_tests {
         )
         .unwrap();
         assert_eq!(disabled.limits.disk_spill_limit, None);
+    }
+
+    #[test]
+    fn yaml_device_policy_is_loud_and_reaches_config() {
+        let config = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    weights:\n      device_policy: gpu_layers:2\n",
+        )
+        .unwrap();
+        assert_eq!(config.device_policy, DevicePolicy::GpuLayers(2));
+
+        let error = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    weights:\n      device_policy: gpu_layerz:2\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("failed to parse serving.memory.weights.device_policy"),
+            "{error}"
+        );
     }
 
     #[test]

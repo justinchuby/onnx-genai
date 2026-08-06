@@ -164,6 +164,8 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
+            weight_placement: None,
+            #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
             native_active_session: None,
@@ -345,6 +347,18 @@ impl Engine {
                 "native execution provider pool is now governed"
             );
         }
+        let weight_placement = plan_static_weight_placement(
+            native_session.inference_session(),
+            config.device_policy,
+            governed_pool_bytes,
+        )?;
+        if let Some(report) = &weight_placement {
+            tracing::info!(
+                device_bytes = report.device_bytes,
+                host_bytes = report.host_bytes,
+                "computed static weight placement plan; enforcement is not wired yet"
+            );
+        }
         // Charge the fixed-size recurrent state a hybrid decoder keeps --
         // `conv_state` and `recurrent_state` for the linear-attention layers.
         //
@@ -464,6 +478,7 @@ impl Engine {
             sessions: HashMap::new(),
             session: None,
             native_session: Some(native_session),
+            weight_placement,
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,
