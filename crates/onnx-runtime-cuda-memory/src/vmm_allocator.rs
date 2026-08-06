@@ -121,6 +121,13 @@ static GLOBAL_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_RESERVED_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PEAK_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+/// Times a granule was released whose reference count was already zero.
+///
+/// Always zero in a correct run. A non-zero reading means some allocation
+/// committed a granule without taking a reference for it, or released one
+/// twice -- an accounting error that would otherwise show up only as another
+/// allocation's memory being unmapped underneath it.
+static GLOBAL_REF_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the process-global VMM arena counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,6 +147,15 @@ pub struct GlobalVmmStats {
     /// is granule sharing working, and one commit per allocation would mean
     /// every small tensor is costing a whole 2 MiB granule.
     pub allocations: u64,
+    /// Times a granule was released whose reference count was already zero.
+    ///
+    /// **Anything but zero is a bug**, and the reason this is reported rather
+    /// than merely defended against: the release path skips such a granule to
+    /// avoid unmapping memory another allocation is still using, which is the
+    /// safe action but also a silent one. Without this counter a refcount
+    /// imbalance is indistinguishable from correct operation until the wrong
+    /// memory is unmapped somewhere else entirely.
+    pub ref_underflows: u64,
 }
 
 /// Read the process-global VMM arena counters.
@@ -155,6 +171,7 @@ pub fn global_vmm_stats() -> GlobalVmmStats {
         reserved_bytes: GLOBAL_RESERVED_BYTES.load(Ordering::Relaxed),
         peak_committed_bytes: GLOBAL_PEAK_COMMITTED_BYTES.load(Ordering::Relaxed),
         allocations: GLOBAL_ALLOCATIONS.load(Ordering::Relaxed),
+        ref_underflows: GLOBAL_REF_UNDERFLOWS.load(Ordering::Relaxed),
     }
 }
 
@@ -167,6 +184,7 @@ pub fn reset_global_vmm_stats() {
     GLOBAL_RESERVED_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_PEAK_COMMITTED_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_ALLOCATIONS.store(0, Ordering::Relaxed);
+    GLOBAL_REF_UNDERFLOWS.store(0, Ordering::Relaxed);
 }
 
 fn note_commit(granularity: usize) {
@@ -551,8 +569,25 @@ impl CudaVmmAllocator {
             match arena.spans.granule_refs[granule].checked_sub(1) {
                 Some(0) | None => {
                     if arena.spans.granule_refs[granule] == 0 {
-                        // Already released; releasing twice would unmap memory
-                        // another allocation is using.
+                        // Already released. Continuing is the safe action --
+                        // unmapping here would pull memory out from under
+                        // whichever allocation still holds the granule.
+                        //
+                        // But reaching this line at all means the reference
+                        // counts no longer balance: every granule a live
+                        // allocation covers is supposed to hold exactly one
+                        // reference for it. Silently absorbing that is how a
+                        // refcount bug becomes invisible memory corruption
+                        // instead of a failure, so it is counted. Debug builds
+                        // refuse it outright, because a test that provokes an
+                        // imbalance should fail rather than pass quietly.
+                        GLOBAL_REF_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+                        debug_assert!(
+                            false,
+                            "vmm arena: released granule {granule} whose reference count was \
+                             already zero -- some allocation committed it without taking a \
+                             reference, or freed it twice"
+                        );
                         continue;
                     }
                     arena.spans.granule_refs[granule] = 0;
