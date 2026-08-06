@@ -236,6 +236,12 @@ jobs:
       - name: Check feature-gated fast paths have fallback coverage
         run: python3 scripts/check_feature_gate_coverage.py
 
+      # A documented environment variable that nothing parses produces no error
+      # and no effect, so the mistake survives indefinitely. `device_policy`
+      # went months that way (#678). This makes the gap a CI failure.
+      - name: Check documented environment variables are implemented
+        run: python3 .github/scripts/verify_documented_env_vars.py
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.

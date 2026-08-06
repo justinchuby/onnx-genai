@@ -379,12 +379,12 @@ Environment aliases for command-line deployments:
 ONNX_GENAI_WEIGHT_OFFLOAD=1                    # Phase-1 route-first mmap CPU MoE
 ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=<bytes>   # owned Phase-2 warm-cache override
 ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1       # opt-IN async fence-ordered device page-in (default: sync)
-ONNX_GENAI_WEIGHT_PREFETCH=off|exact|heat|predictive|auto
 ```
 
 The older environment aliases sketched here for `ONNX_GENAI_WEIGHT_BUDGET`,
-`ONNX_GENAI_WEIGHT_DEVICE_BUDGET`, `ONNX_GENAI_WEIGHT_HOST_BUDGET`, and
-`ONNX_GENAI_GPU_LAYERS` are not implemented and should not be documented as active
+`ONNX_GENAI_WEIGHT_DEVICE_BUDGET`, `ONNX_GENAI_WEIGHT_HOST_BUDGET`,
+`ONNX_GENAI_GPU_LAYERS`, and `ONNX_GENAI_WEIGHT_PREFETCH` are not implemented and
+should not be documented as active
 configuration until they are wired to the same parser.
 
 `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is **opt-in** (default: synchronous
