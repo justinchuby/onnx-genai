@@ -1879,74 +1879,111 @@ impl Engine {
             common_prefix_len(&state.tokens, &prompt_tokens)
         };
 
+        let supports_past_snapshots = self
+            .native_session
+            .as_ref()
+            .is_some_and(|native| native.supports_past_snapshots());
         let mut restored_prefix_len = None;
         let mut should_store_semantic_snapshot = false;
-        if !active_matches && let Some(boundary) = semantic_prefix_len {
+        if !active_matches
+            && supports_past_snapshots
+            && let Some(boundary) = semantic_prefix_len
+        {
             self.native_recurrent_prefix_stats.lookups += 1;
             if let Some((matched, snapshot)) = self
                 .prefix_cache
                 .lookup_snapshot::<NativePrefixSnapshot>(&prompt_tokens)
-                .filter(|(matched, _)| *matched == boundary && *matched < prompt_tokens.len())
+                .filter(|(matched, _)| *matched >= boundary && *matched < prompt_tokens.len())
             {
                 let native = self
                     .native_session
                     .as_mut()
                     .context("native decoder session is unavailable")?;
-                native.restore_past_snapshot(&snapshot.snapshot)?;
-                self.native_recurrent_prefix_stats.hits += 1;
-                self.native_recurrent_prefix_stats.restored_tokens += matched as u64;
-                restored_prefix_len = Some(matched);
+                match native.restore_past_snapshot(&snapshot.snapshot) {
+                    Ok(()) => {
+                        self.native_recurrent_prefix_stats.hits += 1;
+                        self.native_recurrent_prefix_stats.restored_tokens += matched as u64;
+                        restored_prefix_len = Some(matched);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "skipping native recurrent prefix snapshot restore after failure: \
+                             {error:#}"
+                        );
+                    }
+                }
             } else {
                 should_store_semantic_snapshot = true;
             }
         }
 
-        if should_store_semantic_snapshot && let Some(boundary) = semantic_prefix_len {
+        if should_store_semantic_snapshot
+            && supports_past_snapshots
+            && let Some(boundary) = semantic_prefix_len
+        {
             let snapshot = {
                 let native = self
                     .native_session
                     .as_mut()
                     .context("native decoder session is unavailable")?;
                 native.prefill_prefix(&prompt_tokens[..boundary])?;
-                native.snapshot_past()?
+                native.snapshot_past()
             };
-            let reserve_snapshot = || {
-                onnx_runtime_memory_governor::MemoryGovernor::reserve(
-                    self.governor.memory(),
-                    onnx_runtime_memory_governor::Tier::Host,
-                    snapshot.bytes(),
-                    Holder::RecurrentPrefixSnapshot.role(),
-                    Holder::RecurrentPrefixSnapshot.id(),
-                )
-            };
-            let lease = match reserve_snapshot() {
-                Ok(lease) => lease,
-                Err(first_error) if self.prefix_cache.evict_lru_snapshot() => reserve_snapshot()
-                    .with_context(|| {
-                        format!(
-                            "cannot reserve {} bytes for native recurrent prefix snapshot after \
-                             evicting an older snapshot: {first_error}",
-                            snapshot.bytes()
+            match snapshot {
+                Ok(snapshot) => {
+                    let reserve_snapshot = || {
+                        onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                            self.governor.memory(),
+                            onnx_runtime_memory_governor::Tier::Host,
+                            snapshot.bytes(),
+                            Holder::RecurrentPrefixSnapshot.role(),
+                            Holder::RecurrentPrefixSnapshot.id(),
                         )
-                    })?,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "cannot reserve {} bytes for native recurrent prefix snapshot",
-                            snapshot.bytes()
-                        )
-                    });
+                    };
+                    let lease = match reserve_snapshot() {
+                        Ok(lease) => Some(lease),
+                        Err(first_error) if self.prefix_cache.evict_lru_snapshot() => {
+                            match reserve_snapshot() {
+                                Ok(lease) => Some(lease),
+                                Err(error) => {
+                                    tracing::debug!(
+                                        "skipping native recurrent prefix snapshot store; cannot \
+                                         reserve {} bytes after evicting an older snapshot: \
+                                         {first_error}; retry: {error}",
+                                        snapshot.bytes()
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "skipping native recurrent prefix snapshot store; cannot reserve \
+                                 {} bytes: {error}",
+                                snapshot.bytes()
+                            );
+                            None
+                        }
+                    };
+                    if let Some(lease) = lease {
+                        self.prefix_cache.insert_snapshot(
+                            &prompt_tokens[..boundary],
+                            Arc::new(NativePrefixSnapshot {
+                                snapshot,
+                                _lease: lease,
+                            }),
+                        );
+                        self.native_recurrent_prefix_stats.stores += 1;
+                    }
+                    restored_prefix_len = Some(boundary);
                 }
-            };
-            self.prefix_cache.insert_snapshot(
-                &prompt_tokens[..boundary],
-                Arc::new(NativePrefixSnapshot {
-                    snapshot,
-                    _lease: lease,
-                }),
-            );
-            self.native_recurrent_prefix_stats.stores += 1;
-            restored_prefix_len = Some(boundary);
+                Err(error) => {
+                    tracing::debug!(
+                        "skipping native recurrent prefix snapshot store after snapshot failure: \
+                         {error:#}"
+                    );
+                }
+            }
         }
 
         let result = {
