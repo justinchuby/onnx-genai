@@ -308,3 +308,106 @@ fn qwen36_35b_a3b_qmoe_native_cuda_matches_fp32_oracle() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// #695 regression: on a **hybrid Mamba** model, a continuation that reuses a
+/// post-decode engine (multi-turn chat / a second `generate` sharing a prefix)
+/// must produce the SAME next-token logits as a fresh-engine teacher-force of
+/// the equivalent full context.
+///
+/// ## The bug
+///
+/// Prefix / KV-mirror reuse restores only attention KV; the conv/recurrent
+/// (`Mamba`) `fixed_state_binding_range` is reconstructed only on a full
+/// `rewind(0)` and never rebuilt for a reused prefix, so the recurrent path
+/// starts fresh-zero, inconsistent with the reused attention prefix. Before the
+/// fix, teacher-forcing the 120-token shared context on the engine that just
+/// autoregressively decoded it argmaxed an unrelated token (empirically 279)
+/// instead of the fp32-oracle token (33803) a fresh engine yields.
+///
+/// ## The fix under test
+///
+/// The KV-mirror support gate now returns `false` whenever the decoder carries
+/// recurrent state, forcing a full recompute on continuation. This test locks
+/// the *symptom*: `reused-engine argmax == fresh-engine argmax == ORACLE_TOKEN`.
+/// The fresh engine is the oracle (it correctly re-runs the full prefill), so
+/// the assertion is oracle-backed, not a hard-coded constant. Without the gate
+/// fix the reused-engine argmax diverges and this test fails.
+///
+/// Env-gated on the same real 35B-A3B artifact + CUDA device as the divergence
+/// lock above; skips cleanly when either is absent.
+#[test]
+#[ignore = "requires the real Qwen3.6-35B-A3B int4 QMoE artifacts and a CUDA device"]
+fn qwen36_35b_a3b_hybrid_continuation_matches_fresh_engine() -> anyhow::Result<()> {
+    let Some(qmoe_dir) = resolve_dir("QWEN36_A3B_QMOE_E2E_DIR", DEFAULT_QMOE_DIR) else {
+        return Ok(());
+    };
+    if !cuda_available() {
+        return Ok(());
+    }
+    let tokenizer = Tokenizer::from_file(qmoe_dir.join("tokenizer.json"))?;
+    let prompt_ids = tokenizer.encode(PROMPT)?;
+    let n = DIVERGENCE_INDEX + 1;
+
+    // Engine A autoregressively decodes the shared context, so its conv/recurrent
+    // (Mamba) state now holds the terminal decode state and its prefix cache is
+    // populated — the exact "reused engine" a multi-turn continuation lands on.
+    let mut reused = engine(
+        &qmoe_dir,
+        EngineDecodeBackend::Native,
+        NativeDecodeDevice::Cuda { index: Some(0) },
+    )?;
+    let stream = greedy_stream(&mut reused, n)?;
+    assert_eq!(
+        stream[DIVERGENCE_INDEX], ORACLE_TOKEN,
+        "autoregressive token {DIVERGENCE_INDEX} regressed from fp32-oracle {ORACLE_TOKEN} to {}",
+        stream[DIVERGENCE_INDEX],
+    );
+
+    // The exact shared context: prompt + generated[0..DIVERGENCE_INDEX].
+    let mut context = prompt_ids.clone();
+    context.extend_from_slice(&stream[..DIVERGENCE_INDEX]);
+
+    // Continuation on the REUSED engine: this is the #695 reproduction. With the
+    // KV-mirror gate disabled for recurrent decoders, this must fully recompute
+    // and reproduce the fp32-oracle argmax instead of collapsing to 279.
+    let reused_step = teacher_forced_step(&mut reused, &context, 8)?;
+    let reused_argmax = argmax(&reused_step);
+    drop(reused);
+
+    // Oracle: a FRESH engine re-runs the full prefill and yields the correct
+    // next-token distribution for the same context.
+    let mut fresh = engine(
+        &qmoe_dir,
+        EngineDecodeBackend::Native,
+        NativeDecodeDevice::Cuda { index: Some(0) },
+    )?;
+    let fresh_step = teacher_forced_step(&mut fresh, &context, 8)?;
+    let fresh_argmax = argmax(&fresh_step);
+    drop(fresh);
+
+    assert_eq!(
+        fresh_argmax, ORACLE_TOKEN,
+        "fresh-engine teacher-force must adjudicate the fp32-oracle token {ORACLE_TOKEN}",
+    );
+    assert_eq!(
+        reused_argmax, fresh_argmax,
+        "#695: reused-engine continuation argmax {reused_argmax} must equal the fresh-engine \
+         oracle argmax {fresh_argmax} (before the KV-mirror gate fix it collapsed to 279)",
+    );
+
+    // The reused-engine tie must also land in the benign fp32 band — a stronger
+    // check than argmax alone that the recompute reproduces the full distribution.
+    let reused_margin =
+        logprob_of(&reused_step, ORACLE_TOKEN) - logprob_of(&reused_step, DENSE_CUDA_TOKEN);
+    assert!(
+        MARGIN_BAND.contains(&reused_margin),
+        "reused-engine {ORACLE_TOKEN}-over-{DENSE_CUDA_TOKEN} tie {reused_margin} outside \
+         {MARGIN_BAND:?}",
+    );
+
+    eprintln!(
+        "Qwen3.6-35B-A3B #695 continuation OK: reused-engine argmax {reused_argmax} == \
+         fresh-engine oracle {fresh_argmax} (recurrent-state gate forces full recompute)",
+    );
+    Ok(())
+}
