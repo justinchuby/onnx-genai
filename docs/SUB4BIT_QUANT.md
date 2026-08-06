@@ -254,12 +254,26 @@ The op name intentionally says “block quantized”, not “NBits”: MXFP4 and
 indices are semantic formats, not merely bit widths. A future schema can add
 standardized layouts without changing the meaning of old models.
 
-The CPU v1 implementation now registers this op in
-`pkg.nxrt`, accepts f32 `A`, native uint8 `packed_B`, and an
-optional f32 bias, then dequantizes to f32 and uses the shared CPU GEMM. MXFP4
-and IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M
-are implemented using the pinned llama.cpp layouts and dequantization math
+The CPU v1 implementation registers this op in `pkg.nxrt`, accepts f32/f16/bf16
+`A`, native uint8 `packed_B`, and an optional same-dtype bias. It currently
+dequantizes to f32 and uses the shared CPU GEMM. For constant `packed_B`, the
+dense expansion is stored in a per-kernel bounded LRU cache
+(`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`, default 256 MiB), so repeated decode
+does not expand the same immutable weight every token. This is explicitly
+cached-dense reuse, not direct quantized-domain compute. MXFP4 and IQ4_NL,
+IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, and IQ1_M are implemented
+using the pinned llama.cpp layouts and dequantization math
 [L1][L2][L3][L4][L5][L6][L7][L8][L9][L13].
+
+The cache budget is **per compiled kernel instance**, not per session, model, or
+process. Each `(session, node, resolved input shapes)` kernel owns an independent
+LRU with that ceiling. Consequently, a model containing many block-quantized
+projections can retain close to the aggregate size of all of their f32 dense
+expansions (or up to the per-kernel limit for each active kernel); the default
+does **not** impose a model-wide 256 MiB cap. Accounting covers resident dense
+f32 payload bytes, not key/`Arc` metadata, and an in-flight `Arc` remains alive
+after eviction until the current compute finishes, so short-lived aggregate
+memory can be higher. Set the environment variable to `0` to disable retention.
 
 For MXFP4 interoperability, also support a lowering between this GGUF-native
 layout and ORT's current `QMoE(quant_type="fp4")` representation, which uses
@@ -314,12 +328,15 @@ Execution for one admitted token batch is:
 6. scatter-add outputs using `aggregation_weights`; and
 7. release expert leases after the stream/event completes.
 
-For decode, grouped GEMV over selected experts is the primary kernel. For
-prefill or a continuous batch with many rows per expert, dequantized panels may
-feed grouped/batched CPU GEMM; ORT's QMoE and MLAS kernels should be
-the implementation reference. CUDA should stage selected block ranges into a
-stream-ordered expert cache and use a direct IQ/MXFP4 kernel, not expand entire
-experts to fp16/f32.
+For decode, grouped GEMV over selected experts is the primary kernel. The current
+CPU implementation groups rows by expert and uses the same bounded cached-dense
+reuse for constant routed expert projections, avoiding per-token re-expansion of
+hot experts while still reporting the path as cached-dense rather than
+quantized-domain. For prefill or a continuous batch with many rows per expert,
+dequantized panels may feed grouped/batched CPU GEMM; ORT's QMoE and MLAS
+kernels should be the implementation reference. CUDA should stage selected block
+ranges into a stream-ordered expert cache and use a direct IQ/MXFP4 kernel, not
+expand entire experts to fp16/f32.
 
 This fusion is also the memory boundary. A decomposed graph encourages the
 executor to map or upload every expert initializer. The fused kernel can page

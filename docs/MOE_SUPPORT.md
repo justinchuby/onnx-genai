@@ -1,12 +1,14 @@
 # First-Class Mixture-of-Experts Support
 
-**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP registers
-grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`; quantized kernels
-dequantize active experts route-first. The CPU `BlockQuantizedMoE` path is
-memory-format-only today: it does not perform quantized-domain expert compute,
-and its dense-f32 expert dispatch is claimed as tier3 in `dispatch_manifest.toml`.
-CUDA grouped MoE and the broader Phase 3 streaming/scheduling work are not
-claimed complete.
+**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP
+registers grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`;
+quantized kernels dequantize active experts route-first and cache constant
+dense expert expansions under a bounded per-kernel LRU. The CPU
+`BlockQuantizedMoE` path remains memory-format-only: routed experts are
+dequantized to dense f32 before grouped compute, rather than computed directly
+in the quantized domain. Both the dense-f32 dispatch and cached-dense hit path
+are claimed as tier3 in `dispatch_manifest.toml`. CUDA grouped MoE and the
+broader Phase 3 streaming/scheduling work are not claimed complete.
 
 ## 1. Executive recommendation
 
@@ -534,7 +536,16 @@ and invokes one expert computation per active expert. Multi-row expert groups us
 the CPU EP's shared GEMM backend; decode groups of one use the scalar GEMV path
 without issuing a per-token GEMM. `QMoE` and `BlockQuantizedMoE` dequantize only
 active experts, one expert at a time, then consume all rows routed to that expert.
-They do not materialize a full all-expert dequantization buffer.
+`BlockQuantizedMoE` stores constant routed expert dense expansions in a
+kernel-local bounded cached-dense LRU shared by that kernel's FC1/FC2/FC3 entries
+(`ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES`, default 256 MiB), so hot experts do
+not re-expand every token. The ceiling applies independently to every compiled
+MoE kernel instance; it is not a model-wide cap, and aggregate retained dense
+memory can approach all hot dequantized expert projections across the model.
+Accounting covers resident f32 payloads rather than metadata or in-flight
+post-eviction `Arc` leases. This is not direct quantized-domain expert compute,
+and dispatch evidence labels it cached-dense. The kernel hashes/dequantizes only
+selected expert slices and never materializes a full all-expert dense buffer.
 
 CPU differential coverage:
 
