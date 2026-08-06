@@ -31,9 +31,11 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM` until it has been measured for throughput. The KV cache still has no virtually contiguous layout (#656) |
+| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it; still opt-in** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM`. **It has not earned the default**: measured throughput is indistinguishable from `cuMemAlloc` and the apparent VRAM-floor advantage did not survive scrutiny — see "How this area fails" below. The KV cache still has no virtually contiguous layout (#656) |
 | Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
+| Prefix reuse | — | **implemented and measured** | The one part of this document with an unambiguous end-to-end win. On qwen2.5-0.5b with a 5,122-token shared prefix, a warm request prefilled **9 tokens instead of 5,131** and TTFT fell from 137,850 ms to **2,758 ms** — a 44x reduction. Served by native-session KV rewind; the recurrent-state snapshots of #650/#672 are a separate path that native CUDA does not currently hit (`lookups=0`) |
+| Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
 
 ### How this area fails
 
@@ -70,6 +72,47 @@ feature is inert.
 **Before trusting a correctness test, break the code and watch it go red.** Both
 vacuous tests above were counted as coverage. Deliberately stubbing the function
 under test takes a minute and is the only thing that would have caught either.
+
+### The same failure, one level up: results
+
+The pattern is not confined to code. A *measurement* can be right, reproducible,
+and still support a conclusion it does not license. Two instances, both caught
+only because someone asked a second question:
+
+- **A prefetch A/B compared demand fallback against itself.** At a 96 MiB
+  budget the guard silently declined every prefetch, so both arms ran the same
+  path. The counters that would have shown it did not exist yet, and "the
+  feature is enabled" was inferred from the absence of an error (#673).
+- **The VMM arena appeared to reach a lower VRAM floor than `cuMemAlloc`**
+  — 2.56 GiB against 2.60 GiB — and that 40 MiB was about to justify deleting
+  the `cuMemAlloc` path. Re-running the sweep showed the arena floor is
+  **non-monotonic**: it passes at 2.34–2.36 GiB, *fails* at 2.37–2.47, and
+  passes again at 2.48. Every run that passed below the failure band did so
+  while printing `the memory ledger refused the arena's committed bytes ... the
+  ledger understates device use`. The arena did not fit in less memory; it
+  proceeded while the ledger was knowingly wrong. **The measurement and the bug
+  (#694) were the same event.**
+
+So a third habit, for numbers rather than code:
+
+**Ask what else could produce this number.** Name an alternative mechanism and
+rule it out, or say that you could not. In both cases above the alternative was
+"the feature was not actually doing what the arm's name says", which is the
+first thing to check and the easiest to skip.
+
+Two corollaries worth stating because both cost time here:
+
+- **A run that warns about its own accounting is a failed run.** The floor test
+  above could pass while printing that the ledger had rejected it — as a floor
+  test, it could fail to fail.
+- **Check the binary is the one you think it is.** A finding in #693 that the
+  arena had committed 18.8 GiB on an 8 GiB card was measured with a stale
+  `target/release` build and had to be retracted. On Windows, `Copy-Item`
+  preserves the source mtime, so restoring a file from a `.bak` can leave cargo
+  reusing a stale artifact.
+
+The `Challenger` role (`.squad/agents/challenger/charter.md`) exists to apply
+this systematically to any result that would change technical direction.
 
 The last five rows are newer than the layers above them and move fastest, so
 each says where it actually is. "Decided" and "in `main`" are different states
