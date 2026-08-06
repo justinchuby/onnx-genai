@@ -1,5 +1,15 @@
 use super::*;
 
+pub(crate) struct NativeDecodeLoadOptions<'a> {
+    pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
+    #[cfg(feature = "cuda")]
+    pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
+    pub(crate) io: Option<&'a ModelIoSpec>,
+    pub(crate) metadata_max_len: Option<usize>,
+    pub(crate) key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
+    pub(crate) decode_precision: DecodePrecision,
+}
+
 fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
     let root = if path.is_dir() { path } else { path.parent()? };
     [
@@ -75,11 +85,7 @@ impl NativeDecodeSession {
     pub(crate) fn load_with_weight_offload_host_cache(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
-        host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
-        io: Option<&ModelIoSpec>,
-        metadata_max_len: Option<usize>,
-        key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
-        decode_precision: DecodePrecision,
+        options: NativeDecodeLoadOptions<'_>,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -89,19 +95,29 @@ impl NativeDecodeSession {
         let mut builder = InferenceSession::builder()
             .model(path)
             .device(preference)
-            .decode_precision(decode_precision);
+            .decode_precision(options.decode_precision);
         if device == NativeDecodeDevice::Cpu {
             let ep =
                 onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(
-                    host_cache,
+                    options.host_cache,
                 )
                 .context("initialize native CPU execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         #[cfg(feature = "cuda")]
         if let NativeDecodeDevice::Cuda { index } = device {
-            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index.unwrap_or(0))
-                .context("initialize native CUDA execution provider")?;
+            let ep = match options.cuda_offload_policy {
+                Some(policy) => {
+                    onnx_runtime_ep_cuda::CudaExecutionProvider::initialized_with_offload_policy(
+                        index.unwrap_or(0),
+                        policy,
+                    )
+                }
+                None => {
+                    onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index.unwrap_or(0))
+                }
+            }
+            .context("initialize native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         if let NativeDecodeDevice::Plugin {
@@ -120,15 +136,28 @@ impl NativeDecodeSession {
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
-        Self::validate_key_sequence_lengths_contract(&session, key_sequence_lengths_policy)?;
+        Self::validate_key_sequence_lengths_contract(
+            &session,
+            options.key_sequence_lengths_policy,
+        )?;
         Self::from_session_with_cuda_options_and_io(
             session,
             NativeDecodeCudaOptions {
                 kv_max_len: None,
-                metadata_max_len,
+                metadata_max_len: options.metadata_max_len,
                 graph_capture: None,
+                weight_offload_enabled: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        options.cuda_offload_policy.map(|policy| policy.enabled)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
+                },
             },
-            io,
+            options.io,
         )
     }
 
@@ -182,6 +211,7 @@ impl NativeDecodeSession {
                 kv_max_len: cuda_kv_max_len,
                 metadata_max_len,
                 graph_capture: None,
+                weight_offload_enabled: None,
             },
         )
     }
@@ -265,6 +295,7 @@ impl NativeDecodeSession {
                 kv_max_len: cuda_kv_max_len,
                 metadata_max_len: None,
                 graph_capture: None,
+                weight_offload_enabled: None,
             },
             io,
         )
@@ -693,8 +724,9 @@ impl NativeDecodeSession {
             // with graph capture; when the CUDA EP isn't compiled in there is no
             // pager, so offload is unconditionally off here.
             #[cfg(feature = "cuda")]
-            let weight_offload_enabled =
-                onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled;
+            let weight_offload_enabled = cuda_options
+                .weight_offload_enabled
+                .unwrap_or_else(|| onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled);
             #[cfg(not(feature = "cuda"))]
             let weight_offload_enabled = false;
             let graph_enabled = resolve_graph_capture_enabled(

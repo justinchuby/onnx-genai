@@ -38,6 +38,7 @@ use cuda::DecodeCudaState;
 use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
 use io::*;
+pub(crate) use load::NativeDecodeLoadOptions;
 pub use paged_gqa::{
     GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
     paged_gqa_decode_step,
@@ -69,6 +70,7 @@ pub struct NativeDecodeCudaOptions {
     pub kv_max_len: Option<usize>,
     pub metadata_max_len: Option<usize>,
     pub graph_capture: Option<bool>,
+    pub weight_offload_enabled: Option<bool>,
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
