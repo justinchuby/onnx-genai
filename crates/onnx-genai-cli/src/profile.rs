@@ -597,6 +597,8 @@ pub(crate) struct VmmArena {
     pub(crate) reserved_bytes: u64,
     pub(crate) peak_committed_bytes: u64,
     pub(crate) allocations: u64,
+    /// Non-zero means the arena's granule reference counts do not balance.
+    pub(crate) ref_underflows: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -984,6 +986,17 @@ impl RunProfile {
                         "{:<24} {} allocs, {} commits, {} releases",
                         "vmm arena activity", arena.allocations, arena.commits, arena.releases
                     );
+                    // Printed only when non-zero, and phrased as a fault
+                    // rather than a statistic: a balanced arena has nothing to
+                    // say here, and an unbalanced one has already unmapped
+                    // memory some other allocation believes it owns.
+                    if arena.ref_underflows > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} BUG: {} granule release(s) with a zero reference count",
+                            "vmm arena", arena.ref_underflows
+                        );
+                    }
                 }
             }
         }
@@ -1218,13 +1231,14 @@ impl RunProfile {
         }
         if let Some(arena) = self.memory.vmm_arena {
             fields.push(format!(
-                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{}}}",
+                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{}}}",
                 arena.commits,
                 arena.releases,
                 arena.committed_bytes,
                 arena.reserved_bytes,
                 arena.peak_committed_bytes,
-                arena.allocations
+                arena.allocations,
+                arena.ref_underflows
             ));
         }
         format!("{{{}}}", fields.join(","))
