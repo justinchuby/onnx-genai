@@ -735,7 +735,15 @@ mod tests {
     #[test]
     #[cfg(feature = "native-backend")]
     fn provider_pool_adoption_replaces_the_fixed_weight_reservation() {
-        let governor = governor(2_000);
+        // The ceiling is deliberately tight: 1_000 leaves room for one 600-byte
+        // claim but not for two at once. That is what pins the *ordering* rather
+        // than only the final total -- with the release moved after the
+        // adoption, the transient peak of 1_200 exceeds the tier and the
+        // `reserve` below fails. A roomier ceiling would let the buggy
+        // interleaving succeed and settle on the same total, which is exactly
+        // the failure this test exists to catch (#704), and the ordering is
+        // what the equivalent VMM fix in #667 turned on.
+        let governor = governor(1_000);
         let mut plan = ModelMemoryPlan::new(governor.clone());
 
         plan.reserve(Holder::FixedDeviceReservation, 600)
