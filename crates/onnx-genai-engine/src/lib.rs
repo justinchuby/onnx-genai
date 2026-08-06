@@ -146,6 +146,9 @@ pub struct VmmArenaStats {
     /// Times a byte counter would have gone negative and was clamped.
     /// **Anything but zero is a bug** in the allocator's accounting.
     pub byte_underflows: u64,
+    /// Committed bytes the adopted memory governor did not record.
+    /// **Anything but zero is a fault** because admission sees understated use.
+    pub unaccounted_committed_bytes: u64,
 }
 
 #[cfg(feature = "native-backend")]

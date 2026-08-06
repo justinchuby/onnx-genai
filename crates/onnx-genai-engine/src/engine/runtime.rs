@@ -316,6 +316,11 @@ impl Engine {
         self.governor.snapshot()
     }
 
+    /// Bytes by which the device memory ledger exceeds its live ceiling.
+    pub fn device_oversubscribed_bytes(&self) -> u64 {
+        self.governor.device_oversubscribed_bytes()
+    }
+
     /// Static weight placement computed from `device_policy` at model load.
     pub fn weight_placement_report(&self) -> Option<&WeightPlacementReport> {
         #[cfg(feature = "native-backend")]
@@ -1230,6 +1235,7 @@ impl Engine {
                 allocations: stats.allocations,
                 ref_underflows: stats.ref_underflows,
                 byte_underflows: stats.byte_underflows,
+                unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
             })
         }
         #[cfg(not(feature = "cuda"))]

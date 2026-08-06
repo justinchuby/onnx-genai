@@ -277,6 +277,75 @@ fn live_allocations_do_not_overlap() {
     }
 }
 
+/// Adoption records already-committed private-ledger bytes even over limit.
+///
+/// This is the #694 wiring test: the arena has already mapped the granules, so
+/// `adopt_governor` must record the accomplished fact instead of asking whether
+/// the bytes may be taken. If it calls `reserve`, the real governor refuses and
+/// the ledger stays at the pre-existing lease.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn adoption_records_committed_bytes_even_when_the_tier_is_over_limit() {
+    let context = match CudaContext::new(0) {
+        Ok(context) => context,
+        Err(error) => panic!(
+            "VMM allocator test requires a CUDA driver; CPU-only runs must leave this test ignored: {error}"
+        ),
+    };
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 20, 0, 0));
+    let existing = governor
+        .reserve(
+            Tier::Device,
+            6 << 20,
+            MemoryRole::Weights,
+            HolderId::new(22),
+        )
+        .expect("fixture lease leaves less room than the arena will commit");
+    let allocator = CudaVmmAllocator::detached(
+        context,
+        DeviceKey::device(0),
+        0,
+        16 << 20,
+        HOLDER,
+        MemoryRole::Workspace { step_scoped: false },
+    )
+    .expect("detached arena reserves address space");
+
+    let pointer = allocator
+        .allocate(3 << 20, 256)
+        .expect("private startup ledger does not refuse the commit");
+    let (committed, _) = allocator.committed_and_reserved();
+    let remainder = (8 << 20) - (6 << 20);
+    assert!(
+        committed as u64 > remainder,
+        "fixture must commit more than the real governor's remaining {remainder} bytes"
+    );
+
+    let adoption = allocator.adopt_governor(&governor, HOLDER);
+    assert_eq!(
+        adoption.unaccounted_bytes, 0,
+        "the reference governor records committed bytes rather than refusing them"
+    );
+    assert_eq!(adoption.recorded_bytes, committed as u64);
+    assert_eq!(
+        governor.used(Tier::Device),
+        (6 << 20) + committed as u64,
+        "adoption must leave the ledger reporting the true committed total"
+    );
+    assert_eq!(
+        governor.oversubscribed_bytes(Tier::Device),
+        (6 << 20) + committed as u64 - (8 << 20),
+        "over-subscription must be observable after adoption"
+    );
+
+    // SAFETY: the pointer came from this allocator and is still live.
+    unsafe { allocator.deallocate(pointer, 3 << 20, 256) };
+    drop(existing);
+}
+
 /// The ledger can refuse, and a refusal leaves nothing mapped.
 ///
 /// A budget that can be exceeded is not a budget (G1). The important half is

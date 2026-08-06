@@ -562,6 +562,8 @@ pub(crate) struct MemoryUsage {
     /// allocations do not appear in the host process's resident set.
     pub(crate) device_used_bytes: Option<u64>,
     pub(crate) device_limit_bytes: Option<u64>,
+    /// Non-zero means the device ledger is over its live ceiling.
+    pub(crate) device_oversubscribed_bytes: Option<u64>,
     /// What the device ceiling is carved into. Reporting only a total answers
     /// "how much" but never "why", which is the question when a model does not
     /// fit: weights are fixed, but the KV budget is what a longer context eats.
@@ -601,6 +603,8 @@ pub(crate) struct VmmArena {
     pub(crate) ref_underflows: u64,
     /// Non-zero means a byte counter was decremented below zero and clamped.
     pub(crate) byte_underflows: u64,
+    /// Non-zero means committed device bytes were not recorded in the adopted governor.
+    pub(crate) unaccounted_committed_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -660,6 +664,8 @@ impl MemoryUsage {
             && self.kv_budget_bytes.is_none()
             && self.host_ram_used_bytes.is_none()
             && self.device_used_bytes.is_none()
+            && self.device_limit_bytes.is_none()
+            && self.device_oversubscribed_bytes.is_none()
             && self.composition.is_none()
             && self.activation_plan.is_none()
             && self.weight_placement.is_none()
@@ -935,6 +941,18 @@ impl RunProfile {
                     format_bytes(device)
                 );
             }
+            if let Some(bytes) = self
+                .memory
+                .device_oversubscribed_bytes
+                .filter(|bytes| *bytes > 0)
+            {
+                let _ = writeln!(
+                    out,
+                    "{:<24} FAULT: device tier oversubscribed by {}",
+                    "memory ledger",
+                    format_bytes(bytes)
+                );
+            }
             if let Some(plan) = self.memory.activation_plan {
                 if plan.complete {
                     let _ = writeln!(
@@ -1005,6 +1023,13 @@ impl RunProfile {
                             "{:<24} BUG: {} byte counter underflow(s); committed bytes above \
                              are a lower bound",
                             "vmm arena", arena.byte_underflows
+                        );
+                    }
+                    if arena.unaccounted_committed_bytes > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} FAULT: {} committed byte(s) not recorded in the memory ledger",
+                            "vmm arena", arena.unaccounted_committed_bytes
                         );
                     }
                 }
@@ -1180,6 +1205,13 @@ impl RunProfile {
         if let Some(limit) = self.memory.device_limit_bytes.filter(|bytes| *bytes > 0) {
             fields.push(format!("\"device_memory_limit_bytes\":{limit}"));
         }
+        if let Some(bytes) = self
+            .memory
+            .device_oversubscribed_bytes
+            .filter(|bytes| *bytes > 0)
+        {
+            fields.push(format!("\"device_oversubscribed_bytes\":{bytes}"));
+        }
         if let Some(composition) = self
             .memory
             .composition
@@ -1241,7 +1273,7 @@ impl RunProfile {
         }
         if let Some(arena) = self.memory.vmm_arena {
             fields.push(format!(
-                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{},\"byte_underflows\":{}}}",
+                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{},\"byte_underflows\":{},\"unaccounted_committed_bytes\":{}}}",
                 arena.commits,
                 arena.releases,
                 arena.committed_bytes,
@@ -1249,7 +1281,8 @@ impl RunProfile {
                 arena.peak_committed_bytes,
                 arena.allocations,
                 arena.ref_underflows,
-                arena.byte_underflows
+                arena.byte_underflows,
+                arena.unaccounted_committed_bytes
             ));
         }
         format!("{{{}}}", fields.join(","))

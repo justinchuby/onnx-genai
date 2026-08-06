@@ -701,6 +701,7 @@ impl Backend {
                     host_ram_used_bytes: Some(snapshot.host_ram.used),
                     device_used_bytes: Some(snapshot.vram.used),
                     device_limit_bytes: Some(snapshot.resolved_limits.vram_bytes),
+                    device_oversubscribed_bytes: Some(engine.device_oversubscribed_bytes()),
                     peak_resident_bytes: None,
                     composition: Some(profile::DeviceComposition {
                         model_weights_bytes: breakdown.model_weights_bytes,
@@ -729,6 +730,7 @@ impl Backend {
                         allocations: stats.allocations,
                         ref_underflows: stats.ref_underflows,
                         byte_underflows: stats.byte_underflows,
+                        unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
                     }),
                 })
             }
