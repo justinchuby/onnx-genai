@@ -941,6 +941,18 @@ impl RunProfile {
                     format_bytes(device)
                 );
             }
+            if let Some(bytes) = self
+                .memory
+                .device_oversubscribed_bytes
+                .filter(|bytes| *bytes > 0)
+            {
+                let _ = writeln!(
+                    out,
+                    "{:<24} FAULT: device tier oversubscribed by {}",
+                    "memory ledger",
+                    format_bytes(bytes)
+                );
+            }
             if let Some(plan) = self.memory.activation_plan {
                 if plan.complete {
                     let _ = writeln!(
@@ -1018,18 +1030,6 @@ impl RunProfile {
                             out,
                             "{:<24} FAULT: {} committed byte(s) not recorded in the memory ledger",
                             "vmm arena", arena.unaccounted_committed_bytes
-                        );
-                    }
-                    if let Some(bytes) = self
-                        .memory
-                        .device_oversubscribed_bytes
-                        .filter(|bytes| *bytes > 0)
-                    {
-                        let _ = writeln!(
-                            out,
-                            "{:<24} FAULT: device tier oversubscribed by {}",
-                            "memory ledger",
-                            format_bytes(bytes)
                         );
                     }
                 }

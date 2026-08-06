@@ -879,6 +879,13 @@ impl ExecutionProvider for CudaExecutionProvider {
                      committed"
                 );
             }
+            if adoption.unaccounted_bytes > 0 {
+                let bytes = adoption.unaccounted_bytes;
+                eprintln!(
+                    "cuda_ep: WARNING: {bytes} committed VMM arena byte(s) were not recorded in \
+                     the memory ledger; profile output will report the accounting fault"
+                );
+            }
         }
 
         // The weight-residency cache is the standing pool this EP keeps. With
