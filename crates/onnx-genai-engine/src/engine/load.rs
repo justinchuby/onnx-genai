@@ -306,7 +306,7 @@ impl Engine {
         // A refusal here is the point: it says the model does not fit while
         // there is still a load to fail, rather than at an allocation somewhere
         // unrelated later.
-        // End the double count.
+        // End the allocator double count.
         //
         // The fixed reservation covers weights *and* activations *and* runtime
         // overhead, taken before any session existed because nothing else
@@ -329,6 +329,39 @@ impl Engine {
                     "released {released} bytes of the fixed device reservation: the allocator \
                      commits on demand and charges the ledger for the model's weights as it \
                      maps them, so reserving for them as well counted the same memory twice"
+                );
+            }
+        }
+        // End the residency double count.
+        //
+        // With CUDA weight offload and the VMM arena off, the "model weights"
+        // portion of the fixed reservation is the residency budget: the device
+        // will hold at most that much of the package at once. The CUDA EP then
+        // adopts the same budget as the residency cache lease it owns. Leaving
+        // the fixed claim live while adoption calls `reserve` asks the ledger
+        // for the exact bytes it already charged, producing the #704 refusal.
+        //
+        // Release the startup placeholder only on the CUDA offload path, where
+        // the provider is about to take over the same device claim. Non-CUDA
+        // providers do not hold this residency cache, and VMM has already
+        // released the weight portion above because its allocator records real
+        // commits instead of a standing weight budget.
+        #[cfg(feature = "cuda")]
+        if matches!(
+            native_device,
+            crate::native_decode::NativeDecodeDevice::Cuda { .. }
+        ) && onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled
+            && !native_session.commits_on_demand()
+        {
+            let weights = governor.snapshot().breakdown.model_weights_bytes;
+            let released = governor
+                .plan()
+                .release_fixed_device_reservation_for_provider_pool(weights);
+            if released > 0 {
+                tracing::debug!(
+                    "released {released} bytes of the fixed device reservation: CUDA weight \
+                     offload will adopt the same bytes as the residency cache lease, so keeping \
+                     both claims would double-count the cache budget"
                 );
             }
         }

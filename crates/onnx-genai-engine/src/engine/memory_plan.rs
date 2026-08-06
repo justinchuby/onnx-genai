@@ -296,6 +296,29 @@ impl ModelMemoryPlan {
         entry.lease.shrink(bytes)
     }
 
+    /// Give the startup weight reservation back before the provider adopts it.
+    ///
+    /// CUDA weight offload is loaded in two phases: the engine first reserves
+    /// the device residency budget as part of the fixed model claim because no
+    /// execution provider exists yet, and the provider later adopts the same
+    /// budget as the cache lease it will hold. If the startup reservation stays
+    /// live while adoption calls `reserve`, the ledger sees two independent
+    /// weight claims for one residency cache and refuses a model that actually
+    /// fits (#704).
+    #[cfg(feature = "native-backend")]
+    #[cfg_attr(
+        all(not(feature = "cuda"), not(test)),
+        expect(
+            dead_code,
+            reason = "the production caller is the CUDA weight-offload adoption path; the \
+                      native-backend-only CI build keeps the regression test but cannot call the \
+                      CUDA branch"
+        )
+    )]
+    pub(crate) fn release_fixed_device_reservation_for_provider_pool(&mut self, bytes: u64) -> u64 {
+        self.release(Holder::FixedDeviceReservation, bytes)
+    }
+
     /// Reserve `bytes` for `holder` on a tier the caller determined.
     ///
     /// Only for holders whose tier is a fact about the running system rather
@@ -699,5 +722,51 @@ mod tests {
 
         drop(held_elsewhere);
         assert_eq!(governor.used(Tier::Device), 100);
+    }
+
+    /// Provider adoption must transfer the startup fixed reservation, not add a
+    /// second equal claim.
+    ///
+    /// This is the #704 offload-only failure in miniature. The engine has
+    /// already charged the residency budget as a fixed device reservation
+    /// because the CUDA EP did not exist when the governor was built. When the
+    /// EP later adopts that same budget, the true device total is still one
+    /// residency budget, not the fixed reservation plus another copy.
+    #[test]
+    #[cfg(feature = "native-backend")]
+    fn provider_pool_adoption_replaces_the_fixed_weight_reservation() {
+        // The ceiling is deliberately tight: 1_000 leaves room for one 600-byte
+        // claim but not for two at once. That is what pins the *ordering* rather
+        // than only the final total -- with the release moved after the
+        // adoption, the transient peak of 1_200 exceeds the tier and the
+        // `reserve` below fails. A roomier ceiling would let the buggy
+        // interleaving succeed and settle on the same total, which is exactly
+        // the failure this test exists to catch (#704), and the ordering is
+        // what the equivalent VMM fix in #667 turned on.
+        let governor = governor(1_000);
+        let mut plan = ModelMemoryPlan::new(governor.clone());
+
+        plan.reserve(Holder::FixedDeviceReservation, 600)
+            .expect("startup reservation fits");
+        assert_eq!(governor.used(Tier::Device), 600);
+
+        let _released = plan.release_fixed_device_reservation_for_provider_pool(600);
+        let provider_lease = governor
+            .reserve(
+                Tier::Device,
+                600,
+                MemoryRole::Weights,
+                Holder::WeightResidency.id(),
+            )
+            .expect("the provider can adopt the transferred budget");
+
+        assert_eq!(
+            governor.used(Tier::Device),
+            600,
+            "adoption must leave the ledger at the true total, not double the residency budget"
+        );
+
+        drop(provider_lease);
+        assert_eq!(governor.used(Tier::Device), 0);
     }
 }
