@@ -309,6 +309,28 @@ def main() -> None:
         "<f4"
     )
     (OUT_DIR / "input_embedding.f32").write_bytes(input_embedding.tobytes())
+    (OUT_DIR / "inference_metadata.yaml").write_text(
+        """model:
+  max_sequence_length: 16
+  io:
+    token_input: input_ids
+    attention_mask_input: attention_mask
+    position_ids_input: position_ids
+    logits_output: logits
+    hidden_output: hidden_states.0
+    kv_inputs:
+      - past_key_values.0.key
+      - past_key_values.0.value
+      - past_key_values.1.key
+      - past_key_values.1.value
+    kv_outputs:
+      - present.0.key
+      - present.0.value
+      - present.1.key
+      - present.1.value
+""",
+        encoding="utf-8",
+    )
 
     manifest = {
         "generator": "scripts/build_tiny_gemma4_assistant.py",

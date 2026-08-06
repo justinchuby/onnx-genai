@@ -115,7 +115,7 @@ fn pipeline_generation_carries_multiaxis_positions_and_fixed_state_after_reset()
 }
 
 #[test]
-fn pipeline_load_rejects_fixed_state_over_host_admission_budget() {
+fn pipeline_load_rejects_kv_page_pool_before_fixed_state_when_host_budget_cannot_fit_either() {
     let config = EngineConfig {
         limits: ResourceLimits {
             host_ram_limit: ResourceLimit::Bytes(15),
@@ -125,10 +125,22 @@ fn pipeline_load_rejects_fixed_state_over_host_admission_budget() {
     };
 
     let error = match Engine::from_pipeline_dir(&fixture_dir(), config) {
-        Ok(_) => panic!("16 bytes of fixed state must not fit a 15-byte host admission budget"),
+        Ok(_) => panic!("a 15-byte host admission budget must not fit the pipeline memory floor"),
         Err(error) => error,
     };
     let message = error.to_string();
-    assert!(message.contains("requires 16 bytes"), "{message}");
-    assert!(message.contains("budget is 15 bytes"), "{message}");
+    assert!(
+        message.contains("cannot allocate the pipeline KV page pool"),
+        "{message}"
+    );
+    assert!(message.contains("1 page(s) across 2 layer(s)"), "{message}");
+    assert!(
+        message.contains("resolved KV/host memory budget"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("decoder fixed-state initialization"),
+        "a pipeline with KV must first prove that its minimum KV page pool fits; \
+         fixed-state admission is reached only after the pool has been admitted: {message}"
+    );
 }
