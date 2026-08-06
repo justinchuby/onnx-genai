@@ -49,6 +49,10 @@ impl DecodeBackend for NativeDecodeSession {
 }
 
 impl NativeDecodeSession {
+    pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
+        self.session.activation_memory_plan_stats().map(Into::into)
+    }
+
     pub(super) fn rewind_inner(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len > self.current_len {
             bail!(

@@ -566,6 +566,19 @@ pub(crate) struct MemoryUsage {
     /// "how much" but never "why", which is the question when a model does not
     /// fit: weights are fixed, but the KV budget is what a longer context eats.
     pub(crate) composition: Option<DeviceComposition>,
+    /// Latest native activation planner result. This is separate from the
+    /// device-reservation breakdown: it measures what activation sharing would
+    /// save inside the executor, even before the allocator uses it.
+    pub(crate) activation_plan: Option<ActivationPlanMemory>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ActivationPlanMemory {
+    pub(crate) complete: bool,
+    pub(crate) peak_bytes: u64,
+    pub(crate) naive_bytes: u64,
+    pub(crate) savings_ratio: f64,
+    pub(crate) unknown_sizes: usize,
 }
 
 /// How the device memory ceiling is divided.
@@ -608,6 +621,7 @@ impl MemoryUsage {
             && self.host_ram_used_bytes.is_none()
             && self.device_used_bytes.is_none()
             && self.composition.is_none()
+            && self.activation_plan.is_none()
     }
 }
 
@@ -879,6 +893,24 @@ impl RunProfile {
                     format_bytes(device)
                 );
             }
+            if let Some(plan) = self.memory.activation_plan {
+                if plan.complete {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} vs {} ({:.1}% saved)",
+                        "activation plan",
+                        format_bytes(plan.peak_bytes),
+                        format_bytes(plan.naive_bytes),
+                        plan.savings_ratio * 100.0
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} deferred ({} unknown sizes)",
+                        "activation plan", plan.unknown_sizes
+                    );
+                }
+            }
         }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
@@ -891,14 +923,42 @@ impl RunProfile {
             let _ = writeln!(out, "\nnative executor phases:");
             let _ = writeln!(out, "{:<34} {:>12} {:>10}", "phase", "total_ms", "calls");
             let _ = writeln!(out, "{}", "-".repeat(58));
-            for (phase, total_ns, calls) in executor_phases {
+            for (phase, total_ns, calls) in &executor_phases {
+                if !is_executor_phase_time_row(phase) {
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "{:<34} {:>12.3} {:>10}",
                     phase,
-                    total_ns as f64 / 1e6,
+                    *total_ns as f64 / 1e6,
                     calls
                 );
+            }
+            let byte_rows = executor_phases
+                .iter()
+                .filter(|(phase, _, _)| !is_executor_phase_time_row(phase))
+                .collect::<Vec<_>>();
+            if !byte_rows.is_empty() {
+                let _ = writeln!(out, "\nnative executor byte counters:");
+                let _ = writeln!(
+                    out,
+                    "{:<34} {:>12} {:>10} {:>12}",
+                    "counter", "total_mb", "calls", "mb/call"
+                );
+                let _ = writeln!(out, "{}", "-".repeat(72));
+                for (phase, total_bytes, calls) in byte_rows {
+                    let total_mb = *total_bytes as f64 / (1024.0 * 1024.0);
+                    let mb_per_call = if *calls > 0 {
+                        total_mb / *calls as f64
+                    } else {
+                        0.0
+                    };
+                    let _ = writeln!(
+                        out,
+                        "{phase:<34} {total_mb:>12.3} {calls:>10} {mb_per_call:>12.3}"
+                    );
+                }
             }
         }
 
@@ -1061,6 +1121,16 @@ impl RunProfile {
                 parts.join(",")
             ));
         }
+        if let Some(plan) = self.memory.activation_plan {
+            fields.push(format!(
+                "\"activation_memory_plan\":{{\"complete\":{},\"peak_bytes\":{},\"naive_bytes\":{},\"savings_ratio\":{:.6},\"unknown_sizes\":{}}}",
+                plan.complete,
+                plan.peak_bytes,
+                plan.naive_bytes,
+                plan.savings_ratio,
+                plan.unknown_sizes
+            ));
+        }
         format!("{{{}}}", fields.join(","))
     }
 }
@@ -1081,6 +1151,10 @@ fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn is_executor_phase_time_row(phase: &str) -> bool {
+    !phase.ends_with("_bytes")
 }
 
 #[cfg(test)]
@@ -1186,6 +1260,15 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.9), 4.0);
         assert_eq!(percentile(&sorted, 1.0), 4.0);
         assert_eq!(percentile(&[], 0.5), 0.0);
+    }
+
+    #[test]
+    fn executor_phase_table_excludes_byte_counters_from_millisecond_rows() {
+        assert!(is_executor_phase_time_row("run_scoped.setup_total.top"));
+        assert!(!is_executor_phase_time_row("activation_plan.peak_bytes"));
+        assert!(!is_executor_phase_time_row(
+            "collect_outputs.top_host_bytes"
+        ));
     }
 
     #[test]
