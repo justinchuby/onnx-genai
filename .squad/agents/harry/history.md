@@ -87,3 +87,8 @@
 
 - Rejected #625 rev1 for a major initializer-input leak in the native loader metadata path and assigned revision away from the locked-out author.
 - Approved rev2 after Quaid added initializer exclusion mirroring `graph_builder.rs` plus metadata==Session KV-geometry parity coverage.
+
+## 2026-08-06T00:00:00Z — PR #676 review
+
+- Harry picked up review after gpt-5.6-sol canary-looped, approved #676 with two nits only, and the coordinator squash-merged it.
+- Review conclusion: native 3-D router-probs fix and token-119 oracle regression are sound; token-119 proves QMoE is more accurate than dense int4 for that step rather than exposing a native kernel bug.
