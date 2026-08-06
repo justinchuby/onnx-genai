@@ -1906,6 +1906,22 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
 }
 
 #[tokio::test]
+async fn loaded_server_model_reports_nonzero_device_ledger_usage() {
+    let state = tiny_state();
+    let handle = state.registry.resolve("").unwrap().unwrap();
+    let snapshot = handle.engine.resource_snapshot().await.unwrap();
+
+    assert!(
+        snapshot.breakdown.model_weights_bytes > 0,
+        "fixture must charge a quantity, not just emit a load event"
+    );
+    assert!(
+        snapshot.vram.used > 0,
+        "server metrics must read the engine ledger after load; a zero here recreates #706"
+    );
+}
+
+#[tokio::test]
 async fn queue_depth_admission_limit_returns_429_with_retry_after() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load_with_config(
