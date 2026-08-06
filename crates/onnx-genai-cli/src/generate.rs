@@ -178,6 +178,11 @@ struct CudaOffloadSnapshot {
     htod_ns: u64,
     copy_wait_ns: u64,
     admit_sync_ns: u64,
+    staging_fill_bytes: u64,
+    staging_fill_regions: u64,
+    staging_fill_calls: u64,
+    materialize_fallback_calls: u64,
+    htod_bytes: u64,
 }
 
 fn cuda_offload_stats() -> CudaOffloadSnapshot {
@@ -197,6 +202,11 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
             htod_ns: stats.htod_ns,
             copy_wait_ns: stats.copy_wait_ns,
             admit_sync_ns: stats.admit_sync_ns,
+            staging_fill_bytes: stats.staging_fill_bytes,
+            staging_fill_regions: stats.staging_fill_regions,
+            staging_fill_calls: stats.staging_fill_calls,
+            materialize_fallback_calls: stats.materialize_fallback_calls,
+            htod_bytes: stats.htod_bytes,
         }
     }
     #[cfg(not(feature = "native-cuda"))]
@@ -247,6 +257,19 @@ fn emit_cuda_offload_counters(
     let htod_ns = after.htod_ns.saturating_sub(before.htod_ns);
     let copy_wait_ns = after.copy_wait_ns.saturating_sub(before.copy_wait_ns);
     let admit_sync_ns = after.admit_sync_ns.saturating_sub(before.admit_sync_ns);
+    let staging_fill_bytes = after
+        .staging_fill_bytes
+        .saturating_sub(before.staging_fill_bytes);
+    let staging_fill_regions = after
+        .staging_fill_regions
+        .saturating_sub(before.staging_fill_regions);
+    let staging_fill_calls = after
+        .staging_fill_calls
+        .saturating_sub(before.staging_fill_calls);
+    let materialize_fallback_calls = after
+        .materialize_fallback_calls
+        .saturating_sub(before.materialize_fallback_calls);
+    let htod_bytes = after.htod_bytes.saturating_sub(before.htod_bytes);
     if page_ins > 0
         || hits > 0
         || evictions > 0
@@ -259,6 +282,11 @@ fn emit_cuda_offload_counters(
         || htod_ns > 0
         || copy_wait_ns > 0
         || admit_sync_ns > 0
+        || staging_fill_bytes > 0
+        || staging_fill_regions > 0
+        || staging_fill_calls > 0
+        || materialize_fallback_calls > 0
+        || htod_bytes > 0
     {
         profile.counter("weight offload page-ins", page_ins as f64, "page-ins");
         profile.counter("weight offload cache hits", hits as f64, "hits");
@@ -297,15 +325,36 @@ fn emit_cuda_offload_counters(
             "reuses",
         );
         profile.counter(
-            "weight offload materialize",
+            "weight offload staging fill",
             materialize_ns as f64 / 1_000_000.0,
             "ms",
+        );
+        profile.counter(
+            "weight offload staging fill bytes",
+            staging_fill_bytes as f64,
+            "bytes",
+        );
+        profile.counter(
+            "weight offload staging fill regions",
+            staging_fill_regions as f64,
+            "regions",
+        );
+        profile.counter(
+            "weight offload staging fill calls",
+            staging_fill_calls as f64,
+            "calls",
+        );
+        profile.counter(
+            "weight offload materialize fallback calls",
+            materialize_fallback_calls as f64,
+            "calls",
         );
         profile.counter(
             "weight offload H2D enqueue/copy",
             htod_ns as f64 / 1_000_000.0,
             "ms",
         );
+        profile.counter("weight offload H2D bytes", htod_bytes as f64, "bytes");
         profile.counter(
             "weight offload copy wait",
             copy_wait_ns as f64 / 1_000_000.0,

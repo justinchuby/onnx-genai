@@ -47,6 +47,11 @@ static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HTOD_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COPY_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_ADMIT_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_REGIONS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_MATERIALIZE_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn add_duration(counter: &AtomicU64, elapsed: Duration) {
     let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -68,6 +73,11 @@ pub struct GlobalOffloadStats {
     pub htod_ns: u64,
     pub copy_wait_ns: u64,
     pub admit_sync_ns: u64,
+    pub staging_fill_bytes: u64,
+    pub staging_fill_regions: u64,
+    pub staging_fill_calls: u64,
+    pub materialize_fallback_calls: u64,
+    pub htod_bytes: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -85,6 +95,11 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
         copy_wait_ns: GLOBAL_COPY_WAIT_NS.load(Ordering::Relaxed),
         admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
+        staging_fill_bytes: GLOBAL_STAGING_FILL_BYTES.load(Ordering::Relaxed),
+        staging_fill_regions: GLOBAL_STAGING_FILL_REGIONS.load(Ordering::Relaxed),
+        staging_fill_calls: GLOBAL_STAGING_FILL_CALLS.load(Ordering::Relaxed),
+        materialize_fallback_calls: GLOBAL_MATERIALIZE_FALLBACK_CALLS.load(Ordering::Relaxed),
+        htod_bytes: GLOBAL_HTOD_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -102,6 +117,11 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
     GLOBAL_COPY_WAIT_NS.store(0, Ordering::Relaxed);
     GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_REGIONS.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_MATERIALIZE_FALLBACK_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -255,6 +275,7 @@ impl CudaWeightPage {
         unsafe { runtime.htod(bytes, ptr) }
             .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
         add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(page)
     }
 
@@ -308,6 +329,7 @@ impl CudaWeightPage {
             .record_copy_fence()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("copy fence: {error}")))?;
         add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok((page, fence, staging))
     }
 
@@ -352,6 +374,7 @@ impl CudaWeightPage {
             .record_copy_fence()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("copy fence: {error}")))?;
         add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         Ok((page, fence, staging))
     }
 
@@ -413,6 +436,9 @@ fn fill_staging_from_regions(
         staging.as_mut_slice()[offset..end].copy_from_slice(bytes);
         offset = end;
     }
+    GLOBAL_STAGING_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_REGIONS.fetch_add(weight.regions.len() as u64, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_BYTES.fetch_add(total as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -495,6 +521,7 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
             unsafe { self.runtime.htod(bytes, dst) }
                 .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
             add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+            GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             offset += region.len;
         }
 
@@ -829,6 +856,7 @@ impl CudaWeightResidency {
         }
         let materialize_start = std::time::Instant::now();
         let resident = weight.materialize()?;
+        GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         if self.async_pagein {
             // Async, fence-ordered page-in: enqueue the H2D on the transfer stream
@@ -908,6 +936,7 @@ impl CudaWeightResidency {
         }
         let materialize_start = std::time::Instant::now();
         let resident = weight.materialize()?;
+        GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         let staging = self.take_prefetch_staging(resident.bytes().len())?;
         let (page, copy_fence, staging) = match CudaWeightPage::upload_async(

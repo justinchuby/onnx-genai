@@ -86,6 +86,11 @@ struct StepOffloadSnapshot {
     prefetch_issued: u64,
     prefetch_joined: u64,
     prefetch_declined_guard: u64,
+    staging_fill_bytes: u64,
+    staging_fill_regions: u64,
+    staging_fill_calls: u64,
+    materialize_fallback_calls: u64,
+    htod_bytes: u64,
 }
 
 impl StepOffloadSnapshot {
@@ -102,6 +107,11 @@ impl StepOffloadSnapshot {
                 prefetch_issued: stats.prefetch_issued,
                 prefetch_joined: stats.prefetch_joined,
                 prefetch_declined_guard: stats.prefetch_declined_guard,
+                staging_fill_bytes: stats.staging_fill_bytes,
+                staging_fill_regions: stats.staging_fill_regions,
+                staging_fill_calls: stats.staging_fill_calls,
+                materialize_fallback_calls: stats.materialize_fallback_calls,
+                htod_bytes: stats.htod_bytes,
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -122,8 +132,29 @@ impl StepOffloadSnapshot {
             prefetch_declined_guard: self
                 .prefetch_declined_guard
                 .saturating_sub(before.prefetch_declined_guard),
+            staging_fill_bytes: self
+                .staging_fill_bytes
+                .saturating_sub(before.staging_fill_bytes),
+            staging_fill_regions: self
+                .staging_fill_regions
+                .saturating_sub(before.staging_fill_regions),
+            staging_fill_calls: self
+                .staging_fill_calls
+                .saturating_sub(before.staging_fill_calls),
+            materialize_fallback_calls: self
+                .materialize_fallback_calls
+                .saturating_sub(before.materialize_fallback_calls),
+            htod_bytes: self.htod_bytes.saturating_sub(before.htod_bytes),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaStepWallBreakdown {
+    run_ms: f64,
+    logits_read_ms: f64,
+    capture_check_ms: f64,
+    finite_check_ms: f64,
 }
 
 struct CudaStepProfile {
@@ -148,32 +179,57 @@ impl CudaStepProfile {
         })
     }
 
-    fn finish(self, path: &'static str) {
+    fn finish(self, path: &'static str, wall: CudaStepWallBreakdown) {
         let total_ms = self.start.elapsed().as_secs_f64() * 1_000.0;
         let delta = StepOffloadSnapshot::read().delta(self.before);
         let staging_ms = ns_to_ms(delta.materialize_ns);
         let h2d_ms = ns_to_ms(delta.htod_ns);
         let fence_sync_ms = ns_to_ms(delta.copy_wait_ns.saturating_add(delta.admit_sync_ns));
-        let kernel_host_ms = onnx_runtime_session::exec_phase_stats()
-            .into_iter()
-            .find_map(|(name, total_ns, _)| (name == "exec_kernel.compute").then_some(total_ns))
-            .map(|ns| ns as f64 / 1_000_000.0)
-            .unwrap_or(0.0);
-        let residual_ms = total_ms - staging_ms - h2d_ms - fence_sync_ms - kernel_host_ms;
+        let phase_stats = onnx_runtime_session::exec_phase_stats();
+        let phase_ms = |phase: &str| -> f64 {
+            phase_stats
+                .iter()
+                .find_map(|(name, total_ns, _)| (*name == phase).then_some(*total_ns))
+                .map(|ns| ns as f64 / 1_000_000.0)
+                .unwrap_or(0.0)
+        };
+        let kernel_host_ms = phase_ms("exec_kernel.compute");
+        let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
+        let build_inputs_unattributed_ms = build_inputs_ms - staging_ms - h2d_ms - fence_sync_ms;
+        let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
+        let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
+        let residual_ms = total_ms
+            - staging_ms
+            - h2d_ms
+            - fence_sync_ms
+            - kernel_host_ms
+            - build_inputs_unattributed_ms
+            - executor_other_ms
+            - wall.logits_read_ms
+            - wall.capture_check_ms
+            - wall.finite_check_ms;
         static HEADER: std::sync::Once = std::sync::Once::new();
         HEADER.call_once(|| {
             eprintln!(
-                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_enqueue_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard"
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_enqueue_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
             );
         });
         eprintln!(
-            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{residual_ms:.3},{},{},{},{}",
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{},{},{},{}",
             self.past_len,
             self.total_len,
+            wall.logits_read_ms,
+            wall.capture_check_ms,
+            wall.finite_check_ms,
             delta.page_ins,
             delta.prefetch_issued,
             delta.prefetch_joined,
-            delta.prefetch_declined_guard
+            delta.prefetch_declined_guard,
+            delta.staging_fill_bytes,
+            delta.staging_fill_regions,
+            delta.staging_fill_calls,
+            delta.materialize_fallback_calls,
+            delta.htod_bytes
         );
     }
 }
@@ -616,11 +672,16 @@ impl NativeDecodeSession {
                 // EP's single graph slot + capture-error latch are owned solely by
                 // the sibling.
                 let step_profile = CudaStepProfile::begin(past_len, total_len);
+                let mut step_wall = CudaStepWallBreakdown::default();
+                let run_start = std::time::Instant::now();
                 if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                     bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
                 }
+                step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+                let logits_start = std::time::Instant::now();
                 let logits = state.read_logits()?;
+                step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
                 // Detection-before-consumption (Harry #588 PR-3 rec #1): the
                 // logits read above is the single per-step device→host sync.
                 // Piggyback on it to poll the shared capture-error word — a
@@ -628,46 +689,59 @@ impl NativeDecodeSession {
                 // latches the flag; fail hard before consuming the produced token.
                 // The latch lives on the shared EP, so this reads the sibling's
                 // replay result even though the poll is the main-exec-facing call.
+                let capture_check_start = std::time::Instant::now();
                 let capture_error = self.session.check_device_capture_error()?;
+                step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
                 if capture_error != 0 {
                     let _ = state.invalidate_graph(&mut self.session);
                     bail!(
                         "native CUDA decode-inline aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode-inline graph was invalidated"
                     );
                 }
+                let finite_check_start = std::time::Instant::now();
                 if logits.iter().flatten().any(|value| !value.is_finite()) {
                     bail!("native decoder produced non-finite logits");
                 }
+                step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
                 if let Some(profile) = step_profile {
-                    profile.finish("decode_inline");
+                    profile.finish("decode_inline", step_wall);
                 }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
             }
             let step_profile = CudaStepProfile::begin(past_len, total_len);
+            let mut step_wall = CudaStepWallBreakdown::default();
+            let run_start = std::time::Instant::now();
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                 bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
             }
+            step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+            let logits_start = std::time::Instant::now();
             let logits = state.read_logits()?;
+            step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
             // Detection-before-consumption: the logits read above is the single
             // per-step device→host sync. Piggyback on it to poll the shared
             // capture-error word (no extra synchronize). If a captured replay
             // violates a device-side bound, kernels latch the flag and avoid the
             // unsafe access, so fail hard before consuming the produced token.
+            let capture_check_start = std::time::Instant::now();
             let capture_error = self.session.check_device_capture_error()?;
+            step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
             if capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
                 bail!(
                     "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
                 );
             }
+            let finite_check_start = std::time::Instant::now();
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
             }
+            step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
             if let Some(profile) = step_profile {
-                profile.finish("decode");
+                profile.finish("decode", step_wall);
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -737,14 +811,21 @@ impl NativeDecodeSession {
         state.write_captured_step_inputs(supplied, position)?;
 
         let step_profile = CudaStepProfile::begin(past_len, total_len);
+        let mut step_wall = CudaStepWallBreakdown::default();
+        let run_start = std::time::Instant::now();
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
             bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
         }
+        step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+        let logits_start = std::time::Instant::now();
         let logits = state.read_logits()?;
+        step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
         // Detection-before-consumption: piggyback on the single logits sync to
         // poll the shared capture-error word (mirrors the token captured path).
+        let capture_check_start = std::time::Instant::now();
         let capture_error = self.session.check_device_capture_error()?;
+        step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
         if capture_error != 0 {
             let _ = self
                 .cuda
@@ -755,11 +836,13 @@ impl NativeDecodeSession {
                 "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay of a per-step-input decode; the produced token was rejected before consumption and the decode graph was invalidated"
             );
         }
+        let finite_check_start = std::time::Instant::now();
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
         }
+        step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
         if let Some(profile) = step_profile {
-            profile.finish("captured_step_inputs");
+            profile.finish("captured_step_inputs", step_wall);
         }
         let state = self
             .cuda
