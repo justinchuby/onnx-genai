@@ -51,6 +51,7 @@
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
@@ -95,6 +96,107 @@ pub fn vmm_enabled() -> bool {
 }
 /// The device tier name used in errors raised before a governor is consulted.
 const TIER: &str = "device";
+
+/// Process-global VMM arena counters.
+///
+/// # Why these are global rather than per-arena
+///
+/// A caller profiling a run wants to know what the arena did, and it holds a
+/// session rather than an allocator -- the allocator is several layers down
+/// inside an execution provider. Threading a handle out for the sake of a
+/// number is more coupling than the number is worth, and this repository
+/// already answers the same question the same way for weight offload
+/// (`global_offload_stats`).
+///
+/// # Why a quantity and not an event
+///
+/// The arena was once installed, logged that it was installed, and committed
+/// **zero bytes** for an entire generation (#659). The log line was true and
+/// useless: it could not be told apart from a hook that never fired. Only a
+/// byte count could, and only after someone printed one. These exist so that
+/// "is the arena doing anything" is a reading rather than an argument.
+static GLOBAL_COMMITS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_RELEASES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_RESERVED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PEAK_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-global VMM arena counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlobalVmmStats {
+    /// Granules mapped since the process started.
+    pub commits: u64,
+    /// Granules unmapped since the process started.
+    pub releases: u64,
+    /// Physical bytes mapped right now.
+    pub committed_bytes: u64,
+    /// Address space reserved right now. Costs nothing but address space; the
+    /// gap between this and `committed_bytes` is the point of the approach.
+    pub reserved_bytes: u64,
+    /// High-water mark of `committed_bytes`.
+    pub peak_committed_bytes: u64,
+    /// Spans handed out. Compare with `commits`: many allocations per commit
+    /// is granule sharing working, and one commit per allocation would mean
+    /// every small tensor is costing a whole 2 MiB granule.
+    pub allocations: u64,
+}
+
+/// Read the process-global VMM arena counters.
+///
+/// All zero means no arena was ever built -- which is the normal state when
+/// `ONNX_GENAI_CUDA_VMM` is unset, and is distinguishable from an arena that
+/// was built and never used (`reserved_bytes > 0`, `commits == 0`).
+pub fn global_vmm_stats() -> GlobalVmmStats {
+    GlobalVmmStats {
+        commits: GLOBAL_COMMITS.load(Ordering::Relaxed),
+        releases: GLOBAL_RELEASES.load(Ordering::Relaxed),
+        committed_bytes: GLOBAL_COMMITTED_BYTES.load(Ordering::Relaxed),
+        reserved_bytes: GLOBAL_RESERVED_BYTES.load(Ordering::Relaxed),
+        peak_committed_bytes: GLOBAL_PEAK_COMMITTED_BYTES.load(Ordering::Relaxed),
+        allocations: GLOBAL_ALLOCATIONS.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the counters. Tests only -- they are process-global, so a test that
+/// reads them must not race another that writes them.
+pub fn reset_global_vmm_stats() {
+    GLOBAL_COMMITS.store(0, Ordering::Relaxed);
+    GLOBAL_RELEASES.store(0, Ordering::Relaxed);
+    GLOBAL_COMMITTED_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_RESERVED_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_PEAK_COMMITTED_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_ALLOCATIONS.store(0, Ordering::Relaxed);
+}
+
+fn note_commit(granularity: usize) {
+    GLOBAL_COMMITS.fetch_add(1, Ordering::Relaxed);
+    let now = GLOBAL_COMMITTED_BYTES.fetch_add(granularity as u64, Ordering::Relaxed)
+        + granularity as u64;
+    GLOBAL_PEAK_COMMITTED_BYTES.fetch_max(now, Ordering::Relaxed);
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "onnx_runtime::cuda::vmm",
+        granule_bytes = granularity,
+        committed_bytes = now,
+        "vmm arena committed a granule"
+    );
+}
+
+fn note_release(granularity: usize) {
+    GLOBAL_RELEASES.fetch_add(1, Ordering::Relaxed);
+    let now = GLOBAL_COMMITTED_BYTES
+        .fetch_sub(granularity as u64, Ordering::Relaxed)
+        .saturating_sub(granularity as u64);
+    let _ = now;
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "onnx_runtime::cuda::vmm",
+        granule_bytes = granularity,
+        committed_bytes = now,
+        "vmm arena released a granule"
+    );
+}
 
 fn invalid(requested: usize, reason: String) -> MemoryError {
     // The variant carries a &'static str; these are constructed once on a
@@ -342,13 +444,18 @@ impl CudaVmmAllocator {
             .reserve(capacity)
             .map_err(|error| invalid(capacity, format!("cuMemAddressReserve: {error}")))?;
 
+        let arena = Arena {
+            reservation,
+            spans: Spans::new(granularity, capacity),
+            lease: governor.reserve(Tier::Device, 0, role, holder)?,
+        };
+        // After the last fallible step: an arena that failed to build has no
+        // `Drop` to take these back off the books.
+        GLOBAL_RESERVED_BYTES.fetch_add(capacity as u64, Ordering::Relaxed);
+
         Ok(Self {
             backing,
-            arena: Mutex::new(Arena {
-                reservation,
-                spans: Spans::new(granularity, capacity),
-                lease: governor.reserve(Tier::Device, 0, role, holder)?,
-            }),
+            arena: Mutex::new(arena),
             holder,
             role,
             device,
@@ -407,6 +514,7 @@ impl CudaVmmAllocator {
             }
             arena.spans.granule_refs[granule] = 1;
             arena.spans.committed += granularity;
+            note_commit(granularity);
             mapped.push(granule);
         }
         Ok(())
@@ -422,6 +530,7 @@ impl CudaVmmAllocator {
                 .backing
                 .release(&mut arena.reservation, offset, granularity);
             arena.spans.committed -= granularity;
+            note_release(granularity);
             self.give_back_lease(arena, granularity);
         }
     }
@@ -452,6 +561,7 @@ impl CudaVmmAllocator {
                         .backing
                         .release(&mut arena.reservation, offset, granularity);
                     arena.spans.committed -= granularity;
+                    note_release(granularity);
                     self.give_back_lease(arena, granularity);
                 }
                 Some(remaining) => arena.spans.granule_refs[granule] = remaining,
@@ -507,6 +617,7 @@ impl DeviceAllocator for CudaVmmAllocator {
             return Err(error);
         }
         arena.spans.live.insert(offset, bytes);
+        GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
         // SAFETY: `base` is non-null (cuMemAddressReserve refuses otherwise) and
         // `offset` is within the reservation, so the sum cannot be null.
@@ -572,6 +683,13 @@ impl Drop for CudaVmmAllocator {
         let held = arena.spans.committed as u64;
         arena.lease.shrink(held);
         arena.spans.committed = 0;
+
+        // Keep the process-global counters honest. Without this the arena's
+        // bytes stay on the books after it is gone, and a second run in the
+        // same process reads the first run's memory as if it were still
+        // mapped.
+        GLOBAL_COMMITTED_BYTES.fetch_sub(held, Ordering::Relaxed);
+        GLOBAL_RESERVED_BYTES.fetch_sub(reserved as u64, Ordering::Relaxed);
     }
 }
 
