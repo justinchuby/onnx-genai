@@ -143,6 +143,9 @@ pub struct VmmArenaStats {
     /// Times a granule was released whose reference count was already zero.
     /// **Anything but zero is a bug** in the allocator's accounting.
     pub ref_underflows: u64,
+    /// Times a byte counter would have gone negative and was clamped.
+    /// **Anything but zero is a bug** in the allocator's accounting.
+    pub byte_underflows: u64,
 }
 
 #[cfg(feature = "native-backend")]

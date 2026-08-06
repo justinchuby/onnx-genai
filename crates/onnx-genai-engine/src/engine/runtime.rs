@@ -1229,6 +1229,7 @@ impl Engine {
                 peak_committed_bytes: stats.peak_committed_bytes,
                 allocations: stats.allocations,
                 ref_underflows: stats.ref_underflows,
+                byte_underflows: stats.byte_underflows,
             })
         }
         #[cfg(not(feature = "cuda"))]

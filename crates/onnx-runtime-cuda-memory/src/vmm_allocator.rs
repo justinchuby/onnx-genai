@@ -128,6 +128,36 @@ static GLOBAL_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 /// twice -- an accounting error that would otherwise show up only as another
 /// allocation's memory being unmapped underneath it.
 static GLOBAL_REF_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+/// Times a byte counter was decremented below zero and had to be clamped.
+///
+/// Always zero in a correct run. Every byte subtracted from these counters is
+/// supposed to have been added first, so reaching zero from below means a
+/// commit path mapped memory without counting it. On a `u64` the natural
+/// `fetch_sub` **wraps**, turning a small accounting slip into an enormous
+/// number in `--profile` -- which looks like a catastrophic leak and is
+/// actually the opposite. Clamping keeps the reading sane; this counter is how
+/// the underlying fault stays visible rather than being smoothed away.
+static GLOBAL_BYTE_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+
+/// Subtract without wrapping, recording the fault if the counter would go
+/// negative.
+///
+/// Deliberately does **not** assert. One caller is `Drop`, and a panic there
+/// aborts the process instead of failing a test -- the first draft did assert
+/// and turned a clean assertion into `STATUS_STACK_BUFFER_OVERRUN` with no
+/// message. Recording the fault and letting tests assert on
+/// [`GlobalVmmStats::byte_underflows`] keeps the diagnosis readable and keeps
+/// `Drop` infallible.
+fn subtract_counted(counter: &AtomicU64, amount: u64) {
+    let clamped = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(amount))
+        })
+        .is_ok_and(|previous| previous < amount);
+    if clamped {
+        GLOBAL_BYTE_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Snapshot of the process-global VMM arena counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -156,6 +186,13 @@ pub struct GlobalVmmStats {
     /// imbalance is indistinguishable from correct operation until the wrong
     /// memory is unmapped somewhere else entirely.
     pub ref_underflows: u64,
+    /// Times a byte counter would have gone negative and was clamped.
+    ///
+    /// **Anything but zero is a bug.** Without the clamp a `u64` subtraction
+    /// wraps, so a small accounting slip reads as an enormous committed byte
+    /// count -- which looks like a catastrophic leak and is actually the
+    /// opposite.
+    pub byte_underflows: u64,
 }
 
 /// Read the process-global VMM arena counters.
@@ -172,6 +209,7 @@ pub fn global_vmm_stats() -> GlobalVmmStats {
         peak_committed_bytes: GLOBAL_PEAK_COMMITTED_BYTES.load(Ordering::Relaxed),
         allocations: GLOBAL_ALLOCATIONS.load(Ordering::Relaxed),
         ref_underflows: GLOBAL_REF_UNDERFLOWS.load(Ordering::Relaxed),
+        byte_underflows: GLOBAL_BYTE_UNDERFLOWS.load(Ordering::Relaxed),
     }
 }
 
@@ -185,6 +223,7 @@ pub fn reset_global_vmm_stats() {
     GLOBAL_PEAK_COMMITTED_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_ALLOCATIONS.store(0, Ordering::Relaxed);
     GLOBAL_REF_UNDERFLOWS.store(0, Ordering::Relaxed);
+    GLOBAL_BYTE_UNDERFLOWS.store(0, Ordering::Relaxed);
 }
 
 fn note_commit(granularity: usize) {
@@ -203,9 +242,8 @@ fn note_commit(granularity: usize) {
 
 fn note_release(granularity: usize) {
     GLOBAL_RELEASES.fetch_add(1, Ordering::Relaxed);
-    let now = GLOBAL_COMMITTED_BYTES
-        .fetch_sub(granularity as u64, Ordering::Relaxed)
-        .saturating_sub(granularity as u64);
+    subtract_counted(&GLOBAL_COMMITTED_BYTES, granularity as u64);
+    let now = GLOBAL_COMMITTED_BYTES.load(Ordering::Relaxed);
     let _ = now;
     #[cfg(feature = "tracing")]
     tracing::debug!(
@@ -723,8 +761,8 @@ impl Drop for CudaVmmAllocator {
         // bytes stay on the books after it is gone, and a second run in the
         // same process reads the first run's memory as if it were still
         // mapped.
-        GLOBAL_COMMITTED_BYTES.fetch_sub(held, Ordering::Relaxed);
-        GLOBAL_RESERVED_BYTES.fetch_sub(reserved as u64, Ordering::Relaxed);
+        subtract_counted(&GLOBAL_COMMITTED_BYTES, held);
+        subtract_counted(&GLOBAL_RESERVED_BYTES, reserved as u64);
     }
 }
 

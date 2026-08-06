@@ -599,6 +599,8 @@ pub(crate) struct VmmArena {
     pub(crate) allocations: u64,
     /// Non-zero means the arena's granule reference counts do not balance.
     pub(crate) ref_underflows: u64,
+    /// Non-zero means a byte counter was decremented below zero and clamped.
+    pub(crate) byte_underflows: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -997,6 +999,14 @@ impl RunProfile {
                             "vmm arena", arena.ref_underflows
                         );
                     }
+                    if arena.byte_underflows > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} BUG: {} byte counter underflow(s); committed bytes above \
+                             are a lower bound",
+                            "vmm arena", arena.byte_underflows
+                        );
+                    }
                 }
             }
         }
@@ -1231,14 +1241,15 @@ impl RunProfile {
         }
         if let Some(arena) = self.memory.vmm_arena {
             fields.push(format!(
-                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{}}}",
+                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{},\"byte_underflows\":{}}}",
                 arena.commits,
                 arena.releases,
                 arena.committed_bytes,
                 arena.reserved_bytes,
                 arena.peak_committed_bytes,
                 arena.allocations,
-                arena.ref_underflows
+                arena.ref_underflows,
+                arena.byte_underflows
             ));
         }
         format!("{{{}}}", fields.join(","))
