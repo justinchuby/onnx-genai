@@ -1278,6 +1278,35 @@ impl InferenceSession {
         )
     }
 
+    /// Allocate a persistent binding whose virtual allocation is larger than
+    /// the shape currently exposed to kernels.
+    ///
+    /// Lazy device allocators use `committed_ranges` to map only the parts that
+    /// are live. Eager allocators preserve the old behaviour and commit the
+    /// whole allocation, so callers must gate memory-sensitive use on
+    /// [`InferenceSession::commits_on_demand`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_device_binding_committed(
+        &self,
+        input_name: impl Into<String>,
+        output_name: Option<impl Into<String>>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        allocation_bytes: usize,
+        committed_ranges: Vec<std::ops::Range<usize>>,
+    ) -> Result<DeviceIoBinding> {
+        self.exec.allocate_device_binding_committed(
+            input_name.into(),
+            output_name.map(Into::into),
+            dtype,
+            physical_shape,
+            logical_shape,
+            allocation_bytes,
+            committed_ranges,
+        )
+    }
+
     /// Bind a persistent buffer the **caller** allocated on this session's
     /// execution device.
     ///

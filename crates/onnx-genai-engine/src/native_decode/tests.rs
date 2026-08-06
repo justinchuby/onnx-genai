@@ -20,6 +20,40 @@ fn qwen_cuda_smoke_model_dir() -> Option<std::path::PathBuf> {
     Some(model_dir)
 }
 
+#[cfg(feature = "cuda")]
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "cuda")]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: callers must hold `env_lock()` while this guard is live, and
+        // the guard restores the value on drop before releasing that lock.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: paired with `EnvVarGuard::set`; this test-only guard restores
+        // process environment before the next CUDA smoke test observes it.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
 #[test]
 fn tensor_argmax_reads_only_the_final_logits_row_and_keeps_first_tie() {
     let tensor = Tensor::from_f32(&[1, 2, 4], &[100.0, 0.0, 0.0, 0.0, 1.0, 7.0, 7.0, 2.0]).unwrap();
@@ -176,6 +210,27 @@ fn cuda_kv_capacity_error_explains_source_and_device_memory() {
     );
     assert!(message.contains("CUDA free=20000 bytes"), "{message}");
     assert!(message.contains("ONNX_GENAI_CUDA_KV_MAX_LEN"), "{message}");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn non_power_of_two_kv_growth_routes_overlapping_copies_through_scratch() {
+    let inner = 32usize;
+    let elem = 2usize;
+    let old_stride = 2048 * inner * elem;
+    let new_stride = 3000 * inner * elem;
+    let segment = 2048 * inner * elem;
+
+    assert_eq!(
+        in_place_copy_route(old_stride, new_stride, segment),
+        InPlaceCopyRoute::Scratch,
+        "clamped non-power-of-two growth can overlap adjacent KV blocks and must not use cudaMemcpy device-to-device"
+    );
+    assert_eq!(
+        in_place_copy_route(old_stride, old_stride * 2, segment),
+        InPlaceCopyRoute::DeviceToDevice,
+        "doubling growth keeps adjacent KV block copies disjoint"
+    );
 }
 
 #[test]
@@ -2253,6 +2308,106 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// VMM-backed CUDA KV must reserve full context while committing only the
+/// buckets the sequence can touch.
+///
+/// This is the wiring test the allocator-only committed-range test cannot be.
+/// It reads committed bytes from the KV bindings themselves, not from global VMM
+/// counters that unrelated workspaces can move. Sabotaging the initial committed
+/// range or dropping `committed_ranges` in the plumbing makes the load-time KV
+/// commitment equal the full-context reservation and this test fails; sabotaging
+/// `commits_on_demand()` makes growth replace the bindings and this test fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_vmm_kv_grows_in_place_and_commits_more_granules() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    let _guard = env_lock()
+        .lock()
+        .expect("CUDA smoke env mutex should not be poisoned");
+
+    let Some(model_dir) = qwen_cuda_smoke_model_dir() else {
+        return Ok(());
+    };
+    let _vmm = EnvVarGuard::set("ONNX_GENAI_CUDA_VMM", "1");
+    let _graph = EnvVarGuard::set("ONNX_GENAI_CUDA_GRAPH", "0");
+    let _kv_max = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_MAX_LEN", "32768");
+    onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+
+    let mut session = NativeDecodeSession::load_with_resolved_io(
+        model_dir.join("model.onnx"),
+        NativeDecodeDevice::Cuda { index: Some(0) },
+    )?;
+    let before = session
+        .cuda_kv_debug_stats()
+        .context("CUDA session must expose KV stats")?;
+    let full_kv = usize::try_from(session.kv_reservation(before.hard_max_len)?.0)
+        .context("full KV reservation fits in usize")?;
+    let binding_count = before.device_ptrs.len();
+    let granule = before
+        .kv_committed_bytes
+        .checked_div(binding_count)
+        .context("CUDA KV stats must include at least one binding")?;
+    let expected_committed = |stats: &CudaKvDebugStats| -> usize {
+        stats
+            .device_ptrs
+            .iter()
+            .zip(stats.kv_physical_bytes_by_binding.iter())
+            .map(|(&ptr, &bytes)| {
+                if bytes == 0 {
+                    0
+                } else {
+                    ((ptr % granule) + bytes).div_ceil(granule) * granule
+                }
+            })
+            .sum()
+    };
+    let expected_physical_bytes =
+        |stats: &CudaKvDebugStats| -> usize { stats.kv_physical_bytes_by_binding.iter().sum() };
+    assert_eq!(
+        before.kv_committed_bytes,
+        expected_committed(&before),
+        "load must commit exactly the rounded physical KV bucket, not the full reserved context"
+    );
+    assert!(
+        expected_physical_bytes(&before) < full_kv / 2,
+        "VMM KV should expose only the initial physical bucket at load: physical={} full_context={full_kv}",
+        expected_physical_bytes(&before)
+    );
+    assert!(
+        before.kv_committed_bytes < full_kv,
+        "VMM KV should commit far less than the full reserved context at load: committed={} full_context={full_kv}",
+        before.kv_committed_bytes
+    );
+
+    let required = 8193;
+    assert!(
+        before.hard_max_len >= required,
+        "CUDA smoke fixture must allow growth to {required} tokens; hard max is {}",
+        before.hard_max_len
+    );
+    session
+        .cuda
+        .as_mut()
+        .context("CUDA state must be present")?
+        .ensure_capacity(&mut session.session, required)?;
+
+    let after = session.cuda_kv_debug_stats().unwrap();
+    let expected_delta = expected_committed(&after) - expected_committed(&before);
+    assert_eq!(
+        before.device_ptrs, after.device_ptrs,
+        "VMM KV growth must commit the existing virtual range, not replace bindings"
+    );
+    assert_eq!(
+        after.kv_committed_bytes - before.kv_committed_bytes,
+        expected_delta,
+        "growth must commit exactly the next KV bucket delta, not global workspace traffic"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
@@ -2267,6 +2422,7 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
         eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
         return Ok(());
     }
+
     let Some(model_dir) = qwen_cuda_smoke_model_dir() else {
         return Ok(());
     };

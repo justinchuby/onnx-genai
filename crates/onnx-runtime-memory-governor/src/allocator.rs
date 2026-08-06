@@ -116,6 +116,75 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// Take `bytes` aligned to `align`.
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError>;
 
+    /// Reserve one allocation while committing only the byte ranges the caller
+    /// says are live.
+    ///
+    /// Eager allocators cannot separate those two acts, so the default keeps
+    /// the old contract and commits the whole allocation. Lazy allocators may
+    /// override this and pair it with [`DeviceAllocator::commit_allocation_range`].
+    fn allocate_committed(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+    ) -> Result<NonNull<u8>, MemoryError> {
+        let _ = committed_ranges;
+        self.allocate(bytes, align)
+    }
+
+    /// Ensure `offset..offset + bytes` in an existing allocation is physically
+    /// backed.
+    ///
+    /// The default is a no-op because [`DeviceAllocator::allocate`] and the
+    /// default [`DeviceAllocator::allocate_committed`] already committed the
+    /// whole allocation. Lazy allocators override this to grow the physical
+    /// commitment without moving the pointer.
+    fn commit_allocation_range(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        align: usize,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let _ = (ptr, allocation_bytes, align, offset, bytes);
+        Ok(())
+    }
+
+    /// Release physical backing from a byte range in an existing allocation
+    /// while keeping its virtual address reserved.
+    ///
+    /// The default is a no-op because eager allocators cannot partially unmap
+    /// allocations. Lazy allocators may override this so callers can roll back
+    /// a failed multi-buffer growth without leaving committed bytes charged.
+    fn decommit_allocation_range(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        align: usize,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let _ = (ptr, allocation_bytes, align, offset, bytes);
+        Ok(())
+    }
+
+    /// Physical bytes currently claimed by this allocation.
+    ///
+    /// Eager allocators return the allocation length because every byte is
+    /// backed from birth. Lazy allocators override this so tests and profilers
+    /// can assert on bytes that are attributable to one binding rather than on
+    /// process-global activity from unrelated workspaces.
+    fn allocation_committed_bytes(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        align: usize,
+    ) -> usize {
+        let _ = (ptr, align);
+        allocation_bytes
+    }
+
     /// Whether this allocator commits physical memory as it is used rather
     /// than when it is requested.
     ///

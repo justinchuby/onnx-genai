@@ -1734,6 +1734,42 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                allocation_bytes: None,
+                committed_ranges: None,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_device_binding_committed(
+        &self,
+        input_name: String,
+        output_name: Option<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+        allocation_bytes: usize,
+        committed_ranges: Vec<std::ops::Range<usize>>,
+    ) -> Result<DeviceIoBinding> {
+        let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
+            if output_name.is_some() {
+                !self.binding_consumers_use_physical_capacity(vid)
+            } else {
+                !self.binding_consumers_use_padded_capacity(vid)
+            }
+        });
+        DeviceIoBinding::allocate(
+            self.ep.clone(),
+            DeviceBindingSpec {
+                input_name,
+                bind_input: true,
+                output_name,
+                dtype,
+                physical_shape,
+                logical_shape,
+                expose_logical_input_shape,
+                allocation_bytes: Some(allocation_bytes),
+                committed_ranges: Some(committed_ranges),
             },
         )
     }
@@ -1786,6 +1822,8 @@ impl Executor {
                     physical_shape,
                     logical_shape,
                     expose_logical_input_shape,
+                    allocation_bytes: None,
+                    committed_ranges: None,
                 },
                 ptr,
                 len_bytes,
@@ -1810,6 +1848,8 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape: false,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
     }
