@@ -92,6 +92,17 @@ only because someone asked a second question:
   ledger understates device use`. The arena did not fit in less memory; it
   proceeded while the ledger was knowingly wrong. **The measurement and the bug
   (#694) were the same event.**
+- **Windows WDDM makes arena-off floor measurements incomparable to VMM.** On
+  an RTX 4060 Laptop GPU with 8 GiB dedicated VRAM and 47.8 GiB Windows shared
+  GPU memory, the driver reports only the 8 GiB through CUDA (`cuMemGetInfo`),
+  but the legacy `cudaMalloc`/`cuMemAlloc` path can silently spill past that
+  into system RAM. The VMM path (`cuMemCreate` + `cuMemMap`) asks for physical
+  device granules and hard-fails when those do not exist. A 15.5 GiB model
+  loading on this card with the arena off is therefore not weight streaming and
+  not evidence that the non-VMM path fits in VRAM; it is Windows paging GPU
+  memory into system RAM. Floor comparisons on this machine must use quantities
+  both paths can bound, such as VMM committed bytes, or run with sysmem fallback
+  disabled outside the process.
 
 So a third habit, for numbers rather than code:
 
