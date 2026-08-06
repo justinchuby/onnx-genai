@@ -117,6 +117,31 @@ impl From<onnx_runtime_session::ActivationMemoryPlanStats> for ActivationMemoryP
     }
 }
 
+/// What a virtual-memory arena has done to physical memory.
+///
+/// Backend-agnostic on purpose. The counters currently come from the native
+/// CUDA arena, but nothing in this shape is CUDA-specific: any allocator that
+/// reserves address space and commits it on demand answers the same six
+/// questions, so a second backend can report here without the CLI changing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmmArenaStats {
+    /// Granules mapped since the process started.
+    pub commits: u64,
+    /// Granules unmapped since the process started.
+    pub releases: u64,
+    /// Physical bytes mapped right now.
+    pub committed_bytes: u64,
+    /// Address space reserved right now. The gap between this and
+    /// `committed_bytes` is what the approach buys.
+    pub reserved_bytes: u64,
+    /// High-water mark of `committed_bytes`.
+    pub peak_committed_bytes: u64,
+    /// Spans handed out. Many allocations per commit is granule sharing
+    /// working; one commit per allocation means every small tensor costs a
+    /// whole granule.
+    pub allocations: u64,
+}
+
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{

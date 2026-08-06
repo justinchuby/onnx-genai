@@ -384,26 +384,34 @@ pub fn weight_offload_stats() -> WeightOffloadStats {
     metrics().snapshot()
 }
 
-/// Set the default CPU provider's owned warm-host cache sub-budget.
-///
-/// `ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES`, when present, overrides this value.
-pub fn set_weight_offload_host_budget(bytes: u64) -> Result<(), &'static str> {
-    crate::kernels::qmoe::default_weight_offload_host_cache()
-        .reconfigure(bytes)
-        .map_err(|_| "cannot lower host-cache budget while entries are leased")
+pub(crate) fn weight_offload_host_budget(governor_bytes: u64) -> Result<usize, &'static str> {
+    checked_host_budget(
+        effective_host_budget_u64(governor_bytes)
+            .map_err(|_| "host-cache byte budget is not valid for the memory governor")?,
+    )
 }
 
-pub(crate) fn weight_offload_host_budget(governor_bytes: u64) -> Result<usize, &'static str> {
+pub(crate) fn effective_host_budget_u64(
+    governor_bytes: u64,
+) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
     if let Some(value) = std::env::var_os(WEIGHT_OFFLOAD_HOST_BYTES_ENV) {
-        let value = value
-            .to_str()
-            .ok_or("host-cache byte budget is not valid UTF-8")?;
-        let bytes = value
-            .parse::<u64>()
-            .map_err(|_| "host-cache byte budget must be an unsigned decimal byte count")?;
-        return checked_host_budget(bytes);
+        let value =
+            value
+                .to_str()
+                .ok_or(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    tier: onnx_runtime_memory_governor::Tier::Host.name(),
+                    requested: governor_bytes,
+                    reason: "host-cache byte budget is not valid UTF-8",
+                })?;
+        return value.parse::<u64>().map_err(|_| {
+            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                tier: onnx_runtime_memory_governor::Tier::Host.name(),
+                requested: governor_bytes,
+                reason: "host-cache byte budget must be an unsigned decimal byte count",
+            }
+        });
     }
-    checked_host_budget(governor_bytes)
+    Ok(governor_bytes)
 }
 
 pub(crate) fn checked_host_budget(bytes: u64) -> Result<usize, &'static str> {

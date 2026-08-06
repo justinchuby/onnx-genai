@@ -1326,7 +1326,7 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
-    fn two_engine_governors_keep_independent_host_cache_budgets() {
+    fn engine_governors_keep_disabled_host_cache_budgets_governed() {
         let first = EngineResourceGovernor::new_with_capacities(
             ResourceLimits {
                 host_ram_limit: ResourceLimit::Bytes(400),
@@ -1358,12 +1358,14 @@ mod tests {
 
         assert_eq!(
             first.weight_offload_host_cache().configured_budget_bytes(),
-            400
+            0
         );
+        assert_eq!(first.weight_offload_host_cache().budget(), (0, true));
         assert_eq!(
             second.weight_offload_host_cache().configured_budget_bytes(),
-            900
+            0
         );
+        assert_eq!(second.weight_offload_host_cache().budget(), (0, true));
     }
 
     #[test]

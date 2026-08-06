@@ -720,6 +720,14 @@ impl Backend {
                         }
                     }),
                     weight_placement,
+                    vmm_arena: engine.vmm_arena_stats().map(|stats| profile::VmmArena {
+                        commits: stats.commits,
+                        releases: stats.releases,
+                        committed_bytes: stats.committed_bytes,
+                        reserved_bytes: stats.reserved_bytes,
+                        peak_committed_bytes: stats.peak_committed_bytes,
+                        allocations: stats.allocations,
+                    }),
                 })
             }
             Self::Pipeline(_) => None,

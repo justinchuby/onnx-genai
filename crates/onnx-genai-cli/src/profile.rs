@@ -575,6 +575,28 @@ pub(crate) struct MemoryUsage {
     /// user asks for `gpu_layers:N`, `--profile` must show the translated byte
     /// plan instead of silently accepting a knob that nothing reached.
     pub(crate) weight_placement: Option<WeightPlacementMemory>,
+    /// What the virtual-memory arena did to physical memory, when this build
+    /// can have one. See [`VmmArena`].
+    pub(crate) vmm_arena: Option<VmmArena>,
+}
+
+/// Virtual-memory arena counters, as reported by the engine.
+///
+/// # Why this is printed even when it is all zero
+///
+/// The arena once logged that it was installed and committed **zero bytes**
+/// for an entire generation (#659). A field that disappears when nothing
+/// happened cannot distinguish "no arena" from "an arena doing nothing", which
+/// is precisely the bug. So the row is printed whenever the build could have
+/// an arena, and `reserved 0 B` is a visible answer rather than an absence.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VmmArena {
+    pub(crate) commits: u64,
+    pub(crate) releases: u64,
+    pub(crate) committed_bytes: u64,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) peak_committed_bytes: u64,
+    pub(crate) allocations: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -637,6 +659,7 @@ impl MemoryUsage {
             && self.composition.is_none()
             && self.activation_plan.is_none()
             && self.weight_placement.is_none()
+            && self.vmm_arena.is_none()
     }
 }
 
@@ -937,6 +960,32 @@ impl RunProfile {
                 );
                 let _ = writeln!(out, "{:<24} {}", "  explanation", plan.explanation);
             }
+            if let Some(arena) = self.memory.vmm_arena {
+                if arena.reserved_bytes == 0 && arena.commits == 0 {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} not installed (set ONNX_GENAI_CUDA_VMM=1)",
+                        "vmm arena"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} committed of {} reserved (peak {})",
+                        "vmm arena",
+                        format_bytes(arena.committed_bytes),
+                        format_bytes(arena.reserved_bytes),
+                        format_bytes(arena.peak_committed_bytes)
+                    );
+                    // Allocations per commit is the suballocation ratio: 1.0
+                    // means every allocation took its own granule, which is the
+                    // regression that would make 2 MiB granularity unaffordable.
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} allocs, {} commits, {} releases",
+                        "vmm arena activity", arena.allocations, arena.commits, arena.releases
+                    );
+                }
+            }
         }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
@@ -1165,6 +1214,17 @@ impl RunProfile {
                 plan.device_bytes,
                 plan.host_bytes,
                 json_string(&plan.explanation)
+            ));
+        }
+        if let Some(arena) = self.memory.vmm_arena {
+            fields.push(format!(
+                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{}}}",
+                arena.commits,
+                arena.releases,
+                arena.committed_bytes,
+                arena.reserved_bytes,
+                arena.peak_committed_bytes,
+                arena.allocations
             ));
         }
         format!("{{{}}}", fields.join(","))
