@@ -316,6 +316,10 @@ static DENSE_PREFETCH_GAP_JOINS: AtomicU64 = AtomicU64::new(0);
 static DENSE_PREFETCH_GAP_NODES: AtomicU64 = AtomicU64::new(0);
 static DENSE_PREFETCH_GAP_MAX: AtomicU64 = AtomicU64::new(0);
 
+pub const DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV: &str =
+    "ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH_LOOKAHEAD_NODES";
+const DEFAULT_DENSE_WEIGHT_PREFETCH_LOOKAHEAD_NODES: usize = 1;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DensePrefetchGapStats {
     pub joins: u64,
@@ -329,6 +333,13 @@ pub fn dense_prefetch_gap_stats() -> DensePrefetchGapStats {
         nodes_between_sum: DENSE_PREFETCH_GAP_NODES.load(Ordering::Relaxed),
         nodes_between_max: DENSE_PREFETCH_GAP_MAX.load(Ordering::Relaxed),
     }
+}
+
+pub fn dense_weight_prefetch_lookahead_nodes() -> usize {
+    std::env::var(DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DENSE_WEIGHT_PREFETCH_LOOKAHEAD_NODES)
 }
 
 pub fn reset_dense_prefetch_gap_stats() {

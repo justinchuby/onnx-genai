@@ -19,6 +19,7 @@ pub(crate) struct Executor {
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,
     pub(super) prefetch_issue_nodes: std::sync::Mutex<HashMap<ValueId, usize>>,
+    pub(super) prefetch_lookahead_nodes: usize,
     /// One device buffer per backed value. Static values are allocated once at
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.

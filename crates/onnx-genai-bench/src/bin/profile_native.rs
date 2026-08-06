@@ -481,6 +481,10 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         "weight_offload_prefetch_gap: joins={} nodes_between_sum={} nodes_between_max={}",
         gap.joins, gap.nodes_between_sum, gap.nodes_between_max
     );
+    println!(
+        "weight_offload_prefetch_lookahead: requested_nodes={}",
+        onnx_runtime_session::dense_weight_prefetch_lookahead_nodes()
+    );
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }
@@ -886,6 +890,10 @@ fn main() -> Result<()> {
     println!(
         "weight_offload_prefetch_gap: joins={} nodes_between_sum={} nodes_between_max={}",
         gap.joins, gap.nodes_between_sum, gap.nodes_between_max
+    );
+    println!(
+        "weight_offload_prefetch_lookahead: requested_nodes={}",
+        onnx_runtime_session::dense_weight_prefetch_lookahead_nodes()
     );
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));

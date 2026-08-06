@@ -501,6 +501,7 @@ impl Executor {
             ep,
             weight_handles,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
+            prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
             buffer_shapes,
             value_shapes,

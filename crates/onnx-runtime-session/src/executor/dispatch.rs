@@ -7,8 +7,6 @@ use onnx_runtime_ep_api::ExecutionProviderCapabilities;
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
 impl Executor {
-    const DENSE_WEIGHT_PREFETCH_LOOKAHEAD: usize = 1;
-
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
     /// leaf kernel). Shared by the eager loop and the segmented runner.
     ///
@@ -143,7 +141,10 @@ impl Executor {
     }
 
     fn prefetch_lazy_weights_after(&self, pi: usize) -> Result<()> {
-        let Some(lookahead) = pi.checked_add(Self::DENSE_WEIGHT_PREFETCH_LOOKAHEAD) else {
+        if self.prefetch_lookahead_nodes == 0 {
+            return Ok(());
+        }
+        let Some(lookahead) = pi.checked_add(self.prefetch_lookahead_nodes) else {
             return Ok(());
         };
         let Some(next) = self.plan.get(lookahead) else {
