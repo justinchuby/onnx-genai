@@ -384,6 +384,11 @@ impl Engine {
         self.connector.stats().clone()
     }
 
+    #[cfg(feature = "native-backend")]
+    pub fn recurrent_prefix_cache_stats(&self) -> RecurrentPrefixCacheStats {
+        self.native_recurrent_prefix_stats
+    }
+
     /// Generate the middle text for a fill-in-the-middle request.
     pub fn generate_fim(
         &mut self,
@@ -1177,6 +1182,48 @@ impl Engine {
         self.decode_backend
     }
 
+    /// Latest native activation-memory planner measurement, if the current
+    /// backend is native and has executed far enough to resolve concrete shapes.
+    pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.native_session
+                .as_ref()
+                .and_then(crate::native_decode::NativeDecodeSession::activation_memory_plan_stats)
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
+    /// Process-global CUDA VMM arena counters, when this build has the native
+    /// CUDA execution provider.
+    ///
+    /// `None` means the build cannot have an arena. All-zero means no arena was
+    /// ever built, which is the normal state without `ONNX_GENAI_CUDA_VMM` --
+    /// and is distinguishable from an arena that was built and never committed
+    /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
+    /// behind a log line for an entire release.
+    pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
+            Some(crate::VmmArenaStats {
+                commits: stats.commits,
+                releases: stats.releases,
+                committed_bytes: stats.committed_bytes,
+                reserved_bytes: stats.reserved_bytes,
+                peak_committed_bytes: stats.peak_committed_bytes,
+                allocations: stats.allocations,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
     pub fn fim_config(&self) -> Option<&FimConfig> {
         self.fim_config.as_ref()
@@ -1854,6 +1901,9 @@ impl Engine {
         }
 
         let active_matches = self.native_active_session == Some(session_id);
+        let semantic_prefix_len = options
+            .semantic_prefix_len
+            .filter(|&len| len > 0 && len < prompt_tokens.len());
         if !active_matches {
             let native = self
                 .native_session
@@ -1871,13 +1921,122 @@ impl Engine {
             common_prefix_len(&state.tokens, &prompt_tokens)
         };
 
+        let supports_past_snapshots = self
+            .native_session
+            .as_ref()
+            .is_some_and(|native| native.supports_past_snapshots());
+        let mut restored_prefix_len = None;
+        let mut should_store_semantic_snapshot = false;
+        if !active_matches
+            && supports_past_snapshots
+            && let Some(boundary) = semantic_prefix_len
+        {
+            self.native_recurrent_prefix_stats.lookups += 1;
+            if let Some((matched, snapshot)) = self
+                .prefix_cache
+                .lookup_snapshot::<NativePrefixSnapshot>(&prompt_tokens)
+                .filter(|(matched, _)| *matched >= boundary && *matched < prompt_tokens.len())
+            {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                match native.restore_past_snapshot(&snapshot.snapshot) {
+                    Ok(()) => {
+                        self.native_recurrent_prefix_stats.hits += 1;
+                        self.native_recurrent_prefix_stats.restored_tokens += matched as u64;
+                        restored_prefix_len = Some(matched);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "skipping native recurrent prefix snapshot restore after failure: \
+                             {error:#}"
+                        );
+                    }
+                }
+            } else {
+                should_store_semantic_snapshot = true;
+            }
+        }
+
+        if should_store_semantic_snapshot
+            && supports_past_snapshots
+            && let Some(boundary) = semantic_prefix_len
+        {
+            let snapshot = {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.prefill_prefix(&prompt_tokens[..boundary])?;
+                native.snapshot_past()
+            };
+            match snapshot {
+                Ok(snapshot) => {
+                    let reserve_snapshot = || {
+                        onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                            self.governor.memory(),
+                            onnx_runtime_memory_governor::Tier::Host,
+                            snapshot.bytes(),
+                            Holder::RecurrentPrefixSnapshot.role(),
+                            Holder::RecurrentPrefixSnapshot.id(),
+                        )
+                    };
+                    let lease = match reserve_snapshot() {
+                        Ok(lease) => Some(lease),
+                        Err(first_error) if self.prefix_cache.evict_lru_snapshot() => {
+                            match reserve_snapshot() {
+                                Ok(lease) => Some(lease),
+                                Err(error) => {
+                                    tracing::debug!(
+                                        "skipping native recurrent prefix snapshot store; cannot \
+                                         reserve {} bytes after evicting an older snapshot: \
+                                         {first_error}; retry: {error}",
+                                        snapshot.bytes()
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "skipping native recurrent prefix snapshot store; cannot reserve \
+                                 {} bytes: {error}",
+                                snapshot.bytes()
+                            );
+                            None
+                        }
+                    };
+                    if let Some(lease) = lease {
+                        self.prefix_cache.insert_snapshot(
+                            &prompt_tokens[..boundary],
+                            Arc::new(NativePrefixSnapshot {
+                                snapshot,
+                                _lease: lease,
+                            }),
+                        );
+                        self.native_recurrent_prefix_stats.stores += 1;
+                    }
+                    restored_prefix_len = Some(boundary);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "skipping native recurrent prefix snapshot store after snapshot failure: \
+                         {error:#}"
+                    );
+                }
+            }
+        }
+
         let result = {
             let native = self
                 .native_session
                 .as_mut()
                 .context("native decoder session is unavailable")?;
 
-            let mut resume_from = if active_matches {
+            let mut resume_from = if let Some(restored) = restored_prefix_len {
+                restored
+            } else if active_matches {
                 prefix_len.min(native.current_len())
             } else {
                 0

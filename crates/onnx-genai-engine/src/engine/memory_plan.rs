@@ -58,8 +58,12 @@ pub(crate) enum Holder {
     DraftKvPool,
     /// The device weight-residency cache, when weight offload is enabled.
     WeightResidency,
+    /// The CPU EP's warm host cache for dequantized MoE experts.
+    WeightOffloadHostCache,
     /// Fixed-size recurrent state for hybrid decoders.
     RecurrentState,
+    /// Semantic-prefix snapshots of recurrent/native loop-carried state.
+    RecurrentPrefixSnapshot,
     /// The native decode path's past/present KV tensors.
     ///
     /// Distinct from the `*KvPool` holders: those are page pools that lease
@@ -93,12 +97,14 @@ impl Holder {
     /// the variants are unconditional even when only one build configuration
     /// constructs them.
     #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 8] = [
+    pub(crate) const ALL: [Holder; 10] = [
         Holder::KvPool,
         Holder::PipelineKvPool,
         Holder::DraftKvPool,
         Holder::WeightResidency,
+        Holder::WeightOffloadHostCache,
         Holder::RecurrentState,
+        Holder::RecurrentPrefixSnapshot,
         Holder::NativeKvCache,
         Holder::Activations,
         Holder::FixedDeviceReservation,
@@ -114,7 +120,9 @@ impl Holder {
             Holder::PipelineKvPool => 2,
             Holder::DraftKvPool => 3,
             Holder::WeightResidency => 4,
+            Holder::WeightOffloadHostCache => 10,
             Holder::RecurrentState => 5,
+            Holder::RecurrentPrefixSnapshot => 9,
             Holder::NativeKvCache => 8,
             Holder::Activations => 6,
             Holder::FixedDeviceReservation => 7,
@@ -126,12 +134,12 @@ impl Holder {
     pub(crate) const fn role(self) -> MemoryRole {
         match self {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => MemoryRole::KvCache,
-            Holder::WeightResidency => MemoryRole::Weights,
+            Holder::WeightResidency | Holder::WeightOffloadHostCache => MemoryRole::Weights,
             // Rolling state that is destroyed as it is updated: it cannot be
             // rewound, recomputed or shared, so it is not a `Weights`-style
             // demotion candidate and not step-scoped `Workspace` either. It
             // lives and dies with its sequence, like KV.
-            Holder::RecurrentState => MemoryRole::KvCache,
+            Holder::RecurrentState | Holder::RecurrentPrefixSnapshot => MemoryRole::KvCache,
             Holder::NativeKvCache => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
@@ -145,7 +153,9 @@ impl Holder {
             Holder::PipelineKvPool => "pipeline KV page pool",
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
+            Holder::WeightOffloadHostCache => "host weight-offload expert cache",
             Holder::RecurrentState => "recurrent state",
+            Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
             Holder::NativeKvCache => "native decode KV tensors",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
@@ -164,8 +174,10 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
+            Holder::WeightOffloadHostCache => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
+            | Holder::RecurrentPrefixSnapshot
             // The native decode session allocates these through its execution
             // provider, so a CPU-EP session holds them in host memory. The call
             // site supplies the real tier via `reserve_on`; this is the default

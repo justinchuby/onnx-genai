@@ -697,6 +697,23 @@ impl Backend {
                         kv_pages: budget.total_pages,
                         kv_page_bytes: budget.kv_bytes.checked_div(budget.total_pages).unwrap_or(0),
                     }),
+                    activation_plan: engine.activation_memory_plan_stats().map(|stats| {
+                        profile::ActivationPlanMemory {
+                            complete: stats.complete,
+                            peak_bytes: stats.peak_bytes,
+                            naive_bytes: stats.naive_bytes,
+                            savings_ratio: stats.savings_ratio,
+                            unknown_sizes: stats.unknown_sizes,
+                        }
+                    }),
+                    vmm_arena: engine.vmm_arena_stats().map(|stats| profile::VmmArena {
+                        commits: stats.commits,
+                        releases: stats.releases,
+                        committed_bytes: stats.committed_bytes,
+                        reserved_bytes: stats.reserved_bytes,
+                        peak_committed_bytes: stats.peak_committed_bytes,
+                        allocations: stats.allocations,
+                    }),
                 })
             }
             Self::Pipeline(_) => None,

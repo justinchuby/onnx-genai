@@ -11,6 +11,10 @@ categories = ["memory-management", "hardware-support"]
 [features]
 default = []
 cuda = []
+# Emit `tracing` events on every granule commit and release, and on arena
+# construction and teardown. Independent of `cuda`: the software backing used
+# by tests emits them too, so the wiring can be tested without a GPU.
+tracing = ["dep:tracing"]
 # Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
 gpu-tests = []
 
@@ -18,6 +22,10 @@ gpu-tests = []
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-virtual-memory = { workspace = true }
 thiserror = { workspace = true }
+# Off by default: an arena commit is on the allocation path, and a caller that
+# does not subscribe should pay nothing for an event nobody reads. `--profile`
+# reads the counters instead, which are always on.
+tracing = { workspace = true, optional = true }
 
 # Same pin and feature set as the execution provider: the driver is dlopen'd,
 # so building this crate needs no CUDA toolkit. `cublaslt`/`cudnn`/`nvrtc` are

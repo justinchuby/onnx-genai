@@ -528,6 +528,7 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),

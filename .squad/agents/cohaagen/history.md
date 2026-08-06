@@ -99,3 +99,10 @@ _Entries before 2026-07-31T03:03:15Z archived to `history-archive.md` (Scribe ro
 - Delivered the #625 native loader fix with GraphIo/GraphIoMetadata and rebased onto origin/main; locked out after Harry found the initializer-input leak.
 - Confirmed ORT 1.28 still rejects fp16-activation/fp32-scale QMoE, making config-B a capability gap rather than a loader issue.
 - Left GPU watcher PID 1060559 for config-A measurement while external vLLM occupies the GPU.
+
+## 2026-08-06T00:00:00Z — 35B-A3B native sparse QMoE shipped
+
+- Cohaagen-34 fixed native CUDA QMoE `router_probs` rank handling for 3-D tensors, measured Config A at 31.13 ms/tok / 32.12 tok/s, and opened #676.
+- Cohaagen-35 measured Config C (ORT-GenAI 0.14.1 / ORT 1.27 full stack, dense-fallback Q4_K_M) at 461.23 ms/tok / 2.17 tok/s.
+- Cohaagen-36 used a full-fp32 oracle to adjudicate token-119: QMoE token 33803 matches oracle, dense int4 token 5342 is the low-precision outlier; regression test landed in #676.
+- Coordinator merged #625 and #676; 35B-A3B native sparse QMoE is shipped at roughly 12.5–14.8× over the ORT dense-fallback stack.

@@ -145,6 +145,11 @@ fn generate_text(
             if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
                 profile.pages = Some(profile::PageActivity::since(before, after));
             }
+            // `kv_usage` replaces `profile.memory` wholesale, so it must run
+            // before anything that writes into that struct.
+            if let Some(memory) = backend.kv_usage() {
+                profile.memory = memory;
+            }
             record_cuda_offload_counters(&mut profile, offload_before);
             profiling.emit(&mut profile)?;
             emit_stats_line(show_stats, profiling.profile, &mut profile);

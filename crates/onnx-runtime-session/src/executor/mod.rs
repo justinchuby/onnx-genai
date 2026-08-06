@@ -63,6 +63,7 @@ use onnx_runtime_ir::{
     WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides, read_scalar_le,
 };
 use onnx_runtime_loader::WeightStore;
+use onnx_runtime_memory::{PlanOptions, PlanStatus, ViewMap, plan_activations};
 use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy, NodeIo, ShapeData,
@@ -284,6 +285,30 @@ pub fn print_exec_phase_profile() {
 
 pub fn reset_exec_phase_profile() {
     phase_profile::reset();
+}
+
+/// Activation-memory planner metrics from the most recent measured top-level run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActivationMemoryPlanStats {
+    /// `true` when every activation owner had a concrete byte size and the
+    /// planner produced a reusable-slot plan.
+    pub complete: bool,
+    /// Concurrent peak bytes after liveness-based slot sharing.
+    pub peak_bytes: usize,
+    /// Planner upper bound that counts one buffer-owner allocation per activation.
+    /// This is not the executor's exact baseline: in-place aliases and sequence
+    /// storage can make the current executor allocate less.
+    pub naive_bytes: usize,
+    /// Fraction saved vs. the naive baseline: `1 - peak / naive`.
+    pub savings_ratio: f64,
+    /// Number of reusable backing slots in the complete plan.
+    pub num_slots: usize,
+    /// Number of buffer-owner values assigned to slots.
+    pub assignments: usize,
+    /// Number of zero-copy view aliases folded into source-owner liveness.
+    pub view_edges: usize,
+    /// Number of activation owners still missing concrete sizes when deferred.
+    pub unknown_sizes: usize,
 }
 
 pub(crate) fn host_dtype_alignment(dtype: DataType) -> usize {

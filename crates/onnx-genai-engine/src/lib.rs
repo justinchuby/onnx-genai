@@ -93,6 +93,54 @@ pub fn executor_phase_stats() -> Vec<(&'static str, u128, u64)> {
     }
 }
 
+/// Latest native activation-memory planner measurement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActivationMemoryPlanSummary {
+    pub complete: bool,
+    pub peak_bytes: u64,
+    pub naive_bytes: u64,
+    pub savings_ratio: f64,
+    pub unknown_sizes: usize,
+}
+
+#[cfg(feature = "native-backend")]
+impl From<onnx_runtime_session::ActivationMemoryPlanStats> for ActivationMemoryPlanSummary {
+    fn from(stats: onnx_runtime_session::ActivationMemoryPlanStats) -> Self {
+        Self {
+            complete: stats.complete,
+            peak_bytes: stats.peak_bytes as u64,
+            naive_bytes: stats.naive_bytes as u64,
+            savings_ratio: stats.savings_ratio,
+            unknown_sizes: stats.unknown_sizes,
+        }
+    }
+}
+
+/// What a virtual-memory arena has done to physical memory.
+///
+/// Backend-agnostic on purpose. The counters currently come from the native
+/// CUDA arena, but nothing in this shape is CUDA-specific: any allocator that
+/// reserves address space and commits it on demand answers the same six
+/// questions, so a second backend can report here without the CLI changing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmmArenaStats {
+    /// Granules mapped since the process started.
+    pub commits: u64,
+    /// Granules unmapped since the process started.
+    pub releases: u64,
+    /// Physical bytes mapped right now.
+    pub committed_bytes: u64,
+    /// Address space reserved right now. The gap between this and
+    /// `committed_bytes` is what the approach buys.
+    pub reserved_bytes: u64,
+    /// High-water mark of `committed_bytes`.
+    pub peak_committed_bytes: u64,
+    /// Spans handed out. Many allocations per commit is granule sharing
+    /// working; one commit per allocation means every small tensor costs a
+    /// whole granule.
+    pub allocations: u64,
+}
+
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
