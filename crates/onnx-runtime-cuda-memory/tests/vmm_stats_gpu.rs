@@ -134,4 +134,11 @@ fn the_counters_follow_a_full_allocate_and_free_cycle() {
          run in the same process reads the first run's memory as still held"
     );
     assert_eq!(gone.committed_bytes, 0);
+    assert_eq!(
+        gone.ref_underflows, 0,
+        "a correct allocate/free cycle must never release a granule whose \
+         reference count is already zero; a non-zero reading means some \
+         allocation committed a granule without taking a reference for it, and \
+         the arena has unmapped memory another allocation believes it owns"
+    );
 }

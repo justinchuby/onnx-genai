@@ -140,6 +140,9 @@ pub struct VmmArenaStats {
     /// working; one commit per allocation means every small tensor costs a
     /// whole granule.
     pub allocations: u64,
+    /// Times a granule was released whose reference count was already zero.
+    /// **Anything but zero is a bug** in the allocator's accounting.
+    pub ref_underflows: u64,
 }
 
 #[cfg(feature = "native-backend")]
