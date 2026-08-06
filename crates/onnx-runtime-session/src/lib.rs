@@ -29,8 +29,8 @@ pub use epcontext::{
 };
 pub use error::SessionError;
 pub use executor::{
-    CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
-    DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
+    ActivationMemoryPlanStats, CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind,
+    ControlFlowStats, DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
     ExecutionProviderFallbackReport, PrefetchStep, SeamReason, drive_double_buffer,
     exec_phase_stats, plan_double_buffer, print_exec_phase_profile, reset_exec_phase_profile,
 };
@@ -1099,6 +1099,18 @@ impl InferenceSession {
         self.exec.decode_view_plan_counts()
     }
 
+    /// Most recent activation-memory planner measurement.
+    ///
+    /// Populated only by measured top-level eager runs, after concrete shapes
+    /// and zero-copy view aliases are known. Stage-2 replay and nested runs skip
+    /// re-planning and leave the last measured result. The planner's
+    /// `naive_bytes` is an upper-bound activation-owner baseline, not the
+    /// executor's exact current allocation behavior (in-place aliases and
+    /// sequences can allocate less).
+    pub fn activation_memory_plan_stats(&self) -> Option<ActivationMemoryPlanStats> {
+        self.exec.activation_memory_plan_stats()
+    }
+
     /// How many times the single-trip `Scan` inline dual-path
     /// (`ONNX_GENAI_SCAN_INLINE_SINGLE_TRIP`) engaged over this session's
     /// lifetime. `> 0` after a decode run proves the runtime `trip_count == 1`
@@ -1374,6 +1386,15 @@ impl InferenceSession {
     /// is one -- otherwise sizes it for itself, which is a second claim on
     /// memory the governor is already dividing up. Returns the bytes now
     /// governed; zero means this provider holds no standing pool.
+    /// Whether the memory behind this session commits physically as it is used.
+    ///
+    /// Answered by the allocator rather than by the backend, so a caller does
+    /// not need to know whether it is holding a native session or an ONNX
+    /// Runtime one -- both reach the same `DeviceAllocator` seam.
+    pub fn commits_on_demand(&self) -> bool {
+        self.exec.commits_on_demand()
+    }
+
     pub fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,

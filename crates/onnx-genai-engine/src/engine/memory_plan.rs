@@ -60,6 +60,8 @@ pub(crate) enum Holder {
     WeightResidency,
     /// Fixed-size recurrent state for hybrid decoders.
     RecurrentState,
+    /// Semantic-prefix snapshots of recurrent/native loop-carried state.
+    RecurrentPrefixSnapshot,
     /// The native decode path's past/present KV tensors.
     ///
     /// Distinct from the `*KvPool` holders: those are page pools that lease
@@ -93,12 +95,13 @@ impl Holder {
     /// the variants are unconditional even when only one build configuration
     /// constructs them.
     #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 8] = [
+    pub(crate) const ALL: [Holder; 9] = [
         Holder::KvPool,
         Holder::PipelineKvPool,
         Holder::DraftKvPool,
         Holder::WeightResidency,
         Holder::RecurrentState,
+        Holder::RecurrentPrefixSnapshot,
         Holder::NativeKvCache,
         Holder::Activations,
         Holder::FixedDeviceReservation,
@@ -115,6 +118,7 @@ impl Holder {
             Holder::DraftKvPool => 3,
             Holder::WeightResidency => 4,
             Holder::RecurrentState => 5,
+            Holder::RecurrentPrefixSnapshot => 9,
             Holder::NativeKvCache => 8,
             Holder::Activations => 6,
             Holder::FixedDeviceReservation => 7,
@@ -131,7 +135,7 @@ impl Holder {
             // rewound, recomputed or shared, so it is not a `Weights`-style
             // demotion candidate and not step-scoped `Workspace` either. It
             // lives and dies with its sequence, like KV.
-            Holder::RecurrentState => MemoryRole::KvCache,
+            Holder::RecurrentState | Holder::RecurrentPrefixSnapshot => MemoryRole::KvCache,
             Holder::NativeKvCache => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
@@ -146,6 +150,7 @@ impl Holder {
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
             Holder::RecurrentState => "recurrent state",
+            Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
             Holder::NativeKvCache => "native decode KV tensors",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
@@ -166,6 +171,7 @@ impl Holder {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
+            | Holder::RecurrentPrefixSnapshot
             // The native decode session allocates these through its execution
             // provider, so a CPU-EP session holds them in host memory. The call
             // site supplies the real tier via `reserve_on`; this is the default
@@ -245,12 +251,43 @@ impl ModelMemoryPlan {
     /// A provider built before the governor existed sized its pool for itself.
     /// This is where that becomes a claim the rest of the plan can see. The
     /// provider keeps the lease, because it is the thing that must outlive it.
+    #[cfg(feature = "native-backend")]
     pub(crate) fn adopt_provider_pool(
         &self,
         session: &crate::native_decode::NativeDecodeSession,
         holder: Holder,
     ) -> anyhow::Result<u64> {
         session.adopt_memory_governor(&self.governor, holder.tier(), holder.id())
+    }
+
+    /// Give back `bytes` of `holder`'s claim, returning what was actually
+    /// released.
+    ///
+    /// # When a reservation stops being needed
+    ///
+    /// A reservation exists because nothing else accounts for the bytes. When
+    /// something starts to -- a device allocator that commits physically on
+    /// demand and leases each granule -- the reservation and the allocator
+    /// charge the same memory twice, and the tier reads high by that amount.
+    ///
+    /// Releasing rather than never taking it is deliberate. At the moment the
+    /// reservation is made no session exists, so nobody can yet say whether the
+    /// allocator commits on demand. Taking it and giving it back keeps the
+    /// conservative answer for the window where the question is unanswerable.
+    ///
+    /// Returns the bytes released, which may be less than asked for if the
+    /// holder never held that many -- a caller correcting a double count needs
+    /// to know what it actually corrected.
+    ///
+    /// Gated with its only caller: the native decode path is where an
+    /// on-demand allocator is asked about, and an ungated helper is dead code
+    /// in every other build.
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn release(&mut self, holder: Holder, bytes: u64) -> u64 {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.holder == holder) else {
+            return 0;
+        };
+        entry.lease.shrink(bytes)
     }
 
     /// Reserve `bytes` for `holder` on a tier the caller determined.
@@ -344,6 +381,20 @@ impl ModelMemoryPlan {
             );
         }
         Ok(cache)
+    }
+
+    /// Bytes free on `tier` right now.
+    ///
+    /// Read from the ledger rather than from this plan's own entries, so it
+    /// accounts for every holder rather than the ones this plan happens to
+    /// carry.
+    ///
+    /// Gated with its only caller: the native decode path is what needs to
+    /// compare a worst case against real headroom, and an ungated helper is
+    /// dead code in every other build.
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn available_on(&self, tier: Tier) -> u64 {
+        self.governor.available(tier)
     }
 
     /// A live handle on the device KV pool bytes leased through this plan.

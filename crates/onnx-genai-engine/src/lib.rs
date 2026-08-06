@@ -93,6 +93,29 @@ pub fn executor_phase_stats() -> Vec<(&'static str, u128, u64)> {
     }
 }
 
+/// Latest native activation-memory planner measurement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActivationMemoryPlanSummary {
+    pub complete: bool,
+    pub peak_bytes: u64,
+    pub naive_bytes: u64,
+    pub savings_ratio: f64,
+    pub unknown_sizes: usize,
+}
+
+#[cfg(feature = "native-backend")]
+impl From<onnx_runtime_session::ActivationMemoryPlanStats> for ActivationMemoryPlanSummary {
+    fn from(stats: onnx_runtime_session::ActivationMemoryPlanStats) -> Self {
+        Self {
+            complete: stats.complete,
+            peak_bytes: stats.peak_bytes as u64,
+            naive_bytes: stats.naive_bytes as u64,
+            savings_ratio: stats.savings_ratio,
+            unknown_sizes: stats.unknown_sizes,
+        }
+    }
+}
+
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{

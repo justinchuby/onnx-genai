@@ -8,7 +8,9 @@
 //! `ref_count > 1`, and writers must copy before mutating.
 
 use crate::{TokenId, page_table::PageId, page_table::PageTable};
+use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Longest-prefix cache lookup result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,8 @@ struct TrieNode {
     children: HashMap<TokenId, Box<TrieNode>>,
     /// KV page IDs for the full prefix ending at this node.
     page_ids: Vec<PageId>,
+    /// Optional non-KV state attached to the same semantic prefix.
+    snapshot: Option<Arc<dyn Any + Send + Sync>>,
     /// Number of active shared sequence references from `lookup_shared`.
     ref_count: usize,
     last_access: u64,
@@ -85,6 +89,62 @@ impl PrefixCache {
             page_table.retain(page_id);
         }
         self.insert_inner(tokens, page_ids)
+    }
+
+    /// Attach an opaque state snapshot to the trie node for `tokens`.
+    ///
+    /// The prefix cache owns one strong reference. Callers put any memory lease
+    /// required by the snapshot inside the value, so replacing or evicting the
+    /// node drops that lease through ordinary ownership.
+    pub fn insert_snapshot<T>(&mut self, tokens: &[TokenId], snapshot: Arc<T>) -> PrefixMatch
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.clock += 1;
+        let mut node = &mut self.root;
+        for &token in tokens {
+            node = node
+                .children
+                .entry(token)
+                .or_insert_with(|| Box::new(TrieNode::new(self.clock)));
+            node.last_access = self.clock;
+        }
+        node.snapshot = Some(snapshot);
+        PrefixMatch {
+            matched_tokens: tokens.len(),
+            page_ids: node.page_ids.clone(),
+        }
+    }
+
+    /// Find the longest cached prefix carrying a snapshot of type `T`.
+    pub fn lookup_snapshot<T>(&mut self, tokens: &[TokenId]) -> Option<(usize, Arc<T>)>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.clock += 1;
+        let mut node = &mut self.root;
+        let mut best_depth = 0;
+        let mut best_snapshot = None;
+
+        for (idx, &token) in tokens.iter().enumerate() {
+            match node.children.get_mut(&token) {
+                Some(child) => {
+                    node = child;
+                    node.last_access = self.clock;
+                    if let Some(snapshot) = &node.snapshot {
+                        best_depth = idx + 1;
+                        best_snapshot = Some(Arc::clone(snapshot));
+                    }
+                }
+                None => break,
+            }
+        }
+
+        best_snapshot.and_then(|snapshot| {
+            Arc::downcast::<T>(snapshot)
+                .ok()
+                .map(|snapshot| (best_depth, snapshot))
+        })
     }
 
     /// Find the longest cached prefix and retain its pages for a sharing
@@ -161,6 +221,7 @@ impl PrefixCache {
                 break;
             }
             let pages = std::mem::take(&mut node.page_ids);
+            node.snapshot = None;
             for page_id in &pages {
                 page_table.free(*page_id);
             }
@@ -168,6 +229,17 @@ impl PrefixCache {
             released.extend(pages);
         }
         released
+    }
+
+    /// Drop the least-recently-used inactive snapshot, if one exists.
+    pub fn evict_lru_snapshot(&mut self) -> bool {
+        let Some(path) = self.find_lru_snapshot_path() else {
+            return false;
+        };
+        let Some(node) = self.find_node_mut(&path) else {
+            return false;
+        };
+        node.snapshot.take().is_some()
     }
 
     /// Detach an exact cached prefix, returning the pages it referenced.
@@ -181,6 +253,7 @@ impl PrefixCache {
             return Vec::new();
         };
         node.ref_count = 0;
+        node.snapshot = None;
         std::mem::take(&mut node.page_ids)
     }
 
@@ -225,6 +298,13 @@ impl PrefixCache {
         best.map(|(_, path)| path)
     }
 
+    fn find_lru_snapshot_path(&self) -> Option<Vec<TokenId>> {
+        let mut best: Option<(u64, Vec<TokenId>)> = None;
+        let mut path = Vec::new();
+        Self::visit_snapshot_evictable(&self.root, &mut path, &mut best);
+        best.map(|(_, path)| path)
+    }
+
     fn visit_evictable(
         node: &TrieNode,
         path: &mut Vec<TokenId>,
@@ -247,6 +327,28 @@ impl PrefixCache {
         }
     }
 
+    fn visit_snapshot_evictable(
+        node: &TrieNode,
+        path: &mut Vec<TokenId>,
+        best: &mut Option<(u64, Vec<TokenId>)>,
+    ) {
+        if node.snapshot.is_some()
+            && node.ref_count == 0
+            && best
+                .as_ref()
+                .is_none_or(|(best_access, _)| node.last_access < *best_access)
+        {
+            *best = Some((node.last_access, path.clone()));
+        }
+        let mut children = node.children.iter().collect::<Vec<_>>();
+        children.sort_by_key(|(token, _)| **token);
+        for (&token, child) in children {
+            path.push(token);
+            Self::visit_snapshot_evictable(child, path, best);
+            path.pop();
+        }
+    }
+
     fn count_nodes(node: &TrieNode) -> usize {
         node.children
             .values()
@@ -260,6 +362,7 @@ impl TrieNode {
         Self {
             children: HashMap::new(),
             page_ids: Vec::new(),
+            snapshot: None,
             ref_count: 0,
             last_access,
         }
@@ -355,6 +458,20 @@ mod tests {
         );
         assert_eq!(cache.evict_lru(1, &mut table), vec![page]);
         assert!(cache.evict_lru(1, &mut table).is_empty());
+    }
+
+    #[test]
+    fn snapshots_are_looked_up_at_the_longest_semantic_prefix() {
+        let mut cache = PrefixCache::new();
+        cache.insert_snapshot(&[1, 2], Arc::new(String::from("system")));
+        cache.insert_snapshot(&[1, 2, 3, 4], Arc::new(String::from("fork")));
+
+        let (matched, snapshot) = cache
+            .lookup_snapshot::<String>(&[1, 2, 3, 4, 99])
+            .expect("snapshot hit");
+
+        assert_eq!(matched, 4);
+        assert_eq!(snapshot.as_str(), "fork");
     }
 }
 

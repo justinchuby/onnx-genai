@@ -549,6 +549,100 @@ mod tests {
 
     const H: HolderId = HolderId::new(1);
 
+    /// Shrinking then dropping releases each byte exactly once.
+    ///
+    /// The pair matters because both paths return memory to the same tier. If
+    /// `shrink` released without decrementing what the lease still believes it
+    /// holds, `Drop` would return those bytes a second time and the tier would
+    /// drift *downwards* -- reporting free memory that is not free, which ends
+    /// as an allocation failure somewhere with no connection to the cause.
+    #[test]
+    fn shrinking_then_dropping_releases_each_byte_once() {
+        let ledger = LeaseLedger::new(1000, 0, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+
+        {
+            let mut lease = governor
+                .reserve(Tier::Device, 600, MemoryRole::Weights, HolderId::new(1))
+                .expect("600 of 1000");
+            assert_eq!(ledger.used(Tier::Device), 600);
+
+            assert_eq!(lease.shrink(200), 200, "shrink reports what it returned");
+            assert_eq!(ledger.used(Tier::Device), 400);
+            assert_eq!(lease.bytes(), 400, "the lease knows it holds less now");
+
+            // Over-shrinking is clamped, not an underflow.
+            assert_eq!(lease.shrink(9_999), 400);
+            assert_eq!(ledger.used(Tier::Device), 0);
+        }
+
+        assert_eq!(
+            ledger.used(Tier::Device),
+            0,
+            "dropping an emptied lease must not release anything a second time"
+        );
+    }
+
+    /// A lease shrunk part-way and then dropped returns the whole amount, and
+    /// no more.
+    #[test]
+    fn a_partly_shrunk_lease_returns_exactly_its_remainder_on_drop() {
+        let ledger = LeaseLedger::new(1000, 0, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+
+        {
+            let mut lease = governor
+                .reserve(Tier::Device, 500, MemoryRole::Weights, HolderId::new(2))
+                .expect("500 of 1000");
+            lease.shrink(150);
+            assert_eq!(ledger.used(Tier::Device), 350);
+        }
+
+        assert_eq!(
+            ledger.used(Tier::Device),
+            0,
+            "the 350 still held at drop must come back, and only once"
+        );
+
+        // The tier is genuinely reusable afterwards, which is the property a
+        // leak would break silently: the numbers can look right while the
+        // memory is unobtainable.
+        let again = governor
+            .reserve(Tier::Device, 1000, MemoryRole::Weights, HolderId::new(3))
+            .expect("the whole tier is free again after every lease is gone");
+        assert_eq!(again.bytes(), 1000);
+    }
+
+    /// Many reserve/drop cycles leave the tier exactly where they found it.
+    ///
+    /// A one-byte drift per cycle is invisible in a test that runs one cycle
+    /// and fatal in a server that runs millions.
+    #[test]
+    fn repeated_lease_cycles_do_not_drift() {
+        let ledger = LeaseLedger::new(4096, 0, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+
+        for round in 0..1000u64 {
+            let bytes = 1 + round % 512;
+            let mut lease = governor
+                .reserve(Tier::Device, bytes, MemoryRole::KvCache, HolderId::new(4))
+                .expect("well under the tier limit");
+            // Exercise both return paths: some rounds shrink to nothing, some
+            // leave a remainder for `Drop`.
+            if round % 3 == 0 {
+                lease.shrink(bytes);
+            } else if round % 3 == 1 {
+                lease.shrink(bytes / 2);
+            }
+        }
+
+        assert_eq!(
+            ledger.used(Tier::Device),
+            0,
+            "1000 reserve/shrink/drop cycles must leave the tier empty"
+        );
+    }
+
     /// G1: the sum of live leases never exceeds the tier limit.
     ///
     /// Stated as "the last byte is grantable and the one after it is not",

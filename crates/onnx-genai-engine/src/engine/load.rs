@@ -177,6 +177,8 @@ impl Engine {
             native_max_sessions: config.native_max_sessions,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft,
             mtp,
             eagle3,
@@ -302,6 +304,32 @@ impl Engine {
         // A refusal here is the point: it says the model does not fit while
         // there is still a load to fail, rather than at an allocation somewhere
         // unrelated later.
+        // End the double count.
+        //
+        // The fixed reservation covers weights *and* activations *and* runtime
+        // overhead, taken before any session existed because nothing else
+        // accounted for them. An allocator that commits on demand accounts for
+        // the weights itself, granule by granule, as they are actually
+        // allocated -- so holding a reservation for them too charges the same
+        // memory twice and the tier reads high by the weight size.
+        //
+        // Only the weight portion is released. Activations and ONNX Runtime's
+        // internal overhead do not flow through our allocator, so nothing else
+        // is accounting for those and the reservation is still the only thing
+        // that knows about them.
+        if native_session.commits_on_demand() {
+            let weights = governor.snapshot().breakdown.model_weights_bytes;
+            let released = governor
+                .plan()
+                .release(Holder::FixedDeviceReservation, weights);
+            if released > 0 {
+                tracing::debug!(
+                    "released {released} bytes of the fixed device reservation: the allocator \
+                     commits on demand and charges the ledger for the model's weights as it \
+                     maps them, so reserving for them as well counted the same memory twice"
+                );
+            }
+        }
         let governed_pool_bytes = governor
             .plan()
             .adopt_provider_pool(&native_session, Holder::WeightResidency)
@@ -310,6 +338,7 @@ impl Engine {
                  grant alongside the model's other claims; lower \
                  ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES or raise the device limit",
             )?;
+
         if governed_pool_bytes > 0 {
             tracing::debug!(
                 bytes = governed_pool_bytes,
@@ -360,19 +389,40 @@ impl Engine {
                 let (native_kv_bytes, native_kv_tier) = native_session
                     .kv_reservation(max_context)
                     .context("sizing the decoder's KV tensors")?;
-                governor
-                    .plan()
-                    .reserve_on(Holder::NativeKvCache, native_kv_tier, native_kv_bytes)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
-                             {max_context} tokens of context on {native_kv_tier:?}: {error}; \
-                             {max_context} is the model's declared max_sequence_length, and \
-                             --max-context will not lower it because the declared value takes \
-                             precedence -- raise the limit for that tier, or re-export the model \
-                             with a shorter declared context"
-                        )
-                    })?;
+                if native_session.commits_on_demand() {
+                    // The allocator maps physical memory as the sequence grows
+                    // and charges the ledger for each granule, so the worst
+                    // case is a ceiling to check rather than a claim to hold.
+                    //
+                    // Holding it would refuse models a short conversation never
+                    // grows into -- 768 MiB per sequence on a 32K-context 0.5B
+                    // model -- which on a small machine is the difference
+                    // between running and not.
+                    let headroom = governor.plan().available_on(native_kv_tier);
+                    if native_kv_bytes > headroom {
+                        tracing::warn!(
+                            "one sequence at {max_context} tokens of context needs \
+                             {native_kv_bytes} bytes of KV on {native_kv_tier:?} but only \
+                             {headroom} bytes are free; the allocator commits on demand so this \
+                             loads, and a conversation that grows into the full context will be \
+                             refused a page at a time rather than at load"
+                        );
+                    }
+                } else {
+                    governor
+                        .plan()
+                        .reserve_on(Holder::NativeKvCache, native_kv_tier, native_kv_bytes)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
+                                 {max_context} tokens of context on {native_kv_tier:?}: {error}; \
+                                 {max_context} is the model's declared max_sequence_length, and \
+                                 --max-context will not lower it because the declared value takes \
+                                 precedence -- raise the limit for that tier, or re-export the \
+                                 model with a shorter declared context"
+                            )
+                        })?;
+                }
             }
             // Refusing to load would be the strict reading, but the model runs
             // fine and the only loss is that this holder is missing from the
@@ -421,6 +471,7 @@ impl Engine {
             native_default_session: None,
             native_max_sessions: config.native_max_sessions,
             native_shared_kv_proposer,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,

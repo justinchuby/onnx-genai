@@ -531,6 +531,12 @@ impl DeviceAllocator for CudaVmmAllocator {
         arena.spans.give_back(offset, len);
     }
 
+    /// True: spans are carved from granules mapped as they are needed, and
+    /// each granule is leased before it is mapped.
+    fn commits_on_demand(&self) -> bool {
+        true
+    }
+
     fn device(&self) -> DeviceKey {
         self.device
     }
