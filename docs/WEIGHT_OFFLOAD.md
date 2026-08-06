@@ -13,102 +13,86 @@
 >
 > **Date:** 2026-07-14
 
-## 0. Measured behaviour, 2026-08-06
+## 0. North star
 
-Everything below §1 is the **target design**. This section is what the code
-actually does, measured end to end on a real model. Read it first: several of
-the properties §1 promises are not yet true, and one of them fails in the
-opposite direction from what you would guess.
+**One model package runs on any machine that can physically hold one activation
+set, and gets faster as the machine gets bigger — without a different build, a
+different file, or a different code path.**
 
-**Test article.** qwen2.5-14b int4 (GGUF → ONNX, `MatMulNBits`), weights
-8,323,234,962 bytes, on an **RTX 4060 Laptop: 8188 MiB dedicated VRAM**, native
-CUDA backend. The model misses fitting by roughly 600 MB, which is exactly the
-regime this document is about.
+That is the whole objective. Everything else in this document is a means to it,
+and any part of it can be replaced by something that serves it better.
 
-### 0.1 The paths do not compose
+### 0.1 What that commits us to
 
-| `ONNX_GENAI_CUDA_VMM` | `ONNX_GENAI_WEIGHT_OFFLOAD` | result |
-|---|---|---|
-| off | off | 6.01 tok/s |
-| **on** | off | `CUDA_ERROR_OUT_OF_MEMORY` at load |
-| off | **on** | fixed by [#707]; was a double-counted budget |
-| **on** | **on** | 0.22 tok/s |
+Four properties, in priority order. When they conflict, the earlier one wins.
 
-Two of four configurations failed to load. That also means **every A/B that
-toggled one of these was comparing a working configuration against a broken
-one** — including the VRAM-floor comparisons that were briefly used to argue for
-deleting the `cuMemAlloc` path. Tracked in [#704].
+1. **Capacity degrades into latency, never into failure.** A model that does not
+   fit should get slower, not refuse to load. The floor is one activation set
+   plus one bounded weight tile — not the whole model, not a whole expert.
+2. **The user states one number: how much of their device they are willing to
+   give up.** Everything else is derived. A knob that must be discovered,
+   enabled, and then sized again elsewhere is a design failure even when each
+   piece works.
+3. **We must beat the operating system.** Every platform already has a way to
+   overflow device memory — WDDM shared memory, UVM, swap. Ours is only worth
+   having if it is *faster*, and it should be, because we know the access
+   schedule in advance and the OS does not. **If we are slower than doing
+   nothing, the honest recommendation is to do nothing.**
+4. **One authority accounts for every byte.** Any path that allocates without
+   the ledger seeing it is a second set of books, and a system with two sets of
+   books cannot make an admission decision.
 
-### 0.2 On Windows, `cudaMalloc` can exceed VRAM and the VMM arena cannot
+### 0.2 What would falsify this design
 
-This machine has **47.8 GB of WDDM "Shared GPU Memory"** backed by system RAM.
-The CUDA driver reports only the dedicated 8 GiB (`cuMemGetInfo` → 8.00 GiB),
-but the two allocation APIs diverge past that line:
+Stated up front so it stays testable rather than becoming a slogan:
 
-| API | used by | past 8 GiB |
-|---|---|---|
-| `cudaMalloc` | the non-arena path | **silently spills into system RAM** |
-| `cuMemCreate` + `cuMemMap` | the VMM arena | **hard failure** |
+- A model that fits in host RAM but cannot be made to load at all.
+- Our managed offload measured slower than the platform's own overflow mechanism
+  on the same model and machine (property 3 — this is a **quantitative** bar, and
+  it is currently failing; see §0.4).
+- A user needing to know more than one memory number to run a model that fits.
+- Any allocation the governor cannot see.
 
-So the baseline "fits" a 15.5 GB model only because Windows is paging GPU memory
-into RAM behind the driver's back. **The arena's OOM is not a defect — the arena
-is honest and the baseline is not.** Consequences:
+### 0.3 What is deliberately out of scope
 
-- **VRAM-floor measurements are meaningless on WDDM**, because the non-arena arm
-  is not bounded by VRAM at all. Use committed bytes instead.
-- What §2.1 calls storage-backed execution is, on this path, **not our streaming
-  at all** — it is an OS mechanism we neither control nor can observe.
-- WDDM spill is invisible to the governor, so "device memory in use" understates
-  reality by whatever spilled.
+- Making a model fit that cannot fit — there is a physical floor and this design
+  does not pretend otherwise.
+- Beating a machine that has enough memory. When everything is resident, the
+  right behaviour is to get out of the way entirely: allocate once, use stable
+  pointers, and add no per-token cost.
+- Changing numerics to save memory. Quantization is chosen by the model package,
+  not by the residency system.
 
-A user can opt out via NVIDIA Control Panel → *CUDA — Sysmem Fallback Policy* →
-*Prefer No Sysmem Fallback*. TCC mode is generally unavailable on GeForce laptop
-parts. See [#704].
+### 0.4 Current state
 
-### 0.3 Our offload is 27x slower than the OS doing it naively
+**This subsection is a snapshot and is expected to rot. The rest of §0 is not.**
+It is kept deliberately short and links out rather than restating numbers, so
+that stale figures live in issue threads where they can be superseded, not in
+the design.
 
-6.01 tok/s (WDDM paging) versus 0.22 tok/s (our weight offload). We lose to a
-mechanism that pages on demand at page granularity with **no knowledge of the
-workload**, while we hold a complete description of the future: decoding walks
-the layers in a fixed order and repeats that identical walk every token.
+| north-star property | status |
+|---|---|
+| 1. degrades into latency | **holds** — a model exceeding the card loads and answers correctly |
+| 2. one number | **fails** — `--vram-limit` does not bound weights, and offload needs two further opt-ins ([#712]) |
+| 3. beats the OS | **fails** — measurably slower than WDDM demand paging ([#705]) |
+| 4. one authority | **holds on the paths that are wired**; the platform itself can allocate behind our back on Windows ([#704]) |
 
-The largest known contributor is stated in a warning and not otherwise tracked:
+Two structural notes that are not merely "not done yet":
 
-```
-weight offload is incompatible with CUDA graph capture; capture disabled
-```
+- **The memory paths do not compose.** Some combinations of the arena, offload
+  and the baseline fail to load ([#704]). Until that is fixed, any A/B that
+  toggles one of them may be comparing against a broken configuration.
+- **The platform is part of the system.** On Windows WDDM, `cudaMalloc` spills
+  past dedicated VRAM into system RAM and `cuMemGetInfo` cannot see it. Device
+  capacity is therefore not a number we can read, and floor comparisons taken on
+  such a machine do not mean what they appear to ([#704]).
 
-**Today, on a Windows consumer GPU, a user is better off leaving weight offload
-switched off.** It is opt-in, so nothing is broken by default, but that is the
-current state. Tracked in [#705], which proposes the honest success criterion:
-*our managed path must be measurably faster than WDDM spill on a model that does
-not fit.*
-
-### 0.4 `--vram-limit` does not limit VRAM
-
-At a 2 GB ceiling on a model needing ~15.5 GB, generation **succeeds**. The flag
-bounds only the KV budget derivation; weights ignore it, and the mismatch is
-reported as a warning that then proceeds. [#712] proposes making it the single
-knob that also drives offload automatically, so §7.1's "budget first, layer count
-as an override" becomes true rather than aspirational.
-
-### 0.5 What is confirmed working
-
-- **Prefix reuse.** 5,122-token shared prefix: a warm request prefilled **9
-  tokens instead of 5,131**, TTFT 137,850 ms → **2,758 ms**. On the HTTP server,
-  hit rate **0.9886** across a concurrency sweep.
-- **Multi-request concurrency to 8.** Four concurrent requests cost 1.2x the wall
-  clock of one. Beyond that it degraded badly until [#711] fixed the server
-  reporting `vram_used_bytes = 0` while a 14B was loaded; 16-concurrent then
-  improved 472.8 s → 126.4 s median. The tail is not yet fixed ([#706]).
-- **A model that does not fit loads and answers correctly**, which is the point
-  of this document — just not yet faster than the operating system.
+What is confirmed working, and worth not re-litigating: **prefix reuse**, and
+**multi-request concurrency** up to the point where admission becomes the limit.
+See `MEMORY_ARCHITECTURE.md` for the per-component status table.
 
 [#704]: https://github.com/justinchuby/onnx-genai/issues/704
 [#705]: https://github.com/justinchuby/onnx-genai/issues/705
-[#706]: https://github.com/justinchuby/onnx-genai/issues/706
-[#707]: https://github.com/justinchuby/onnx-genai/pull/707
-[#711]: https://github.com/justinchuby/onnx-genai/pull/711
 [#712]: https://github.com/justinchuby/onnx-genai/issues/712
 
 ## 1. Executive recommendation
