@@ -157,8 +157,9 @@ impl Executor {
                 .weight_handles
                 .get(vid)
                 .and_then(|handle| handle.as_lazy())
+                && self.ep.prefetch_lazy_weight(vid.0 as u64, lazy)?
             {
-                self.ep.prefetch_lazy_weight(vid.0 as u64, lazy)?;
+                self.prefetch_issue_nodes.lock().unwrap().insert(*vid, pi);
             }
         }
         Ok(())
@@ -366,6 +367,7 @@ impl Executor {
         // weights the EP can page are uploaded here and bound as normal device
         // views; ones it declines stay absent and are flagged `lazy_unresolved`.
         let in_infos = self.build_input_bindings(
+            pi,
             inputs,
             input_dtypes,
             input_shapes,
@@ -775,8 +777,10 @@ impl Executor {
     /// become absent placeholders. Runs while only shared borrows of `self` are
     /// live, so the returned owned vector can outlive the disjoint `&mut`
     /// borrows the compute path takes afterwards.
+    #[allow(clippy::too_many_arguments)]
     fn build_input_bindings(
         &self,
+        pi: usize,
         inputs: &[Option<ValueId>],
         input_dtypes: &[DataType],
         input_shapes: &[Vec<usize>],
@@ -867,9 +871,14 @@ impl Executor {
                 // the paged bytes and keep the page pinned for the kernel's
                 // lifetime via `paged`. On `None` (EP can't page) the input stays
                 // absent and is routed to the kernel as a lazy `KernelInput::Weight`.
+                let issued_at = self.prefetch_issue_nodes.lock().unwrap().remove(&vid);
                 let paged = self.ep.page_lazy_weight(vid.0 as u64, lazy)?;
                 match paged {
                     Some(paged) => {
+                        if let Some(issued_at) = issued_at {
+                            let nodes_between = pi.saturating_sub(issued_at);
+                            record_dense_prefetch_gap(nodes_between as u64);
+                        }
                         let shape = input_shapes[i].clone();
                         let strides = compute_contiguous_strides(&shape);
                         in_infos.push(InInfo {

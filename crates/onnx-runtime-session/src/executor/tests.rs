@@ -1002,9 +1002,9 @@ impl ExecutionProvider for WeightDeliveryEp {
         &self,
         _key: u64,
         _weight: &onnx_runtime_ep_api::LazyWeight,
-    ) -> onnx_runtime_ep_api::Result<()> {
+    ) -> onnx_runtime_ep_api::Result<bool> {
         self.deliveries.lock().unwrap().push("prefetch");
-        Ok(())
+        Ok(true)
     }
 }
 

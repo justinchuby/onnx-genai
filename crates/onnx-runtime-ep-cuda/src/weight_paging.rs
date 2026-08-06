@@ -40,6 +40,8 @@ static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PREFETCH_ISSUED: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PREFETCH_DECLINED_GUARD: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PREFETCH_JOINED: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_STAGING_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PREFETCH_STAGING_REUSES: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the process-global weight-offload counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +52,8 @@ pub struct GlobalOffloadStats {
     pub prefetch_issued: u64,
     pub prefetch_declined_guard: u64,
     pub prefetch_joined: u64,
+    pub prefetch_staging_allocs: u64,
+    pub prefetch_staging_reuses: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -61,6 +65,8 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         prefetch_issued: GLOBAL_PREFETCH_ISSUED.load(Ordering::Relaxed),
         prefetch_declined_guard: GLOBAL_PREFETCH_DECLINED_GUARD.load(Ordering::Relaxed),
         prefetch_joined: GLOBAL_PREFETCH_JOINED.load(Ordering::Relaxed),
+        prefetch_staging_allocs: GLOBAL_PREFETCH_STAGING_ALLOCS.load(Ordering::Relaxed),
+        prefetch_staging_reuses: GLOBAL_PREFETCH_STAGING_REUSES.load(Ordering::Relaxed),
     }
 }
 
@@ -72,6 +78,8 @@ pub fn reset_global_offload_stats() {
     GLOBAL_PREFETCH_ISSUED.store(0, Ordering::Relaxed);
     GLOBAL_PREFETCH_DECLINED_GUARD.store(0, Ordering::Relaxed);
     GLOBAL_PREFETCH_JOINED.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_STAGING_ALLOCS.store(0, Ordering::Relaxed);
+    GLOBAL_PREFETCH_STAGING_REUSES.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -178,6 +186,10 @@ pub struct CudaResidencyStats {
     pub prefetch_declined_guard: u64,
     /// Demand page-ins that consumed an in-flight lookahead page.
     pub prefetch_joined: u64,
+    /// Pinned staging buffers allocated for prefetch.
+    pub prefetch_staging_allocs: u64,
+    /// Pinned staging buffers reused from the prefetch pool.
+    pub prefetch_staging_reuses: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -192,11 +204,6 @@ pub struct CudaWeightPage {
     len: usize,
     dtype: DataType,
     shape: Vec<usize>,
-    /// Owned pinned host staging that backed an asynchronous page-in, kept alive
-    /// so an in-flight `cuMemcpyHtoDAsync` never reads freed host memory. `None`
-    /// for pages uploaded synchronously (the source is fully consumed before
-    /// `htod` returns). Freed on drop — long after the copy has completed.
-    staging: Option<PinnedStaging>,
 }
 
 impl CudaWeightPage {
@@ -221,7 +228,6 @@ impl CudaWeightPage {
             len: bytes.len(),
             dtype,
             shape,
-            staging: None,
         };
         // SAFETY: `ptr` owns `bytes.len()` bytes; `page`'s Drop frees it if the
         // copy below fails.
@@ -235,52 +241,50 @@ impl CudaWeightPage {
     /// dedicated transfer stream, returning the page plus a **copy fence** the
     /// caller MUST order the consuming compute work after (via
     /// [`CudaRuntime::compute_wait_fence`]). Because the copy is asynchronous,
-    /// the source bytes are first staged into a page-locked buffer that the
-    /// returned [`CudaWeightPage`] owns, so the transfer keeps reading valid host
-    /// memory until it completes — the staging outlives the page's whole life,
-    /// which itself outlives any consumer ordered after the fence. Frees the VRAM
-    /// (and staging) on any failure.
+    /// the source bytes are first staged into a caller-owned page-locked buffer
+    /// that MUST outlive the returned fence. Frees the VRAM on any failure.
     pub fn upload_async(
         runtime: &Arc<CudaRuntime>,
         dtype: DataType,
         shape: Vec<usize>,
         bytes: &[u8],
-    ) -> Result<(Self, u64), WeightHandleError> {
+        mut staging: PinnedStaging,
+    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
         if bytes.is_empty() {
             return Err(WeightHandleError::MissingRegions);
+        }
+        if staging.len() < bytes.len() {
+            return Err(WeightHandleError::InvalidResident(format!(
+                "pinned staging buffer is too small: {} < {}",
+                staging.len(),
+                bytes.len()
+            )));
         }
         let ptr = runtime
             .alloc_raw(bytes.len())
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
-        let mut staging = runtime
-            .alloc_pinned(bytes.len())
-            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
-        staging.as_mut_slice().copy_from_slice(bytes);
-        // Own both the VRAM `ptr` and the pinned `staging` before enqueuing the
-        // copy, so any error below drops `page` and frees both exactly once.
+        staging.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        // Own the VRAM `ptr` before enqueuing the copy, so any error below drops
+        // `page` and frees it exactly once. The pinned staging remains owned by
+        // this function and is returned to the caller on success so it can keep
+        // the source alive until the fence completes.
         let page = Self {
             runtime: Arc::clone(runtime),
             ptr,
             len: bytes.len(),
             dtype,
             shape,
-            staging: Some(staging),
         };
-        // SAFETY: `dst` (`ptr`) owns `len` bytes; the async source is the pinned
-        // staging `page` owns, which outlives the transfer (freed only on the
-        // page's Drop, well after the copy fence has been awaited).
-        let staged = page
-            .staging
-            .as_ref()
-            .expect("staging was just set")
-            .as_slice();
+        // SAFETY: `dst` (`ptr`) owns `len` bytes; the async source is pinned
+        // staging owned by the caller until the returned fence is awaited.
+        let staged = &staging.as_slice()[..bytes.len()];
         unsafe { runtime.htod_async(staged, ptr) }.map_err(|error| {
             WeightHandleError::DeviceBinding(format!("async H2D copy: {error}"))
         })?;
         let fence = runtime
             .record_copy_fence()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("copy fence: {error}")))?;
-        Ok((page, fence))
+        Ok((page, fence, staging))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -368,7 +372,6 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
             len: total,
             dtype: weight.dtype,
             shape: weight.shape.clone(),
-            staging: None,
         };
 
         let mut offset: usize = 0;
@@ -438,10 +441,13 @@ struct ResidencyInner {
     prefetch_issued: u64,
     prefetch_declined_guard: u64,
     prefetch_joined: u64,
+    prefetch_staging_allocs: u64,
+    prefetch_staging_reuses: u64,
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
     in_flight: HashMap<u64, InFlightPage>,
+    prefetch_staging_pool: Vec<PinnedStaging>,
     /// The governor grant this budget came from, when it came from one.
     ///
     /// Held for its `Drop`: releasing the lease is how the tier learns these
@@ -464,6 +470,7 @@ struct ResidencyInner {
 struct InFlightPage {
     page: Arc<CudaWeightPage>,
     copy_fence: u64,
+    staging: PinnedStaging,
 }
 
 impl CudaWeightResidency {
@@ -488,9 +495,12 @@ impl CudaWeightResidency {
                 prefetch_issued: 0,
                 prefetch_declined_guard: 0,
                 prefetch_joined: 0,
+                prefetch_staging_allocs: 0,
+                prefetch_staging_reuses: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
                 in_flight: HashMap::new(),
+                prefetch_staging_pool: Vec::new(),
             }),
         }
     }
@@ -542,9 +552,12 @@ impl CudaWeightResidency {
                 prefetch_issued: 0,
                 prefetch_declined_guard: 0,
                 prefetch_joined: 0,
+                prefetch_staging_allocs: 0,
+                prefetch_staging_reuses: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
                 in_flight: HashMap::new(),
+                prefetch_staging_pool: Vec::new(),
             }),
         })
     }
@@ -648,11 +661,18 @@ impl CudaWeightResidency {
             // (overlapping the in-flight compute), admit, then order the compute
             // stream after the transfer's completion event so the consuming kernel
             // waits only on the copy — never a full host sync.
-            let (page, copy_fence) = CudaWeightPage::upload_async(
+            let staging = self
+                .runtime
+                .alloc_pinned(resident.bytes().len())
+                .map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!("pinned alloc: {error}"))
+                })?;
+            let (page, copy_fence, staging) = CudaWeightPage::upload_async(
                 &self.runtime,
                 resident.dtype,
                 resident.shape.clone(),
                 resident.bytes(),
+                staging,
             )?;
             let admitted = self.admit(key, Arc::new(page))?;
             self.runtime
@@ -660,6 +680,7 @@ impl CudaWeightResidency {
                 .map_err(|error| {
                     WeightHandleError::DeviceBinding(format!("copy fence wait: {error}"))
                 })?;
+            drop(staging);
             Ok(admitted)
         } else {
             // Legacy synchronous page-in (A/B "before" arm / kill-switch): the
@@ -681,14 +702,14 @@ impl CudaWeightResidency {
         &self,
         key: u64,
         weight: &LazyWeight,
-    ) -> Result<(), WeightHandleError> {
+    ) -> Result<bool, WeightHandleError> {
         if !self.async_pagein {
-            return Ok(());
+            return Ok(false);
         }
         {
             let inner = self.lock();
             if inner.pages.contains_key(&key) || inner.in_flight.contains_key(&key) {
-                return Ok(());
+                return Ok(false);
             }
         }
         let bytes = weight
@@ -708,15 +729,17 @@ impl CudaWeightResidency {
                     drop(inner);
                     self.record_prefetch_declined_guard();
                 }
-                return Ok(());
+                return Ok(false);
             }
         }
         let resident = weight.materialize()?;
-        let (page, copy_fence) = CudaWeightPage::upload_async(
+        let staging = self.take_prefetch_staging(resident.bytes().len())?;
+        let (page, copy_fence, staging) = CudaWeightPage::upload_async(
             &self.runtime,
             resident.dtype,
             resident.shape.clone(),
             resident.bytes(),
+            staging,
         )?;
         let page = Arc::new(page);
         let mut inner = self.lock();
@@ -727,22 +750,28 @@ impl CudaWeightResidency {
             let declined_by_guard = inner.resident_bytes.saturating_add(bytes) > inner.budget;
             drop(inner);
             self.drain_copy_stream()?;
+            self.recycle_prefetch_staging(staging);
             if declined_by_guard {
                 self.record_prefetch_declined_guard();
             }
-            return Ok(());
+            return Ok(false);
         }
         inner.insert_page(key, Arc::clone(&page), bytes);
         inner.record_prefetch_issued();
-        inner
-            .in_flight
-            .insert(key, InFlightPage { page, copy_fence });
-        Ok(())
+        inner.in_flight.insert(
+            key,
+            InFlightPage {
+                page,
+                copy_fence,
+                staging,
+            },
+        );
+        Ok(true)
     }
 
     fn join_in_flight(&self, key: u64) -> Result<Option<Arc<CudaWeightPage>>, WeightHandleError> {
         let mut inner = self.lock();
-        let Some(prefetch) = inner.in_flight.get(&key) else {
+        let Some(prefetch) = inner.in_flight.remove(&key) else {
             return Ok(None);
         };
         let page = Arc::clone(&prefetch.page);
@@ -753,9 +782,36 @@ impl CudaWeightResidency {
             .map_err(|error| {
                 WeightHandleError::DeviceBinding(format!("prefetch fence wait: {error}"))
             })?;
-        inner.in_flight.remove(&key);
         inner.record_prefetch_joined();
+        inner.prefetch_staging_pool.push(prefetch.staging);
         Ok(Some(page))
+    }
+
+    fn take_prefetch_staging(&self, bytes: usize) -> Result<PinnedStaging, WeightHandleError> {
+        {
+            let mut inner = self.lock();
+            if let Some(index) = inner
+                .prefetch_staging_pool
+                .iter()
+                .position(|staging| staging.len() >= bytes)
+            {
+                inner.prefetch_staging_reuses += 1;
+                GLOBAL_PREFETCH_STAGING_REUSES.fetch_add(1, Ordering::Relaxed);
+                return Ok(inner.prefetch_staging_pool.swap_remove(index));
+            }
+        }
+        let staging = self
+            .runtime
+            .alloc_pinned(bytes)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
+        let mut inner = self.lock();
+        inner.prefetch_staging_allocs += 1;
+        GLOBAL_PREFETCH_STAGING_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        Ok(staging)
+    }
+
+    fn recycle_prefetch_staging(&self, staging: PinnedStaging) {
+        self.lock().prefetch_staging_pool.push(staging);
     }
 
     fn record_prefetch_declined_guard(&self) {
@@ -888,6 +944,8 @@ impl CudaWeightResidency {
             prefetch_issued: inner.prefetch_issued,
             prefetch_declined_guard: inner.prefetch_declined_guard,
             prefetch_joined: inner.prefetch_joined,
+            prefetch_staging_allocs: inner.prefetch_staging_allocs,
+            prefetch_staging_reuses: inner.prefetch_staging_reuses,
         }
     }
 
