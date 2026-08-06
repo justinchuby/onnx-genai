@@ -92,3 +92,9 @@
 
 - Harry picked up review after gpt-5.6-sol canary-looped, approved #676 with two nits only, and the coordinator squash-merged it.
 - Review conclusion: native 3-D router-probs fix and token-119 oracle regression are sound; token-119 proves QMoE is more accurate than dense int4 for that step rather than exposing a native kernel bug.
+
+## 2026-08-06T00:00:00Z — PR #700 review
+
+- Approved #700 after verifying the recurrent-state gate disables host/device KV-mirror reuse for hybrid decoders without regressing single-shot behavior.
+- Confirmed the env-gated GPU continuation regression compares reused continuation argmax against the fresh oracle (`33803`).
+- Flagged a minor residual on the ORT paged-reuse path (`kv_bridge.rs:407`); coordinator filed #701.
