@@ -398,7 +398,7 @@ pub(crate) async fn admin_unload_model(
 /// 1,067 polls under sustained load.
 ///
 /// When the governor cannot be read the family is absent, so this ALWAYS emits
-/// `onnxgenai_resource_governor_available` to say which case a scrape is in.
+/// `onnx_genai_resource_governor_available` to say which case a scrape is in.
 /// Silently dropping the gauges made an unreadable governor look exactly like
 /// a scrape gap -- the one shape operators read as "nothing to see".
 pub(crate) async fn prometheus_metrics(

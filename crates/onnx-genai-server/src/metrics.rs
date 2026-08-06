@@ -319,11 +319,11 @@ pub(crate) fn encode_prometheus() -> String {
 /// string; a typo here would split one series into two and neither would
 /// alarm.
 #[cfg(feature = "metrics")]
-pub(crate) const RESOURCE_GOVERNOR_AVAILABLE: &str = "onnxgenai_resource_governor_available";
+pub(crate) const RESOURCE_GOVERNOR_AVAILABLE: &str = "onnx_genai_resource_governor_available";
 
 #[cfg(feature = "metrics")]
 const RESOURCE_GOVERNOR_AVAILABLE_HELP: &str = "1 when the resource governor was readable for this scrape and the \
-     onnxgenai_vram_*/host_ram_*/kv_* gauges below are present; 0 when it was \
+     onnx_genai_vram_*/host_ram_*/kv_* gauges below are present; 0 when it was \
      not and those gauges are absent for that reason.";
 
 /// Emits the availability marker alone, for scrapes where the governor could
@@ -345,7 +345,7 @@ pub(crate) fn encode_resource_governor_unavailable() -> String {
     output
 }
 
-const KV_PAGING_APPLICABLE: &str = "onnxgenai_kv_paging_applicable";
+const KV_PAGING_APPLICABLE: &str = "onnx_genai_kv_paging_applicable";
 const KV_PAGING_APPLICABLE_HELP: &str = concat!(
     "Whether paged KV is the mechanism the decoder uses: ",
     "1 applicable, 0 not applicable, -1 not yet determined. ",
@@ -357,7 +357,7 @@ const KV_PAGING_APPLICABLE_HELP: &str = concat!(
 ///
 /// `applicable` is emitted first and deliberately, because the counters below
 /// it are honest reads of a real structure even on a model that never consults
-/// the pool. `onnxgenai_kv_pages_capacity` is *non-zero* on a continuous-batching
+/// the pool. `onnx_genai_kv_pages_capacity` is *non-zero* on a continuous-batching
 /// model, so a consumer that charted utilisation without checking applicability
 /// would be charting a mechanism that is not running -- and nothing in the
 /// numbers themselves would reveal it.
@@ -387,55 +387,55 @@ pub(crate) fn encode_kv_telemetry(
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_pages_in_use",
+        "onnx_genai_kv_pages_in_use",
         "KV pages with at least one reference, on any tier. May exceed capacity: eviction demotes a page to the cold tier without dropping its reference.",
         snapshot.pages_in_use as u64,
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_pages_shared",
+        "onnx_genai_kv_pages_shared",
         "KV pages with more than one reference, i.e. shared by copy-on-write or prefix reuse.",
         snapshot.pages_shared as u64,
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_pages_capacity",
+        "onnx_genai_kv_pages_capacity",
         "Hot-tier live KV page capacity.",
         snapshot.hot_capacity as u64,
     );
     gauge(
         &mut output,
-        "onnxgenai_kv_page_size_tokens",
+        "onnx_genai_kv_page_size_tokens",
         "Token slots per KV page.",
         snapshot.page_size as u64,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_page_allocations_total",
+        "onnx_genai_kv_page_allocations_total",
         "KV pages handed out.",
         snapshot.allocations,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_page_allocation_failures_total",
+        "onnx_genai_kv_page_allocation_failures_total",
         "KV page allocations that found no page. The honest signal that the pool is under real pressure.",
         snapshot.allocation_failures,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_page_frees_total",
+        "onnx_genai_kv_page_frees_total",
         "KV pages returned to the free list.",
         snapshot.frees,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_hot_evictions_total",
+        "onnx_genai_kv_hot_evictions_total",
         "KV pages demoted from the hot tier.",
         snapshot.hot_evictions,
     );
     counter(
         &mut output,
-        "onnxgenai_kv_prefix_evictions_total",
+        "onnx_genai_kv_prefix_evictions_total",
         "KV pages dropped from the prefix cache.",
         snapshot.prefix_evictions,
     );
@@ -453,63 +453,63 @@ pub(crate) fn encode_resource_governor(snapshot: &GovernorSnapshot) -> String {
     );
     gauge(
         &mut output,
-        "onnxgenai_vram_used_bytes",
+        "onnx_genai_vram_used_bytes",
         "VRAM currently used.",
         snapshot.vram.used,
     );
     gauge(
         &mut output,
-        "onnxgenai_vram_limit_bytes",
+        "onnx_genai_vram_limit_bytes",
         "Configured VRAM ceiling.",
         snapshot.vram.limit,
     );
     gauge(
         &mut output,
-        "onnxgenai_vram_headroom_bytes",
+        "onnx_genai_vram_headroom_bytes",
         "VRAM bytes below the configured ceiling.",
         snapshot.vram.headroom,
     );
     gauge(
         &mut output,
-        "onnxgenai_host_ram_used_bytes",
+        "onnx_genai_host_ram_used_bytes",
         "Host RAM currently used.",
         snapshot.host_ram.used,
     );
     gauge(
         &mut output,
-        "onnxgenai_host_ram_limit_bytes",
+        "onnx_genai_host_ram_limit_bytes",
         "Configured host RAM ceiling.",
         snapshot.host_ram.limit,
     );
     gauge(
         &mut output,
-        "onnxgenai_host_ram_headroom_bytes",
+        "onnx_genai_host_ram_headroom_bytes",
         "Host RAM bytes below the configured ceiling.",
         snapshot.host_ram.headroom,
     );
     if let Some(disk) = snapshot.disk_spill {
         gauge(
             &mut output,
-            "onnxgenai_disk_spill_used_bytes",
+            "onnx_genai_disk_spill_used_bytes",
             "Disk spill currently used.",
             disk.used,
         );
         gauge(
             &mut output,
-            "onnxgenai_disk_spill_limit_bytes",
+            "onnx_genai_disk_spill_limit_bytes",
             "Configured disk spill ceiling.",
             disk.limit,
         );
         gauge(
             &mut output,
-            "onnxgenai_disk_spill_headroom_bytes",
+            "onnx_genai_disk_spill_headroom_bytes",
             "Disk spill bytes below the configured ceiling.",
             disk.headroom,
         );
     }
     gauge(
         &mut output,
-        "onnxgenai_kv_budget_bytes",
+        "onnx_genai_kv_budget_bytes",
         "Derived VRAM budget available to KV cache.",
         snapshot.derived_budget.kv_bytes,
     );
@@ -613,21 +613,73 @@ mod tests {
         // with no symptom at the point of the omission, so pin all of them.
         let output = encode_kv_telemetry(Applicability::Applicable, &sample());
         for expected in [
-            "onnxgenai_kv_pages_in_use 12",
-            "onnxgenai_kv_pages_shared 3",
-            "onnxgenai_kv_pages_capacity 64",
-            "onnxgenai_kv_page_size_tokens 16",
-            "onnxgenai_kv_page_allocations_total 100",
-            "onnxgenai_kv_page_allocation_failures_total 2",
-            "onnxgenai_kv_page_frees_total 88",
-            "onnxgenai_kv_hot_evictions_total 5",
-            "onnxgenai_kv_prefix_evictions_total 1",
+            "onnx_genai_kv_pages_in_use 12",
+            "onnx_genai_kv_pages_shared 3",
+            "onnx_genai_kv_pages_capacity 64",
+            "onnx_genai_kv_page_size_tokens 16",
+            "onnx_genai_kv_page_allocations_total 100",
+            "onnx_genai_kv_page_allocation_failures_total 2",
+            "onnx_genai_kv_page_frees_total 88",
+            "onnx_genai_kv_hot_evictions_total 5",
+            "onnx_genai_kv_prefix_evictions_total 1",
         ] {
             assert!(
                 output.contains(expected),
                 "missing {expected} in:\n{output}"
             );
         }
+    }
+
+    /// Every emitted metric name uses the documented `onnx_genai_` prefix.
+    ///
+    /// # Why the other tests do not cover this
+    ///
+    /// The exposition tests pin metric names as **literals**, so they agree
+    /// with whatever the emitter spells and stay green under a prefix that no
+    /// documentation mentions. The whole memory-governor and KV-paging family
+    /// was emitted as `onnxgenai_` -- no underscore -- for long enough that
+    /// nobody could scrape it: the numbers were real, correct, and exported
+    /// under a name that appears zero times in `docs/`.
+    ///
+    /// This asserts the *convention* rather than a list, so a family added
+    /// tomorrow with the wrong prefix fails here instead of quietly producing
+    /// an empty Grafana panel.
+    #[test]
+    fn every_emitted_metric_name_uses_the_documented_prefix() {
+        let mut exposition = String::new();
+        exposition.push_str(&encode_prometheus());
+        exposition.push_str(&encode_kv_telemetry(Applicability::Applicable, &sample()));
+        exposition.push_str(&encode_resource_governor_unavailable());
+
+        let mut offenders = Vec::new();
+        for line in exposition.lines() {
+            // `# HELP <name> ...` / `# TYPE <name> ...` carry the name in the
+            // third field; a sample line carries it first, possibly followed
+            // by `{labels}`.
+            let name = if let Some(rest) = line
+                .strip_prefix("# HELP ")
+                .or_else(|| line.strip_prefix("# TYPE "))
+            {
+                rest.split_whitespace().next()
+            } else if line.starts_with('#') || line.trim().is_empty() {
+                None
+            } else {
+                line.split_whitespace()
+                    .next()
+                    .map(|token| token.split('{').next().unwrap_or(token))
+            };
+            if let Some(name) = name
+                && !name.starts_with("onnx_genai_")
+            {
+                offenders.push(name.to_string());
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these metric names do not use the documented `onnx_genai_` prefix, \
+             so nothing scraping the documented names will find them: {offenders:?}"
+        );
     }
 
     #[test]
@@ -639,13 +691,13 @@ mod tests {
         for (state, expected) in [
             (
                 Applicability::Applicable,
-                "onnxgenai_kv_paging_applicable 1",
+                "onnx_genai_kv_paging_applicable 1",
             ),
             (
                 Applicability::NotApplicable,
-                "onnxgenai_kv_paging_applicable 0",
+                "onnx_genai_kv_paging_applicable 0",
             ),
-            (Applicability::Unknown, "onnxgenai_kv_paging_applicable -1"),
+            (Applicability::Unknown, "onnx_genai_kv_paging_applicable -1"),
         ] {
             let output = encode_kv_telemetry(state, &sample());
             assert!(
@@ -661,10 +713,10 @@ mod tests {
         // rate() on a gauge, or a counter reset alarm on a gauge, are both
         // silent misreadings rather than errors.
         let output = encode_kv_telemetry(Applicability::Applicable, &sample());
-        assert!(output.contains("# TYPE onnxgenai_kv_page_allocations_total counter"));
-        assert!(output.contains("# TYPE onnxgenai_kv_page_allocation_failures_total counter"));
-        assert!(output.contains("# TYPE onnxgenai_kv_pages_in_use gauge"));
-        assert!(output.contains("# TYPE onnxgenai_kv_paging_applicable gauge"));
+        assert!(output.contains("# TYPE onnx_genai_kv_page_allocations_total counter"));
+        assert!(output.contains("# TYPE onnx_genai_kv_page_allocation_failures_total counter"));
+        assert!(output.contains("# TYPE onnx_genai_kv_pages_in_use gauge"));
+        assert!(output.contains("# TYPE onnx_genai_kv_paging_applicable gauge"));
     }
 
     #[test]
@@ -673,7 +725,7 @@ mod tests {
         // that the applicability flag tells a consumer not to chart them as a
         // live mechanism. Dropping them instead would look like a scrape gap.
         let output = encode_kv_telemetry(Applicability::NotApplicable, &sample());
-        assert!(output.contains("onnxgenai_kv_pages_capacity 64"));
-        assert!(output.contains("onnxgenai_kv_paging_applicable 0"));
+        assert!(output.contains("onnx_genai_kv_pages_capacity 64"));
+        assert!(output.contains("onnx_genai_kv_paging_applicable 0"));
     }
 }
