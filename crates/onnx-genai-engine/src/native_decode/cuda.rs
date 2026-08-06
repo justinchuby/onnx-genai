@@ -184,7 +184,9 @@ impl CudaStepProfile {
         let delta = StepOffloadSnapshot::read().delta(self.before);
         let staging_ms = ns_to_ms(delta.materialize_ns);
         let h2d_ms = ns_to_ms(delta.htod_ns);
-        let fence_sync_ms = ns_to_ms(delta.copy_wait_ns.saturating_add(delta.admit_sync_ns));
+        let copy_wait_ms = ns_to_ms(delta.copy_wait_ns);
+        let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
+        let fence_sync_ms = copy_wait_ms + admit_sync_ms;
         let phase_stats = onnx_runtime_session::exec_phase_stats();
         let phase_ms = |phase: &str| -> f64 {
             phase_stats
@@ -211,11 +213,11 @@ impl CudaStepProfile {
         static HEADER: std::sync::Once = std::sync::Once::new();
         HEADER.call_once(|| {
             eprintln!(
-                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_enqueue_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_enqueue_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,copy_wait_ms,admit_sync_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
             );
         });
         eprintln!(
-            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{},{},{},{}",
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{copy_wait_ms:.3},{admit_sync_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{},{},{},{}",
             self.past_len,
             self.total_len,
             wall.logits_read_ms,
