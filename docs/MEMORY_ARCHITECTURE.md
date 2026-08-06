@@ -31,9 +31,45 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented, no production consumer** | `crates/onnx-runtime-virtual-memory`; `VirtualBuffer` appears only in `virtual_memory_gpu.rs`, a test |
-| Activation planning | — | **crate exists, no consumer** | `crates/onnx-runtime-memory`, 1269 lines, zero dependency declarations; the engine reports `activations_bytes: 0` (#514) |
+| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM` until it has been measured for throughput. The KV cache still has no virtually contiguous layout (#656) |
+| Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
+
+### How this area fails
+
+Not with wrong code. With code that is right, tested, and never reached — and
+with tests that cannot fail. Recording the pattern because it has cost more
+here than any bug:
+
+- The CUDA VMM arena was installed, logged that it was installed, and committed
+  **zero bytes** for a full generation. The hook fired at governor adoption,
+  which on the native path is after the session has built every tensor it will
+  use. Found only by printing a byte count on drop (#659).
+- Forty-four GPU test files skipped silently on a machine with a working GPU,
+  because the Rust path had no NVIDIA wheel discovery. A skip and a pass look
+  identical in `cargo test` output (#636).
+- An allocation counter stopped counting when EP allocations were rerouted, and
+  about twenty-five assertions quietly became `0 == 0` (#635).
+- `onnx-genai-ort` was never in any CI test step, so seven merged pull requests
+  went unmeasured (#631).
+- A test asserting the activation planner's load-time and run-time figures agree
+  held vacuously: its fixture contained no view-producing op, and that equality
+  is exactly what a view breaks (#671).
+- A test asserting a recurrent-state cache hit produces byte-identical output
+  held vacuously: the fixture's vocab dimension was 1, so argmax always returned
+  token 0, and its recurrent state was `Identity`, so it never evolved. The
+  restore function could have been replaced with `Ok(())` (#672).
+
+Two habits follow, and they are cheap:
+
+**Measure a quantity, not an event.** "The arena is installed" and "the arena is
+being used" are different claims, and only the second is worth making. A byte
+count, a hit rate, a commit count — something that can read zero when the
+feature is inert.
+
+**Before trusting a correctness test, break the code and watch it go red.** Both
+vacuous tests above were counted as coverage. Deliberately stubbing the function
+under test takes a minute and is the only thing that would have caught either.
 
 The last five rows are newer than the layers above them and move fastest, so
 each says where it actually is. "Decided" and "in `main`" are different states
@@ -98,6 +134,36 @@ Related: #596 (decisions taken while implementing the first slice of L3), #598,
 
 ## 1. Overview
 
+### 1.0 One memory management path
+
+The target, stated by the repository owner and recorded here because it decides
+arguments this document would otherwise have to relitigate:
+
+> 我们只需要一份内存管理就行 — we only need one memory management.
+> Once the VMM work is complete it becomes the default, and the non-VMM path is
+> deleted if VMM subsumes it.
+
+Two consequences worth reading before adding anything to this design:
+
+**A second authority for a question the ledger already answers should be
+removed rather than wired.** `placement.rs` carried its own coordinated
+weight/KV/scratch VRAM arbitration, landed deliberately as Phase 3a with wiring
+left to Phase 3b. It was deleted rather than wired, because connecting it would
+have *created* the second authority the ledger exists to end. Its placement
+planner stayed: deciding *which* layers live on the device is a different
+question, and it now takes its budget as an argument so it can ask the governor
+for one.
+
+**A reservation stops being needed the moment something else accounts for the
+bytes truthfully.** The fixed device reservation covered weights, activations
+and runtime overhead because nothing else knew about them. When the allocator
+commits physically on demand and leases each granule, it knows about the
+weights — so that half of the reservation is released at adoption, and only the
+half nothing else accounts for is kept. Holding both charged the same memory
+twice and made the ledger refuse the arena.
+
+### 1.1 The lease contract, and who may replace it
+
 Memory management in onnx-genai is organized as a five-layer hierarchy. Each layer
 has a distinct scope, a distinct owner, and a distinct reason to exist:
 
@@ -146,7 +212,6 @@ and residency managers allocate through EPs. No layer bypasses the one below it.
 > this document refines the ownership boundaries.
 
 ### 1.1 The lease contract, and who may replace it
-
 The layers above describe *authorities*. This section describes the one
 mechanism they all share, because a design where every layer invents its own
 accounting is a design where two authorities disagree about the same bytes.
