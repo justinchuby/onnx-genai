@@ -106,6 +106,13 @@ fn granule_reference_counts_balance_across_shared_allocations() {
         "the last tenant of each granule must unmap it"
     );
     assert_eq!(
+        stats.byte_underflows, 0,
+        "every byte subtracted from the counters must have been added first; a \
+         clamp here means some commit path mapped memory without counting it, \
+         and the committed figure in --profile is a lower bound rather than a \
+         measurement"
+    );
+    assert_eq!(
         stats.releases, stats.commits,
         "commits and releases must balance once every allocation is gone"
     );
