@@ -55,15 +55,22 @@ __device__ __forceinline__ int total_order_key(float value)
     return bits;
 }
 
-__device__ __forceinline__ bool route_value_is_better(
-    float candidate, int candidate_index, float best, int best_index)
-{
-    const int candidate_key = total_order_key(candidate);
-    const int best_key = total_order_key(best);
-    return candidate_key > best_key
-        || (candidate_key == best_key && candidate_index < best_index);
-}
+// Sentinel key strictly below every real `total_order_key` (whose minimum is
+// the key of -inf, 0x807fffff); used by inactive reduction lanes so they always
+// lose the argmax.
+#define QMOE_ROUTE_KEY_SENTINEL ((int)0x80000000)
 
+// One CUDA block cooperatively routes one row (grid-strided over rows). The
+// top-k expert selection is parallelized as `k` rounds of a block-wide argmax
+// by (total_order_key descending, index ascending) — bit-identical to the
+// serial scan because integer-key argmax with a deterministic tie rule is
+// order-independent. The fp32 routing-weight reductions (softmax / normalize /
+// separate router-weight aggregation) stay on a single thread in the ORIGINAL
+// sequential order so their floating-point rounding is byte-for-byte identical
+// to the previous serial kernel; they now read the row's logits from shared
+// memory instead of re-issuing latency-bound global loads. At decode (rows=1)
+// this replaces a single active thread with the whole block, which was the
+// dominant decode cost.
 extern "C" __global__ void qmoe_route(
     const float* router_probs,
     const float* router_weights,
@@ -74,74 +81,105 @@ extern "C" __global__ void qmoe_route(
     const int top_k,
     const int normalize)
 {
-    const unsigned long long first =
-        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned long long stride =
-        (unsigned long long)gridDim.x * blockDim.x;
-    for (unsigned long long row = first; row < rows; row += stride) {
+    extern __shared__ unsigned char qmoe_route_smem[];
+    float* shared_logits = (float*)qmoe_route_smem;
+    int* picked = (int*)(shared_logits + experts);
+    int* reduce_key = picked + experts;
+    int* reduce_idx = reduce_key + blockDim.x;
+
+    for (unsigned long long row = blockIdx.x; row < rows; row += gridDim.x) {
         const float* logits = router_probs + row * (unsigned long long)experts;
         int* indices = selected_experts + row * (unsigned long long)top_k;
         float* weights = selected_weights + row * (unsigned long long)top_k;
 
+        for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
+            shared_logits[expert] = logits[expert];
+            picked[expert] = 0;
+        }
+        __syncthreads();
+
         for (int slot = 0; slot < top_k; ++slot) {
-            int best_index = -1;
-            float best_value = 0.0f;
-            for (int expert = 0; expert < experts; ++expert) {
-                bool already_selected = false;
-                for (int previous = 0; previous < slot; ++previous) {
-                    already_selected |= indices[previous] == expert;
-                }
-                if (already_selected) {
+            int local_key = QMOE_ROUTE_KEY_SENTINEL;
+            int local_index = 0x7fffffff;
+            for (int expert = threadIdx.x; expert < experts;
+                 expert += blockDim.x) {
+                if (picked[expert]) {
                     continue;
                 }
-                const float candidate = logits[expert];
-                if (best_index < 0
-                    || route_value_is_better(
-                        candidate, expert, best_value, best_index)) {
-                    best_index = expert;
-                    best_value = candidate;
+                const int key = total_order_key(shared_logits[expert]);
+                if (key > local_key
+                    || (key == local_key && expert < local_index)) {
+                    local_key = key;
+                    local_index = expert;
                 }
             }
-            indices[slot] = best_index;
+            reduce_key[threadIdx.x] = local_key;
+            reduce_idx[threadIdx.x] = local_index;
+            __syncthreads();
+            for (unsigned int stride = blockDim.x >> 1; stride > 0;
+                 stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    const int other_key = reduce_key[threadIdx.x + stride];
+                    const int other_index = reduce_idx[threadIdx.x + stride];
+                    const int self_key = reduce_key[threadIdx.x];
+                    const int self_index = reduce_idx[threadIdx.x];
+                    if (other_key > self_key
+                        || (other_key == self_key
+                            && other_index < self_index)) {
+                        reduce_key[threadIdx.x] = other_key;
+                        reduce_idx[threadIdx.x] = other_index;
+                    }
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                const int best_index = reduce_idx[0];
+                indices[slot] = best_index;
+                picked[best_index] = 1;
+            }
+            __syncthreads();
         }
 
-        if (router_weights) {
-            const float* aggregation =
-                router_weights + row * (unsigned long long)experts;
-            float denominator = 1.0f;
-            if (normalize) {
-                denominator = 0.0f;
+        if (threadIdx.x == 0) {
+            if (router_weights) {
+                const float* aggregation =
+                    router_weights + row * (unsigned long long)experts;
+                float denominator = 1.0f;
+                if (normalize) {
+                    denominator = 0.0f;
+                    for (int slot = 0; slot < top_k; ++slot) {
+                        denominator += aggregation[indices[slot]];
+                    }
+                }
                 for (int slot = 0; slot < top_k; ++slot) {
-                    denominator += aggregation[indices[slot]];
+                    weights[slot] = denominator == 0.0f
+                        ? 0.0f
+                        : aggregation[indices[slot]] / denominator;
+                }
+            } else {
+                float maximum = -__int_as_float(0x7f800000);
+                for (int expert = 0; expert < experts; ++expert) {
+                    maximum = fmaxf(maximum, shared_logits[expert]);
+                }
+                float all_sum = 0.0f;
+                for (int expert = 0; expert < experts; ++expert) {
+                    all_sum += expf(shared_logits[expert] - maximum);
+                }
+                float denominator = all_sum;
+                if (normalize) {
+                    denominator = 0.0f;
+                    for (int slot = 0; slot < top_k; ++slot) {
+                        denominator += expf(shared_logits[indices[slot]] - maximum);
+                    }
+                }
+                for (int slot = 0; slot < top_k; ++slot) {
+                    weights[slot] =
+                        expf(shared_logits[indices[slot]] - maximum)
+                        / denominator;
                 }
             }
-            for (int slot = 0; slot < top_k; ++slot) {
-                weights[slot] = denominator == 0.0f
-                    ? 0.0f
-                    : aggregation[indices[slot]] / denominator;
-            }
-            continue;
         }
-
-        float maximum = -__int_as_float(0x7f800000);
-        for (int expert = 0; expert < experts; ++expert) {
-            maximum = fmaxf(maximum, logits[expert]);
-        }
-        float all_sum = 0.0f;
-        for (int expert = 0; expert < experts; ++expert) {
-            all_sum += expf(logits[expert] - maximum);
-        }
-        float denominator = all_sum;
-        if (normalize) {
-            denominator = 0.0f;
-            for (int slot = 0; slot < top_k; ++slot) {
-                denominator += expf(logits[indices[slot]] - maximum);
-            }
-        }
-        for (int slot = 0; slot < top_k; ++slot) {
-            weights[slot] =
-                expf(logits[indices[slot]] - maximum) / denominator;
-        }
+        __syncthreads();
     }
 }
 
@@ -1066,14 +1104,7 @@ impl Kernel for QMoEKernel {
             &input_shape[..input_shape.len() - 1],
             "flattened input row count",
         )?;
-        require_rank("router_probs", inputs[1].shape, 2)?;
-        if inputs[1].shape[0] != rows {
-            return Err(error(format!(
-                "router_probs rows {} must equal flattened input rows {rows}",
-                inputs[1].shape[0]
-            )));
-        }
-        let experts = inputs[1].shape[1];
+        let experts = router_probs_experts(inputs[1].shape, rows)?;
         if self.attributes.k > experts {
             return Err(error(format!(
                 "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
@@ -1419,7 +1450,7 @@ impl QMoEKernel {
         let experts = as_i32("expert count", experts)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
         let normalize = i32::from(self.attributes.normalize_routing_weights);
-        let config = self.pointwise_launch_config(rows)?;
+        let config = self.route_launch_config(rows, experts)?;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&router_probs)
@@ -1819,6 +1850,44 @@ impl QMoEKernel {
         u32::try_from(grid).map_err(|_| error("reduction grid exceeds CUDA limits"))
     }
 
+    /// Launch geometry for `qmoe_route`: one block per row (grid-strided),
+    /// with a power-of-two block so the block-wide argmax tree reduction is
+    /// exact, plus dynamic shared memory for the row's logits, the picked
+    /// mask, and the reduction scratch. This cooperatively parallelizes the
+    /// per-row top-k selection — at decode (rows=1) the whole block works one
+    /// row instead of a single thread.
+    fn route_launch_config(&self, rows: u64, experts: i32) -> Result<LaunchConfig> {
+        let capabilities = self.runtime.capabilities();
+        let preferred = if capabilities.compute_capability().0 >= 7 {
+            256
+        } else {
+            128
+        };
+        let capped = preferred.min(capabilities.max_threads_per_block()).max(1);
+        // Floor to a power of two for the tree reduction.
+        let block = 1u32 << (31 - capped.leading_zeros());
+        let saturation = u64::from(capabilities.multiprocessor_count()).saturating_mul(32);
+        let grid_x = rows.min(saturation.max(1)).min(u64::from(u32::MAX)).max(1);
+        let experts = usize::try_from(experts).map_err(|_| error("negative expert count"))?;
+        let shared_ints = experts
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(2 * block as usize))
+            .ok_or_else(|| error("QMoE routing shared memory exceeds usize limits"))?;
+        let shared_mem_bytes = shared_ints
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| error("QMoE routing shared memory exceeds CUDA limits"))?;
+        Ok(LaunchConfig {
+            grid_dim: (
+                u32::try_from(grid_x).map_err(|_| error("route grid exceeds CUDA limits"))?,
+                1,
+                1,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes,
+        })
+    }
+
     fn pointwise_launch_config(&self, total: u64) -> Result<LaunchConfig> {
         let capabilities = self.runtime.capabilities();
         let preferred = if capabilities.compute_capability().0 >= 7 {
@@ -1971,6 +2040,29 @@ fn require_rank(name: &str, shape: &[usize], rank: usize) -> Result<()> {
     Ok(())
 }
 
+/// Validates `router_probs` shape against the flattened input `rows` and returns
+/// the trailing `num_experts` dimension.
+///
+/// `router_probs` mirrors the `input` handling: any rank is accepted as long as
+/// the final dimension is `num_experts` and the leading dimensions multiply to
+/// the flattened token count `rows`. This treats the tensor as a row-major
+/// `[rows, num_experts]` buffer, matching the device route kernel and ORT's QMoE
+/// semantics where `num_rows` is the flattened token count. It is byte-identical
+/// to the previous 2-D `[rows, num_experts]` contract while additionally
+/// accepting 3-D `[batch, sequence, num_experts]` decode inputs.
+fn router_probs_experts(shape: &[usize], rows: usize) -> Result<usize> {
+    let (&experts, leading) = shape.split_last().ok_or_else(|| {
+        error("router_probs must have at least rank 1 ending in num_experts, got shape []")
+    })?;
+    let router_rows = checked_product(leading, "flattened router_probs row count")?;
+    if router_rows != rows {
+        return Err(error(format!(
+            "router_probs rows {router_rows} (from shape {shape:?}) must equal flattened input rows {rows}"
+        )));
+    }
+    Ok(experts)
+}
+
 fn require_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
     if got != expected {
         return Err(error(format!(
@@ -2095,6 +2187,53 @@ mod tests {
             ]);
             assert!(unsupported_reason(&unsupported).is_some(), "{quant_type}");
         }
+    }
+
+    #[test]
+    fn router_probs_accepts_two_dimensional_prefill_shape() {
+        // Byte-identical to the previous rank-2 [rows, num_experts] contract.
+        assert_eq!(router_probs_experts(&[4, 256], 4).unwrap(), 256);
+        assert_eq!(router_probs_experts(&[1, 256], 1).unwrap(), 256);
+    }
+
+    #[test]
+    fn router_probs_accepts_three_dimensional_decode_shape() {
+        // Qwen3.6-35B-A3B QMoE fusion emits [batch, sequence, num_experts] for a
+        // decode step; the leading dims flatten to the single input row.
+        assert_eq!(router_probs_experts(&[1, 1, 256], 1).unwrap(), 256);
+        // A multi-token prefill window [batch, sequence, num_experts] flattens to
+        // batch * sequence rows.
+        assert_eq!(router_probs_experts(&[2, 3, 256], 6).unwrap(), 256);
+    }
+
+    #[test]
+    fn router_probs_rejects_row_count_mismatch() {
+        let error = router_probs_experts(&[2, 256], 1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("router_probs rows 2"), "{message}");
+        assert!(message.contains("flattened input rows 1"), "{message}");
+
+        let error = router_probs_experts(&[1, 1, 256], 2).unwrap_err();
+        assert!(
+            error.to_string().contains("flattened input rows 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn router_probs_reports_trailing_experts_for_k_bound_check() {
+        // The trailing dimension is the num_experts value the caller compares
+        // against top-k, so a too-small last dim is caught as k > num_experts.
+        let experts = router_probs_experts(&[1, 1, 4], 1).unwrap();
+        assert_eq!(experts, 4);
+        let k = 8usize;
+        assert!(k > experts, "k must exceed a smaller trailing experts dim");
+    }
+
+    #[test]
+    fn router_probs_rejects_rank_zero_shape() {
+        let error = router_probs_experts(&[], 1).unwrap_err();
+        assert!(error.to_string().contains("at least rank 1"), "{error}");
     }
 
     #[test]

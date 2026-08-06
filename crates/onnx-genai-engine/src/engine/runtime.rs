@@ -316,6 +316,18 @@ impl Engine {
         self.governor.snapshot()
     }
 
+    /// Static weight placement computed from `device_policy` at model load.
+    pub fn weight_placement_report(&self) -> Option<&WeightPlacementReport> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.weight_placement.as_ref()
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
     /// Change the live VRAM ceiling when runtime overrides are enabled.
     pub fn set_vram_limit(
         &self,
@@ -1192,6 +1204,34 @@ impl Engine {
                 .and_then(crate::native_decode::NativeDecodeSession::activation_memory_plan_stats)
         }
         #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
+    /// Process-global CUDA VMM arena counters, when this build has the native
+    /// CUDA execution provider.
+    ///
+    /// `None` means the build cannot have an arena. All-zero means no arena was
+    /// ever built, which is the normal state without `ONNX_GENAI_CUDA_VMM` --
+    /// and is distinguishable from an arena that was built and never committed
+    /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
+    /// behind a log line for an entire release.
+    pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
+            Some(crate::VmmArenaStats {
+                commits: stats.commits,
+                releases: stats.releases,
+                committed_bytes: stats.committed_bytes,
+                reserved_bytes: stats.reserved_bytes,
+                peak_committed_bytes: stats.peak_committed_bytes,
+                allocations: stats.allocations,
+                ref_underflows: stats.ref_underflows,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
         {
             None
         }

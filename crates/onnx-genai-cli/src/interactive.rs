@@ -682,6 +682,19 @@ impl Backend {
                 let snapshot = engine.resource_snapshot();
                 let budget = snapshot.derived_budget;
                 let breakdown = snapshot.breakdown;
+                #[cfg(feature = "native-backend")]
+                let weight_placement =
+                    engine
+                        .weight_placement_report()
+                        .map(|report| profile::WeightPlacementMemory {
+                            coordinated_weight_budget_bytes: report.coordinated_weight_budget_bytes,
+                            effective_budget_bytes: report.effective_budget_bytes,
+                            device_bytes: report.device_bytes,
+                            host_bytes: report.host_bytes,
+                            explanation: report.explanation.clone(),
+                        });
+                #[cfg(not(feature = "native-backend"))]
+                let weight_placement = None;
                 Some(profile::MemoryUsage {
                     kv_budget_bytes: Some(budget.kv_bytes),
                     kv_max_tokens: Some(budget.max_total_tokens),
@@ -705,6 +718,16 @@ impl Backend {
                             savings_ratio: stats.savings_ratio,
                             unknown_sizes: stats.unknown_sizes,
                         }
+                    }),
+                    weight_placement,
+                    vmm_arena: engine.vmm_arena_stats().map(|stats| profile::VmmArena {
+                        commits: stats.commits,
+                        releases: stats.releases,
+                        committed_bytes: stats.committed_bytes,
+                        reserved_bytes: stats.reserved_bytes,
+                        peak_committed_bytes: stats.peak_committed_bytes,
+                        allocations: stats.allocations,
+                        ref_underflows: stats.ref_underflows,
                     }),
                 })
             }

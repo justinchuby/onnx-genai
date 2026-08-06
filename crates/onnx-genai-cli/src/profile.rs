@@ -542,7 +542,7 @@ impl PageActivity {
 }
 
 /// Memory the run needed, from the kernel and from the engine's own accounting.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct MemoryUsage {
     /// Process high-water mark: weights, KV pages, ORT arenas and transients
     /// together, which is what decides whether a model fits on a machine.
@@ -570,6 +570,35 @@ pub(crate) struct MemoryUsage {
     /// device-reservation breakdown: it measures what activation sharing would
     /// save inside the executor, even before the allocator uses it.
     pub(crate) activation_plan: Option<ActivationPlanMemory>,
+    /// Load-time static weight placement plan, when the loader found pageable
+    /// layer regions. The row is the honesty check for `device_policy`: if a
+    /// user asks for `gpu_layers:N`, `--profile` must show the translated byte
+    /// plan instead of silently accepting a knob that nothing reached.
+    pub(crate) weight_placement: Option<WeightPlacementMemory>,
+    /// What the virtual-memory arena did to physical memory, when this build
+    /// can have one. See [`VmmArena`].
+    pub(crate) vmm_arena: Option<VmmArena>,
+}
+
+/// Virtual-memory arena counters, as reported by the engine.
+///
+/// # Why this is printed even when it is all zero
+///
+/// The arena once logged that it was installed and committed **zero bytes**
+/// for an entire generation (#659). A field that disappears when nothing
+/// happened cannot distinguish "no arena" from "an arena doing nothing", which
+/// is precisely the bug. So the row is printed whenever the build could have
+/// an arena, and `reserved 0 B` is a visible answer rather than an absence.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VmmArena {
+    pub(crate) commits: u64,
+    pub(crate) releases: u64,
+    pub(crate) committed_bytes: u64,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) peak_committed_bytes: u64,
+    pub(crate) allocations: u64,
+    /// Non-zero means the arena's granule reference counts do not balance.
+    pub(crate) ref_underflows: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -579,6 +608,15 @@ pub(crate) struct ActivationPlanMemory {
     pub(crate) naive_bytes: u64,
     pub(crate) savings_ratio: f64,
     pub(crate) unknown_sizes: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WeightPlacementMemory {
+    pub(crate) coordinated_weight_budget_bytes: u64,
+    pub(crate) effective_budget_bytes: u64,
+    pub(crate) device_bytes: u64,
+    pub(crate) host_bytes: u64,
+    pub(crate) explanation: String,
 }
 
 /// How the device memory ceiling is divided.
@@ -622,6 +660,8 @@ impl MemoryUsage {
             && self.device_used_bytes.is_none()
             && self.composition.is_none()
             && self.activation_plan.is_none()
+            && self.weight_placement.is_none()
+            && self.vmm_arena.is_none()
     }
 }
 
@@ -911,6 +951,54 @@ impl RunProfile {
                     );
                 }
             }
+            if let Some(plan) = &self.memory.weight_placement {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {} device / {} host (budget {})",
+                    "weight placement",
+                    format_bytes(plan.device_bytes),
+                    format_bytes(plan.host_bytes),
+                    format_bytes(plan.effective_budget_bytes)
+                );
+                let _ = writeln!(out, "{:<24} {}", "  explanation", plan.explanation);
+            }
+            if let Some(arena) = self.memory.vmm_arena {
+                if arena.reserved_bytes == 0 && arena.commits == 0 {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} not installed (set ONNX_GENAI_CUDA_VMM=1)",
+                        "vmm arena"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} committed of {} reserved (peak {})",
+                        "vmm arena",
+                        format_bytes(arena.committed_bytes),
+                        format_bytes(arena.reserved_bytes),
+                        format_bytes(arena.peak_committed_bytes)
+                    );
+                    // Allocations per commit is the suballocation ratio: 1.0
+                    // means every allocation took its own granule, which is the
+                    // regression that would make 2 MiB granularity unaffordable.
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {} allocs, {} commits, {} releases",
+                        "vmm arena activity", arena.allocations, arena.commits, arena.releases
+                    );
+                    // Printed only when non-zero, and phrased as a fault
+                    // rather than a statistic: a balanced arena has nothing to
+                    // say here, and an unbalanced one has already unmapped
+                    // memory some other allocation believes it owns.
+                    if arena.ref_underflows > 0 {
+                        let _ = writeln!(
+                            out,
+                            "{:<24} BUG: {} granule release(s) with a zero reference count",
+                            "vmm arena", arena.ref_underflows
+                        );
+                    }
+                }
+            }
         }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
@@ -1129,6 +1217,28 @@ impl RunProfile {
                 plan.naive_bytes,
                 plan.savings_ratio,
                 plan.unknown_sizes
+            ));
+        }
+        if let Some(plan) = &self.memory.weight_placement {
+            fields.push(format!(
+                "\"weight_placement\":{{\"coordinated_weight_budget_bytes\":{},\"effective_budget_bytes\":{},\"device_bytes\":{},\"host_bytes\":{},\"explanation\":{}}}",
+                plan.coordinated_weight_budget_bytes,
+                plan.effective_budget_bytes,
+                plan.device_bytes,
+                plan.host_bytes,
+                json_string(&plan.explanation)
+            ));
+        }
+        if let Some(arena) = self.memory.vmm_arena {
+            fields.push(format!(
+                "\"vmm_arena\":{{\"commits\":{},\"releases\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"peak_committed_bytes\":{},\"allocations\":{},\"ref_underflows\":{}}}",
+                arena.commits,
+                arena.releases,
+                arena.committed_bytes,
+                arena.reserved_bytes,
+                arena.peak_committed_bytes,
+                arena.allocations,
+                arena.ref_underflows
             ));
         }
         format!("{{{}}}", fields.join(","))
@@ -1490,6 +1600,30 @@ mod tests {
         assert!(text.contains("kv cache budget"), "{text}");
         let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
         assert!(value.get("device_memory_breakdown").is_none());
+    }
+
+    #[test]
+    fn weight_placement_explanation_is_visible_in_profile_text_and_json() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.weight_placement = Some(WeightPlacementMemory {
+            coordinated_weight_budget_bytes: 2048,
+            effective_budget_bytes: 1024,
+            device_bytes: 512,
+            host_bytes: 1536,
+            explanation: "VRAM placement: source=gpu_layers:1".to_string(),
+        });
+
+        let text = profile.to_text();
+        assert!(text.contains("weight placement"), "{text}");
+        assert!(text.contains("source=gpu_layers:1"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["weight_placement"]["device_bytes"], 512);
+        assert_eq!(
+            value["weight_placement"]["explanation"],
+            "VRAM placement: source=gpu_layers:1"
+        );
     }
 
     #[test]

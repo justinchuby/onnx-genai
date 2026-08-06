@@ -37,14 +37,15 @@ pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchMa
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
-    DryConfig, Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineDecodeBackend,
-    EngineGovernorError, EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions,
-    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
-    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig,
-    MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig,
+    DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine, EngineConfig,
+    EngineConfigError, EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor,
+    FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
+    KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
+    MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
+    SpeculativeMode, TokenLogprob, WeightPlacementReport, XtcConfig, parse_device_policy,
     parse_resource_limit,
 };
 pub use fim::{FimConfig, FimFormat};
@@ -114,6 +115,34 @@ impl From<onnx_runtime_session::ActivationMemoryPlanStats> for ActivationMemoryP
             unknown_sizes: stats.unknown_sizes,
         }
     }
+}
+
+/// What a virtual-memory arena has done to physical memory.
+///
+/// Backend-agnostic on purpose. The counters currently come from the native
+/// CUDA arena, but nothing in this shape is CUDA-specific: any allocator that
+/// reserves address space and commits it on demand answers the same six
+/// questions, so a second backend can report here without the CLI changing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmmArenaStats {
+    /// Granules mapped since the process started.
+    pub commits: u64,
+    /// Granules unmapped since the process started.
+    pub releases: u64,
+    /// Physical bytes mapped right now.
+    pub committed_bytes: u64,
+    /// Address space reserved right now. The gap between this and
+    /// `committed_bytes` is what the approach buys.
+    pub reserved_bytes: u64,
+    /// High-water mark of `committed_bytes`.
+    pub peak_committed_bytes: u64,
+    /// Spans handed out. Many allocations per commit is granule sharing
+    /// working; one commit per allocation means every small tensor costs a
+    /// whole granule.
+    pub allocations: u64,
+    /// Times a granule was released whose reference count was already zero.
+    /// **Anything but zero is a bug** in the allocator's accounting.
+    pub ref_underflows: u64,
 }
 
 #[cfg(feature = "native-backend")]

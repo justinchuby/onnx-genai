@@ -105,33 +105,7 @@ jobs:
       - name: Test Linux offline crates
         run: >-
           cargo test --locked
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p mlas-sys
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
+          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
       - name: Clippy Linux offline crates
         run: >-
           cargo clippy --locked --all-targets
@@ -218,6 +192,9 @@ jobs:
       - name: Check publish order
         run: python3 scripts/check_publish_order.py
 
+      - name: Verify workspace test package coverage
+        run: python .github/scripts/workspace_test_packages.py verify
+
       - name: Check the profile table matches the samples
         run: python3 scripts/check_profile_table.py
 
@@ -235,6 +212,12 @@ jobs:
 
       - name: Check feature-gated fast paths have fallback coverage
         run: python3 scripts/check_feature_gate_coverage.py
+
+      # A documented environment variable that nothing parses produces no error
+      # and no effect, so the mistake survives indefinitely. `device_policy`
+      # went months that way (#678). This makes the gap a CI failure.
+      - name: Check documented environment variables are implemented
+        run: python3 .github/scripts/verify_documented_env_vars.py
 
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
@@ -364,36 +347,14 @@ jobs:
           fi
       # Never replace these explicit packages with bare `cargo test` or
       # `--workspace`: that selects onnx-genai-ort-sys, whose build script
-      # downloads a native ONNX Runtime distribution.
+      # downloads a native ONNX Runtime distribution. The package list is
+      # derived from cargo metadata and the commented deny-list in
+      # `.github/scripts/workspace_test_packages.py`, so new offline workspace
+      # crates are tested by default.
       - name: Test cross-platform offline crates with coverage
         run: >-
           cargo llvm-cov --locked --codecov --output-path codecov-offline.json
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
+          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
       - name: Upload offline coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -406,7 +367,9 @@ jobs:
       # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
-        run: cargo llvm-cov --locked --codecov --output-path codecov-mlas.json -p mlas-sys
+        run: >-
+          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json
+          $(python .github/scripts/workspace_test_packages.py cargo-args linux-only)
       - name: Upload MLAS coverage to Codecov
         if: always() && runner.os == 'Linux'
         uses: codecov/codecov-action@v4
@@ -464,32 +427,7 @@ jobs:
       - name: Test cross-platform offline crates
         run: >-
           cargo test --locked
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
+          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
       - name: Clippy Windows ARM64 offline crates
         run: >-
           cargo clippy --locked --all-targets
@@ -687,15 +625,18 @@ jobs:
           $ort.DirectoryName >> $env:GITHUB_PATH
       - name: Test onnx-genai-cli with coverage
         run: cargo llvm-cov --locked --no-clean --codecov --output-path codecov-cli-ort.json -p onnx-genai-cli
-      # `onnx-genai-ort` is the ORT backend itself, and its tests had never run
-      # anywhere in CI: every other lane must stay offline, and this lane -- the
-      # only one with a downloaded ONNX Runtime -- named just the CLI. A loader
-      # change silently left one of its unit assertions stale for that whole
-      # time, and its decode_session tests had been failing since #380/#412. The
-      # ORT distribution is already downloaded and on PATH by this point, so
-      # covering the crate that needs it costs a step, not a download.
-      - name: Test onnx-genai-ort
-        run: cargo test --locked -p onnx-genai-ort
+      # These crates depend on the downloaded ONNX Runtime distribution above.
+      # The set is still derived from the workspace inventory, not hand-copied
+      # here; adding a new ORT-backed crate means classifying it in the script.
+      - name: Test ORT-backed workspace crates
+        run: >-
+          cargo test --locked
+          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
+      # `native-backend` is CPU-runnable: it selects the native CPU EP/session
+      # crates, while CUDA-only engine integration tests are behind
+      # required-features = ["cuda", "native-backend"] and are not selected here.
+      - name: Test onnx-genai-engine native backend
+        run: cargo test --locked -p onnx-genai-engine --features native-backend
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4

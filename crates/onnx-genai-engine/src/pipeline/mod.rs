@@ -712,15 +712,29 @@ impl PipelineEngine {
             // autoregressive are not yet wired for native and are rejected once
             // the plan is known (below), rather than at construction.
         }
+        let native_ort_skips = if backend == PipelineBackend::Native {
+            let directory = PipelineModelDirectory::load(pipeline_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
+            match PipelinePlan::from_spec(&directory.spec, schedulers)? {
+                PipelinePlan::Autoregressive(ar) => {
+                    let mut skips = BTreeSet::from([ar.decoder]);
+                    skips.extend(ar.step_components);
+                    skips
+                }
+                _ => BTreeSet::new(),
+            }
+        } else {
+            BTreeSet::new()
+        };
         let models = if backend == PipelineBackend::Native {
-            // The native backend drives every component through the native nxrt
-            // `ComponentSession` seam, so an ORT `Session` for any of them would
-            // be redundant — and a native-only operator (for example a QMoE
-            // artifact whose fp16 I/O + fp32 scales ORT's op type-checker rejects
-            // at load) would abort the whole pipeline load. Skip ORT session
-            // construction and resolve each component's decode contract from its
-            // session-free graph metadata instead (see `PipelineModels::graph_io`).
-            PipelineModels::load_with_ort_session_filter(pipeline_dir, session_options, |_| false)
+            // The native flat-AR backend drives the decoder and every-step
+            // components through native nxrt sessions, so ORT sessions for those
+            // components would be redundant and can reject native-only operators.
+            // Prompt-only components still run through the existing ORT prologue,
+            // so keep their sessions loaded.
+            PipelineModels::load_with_ort_session_filter(pipeline_dir, session_options, |name| {
+                !native_ort_skips.contains(name)
+            })
         } else {
             PipelineModels::load_with_options(pipeline_dir, session_options)
         }
@@ -786,7 +800,8 @@ impl PipelineEngine {
                         .with_context(|| {
                             format!(
                                 "cannot allocate the pipeline KV page pool: {pipeline_pages} \
-                                 page(s) across {} layer(s) do not fit the device KV budget",
+                                 page(s) across {} layer(s) do not fit the resolved KV/host \
+                                 memory budget",
                                 kv_model.layer_configs.len()
                             )
                         })?,

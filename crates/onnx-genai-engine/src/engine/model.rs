@@ -37,6 +37,9 @@ pub struct Engine {
     /// by the server's fallback driver in this first milestone.
     #[cfg(feature = "native-backend")]
     pub(crate) native_session: Option<crate::native_decode::NativeDecodeSession>,
+    /// Load-time static device/host placement plan for pageable weight layers.
+    #[cfg(feature = "native-backend")]
+    pub(crate) weight_placement: Option<WeightPlacementReport>,
     /// Multi-session native state: per-session token history keyed by session id.
     /// The active session (whose KV is loaded in `native_session`) is tracked by
     /// `native_active_session`. When switching, the engine re-prefills from the

@@ -44,14 +44,15 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DryConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
-    GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
-    KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
-    MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival,
-    SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition, SharedKvBinding,
-    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
+    DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig, EngineConfigError,
+    EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
+    KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion,
+    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
+    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightPlacementReport,
+    XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -65,6 +66,8 @@ mod load;
 pub(crate) mod memory_plan;
 mod metadata;
 mod model;
+#[cfg(feature = "native-backend")]
+mod placement;
 mod runtime;
 mod speculative_load;
 
@@ -77,6 +80,8 @@ pub(crate) use memory_plan::Holder;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
+#[cfg(feature = "native-backend")]
+pub(crate) use placement::plan_static_weight_placement;
 pub(crate) use speculative_load::*;
 
 #[cfg(test)]
@@ -206,6 +211,8 @@ mod tests {
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,
+            #[cfg(feature = "native-backend")]
+            weight_placement: None,
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
@@ -1232,6 +1239,37 @@ mod tests {
         assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
     }
 
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn device_policy_reaches_native_load_and_profiles_placement() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare");
+        let config = EngineConfig::from_yaml(
+            "serving:\n  memory:\n    weights:\n      device_policy: gpu_layers:1\n",
+        )
+        .unwrap();
+        let config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(crate::native_decode::NativeDecodeDevice::Cpu),
+            ..config
+        };
+
+        let engine = Engine::from_dir(&model_dir, config).unwrap();
+        let report = engine
+            .weight_placement_report()
+            .expect("QMoE fixture should produce a static weight placement report");
+
+        assert!(
+            report.explanation.contains("gpu_layers:1"),
+            "{}",
+            report.explanation
+        );
+        assert!(
+            report.host_bytes > 0,
+            "CPU load has no governed device residency budget, so the plan should visibly keep bytes on host: {report:?}"
+        );
+    }
+
     #[cfg(not(feature = "native-backend"))]
     #[test]
     fn forced_native_without_feature_reports_how_to_switch() {
@@ -1288,7 +1326,7 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
-    fn two_engine_governors_keep_independent_host_cache_budgets() {
+    fn engine_governors_keep_disabled_host_cache_budgets_governed() {
         let first = EngineResourceGovernor::new_with_capacities(
             ResourceLimits {
                 host_ram_limit: ResourceLimit::Bytes(400),
@@ -1320,12 +1358,14 @@ mod tests {
 
         assert_eq!(
             first.weight_offload_host_cache().configured_budget_bytes(),
-            400
+            0
         );
+        assert_eq!(first.weight_offload_host_cache().budget(), (0, true));
         assert_eq!(
             second.weight_offload_host_cache().configured_budget_bytes(),
-            900
+            0
         );
+        assert_eq!(second.weight_offload_host_cache().budget(), (0, true));
     }
 
     #[test]

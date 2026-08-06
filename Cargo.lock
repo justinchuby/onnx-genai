@@ -2333,6 +2333,7 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-virtual-memory",
  "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

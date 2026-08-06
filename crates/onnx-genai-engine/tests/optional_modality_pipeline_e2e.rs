@@ -62,6 +62,7 @@ opset_import { domain: "" version: 13 }
 "#;
     fs::write(root.join("audio_encoder.onnx.textproto"), audio_encoder)?;
     let marker = "  output {\n    name: \"inputs_embeds\"";
+    let crlf_marker = "  output {\r\n    name: \"inputs_embeds\"";
     let audio_input = "\
   input {
     name: \"audio_features\"
@@ -77,7 +78,11 @@ opset_import { domain: "" version: 13 }
   }
   output {
     name: \"inputs_embeds\"";
-    let embedding = original.replacen(marker, audio_input, 1);
+    let embedding = if original.contains(marker) {
+        original.replacen(marker, audio_input, 1)
+    } else {
+        original.replacen(crlf_marker, audio_input, 1)
+    };
     assert_ne!(embedding, original, "embedding fixture marker must match");
     fs::write(root.join("embedding.onnx.textproto"), embedding)?;
     fs::write(root.join("inference_metadata.yaml"), metadata)?;
