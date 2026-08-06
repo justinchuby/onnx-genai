@@ -296,7 +296,17 @@ impl EngineResourceGovernor {
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
     pub fn snapshot(&self) -> GovernorSnapshot {
-        self.inner.snapshot()
+        use onnx_runtime_memory_governor::Tier;
+
+        let mut snapshot = self.inner.snapshot();
+        snapshot.vram =
+            Self::tier_snapshot_from_ledger(&self.memory, Tier::Device, snapshot.vram.limit);
+        snapshot.host_ram =
+            Self::tier_snapshot_from_ledger(&self.memory, Tier::Host, snapshot.host_ram.limit);
+        if let Some(disk) = snapshot.disk_spill.as_mut() {
+            *disk = Self::tier_snapshot_from_ledger(&self.memory, Tier::Disk, disk.limit);
+        }
+        snapshot
     }
 
     /// Change the live VRAM ceiling when runtime overrides are enabled.
@@ -310,6 +320,23 @@ impl EngineResourceGovernor {
         // TODO(§26.11.2): execute the returned priority/offload/eviction order
         // across live engine sessions when the outcome reports an overage.
         Ok(self.inner.set_vram_limit(limit)?)
+    }
+
+    /// Report live use from the lease ledger, not from the scheduler's transient
+    /// byte budget. The server metrics read this snapshot after model load; using
+    /// the budget here made a loaded model look like 0 bytes until a scheduled
+    /// request happened to be active, so admission saw an empty card (#706).
+    fn tier_snapshot_from_ledger(
+        memory: &onnx_runtime_memory_governor::LedgerGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        limit: u64,
+    ) -> onnx_genai_scheduler::TierSnapshot {
+        let used = onnx_runtime_memory_governor::MemoryGovernor::used(memory, tier);
+        onnx_genai_scheduler::TierSnapshot {
+            used,
+            limit,
+            headroom: limit.saturating_sub(used),
+        }
     }
 
     pub(crate) fn byte_budget(&self) -> onnx_genai_scheduler::ByteBudget {

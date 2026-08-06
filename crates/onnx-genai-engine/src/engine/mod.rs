@@ -1429,7 +1429,20 @@ mod tests {
             0,
         )
         .unwrap();
-        governor.byte_budget().try_reserve(300).unwrap();
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor as _, MemoryRole, Tier};
+
+        let _device = governor
+            .memory()
+            .reserve(Tier::Device, 300, MemoryRole::KvCache, HolderId::new(1))
+            .unwrap();
+        let _host = governor
+            .memory()
+            .reserve(Tier::Host, 500, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        let _disk = governor
+            .memory()
+            .reserve(Tier::Disk, 1_000, MemoryRole::KvCache, HolderId::new(3))
+            .unwrap();
 
         let snapshot = governor.snapshot();
         assert_eq!(
