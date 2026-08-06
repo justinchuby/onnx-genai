@@ -58,6 +58,8 @@ pub(crate) enum Holder {
     DraftKvPool,
     /// The device weight-residency cache, when weight offload is enabled.
     WeightResidency,
+    /// The CPU EP's warm host cache for dequantized MoE experts.
+    WeightOffloadHostCache,
     /// Fixed-size recurrent state for hybrid decoders.
     RecurrentState,
     /// Semantic-prefix snapshots of recurrent/native loop-carried state.
@@ -95,11 +97,12 @@ impl Holder {
     /// the variants are unconditional even when only one build configuration
     /// constructs them.
     #[allow(dead_code)]
-    pub(crate) const ALL: [Holder; 9] = [
+    pub(crate) const ALL: [Holder; 10] = [
         Holder::KvPool,
         Holder::PipelineKvPool,
         Holder::DraftKvPool,
         Holder::WeightResidency,
+        Holder::WeightOffloadHostCache,
         Holder::RecurrentState,
         Holder::RecurrentPrefixSnapshot,
         Holder::NativeKvCache,
@@ -117,6 +120,7 @@ impl Holder {
             Holder::PipelineKvPool => 2,
             Holder::DraftKvPool => 3,
             Holder::WeightResidency => 4,
+            Holder::WeightOffloadHostCache => 10,
             Holder::RecurrentState => 5,
             Holder::RecurrentPrefixSnapshot => 9,
             Holder::NativeKvCache => 8,
@@ -130,7 +134,7 @@ impl Holder {
     pub(crate) const fn role(self) -> MemoryRole {
         match self {
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => MemoryRole::KvCache,
-            Holder::WeightResidency => MemoryRole::Weights,
+            Holder::WeightResidency | Holder::WeightOffloadHostCache => MemoryRole::Weights,
             // Rolling state that is destroyed as it is updated: it cannot be
             // rewound, recomputed or shared, so it is not a `Weights`-style
             // demotion candidate and not step-scoped `Workspace` either. It
@@ -149,6 +153,7 @@ impl Holder {
             Holder::PipelineKvPool => "pipeline KV page pool",
             Holder::DraftKvPool => "draft model KV page pool",
             Holder::WeightResidency => "device weight residency cache",
+            Holder::WeightOffloadHostCache => "host weight-offload expert cache",
             Holder::RecurrentState => "recurrent state",
             Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
             Holder::NativeKvCache => "native decode KV tensors",
@@ -169,6 +174,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
+            Holder::WeightOffloadHostCache => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot
