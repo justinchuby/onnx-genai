@@ -179,6 +179,10 @@ impl NativeDecodeSession {
 }
 
 impl NativeDecodeSession {
+    pub(crate) fn inference_session(&self) -> &InferenceSession {
+        &self.session
+    }
+
     pub fn current_len(&self) -> usize {
         self.current_len
     }

@@ -542,7 +542,7 @@ impl PageActivity {
 }
 
 /// Memory the run needed, from the kernel and from the engine's own accounting.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct MemoryUsage {
     /// Process high-water mark: weights, KV pages, ORT arenas and transients
     /// together, which is what decides whether a model fits on a machine.
@@ -570,6 +570,11 @@ pub(crate) struct MemoryUsage {
     /// device-reservation breakdown: it measures what activation sharing would
     /// save inside the executor, even before the allocator uses it.
     pub(crate) activation_plan: Option<ActivationPlanMemory>,
+    /// Load-time static weight placement plan, when the loader found pageable
+    /// layer regions. The row is the honesty check for `device_policy`: if a
+    /// user asks for `gpu_layers:N`, `--profile` must show the translated byte
+    /// plan instead of silently accepting a knob that nothing reached.
+    pub(crate) weight_placement: Option<WeightPlacementMemory>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -579,6 +584,15 @@ pub(crate) struct ActivationPlanMemory {
     pub(crate) naive_bytes: u64,
     pub(crate) savings_ratio: f64,
     pub(crate) unknown_sizes: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WeightPlacementMemory {
+    pub(crate) coordinated_weight_budget_bytes: u64,
+    pub(crate) effective_budget_bytes: u64,
+    pub(crate) device_bytes: u64,
+    pub(crate) host_bytes: u64,
+    pub(crate) explanation: String,
 }
 
 /// How the device memory ceiling is divided.
@@ -622,6 +636,7 @@ impl MemoryUsage {
             && self.device_used_bytes.is_none()
             && self.composition.is_none()
             && self.activation_plan.is_none()
+            && self.weight_placement.is_none()
     }
 }
 
@@ -911,6 +926,17 @@ impl RunProfile {
                     );
                 }
             }
+            if let Some(plan) = &self.memory.weight_placement {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {} device / {} host (budget {})",
+                    "weight placement",
+                    format_bytes(plan.device_bytes),
+                    format_bytes(plan.host_bytes),
+                    format_bytes(plan.effective_budget_bytes)
+                );
+                let _ = writeln!(out, "{:<24} {}", "  explanation", plan.explanation);
+            }
         }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
@@ -1129,6 +1155,16 @@ impl RunProfile {
                 plan.naive_bytes,
                 plan.savings_ratio,
                 plan.unknown_sizes
+            ));
+        }
+        if let Some(plan) = &self.memory.weight_placement {
+            fields.push(format!(
+                "\"weight_placement\":{{\"coordinated_weight_budget_bytes\":{},\"effective_budget_bytes\":{},\"device_bytes\":{},\"host_bytes\":{},\"explanation\":{}}}",
+                plan.coordinated_weight_budget_bytes,
+                plan.effective_budget_bytes,
+                plan.device_bytes,
+                plan.host_bytes,
+                json_string(&plan.explanation)
             ));
         }
         format!("{{{}}}", fields.join(","))
@@ -1490,6 +1526,30 @@ mod tests {
         assert!(text.contains("kv cache budget"), "{text}");
         let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
         assert!(value.get("device_memory_breakdown").is_none());
+    }
+
+    #[test]
+    fn weight_placement_explanation_is_visible_in_profile_text_and_json() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.weight_placement = Some(WeightPlacementMemory {
+            coordinated_weight_budget_bytes: 2048,
+            effective_budget_bytes: 1024,
+            device_bytes: 512,
+            host_bytes: 1536,
+            explanation: "VRAM placement: source=gpu_layers:1".to_string(),
+        });
+
+        let text = profile.to_text();
+        assert!(text.contains("weight placement"), "{text}");
+        assert!(text.contains("source=gpu_layers:1"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["weight_placement"]["device_bytes"], 512);
+        assert_eq!(
+            value["weight_placement"]["explanation"],
+            "VRAM placement: source=gpu_layers:1"
+        );
     }
 
     #[test]

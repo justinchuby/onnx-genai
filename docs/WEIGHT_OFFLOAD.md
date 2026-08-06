@@ -300,9 +300,12 @@ control for repeatability:
 device_policy = auto | cpu | gpu_layers:<N> | device_bytes:<SIZE>
 ```
 
-`gpu_layers:N` places complete transformer blocks where possible, avoiding activation
-ping-pong at every node. Shared weights for those blocks are resident; their expert
-pools use the remaining device cache. The rest execute on CPU from warm/mmap pages.
+`gpu_layers:N` is now parsed by the engine and translated into a byte-capped
+whole-layer placement plan during native model load. The plan is reported in
+`--profile`, including the planner's human-readable explanation. Enforcement is
+still advisory in this increment: the native executor still owns one EP per session,
+so device-planned layers are not yet made resident while host-planned layers execute
+from CPU mmap/warm pages. A follow-up must consume the plan at the executor boundary.
 An advanced expert pin list may be added later, but raw expert-count configuration is
 less stable than a byte budget because expert sizes can differ.
 
@@ -341,9 +344,9 @@ not successful if it slows that case materially.
 ## 8. Configuration and UX
 
 Use the existing `serving.memory.limits` surface as the global authority; it already
-accepts byte, fraction, and `auto` values
-([config.rs lines 368-408](../crates/onnx-genai-engine/src/config.rs#L368-L408)). Add a
-weight policy below it rather than creating an unrelated memory governor:
+accepts byte, fraction, and `auto` values. The implemented weight-policy surface is
+`serving.memory.weights.device_policy`; invalid values are load-time errors, not
+silent fallback:
 
 ```yaml
 serving:
@@ -353,12 +356,22 @@ serving:
       host_ram_limit: auto
       disk_spill_limit: auto
     weights:
-      mode: auto                 # auto | mmap | resident
-      device_budget: auto        # sub-budget, capped by vram_limit
-      host_budget: auto          # owned/pinned cache, capped by host_ram_limit
       device_policy: auto        # or gpu_layers:48 / device_bytes:120GiB
-      prefetch: auto             # off | exact | heat | predictive | auto
 ```
+
+Supported `device_policy` values:
+
+- `auto`: plan from the governor-coordinated device weight budget.
+- `cpu`: plan every discovered layer for host placement.
+- `gpu_layers:<N>`: translate the first `N` discovered layers into bytes, capped by
+  the governor-coordinated device weight budget.
+- `device_bytes:<SIZE>`: plan from the explicit byte size, still capped by the
+  governor-coordinated device weight budget. `<SIZE>` accepts the same byte suffixes
+  as `vram_limit` (`MiB`, `GiB`, `MB`, `GB`, or raw bytes), but not fractions.
+
+Current layer discovery covers native `com.microsoft::QMoE` expert regions, which are
+the pageable MoE weight regions the existing planner understands. Models without such
+regions run normally and produce no weight-placement profile row.
 
 Environment aliases for command-line deployments:
 
@@ -366,12 +379,13 @@ Environment aliases for command-line deployments:
 ONNX_GENAI_WEIGHT_OFFLOAD=1                    # Phase-1 route-first mmap CPU MoE
 ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES=<bytes>   # owned Phase-2 warm-cache override
 ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1       # opt-IN async fence-ordered device page-in (default: sync)
-ONNX_GENAI_WEIGHT_BUDGET=auto|<bytes>          # shorthand resident-weight cap
-ONNX_GENAI_WEIGHT_DEVICE_BUDGET=auto|<bytes>
-ONNX_GENAI_WEIGHT_HOST_BUDGET=auto|<bytes>
-ONNX_GENAI_GPU_LAYERS=<N>
 ONNX_GENAI_WEIGHT_PREFETCH=off|exact|heat|predictive|auto
 ```
+
+The older environment aliases sketched here for `ONNX_GENAI_WEIGHT_BUDGET`,
+`ONNX_GENAI_WEIGHT_DEVICE_BUDGET`, `ONNX_GENAI_WEIGHT_HOST_BUDGET`, and
+`ONNX_GENAI_GPU_LAYERS` are not implemented and should not be documented as active
+configuration until they are wired to the same parser.
 
 `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is **opt-in** (default: synchronous
 page-in). Set it to a truthy value (`1`/`true`/`yes`/`on`) to use the
@@ -414,6 +428,10 @@ At startup, print an explainable plan: total/shared/expert bytes, selected tiers
 resident layer count, cache caps, expected minimum working set, and whether async
 prefetch is actually supported. Do not claim asynchronous overlap while the active EP
 still implements synchronous copies.
+
+`--profile` now prints the `PlacementPlan::explanation` for the computed static
+weight plan. Because enforcement is not wired yet, that row is a planning/diagnostic
+row rather than proof that the executor consumed the placement.
 
 ## 9. Observability and correctness invariants
 
