@@ -698,6 +698,13 @@ impl CudaWeightResidency {
     /// Best-effort single-weight lookahead page-in. It only engages for the
     /// asynchronous path and only when the new page fits inside the current
     /// residency budget without evicting or growing the lease.
+    ///
+    /// Depth is intentionally a scheduler knob, not a residency-policy knob:
+    /// qwen2.5-0.5b on RTX 4060 at a 1.5 GiB weight budget was swept at 1, 2,
+    /// 4, 8, and 16 nodes of lookahead. The requested issue-to-join gap was
+    /// reachable and no evictions occurred, but no speedup was established; 16
+    /// nodes was worse. Keep the guard conservative unless a larger,
+    /// transfer-bound model proves a deeper default helps.
     pub fn prefetch_materialized(
         &self,
         key: u64,
