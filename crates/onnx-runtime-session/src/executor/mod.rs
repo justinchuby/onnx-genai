@@ -122,6 +122,10 @@ mod phase_profile {
         STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
     }
 
+    pub fn enable_for_process() {
+        STATE.store(2, Ordering::Relaxed);
+    }
+
     /// Test-only snapshot of a phase's accumulated `(total_ns, count)`.
     #[cfg(test)]
     pub(super) fn snapshot(phase: &'static str) -> Option<(u128, u64)> {
@@ -285,6 +289,16 @@ pub fn print_exec_phase_profile() {
 
 pub fn reset_exec_phase_profile() {
     phase_profile::reset();
+}
+
+/// Force executor phase profiling on for targeted per-step attribution.
+///
+/// This is deliberately process-wide because the phase profiler is itself
+/// process-wide. Callers use it only under explicit diagnostic env knobs before
+/// resetting and sampling a single decode step; production paths should leave
+/// the cheap env-gated default untouched.
+pub fn enable_exec_phase_profile_for_process() {
+    phase_profile::enable_for_process();
 }
 
 /// Activation-memory planner metrics from the most recent measured top-level run.

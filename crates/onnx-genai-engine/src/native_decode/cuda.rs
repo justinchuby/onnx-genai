@@ -66,6 +66,122 @@ fn log_weight_offload_capture_exclusion() {
     });
 }
 
+fn cuda_step_profile_enabled() -> bool {
+    std::env::var_os("ONNX_GENAI_PROFILE_CUDA_DECODE_STEPS").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StepOffloadSnapshot {
+    materialize_ns: u64,
+    htod_ns: u64,
+    copy_wait_ns: u64,
+    admit_sync_ns: u64,
+    page_ins: u64,
+    prefetch_issued: u64,
+    prefetch_joined: u64,
+    prefetch_declined_guard: u64,
+}
+
+impl StepOffloadSnapshot {
+    fn read() -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::global_offload_stats();
+            Self {
+                materialize_ns: stats.materialize_ns,
+                htod_ns: stats.htod_ns,
+                copy_wait_ns: stats.copy_wait_ns,
+                admit_sync_ns: stats.admit_sync_ns,
+                page_ins: stats.page_ins,
+                prefetch_issued: stats.prefetch_issued,
+                prefetch_joined: stats.prefetch_joined,
+                prefetch_declined_guard: stats.prefetch_declined_guard,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::default()
+        }
+    }
+
+    fn delta(self, before: Self) -> Self {
+        Self {
+            materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
+            htod_ns: self.htod_ns.saturating_sub(before.htod_ns),
+            copy_wait_ns: self.copy_wait_ns.saturating_sub(before.copy_wait_ns),
+            admit_sync_ns: self.admit_sync_ns.saturating_sub(before.admit_sync_ns),
+            page_ins: self.page_ins.saturating_sub(before.page_ins),
+            prefetch_issued: self.prefetch_issued.saturating_sub(before.prefetch_issued),
+            prefetch_joined: self.prefetch_joined.saturating_sub(before.prefetch_joined),
+            prefetch_declined_guard: self
+                .prefetch_declined_guard
+                .saturating_sub(before.prefetch_declined_guard),
+        }
+    }
+}
+
+struct CudaStepProfile {
+    past_len: usize,
+    total_len: usize,
+    before: StepOffloadSnapshot,
+    start: std::time::Instant,
+}
+
+impl CudaStepProfile {
+    fn begin(past_len: usize, total_len: usize) -> Option<Self> {
+        if !cuda_step_profile_enabled() {
+            return None;
+        }
+        onnx_runtime_session::enable_exec_phase_profile_for_process();
+        onnx_runtime_session::reset_exec_phase_profile();
+        Some(Self {
+            past_len,
+            total_len,
+            before: StepOffloadSnapshot::read(),
+            start: std::time::Instant::now(),
+        })
+    }
+
+    fn finish(self, path: &'static str) {
+        let total_ms = self.start.elapsed().as_secs_f64() * 1_000.0;
+        let delta = StepOffloadSnapshot::read().delta(self.before);
+        let staging_ms = ns_to_ms(delta.materialize_ns);
+        let h2d_ms = ns_to_ms(delta.htod_ns);
+        let fence_sync_ms = ns_to_ms(delta.copy_wait_ns.saturating_add(delta.admit_sync_ns));
+        let kernel_host_ms = onnx_runtime_session::exec_phase_stats()
+            .into_iter()
+            .find_map(|(name, total_ns, _)| (name == "exec_kernel.compute").then_some(total_ns))
+            .map(|ns| ns as f64 / 1_000_000.0)
+            .unwrap_or(0.0);
+        let residual_ms = total_ms - staging_ms - h2d_ms - fence_sync_ms - kernel_host_ms;
+        static HEADER: std::sync::Once = std::sync::Once::new();
+        HEADER.call_once(|| {
+            eprintln!(
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_enqueue_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard"
+            );
+        });
+        eprintln!(
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{residual_ms:.3},{},{},{},{}",
+            self.past_len,
+            self.total_len,
+            delta.page_ins,
+            delta.prefetch_issued,
+            delta.prefetch_joined,
+            delta.prefetch_declined_guard
+        );
+    }
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
@@ -499,6 +615,7 @@ impl NativeDecodeSession {
                 // exec's capture machine stays dormant on decode, so the shared
                 // EP's single graph slot + capture-error latch are owned solely by
                 // the sibling.
+                let step_profile = CudaStepProfile::begin(past_len, total_len);
                 if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                     bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
@@ -521,10 +638,14 @@ impl NativeDecodeSession {
                 if logits.iter().flatten().any(|value| !value.is_finite()) {
                     bail!("native decoder produced non-finite logits");
                 }
+                if let Some(profile) = step_profile {
+                    profile.finish("decode_inline");
+                }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
             }
+            let step_profile = CudaStepProfile::begin(past_len, total_len);
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                 bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
@@ -544,6 +665,9 @@ impl NativeDecodeSession {
             }
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
+            }
+            if let Some(profile) = step_profile {
+                profile.finish("decode");
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -612,6 +736,7 @@ impl NativeDecodeSession {
         state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
         state.write_captured_step_inputs(supplied, position)?;
 
+        let step_profile = CudaStepProfile::begin(past_len, total_len);
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
             bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
@@ -632,6 +757,9 @@ impl NativeDecodeSession {
         }
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
+        }
+        if let Some(profile) = step_profile {
+            profile.finish("captured_step_inputs");
         }
         let state = self
             .cuda
