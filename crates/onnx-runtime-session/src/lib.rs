@@ -30,9 +30,12 @@ pub use epcontext::{
 pub use error::SessionError;
 pub use executor::{
     ActivationMemoryPlanStats, CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind,
-    ControlFlowStats, DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
-    ExecutionProviderFallbackReport, PrefetchStep, SeamReason, drive_double_buffer,
-    exec_phase_stats, plan_double_buffer, print_exec_phase_profile, reset_exec_phase_profile,
+    ControlFlowStats, DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV, DensePrefetchGapStats,
+    DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
+    ExecutionProviderFallbackReport, PrefetchStep, SeamReason, dense_prefetch_gap_stats,
+    dense_weight_prefetch_lookahead_nodes, drive_double_buffer, exec_phase_stats,
+    plan_double_buffer, print_exec_phase_profile, reset_dense_prefetch_gap_stats,
+    reset_exec_phase_profile,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,

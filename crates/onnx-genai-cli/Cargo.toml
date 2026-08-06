@@ -49,7 +49,7 @@ native-backend = ["onnx-genai-server/native-backend"]
 # Native CUDA path: enables the native backend and our hand-written CUDA EP
 # (`onnx-runtime-ep-cuda`) through `onnx-genai-server/cuda`. Use this, not
 # `cuda`, when you want the native CUDA kernels compiled into the CLI.
-native-cuda = ["native-backend", "onnx-genai-server/cuda"]
+native-cuda = ["native-backend", "onnx-genai-server/cuda", "dep:onnx-runtime-ep-cuda"]
 mlas = ["onnx-genai-server/mlas"]
 
 [dependencies]
@@ -57,6 +57,7 @@ onnx-genai = { workspace = true }
 serde_json = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-server = { workspace = true }
+onnx-runtime-ep-cuda = { workspace = true, optional = true }
 clap = { workspace = true }
 ctrlc = { workspace = true }
 anyhow = { workspace = true }

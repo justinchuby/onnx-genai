@@ -992,6 +992,7 @@ impl ExecutionProvider for WeightDeliveryEp {
             ));
         }
         if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
+            || LazyWeightBoundary::MatMulNBits.matches(&op.domain, &op.op_type)
             || (op.is_default_domain() && op.op_type == "Identity")
         {
             KernelMatch::Supported {
@@ -1097,6 +1098,15 @@ impl ExecutionProvider for WeightDeliveryEp {
         }
         self.copy_bytes(src.as_ptr().cast(), dst.as_mut_ptr(), dst.len())
     }
+
+    fn prefetch_lazy_weight(
+        &self,
+        _key: u64,
+        _weight: &onnx_runtime_ep_api::LazyWeight,
+    ) -> onnx_runtime_ep_api::Result<bool> {
+        self.deliveries.lock().unwrap().push("prefetch");
+        Ok(true)
+    }
 }
 
 fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
@@ -1136,6 +1146,67 @@ fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     node.domain = "pkg.nxrt".into();
     graph.insert_node(node);
     graph.add_output(output);
+
+    let mut store = WeightStore::new();
+    store.map_external(&path).unwrap();
+    (graph, Arc::new(store), path)
+}
+
+fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"))
+        .join("weight-handle-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+    let path = root.join(format!("matmul-nbits-pair-{}-{id}.bin", std::process::id()));
+    std::fs::write(&path, [1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let first_weight = graph.create_named_value("first_weight", DataType::Uint8, static_shape([4]));
+    let second_weight =
+        graph.create_named_value("second_weight", DataType::Uint8, static_shape([4]));
+    graph.set_initializer(
+        first_weight,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 0,
+            length: 4,
+            dtype: DataType::Uint8,
+            dims: vec![4],
+        },
+    );
+    graph.set_initializer(
+        second_weight,
+        WeightRef::External {
+            path: path.clone(),
+            offset: 4,
+            length: 4,
+            dtype: DataType::Uint8,
+            dims: vec![4],
+        },
+    );
+    let first_output = graph.create_named_value("first_output", DataType::Uint8, static_shape([4]));
+    let final_output = graph.create_named_value("final_output", DataType::Uint8, static_shape([4]));
+    let mut first = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(first_weight)],
+        vec![first_output],
+    );
+    first.domain = "com.microsoft".into();
+    graph.insert_node(first);
+    let mut second = Node::new(
+        NodeId(1),
+        "MatMulNBits",
+        vec![Some(second_weight), Some(first_output)],
+        vec![final_output],
+    );
+    second.domain = "com.microsoft".into();
+    graph.insert_node(second);
+    graph.add_output(final_output);
 
     let mut store = WeightStore::new();
     store.map_external(&path).unwrap();
@@ -1286,6 +1357,33 @@ fn executor_selects_lazy_or_resident_weight_delivery_from_ep_capability() {
         drop(executor);
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "Miri cannot model the file-backed memmap2 mmap used by WeightStore::map_external"
+)]
+fn executor_prefetches_next_lazy_weight_before_current_node_runs() {
+    // This fixture deliberately uses an external initializer because the lazy
+    // weight production path requires mmap provenance. Miri rejects that mmap
+    // syscall before executor dispatch, so the Miri suite covers the pure
+    // executor prefetch machinery in `executor::prefetch::tests` instead.
+    let (graph, weights, path) = two_node_weight_delivery_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep: Arc<dyn ExecutionProvider> =
+        Arc::new(WeightDeliveryEp::new(true, Arc::clone(&deliveries)));
+    let mut executor = Executor::build(graph, weights, ep).unwrap();
+    let outputs = executor.run(&[]).unwrap();
+
+    assert_eq!(outputs[0].as_bytes(), &[5, 6, 7, 8]);
+    assert_eq!(
+        &*deliveries.lock().unwrap(),
+        &["prefetch", "lazy", "lazy"],
+        "the executor must drive a production lookahead call before dispatching node 0"
+    );
+    drop(executor);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

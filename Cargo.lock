@@ -2068,6 +2068,7 @@ dependencies = [
  "onnx-genai-engine",
  "onnx-genai-metadata",
  "onnx-genai-server",
+ "onnx-runtime-ep-cuda",
  "pyo3",
  "reedline",
  "serde_json",

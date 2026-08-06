@@ -332,6 +332,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         )))
     }
 
+    fn prefetch_lazy_weight(&self, key: u64, weight: &LazyWeight) -> Result<bool> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(false);
+        };
+        residency
+            .prefetch_materialized(key, weight)
+            .map_err(|error| EpError::KernelFailed(format!("weight offload prefetch: {error}")))
+    }
+
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
         // The context, stream, and cuBLASLt handle are created eagerly in
         // `new`; binding here confirms the device is reachable on this thread.
@@ -1250,14 +1259,17 @@ extern "C" __global__ void copy_out(const float* in, float* out, unsigned long l
             // fence, then a fenced consumer must observe the byte-identical
             // payload. Keeps the production API (not just its primitive chain)
             // under regression cover.
-            let (page, page_fence) = crate::weight_paging::CudaWeightPage::upload_async(
+            let staging = runtime.alloc_pinned(payload_bytes.len()).unwrap();
+            let (page, page_fence, staging) = crate::weight_paging::CudaWeightPage::upload_async(
                 &runtime,
                 DataType::Float32,
                 vec![n],
                 payload_bytes,
+                staging,
             )
             .unwrap();
             runtime.compute_wait_fence(page_fence).unwrap();
+            drop(staging);
             let page_p = cuptr(page.device_ptr());
             let mut consume = runtime.stream().launch_builder(&copy_out);
             consume.arg(&page_p).arg(&out_p).arg(&n_u64);

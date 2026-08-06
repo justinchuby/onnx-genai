@@ -481,7 +481,15 @@ impl Executor {
             Self::classify_special_values(&graph, &order);
 
         // 3) Build the structural per-node plan.
-        let plan = Self::build_node_plan(&graph, &order, &value_dtypes, has_symbols);
+        let capabilities = ep.capabilities();
+        let plan = Self::build_node_plan(
+            &graph,
+            &order,
+            &value_dtypes,
+            has_symbols,
+            &weight_handles,
+            &capabilities,
+        );
 
         // 4) name → value id and the set of caller-required inputs.
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
@@ -492,6 +500,8 @@ impl Executor {
             weights,
             ep,
             weight_handles,
+            prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
+            prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
             buffer_shapes,
             value_shapes,
@@ -1002,6 +1012,8 @@ impl Executor {
         order: &[NodeId],
         value_dtypes: &HashMap<ValueId, DataType>,
         has_symbols: bool,
+        weight_handles: &HashMap<ValueId, WeightHandle>,
+        capabilities: &onnx_runtime_ep_api::ExecutionProviderCapabilities,
     ) -> Vec<NodePlan> {
         let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
@@ -1037,6 +1049,20 @@ impl Executor {
                 })
                 .collect();
             let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
+            let mut lazy_weight_inputs = Vec::new();
+            if LazyWeightBoundary::MatMul.matches(&node.domain, &node.op_type)
+                || LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type)
+            {
+                for vid in inputs.iter().flatten() {
+                    if weight_handles
+                        .get(vid)
+                        .is_some_and(|handle| handle.is_lazy_for(capabilities))
+                        && !lazy_weight_inputs.contains(vid)
+                    {
+                        lazy_weight_inputs.push(*vid);
+                    }
+                }
+            }
             plan.push(NodePlan {
                 node_id: nid,
                 inputs,
@@ -1044,6 +1070,7 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
+                lazy_weight_inputs,
             });
         }
         let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();

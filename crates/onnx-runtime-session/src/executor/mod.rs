@@ -45,6 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
@@ -336,6 +337,59 @@ fn print_op_profile(total: Duration, timings: HashMap<String, (Duration, usize)>
     }
 }
 
+static DENSE_PREFETCH_GAP_JOINS: AtomicU64 = AtomicU64::new(0);
+static DENSE_PREFETCH_GAP_NODES: AtomicU64 = AtomicU64::new(0);
+static DENSE_PREFETCH_GAP_MAX: AtomicU64 = AtomicU64::new(0);
+
+pub const DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV: &str =
+    "ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH_LOOKAHEAD_NODES";
+const DEFAULT_DENSE_WEIGHT_PREFETCH_LOOKAHEAD_NODES: usize = 1;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DensePrefetchGapStats {
+    pub joins: u64,
+    pub nodes_between_sum: u64,
+    pub nodes_between_max: u64,
+}
+
+pub fn dense_prefetch_gap_stats() -> DensePrefetchGapStats {
+    DensePrefetchGapStats {
+        joins: DENSE_PREFETCH_GAP_JOINS.load(Ordering::Relaxed),
+        nodes_between_sum: DENSE_PREFETCH_GAP_NODES.load(Ordering::Relaxed),
+        nodes_between_max: DENSE_PREFETCH_GAP_MAX.load(Ordering::Relaxed),
+    }
+}
+
+pub fn dense_weight_prefetch_lookahead_nodes() -> usize {
+    std::env::var(DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DENSE_WEIGHT_PREFETCH_LOOKAHEAD_NODES)
+}
+
+pub fn reset_dense_prefetch_gap_stats() {
+    DENSE_PREFETCH_GAP_JOINS.store(0, Ordering::Relaxed);
+    DENSE_PREFETCH_GAP_NODES.store(0, Ordering::Relaxed);
+    DENSE_PREFETCH_GAP_MAX.store(0, Ordering::Relaxed);
+}
+
+fn record_dense_prefetch_gap(nodes_between: u64) {
+    DENSE_PREFETCH_GAP_JOINS.fetch_add(1, Ordering::Relaxed);
+    DENSE_PREFETCH_GAP_NODES.fetch_add(nodes_between, Ordering::Relaxed);
+    let mut current = DENSE_PREFETCH_GAP_MAX.load(Ordering::Relaxed);
+    while nodes_between > current {
+        match DENSE_PREFETCH_GAP_MAX.compare_exchange_weak(
+            current,
+            nodes_between,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// A per-node compiled entry: the structural facts the run loop needs without
 /// re-deriving them from the graph. Shapes are **not** baked here — they are
 /// resolved per run from the bound inputs (see module docs).
@@ -359,6 +413,8 @@ pub(crate) struct NodePlan {
     /// Inputs consumed for the final time by this node and therefore eligible for
     /// a kernel-authorized in-place overwrite after additional runtime guards.
     pub inplace_dead_inputs: Vec<bool>,
+    /// Lazy weight inputs this node may ask the EP to page at dispatch time.
+    pub lazy_weight_inputs: Vec<ValueId>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
