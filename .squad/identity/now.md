@@ -1,6 +1,6 @@
 # Team Focus — now
 
-**Current focus:** 35B-A3B native sparse QMoE shipped (#625+#676 merged, 12.5-14.8x over ORT); next = issue #610 scorecard update + scale to larger models.
+**Current focus:** 35B-A3B QMoE 62 tok/s (#684); hybrid Mamba continuation correctness fixed (#695/#700), ORT-path follow-up #701. Next perf levers: CUDA-graph capture repair + norm fusion (~50x above roofline).
 
 **MERGED THIS WAVE (2026-08-01):** #571 (capture default-on, native beats ORT 1.44× dense byte-identical), #572 (async weight-offload page-in → opt-in), #573 (loader auto-derives io kv/state_pairs → stock qwen3.x linear-attn 27b runs natively, byte-identical CUDA==CPU oracle GPU e2e), #575 (CI hotfix: DeviceOffloadPolicy Default derivable — unblocked CUDA-compile clippy -D warnings lane), **#574 (Lever 2 op-1: CUDA Transpose → persistent metadata, capture-eligible; byte-identical; Harry-approved, guard mutation-proven)**, **#577 (Lever 2 op-2: CUDA Tile → persistent metadata; Harry-approved; repeats-uniqueness crux proven sound at kernel level; +1.9% 27b re-measured, byte-identical tokens; 22/22 construction_gpu)**.
 
