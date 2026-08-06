@@ -282,6 +282,14 @@ impl EngineResourceGovernor {
         onnx_runtime_memory_governor::MemoryGovernor::used(&self.memory, tier)
     }
 
+    /// Bytes by which the device ledger exceeds its live ceiling.
+    pub fn device_oversubscribed_bytes(&self) -> u64 {
+        onnx_runtime_memory_governor::MemoryGovernor::oversubscribed_bytes(
+            &self.memory,
+            onnx_runtime_memory_governor::Tier::Device,
+        )
+    }
+
     pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {
         &self.memory
     }

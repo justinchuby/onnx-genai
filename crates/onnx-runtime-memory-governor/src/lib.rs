@@ -56,9 +56,9 @@
 //!
 //! ## The invariants this crate enforces
 //!
-//! * **G1** For every tier, the sum of live leases never exceeds that tier's
-//!   limit. There is no advisory mode: a limit that can be exceeded is not a
-//!   limit.
+//! * **G1** New reservations never make the sum of live leases exceed a tier's
+//!   limit. Already-committed memory is recorded even when it exceeds the
+//!   limit, because refusing to count it would make later admission optimistic.
 //! * **G2** A lease is released exactly once, on drop, and releasing cannot
 //!   fail. Callers cannot leak a reservation by taking an early return.
 //! * **G3** The governor never frees anyone's memory. It asks holders through
@@ -258,6 +258,11 @@ impl LeaseLedger {
         self.limit(tier).saturating_sub(self.used(tier))
     }
 
+    /// Bytes by which current leases exceed `tier`'s ceiling.
+    pub fn oversubscribed_bytes(&self, tier: Tier) -> u64 {
+        self.used(tier).saturating_sub(self.limit(tier))
+    }
+
     /// Replace a tier ceiling.
     ///
     /// Lowering below current usage is allowed and does **not** revoke anything:
@@ -292,6 +297,30 @@ impl LeaseLedger {
                     role,
                 });
             }
+            match self.used[index].compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    /// Record bytes that are already committed, even if the tier is over limit.
+    fn record_claim(&self, tier: Tier, bytes: u64) -> Result<(), MemoryError> {
+        let index = tier.index();
+        let mut used = self.used[index].load(Ordering::Acquire);
+        loop {
+            let Some(next) = used.checked_add(bytes) else {
+                return Err(MemoryError::InvalidRequest {
+                    tier: tier.name(),
+                    requested: bytes,
+                    reason: "the request overflows the tier's byte counter",
+                });
+            };
             match self.used[index].compare_exchange_weak(
                 used,
                 next,
@@ -472,8 +501,44 @@ pub trait MemoryGovernor {
         holder: HolderId,
     ) -> Result<MemoryLease, MemoryError>;
 
+    /// Record `bytes` on `tier` that are already committed for `role`.
+    ///
+    /// Unlike [`reserve`](MemoryGovernor::reserve), this is not an admission
+    /// request. `reserve` asks "may I take these bytes?", which has a
+    /// legitimate no. This states "I have taken these bytes", and refusing to
+    /// record that fact does not un-commit memory; it only makes the ledger
+    /// report room that does not exist.
+    ///
+    /// A tier may go over its limit as a result. That is the correct failure
+    /// mode: an over-subscribed tier that says it is over-subscribed lets
+    /// admission become conservative, whereas a refused record reproduces the
+    /// two-sets-of-books bug this contract exists to remove.
+    ///
+    /// The default delegates to [`reserve`](MemoryGovernor::reserve) so
+    /// existing third-party governors keep compiling. Governors that own a
+    /// real ledger should override this to record the accomplished fact.
+    fn record_committed(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<MemoryLease, MemoryError> {
+        self.reserve(tier, bytes, role, holder)
+    }
+
     /// Bytes currently grantable on `tier`.
     fn available(&self, tier: Tier) -> u64;
+
+    /// Bytes by which current leases exceed `tier`'s ceiling.
+    ///
+    /// This is separate from [`available`](MemoryGovernor::available) because
+    /// `available` is a grantable-byte count and therefore saturates at zero.
+    /// Zero can mean exactly full or over by gigabytes; only the second is an
+    /// accounting fault admission must surface.
+    fn oversubscribed_bytes(&self, _tier: Tier) -> u64 {
+        0
+    }
 
     /// Bytes currently leased on `tier`, across every holder.
     ///
@@ -530,8 +595,29 @@ impl MemoryGovernor for LedgerGovernor {
         ))
     }
 
+    fn record_committed(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<MemoryLease, MemoryError> {
+        self.ledger.record_claim(tier, bytes)?;
+        Ok(MemoryLease::new(
+            tier,
+            bytes,
+            role,
+            holder,
+            Arc::clone(&self.ledger) as Arc<dyn LeaseAccounting>,
+        ))
+    }
+
     fn available(&self, tier: Tier) -> u64 {
         self.ledger.available(tier)
+    }
+
+    fn oversubscribed_bytes(&self, tier: Tier) -> u64 {
+        self.ledger.oversubscribed_bytes(tier)
     }
 
     fn used(&self, tier: Tier) -> u64 {
@@ -548,6 +634,44 @@ mod tests {
     }
 
     const H: HolderId = HolderId::new(1);
+
+    #[test]
+    fn record_committed_records_already_taken_bytes_even_over_limit() {
+        let governor = governor(10, 0, 0);
+        let held_first = governor
+            .reserve(Tier::Device, 8, MemoryRole::Weights, H)
+            .expect("initial lease fits");
+
+        let already_committed = governor
+            .record_committed(Tier::Device, 5, MemoryRole::Weights, HolderId::new(2))
+            .expect("recording committed bytes is not an admission request");
+
+        assert_eq!(
+            governor.used(Tier::Device),
+            13,
+            "the ledger must report the true total after recording committed memory"
+        );
+        assert_eq!(governor.available(Tier::Device), 0);
+
+        drop(already_committed);
+        assert_eq!(governor.used(Tier::Device), 8);
+        drop(held_first);
+        assert_eq!(governor.used(Tier::Device), 0);
+    }
+
+    #[test]
+    fn oversubscribed_bytes_reports_excess_beyond_the_limit() {
+        let governor = governor(10, 0, 0);
+        let _first = governor
+            .reserve(Tier::Device, 8, MemoryRole::Weights, H)
+            .expect("initial lease fits");
+        let _committed = governor
+            .record_committed(Tier::Device, 5, MemoryRole::Weights, HolderId::new(2))
+            .expect("already committed memory is recorded");
+
+        assert_eq!(governor.available(Tier::Device), 0);
+        assert_eq!(governor.oversubscribed_bytes(Tier::Device), 3);
+    }
 
     /// Shrinking then dropping releases each byte exactly once.
     ///

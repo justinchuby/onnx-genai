@@ -871,17 +871,13 @@ impl ExecutionProvider for CudaExecutionProvider {
             // The arena has been serving allocations against its own ledger
             // since construction. Move the claim to the real one now that it
             // exists.
-            match arena.adopt_governor(governor, holder) {
-                Ok(bytes) => eprintln!(
+            let adoption = arena.adopt_governor(governor, holder);
+            if adoption.recorded_bytes > 0 {
+                let bytes = adoption.recorded_bytes;
+                eprintln!(
                     "cuda_ep: VMM arena joined the memory ledger holding {bytes} bytes already \
                      committed"
-                ),
-                Err(error) => eprintln!(
-                    "cuda_ep: WARNING: the memory ledger refused the VMM arena's {} committed \
-                     bytes: {error}; the arena keeps its own accounting and the ledger \
-                     understates device use",
-                    arena.committed_and_reserved().0
-                ),
+                );
             }
         }
 

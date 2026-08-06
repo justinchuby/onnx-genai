@@ -138,6 +138,16 @@ static GLOBAL_REF_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
 /// actually the opposite. Clamping keeps the reading sane; this counter is how
 /// the underlying fault stays visible rather than being smoothed away.
 static GLOBAL_BYTE_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+/// Committed bytes the arena could not move from its private startup ledger
+/// into the adopted governor.
+///
+/// Always zero for the reference governor. A non-zero value means a
+/// third-party governor kept the compatibility default for `record_committed`
+/// and refused a bookkeeping record for bytes already mapped. Continuing is
+/// less disruptive than failing a load that can run, but the number must stay
+/// visible because downstream admission now reads a ledger that understates
+/// device use.
+static GLOBAL_UNACCOUNTED_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Subtract without wrapping, recording the fault if the counter would go
 /// negative.
@@ -193,6 +203,12 @@ pub struct GlobalVmmStats {
     /// count -- which looks like a catastrophic leak and is actually the
     /// opposite.
     pub byte_underflows: u64,
+    /// Committed bytes not recorded in the adopted memory ledger.
+    ///
+    /// **Anything but zero is a fault.** The memory is mapped, but admission
+    /// will not see it through the governor and can therefore over-admit later
+    /// work.
+    pub unaccounted_committed_bytes: u64,
 }
 
 /// Read the process-global VMM arena counters.
@@ -210,6 +226,7 @@ pub fn global_vmm_stats() -> GlobalVmmStats {
         allocations: GLOBAL_ALLOCATIONS.load(Ordering::Relaxed),
         ref_underflows: GLOBAL_REF_UNDERFLOWS.load(Ordering::Relaxed),
         byte_underflows: GLOBAL_BYTE_UNDERFLOWS.load(Ordering::Relaxed),
+        unaccounted_committed_bytes: GLOBAL_UNACCOUNTED_COMMITTED_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -224,6 +241,7 @@ pub fn reset_global_vmm_stats() {
     GLOBAL_ALLOCATIONS.store(0, Ordering::Relaxed);
     GLOBAL_REF_UNDERFLOWS.store(0, Ordering::Relaxed);
     GLOBAL_BYTE_UNDERFLOWS.store(0, Ordering::Relaxed);
+    GLOBAL_UNACCOUNTED_COMMITTED_BYTES.store(0, Ordering::Relaxed);
 }
 
 fn note_commit(granularity: usize) {
@@ -370,13 +388,21 @@ struct Arena {
     reservation: <CudaVirtualBacking as VirtualBacking>::Reservation,
     spans: Spans,
     /// The ledger claim covering every committed granule.
-    /// The ledger claim covering every committed granule.
     ///
     /// Taken at construction at zero bytes so every commit is a `grow` on an
     /// existing claim. That keeps the governor out of this type: a lease is
     /// owned, a `&dyn` borrow is not, and the execution-provider contract
     /// hands over the latter.
     lease: MemoryLease,
+}
+
+/// Result of moving an arena's committed-byte claim to a real governor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmmAdoption {
+    /// Bytes recorded in the adopted governor.
+    pub recorded_bytes: u64,
+    /// Bytes still held only by the arena's private startup ledger.
+    pub unaccounted_bytes: u64,
 }
 
 /// Device memory carved out of one reserved address range, with physical
@@ -449,25 +475,35 @@ impl CudaVmmAllocator {
         )
     }
 
-    /// Move this arena's claim onto `governor`, reporting the bytes it now
-    /// holds there.
+    /// Move this arena's claim onto `governor`, reporting what was recorded.
     ///
-    /// Takes a lease for everything currently committed. If the governor
-    /// refuses, the arena keeps its previous claim and the caller learns the
-    /// shortfall -- the memory is already mapped, so failing here must not
-    /// unmap it.
-    pub fn adopt_governor(
-        &self,
-        governor: &dyn MemoryGovernor,
-        holder: HolderId,
-    ) -> Result<u64, MemoryError> {
+    /// The bytes are already committed and mapped, so adoption records an
+    /// accomplished fact rather than asking for permission. If a third-party
+    /// governor keeps the compatibility default and refuses, the arena keeps
+    /// its private claim and records a visible accounting fault instead of
+    /// failing a load that can otherwise run.
+    pub fn adopt_governor(&self, governor: &dyn MemoryGovernor, holder: HolderId) -> VmmAdoption {
         let mut arena = self.lock();
         let committed = arena.spans.committed as u64;
-        let lease = governor.reserve(Tier::Device, committed, self.role, holder)?;
-        // Replacing the lease drops the private one, which returns the bytes to
-        // a ledger nobody reads. The real governor now holds them.
-        arena.lease = lease;
-        Ok(committed)
+        match governor.record_committed(Tier::Device, committed, self.role, holder) {
+            Ok(lease) => {
+                // Replacing the lease drops the private one, which returns the
+                // bytes to a ledger nobody reads. The real governor now holds
+                // them, even if doing so puts the tier over its limit.
+                arena.lease = lease;
+                VmmAdoption {
+                    recorded_bytes: committed,
+                    unaccounted_bytes: 0,
+                }
+            }
+            Err(_) => {
+                GLOBAL_UNACCOUNTED_COMMITTED_BYTES.fetch_add(committed, Ordering::Relaxed);
+                VmmAdoption {
+                    recorded_bytes: 0,
+                    unaccounted_bytes: committed,
+                }
+            }
+        }
     }
 
     /// Reserve `capacity` bytes of device address space to allocate from.
