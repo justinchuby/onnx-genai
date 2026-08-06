@@ -43,6 +43,16 @@
 //! top-2 (next candidate ~1.3 logits back) and their gap is < 0.1 logit across
 //! every precision — the signature of a rounding-order flip, not a logic bug.
 //!
+//! ## Teacher-forcing must use a fresh engine
+//!
+//! Every teacher-forced adjudication above runs on a **fresh** engine that has
+//! not decoded anything. This is load-bearing for a hybrid Mamba model: reusing
+//! an engine that already generated the prefix serves the step from the prefix /
+//! decode caches, which restore attention KV but *not* the conv/recurrent
+//! (`Mamba`) state, so the teacher-forced logits come from a corrupted state and
+//! the argmax collapses to an unrelated token (279) instead of 33803. The QMoE
+//! row above is only reproducible on a fresh engine.
+//!
 //! ## Building the fp32 oracle
 //!
 //! These exports are natively fp16 (fp16 activations/scales), so there is no
@@ -209,9 +219,26 @@ fn qwen36_35b_a3b_qmoe_native_cuda_matches_fp32_oracle() -> anyhow::Result<()> {
     let mut context = prompt_ids.clone();
     context.extend_from_slice(&qmoe_stream[..DIVERGENCE_INDEX]);
 
-    // 2) QMoE teacher-forced at that context: argmax is the oracle token, the
-    //    runner-up is the dense-CUDA outlier, and the tie is the benign band.
-    let qmoe_step = teacher_forced_step(&mut qmoe, &context, 8)?;
+    // Free the autoregressive engine before teacher-forcing. The teacher-forced
+    // step MUST run on a FRESH engine. This is a hybrid Mamba model: reusing the
+    // engine that just decoded 120 tokens serves the next step from the prefix /
+    // decode caches, which restore attention KV but NOT the conv/recurrent
+    // (`Mamba`) state. A reused-engine teacher-forced step therefore predicts from
+    // a corrupted state and argmaxes an unrelated token (empirically 33803's slot
+    // collapses to 279 — byte-identical on the serial and the parallel (#684) QMoE
+    // kernels, i.e. not a kernel bug). A fresh engine re-runs the full prefill and
+    // reproduces the fp32-oracle tie.
+    drop(qmoe);
+
+    // 2) QMoE teacher-forced on a fresh engine at that context: argmax is the
+    //    oracle token, the runner-up is the dense-CUDA outlier, and the tie is the
+    //    benign band.
+    let mut qmoe_tf = engine(
+        &qmoe_dir,
+        EngineDecodeBackend::Native,
+        NativeDecodeDevice::Cuda { index: Some(0) },
+    )?;
+    let qmoe_step = teacher_forced_step(&mut qmoe_tf, &context, 8)?;
     assert_eq!(
         argmax(&qmoe_step),
         ORACLE_TOKEN,
@@ -222,7 +249,7 @@ fn qwen36_35b_a3b_qmoe_native_cuda_matches_fp32_oracle() -> anyhow::Result<()> {
         MARGIN_BAND.contains(&margin),
         "QMoE {ORACLE_TOKEN}-over-{DENSE_CUDA_TOKEN} tie {margin} outside {MARGIN_BAND:?}",
     );
-    drop(qmoe);
+    drop(qmoe_tf);
 
     // 3) DENSE int4 CUDA autoregressive decode is the lower-precision outlier:
     //    its recurrent-state drift tips this tie to DENSE_CUDA_TOKEN. Confirm the
