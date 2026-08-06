@@ -560,6 +560,16 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        let full = 0..size;
+        self.allocate_committed(size, alignment, std::slice::from_ref(&full))
+    }
+
+    fn allocate_committed(
+        &self,
+        size: usize,
+        alignment: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+    ) -> Result<DeviceBuffer> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
@@ -572,7 +582,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         // same value; normalising a zero-byte request is the allocator's job,
         // because the contract lets an implementation rely on the two sizes
         // agreeing.
-        let ptr = self.memory().allocate(size, alignment).map_err(|error| {
+        let ptr = self
+            .memory()
+            .allocate_committed(size, alignment, committed_ranges)
+            .map_err(|error| {
             // Keep what the allocator said. Reporting every failure as "out of
             // memory" would describe an alignment rejection or a dead context
             // as exhausted VRAM and send the reader looking in the wrong place.
@@ -589,6 +602,68 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(unsafe {
             DeviceBuffer::from_raw_parts(ptr.as_ptr().cast(), self.device, size, alignment)
         })
+    }
+
+    fn commit_allocation_range(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        assert_eq!(
+            buffer.device(),
+            self.device,
+            "cuda_ep: refusing to commit a buffer from device {:?}",
+            buffer.device()
+        );
+        let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
+            return Ok(());
+        };
+        self.memory()
+            .commit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not commit range {offset}..{} of {} byte allocation on CUDA device {}: {error}",
+                    offset.saturating_add(bytes),
+                    buffer.len(),
+                    self.device.index
+                ))
+            })
+    }
+
+    fn decommit_allocation_range(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        assert_eq!(
+            buffer.device(),
+            self.device,
+            "cuda_ep: refusing to decommit a buffer from device {:?}",
+            buffer.device()
+        );
+        let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
+            return Ok(());
+        };
+        self.memory()
+            .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not decommit range {offset}..{} of {} byte allocation on CUDA device {}: {error}",
+                    offset.saturating_add(bytes),
+                    buffer.len(),
+                    self.device.index
+                ))
+            })
+    }
+
+    fn allocation_committed_bytes(&self, buffer: &DeviceBuffer) -> usize {
+        let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
+            return 0;
+        };
+        self.memory()
+            .allocation_committed_bytes(ptr, buffer.len(), buffer.alignment())
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {

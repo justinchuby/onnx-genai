@@ -49,7 +49,7 @@
 //!
 //! [`CudaDeviceAllocator`]: crate::device_allocator::CudaDeviceAllocator
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -309,11 +309,18 @@ struct Spans {
     /// Free spans as `offset -> len`, kept coalesced so an allocation freed
     /// next to another leaves one span rather than two.
     free: BTreeMap<usize, usize>,
-    /// Live spans as `offset -> len`, so `deallocate` can be told the length
-    /// even when the caller's `bytes` disagrees with what was rounded out.
-    live: BTreeMap<usize, usize>,
+    /// Live spans as `offset -> span`, so `deallocate` can release exactly the
+    /// granules this allocation claimed even when it reserved more address
+    /// space than it committed.
+    live: BTreeMap<usize, LiveSpan>,
     /// Bytes currently committed, which is `lease.bytes()` when a lease exists.
     committed: usize,
+}
+
+#[derive(Debug)]
+struct LiveSpan {
+    len: usize,
+    committed: BTreeSet<usize>,
 }
 
 impl Spans {
@@ -579,20 +586,24 @@ impl CudaVmmAllocator {
     /// the budget decorative.
     ///
     /// [`VirtualBuffer`]: onnx_runtime_virtual_memory::VirtualBuffer
-    fn commit_range(
+    fn claim_granules(
         &self,
         arena: &mut Arena,
-        range: std::ops::Range<usize>,
-    ) -> Result<(), MemoryError> {
+        granules: impl IntoIterator<Item = usize>,
+    ) -> Result<BTreeSet<usize>, MemoryError> {
         let granularity = arena.spans.granularity;
-        let mut mapped: Vec<usize> = Vec::new();
-        for granule in range {
+        let mut claimed = BTreeSet::new();
+        for granule in granules {
+            if !claimed.insert(granule) {
+                continue;
+            }
             if arena.spans.granule_refs[granule] > 0 {
                 arena.spans.granule_refs[granule] += 1;
                 continue;
             }
             if let Err(error) = self.take(arena, granularity) {
-                self.undo(arena, &mapped, granularity);
+                claimed.remove(&granule);
+                self.release_granules(arena, &claimed);
                 return Err(error);
             }
             let offset = granule * granularity;
@@ -601,30 +612,15 @@ impl CudaVmmAllocator {
                 .commit(&mut arena.reservation, offset, granularity)
             {
                 self.give_back_lease(arena, granularity);
-                self.undo(arena, &mapped, granularity);
+                claimed.remove(&granule);
+                self.release_granules(arena, &claimed);
                 return Err(invalid(granularity, format!("cuMemMap: {error}")));
             }
             arena.spans.granule_refs[granule] = 1;
             arena.spans.committed += granularity;
             note_commit(granularity);
-            mapped.push(granule);
         }
-        Ok(())
-    }
-
-    /// Roll back the granules this call had already taken, so a failure
-    /// halfway through leaves the arena as it was found.
-    fn undo(&self, arena: &mut Arena, mapped: &[usize], granularity: usize) {
-        for &granule in mapped {
-            arena.spans.granule_refs[granule] = 0;
-            let offset = granule * granularity;
-            let _ = self
-                .backing
-                .release(&mut arena.reservation, offset, granularity);
-            arena.spans.committed -= granularity;
-            note_release(granularity);
-            self.give_back_lease(arena, granularity);
-        }
+        Ok(claimed)
     }
 
     fn take(&self, arena: &mut Arena, bytes: usize) -> Result<(), MemoryError> {
@@ -635,35 +631,13 @@ impl CudaVmmAllocator {
         arena.lease.shrink(bytes as u64);
     }
 
-    /// Drop this call's claim on `range`, unmapping whatever it was the last
-    /// user of.
-    fn release_range(&self, arena: &mut Arena, range: std::ops::Range<usize>) {
+    /// Drop this allocation's claims, unmapping whatever it was the last user
+    /// of.
+    fn release_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
         let granularity = arena.spans.granularity;
-        for granule in range {
+        for &granule in granules.iter().rev() {
             match arena.spans.granule_refs[granule].checked_sub(1) {
-                Some(0) | None => {
-                    if arena.spans.granule_refs[granule] == 0 {
-                        // Already released. Continuing is the safe action --
-                        // unmapping here would pull memory out from under
-                        // whichever allocation still holds the granule.
-                        //
-                        // But reaching this line at all means the reference
-                        // counts no longer balance: every granule a live
-                        // allocation covers is supposed to hold exactly one
-                        // reference for it. Silently absorbing that is how a
-                        // refcount bug becomes invisible memory corruption
-                        // instead of a failure, so it is counted. Debug builds
-                        // refuse it outright, because a test that provokes an
-                        // imbalance should fail rather than pass quietly.
-                        GLOBAL_REF_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
-                        debug_assert!(
-                            false,
-                            "vmm arena: released granule {granule} whose reference count was \
-                             already zero -- some allocation committed it without taking a \
-                             reference, or freed it twice"
-                        );
-                        continue;
-                    }
+                Some(0) => {
                     arena.spans.granule_refs[granule] = 0;
                     let offset = granule * granularity;
                     let _ = self
@@ -674,8 +648,29 @@ impl CudaVmmAllocator {
                     self.give_back_lease(arena, granularity);
                 }
                 Some(remaining) => arena.spans.granule_refs[granule] = remaining,
+                None => {
+                    // Already released. Continuing is the safe action --
+                    // unmapping here would pull memory out from under
+                    // whichever allocation still holds the granule.
+                    //
+                    // But reaching this line at all means the reference counts
+                    // no longer balance. It is counted for release builds and
+                    // asserted in debug builds, rather than panicking from a
+                    // Drop-reachable path and aborting during unwinding.
+                    GLOBAL_REF_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+                    debug_assert!(
+                        false,
+                        "vmm arena: released granule {granule} whose reference count was \
+                         already zero -- some allocation committed it without taking a \
+                         reference, or freed it twice"
+                    );
+                }
             }
         }
+    }
+
+    fn release_committed_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
+        self.release_granules(arena, granules);
     }
 }
 
@@ -695,6 +690,16 @@ fn aligned_fits(start: usize, span: usize, len: usize, align: usize) -> bool {
 // `device` names the CUDA device the reservation belongs to.
 impl DeviceAllocator for CudaVmmAllocator {
     fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        let full = 0..bytes;
+        self.allocate_committed(bytes, align, std::slice::from_ref(&full))
+    }
+
+    fn allocate_committed(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+    ) -> Result<NonNull<u8>, MemoryError> {
         if bytes == 0 {
             return Err(invalid(
                 bytes,
@@ -720,17 +725,202 @@ impl DeviceAllocator for CudaVmmAllocator {
                 ),
             ));
         };
-        let granules = arena.spans.granules(offset, bytes);
-        if let Err(error) = self.commit_range(&mut arena, granules) {
-            arena.spans.give_back(offset, bytes);
-            return Err(error);
+        let mut committed = BTreeSet::new();
+        for range in committed_ranges {
+            if range.start > range.end || range.end > bytes {
+                self.release_committed_granules(&mut arena, &committed);
+                arena.spans.give_back(offset, bytes);
+                return Err(invalid(
+                    bytes,
+                    format!(
+                        "committed subrange {}..{} lies outside allocation of {bytes} bytes",
+                        range.start, range.end
+                    ),
+                ));
+            }
+            if range.is_empty() {
+                continue;
+            }
+            let absolute = offset + range.start..offset + range.end;
+            let granules = arena
+                .spans
+                .granules(absolute.start, absolute.len())
+                .filter(|granule| !committed.contains(granule))
+                .collect::<Vec<_>>();
+            let claimed = match self.claim_granules(&mut arena, granules) {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    self.release_committed_granules(&mut arena, &committed);
+                    arena.spans.give_back(offset, bytes);
+                    return Err(error);
+                }
+            };
+            committed.extend(claimed);
         }
-        arena.spans.live.insert(offset, bytes);
+        arena.spans.live.insert(
+            offset,
+            LiveSpan {
+                len: bytes,
+                committed,
+            },
+        );
         GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
         // SAFETY: `base` is non-null (cuMemAddressReserve refuses otherwise) and
         // `offset` is within the reservation, so the sum cannot be null.
         Ok(unsafe { NonNull::new_unchecked((base + offset) as *mut u8) })
+    }
+
+    fn commit_allocation_range(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        _align: usize,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let end = byte_offset.checked_add(bytes).ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                format!("commit range offset {byte_offset} plus {bytes} bytes overflows"),
+            )
+        })?;
+        if end > allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "commit range {byte_offset}..{end} exceeds allocation of {allocation_bytes} bytes"
+                ),
+            ));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return Err(invalid(
+                allocation_bytes,
+                "commit pointer is below the VMM arena reservation".to_string(),
+            ));
+        };
+        let Some(live) = arena.spans.live.get(&offset) else {
+            return Err(invalid(
+                allocation_bytes,
+                "commit pointer is not a live VMM allocation".to_string(),
+            ));
+        };
+        let len = live.len;
+        if len != allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "commit allocation size {allocation_bytes} does not match live VMM allocation size {len}"
+                ),
+            ));
+        }
+        let absolute = offset + byte_offset..offset + end;
+        let granules = arena
+            .spans
+            .granules(absolute.start, absolute.len())
+            .filter(|granule| !live.committed.contains(granule))
+            .collect::<Vec<_>>();
+        let claimed = self.claim_granules(&mut arena, granules)?;
+        if let Some(live) = arena.spans.live.get_mut(&offset) {
+            live.committed.extend(claimed);
+        }
+        Ok(())
+    }
+
+    fn decommit_allocation_range(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        _align: usize,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let end = byte_offset.checked_add(bytes).ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                format!("decommit range offset {byte_offset} plus {bytes} bytes overflows"),
+            )
+        })?;
+        if end > allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "decommit range {byte_offset}..{end} exceeds allocation of {allocation_bytes} bytes"
+                ),
+            ));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return Err(invalid(
+                allocation_bytes,
+                "decommit pointer is below the VMM arena reservation".to_string(),
+            ));
+        };
+        let Some(live) = arena.spans.live.get(&offset) else {
+            return Err(invalid(
+                allocation_bytes,
+                "decommit pointer is not a live VMM allocation".to_string(),
+            ));
+        };
+        if live.len != allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "decommit allocation size {allocation_bytes} does not match live VMM allocation size {}",
+                    live.len
+                ),
+            ));
+        }
+        let granularity = arena.spans.granularity;
+        let absolute_start = offset + byte_offset;
+        let absolute_end = offset + end;
+        let releasable = live
+            .committed
+            .iter()
+            .copied()
+            .filter(|granule| {
+                let start = granule * granularity;
+                start >= absolute_start && start < absolute_end
+            })
+            .collect::<BTreeSet<_>>();
+        self.release_committed_granules(&mut arena, &releasable);
+        if let Some(live) = arena.spans.live.get_mut(&offset) {
+            for granule in releasable {
+                live.committed.remove(&granule);
+            }
+        }
+        Ok(())
+    }
+
+    fn allocation_committed_bytes(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        _align: usize,
+    ) -> usize {
+        let arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return allocation_bytes;
+        };
+        arena
+            .spans
+            .live
+            .get(&offset)
+            .map(|live| live.committed.len() * arena.spans.granularity)
+            .unwrap_or(allocation_bytes)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
@@ -743,12 +933,11 @@ impl DeviceAllocator for CudaVmmAllocator {
         // The recorded length wins over the caller's: `allocate` is free to
         // hand back a span it rounded, and freeing the caller's figure would
         // leave the difference unreachable.
-        let Some(len) = arena.spans.live.remove(&offset) else {
+        let Some(live) = arena.spans.live.remove(&offset) else {
             return;
         };
-        let granules = arena.spans.granules(offset, len);
-        self.release_range(&mut arena, granules);
-        arena.spans.give_back(offset, len);
+        self.release_committed_granules(&mut arena, &live.committed);
+        arena.spans.give_back(offset, live.len);
     }
 
     /// True: spans are carved from granules mapped as they are needed, and

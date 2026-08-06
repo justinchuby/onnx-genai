@@ -111,6 +111,240 @@ fn an_allocation_commits_a_granule_and_the_ledger_sees_it() {
     );
 }
 
+/// A partial commit is a real allocation claim, not just a map operation.
+///
+/// KV reserves a large span and commits pieces later. If those late commits do
+/// not take a per-allocation reference, a neighboring workspace that shares the
+/// boundary granule can free first and unmap live KV. This test reproduces that
+/// boundary sharing and asserts the committed granule survives until the KV-like
+/// span itself is freed.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn late_committed_ranges_hold_their_own_granule_reference() {
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
+
+    let probe = allocator.allocate(4096, 256).expect("probe allocation");
+    let granularity = allocator.committed_and_reserved().0;
+    unsafe { allocator.deallocate(probe, 4096, 256) };
+    assert!(granularity >= 4096, "probe reveals a real granule");
+
+    let kv_len = granularity + 4096;
+    let kv = allocator
+        .allocate_committed(kv_len, 256, &[])
+        .expect("reserve KV-like span without committing");
+    let workspace = allocator
+        .allocate(4096, 256)
+        .expect("workspace shares KV's tail granule");
+    assert_eq!(allocator.committed_and_reserved().0, granularity);
+
+    allocator
+        .commit_allocation_range(kv, kv_len, 256, granularity, 4096)
+        .expect("KV commits into the shared tail granule");
+    unsafe { allocator.deallocate(workspace, 4096, 256) };
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        granularity,
+        "freeing the workspace must not unmap the KV-owned tail granule"
+    );
+
+    unsafe { allocator.deallocate(kv, kv_len, 256) };
+    assert_eq!(allocator.committed_and_reserved().0, 0);
+    assert_eq!(
+        governor.used(Tier::Device),
+        0,
+        "partial committed ranges must release their ledger bytes on free"
+    );
+}
+
+/// A partially committed allocation must release only the granules it claimed.
+///
+/// KV reserves a span much larger than the tokens it has reached. Releasing
+/// every granule the virtual span overlaps would decrement a neighbor's
+/// reference in an uncommitted tail bucket and unmap live workspace memory.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn partially_committed_free_does_not_release_neighbor_granules() {
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
+
+    let probe = allocator.allocate(4096, 256).expect("probe allocation");
+    let granularity = allocator.committed_and_reserved().0;
+    unsafe { allocator.deallocate(probe, 4096, 256) };
+    assert!(granularity >= 4096, "probe reveals a real granule");
+
+    let kv_len = granularity + 4096;
+    let first_bucket = 0..4096;
+    let kv = allocator
+        .allocate_committed(kv_len, 256, std::slice::from_ref(&first_bucket))
+        .expect("KV-like span commits only its first bucket");
+    let workspace = allocator
+        .allocate(4096, 256)
+        .expect("workspace lands in KV's uncommitted tail granule");
+    assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
+
+    unsafe { allocator.deallocate(kv, kv_len, 256) };
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        granularity,
+        "freeing KV must leave the neighbor-owned tail granule mapped"
+    );
+    assert_eq!(governor.used(Tier::Device) as usize, granularity);
+
+    unsafe { allocator.deallocate(workspace, 4096, 256) };
+    assert_eq!(allocator.committed_and_reserved().0, 0);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+/// Growth rollback must be able to return late commits without freeing the
+/// allocation's original prefix.
+///
+/// Native CUDA KV commits every binding's next bucket before repacking live
+/// data. If a later binding refuses the growth, the earlier successful commits
+/// are rolled back with `decommit_allocation_range`; this test proves that the
+/// rollback releases only the newly claimed granules and leaves the old bucket
+/// mapped.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn decommit_range_rolls_back_late_commits_without_releasing_prefix() {
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
+
+    let probe = allocator.allocate(4096, 256).expect("probe allocation");
+    let granularity = allocator.committed_and_reserved().0;
+    unsafe { allocator.deallocate(probe, 4096, 256) };
+
+    let len = granularity * 3;
+    let prefix = 0..granularity;
+    let pointer = allocator
+        .allocate_committed(len, 256, std::slice::from_ref(&prefix))
+        .expect("prefix commit");
+    assert_eq!(allocator.committed_and_reserved().0, granularity);
+
+    allocator
+        .commit_allocation_range(pointer, len, 256, 0, granularity * 2)
+        .expect("late growth commit");
+    assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
+
+    allocator
+        .decommit_allocation_range(pointer, len, 256, granularity, granularity)
+        .expect("rollback late growth commit");
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        granularity,
+        "rollback should release the late bucket but keep the original prefix"
+    );
+    assert_eq!(governor.used(Tier::Device) as usize, granularity);
+
+    unsafe { allocator.deallocate(pointer, len, 256) };
+    assert_eq!(allocator.committed_and_reserved().0, 0);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+/// Rollback starts at the old logical bucket size, which is rarely aligned to
+/// CUDA's physical granule. The decommit path must still release granules that
+/// were first claimed by the failed growth while preserving the old prefix.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn decommit_misaligned_growth_tail_releases_new_granules_only() {
+    let (allocator, governor) = allocator(64 << 20, 8 << 30);
+
+    let probe = allocator.allocate(4096, 256).expect("probe allocation");
+    let granularity = allocator.committed_and_reserved().0;
+    unsafe { allocator.deallocate(probe, 4096, 256) };
+
+    let old_bytes = 4096;
+    let len = granularity * 3;
+    let prefix = 0..old_bytes;
+    let pointer = allocator
+        .allocate_committed(len, 256, std::slice::from_ref(&prefix))
+        .expect("misaligned prefix commit");
+    assert_eq!(allocator.committed_and_reserved().0, granularity);
+
+    allocator
+        .commit_allocation_range(pointer, len, 256, 0, granularity + old_bytes)
+        .expect("growth claims a second granule");
+    assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
+
+    allocator
+        .decommit_allocation_range(pointer, len, 256, old_bytes, granularity)
+        .expect("rollback starts at a non-granule-aligned old bucket");
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        granularity,
+        "misaligned rollback should release the newly claimed granule only"
+    );
+    assert_eq!(governor.used(Tier::Device) as usize, granularity);
+
+    unsafe { allocator.deallocate(pointer, len, 256) };
+    assert_eq!(allocator.committed_and_reserved().0, 0);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+/// A large virtual allocation can stay mostly uncommitted while disjoint live
+/// stripes are mapped underneath it.
+///
+/// This is the KV-cache failure mode from #656 in allocator form: a binding may
+/// reserve its full context address range, but a short sequence must charge only
+/// the token stripes it can actually touch. An assertion on the committed byte
+/// count catches the vacuous implementation that routes through eager
+/// allocation and still "works" while mapping the whole context.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn committed_ranges_do_not_map_the_whole_virtual_allocation() {
+    let (allocator, governor) = allocator(256 << 20, 8 << 30);
+    let reserved = 128 << 20;
+    let pointer = allocator
+        .allocate_committed(reserved, 256, &[])
+        .expect("reserve a large KV-like allocation");
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        0,
+        "reserving the binding must not map physical memory"
+    );
+
+    allocator
+        .commit_allocation_range(pointer, reserved, 256, 0, 4096)
+        .expect("commit first token stripe");
+    allocator
+        .commit_allocation_range(pointer, reserved, 256, 64 << 20, 4096)
+        .expect("commit second head's token stripe");
+    let committed_short = allocator.committed_and_reserved().0;
+    assert!(
+        committed_short > 0 && committed_short < reserved / 8,
+        "two small stripes committed {committed_short} bytes out of {reserved}; \
+         this must stay far below the full virtual allocation"
+    );
+    assert_eq!(governor.used(Tier::Device) as usize, committed_short);
+
+    allocator
+        .commit_allocation_range(pointer, reserved, 256, 0, reserved)
+        .expect("commit the full context");
+    let committed_full = allocator.committed_and_reserved().0;
+    assert!(
+        committed_full > committed_short * 8,
+        "full-context commit {committed_full} must be much larger than short \
+         sequence commit {committed_short}"
+    );
+
+    // SAFETY: the pointer came from this allocator and is still live.
+    unsafe { allocator.deallocate(pointer, reserved, 256) };
+    assert_eq!(allocator.committed_and_reserved().0, 0);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
 /// Many small allocations share granules rather than each taking one.
 ///
 /// The property that makes 2 MiB granularity affordable for a runtime that

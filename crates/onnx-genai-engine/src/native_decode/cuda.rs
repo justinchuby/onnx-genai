@@ -70,8 +70,11 @@ fn log_weight_offload_capture_exclusion() {
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
+    pub hard_max_len: usize,
     pub max_len_source: String,
     pub device_ptrs: Vec<usize>,
+    pub kv_committed_bytes: usize,
+    pub kv_physical_bytes_by_binding: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
     pub graph: CudaGraphDebugStats,
 }
@@ -172,6 +175,9 @@ pub(crate) struct DecodeCudaState {
     graph_replays: u64,
     graph_fallbacks: u64,
     capacity: CudaKvCapacity,
+    /// The KV bindings reserve their full context address range while the CUDA
+    /// VMM allocator maps only the token stripes reached so far.
+    kv_commits_on_demand: bool,
     pub(crate) graph_fallback_reason: Option<String>,
     pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
@@ -1041,11 +1047,39 @@ impl DecodeCudaState {
         )
     }
 
-    fn ensure_capacity(
+    pub(super) fn ensure_capacity(
         &mut self,
         session: &mut InferenceSession,
         required: usize,
     ) -> anyhow::Result<bool> {
+        if self.kv_commits_on_demand {
+            if required > self.capacity.max_len {
+                bail!("{}", self.capacity_exceeded_error(required));
+            }
+            if required <= self.max_len {
+                return Ok(false);
+            }
+            let old_capacity = self.max_len;
+            let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
+            let valid_len = self.logical_len;
+            self.commit_vmm_growth(new_capacity).map_err(|error| {
+                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                    .map_err(|error| error.to_string());
+                self.growth_failed_error(old_capacity, new_capacity, error, memory)
+            })?;
+            native_cuda_device_barrier(session)?;
+            self.apply_vmm_growth(new_capacity, valid_len)?;
+            self.invalidate_graph(session)?;
+            self.max_len = new_capacity;
+            tracing::info!(
+                old_len = old_capacity,
+                new_len = new_capacity,
+                valid_len,
+                hard_max_len = self.capacity.max_len,
+                "grew VMM-backed native CUDA KV capacity bucket in place"
+            );
+            return Ok(true);
+        }
         let mut backend = NativeCudaCapacityBackend {
             state: self,
             session,
@@ -1067,6 +1101,152 @@ impl DecodeCudaState {
                 Ok(true)
             }
         }
+    }
+
+    /// Commit every byte the next VMM-backed bucket can touch before mutating
+    /// any live KV.
+    ///
+    /// This keeps growth transactional with respect to model state: a tight
+    /// card may refuse the new granule, but then all layer bindings still expose
+    /// the old shapes and hold the old layout. Extra committed granules are
+    /// only installed after their lease succeeds, so the governor remains the
+    /// single source of memory truth.
+    fn commit_vmm_growth(&mut self, new_capacity: usize) -> anyhow::Result<()> {
+        let mut committed: Vec<(usize, usize, usize)> = Vec::new();
+        let kv_indices = self.kv_binding_range.clone().collect::<Vec<_>>();
+        for index in kv_indices {
+            let binding = &mut self.bindings[index];
+            let mut new_shape = binding.physical_shape().to_vec();
+            if new_shape.len() != 4 {
+                bail!(
+                    "VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                    binding.input_name(),
+                    new_shape
+                );
+            }
+            new_shape[2] = new_capacity;
+            let bytes = checked_shape_bytes(&new_shape, binding.dtype).with_context(|| {
+                format!(
+                    "VMM-backed CUDA KV '{}' growth size overflows for shape {:?}",
+                    binding.input_name(),
+                    new_shape
+                )
+            })?;
+            let old_bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                .with_context(|| {
+                    format!(
+                        "VMM-backed CUDA KV '{}' current size overflows for shape {:?}",
+                        binding.input_name(),
+                        binding.physical_shape()
+                    )
+                })?;
+            if let Err(error) = binding.commit_range(0, bytes) {
+                rollback_vmm_growth_commits(&mut self.bindings, &committed);
+                return Err(error.into());
+            }
+            committed.push((index, old_bytes, bytes.saturating_sub(old_bytes)));
+        }
+        let mask_bytes = new_capacity
+            .checked_mul(std::mem::size_of::<i64>())
+            .with_context(|| {
+                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
+            })?;
+        let old_mask_bytes =
+            checked_shape_bytes(self.bindings[0].physical_shape(), DataType::Int64).with_context(
+                || {
+                    format!(
+                        "VMM-backed CUDA mask current size overflows for shape {:?}",
+                        self.bindings[0].physical_shape()
+                    )
+                },
+            )?;
+        if let Err(error) = self.bindings[0].commit_range(0, mask_bytes) {
+            rollback_vmm_growth_commits(&mut self.bindings, &committed);
+            return Err(error.into());
+        }
+        committed.push((0, old_mask_bytes, mask_bytes.saturating_sub(old_mask_bytes)));
+        Ok(())
+    }
+
+    /// Grow VMM-backed KV in place, keeping the reserved address range stable.
+    ///
+    /// The allocation is sized for full context at construction, but kernels see
+    /// only the current bucket as the physical shape. On growth we commit the
+    /// larger bucket, move each head's valid prefix from the old stride to the
+    /// new stride, and zero the newly visible suffix. This prevents the failure
+    /// where a "reserved" KV cache secretly commits the full context at load,
+    /// while preserving the fixed-stride padded shape CUDA graph capture expects
+    /// inside one bucket.
+    fn apply_vmm_growth(&mut self, new_capacity: usize, valid_len: usize) -> anyhow::Result<()> {
+        // All fallible commits have already succeeded, so the expected
+        // tight-card failure path is transactional. A later CUDA copy/memset
+        // failure can still leave mixed old/new strides; #699 tracks adding a
+        // poison/reset path rather than hiding that rarer device failure here.
+        for binding in &mut self.bindings[self.kv_binding_range.clone()] {
+            let old_shape = binding.physical_shape().to_vec();
+            if old_shape.len() != 4 {
+                bail!(
+                    "VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                    binding.input_name(),
+                    old_shape
+                );
+            }
+            let mut new_shape = old_shape.clone();
+            new_shape[2] = new_capacity;
+            let elem = binding.dtype.checked_storage_bytes(1).with_context(|| {
+                format!(
+                    "VMM-backed CUDA KV '{}' has unsized dtype {:?}",
+                    binding.input_name(),
+                    binding.dtype
+                )
+            })?;
+            let ptr = binding.device_ptr() as usize;
+            copy_kv_prefix_device_to_device_in_place(
+                ptr, &old_shape, &new_shape, 2, valid_len, elem,
+            )?;
+            zero_kv_suffix_device(ptr, &new_shape, 2, valid_len, elem)?;
+            let mut logical_shape = new_shape.clone();
+            logical_shape[2] = valid_len;
+            binding.set_physical_and_logical_shapes(new_shape, logical_shape)?;
+        }
+        self.grow_vmm_mask_in_place(new_capacity, valid_len)?;
+        Ok(())
+    }
+
+    fn initial_vmm_kv_committed_range(
+        physical_shape: &[usize],
+        dtype: DataType,
+    ) -> anyhow::Result<std::ops::Range<usize>> {
+        let bytes = checked_shape_bytes(physical_shape, dtype)
+            .context("initial VMM-backed CUDA KV bucket size overflow")?;
+        Ok(0..bytes)
+    }
+
+    fn full_vmm_kv_allocation_bytes(
+        physical_shape: &[usize],
+        dtype: DataType,
+        max_len: usize,
+    ) -> anyhow::Result<usize> {
+        let mut full_shape = physical_shape.to_vec();
+        full_shape[2] = max_len;
+        checked_shape_bytes(&full_shape, dtype)
+            .context("full VMM-backed CUDA KV reservation size overflow")
+    }
+
+    fn grow_vmm_mask_in_place(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> anyhow::Result<()> {
+        let bytes = new_capacity
+            .checked_mul(std::mem::size_of::<i64>())
+            .with_context(|| {
+                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
+            })?;
+        native_cuda_memset_zero(self.bindings[0].device_ptr() as usize, bytes)?;
+        self.bindings[0]
+            .set_physical_and_logical_shapes(vec![1, new_capacity], vec![1, valid_len])?;
+        Ok(())
     }
 
     /// Collect the symbolic dimension ids that the native decoder structurally
@@ -1147,15 +1327,36 @@ impl DecodeCudaState {
         graph_enabled: bool,
         position_rank: usize,
     ) -> anyhow::Result<Self> {
+        let kv_commits_on_demand = session.commits_on_demand();
         let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
-        let mut mask = session.allocate_device_binding(
-            io.attention_mask,
-            None::<String>,
-            DataType::Int64,
-            vec![1, max_len],
-            vec![1, max_len],
-        )?;
-        mask.write_bytes(0, &vec![0; max_len * std::mem::size_of::<i64>()])?;
+        let mask_bytes = max_len
+            .checked_mul(std::mem::size_of::<i64>())
+            .context("initial CUDA mask size overflow")?;
+        let full_mask_bytes = capacity
+            .max_len
+            .checked_mul(std::mem::size_of::<i64>())
+            .context("full CUDA mask reservation size overflow")?;
+        let mask = if kv_commits_on_demand {
+            let committed = std::iter::once(0..mask_bytes).collect::<Vec<_>>();
+            session.allocate_device_binding_committed(
+                io.attention_mask,
+                None::<String>,
+                DataType::Int64,
+                vec![1, max_len],
+                vec![1, max_len],
+                full_mask_bytes,
+                committed,
+            )?
+        } else {
+            session.allocate_device_binding(
+                io.attention_mask,
+                None::<String>,
+                DataType::Int64,
+                vec![1, max_len],
+                vec![1, max_len],
+            )?
+        };
+        native_cuda_memset_zero(mask.device_ptr() as usize, mask_bytes)?;
 
         let mut pairs = present_to_past
             .iter()
@@ -1177,15 +1378,54 @@ impl DecodeCudaState {
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
             let (physical_shape, logical_shape) =
                 Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, false)?;
-            bindings.push(session.allocate_device_binding(
-                past.clone(),
-                Some(present.clone()),
-                meta.dtype,
-                physical_shape,
-                logical_shape,
-            )?);
+            let binding = if kv_commits_on_demand {
+                let allocation_bytes = Self::full_vmm_kv_allocation_bytes(
+                    &physical_shape,
+                    meta.dtype,
+                    capacity.max_len,
+                )
+                .with_context(|| {
+                    format!("sizing full VMM-backed CUDA KV reservation for '{past}'")
+                })?;
+                let initial_range =
+                    Self::initial_vmm_kv_committed_range(&physical_shape, meta.dtype)
+                        .with_context(|| {
+                            format!("sizing initial VMM-backed CUDA KV bucket for '{past}'")
+                        })?;
+                session.allocate_device_binding_committed(
+                    past.clone(),
+                    Some(present.clone()),
+                    meta.dtype,
+                    physical_shape,
+                    logical_shape,
+                    allocation_bytes,
+                    vec![initial_range],
+                )?
+            } else {
+                session.allocate_device_binding(
+                    past.clone(),
+                    Some(present.clone()),
+                    meta.dtype,
+                    physical_shape,
+                    logical_shape,
+                )?
+            };
+            bindings.push(binding);
         }
         let kv_end = bindings.len();
+        if kv_commits_on_demand {
+            for binding in &mut bindings[kv_start..kv_end] {
+                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
+                    .with_context(|| {
+                        format!(
+                            "initial VMM-backed CUDA KV '{}' bucket size overflows for shape {:?}",
+                            binding.input_name(),
+                            binding.physical_shape()
+                        )
+                    })?;
+                native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
+            }
+        }
         for (present, past) in pairs
             .iter()
             .filter(|(_, past)| fixed_state_inputs.contains(past))
@@ -1534,6 +1774,7 @@ impl DecodeCudaState {
             graph_replays: 0,
             graph_fallbacks: 0,
             capacity,
+            kv_commits_on_demand,
             graph_fallback_reason: None,
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
@@ -1649,10 +1890,29 @@ impl DecodeCudaState {
         };
         let binding = &mut self.bindings[index];
         let dtype = binding.dtype;
-        let physical_shape = binding.physical_shape().to_vec();
-        let bytes = binding
-            .read_bytes()
-            .with_context(|| format!("read device present KV for '{past_name}'"))?;
+        let mut physical_shape = binding.physical_shape().to_vec();
+        let bytes = if self.kv_commits_on_demand {
+            let seq_len = self.logical_len;
+            let elem = dtype.checked_storage_bytes(1).with_context(|| {
+                format!("device present KV '{past_name}' has unsized dtype {dtype:?}")
+            })?;
+            let heads = physical_shape[1];
+            let head_dim = physical_shape[3];
+            let capacity_head_stride = physical_shape[2] * head_dim * elem;
+            let live_head_bytes = seq_len * head_dim * elem;
+            let mut compact = Vec::with_capacity(heads * live_head_bytes);
+            for head in 0..heads {
+                compact.extend(
+                    binding.read_bytes_range(head * capacity_head_stride, live_head_bytes)?,
+                );
+            }
+            physical_shape[2] = seq_len;
+            compact
+        } else {
+            binding
+                .read_bytes()
+                .with_context(|| format!("read device present KV for '{past_name}'"))?
+        };
         let tensor = Tensor::from_raw(dtype, physical_shape.clone(), &bytes)
             .with_context(|| format!("interpret device present KV bytes for '{past_name}'"))?;
         let values = kv_dtype_to_f32(&tensor)
@@ -2047,6 +2307,8 @@ impl DecodeCudaState {
 
     pub(crate) fn debug_stats(&self, session: &InferenceSession) -> CudaKvDebugStats {
         let mut transfers = DeviceBindingTransferStats::default();
+        let mut kv_committed_bytes = 0usize;
+        let mut kv_physical_bytes_by_binding = Vec::new();
         let device_ptrs = self.bindings[self.kv_binding_range.clone()]
             .iter()
             .map(|binding| {
@@ -2055,14 +2317,21 @@ impl DecodeCudaState {
                 transfers.host_upload_bytes += stats.host_upload_bytes;
                 transfers.host_download_calls += stats.host_download_calls;
                 transfers.host_download_bytes += stats.host_download_bytes;
+                kv_committed_bytes += binding.committed_bytes();
+                kv_physical_bytes_by_binding.push(
+                    checked_shape_bytes(binding.physical_shape(), binding.dtype).unwrap_or(0),
+                );
                 binding.device_ptr() as usize
             })
             .collect();
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
+            hard_max_len: self.capacity.max_len,
             max_len_source: self.capacity.source.clone(),
             device_ptrs,
+            kv_committed_bytes,
+            kv_physical_bytes_by_binding,
             kv_transfers: transfers,
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,
@@ -2319,6 +2588,171 @@ fn copy_kv_prefix_device_to_device(
         )?;
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn copy_kv_prefix_device_to_device_in_place(
+    ptr: usize,
+    old_shape: &[usize],
+    new_shape: &[usize],
+    seq_axis: usize,
+    valid_len: usize,
+    elem_size: usize,
+) -> anyhow::Result<()> {
+    if valid_len == 0 {
+        return Ok(());
+    }
+    if old_shape.len() != new_shape.len() || seq_axis >= old_shape.len() {
+        bail!(
+            "invalid CUDA KV in-place grow copy shapes {old_shape:?} -> {new_shape:?} on axis {seq_axis}"
+        );
+    }
+    let old_cap = old_shape[seq_axis];
+    let new_cap = new_shape[seq_axis];
+    let blocks = old_shape[..seq_axis]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV in-place grow copy block count overflow")?;
+    let inner = old_shape[seq_axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV in-place grow copy inner size overflow")?;
+    let segment_bytes = valid_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV in-place grow copy segment size overflow")?;
+    let old_stride = old_cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV in-place grow copy old stride overflow")?;
+    let new_stride = new_cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV in-place grow copy new stride overflow")?;
+    for block in (0..blocks).rev() {
+        let src_offset = block
+            .checked_mul(old_stride)
+            .context("CUDA KV in-place grow copy source offset overflow")?;
+        let dst_offset = block
+            .checked_mul(new_stride)
+            .context("CUDA KV in-place grow copy destination offset overflow")?;
+        match in_place_copy_route(src_offset, dst_offset, segment_bytes) {
+            InPlaceCopyRoute::Noop => {}
+            InPlaceCopyRoute::Scratch => {
+                let src_start = ptr + src_offset;
+                let mut scratch = vec![0u8; segment_bytes];
+                onnx_genai_ort::cuda_rt::memcpy_device_to_host(&mut scratch, src_start)?;
+                onnx_genai_ort::cuda_rt::memcpy_host_to_device(ptr + dst_offset, &scratch)?;
+            }
+            InPlaceCopyRoute::DeviceToDevice => {
+                onnx_genai_ort::cuda_rt::memcpy_device_to_device(
+                    ptr + dst_offset,
+                    ptr + src_offset,
+                    segment_bytes,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "cuda")]
+pub(super) enum InPlaceCopyRoute {
+    Noop,
+    DeviceToDevice,
+    Scratch,
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn in_place_copy_route(
+    src_offset: usize,
+    dst_offset: usize,
+    segment_bytes: usize,
+) -> InPlaceCopyRoute {
+    if src_offset == dst_offset || segment_bytes == 0 {
+        return InPlaceCopyRoute::Noop;
+    }
+    let src_end = src_offset + segment_bytes;
+    let dst_end = dst_offset + segment_bytes;
+    if dst_offset < src_end && src_offset < dst_end {
+        InPlaceCopyRoute::Scratch
+    } else {
+        InPlaceCopyRoute::DeviceToDevice
+    }
+}
+
+fn rollback_vmm_growth_commits(
+    bindings: &mut [DeviceIoBinding],
+    committed: &[(usize, usize, usize)],
+) {
+    for &(index, old_bytes, extra_bytes) in committed.iter().rev() {
+        if extra_bytes == 0 {
+            continue;
+        }
+        let _ = bindings[index].decommit_range(old_bytes, extra_bytes);
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn copy_kv_prefix_device_to_device_in_place(
+    _ptr: usize,
+    _old_shape: &[usize],
+    _new_shape: &[usize],
+    _seq_axis: usize,
+    _valid_len: usize,
+    _elem_size: usize,
+) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+#[cfg(feature = "cuda")]
+fn zero_kv_suffix_device(
+    ptr: usize,
+    shape: &[usize],
+    seq_axis: usize,
+    valid_len: usize,
+    elem_size: usize,
+) -> anyhow::Result<()> {
+    if shape.is_empty() || seq_axis >= shape.len() || valid_len >= shape[seq_axis] {
+        return Ok(());
+    }
+    let cap = shape[seq_axis];
+    let blocks = shape[..seq_axis]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV suffix zero block count overflow")?;
+    let inner = shape[seq_axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV suffix zero inner size overflow")?;
+    let stride = cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV suffix zero stride overflow")?;
+    let suffix_offset = valid_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV suffix zero offset overflow")?;
+    let suffix_bytes = (cap - valid_len)
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV suffix zero byte count overflow")?;
+    for block in 0..blocks {
+        native_cuda_memset_zero(ptr + block * stride + suffix_offset, suffix_bytes)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn zero_kv_suffix_device(
+    _ptr: usize,
+    _shape: &[usize],
+    _seq_axis: usize,
+    _valid_len: usize,
+    _elem_size: usize,
+) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
 }
 
 #[cfg(not(feature = "cuda"))]

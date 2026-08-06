@@ -31,7 +31,6 @@ use crate::{OrtError, Result};
 const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 
 /// `cudaMemcpyKind::cudaMemcpyDeviceToHost`.
-#[cfg(test)]
 const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
 /// `cudaMemcpyKind::cudaMemcpyDeviceToDevice`.
@@ -331,8 +330,7 @@ pub fn memcpy_host_to_device(dst: usize, src: &[u8]) -> Result<()> {
 /// The runtime-API `cudaMemcpy` is synchronous for a pageable host destination,
 /// so `dst` holds the copied bytes once this returns. Used by tests to read back
 /// device-resident tensors written through the captured-decode input helpers.
-#[cfg(test)]
-pub(crate) fn memcpy_device_to_host(dst: &mut [u8], src: usize) -> Result<()> {
+pub fn memcpy_device_to_host(dst: &mut [u8], src: usize) -> Result<()> {
     if dst.is_empty() {
         return Ok(());
     }

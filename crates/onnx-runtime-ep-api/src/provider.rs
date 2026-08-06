@@ -469,6 +469,55 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;
+
+    /// Allocate device address space while committing only selected byte ranges.
+    ///
+    /// Providers whose allocator cannot reserve without committing should use
+    /// the default, preserving eager allocation. CUDA VMM overrides this so
+    /// shape-stable buffers such as KV can keep one virtual address while
+    /// mapping physical granules only where the live sequence reaches.
+    fn allocate_committed(
+        &self,
+        size: usize,
+        alignment: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+    ) -> Result<DeviceBuffer> {
+        let _ = committed_ranges;
+        self.allocate(size, alignment)
+    }
+
+    /// Ensure a byte range in an existing allocation is backed by physical
+    /// memory. Eager providers committed everything at allocation time, so their
+    /// default is a no-op.
+    fn commit_allocation_range(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let _ = (buffer, offset, bytes);
+        Ok(())
+    }
+
+    /// Release physical backing from a byte range in an existing allocation
+    /// while preserving its virtual address. Eager providers keep the default
+    /// no-op; lazy providers use this for transactional growth rollback.
+    fn decommit_allocation_range(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let _ = (buffer, offset, bytes);
+        Ok(())
+    }
+
+    /// Physical bytes currently claimed by `buffer`. Eager providers return
+    /// `buffer.len()`; lazy providers may report the committed subset.
+    fn allocation_committed_bytes(&self, buffer: &DeviceBuffer) -> usize {
+        buffer.len()
+    }
+
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
 

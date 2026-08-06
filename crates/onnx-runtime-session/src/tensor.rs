@@ -236,6 +236,12 @@ pub(crate) struct DeviceBindingSpec {
     pub(crate) logical_shape: Vec<usize>,
     /// Whether graph inputs see the valid prefix rather than allocation capacity.
     pub(crate) expose_logical_input_shape: bool,
+    /// Bytes reserved in the allocation. Defaults to the physical shape's byte
+    /// size; larger values let a binding grow its exposed shape without moving.
+    pub(crate) allocation_bytes: Option<usize>,
+    /// Byte ranges to commit immediately. Eager providers ignore this because
+    /// allocation already commits the whole buffer.
+    pub(crate) committed_ranges: Option<Vec<std::ops::Range<usize>>>,
 }
 
 /// The parameters for [`DeviceIoBinding::from_external_memory`], grouped the
@@ -334,6 +340,8 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            allocation_bytes,
+            committed_ranges,
         } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let bytes = checked_expected_bytes(dtype, &physical_shape)
@@ -342,8 +350,29 @@ impl DeviceIoBinding {
                 dims: physical_shape.clone(),
             })?
             .max(1);
+        let allocation_bytes = allocation_bytes.unwrap_or(bytes).max(1);
+        if allocation_bytes < bytes {
+            return Err(SessionError::ExternalBuffer {
+                binding: input_name,
+                reason: format!(
+                    "allocation is {allocation_bytes} bytes but physical shape {physical_shape:?} needs {bytes}"
+                ),
+            });
+        }
         let allocator_for_buffer = allocator.clone();
-        let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
+        let default_range;
+        let ranges = match committed_ranges.as_deref() {
+            Some(ranges) => ranges,
+            None => {
+                default_range = 0..allocation_bytes;
+                std::slice::from_ref(&default_range)
+            }
+        };
+        let buffer = allocator_for_buffer.allocate_committed(
+            allocation_bytes,
+            TensorLayout::contiguous().alignment,
+            ranges,
+        )?;
         Ok(Self {
             input_name,
             bind_input,
@@ -396,6 +425,8 @@ impl DeviceIoBinding {
             physical_shape,
             logical_shape,
             expose_logical_input_shape,
+            allocation_bytes: _,
+            committed_ranges: _,
         } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let required = checked_expected_bytes(dtype, &physical_shape)
@@ -505,6 +536,60 @@ impl DeviceIoBinding {
         Ok(())
     }
 
+    pub fn set_physical_and_logical_shapes(
+        &mut self,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<()> {
+        validate_logical_shape(&physical_shape, &logical_shape)?;
+        let required = checked_expected_bytes(self.dtype, &physical_shape).ok_or_else(|| {
+            SessionError::ShapeOverflow {
+                value: format!("device binding '{}'", self.input_name),
+                dims: physical_shape.clone(),
+            }
+        })?;
+        if required > self.buffer().len() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: format!(
+                    "shape {physical_shape:?} needs {required} bytes but allocation has {}",
+                    self.buffer().len()
+                ),
+            });
+        }
+        self.physical_shape = physical_shape;
+        self.logical_shape = logical_shape;
+        Ok(())
+    }
+
+    pub fn commit_range(&mut self, byte_offset: usize, bytes: usize) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator
+            .commit_allocation_range(buffer, byte_offset, bytes)?;
+        Ok(())
+    }
+
+    pub fn decommit_range(&mut self, byte_offset: usize, bytes: usize) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator
+            .decommit_allocation_range(buffer, byte_offset, bytes)?;
+        Ok(())
+    }
+
+    pub fn committed_bytes(&self) -> usize {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        self.allocator.allocation_committed_bytes(buffer)
+    }
+
     pub fn device_ptr(&self) -> *const std::ffi::c_void {
         self.buffer().as_ptr()
     }
@@ -536,6 +621,46 @@ impl DeviceIoBinding {
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
         Ok(())
+    }
+
+    pub fn read_bytes_range(&mut self, byte_offset: usize, byte_len: usize) -> Result<Vec<u8>> {
+        let end =
+            byte_offset
+                .checked_add(byte_len)
+                .ok_or_else(|| SessionError::ExternalBuffer {
+                    binding: self.input_name.clone(),
+                    reason: format!(
+                        "read range offset {byte_offset} plus {byte_len} bytes overflows"
+                    ),
+                })?;
+        let buffer = self.buffer();
+        if end > buffer.len() {
+            return Err(SessionError::ExternalBuffer {
+                binding: self.input_name.clone(),
+                reason: format!(
+                    "read range {byte_offset}..{end} exceeds allocation of {} bytes",
+                    buffer.len()
+                ),
+            });
+        }
+        let mut bytes = vec![0; byte_len];
+        if byte_len == 0 {
+            return Ok(bytes);
+        }
+        // SAFETY: the offset range is checked inside the live allocation above;
+        // the borrowed handle owns nothing and `DeviceBuffer` has no destructor.
+        let alias = unsafe {
+            DeviceBuffer::from_borrowed_parts(
+                (buffer.as_ptr() as *const u8).add(byte_offset) as *mut std::ffi::c_void,
+                buffer.device(),
+                byte_len,
+                buffer.alignment(),
+            )
+        };
+        self.allocator.copy_to_host(&alias, &mut bytes)?;
+        self.transfer_stats.host_download_calls += 1;
+        self.transfer_stats.host_download_bytes += bytes.len() as u64;
+        Ok(bytes)
     }
 
     pub fn device_argmax_supported(&self) -> bool {
@@ -1088,6 +1213,8 @@ mod tests {
                 physical_shape: vec![element_count],
                 logical_shape: vec![element_count],
                 expose_logical_input_shape: false,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
         .expect_err("overflowing device binding byte count must be rejected");
@@ -1167,6 +1294,8 @@ mod tests {
                 physical_shape: vec![1, 4096],
                 logical_shape: vec![1, 4096],
                 expose_logical_input_shape: true,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
         .unwrap();
@@ -1193,6 +1322,8 @@ mod tests {
                 physical_shape: vec![1, 4096],
                 logical_shape: vec![1, 5],
                 expose_logical_input_shape: false,
+                allocation_bytes: None,
+                committed_ranges: None,
             },
         )
         .unwrap();
