@@ -883,6 +883,10 @@ pub struct GenerateOptions {
     /// KV state for matching prompt prefixes. Set to `true` for A/B measurement
     /// or when guaranteed-cold behaviour is required.
     pub cold_start: bool,
+    /// Token length of a declared semantic prefix boundary, such as the end of a
+    /// system prompt. Native hybrid decoders may snapshot loop-carried state at
+    /// this boundary and reuse it for later prompts that share the prefix.
+    pub semantic_prefix_len: Option<usize>,
 }
 
 impl Default for GenerateOptions {
@@ -913,8 +917,18 @@ impl Default for GenerateOptions {
             constraint: None,
             top_logprobs: None,
             cold_start: false,
+            semantic_prefix_len: None,
         }
     }
+}
+
+/// Observable activity for semantic recurrent-prefix reuse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecurrentPrefixCacheStats {
+    pub lookups: u64,
+    pub hits: u64,
+    pub stores: u64,
+    pub restored_tokens: u64,
 }
 
 /// Sampling controls a caller explicitly requested.

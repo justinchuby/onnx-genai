@@ -63,6 +63,9 @@ pub struct Engine {
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
+    /// Native recurrent/past snapshots keyed by semantic token prefixes.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_recurrent_prefix_stats: RecurrentPrefixCacheStats,
     /// Optional draft model used by the speculative decoding path.
     pub(crate) draft: Option<DraftModel>,
     /// Optional MTP head and target-side projections.
@@ -93,6 +96,12 @@ pub struct Engine {
     /// Tests that exercise pre-session validation may set this to `None` so they
     /// stay model-free and do not touch the local ORT library.
     pub(crate) _environment: Option<Environment>,
+}
+
+#[cfg(feature = "native-backend")]
+pub(crate) struct NativePrefixSnapshot {
+    pub(crate) snapshot: crate::native_decode::NativePastSnapshot,
+    pub(crate) _lease: onnx_runtime_memory_governor::MemoryLease,
 }
 
 // SAFETY: `Engine` owns every ORT or native-runtime handle reachable through

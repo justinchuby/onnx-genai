@@ -102,6 +102,24 @@ pub struct NativeDecodeSession {
     decode_inline: DecodeInlineState,
 }
 
+/// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.
+///
+/// Host-native decoding keeps dense KV and recurrent state in the same `past`
+/// map, so the production snapshot stores the whole map to make restoring a
+/// boundary actually executable. The recurrent entries are still identified
+/// from the declared present→past pairs for sizing and gating.
+pub(crate) struct NativePastSnapshot {
+    past: HashMap<String, Tensor>,
+    len: usize,
+    bytes: u64,
+}
+
+impl NativePastSnapshot {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeInlineState {
@@ -167,6 +185,84 @@ impl NativeDecodeSession {
 
     pub fn kv_layer_count(&self) -> usize {
         self.kv_inputs.len() / 2
+    }
+
+    pub(crate) fn supports_past_snapshots(&self) -> bool {
+        self.cuda.is_none() && self.cpu_kv.is_none() && self.has_recurrent_state()
+    }
+
+    fn recurrent_past_names(&self) -> HashSet<String> {
+        let declared = self
+            .present_to_past
+            .values()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.session
+            .inputs()
+            .iter()
+            .filter(|meta| declared.contains(meta.name.as_str()))
+            .filter(|meta| is_recurrent_state_shape(&meta.shape))
+            .map(|meta| meta.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn has_recurrent_state(&self) -> bool {
+        !self.recurrent_past_names().is_empty()
+    }
+
+    pub(crate) fn snapshot_past(&self) -> anyhow::Result<NativePastSnapshot> {
+        if !self.supports_past_snapshots() {
+            bail!("native past snapshots require host past tensors and recurrent state");
+        }
+        let recurrent = self.recurrent_past_names();
+        if !recurrent.iter().all(|name| self.past.contains_key(name)) {
+            bail!("cannot snapshot recurrent prefix before all recurrent tensors are materialized");
+        }
+        let mut bytes = 0u64;
+        let mut past = HashMap::with_capacity(self.past.len());
+        for (name, tensor) in &self.past {
+            bytes =
+                bytes.saturating_add(u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX));
+            past.insert(
+                name.clone(),
+                tensor.try_clone().map_err(anyhow::Error::from)?,
+            );
+        }
+        Ok(NativePastSnapshot {
+            past,
+            len: self.current_len,
+            bytes,
+        })
+    }
+
+    pub(crate) fn restore_past_snapshot(
+        &mut self,
+        snapshot: &NativePastSnapshot,
+    ) -> anyhow::Result<()> {
+        if !self.supports_past_snapshots() {
+            bail!("native past snapshots require host past tensors and recurrent state");
+        }
+        let mut restored = HashMap::with_capacity(snapshot.past.len());
+        for (name, tensor) in &snapshot.past {
+            restored.insert(
+                name.clone(),
+                tensor.try_clone().map_err(anyhow::Error::from)?,
+            );
+        }
+        self.past = restored;
+        self.current_len = snapshot.len;
+        self.last_hidden = None;
+        Ok(())
+    }
+
+    pub(crate) fn prefill_prefix(&mut self, tokens: &[TokenId]) -> anyhow::Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let past_len = self.current_len;
+        self.decode_argmax(tokens, past_len)?
+            .context("native prefix prefill produced no argmax token")?;
+        Ok(())
     }
 
     /// Whether this session keeps its self-attention KV as plain host tensors
