@@ -589,6 +589,17 @@ impl WeightStore {
         Some((mmap.id, *offset, *length))
     }
 
+    /// Resolve a validated external-data region by stable mmap id.
+    ///
+    /// Lazy device weight paging carries this id instead of a path so the hot
+    /// page-in path can copy directly from the live mmap. That prevents the
+    /// WDDM offload failure mode where every page-in first rebuilt an owned host
+    /// tensor and spent most of decode time in redundant CPU materialization.
+    pub fn mmap_region_bytes(&self, mapping_id: usize, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmaps.values().find(|mapped| mapped.id == mapping_id)?;
+        mmap.mmap.get(offset..offset.checked_add(len)?)
+    }
+
     fn external_bytes(&self, path: &Path, offset: usize, length: usize) -> Option<&[u8]> {
         let mmap = self.mmaps.get(path)?;
         mmap.mmap.get(offset..offset.checked_add(length)?)

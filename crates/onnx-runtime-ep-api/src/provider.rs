@@ -376,8 +376,9 @@ pub trait ExecutionProvider: Send + Sync {
         &self,
         key: u64,
         weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
     ) -> Result<Option<crate::PagedWeight>> {
-        let _ = (key, weight);
+        let _ = (key, weight, source);
         Ok(None)
     }
 
@@ -386,8 +387,13 @@ pub trait ExecutionProvider: Send + Sync {
     /// enqueued, so callers can distinguish a real prefetch from a no-op or
     /// eviction-neutrality guard decline. The default is a no-op so providers
     /// that do not own a residency cache do not need to participate.
-    fn prefetch_lazy_weight(&self, key: u64, weight: &crate::LazyWeight) -> Result<bool> {
-        let _ = (key, weight);
+    fn prefetch_lazy_weight(
+        &self,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<bool> {
+        let _ = (key, weight, source);
         Ok(false)
     }
 

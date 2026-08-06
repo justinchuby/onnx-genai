@@ -174,6 +174,10 @@ struct CudaOffloadSnapshot {
     prefetch_joined: u64,
     prefetch_staging_allocs: u64,
     prefetch_staging_reuses: u64,
+    materialize_ns: u64,
+    htod_ns: u64,
+    copy_wait_ns: u64,
+    admit_sync_ns: u64,
 }
 
 fn cuda_offload_stats() -> CudaOffloadSnapshot {
@@ -189,6 +193,10 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
             prefetch_joined: stats.prefetch_joined,
             prefetch_staging_allocs: stats.prefetch_staging_allocs,
             prefetch_staging_reuses: stats.prefetch_staging_reuses,
+            materialize_ns: stats.materialize_ns,
+            htod_ns: stats.htod_ns,
+            copy_wait_ns: stats.copy_wait_ns,
+            admit_sync_ns: stats.admit_sync_ns,
         }
     }
     #[cfg(not(feature = "native-cuda"))]
@@ -235,6 +243,10 @@ fn emit_cuda_offload_counters(
     let prefetch_staging_reuses = after
         .prefetch_staging_reuses
         .saturating_sub(before.prefetch_staging_reuses);
+    let materialize_ns = after.materialize_ns.saturating_sub(before.materialize_ns);
+    let htod_ns = after.htod_ns.saturating_sub(before.htod_ns);
+    let copy_wait_ns = after.copy_wait_ns.saturating_sub(before.copy_wait_ns);
+    let admit_sync_ns = after.admit_sync_ns.saturating_sub(before.admit_sync_ns);
     if page_ins > 0
         || hits > 0
         || evictions > 0
@@ -243,6 +255,10 @@ fn emit_cuda_offload_counters(
         || prefetch_joined > 0
         || prefetch_staging_allocs > 0
         || prefetch_staging_reuses > 0
+        || materialize_ns > 0
+        || htod_ns > 0
+        || copy_wait_ns > 0
+        || admit_sync_ns > 0
     {
         profile.counter("weight offload page-ins", page_ins as f64, "page-ins");
         profile.counter("weight offload cache hits", hits as f64, "hits");
@@ -271,14 +287,34 @@ fn emit_cuda_offload_counters(
             "prefetches",
         );
         profile.counter(
-            "weight offload prefetch staging allocs",
+            "weight offload pinned staging allocs",
             prefetch_staging_allocs as f64,
             "allocs",
         );
         profile.counter(
-            "weight offload prefetch staging reuses",
+            "weight offload pinned staging reuses",
             prefetch_staging_reuses as f64,
             "reuses",
+        );
+        profile.counter(
+            "weight offload materialize",
+            materialize_ns as f64 / 1_000_000.0,
+            "ms",
+        );
+        profile.counter(
+            "weight offload H2D enqueue/copy",
+            htod_ns as f64 / 1_000_000.0,
+            "ms",
+        );
+        profile.counter(
+            "weight offload copy wait",
+            copy_wait_ns as f64 / 1_000_000.0,
+            "ms",
+        );
+        profile.counter(
+            "weight offload admit sync",
+            admit_sync_ns as f64 / 1_000_000.0,
+            "ms",
         );
     }
 }

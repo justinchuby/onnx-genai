@@ -338,12 +338,17 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// residency cache, returning a [`PagedWeight`] whose keep-alive pins the
     /// device allocation for the kernel's lifetime. Returns `Ok(None)` when
     /// offload is disabled so dispatch falls back to the resident path.
-    fn page_lazy_weight(&self, key: u64, weight: &LazyWeight) -> Result<Option<PagedWeight>> {
+    fn page_lazy_weight(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn onnx_runtime_ep_api::MmapRegionSource,
+    ) -> Result<Option<PagedWeight>> {
         let Some(residency) = self.residency.as_ref() else {
             return Ok(None);
         };
         let page = residency
-            .resident_materialized(key, weight)
+            .resident_mapped(key, weight, source)
             .map_err(|error| EpError::KernelFailed(format!("weight offload page-in: {error}")))?;
         let device_ptr = page.device_ptr();
         let len = page.len();
@@ -355,12 +360,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         )))
     }
 
-    fn prefetch_lazy_weight(&self, key: u64, weight: &LazyWeight) -> Result<bool> {
+    fn prefetch_lazy_weight(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn onnx_runtime_ep_api::MmapRegionSource,
+    ) -> Result<bool> {
         let Some(residency) = self.residency.as_ref() else {
             return Ok(false);
         };
         residency
-            .prefetch_materialized(key, weight)
+            .prefetch_mapped(key, weight, source)
             .map_err(|error| EpError::KernelFailed(format!("weight offload prefetch: {error}")))
     }
 

@@ -1,10 +1,30 @@
 use super::*;
-use onnx_runtime_ep_api::ExecutionProviderCapabilities;
+use onnx_runtime_ep_api::{
+    ExecutionProviderCapabilities, ExternalMmapRegion, MmapRegionSource, WeightHandleError,
+};
 
 /// Per-input-slot result of the strided-input materialization gate: `Some` with
 /// the gathered contiguous bytes and their strides when a private temp was
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
+
+struct WeightStoreRegionSource<'a>(&'a onnx_runtime_loader::weights::WeightStore);
+
+impl MmapRegionSource for WeightStoreRegionSource<'_> {
+    fn region_bytes(
+        &self,
+        region: &ExternalMmapRegion,
+    ) -> std::result::Result<&[u8], WeightHandleError> {
+        self.0
+            .mmap_region_bytes(region.mapping_id, region.offset, region.len)
+            .ok_or_else(|| {
+                WeightHandleError::InvalidResident(format!(
+                    "external mmap region id={} offset={} len={} is no longer available",
+                    region.mapping_id, region.offset, region.len
+                ))
+            })
+    }
+}
 
 impl Executor {
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
@@ -158,7 +178,11 @@ impl Executor {
                 .weight_handles
                 .get(vid)
                 .and_then(|handle| handle.as_lazy())
-                && self.ep.prefetch_lazy_weight(vid.0 as u64, lazy)?
+                && self.ep.prefetch_lazy_weight(
+                    vid.0 as u64,
+                    lazy,
+                    &WeightStoreRegionSource(self.weights.as_ref()),
+                )?
             {
                 self.prefetch_issue_nodes.lock().unwrap().insert(*vid, pi);
             }
@@ -873,7 +897,11 @@ impl Executor {
                 // lifetime via `paged`. On `None` (EP can't page) the input stays
                 // absent and is routed to the kernel as a lazy `KernelInput::Weight`.
                 let issued_at = self.prefetch_issue_nodes.lock().unwrap().remove(&vid);
-                let paged = self.ep.page_lazy_weight(vid.0 as u64, lazy)?;
+                let paged = self.ep.page_lazy_weight(
+                    vid.0 as u64,
+                    lazy,
+                    &WeightStoreRegionSource(self.weights.as_ref()),
+                )?;
                 match paged {
                     Some(paged) => {
                         if let Some(issued_at) = issued_at {
