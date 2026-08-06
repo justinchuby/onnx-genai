@@ -798,6 +798,180 @@ fn split_constant_input_warms_and_captures() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn split_runtime_sizes_with_resolved_outputs_warms_and_captures() {
+    // The GatedDeltaNet decode Split (C3 of the GDN capture fix): a *runtime*
+    // split-sizes input that is NOT flagged constant (its sizes come from a
+    // `Constant` node the default `OptimizationLevel::None` never folds into an
+    // initializer). The old path host-read the sizes and synchronized every
+    // step, de-capturing the surrounding decode block. Because the executor
+    // pre-allocates each output at its statically-inferred shape, the sizes are
+    // fully determined by the output shapes — so after warmup the kernel derives
+    // a static plan and becomes capture-safe with byte-identical results.
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // Qwen3.5 GatedDeltaNet split: [1,1,H,320] -> [1,1,H,128] + [1,1,H,128] +
+    // [1,1,H,64] (q/k/v-style fan-out), axis=-1.
+    let heads = 4usize;
+    let data_shape = [1, 1, heads, 320];
+    let split_shape = [3];
+    let output_shapes = [
+        vec![1, 1, heads, 128],
+        vec![1, 1, heads, 128],
+        vec![1, 1, heads, 64],
+    ];
+    let data = (0..heads * 320)
+        .map(|value| value as f32)
+        .collect::<Vec<_>>();
+    let data_bytes = raw(&data);
+    let split_bytes = raw(&[128_i64, 128, 64]);
+    // NOTE: no `set_constant_inputs` — constant_split_input stays false, which is
+    // exactly the GDN case the C3 fix targets.
+    let kernel = build_split_kernel(
+        &ep,
+        &data_shape,
+        &output_shapes,
+        &[("axis", Attribute::Int(-1))],
+        Some(&split_shape),
+    );
+    // Before warmup the kernel has no static plan, so it must decline capture
+    // (the dynamic host-read/synchronize path).
+    assert!(
+        matches!(kernel.capture_support(), CaptureSupport::Unsupported { .. }),
+        "a cold runtime-split Split must decline capture until warmed"
+    );
+
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let split_buffer = ep.allocate(split_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&split_bytes, cuptr(split_buffer.as_ptr()))
+            .unwrap();
+    }
+    let data_strides = compute_contiguous_strides(&data_shape);
+    let split_strides = compute_contiguous_strides(&split_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &data_shape,
+            &data_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(split_buffer.as_ptr()),
+            DataType::Int64,
+            &split_shape,
+            &split_strides,
+            device,
+        ),
+    ];
+    let mut output_buffers = output_shapes
+        .iter()
+        .map(|shape| {
+            ep.allocate(DataType::Float32.storage_bytes(shape.iter().product()), 256)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output_strides = output_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+
+    macro_rules! execute {
+        () => {{
+            let mut outputs = output_buffers
+                .iter_mut()
+                .zip(&output_shapes)
+                .zip(&output_strides)
+                .map(|((buffer, shape), strides)| {
+                    TensorMut::new(
+                        DevicePtrMut(buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        shape,
+                        strides,
+                        device,
+                    )
+                })
+                .collect::<Vec<_>>();
+            kernel.execute(&inputs, &mut outputs).unwrap();
+        }};
+    }
+
+    // Warm eagerly: the output-derived plan is cached, flipping capture_support
+    // to Supported WITHOUT ever host-reading the split-size input.
+    execute!();
+    assert_eq!(
+        kernel.capture_support(),
+        CaptureSupport::Supported,
+        "after warmup the output-derived static plan must admit capture"
+    );
+
+    let eager = output_buffers
+        .iter()
+        .zip(&output_shapes)
+        .map(|(buffer, shape)| {
+            let mut bytes = vec![0; DataType::Float32.storage_bytes(shape.iter().product())];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+
+    // Capture + replay must succeed (no host-read/sync in the captured region)
+    // and reproduce the eager bytes exactly.
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute!();
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.has_graph_executable().unwrap());
+    runtime.replay_graph().unwrap();
+    let replayed = output_buffers
+        .iter()
+        .zip(&output_shapes)
+        .map(|(buffer, shape)| {
+            let mut bytes = vec![0; DataType::Float32.storage_bytes(shape.iter().product())];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replayed, eager, "replayed Split bytes must equal eager");
+
+    // Byte-exact vs the reference chunking.
+    let expected: Vec<Vec<f32>> = {
+        let bounds = [(0usize, 128usize), (128, 256), (256, 320)];
+        bounds
+            .iter()
+            .map(|&(lo, hi)| {
+                data.chunks_exact(320)
+                    .flat_map(|head| &head[lo..hi])
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    for (idx, want) in expected.iter().enumerate() {
+        assert_eq!(eager[idx], raw(want), "output {idx} byte mismatch");
+    }
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(split_buffer).unwrap();
+    for buffer in output_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
 fn build_movement_kernel(
     ep: &CudaExecutionProvider,
     op: &str,
