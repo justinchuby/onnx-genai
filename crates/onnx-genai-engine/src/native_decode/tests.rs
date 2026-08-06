@@ -631,6 +631,50 @@ fn native_decoder_auto_derives_hybrid_state_io() {
 }
 
 #[test]
+fn native_kv_mirror_gate_excludes_hybrid_recurrent_decoders() {
+    // #695: prefix/KV-mirror reuse restores only attention KV. A hybrid
+    // recurrent decoder's unmasked conv/recurrent state is NOT reconstructed
+    // from a reused prefix (only re-zeroed on a full reset), so a mirrored
+    // continuation would run a fresh-zero recurrent state against a reused
+    // attention prefix and silently emit wrong logits. The mirror-support gate
+    // must therefore decline (forcing a full recompute) whenever recurrent
+    // state is present — detected generically from graph metadata, no model
+    // name. Single-shot generation never consults these gates, so it is
+    // unaffected.
+    let hybrid = NativeDecodeSession::from_session(tiny_hybrid_decoder())
+        .expect("hybrid decoder loads via graph-derived io");
+    assert!(
+        hybrid.has_recurrent_state(),
+        "tiny_hybrid_decoder carries conv/recurrent state"
+    );
+    assert!(
+        !hybrid.supports_host_kv_mirror(),
+        "host KV-mirror reuse must be disabled for hybrid recurrent decoders (#695)"
+    );
+    assert!(
+        !hybrid.supports_device_kv_mirror(),
+        "device KV-mirror reuse must be disabled for hybrid recurrent decoders (#695)"
+    );
+
+    // Control: a pure-dense rank-4 f32 decoder has no recurrent state, so the
+    // host mirror path stays enabled — the gate fires ONLY on recurrent models.
+    let dense = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(true),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("dense decoder loads with explicit io");
+    assert!(
+        !dense.has_recurrent_state(),
+        "tiny_decoder is pure-dense attention KV"
+    );
+    assert!(
+        dense.supports_host_kv_mirror(),
+        "pure-dense host decoders keep KV-mirror reuse enabled"
+    );
+}
+
+#[test]
 fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
     // The fallback's safety gate: a pure-dense decoder derives ZERO state pairs,
     // so auto-derive declines and the model keeps its existing shape-inference

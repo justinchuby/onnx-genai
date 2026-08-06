@@ -279,8 +279,20 @@ impl NativeDecodeSession {
     /// caches would not round-trip losslessly through the f32 paged store — both
     /// are deferred to Inc-D. Every declared KV past input must be a rank-4 f32
     /// cache (`[1, num_kv_heads, seq, head_dim]`).
+    ///
+    /// Hybrid recurrent decoders (conv/recurrent `fixed_state` alongside
+    /// attention KV) are excluded: prefix mirroring restores only attention KV,
+    /// but their unmasked recurrent/conv state is not reconstructed from a reused
+    /// prefix, so a mirrored continuation would run a fresh-zero recurrent state
+    /// against a reused attention prefix and silently emit wrong logits (#695).
+    /// Gating the mirror off forces a full recompute for these models — correct,
+    /// if slower — until per-prefix recurrent-state restore lands.
     pub(crate) fn supports_host_kv_mirror(&self) -> bool {
-        if self.cuda.is_some() || self.cpu_kv.is_some() || self.kv_inputs.is_empty() {
+        if self.cuda.is_some()
+            || self.cpu_kv.is_some()
+            || self.kv_inputs.is_empty()
+            || self.has_recurrent_state()
+        {
             return false;
         }
         self.kv_inputs.iter().all(|name| {
@@ -306,8 +318,16 @@ impl NativeDecodeSession {
     /// f32 with the same `half` convert ORT uses (bit-exact round-trip); `bf16`,
     /// non-rank-4, and in-place / CPU-resident caches stay gated to the non-paged
     /// fallback — no silent-wrong paged run.
+    ///
+    /// Hybrid recurrent decoders (conv/recurrent `fixed_state` alongside
+    /// attention KV) are excluded for the same reason as the host path
+    /// ([`supports_host_kv_mirror`](Self::supports_host_kv_mirror)): device
+    /// prefix reuse (`DecodeCudaState::seed_prefix`) restores only attention KV,
+    /// while the recurrent/conv state is reconstructed only on a full
+    /// `rewind(0)`, so a mirrored continuation runs a fresh-zero recurrent state
+    /// against a reused attention prefix and silently emits wrong logits (#695).
     pub(crate) fn supports_device_kv_mirror(&self) -> bool {
-        if self.kv_inputs.is_empty() {
+        if self.kv_inputs.is_empty() || self.has_recurrent_state() {
             return false;
         }
         self.cuda
