@@ -77,6 +77,52 @@ pub use allocator::{DeviceAllocator, DeviceKey, HostAllocator};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Stable identity of one physical-memory accounting authority.
+///
+/// Equality means two components charge the same books for physical memory in
+/// the same compatibility domain. It does not mean merely "the same device":
+/// two independent ledgers for device 0 deliberately receive different IDs.
+///
+/// Shared-resource construction must copy an existing ID, normally by cloning
+/// the governor that owns it. Creating another ID for the same device declares
+/// another accounting authority and therefore makes shared physical backing
+/// incompatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryAuthorityId {
+    device: DeviceKey,
+    serial: u64,
+}
+
+impl MemoryAuthorityId {
+    /// Create a distinct authority for `device`.
+    ///
+    /// Use this once when constructing the ledger that owns the device's
+    /// physical bytes. Holders that share those books reuse the returned ID;
+    /// they must not independently call this constructor.
+    pub fn new(device: DeviceKey) -> Self {
+        static NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+        Self {
+            device,
+            serial: NEXT_AUTHORITY.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The physical-memory compatibility domain this authority governs.
+    pub const fn device(self) -> DeviceKey {
+        self.device
+    }
+}
+
+impl std::fmt::Display for MemoryAuthorityId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:?} device {} authority {}",
+            self.device.tier, self.device.index, self.serial
+        )
+    }
+}
+
 /// Where the bytes physically live.
 ///
 /// Ordered from fastest to slowest, which is also the demotion order.
@@ -226,14 +272,29 @@ pub enum MemoryError {
 /// infallible and allocation-free, which is what G2 requires.
 #[derive(Debug)]
 pub struct LeaseLedger {
+    authority_id: MemoryAuthorityId,
     limits: [AtomicU64; 3],
     used: [AtomicU64; 3],
 }
 
 impl LeaseLedger {
-    /// A ledger with the given per-tier ceilings.
+    /// A single-device ledger with the given per-tier ceilings.
+    ///
+    /// The device tier defaults to device 0. Use [`Self::new_for_device`] when
+    /// constructing an authority for another device.
     pub fn new(device_bytes: u64, host_bytes: u64, disk_bytes: u64) -> Arc<Self> {
+        Self::new_for_device(DeviceKey::device(0), device_bytes, host_bytes, disk_bytes)
+    }
+
+    /// A ledger whose device tier belongs to `device`.
+    pub fn new_for_device(
+        device: DeviceKey,
+        device_bytes: u64,
+        host_bytes: u64,
+        disk_bytes: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            authority_id: MemoryAuthorityId::new(device),
             limits: [
                 AtomicU64::new(device_bytes),
                 AtomicU64::new(host_bytes),
@@ -491,6 +552,14 @@ pub trait PressureResponder: Send + Sync {
 
 /// The authority that grants leases.
 pub trait MemoryGovernor {
+    /// Stable identity of the physical-memory books this governor charges.
+    ///
+    /// Backings that retain physical allocations after unmapping use this to
+    /// reject a buffer wired to different books. Implementations must return
+    /// the same value for their lifetime. Two governors may return the same ID
+    /// only when they deliberately share one physical-memory ledger.
+    fn authority_id(&self) -> MemoryAuthorityId;
+
     /// Reserve `bytes` on `tier` for `role`, or fail without disturbing any
     /// existing lease.
     fn reserve(
@@ -567,6 +636,9 @@ pub struct LedgerGovernor {
 
 impl LedgerGovernor {
     /// A governor over `ledger`.
+    ///
+    /// The authority identity belongs to the ledger, so every governor over the
+    /// same ledger reports the same identity.
     pub fn new(ledger: Arc<LeaseLedger>) -> Self {
         Self { ledger }
     }
@@ -578,6 +650,10 @@ impl LedgerGovernor {
 }
 
 impl MemoryGovernor for LedgerGovernor {
+    fn authority_id(&self) -> MemoryAuthorityId {
+        self.ledger.authority_id
+    }
+
     fn reserve(
         &self,
         tier: Tier,
@@ -634,6 +710,18 @@ mod tests {
     }
 
     const H: HolderId = HolderId::new(1);
+
+    #[test]
+    fn governors_over_one_ledger_share_authority_but_independent_ledgers_do_not() {
+        let ledger = LeaseLedger::new(10, 0, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let second_wrapper = LedgerGovernor::new(ledger);
+        let independent = LedgerGovernor::new(LeaseLedger::new(10, 0, 0));
+
+        assert_eq!(governor.authority_id(), second_wrapper.authority_id());
+        assert_ne!(governor.authority_id(), independent.authority_id());
+        assert_eq!(governor.authority_id().device(), DeviceKey::device(0));
+    }
 
     #[test]
     fn record_committed_records_already_taken_bytes_even_over_limit() {

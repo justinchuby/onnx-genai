@@ -418,6 +418,7 @@ pub struct HostGovernor {
 }
 
 struct HostGovernorInner {
+    memory_authority_id: onnx_runtime_memory_governor::MemoryAuthorityId,
     ledger: Mutex<Ledger>,
     mailbox: Mutex<CancelMailbox>,
     sink: Arc<dyn ProtocolTraceSink>,
@@ -488,6 +489,9 @@ impl HostGovernor {
 
         Ok(Self {
             inner: Arc::new(HostGovernorInner {
+                memory_authority_id: onnx_runtime_memory_governor::MemoryAuthorityId::new(
+                    onnx_runtime_memory_governor::DeviceKey::HOST,
+                ),
                 ledger: Mutex::new(ledger),
                 mailbox: Mutex::new(CancelMailbox::new(config.mailbox_capacity)?),
                 sink,
@@ -500,6 +504,10 @@ impl HostGovernor {
                 mailbox_id: config.mailbox_id,
             }),
         })
+    }
+
+    pub(crate) fn memory_authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+        self.inner.memory_authority_id
     }
 
     /// Requests host pages. Returns an already-ready ticket when capacity is
