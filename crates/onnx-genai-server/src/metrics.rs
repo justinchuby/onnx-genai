@@ -321,24 +321,22 @@ fn encode_weight_offload() -> String {
     counter(
         &mut output,
         "onnx_genai_cuda_weight_offload_page_ins_total",
-        "CUDA weight residency page-ins.",
+        "Process-wide cumulative CUDA weight residency page-ins.",
         stats.page_ins,
     );
     counter(
         &mut output,
         "onnx_genai_cuda_weight_offload_hits_total",
-        "CUDA weight residency cache hits.",
+        "Process-wide cumulative CUDA weight residency cache hits.",
         stats.hits,
     );
     counter(
         &mut output,
         "onnx_genai_cuda_weight_offload_evictions_total",
-        "CUDA weight residency evictions.",
+        "Process-wide cumulative CUDA weight residency evictions.",
         stats.evictions,
     );
-    output.push_str(
-        "# HELP onnx_genai_cuda_weight_offload_hit_rate CUDA weight residency hit ratio.\n",
-    );
+    output.push_str("# HELP onnx_genai_cuda_weight_offload_hit_rate Process-wide CUDA weight residency hit ratio derived from cumulative hits and page-ins.\n");
     output.push_str("# TYPE onnx_genai_cuda_weight_offload_hit_rate gauge\n");
     let lookups = stats.hits + stats.page_ins;
     let hit_rate = if lookups == 0 {
@@ -347,18 +345,6 @@ fn encode_weight_offload() -> String {
         stats.hits as f64 / lookups as f64
     };
     writeln!(output, "onnx_genai_cuda_weight_offload_hit_rate {hit_rate}").expect("String write");
-    gauge(
-        &mut output,
-        "onnx_genai_cuda_weight_offload_budget_bytes",
-        "Configured CUDA device-residency budget for weight offload.",
-        stats.budget_bytes,
-    );
-    gauge(
-        &mut output,
-        "onnx_genai_cuda_weight_offload_peak_resident_bytes",
-        "Peak CUDA device-resident bytes in the weight offload cache.",
-        stats.peak_resident_bytes,
-    );
     output
 }
 
@@ -734,6 +720,46 @@ mod tests {
             "these metric names do not use the documented `onnx_genai_` prefix, \
              so nothing scraping the documented names will find them: {offenders:?}"
         );
+    }
+
+    #[test]
+    fn prometheus_does_not_export_non_aggregate_weight_offload_gauges() {
+        let output = encode_prometheus();
+        for stale_name in [
+            "onnx_genai_cuda_weight_offload_budget_bytes",
+            "onnx_genai_cuda_weight_offload_peak_resident_bytes",
+        ] {
+            assert!(
+                !output.contains(stale_name),
+                "{stale_name} is per-residency state, not process truth, and must not be exported"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_weight_offload_metrics_are_process_activity_only() {
+        let output = encode_weight_offload();
+        for expected in [
+            "# TYPE onnx_genai_cuda_weight_offload_page_ins_total counter",
+            "# TYPE onnx_genai_cuda_weight_offload_hits_total counter",
+            "# TYPE onnx_genai_cuda_weight_offload_evictions_total counter",
+            "# TYPE onnx_genai_cuda_weight_offload_hit_rate gauge",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing expected process-wide offload metric {expected} in:\n{output}"
+            );
+        }
+        for stale_name in [
+            "onnx_genai_cuda_weight_offload_budget_bytes",
+            "onnx_genai_cuda_weight_offload_peak_resident_bytes",
+        ] {
+            assert!(
+                !output.contains(stale_name),
+                "{stale_name} is per-residency state, not process truth, and must not be exported"
+            );
+        }
     }
 
     #[test]
