@@ -143,11 +143,12 @@ fn offloaded_native_cuda_decode_is_token_identical_and_pages() -> anyhow::Result
     }
     onnx_runtime_ep_cuda::reset_global_offload_stats();
     // Lock the new default: with only WEIGHT_OFFLOAD=1 set (async var unset), the
-    // resolved policy uses the SYNCHRONOUS page-in. Async page-in is opt-in (#544
-    // follow-up: sync is faster in the eviction/thrash regime, measured A/B).
+    // resolved policy uses async page-in so dense lookahead can overlap the known
+    // next layer. The old synchronous path remains available via
+    // ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0 for A/B.
     assert!(
-        !onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().async_pagein,
-        "async page-in must be opt-in: the default offload policy should be synchronous"
+        onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().async_pagein,
+        "async page-in must be the default: otherwise dense prefetch cannot engage"
     );
     let offloaded_start = Instant::now();
     let offloaded = generate(&dir)?;

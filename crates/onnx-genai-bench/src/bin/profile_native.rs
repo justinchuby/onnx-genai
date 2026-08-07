@@ -465,25 +465,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         println!("generated_token_ids: {tokens:?}");
     }
     let offload = onnx_runtime_ep_cuda::global_offload_stats();
-    let gap = onnx_runtime_session::dense_prefetch_gap_stats();
     println!(
-        "weight_offload_prefetch: issued={} declined_guard={} joined={} staging_allocs={} staging_reuses={} page_ins={} hits={} evictions={}",
-        offload.prefetch_issued,
-        offload.prefetch_declined_guard,
-        offload.prefetch_joined,
-        offload.prefetch_staging_allocs,
-        offload.prefetch_staging_reuses,
-        offload.page_ins,
-        offload.hits,
-        offload.evictions
-    );
-    println!(
-        "weight_offload_prefetch_gap: joins={} nodes_between_sum={} nodes_between_max={}",
-        gap.joins, gap.nodes_between_sum, gap.nodes_between_max
-    );
-    println!(
-        "weight_offload_prefetch_lookahead: requested_nodes={}",
-        onnx_runtime_session::dense_weight_prefetch_lookahead_nodes()
+        "weight_offload_cache: page_ins={} hits={} evictions={}",
+        offload.page_ins, offload.hits, offload.evictions
     );
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
@@ -875,25 +859,9 @@ fn main() -> Result<()> {
         );
     }
     let offload = onnx_runtime_ep_cuda::global_offload_stats();
-    let gap = onnx_runtime_session::dense_prefetch_gap_stats();
     println!(
-        "weight_offload_prefetch: issued={} declined_guard={} joined={} staging_allocs={} staging_reuses={} page_ins={} hits={} evictions={}",
-        offload.prefetch_issued,
-        offload.prefetch_declined_guard,
-        offload.prefetch_joined,
-        offload.prefetch_staging_allocs,
-        offload.prefetch_staging_reuses,
-        offload.page_ins,
-        offload.hits,
-        offload.evictions
-    );
-    println!(
-        "weight_offload_prefetch_gap: joins={} nodes_between_sum={} nodes_between_max={}",
-        gap.joins, gap.nodes_between_sum, gap.nodes_between_max
-    );
-    println!(
-        "weight_offload_prefetch_lookahead: requested_nodes={}",
-        onnx_runtime_session::dense_weight_prefetch_lookahead_nodes()
+        "weight_offload_cache: page_ins={} hits={} evictions={}",
+        offload.page_ins, offload.hits, offload.evictions
     );
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));

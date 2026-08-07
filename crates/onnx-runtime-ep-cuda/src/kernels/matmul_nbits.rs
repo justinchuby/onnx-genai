@@ -6516,8 +6516,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let mut zp_codes = vec![8i32; n * k_blocks];
         let mut zp_packed = vec![0u8; n * zp_row_bytes];
         if explicit_zp {
-            for i in 0..n * k_blocks {
-                zp_codes[i] = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
+            for code in zp_codes.iter_mut().take(n * k_blocks) {
+                *code = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
             }
             for col in 0..n {
                 for block in 0..k_blocks {
@@ -6612,8 +6612,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
         let scales_shape = [n, k_blocks];
         let scales_strides = [k_blocks as i64, 1];
-        let zp_shape = [n, zp_row_bytes];
-        let zp_strides = [zp_row_bytes as i64, 1];
         let bias_shape = [n];
         let bias_strides = [1i64];
         let y_shape = [1usize, n];

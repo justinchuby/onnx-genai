@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for `pkg.nxrt::SparseKvGather` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph

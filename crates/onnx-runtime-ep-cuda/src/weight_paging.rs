@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
@@ -37,11 +38,30 @@ use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_ISSUED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_DECLINED_GUARD: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_JOINED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_STAGING_ALLOCS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_STAGING_REUSES: AtomicU64 = AtomicU64::new(0);
+// Time spent filling the host staging buffer from mmap regions. This is a
+// host-blocking CPU memcpy span and contains no CUDA synchronization.
+static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+// CUDA-event elapsed time for H2D DMA: start event before cuMemcpyHtoDAsync,
+// end event after it, then host-block on the end event to read elapsed time.
+static GLOBAL_HTOD_NS: AtomicU64 = AtomicU64::new(0);
+// Host-blocking compute-stream synchronize taken before evicting pages whose
+// VRAM might still be referenced by earlier kernels.
+static GLOBAL_ADMIT_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_REGIONS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_MATERIALIZE_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
+// Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
+static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn add_duration(counter: &AtomicU64, elapsed: Duration) {
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    counter.fetch_add(nanos, Ordering::Relaxed);
+}
 
 /// Snapshot of the process-global weight-offload counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,11 +69,18 @@ pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
     pub evictions: u64,
-    pub prefetch_issued: u64,
-    pub prefetch_declined_guard: u64,
-    pub prefetch_joined: u64,
-    pub prefetch_staging_allocs: u64,
-    pub prefetch_staging_reuses: u64,
+    pub materialize_ns: u64,
+    pub htod_ns: u64,
+    pub admit_sync_ns: u64,
+    pub staging_fill_bytes: u64,
+    pub staging_fill_regions: u64,
+    pub staging_fill_calls: u64,
+    pub materialize_fallback_calls: u64,
+    pub htod_bytes: u64,
+    pub vram_alloc_ns: u64,
+    pub vram_free_ns: u64,
+    pub budget_bytes: u64,
+    pub peak_resident_bytes: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -62,11 +89,18 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
-        prefetch_issued: GLOBAL_PREFETCH_ISSUED.load(Ordering::Relaxed),
-        prefetch_declined_guard: GLOBAL_PREFETCH_DECLINED_GUARD.load(Ordering::Relaxed),
-        prefetch_joined: GLOBAL_PREFETCH_JOINED.load(Ordering::Relaxed),
-        prefetch_staging_allocs: GLOBAL_PREFETCH_STAGING_ALLOCS.load(Ordering::Relaxed),
-        prefetch_staging_reuses: GLOBAL_PREFETCH_STAGING_REUSES.load(Ordering::Relaxed),
+        materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
+        htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
+        admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
+        staging_fill_bytes: GLOBAL_STAGING_FILL_BYTES.load(Ordering::Relaxed),
+        staging_fill_regions: GLOBAL_STAGING_FILL_REGIONS.load(Ordering::Relaxed),
+        staging_fill_calls: GLOBAL_STAGING_FILL_CALLS.load(Ordering::Relaxed),
+        materialize_fallback_calls: GLOBAL_MATERIALIZE_FALLBACK_CALLS.load(Ordering::Relaxed),
+        htod_bytes: GLOBAL_HTOD_BYTES.load(Ordering::Relaxed),
+        vram_alloc_ns: GLOBAL_VRAM_ALLOC_NS.load(Ordering::Relaxed),
+        vram_free_ns: GLOBAL_VRAM_FREE_NS.load(Ordering::Relaxed),
+        budget_bytes: GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed),
+        peak_resident_bytes: GLOBAL_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -75,11 +109,18 @@ pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_ISSUED.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_DECLINED_GUARD.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_JOINED.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_STAGING_ALLOCS.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_STAGING_REUSES.store(0, Ordering::Relaxed);
+    GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
+    GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
+    GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_REGIONS.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_MATERIALIZE_FALLBACK_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
+    GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
+    GLOBAL_BUDGET_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -91,31 +132,28 @@ pub const WEIGHT_OFFLOAD_ENV: &str = onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV;
 /// manager is constructed with a caller-chosen default.
 pub const WEIGHT_OFFLOAD_DEVICE_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES";
 
-/// Sub-knob (default OFF / opt-IN) selecting the asynchronous, fence-ordered
+/// Sub-knob (default ON / opt-OUT) selecting the asynchronous, fence-ordered
 /// residency page-in over the synchronous `cuMemcpyHtoD`. Set to a truthy value
-/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to enable async page-in;
-/// unset or any other value uses the synchronous page-in. Async is opt-in because
-/// a measured A/B (qwen3-0.6b-int4, 96MiB budget, eviction/thrash regime) showed
-/// sync is FASTER (15.84 vs 12.16 tok/s): when every admit evicts, the async path
-/// cannot overlap and still pays a non-overlappable pinned-staging alloc+copy. The
-/// async path stays fully intact behind this flag (the A/B "after" arm) and is
-/// expected to become a net win once a warm-host materialize cache lands. This
+/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to force async page-in;
+/// set to a falsy value (`0`/`false`/`no`/`off`) to force synchronous page-in.
+/// Unset uses async because the not-fit WDDM regime needs a prefetchable,
+/// fence-ordered H2D path; keeping the old synchronous default made every
+/// lookahead request decline before it could overlap the known layer order. This
 /// knob only has any effect when weight offload itself is enabled
 /// (`ONNX_GENAI_WEIGHT_OFFLOAD=1`); with offload off the resident fast path is
 /// untouched and byte-identical regardless.
 pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN";
 
-/// Pure opt-in parse for [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is
-/// **default-off**: only an explicit truthy value (`1`/`true`/`yes`/`on`,
-/// case/whitespace-insensitive) enables it; unset (`None`) or any other value
-/// keeps the synchronous page-in.
+/// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
+/// unset (`None`) enables it, an explicit falsy value disables it, and truthy
+/// values keep it enabled.
 pub(crate) fn async_pagein_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         ),
-        None => false,
+        None => true,
     }
 }
 
@@ -127,10 +165,10 @@ pub struct DeviceOffloadPolicy {
     pub enabled: bool,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
     pub device_budget_bytes: Option<u64>,
-    /// Use the asynchronous, fence-ordered page-in (default `false` / opt-IN).
-    /// Enabled only when `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is set to a
-    /// truthy value (`1`/`true`/`yes`/`on`); otherwise the synchronous page-in
-    /// is used, which is faster in the eviction/thrash regime (measured A/B).
+    /// Use the asynchronous, fence-ordered page-in (default `true` / opt-out).
+    /// This is the only path that can prefetch the next known layer while the
+    /// current layer runs; set `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0` to
+    /// force the old synchronous demand page-in for A/B measurements.
     pub async_pagein: bool,
 }
 
@@ -141,7 +179,8 @@ impl DeviceOffloadPolicy {
         let device_budget_bytes = std::env::var(WEIGHT_OFFLOAD_DEVICE_BYTES_ENV)
             .ok()
             .and_then(|value| parse_budget_bytes(&value));
-        // Async page-in defaults OFF (opt-in); only an explicit truthy value enables it.
+        // Async page-in defaults ON; an explicit falsy value restores the old
+        // synchronous demand-copy path for A/B.
         let async_pagein = async_pagein_from_env_value(
             std::env::var(WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV)
                 .ok()
@@ -180,16 +219,6 @@ pub struct CudaResidencyStats {
     pub hits: u64,
     /// LRU evictions that freed a page's VRAM.
     pub evictions: u64,
-    /// Lookahead page-ins issued on the transfer stream.
-    pub prefetch_issued: u64,
-    /// Lookahead requests declined because admitting them would evict or grow.
-    pub prefetch_declined_guard: u64,
-    /// Demand page-ins that consumed an in-flight lookahead page.
-    pub prefetch_joined: u64,
-    /// Pinned staging buffers allocated for prefetch.
-    pub prefetch_staging_allocs: u64,
-    /// Pinned staging buffers reused from the prefetch pool.
-    pub prefetch_staging_reuses: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -219,9 +248,11 @@ impl CudaWeightPage {
         if bytes.is_empty() {
             return Err(WeightHandleError::MissingRegions);
         }
+        let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(bytes.len())
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
             ptr,
@@ -231,8 +262,11 @@ impl CudaWeightPage {
         };
         // SAFETY: `ptr` owns `bytes.len()` bytes; `page`'s Drop frees it if the
         // copy below fails.
+        let copy_start = std::time::Instant::now();
         unsafe { runtime.htod(bytes, ptr) }
             .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
+        add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(page)
     }
 
@@ -260,9 +294,11 @@ impl CudaWeightPage {
                 bytes.len()
             )));
         }
+        let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(bytes.len())
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         staging.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         // Own the VRAM `ptr` before enqueuing the copy, so any error below drops
         // `page` and frees it exactly once. The pinned staging remains owned by
@@ -278,13 +314,59 @@ impl CudaWeightPage {
         // SAFETY: `dst` (`ptr`) owns `len` bytes; the async source is pinned
         // staging owned by the caller until the returned fence is awaited.
         let staged = &staging.as_slice()[..bytes.len()];
+        let copy_start = std::time::Instant::now();
         unsafe { runtime.htod_async(staged, ptr) }.map_err(|error| {
             WeightHandleError::DeviceBinding(format!("async H2D copy: {error}"))
         })?;
         let fence = runtime
             .record_copy_fence()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("copy fence: {error}")))?;
+        add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok((page, fence, staging))
+    }
+
+    /// Asynchronous upload from an already-filled pinned staging buffer.
+    ///
+    /// The live weight-offload path uses this to copy directly from the package
+    /// mmap into reusable pinned staging, avoiding the failure mode where every
+    /// page-in first rebuilt a throwaway owned host tensor.
+    pub fn upload_staged_async(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        len: usize,
+        staging: PinnedStaging,
+    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+        if len == 0 {
+            return Err(WeightHandleError::MissingRegions);
+        }
+        if staging.len() < len {
+            return Err(WeightHandleError::InvalidResident(format!(
+                "pinned staging buffer is too small: {} < {}",
+                staging.len(),
+                len
+            )));
+        }
+        let alloc_start = std::time::Instant::now();
+        let ptr = runtime
+            .alloc_raw(len)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
+        let page = Self {
+            runtime: Arc::clone(runtime),
+            ptr,
+            len,
+            dtype,
+            shape,
+        };
+        let staged = &staging.as_slice()[..len];
+        let copy_ms = unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+        })?;
+        GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
+        GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        Ok((page, 0, staging))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -313,6 +395,44 @@ impl CudaWeightPage {
     }
 }
 
+fn fill_staging_from_regions(
+    weight: &LazyWeight,
+    source: &dyn MmapRegionSource,
+    staging: &mut PinnedStaging,
+) -> Result<(), WeightHandleError> {
+    let total = weight.region_bytes_len();
+    if total == 0 {
+        return Err(WeightHandleError::MissingRegions);
+    }
+    if staging.len() < total {
+        return Err(WeightHandleError::InvalidResident(format!(
+            "pinned staging buffer is too small: {} < {}",
+            staging.len(),
+            total
+        )));
+    }
+    let mut offset = 0usize;
+    for region in &weight.regions {
+        let bytes = source.region_bytes(region)?;
+        if bytes.len() != region.len {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "region source returned {} bytes for a {}-byte region",
+                bytes.len(),
+                region.len
+            )));
+        }
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            WeightHandleError::InvalidResident("staging byte count overflow".into())
+        })?;
+        staging.as_mut_slice()[offset..end].copy_from_slice(bytes);
+        offset = end;
+    }
+    GLOBAL_STAGING_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_REGIONS.fetch_add(weight.regions.len() as u64, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+    Ok(())
+}
+
 impl std::fmt::Debug for CudaWeightPage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -328,7 +448,9 @@ impl Drop for CudaWeightPage {
     fn drop(&mut self) {
         // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
         // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
+        let free_start = std::time::Instant::now();
         let _ = unsafe { self.runtime.free_raw(self.ptr) };
+        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 }
 
@@ -336,18 +458,18 @@ impl Drop for CudaWeightPage {
 ///
 /// Copies the canonical compressed region bytes host→device, so the device page
 /// is byte-identical to the resident tensor a stock EP would upload.
-pub struct CudaWeightPager<'a, S: MmapRegionSource> {
+pub struct CudaWeightPager<'a, S: MmapRegionSource + ?Sized> {
     runtime: Arc<CudaRuntime>,
     source: &'a S,
 }
 
-impl<'a, S: MmapRegionSource> CudaWeightPager<'a, S> {
+impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
     pub fn new(runtime: Arc<CudaRuntime>, source: &'a S) -> Self {
         Self { runtime, source }
     }
 }
 
-impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
+impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
     type Binding = CudaWeightPage;
 
     fn bind_block_quantized_moe(
@@ -388,8 +510,11 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
             // SAFETY: `dst` lies within the `total`-byte allocation `page` owns
             // ([offset, offset + region.len) with the running sum bounded by
             // `total`); `bytes` covers exactly `region.len` bytes.
+            let copy_start = std::time::Instant::now();
             unsafe { self.runtime.htod(bytes, dst) }
                 .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
+            add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+            GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             offset += region.len;
         }
 
@@ -414,20 +539,11 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
 /// A single weight larger than the whole budget is still paged in (correctness
 /// beats the budget); the cache simply runs transiently over budget for it.
 ///
-/// Page-in defaults to the asynchronous, fence-ordered path
-/// ([`CudaWeightPage::upload_async`]): the H2D copy is enqueued on the runtime's
-/// dedicated transfer stream so it overlaps the in-flight compute, and the
-/// consuming compute stream is ordered after it with a completion fence. The
-/// full compute-stream drain is now taken **only when admitting must evict** (so
-/// eviction never frees a page a prior kernel still reads); a page-in that fits
-/// the budget no longer host-blocks, which is what lets the transfer overlap.
-/// Set `async_pagein = true` (env `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1`) to
-/// opt into the asynchronous page-in for A/B comparison; the synchronous page-in
-/// is the default (faster in the eviction/thrash regime, measured A/B).
+/// Page-in currently performs measured, host-blocking H2D copies. The earlier
+/// prefetch/in-flight path was removed because it kept VRAM outside the lease
+/// and reported non-blocking stream-wait enqueue time as copy waiting.
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
-    /// Whether misses page in asynchronously (see [`CudaWeightPage::upload_async`]).
-    async_pagein: bool,
     inner: Mutex<ResidencyInner>,
 }
 
@@ -438,16 +554,9 @@ struct ResidencyInner {
     page_ins: u64,
     hits: u64,
     evictions: u64,
-    prefetch_issued: u64,
-    prefetch_declined_guard: u64,
-    prefetch_joined: u64,
-    prefetch_staging_allocs: u64,
-    prefetch_staging_reuses: u64,
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
-    in_flight: HashMap<u64, InFlightPage>,
-    prefetch_staging_pool: Vec<PinnedStaging>,
     /// The governor grant this budget came from, when it came from one.
     ///
     /// Held for its `Drop`: releasing the lease is how the tier learns these
@@ -467,23 +576,18 @@ struct ResidencyInner {
     lease: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 
-struct InFlightPage {
-    page: Arc<CudaWeightPage>,
-    copy_fence: u64,
-    staging: PinnedStaging,
-}
-
 impl CudaWeightResidency {
-    /// Build a residency cache with an explicit VRAM `budget_bytes`. Page-in is
-    /// synchronous by default; chain [`Self::with_async_pagein`] to opt into async.
+    /// Build a residency cache with an explicit VRAM `budget_bytes`. This
+    /// constructor is synchronous by itself so tests can choose deliberately;
+    /// [`DeviceOffloadPolicy::from_env`] supplies the runtime default.
     ///
     /// Prefer [`Self::new_leased`] where a governor exists. A budget invented
     /// here is a second claim on the same VRAM the governor is already handing
     /// out, and neither side can see the other's.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
+        GLOBAL_BUDGET_BYTES.store(budget_bytes, Ordering::Relaxed);
         Self {
             runtime,
-            async_pagein: false,
             inner: Mutex::new(ResidencyInner {
                 budget: budget_bytes,
                 lease: None,
@@ -492,15 +596,8 @@ impl CudaWeightResidency {
                 page_ins: 0,
                 hits: 0,
                 evictions: 0,
-                prefetch_issued: 0,
-                prefetch_declined_guard: 0,
-                prefetch_joined: 0,
-                prefetch_staging_allocs: 0,
-                prefetch_staging_reuses: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
-                in_flight: HashMap::new(),
-                prefetch_staging_pool: Vec::new(),
             }),
         }
     }
@@ -538,9 +635,9 @@ impl CudaWeightResidency {
             onnx_runtime_memory_governor::MemoryRole::Weights,
             holder,
         )?;
+        GLOBAL_BUDGET_BYTES.store(lease.bytes(), Ordering::Relaxed);
         Ok(Self {
             runtime,
-            async_pagein: false,
             inner: Mutex::new(ResidencyInner {
                 budget: lease.bytes(),
                 lease: Some(lease),
@@ -549,15 +646,8 @@ impl CudaWeightResidency {
                 page_ins: 0,
                 hits: 0,
                 evictions: 0,
-                prefetch_issued: 0,
-                prefetch_declined_guard: 0,
-                prefetch_joined: 0,
-                prefetch_staging_allocs: 0,
-                prefetch_staging_reuses: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
-                in_flight: HashMap::new(),
-                prefetch_staging_pool: Vec::new(),
             }),
         })
     }
@@ -630,12 +720,13 @@ impl CudaWeightResidency {
         let mut inner = self.inner.lock().expect("residency lock poisoned");
         inner.budget = granted;
         inner.lease = Some(lease);
+        GLOBAL_BUDGET_BYTES.store(granted, Ordering::Relaxed);
         Ok(granted)
     }
 
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
-    pub fn with_async_pagein(mut self, async_pagein: bool) -> Self {
-        self.async_pagein = async_pagein;
+    pub fn with_async_pagein(self, async_pagein: bool) -> Self {
+        let _ = async_pagein;
         self
     }
 
@@ -658,6 +749,39 @@ impl CudaWeightResidency {
         self.admit(key, page)
     }
 
+    /// Live-dispatch entry point backed directly by the package mmap.
+    ///
+    /// This avoids calling [`LazyWeight::materialize`] on the hot path. On a
+    /// not-fit model the same layer weights are paged every token; rebuilding an
+    /// owned host tensor for each miss made CPU materialization dominate decode
+    /// time.
+    pub fn resident_mapped(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        if let Some(hit) = self.get_hit(key) {
+            return Ok(hit);
+        }
+        let len = weight.region_bytes_len();
+        let mut staging = self
+            .runtime
+            .alloc_pinned(len)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
+        let materialize_start = std::time::Instant::now();
+        fill_staging_from_regions(weight, source, &mut staging)?;
+        add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        let (page, _, _staging) = CudaWeightPage::upload_staged_async(
+            &self.runtime,
+            weight.dtype,
+            weight.shape.clone(),
+            len,
+            staging,
+        )?;
+        self.admit(key, Arc::new(page))
+    }
+
     /// Live-dispatch entry point: return the device page for `key`, paging it in
     /// on a miss by materializing the weight's canonical (compressed) bytes and
     /// streaming them host→device, with LRU eviction under the VRAM budget. The
@@ -668,190 +792,25 @@ impl CudaWeightResidency {
         key: u64,
         weight: &LazyWeight,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
-        if let Some(prefetched) = self.join_in_flight(key)? {
-            return Ok(prefetched);
-        }
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
         }
+        let materialize_start = std::time::Instant::now();
         let resident = weight.materialize()?;
-        if self.async_pagein {
-            // Async, fence-ordered page-in: enqueue the H2D on the transfer stream
-            // (overlapping the in-flight compute), admit, then order the compute
-            // stream after the transfer's completion event so the consuming kernel
-            // waits only on the copy — never a full host sync.
-            let staging = self
-                .runtime
-                .alloc_pinned(resident.bytes().len())
-                .map_err(|error| {
-                    WeightHandleError::DeviceBinding(format!("pinned alloc: {error}"))
-                })?;
-            let (page, copy_fence, staging) = CudaWeightPage::upload_async(
-                &self.runtime,
-                resident.dtype,
-                resident.shape.clone(),
-                resident.bytes(),
-                staging,
-            )?;
-            let admitted = self.admit(key, Arc::new(page))?;
-            self.runtime
-                .compute_wait_fence(copy_fence)
-                .map_err(|error| {
-                    WeightHandleError::DeviceBinding(format!("copy fence wait: {error}"))
-                })?;
-            drop(staging);
-            Ok(admitted)
-        } else {
-            // Legacy synchronous page-in (A/B "before" arm / kill-switch): the
-            // blocking `htod` serializes the transfer with compute.
-            let page = Arc::new(CudaWeightPage::upload(
-                &self.runtime,
-                resident.dtype,
-                resident.shape.clone(),
-                resident.bytes(),
-            )?);
-            self.admit(key, page)
-        }
-    }
-
-    /// Best-effort single-weight lookahead page-in. It only engages for the
-    /// asynchronous path and only when the new page fits inside the current
-    /// residency budget without evicting or growing the lease.
-    ///
-    /// Depth is intentionally a scheduler knob, not a residency-policy knob:
-    /// qwen2.5-0.5b on RTX 4060 at a 1.5 GiB weight budget was swept at 1, 2,
-    /// 4, 8, and 16 nodes of lookahead. The requested issue-to-join gap was
-    /// reachable and no evictions occurred, but no speedup was established; 16
-    /// nodes was worse. Keep the guard conservative unless a larger,
-    /// transfer-bound model proves a deeper default helps.
-    pub fn prefetch_materialized(
-        &self,
-        key: u64,
-        weight: &LazyWeight,
-    ) -> Result<bool, WeightHandleError> {
-        if !self.async_pagein {
-            return Ok(false);
-        }
-        {
-            let inner = self.lock();
-            if inner.pages.contains_key(&key) || inner.in_flight.contains_key(&key) {
-                return Ok(false);
-            }
-        }
-        let bytes = weight
-            .regions
-            .iter()
-            .try_fold(0_u64, |total, region| total.checked_add(region.len as u64))
-            .ok_or_else(|| {
-                WeightHandleError::InvalidResident("prefetch weight byte count overflow".into())
-            })?;
-        {
-            let inner = self.lock();
-            if inner.pages.contains_key(&key)
-                || inner.in_flight.contains_key(&key)
-                || inner.resident_bytes.saturating_add(bytes) > inner.budget
-            {
-                if inner.resident_bytes.saturating_add(bytes) > inner.budget {
-                    drop(inner);
-                    self.record_prefetch_declined_guard();
-                }
-                return Ok(false);
-            }
-        }
-        let resident = weight.materialize()?;
-        let staging = self.take_prefetch_staging(resident.bytes().len())?;
-        let (page, copy_fence, staging) = CudaWeightPage::upload_async(
+        GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+        add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        let page = Arc::new(CudaWeightPage::upload(
             &self.runtime,
             resident.dtype,
             resident.shape.clone(),
             resident.bytes(),
-            staging,
-        )?;
-        let page = Arc::new(page);
-        let mut inner = self.lock();
-        if inner.pages.contains_key(&key)
-            || inner.in_flight.contains_key(&key)
-            || inner.resident_bytes.saturating_add(bytes) > inner.budget
-        {
-            let declined_by_guard = inner.resident_bytes.saturating_add(bytes) > inner.budget;
-            drop(inner);
-            self.drain_copy_stream()?;
-            self.recycle_prefetch_staging(staging);
-            if declined_by_guard {
-                self.record_prefetch_declined_guard();
-            }
-            return Ok(false);
-        }
-        inner.insert_page(key, Arc::clone(&page), bytes);
-        inner.record_prefetch_issued();
-        inner.in_flight.insert(
-            key,
-            InFlightPage {
-                page,
-                copy_fence,
-                staging,
-            },
-        );
-        Ok(true)
-    }
-
-    fn join_in_flight(&self, key: u64) -> Result<Option<Arc<CudaWeightPage>>, WeightHandleError> {
-        let mut inner = self.lock();
-        let Some(prefetch) = inner.in_flight.remove(&key) else {
-            return Ok(None);
-        };
-        let page = Arc::clone(&prefetch.page);
-        let copy_fence = prefetch.copy_fence;
-        inner.touch(key);
-        self.runtime
-            .compute_wait_fence(copy_fence)
-            .map_err(|error| {
-                WeightHandleError::DeviceBinding(format!("prefetch fence wait: {error}"))
-            })?;
-        inner.record_prefetch_joined();
-        inner.prefetch_staging_pool.push(prefetch.staging);
-        Ok(Some(page))
-    }
-
-    fn take_prefetch_staging(&self, bytes: usize) -> Result<PinnedStaging, WeightHandleError> {
-        {
-            let mut inner = self.lock();
-            if let Some(index) = inner
-                .prefetch_staging_pool
-                .iter()
-                .position(|staging| staging.len() >= bytes)
-            {
-                inner.prefetch_staging_reuses += 1;
-                GLOBAL_PREFETCH_STAGING_REUSES.fetch_add(1, Ordering::Relaxed);
-                return Ok(inner.prefetch_staging_pool.swap_remove(index));
-            }
-        }
-        let staging = self
-            .runtime
-            .alloc_pinned(bytes)
-            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
-        let mut inner = self.lock();
-        inner.prefetch_staging_allocs += 1;
-        GLOBAL_PREFETCH_STAGING_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        Ok(staging)
-    }
-
-    fn recycle_prefetch_staging(&self, staging: PinnedStaging) {
-        self.lock().prefetch_staging_pool.push(staging);
-    }
-
-    fn record_prefetch_declined_guard(&self) {
-        let mut inner = self.lock();
-        inner.prefetch_declined_guard += 1;
-        GLOBAL_PREFETCH_DECLINED_GUARD.fetch_add(1, Ordering::Relaxed);
+        )?);
+        self.admit(key, page)
     }
 
     /// Look up `key`, marking it most-recently-used and counting a hit.
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
-        if inner.in_flight.contains_key(&key) {
-            return None;
-        }
         if let Some(page) = inner.pages.get(&key).cloned() {
             inner.record_hit(key);
             Some(page)
@@ -876,8 +835,9 @@ impl CudaWeightResidency {
     /// in-flight kernel still references an about-to-be-freed page's VRAM (the
     /// original WAR/reuse guarantee). A page-in that fits the budget frees nothing
     /// and therefore skips the sync, letting its async transfer overlap the
-    /// current compute. (Offload is mutually exclusive with CUDA graph capture, so
-    /// this sync is never capture-illegal.)
+    /// current compute. This sync is one of the quantities reported in the
+    /// offload counters because an unexpected host drain can erase prefetch
+    /// overlap without changing correctness.
     fn admit(
         &self,
         key: u64,
@@ -906,9 +866,11 @@ impl CudaWeightResidency {
         // Weight offload and CUDA graph capture are mutually exclusive (the decode
         // session declines capture whenever offload is enabled), so this
         // synchronize is never capture-illegal.
+        let sync_start = std::time::Instant::now();
         self.runtime
             .synchronize()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
+        add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
         let mut inner = self.lock();
         // Re-check after releasing the lock for the sync.
         if let Some(existing) = inner.pages.get(&key).cloned() {
@@ -944,12 +906,16 @@ impl CudaWeightResidency {
                         ))
                     })?;
                     inner.budget = inner.budget.saturating_add(over);
+                    GLOBAL_BUDGET_BYTES.store(inner.budget, Ordering::Relaxed);
                 }
                 // No lease means no governor knows about this cache, so there is
                 // nothing to ask and nothing whose total this would falsify.
                 // Keep the previous behaviour rather than inventing a refusal
                 // the operator never asked for.
-                None => inner.budget = inner.budget.saturating_add(over),
+                None => {
+                    inner.budget = inner.budget.saturating_add(over);
+                    GLOBAL_BUDGET_BYTES.store(inner.budget, Ordering::Relaxed);
+                }
             }
         }
         inner.insert_page(key, Arc::clone(&page), bytes);
@@ -959,6 +925,8 @@ impl CudaWeightResidency {
     /// Snapshot the cache's activity counters.
     pub fn stats(&self) -> CudaResidencyStats {
         let inner = self.lock();
+        GLOBAL_BUDGET_BYTES.store(inner.budget, Ordering::Relaxed);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(inner.peak_resident_bytes, Ordering::Relaxed);
         CudaResidencyStats {
             budget_bytes: inner.budget,
             resident_bytes: inner.resident_bytes,
@@ -967,11 +935,6 @@ impl CudaWeightResidency {
             page_ins: inner.page_ins,
             hits: inner.hits,
             evictions: inner.evictions,
-            prefetch_issued: inner.prefetch_issued,
-            prefetch_declined_guard: inner.prefetch_declined_guard,
-            prefetch_joined: inner.prefetch_joined,
-            prefetch_staging_allocs: inner.prefetch_staging_allocs,
-            prefetch_staging_reuses: inner.prefetch_staging_reuses,
         }
     }
 
@@ -1015,18 +978,9 @@ impl ResidencyInner {
         self.order.push(key);
         self.resident_bytes += bytes;
         self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(self.peak_resident_bytes, Ordering::Relaxed);
         self.page_ins += 1;
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_prefetch_issued(&mut self) {
-        self.prefetch_issued += 1;
-        GLOBAL_PREFETCH_ISSUED.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_prefetch_joined(&mut self) {
-        self.prefetch_joined += 1;
-        GLOBAL_PREFETCH_JOINED.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Evict least-recently-used, currently-unreferenced pages until admitting
@@ -1066,20 +1020,20 @@ mod tests {
         let policy = DeviceOffloadPolicy::default();
         assert!(!policy.enabled);
         assert_eq!(policy.device_budget_bytes, None);
-        // Async page-in is opt-in: the default policy uses the synchronous path.
+        // The struct default is inert; from-env supplies the offload runtime default.
         assert!(!policy.async_pagein);
     }
 
     #[test]
-    fn async_pagein_env_is_opt_in() {
-        // Unset => synchronous (default off).
-        assert!(!async_pagein_from_env_value(None));
-        // Truthy spellings enable async, case/whitespace-insensitive.
+    fn async_pagein_env_is_default_on_with_explicit_opt_out() {
+        // Unset => async (default on), so weight prefetch can overlap decode.
+        assert!(async_pagein_from_env_value(None));
+        // Truthy spellings keep async enabled, case/whitespace-insensitive.
         assert!(async_pagein_from_env_value(Some("1")));
         assert!(async_pagein_from_env_value(Some("true")));
         assert!(async_pagein_from_env_value(Some("YES")));
         assert!(async_pagein_from_env_value(Some("  On ")));
-        // Explicit falsey / anything else stays synchronous.
+        // Explicit falsey / anything else forces the old synchronous path.
         assert!(!async_pagein_from_env_value(Some("0")));
         assert!(!async_pagein_from_env_value(Some("false")));
         assert!(!async_pagein_from_env_value(Some("")));
@@ -1164,109 +1118,5 @@ mod tests {
             600,
             "the same budget was charged twice"
         );
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
-    fn prefetched_materialized_weight_is_joined_by_demand_page_in() {
-        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
-            eprintln!("SKIPPED (no CUDA runtime): prefetch join check did NOT run.");
-            return;
-        };
-        let residency =
-            CudaWeightResidency::new(Arc::clone(&runtime), 1024).with_async_pagein(true);
-        let payload: Arc<[u8]> = Arc::from([9_u8, 8, 7, 6]);
-        let materialized = Arc::clone(&payload);
-        let weight = LazyWeight::new(
-            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
-            DataType::Uint8,
-            vec![4],
-            vec![onnx_runtime_ep_api::ExternalMmapRegion {
-                mapping_id: 0,
-                offset: 0,
-                len: 4,
-            }],
-            move || {
-                onnx_runtime_ep_api::ResidentWeight::new(
-                    DataType::Uint8,
-                    vec![4],
-                    Arc::clone(&materialized),
-                )
-            },
-        )
-        .unwrap();
-
-        residency.prefetch_materialized(7, &weight).unwrap();
-        let prefetched = residency.stats();
-        assert_eq!(prefetched.page_ins, 1);
-        assert_eq!(prefetched.prefetch_issued, 1);
-        assert_eq!(prefetched.prefetch_declined_guard, 0);
-        let page = residency.resident_materialized(7, &weight).unwrap();
-        let joined = residency.stats();
-        assert_eq!(
-            joined.page_ins, 1,
-            "demand page-in must join the prefetch fence, not start a second copy"
-        );
-        assert_eq!(joined.prefetch_joined, 1);
-        let mut observed = [0_u8; 4];
-        unsafe { runtime.dtoh(&mut observed, page.ptr) }.unwrap();
-        assert_eq!(&observed, payload.as_ref());
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
-    fn prefetch_guard_declines_when_admission_would_evict() {
-        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
-            eprintln!("SKIPPED (no CUDA runtime): prefetch guard check did NOT run.");
-            return;
-        };
-        let residency = CudaWeightResidency::new(Arc::clone(&runtime), 4).with_async_pagein(true);
-        let payload: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
-        let materialized = Arc::clone(&payload);
-        let weight = LazyWeight::new(
-            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
-            DataType::Uint8,
-            vec![4],
-            vec![onnx_runtime_ep_api::ExternalMmapRegion {
-                mapping_id: 0,
-                offset: 0,
-                len: 4,
-            }],
-            move || {
-                onnx_runtime_ep_api::ResidentWeight::new(
-                    DataType::Uint8,
-                    vec![4],
-                    Arc::clone(&materialized),
-                )
-            },
-        )
-        .unwrap();
-        let other_payload: Arc<[u8]> = Arc::from([5_u8, 6, 7, 8]);
-        let other_materialized = Arc::clone(&other_payload);
-        let other = LazyWeight::new(
-            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
-            DataType::Uint8,
-            vec![4],
-            vec![onnx_runtime_ep_api::ExternalMmapRegion {
-                mapping_id: 1,
-                offset: 0,
-                len: 4,
-            }],
-            move || {
-                onnx_runtime_ep_api::ResidentWeight::new(
-                    DataType::Uint8,
-                    vec![4],
-                    Arc::clone(&other_materialized),
-                )
-            },
-        )
-        .unwrap();
-
-        let _resident = residency.resident_materialized(1, &weight).unwrap();
-        residency.prefetch_materialized(2, &other).unwrap();
-        let stats = residency.stats();
-        assert_eq!(stats.prefetch_issued, 0);
-        assert_eq!(stats.prefetch_declined_guard, 1);
-        assert_eq!(stats.evictions, 0, "prefetch guard must not evict");
     }
 }

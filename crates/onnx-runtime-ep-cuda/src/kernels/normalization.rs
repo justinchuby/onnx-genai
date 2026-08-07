@@ -2288,7 +2288,7 @@ mod tests {
                 *sum += second * second;
             }
         }
-        if residual.len() % 2 != 0 {
+        if !residual.len().is_multiple_of(2) {
             let tail = residual[residual.len() - 1].to_f32();
             lanes[0] += tail * tail;
         }
