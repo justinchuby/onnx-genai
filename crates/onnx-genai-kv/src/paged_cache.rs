@@ -268,7 +268,7 @@ impl PagedKvCache {
                         head,
                         token_offset,
                         key,
-                    );
+                    )?;
                     page.write_head_token(
                         page_size,
                         geom.head_dim,
@@ -276,7 +276,7 @@ impl PagedKvCache {
                         head,
                         token_offset,
                         value,
-                    );
+                    )?;
                 }
             }
             page.filled = page.filled.max(token_offset + 1);
@@ -387,7 +387,7 @@ impl PagedKvCache {
                             head,
                             token_offset,
                             dim,
-                        );
+                        )?;
                         layer_out.value[dst] = page.value_at_slot(
                             page_size,
                             head_dim,
@@ -395,7 +395,7 @@ impl PagedKvCache {
                             head,
                             token_offset,
                             dim,
-                        );
+                        )?;
                     }
                 }
             }

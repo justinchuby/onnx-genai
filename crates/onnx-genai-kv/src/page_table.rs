@@ -8,10 +8,11 @@ use crate::{
 use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
 use std::sync::Arc;
 use std::{
+    any::Any,
     collections::{BTreeMap, HashMap},
     fmt,
     mem::size_of,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     ptr::NonNull,
 };
 
@@ -43,12 +44,20 @@ pub struct DevicePageSpan {
 /// materialization before it can obtain slices; that copy is visible to the
 /// caller and can be charged to the memory governor instead of being hidden
 /// behind an accessor such as `head_token_row()`.
-pub trait KvPageStore: fmt::Debug {
+pub trait KvPageStore: fmt::Debug + Send + Sync + Any {
     fn allocated_bytes(&self) -> u64;
     fn reset_storage(&mut self);
     fn host_view(&self) -> Option<HostPageStoreView<'_>>;
     fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>>;
     fn device_span(&self) -> Option<DevicePageSpan>;
+    fn clone_store(&self) -> Box<dyn KvPageStore>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl Clone for Box<dyn KvPageStore> {
+    fn clone(&self) -> Self {
+        self.clone_store()
+    }
 }
 
 /// Borrowed host slices for a page store.
@@ -130,73 +139,28 @@ impl KvPageStore for HostPageStore {
     fn device_span(&self) -> Option<DevicePageSpan> {
         None
     }
-}
 
-/// Cloneable page-store handle used by `Page`.
-///
-/// It is an enum rather than a trait object so cloning a `PageTable` continues
-/// to duplicate page storage while leaving the governor lease behind. A future
-/// CUDA variant can implement [`KvPageStore`] without changing cache-facing
-/// APIs; host-only callers will see `host_view() == None` until they explicitly
-/// materialize the page.
-#[derive(Debug, Clone)]
-pub enum PageStore {
-    Host(HostPageStore),
-}
-
-impl PageStore {
-    fn host(data_len: usize, quantized_len: usize, fp8_len: usize, scale_len: usize) -> Self {
-        Self::Host(HostPageStore::new(
-            data_len,
-            quantized_len,
-            fp8_len,
-            scale_len,
-        ))
+    fn clone_store(&self) -> Box<dyn KvPageStore> {
+        Box::new(self.clone())
     }
 
-    fn expect_host(&self) -> &HostPageStore {
-        match self {
-            Self::Host(store) => store,
-        }
-    }
-
-    fn expect_host_mut(&mut self) -> &mut HostPageStore {
-        match self {
-            Self::Host(store) => store,
-        }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
-impl KvPageStore for PageStore {
-    fn allocated_bytes(&self) -> u64 {
-        match self {
-            Self::Host(store) => store.allocated_bytes(),
-        }
-    }
-
-    fn reset_storage(&mut self) {
-        match self {
-            Self::Host(store) => store.reset_storage(),
-        }
-    }
-
-    fn host_view(&self) -> Option<HostPageStoreView<'_>> {
-        match self {
-            Self::Host(store) => store.host_view(),
-        }
-    }
-
-    fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
-        match self {
-            Self::Host(store) => store.host_view_mut(),
-        }
-    }
-
-    fn device_span(&self) -> Option<DevicePageSpan> {
-        match self {
-            Self::Host(store) => store.device_span(),
-        }
-    }
+fn host_page_store(
+    data_len: usize,
+    quantized_len: usize,
+    fp8_len: usize,
+    scale_len: usize,
+) -> Box<dyn KvPageStore> {
+    Box::new(HostPageStore::new(
+        data_len,
+        quantized_len,
+        fp8_len,
+        scale_len,
+    ))
 }
 
 /// Scalar storage type for KV page tensors.
@@ -519,7 +483,7 @@ pub struct Page {
     /// Last access timestamp (for LRU eviction).
     pub last_access: u64,
     /// Physical page storage.
-    pub store: PageStore,
+    pub store: Box<dyn KvPageStore>,
     storage_layout: Vec<ComponentStorage>,
 }
 
@@ -527,13 +491,13 @@ impl Deref for Page {
     type Target = HostPageStore;
 
     fn deref(&self) -> &Self::Target {
-        self.store.expect_host()
-    }
-}
-
-impl DerefMut for Page {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.store.expect_host_mut()
+        // Backwards-compatible host field access for existing host-only tests
+        // and callers. Cache-facing code goes through `host_view()` so a device
+        // store is an explicit `None`, not a hidden materialization.
+        self.store
+            .as_any()
+            .downcast_ref::<HostPageStore>()
+            .expect("legacy host field access requires HostPageStore")
     }
 }
 
@@ -596,7 +560,7 @@ impl Page {
             device,
             filled: 0,
             last_access: 0,
-            store: PageStore::host(data_len, quantized_len, fp8_len, scale_len),
+            store: host_page_store(data_len, quantized_len, fp8_len, scale_len),
             storage_layout,
         }
     }
@@ -629,26 +593,30 @@ impl Page {
         head: usize,
         token_offset: usize,
         dim: usize,
-    ) -> f32 {
+    ) -> Result<f32, KvError> {
+        let view = self
+            .store
+            .host_view()
+            .ok_or(KvError::PageNotHostAddressable(self.id))?;
         let storage = self.storage_layout[component];
         let head_len = page_size * head_dim;
         let within = head * head_len + token_offset * head_dim + dim;
-        match storage.dtype {
-            KvDType::F32 => self.data[storage.data_offset + within],
+        Ok(match storage.dtype {
+            KvDType::F32 => view.data[storage.data_offset + within],
             KvDType::Int8 => {
                 let scale =
-                    self.quant_scales[storage.scale_offset + head * page_size + token_offset];
-                f32::from(self.quantized_data[storage.quantized_offset + within]) * scale
+                    view.quant_scales[storage.scale_offset + head * page_size + token_offset];
+                f32::from(view.quantized_data[storage.quantized_offset + within]) * scale
             }
             KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
                 let scale =
-                    self.quant_scales[storage.scale_offset + head * page_size + token_offset];
+                    view.quant_scales[storage.scale_offset + head * page_size + token_offset];
                 decode_fp8(
-                    self.fp8_data[storage.fp8_offset + within],
+                    view.fp8_data[storage.fp8_offset + within],
                     storage.dtype.fp8_format().expect("fp8 dtype"),
                 ) * scale
             }
-        }
+        })
     }
 
     /// Store one token's `head_dim` values for a single `(component, head)` slot.
@@ -669,21 +637,25 @@ impl Page {
         head: usize,
         token_offset: usize,
         values: &[f32],
-    ) {
+    ) -> Result<(), KvError> {
         debug_assert_eq!(values.len(), head_dim);
+        let view = self
+            .store
+            .host_view_mut()
+            .ok_or(KvError::PageNotHostAddressable(self.id))?;
         let storage = self.storage_layout[component];
         let head_len = page_size * head_dim;
         let within = head * head_len + token_offset * head_dim;
         match storage.dtype {
             KvDType::F32 => {
                 let offset = storage.data_offset + within;
-                self.data[offset..offset + head_dim].copy_from_slice(values);
+                view.data[offset..offset + head_dim].copy_from_slice(values);
             }
             KvDType::Int8 => {
                 let scale = quant_scale(values, 127.0);
-                self.quant_scales[storage.scale_offset + head * page_size + token_offset] = scale;
+                view.quant_scales[storage.scale_offset + head * page_size + token_offset] = scale;
                 let offset = storage.quantized_offset + within;
-                for (output, value) in self.quantized_data[offset..offset + head_dim]
+                for (output, value) in view.quantized_data[offset..offset + head_dim]
                     .iter_mut()
                     .zip(values)
                 {
@@ -693,9 +665,9 @@ impl Page {
             KvDType::Fp8E4M3Fn | KvDType::Fp8E5M2 => {
                 let format = storage.dtype.fp8_format().expect("fp8 dtype");
                 let scale = quant_scale(values, format.max_finite());
-                self.quant_scales[storage.scale_offset + head * page_size + token_offset] = scale;
+                view.quant_scales[storage.scale_offset + head * page_size + token_offset] = scale;
                 let offset = storage.fp8_offset + within;
-                for (output, value) in self.fp8_data[offset..offset + head_dim]
+                for (output, value) in view.fp8_data[offset..offset + head_dim]
                     .iter_mut()
                     .zip(values)
                 {
@@ -703,6 +675,7 @@ impl Page {
                 }
             }
         }
+        Ok(())
     }
 
     /// Borrow one token's contiguous `head_dim` f32 row for `(component, head,
@@ -726,10 +699,11 @@ impl Page {
         if storage.dtype != KvDType::F32 {
             return None;
         }
+        let view = self.store.host_view()?;
         let head_len = page_size * head_dim;
         let within = head * head_len + token_offset * head_dim;
         let offset = storage.data_offset + within;
-        Some(&self.data[offset..offset + head_dim])
+        Some(&view.data[offset..offset + head_dim])
     }
 
     pub fn has_quantized_storage(&self) -> bool {
