@@ -1,6 +1,6 @@
 # Adaptive Scheduling & Cost Model Design
 
-> Companion to [ORT2.md](./ORT2.md). Covers server-level scheduling, session hibernation,
+> Companion to [ORT2.md](./ORT2.md). Covers server-level scheduling, session preemption,
 > pluggable cost models, and multi-dimensional resource-aware execution.
 
 **Scope:** Dynamic resource scheduling across sessions. ORT2.md §7 covers *intra-session*
@@ -17,7 +17,7 @@ scheduling decisions made at runtime by genai-server.
 4. [Pluggable Cost Model](#4-pluggable-cost-model)
 5. [System Context: Observable Signals](#5-system-context-observable-signals)
 6. [Scheduling Policy](#6-scheduling-policy)
-7. [Interaction with Paged Memory](#7-interaction-with-paged-memory)
+7. [Interaction with Memory Governor](#7-interaction-with-memory-governor)
 8. [EP Negotiation Protocol](#8-ep-negotiation-protocol)
 9. [genai-server Integration](#9-genai-server-integration)
 10. [Multi-Plan Compilation Strategy](#10-multi-plan-compilation-strategy)
@@ -39,9 +39,9 @@ scheduling decisions made at runtime by genai-server.
 3. **Scheduling is proactive.** React to predicted state (thermal trajectory, queue trends),
    not just current state. By the time GPU is throttling, it's too late.
 
-4. **Hibernate, don't destroy.** Suspending a session (offload state, release compute
-   resources) is always cheaper than recompilation. Leverage paged memory for weight
-   offload.
+4. **Preempt, don't destroy.** Releasing a session's resources (weights paged out, scratch
+   freed) is always cheaper than recompilation. The Governor handles the physical page
+   management; the scheduler just changes session state.
 
 5. **Server is the scheduler.** genai-server sees what individual sessions cannot: queue
    depth, concurrent requests, global utilization, SLA deadlines. It makes inter-session
@@ -62,9 +62,14 @@ scheduling decisions made at runtime by genai-server.
 ├───────────────────────────────────────────────────────────────────┤
 │                    genai-server Scheduler                          │
 │   Knows: all sessions, queue depth, SLA, global utilization       │
-│   Decides: which sessions are active/hibernated/terminated        │
+│   Decides: which sessions are active/preempted/terminated         │
 │            whether to pre-compile plan variants                   │
 │            request routing and priority                           │
+├───────────────────────────────────────────────────────────────────┤
+│                    DeviceGovernor (memory management)              │
+│   Knows: physical page state, per-zone committed bytes            │
+│   Decides: page eviction, commit/decommit, pressure signals       │
+│   Executes: preemption actions requested by scheduler             │
 ├───────────────────────────────────────────────────────────────────┤
 │                    nxrt Session (static, compiled)                 │
 │   Knows: its own graph, placement plan, memory layout             │
@@ -75,11 +80,17 @@ scheduling decisions made at runtime by genai-server.
 | Layer | Responsibility | Input Signals |
 |-------|---------------|---------------|
 | Orchestrator | Node selection, replica scaling | Cluster metrics |
-| genai-server | Session scheduling, hibernation, plan selection | Device metrics, queue state, SLA |
+| genai-server | Session scheduling, preemption decisions, plan selection | Device metrics, queue state, SLA |
+| DeviceGovernor | Physical page management, pressure signals | Committed bytes, zone budgets |
 | nxrt session | Execute compiled plan | (none — static) |
 
 **Key invariant:** A session never observes its own runtime environment. It runs when told
-to run, sleeps when told to sleep. All intelligence is in the scheduler.
+to run, stops when told to stop. All intelligence is in the scheduler.
+
+**Separation of concerns:** The scheduler decides *which* session to preempt (business
+logic: priority, SLA, idle time). The Governor decides *how* to reclaim pages (eviction
+policy, swap vs discard). The scheduler says "preempt session X"; the Governor figures out
+whether to swap KV to host or discard and recompute.
 
 ---
 
@@ -89,16 +100,16 @@ to run, sleeps when told to sleep. All intelligence is in the scheduler.
                  compile()
     ModelDef ─────────────────► Session [READY]
                                     │
-                          wake()    │    schedule()
+                         restore()  │    schedule()
                      ┌──────────────┤──────────────┐
                      │              ▼              │
                      │       Session [ACTIVE]      │
                      │         │         │        │
-                     │   infer()│         │hibernate()
+                     │   infer()│         │preempt()
                      │         ▼         ▼        │
-                     │    [executing]  Session [HIBERNATED]
+                     │    [executing]  Session [PREEMPTED]
                      │                    │        │
-                     │                    │ wake() │
+                     │                    │restore()│
                      │                    └────────┘
                      │
                      │  terminate()
@@ -107,25 +118,29 @@ to run, sleeps when told to sleep. All intelligence is in the scheduler.
 
 ### States
 
-| State | Compute Resources | Weights in Device Memory | Compiled Graph | Can Execute |
-|-------|-------------------|--------------------------|----------------|-------------|
-| READY | Released | Not loaded | ✅ Retained | No (needs wake) |
-| ACTIVE | Allocated | Loaded (or paged in) | ✅ Retained | ✅ Yes |
-| HIBERNATED | Released | Offloaded (paged out) | ✅ Retained | No (needs wake) |
-| TERMINATED | Released | Released | Released | No (needs recompile) |
+| State | Compute Resources | Weights in Device Memory | Session State (KV/recurrent) | Compiled Graph | Can Execute |
+|-------|-------------------|--------------------------|------------------------------|----------------|-------------|
+| READY | Released | Not loaded | None | ✅ Retained | No (needs restore) |
+| ACTIVE | Allocated | Loaded (or paging in) | On device | ✅ Retained | ✅ Yes |
+| PREEMPTED | Released | Evicted (pages returned to Governor) | Swapped to host or discarded | ✅ Retained | No (needs restore) |
+| TERMINATED | Released | Released | Released | Released | No (needs recompile) |
 
 ### Transitions
 
 ```rust
 impl Session {
-    /// Transition READY/HIBERNATED → ACTIVE.
-    /// Pages weights back in, allocates scratch/workspace memory.
-    pub async fn wake(&mut self) -> Result<(), SchedulingError>;
+    /// Transition READY/PREEMPTED → ACTIVE.
+    /// Requests Governor to page weights back in, allocates scratch/workspace.
+    /// For PREEMPTED sessions: also restores session state (KV/recurrent)
+    /// from host swap buffer, or triggers re-prefill if state was discarded.
+    pub async fn restore(&mut self) -> Result<(), SchedulingError>;
 
-    /// Transition ACTIVE → HIBERNATED.
-    /// Releases scratch memory, triggers weight page-out via paged memory system.
-    /// Retains compiled graph (no recompilation needed on wake).
-    pub async fn hibernate(&mut self) -> Result<(), SchedulingError>;
+    /// Transition ACTIVE → PREEMPTED.
+    /// Releases scratch memory, Governor reclaims weight and session state pages.
+    /// Session state is either swapped to host (long sequences) or discarded
+    /// (short sequences where re-prefill is cheaper).
+    /// Retains compiled graph (no recompilation needed on restore).
+    pub async fn preempt(&mut self) -> Result<(), SchedulingError>;
 
     /// Transition any → TERMINATED. Releases everything.
     pub fn terminate(&mut self);
@@ -135,16 +150,39 @@ impl Session {
 }
 ```
 
-### Hibernate Cost Model
+### Preemption Triggers
+
+Preemption can be triggered by three sources:
+
+| Trigger | Who initiates | Example |
+|---------|---------------|---------|
+| Governor (automatic) | Memory pressure, zone budget exceeded | KV growth exhausts budget → Governor signals scheduler → preempt lowest-priority session |
+| Scheduler (automatic) | Idle timeout, thermal emergency, capacity management | Session idle 5 min → preempt to free resources for new requests |
+| User (manual) | Explicit API call | User calls `scheduler.preempt(session_id)` to free specific resources |
+
+```rust
+impl Scheduler {
+    /// User-initiated: preempt a specific session, freeing its resources.
+    pub async fn preempt(&mut self, session_id: SessionId) -> Result<(), ScheduleError>;
+
+    /// User-initiated: restore a preempted session.
+    pub async fn restore(&mut self, session_id: SessionId) -> Result<(), ScheduleError>;
+
+    /// User-initiated: set priority (affects automatic preemption victim selection).
+    pub fn set_priority(&mut self, session_id: SessionId, priority: Priority);
+}
+```
+
+### Preemption Cost Model
 
 | Operation | Approximate Cost |
 |-----------|-----------------|
-| hibernate (7B model, fp16) | ~100ms (page-out 14GB to host, async) |
-| wake (7B model, fp16) | ~200ms (page-in 14GB from host) |
-| wake (from disk/NVMe) | ~2-4s (14GB at 5-7 GB/s) |
+| preempt (7B model, swap KV to host) | ~100ms (page-out weights + KV, async) |
+| restore (7B model, from host) | ~200ms (page-in weights + KV from host) |
+| restore (short seq, recompute) | ~50ms (re-prefill 512 tokens, no swap needed) |
 | recompile from scratch | ~10-60s (depends on model + optimization level) |
 
-Wake is 50-300x cheaper than recompile. Hibernation is always preferable to termination
+Restore is 50-300x cheaper than recompile. Preemption is always preferable to termination
 when the session might be needed again.
 
 ---
@@ -195,12 +233,12 @@ pub trait SchedulingCostModel: Send + Sync {
 pub enum ScheduleAction {
     /// Keep session active and run next inference on it.
     Execute,
-    /// Hibernate this session to free resources.
-    Hibernate,
-    /// Wake a hibernated session.
-    Wake,
-    /// Preempt this session to make room for another.
-    Preempt { in_favor_of: SessionId },
+    /// Preempt this session to free resources.
+    Preempt,
+    /// Restore a preempted session.
+    Restore,
+    /// Preempt this session specifically to make room for another.
+    PreemptInFavorOf { beneficiary: SessionId },
 }
 ```
 
@@ -213,7 +251,7 @@ pub struct LatencySchedulingCost {
     pub queue_weight: f64,
     /// Weight for estimated compute time.
     pub compute_weight: f64,
-    /// Weight for transition overhead (wake/hibernate).
+    /// Weight for transition overhead (preempt/restore).
     pub transition_weight: f64,
 }
 
@@ -224,14 +262,14 @@ impl SchedulingCostModel for LatencySchedulingCost {
                 self.compute_weight * session.estimated_latency_ms as f64
                     + self.queue_weight * ctx.queue_depth_for(session.id) as f64
             }
-            ScheduleAction::Hibernate => {
-                self.transition_weight * session.hibernate_cost_ms as f64
+            ScheduleAction::Preempt => {
+                self.transition_weight * session.preempt_cost_ms as f64
             }
-            ScheduleAction::Wake => {
-                self.transition_weight * session.wake_cost_ms as f64
+            ScheduleAction::Restore => {
+                self.transition_weight * session.restore_cost_ms as f64
             }
-            ScheduleAction::Preempt { .. } => {
-                self.transition_weight * session.hibernate_cost_ms as f64 * 1.5
+            ScheduleAction::PreemptInFavorOf { .. } => {
+                self.transition_weight * session.preempt_cost_ms as f64 * 1.5
             }
         }
     }
@@ -269,7 +307,6 @@ impl SchedulingCostModel for PowerAwareSchedulingCost {
                     + self.power_weight * power_cost
                     + self.thermal_weight * thermal_cost
             }
-            // ... other actions
             _ => base_latency  // simplified
         }
     }
@@ -309,11 +346,11 @@ impl SchedulingCostModel for ThroughputSchedulingCost {
                     util_gap * 10.0
                 }
             }
-            ScheduleAction::Preempt { in_favor_of } => {
+            ScheduleAction::PreemptInFavorOf { beneficiary } => {
                 // Preempt is cheap if the victim is in decode (interruptible)
                 // and the beneficiary is a prefill (latency-sensitive)
                 let victim_interruptibility = session.decode_progress_ratio();
-                let beneficiary_urgency = ctx.sla_slack_for(in_favor_of);
+                let beneficiary_urgency = ctx.sla_slack_for(beneficiary);
                 victim_interruptibility * 10.0 - beneficiary_urgency
             }
             _ => 0.0
@@ -338,7 +375,7 @@ pub struct SystemContext {
     // === Queue-level signals ===
     pub pending_requests: usize,
     pub active_sessions: usize,
-    pub hibernated_sessions: usize,
+    pub preempted_sessions: usize,
 
     // === Historical signals (for prediction) ===
     pub thermal_history: RingBuffer<(Instant, f32)>,  // last N thermal readings
@@ -432,7 +469,7 @@ The scheduling policy is the decision-making layer that uses the cost model to d
 what to do.
 
 ```rust
-/// The scheduling policy decides which sessions to activate, hibernate, or preempt.
+/// The scheduling policy decides which sessions to activate, preempt, or terminate.
 /// It consumes cost model evaluations and produces scheduling decisions.
 pub trait SchedulingPolicy: Send + Sync {
     /// Called periodically (or on event) to produce scheduling decisions.
@@ -455,16 +492,16 @@ pub struct ScheduleDecision {
 pub enum ScheduleReason {
     /// Normal request routing
     RequestArrived { request_id: RequestId },
-    /// Resource pressure — need to free resources
-    ResourcePressure { device: DeviceId, pressure: f32 },
+    /// Memory pressure from Governor — need to free resources
+    MemoryPressure { device: DeviceId, needed_bytes: usize },
     /// Thermal management
     ThermalManagement { device: DeviceId, state: ThermalState },
     /// SLA deadline approaching
     SlaUrgency { request_id: RequestId, slack_ms: i64 },
     /// Idle timeout — no requests for this session in a while
     IdleTimeout { idle_duration: Duration },
-    /// Manual override from operator
-    ManualOverride,
+    /// Manual override from user/operator
+    UserRequested,
 }
 
 pub struct SessionInfo {
@@ -476,21 +513,28 @@ pub struct SessionInfo {
     // Resource footprint
     pub weight_size_bytes: usize,
     pub workspace_size_bytes: usize,
+    pub session_state_bytes: usize,  // KV cache + recurrent state
     pub device_affinity: DeviceId,
 
     // Performance characteristics (from compilation / profiling)
-    // These estimates are populated during session compilation:
-    // - estimated_latency_ms: from PlacementCostModel (ORT2.md §6) applied to the compiled plan
-    // - hibernate_cost_ms: weight_size_bytes / host_bandwidth (from pager stats)
-    // - wake_cost_ms: weight_size_bytes / device_bandwidth (from pager stats)
     pub estimated_latency_ms: u64,
-    pub hibernate_cost_ms: u64,
-    pub wake_cost_ms: u64,
+    pub preempt_cost_ms: u64,   // time to page-out weights + swap state
+    pub restore_cost_ms: u64,   // time to page-in weights + restore state
 
     // Runtime state
     pub last_active: Instant,
     pub total_inferences: u64,
     pub current_request: Option<RequestId>,
+    pub priority: Priority,
+    pub sequence_length: usize,  // affects swap-vs-recompute decision
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    Background,
+    Normal,
+    High,
+    Critical,
 }
 ```
 
@@ -500,7 +544,7 @@ pub struct SessionInfo {
 pub struct DefaultSchedulingPolicy {
     /// Max concurrent active sessions (resource budget).
     pub max_active: usize,
-    /// Idle timeout before auto-hibernate.
+    /// Idle timeout before auto-preempt.
     pub idle_timeout: Duration,
     /// Thermal threshold that triggers preemption.
     pub thermal_preempt_threshold: ThermalState,
@@ -515,13 +559,13 @@ impl SchedulingPolicy for DefaultSchedulingPolicy {
     ) -> Vec<ScheduleDecision> {
         let mut decisions = Vec::new();
 
-        // 1. Thermal emergency: hibernate sessions on overheating devices
+        // 1. Thermal emergency: preempt sessions on overheating devices
         for session in sessions.iter().filter(|s| s.state == SessionState::Active) {
             let device_ctx = ctx.device(session.device_affinity);
             if device_ctx.thermal_state >= self.thermal_preempt_threshold {
                 decisions.push(ScheduleDecision {
                     session_id: session.id,
-                    action: ScheduleAction::Hibernate,
+                    action: ScheduleAction::Preempt,
                     reason: ScheduleReason::ThermalManagement {
                         device: session.device_affinity,
                         state: device_ctx.thermal_state,
@@ -531,12 +575,12 @@ impl SchedulingPolicy for DefaultSchedulingPolicy {
             }
         }
 
-        // 2. Idle timeout: hibernate sessions with no recent activity
+        // 2. Idle timeout: preempt sessions with no recent activity
         for session in sessions.iter().filter(|s| s.state == SessionState::Active) {
             if session.last_active.elapsed() > self.idle_timeout {
                 decisions.push(ScheduleDecision {
                     session_id: session.id,
-                    action: ScheduleAction::Hibernate,
+                    action: ScheduleAction::Preempt,
                     reason: ScheduleReason::IdleTimeout {
                         idle_duration: session.last_active.elapsed(),
                     },
@@ -545,13 +589,13 @@ impl SchedulingPolicy for DefaultSchedulingPolicy {
             }
         }
 
-        // 3. Capacity management: if over max_active, hibernate lowest-value sessions
+        // 3. Capacity management: if over max_active, preempt lowest-value sessions
         let active_count = sessions.iter().filter(|s| s.state == SessionState::Active).count();
         if active_count > self.max_active {
             let mut active: Vec<_> = sessions.iter()
                 .filter(|s| s.state == SessionState::Active)
                 .collect();
-            // Sort by cost of keeping active (highest cost = first to hibernate)
+            // Sort by cost of keeping active (highest cost = first to preempt)
             active.sort_by(|a, b| {
                 let cost_a = cost_model.evaluate(a, ScheduleAction::Execute, ctx);
                 let cost_b = cost_model.evaluate(b, ScheduleAction::Execute, ctx);
@@ -560,17 +604,17 @@ impl SchedulingPolicy for DefaultSchedulingPolicy {
             for session in active.iter().take(active_count - self.max_active) {
                 decisions.push(ScheduleDecision {
                     session_id: session.id,
-                    action: ScheduleAction::Hibernate,
-                    reason: ScheduleReason::ResourcePressure {
+                    action: ScheduleAction::Preempt,
+                    reason: ScheduleReason::MemoryPressure {
                         device: session.device_affinity,
-                        pressure: ctx.device(session.device_affinity).compute_utilization,
+                        needed_bytes: 0, // capacity-driven, not byte-driven
                     },
                     priority: 20,
                 });
             }
         }
 
-        // 4. Wake sessions needed for pending requests
+        // 4. Restore sessions needed for pending requests
         // (handled by request router, not periodic scheduling)
 
         decisions.sort_by_key(|d| d.priority);
@@ -581,76 +625,102 @@ impl SchedulingPolicy for DefaultSchedulingPolicy {
 
 ---
 
-## 7. Interaction with Paged Memory
+## 7. Interaction with Memory Governor
 
-Session hibernate/wake uses nxrt's PagerSchedulerAPI (defined in ORT2.md §33). The key methods are `deprioritize_session`, `prioritize_session`, and `await_critical_resident`.
+Session preemption and restore are coordinated between the Scheduler and the DeviceGovernor.
+The Scheduler decides *who* to preempt; the Governor decides *how* to handle the pages.
 
-Session hibernation leverages nxrt's paged memory system (ORT2.md §8) rather than
-implementing its own offload mechanism.
-
-```
-Session ACTIVE:
-  weights: pages resident in device memory (GPU VRAM)
-  workspace: allocated from arena allocator
-  compiled graph: in host memory (always resident)
-
-Session HIBERNATED:
-  weights: pages evicted (host memory or disk, managed by pager)
-  workspace: freed back to arena
-  compiled graph: in host memory (always resident, cheap)
-
-Session wake():
-  1. Allocate workspace from arena
-  2. Request pager to page-in weight pages (async, overlapped with compute if possible)
-  3. Once all pages resident → state = ACTIVE
-```
-
-**Key insight:** We don't need a separate hibernation data path. The paged memory system
-already knows how to evict and restore pages. Hibernate is just "evict all my pages" and
-wake is "page them back in." The scheduler becomes a *hint provider* to the pager:
-"this session is going to sleep, feel free to evict its pages for higher-priority sessions."
+### Scheduler → Governor Communication
 
 ```rust
-impl Session {
-    pub async fn hibernate(&mut self) -> Result<(), SchedulingError> {
-        // Release workspace (immediate)
-        self.arena.release_workspace();
+/// Governor interface for session-level resource management.
+impl DeviceGovernor {
+    /// Scheduler requests: "free all resources held by this session."
+    /// Governor decides: swap KV to host (long seq) or discard (short seq).
+    pub async fn release_session(&mut self, session_id: SessionId) -> ReleaseReport;
 
-        // Hint to pager: deprioritize all our weight pages
-        self.pager.deprioritize_all(self.weight_page_set).await;
+    /// Scheduler requests: "restore this session's resources."
+    /// Governor pages weights back in and restores session state.
+    pub async fn restore_session(&mut self, session_id: SessionId) -> RestoreReport;
 
-        // Pages will be evicted lazily when memory pressure demands it,
-        // or eagerly if another session needs the space.
-        self.state = SessionState::Hibernated;
-        Ok(())
-    }
+    /// Governor → Scheduler signal: "I'm under pressure, need N bytes freed."
+    /// Scheduler picks the victim session(s).
+    pub fn pressure_signal(&self) -> Option<PressureSignal>;
+}
 
-    pub async fn wake(&mut self) -> Result<(), SchedulingError> {
-        // Allocate workspace
-        self.arena.allocate_workspace(self.workspace_size)?;
+pub struct PressureSignal {
+    pub device: DeviceId,
+    pub needed_bytes: usize,
+    pub urgency: PressureUrgency,
+}
 
-        // Request page-in for all weight pages (async)
-        self.pager.prioritize_all(self.weight_page_set).await?;
+pub enum PressureUrgency {
+    /// Can wait — preempt at next scheduling tick
+    Low,
+    /// Should act soon — new request queued but can't start
+    Medium,
+    /// Must act now — active session's KV growth is blocked
+    High,
+}
 
-        // Wait for critical pages (first few layers) before marking active
-        self.pager.await_resident(self.critical_pages).await?;
+pub struct ReleaseReport {
+    pub freed_bytes: usize,
+    pub state_action: StateAction,
+}
 
-        self.state = SessionState::Active;
-        Ok(())
-    }
+pub enum StateAction {
+    /// Session state (KV/recurrent) was swapped to host — can restore cheaply
+    SwappedToHost { host_buffer_bytes: usize },
+    /// Session state was discarded — must re-prefill on restore
+    Discarded { recompute_tokens: usize },
 }
 ```
 
-### Progressive Wake (Optimization)
+### Decision Flow
 
-For large models, don't wait for all pages before starting inference:
+```
+Governor detects pressure → signals Scheduler
+    ↓
+Scheduler evaluates cost model for each active session
+    ↓
+Scheduler selects victim (lowest priority / highest preempt cost-benefit)
+    ↓
+Scheduler calls session.preempt()
+    ↓
+Session calls Governor.release_session()
+    ↓
+Governor decides swap-vs-discard based on:
+  - sequence_length vs recompute_threshold
+  - available host memory for swap buffer
+  - data type (KV → swap or recompute; recurrent state → always swap)
+    ↓
+Governor frees physical pages → available for other sessions
+```
 
-1. Page in layers 0–N (critical path for first token)
-2. Mark session ACTIVE, begin inference
-3. Continue paging remaining layers in background
-4. If inference reaches a not-yet-paged layer → block on that page (rare with good prefetch)
+### Weight Pages: Discard Always
 
-This reduces wake latency from "page entire model" to "page first few layers."
+Weight pages are always discarded on preemption (never swapped D2H) because the original
+bytes are permanently available via host mmap of the model file. Restore = H2D copy from
+the existing host mapping. No D2H save step needed.
+
+### Session State: Swap or Recompute
+
+| Condition | Action | Rationale |
+|-----------|--------|-----------|
+| `seq_len < recompute_threshold` | Discard + re-prefill on restore | Recompute is faster than D2H + H2D |
+| `seq_len >= recompute_threshold` | Swap to host | D2H + H2D cheaper than re-prefill |
+| Recurrent state (any size) | Swap to host | Cannot recompute (non-linear accumulation) |
+| Host memory insufficient | Discard (forced) | No room to swap; accept re-prefill cost |
+
+The threshold is hardware-dependent:
+```
+recompute_threshold ≈ (swap_round_trip_bytes / pcie_bandwidth) / per_token_prefill_time
+
+Example (PCIe Gen4 x16, ~25 GB/s, 4090):
+  1 GB KV swap round-trip ≈ 80ms
+  ~400 tokens prefill ≈ 80ms
+  → threshold ≈ 400 tokens
+```
 
 ---
 
@@ -690,7 +760,7 @@ requests and nxrt sessions.
           ▼              ▼              ▼
     ┌──────────┐   ┌──────────┐   ┌──────────┐
     │ Session A│   │ Session B│   │ Session C│
-    │ [ACTIVE] │   │ [ACTIVE] │   │[HIBERNATED]│
+    │ [ACTIVE] │   │ [ACTIVE] │   │[PREEMPTED]│
     └──────────┘   └──────────┘   └──────────┘
 ```
 
@@ -703,7 +773,7 @@ pub trait Scheduler {
     fn register_session(&mut self, session: SessionHandle, info: SessionInfo);
 
     /// Request: "I need to run inference on this model. Which session should I use?"
-    /// Scheduler may wake a hibernated session, or reject if overloaded.
+    /// Scheduler may restore a preempted session, or reject if overloaded.
     async fn acquire(&self, model_id: ModelId, request: &RequestInfo) -> Result<SessionHandle, ScheduleError>;
 
     /// Release: "I'm done with this session for now."
@@ -735,7 +805,7 @@ pub struct ResourceBudget {
 }
 
 impl Scheduler {
-    /// Update resource budget. Scheduler will hibernate/terminate sessions to fit.
+    /// Update resource budget. Scheduler will preempt/terminate sessions to fit.
     fn update_budget(&mut self, budget: ResourceBudget);
 }
 ```
@@ -780,12 +850,12 @@ pub struct CompilationConstraints {
 
 ### Switching Between Plans
 
-Plan switching = hibernate current session + wake alternative session:
+Plan switching = preempt current session + restore alternative session:
 
 ```rust
 // Scheduler decides GPU is overheating, switch model_A from gpu-plan to cpu-plan
-scheduler.hibernate(model_a_gpu_session).await?;
-scheduler.wake(model_a_cpu_session).await?;
+scheduler.preempt(model_a_gpu_session).await?;
+scheduler.restore(model_a_cpu_session).await?;
 // Next request for model_A routes to cpu session
 ```
 
@@ -799,7 +869,7 @@ continued degraded performance).
 
 | System | What It Has | What It Lacks |
 |--------|-------------|---------------|
-| **vLLM** | KV cache swap/recompute preemption | General session hibernate; pluggable cost; thermal awareness |
+| **vLLM** | KV cache swap/recompute preemption | General session preemption; pluggable cost; thermal awareness |
 | **TensorRT** | Multi-profile engines, runtime profile switch | Automatic switching; cost model; thermal/power signals |
 | **Core ML** | Compute unit hints; thermal state API | Dynamic switching without reload; scheduling policy |
 | **QNN/SNPE** | Performance profiles (DVFS control) | Multi-plan; pluggable cost; automatic switching |
@@ -813,10 +883,13 @@ Note: The paged attention design assumes Mobius generates models with ScatterND/
    throughput, or any combination). No other runtime offers this.
 2. **Automatic proactive scheduling** — predict thermal trajectory and act before throttle.
    No other runtime does this automatically.
-3. **Session hibernation via paged memory** — general-purpose compiled session
-   suspend/resume without recompilation. Goes beyond vLLM's KV-cache-only swap.
+3. **Governor-driven preemption** — unified memory management where physical pages flow
+   between sessions and zones. Goes beyond vLLM's KV-cache-only swap to full session
+   state management.
 4. **Server-level intelligence, session-level simplicity** — clean separation that keeps
    nxrt sessions deterministic and debuggable while enabling sophisticated scheduling.
+5. **Three preemption triggers** — automatic (Governor pressure, scheduler policy) and
+   manual (user API) all funnel through the same lifecycle state machine.
 
 ---
 
@@ -831,11 +904,11 @@ Note: The paged attention design assumes Mobius generates models with ScatterND/
 3. **Plan variant budget:** How many pre-compiled plans per model is reasonable? Storage
    and compilation time cost. Is 2-3 enough for most cases?
 
-4. **Progressive wake ordering:** How to determine "critical pages" for early wake? First
-   N layers? Or profiling-guided (which layers are hit first)?
+4. **Progressive restore ordering:** How to determine "critical pages" for early restore?
+   First N layers? Or profiling-guided (which layers are hit first)?
 
 5. **Cross-session weight sharing:** If two sessions (same model, different plans) share
-   weights, can the pager deduplicate? Saves memory but complicates page ownership.
+   weights, can the Governor deduplicate? Saves memory but complicates page ownership.
 
 6. **Scheduler tick frequency:** How often should the scheduler's periodic `tick()` run?
    Too fast = overhead. Too slow = missed thermal events. Adaptive frequency?
@@ -844,7 +917,7 @@ Note: The paged attention design assumes Mobius generates models with ScatterND/
    GPU-slice count as a separate session? Or one session with multi-device plan?
 
 8. **Migration vs restart:** If a model needs to move from GPU A to GPU B (e.g., GPU A
-   overheating), is it cheaper to hibernate+wake-on-B, or recompile-for-B?
+   overheating), is it cheaper to preempt+restore-on-B, or recompile-for-B?
 
 9. **SLA specification format:** How do users express SLA requirements? Simple deadline_ms?
    Or richer (p99 < 100ms, throughput > 10 req/s)?
@@ -857,18 +930,18 @@ Note: The paged attention design assumes Mobius generates models with ScatterND/
 ## Appendix A: Signal Collection Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                 DeviceMonitor                          │
-│                                                       │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  │
-│  │ NVML Plugin │  │ sysfs Plugin │  │ IOKit Plugin│  │
-│  │ (NVIDIA GPU)│  │ (Linux CPU)  │  │ (macOS)    │  │
-│  └──────┬──────┘  └──────┬───────┘  └─────┬──────┘  │
-│         └────────────────┼─────────────────┘         │
-│                          ▼                            │
-│              SystemContext (unified)                   │
-│                          │                            │
-└──────────────────────────┼────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                 DeviceMonitor                                      │
+│                                                                   │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐              │
+│  │ NVML Plugin │  │ sysfs Plugin │  │ IOKit Plugin│              │
+│  │ (NVIDIA GPU)│  │ (Linux CPU)  │  │ (macOS)    │              │
+│  └──────┬──────┘  └──────┬───────┘  └─────┬──────┘              │
+│         └────────────────┼─────────────────┘                     │
+│                          ▼                                        │
+│              SystemContext (unified)                               │
+│                          │                                        │
+└──────────────────────────┼────────────────────────────────────────┘
                            │
               ┌────────────┼────────────┐
               ▼            ▼            ▼
