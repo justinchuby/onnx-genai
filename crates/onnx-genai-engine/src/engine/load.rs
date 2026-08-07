@@ -965,6 +965,7 @@ fn resolve_cuda_offload_policy_from_env_policy(
             enabled: true,
             device_budget_bytes: Some(offload_device_budget_bytes),
             async_pagein: env_policy.async_pagein,
+            scan_resistant_dense: env_policy.scan_resistant_dense,
         },
         device_budget_is_override: env_policy.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: true,
@@ -1758,6 +1759,7 @@ mod pool_sizing_tests {
                 enabled: false,
                 device_budget_bytes: None,
                 async_pagein: true,
+                scan_resistant_dense: true,
             },
         )
         .expect("weights above an explicit CUDA VRAM limit should enable offload");
@@ -1782,6 +1784,7 @@ mod pool_sizing_tests {
                 enabled: false,
                 device_budget_bytes: Some(4_000),
                 async_pagein: false,
+                scan_resistant_dense: true,
             },
         )
         .expect("the explicit limit still triggers offload");

@@ -123,7 +123,8 @@ impl CudaExecutionProvider {
                 .unwrap_or(DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
             Arc::new(
                 CudaWeightResidency::new(runtime.clone(), budget)
-                    .with_async_pagein(offload_policy.async_pagein),
+                    .with_async_pagein(offload_policy.async_pagein)
+                    .with_scan_resistant_dense(offload_policy.scan_resistant_dense),
             )
         });
         Ok(Self {
