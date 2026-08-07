@@ -28,8 +28,6 @@ Remove-Item <your-worktree>\target -Recurse -Force -ErrorAction SilentlyContinue
 
 Do not delete another agent's worktree or `target/`. Do not delete your own before your validation commands have passed and your branch is pushed.
 
-Note for disk-reduction attempts: on `x86_64-pc-windows-msvc`, Cargo's `split-debuginfo` is **silently ignored** — `packed`, `unpacked` and `off` all produce identical output, with no error or warning. The knob that works is `debug = "line-tables-only"` (~37% smaller than `debug = 2`, keeps backtrace line numbers).
-
 ### Decision Recording
 After making a decision that affects other team members, write it to:
 `.squad/decisions/inbox/{your-name}-{brief-slug}.md`
