@@ -8,11 +8,9 @@ use crate::{
 use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
 use std::sync::Arc;
 use std::{
-    any::Any,
     collections::{BTreeMap, HashMap},
     fmt,
     mem::size_of,
-    ops::Deref,
     ptr::NonNull,
 };
 
@@ -44,14 +42,13 @@ pub struct DevicePageSpan {
 /// materialization before it can obtain slices; that copy is visible to the
 /// caller and can be charged to the memory governor instead of being hidden
 /// behind an accessor such as `head_token_row()`.
-pub trait KvPageStore: fmt::Debug + Send + Sync + Any {
+pub trait KvPageStore: fmt::Debug + Send + Sync {
     fn allocated_bytes(&self) -> u64;
     fn reset_storage(&mut self);
     fn host_view(&self) -> Option<HostPageStoreView<'_>>;
     fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>>;
     fn device_span(&self) -> Option<DevicePageSpan>;
     fn clone_store(&self) -> Box<dyn KvPageStore>;
-    fn as_any(&self) -> &dyn Any;
 }
 
 impl Clone for Box<dyn KvPageStore> {
@@ -142,10 +139,6 @@ impl KvPageStore for HostPageStore {
 
     fn clone_store(&self) -> Box<dyn KvPageStore> {
         Box::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -487,20 +480,6 @@ pub struct Page {
     storage_layout: Vec<ComponentStorage>,
 }
 
-impl Deref for Page {
-    type Target = HostPageStore;
-
-    fn deref(&self) -> &Self::Target {
-        // Backwards-compatible host field access for existing host-only tests
-        // and callers. Cache-facing code goes through `host_view()` so a device
-        // store is an explicit `None`, not a hidden materialization.
-        self.store
-            .as_any()
-            .downcast_ref::<HostPageStore>()
-            .expect("legacy host field access requires HostPageStore")
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ComponentStorage {
     dtype: KvDType,
@@ -682,11 +661,11 @@ impl Page {
     /// token_offset)`, or `None` when this component is not stored as F32.
     ///
     /// F32 components lay each `(head, token)` row out contiguously in
-    /// [`Page::data`] (see [`Page::write_head_token`]), so a runtime-managed
-    /// (paged) attention reader can attend over the page **in place** — no
-    /// dequantization and no copy. A quantized component has no contiguous f32
-    /// row to borrow and returns `None`, so the caller must fall back to the
-    /// per-element [`Page::value_at_slot`] dequantizing path.
+    /// [`HostPageStore::data`] (see [`Page::write_head_token`]), so a
+    /// runtime-managed (paged) attention reader can attend over the page **in
+    /// place** — no dequantization and no copy. A quantized component has no
+    /// contiguous f32 row to borrow and returns `None`, so the caller must fall
+    /// back to the per-element [`Page::value_at_slot`] dequantizing path.
     pub fn head_token_f32(
         &self,
         page_size: usize,

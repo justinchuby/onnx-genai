@@ -1716,9 +1716,10 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        assert!(page.data.is_empty());
+        let storage = page.store.host_view().expect("host store");
+        assert!(storage.data.is_empty());
         assert_eq!(
-            page.quantized_data.len(),
+            storage.quantized_data.len(),
             small_config(KvDType::Int8).f32_len_per_page()
         );
         let materialized = cache.materialize_sequence(seq).unwrap();
@@ -1742,12 +1743,13 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        assert!(page.data.is_empty());
-        assert!(page.quantized_data.is_empty());
-        assert_eq!(page.fp8_data.len(), config.f32_len_per_page());
-        assert_eq!(page.quant_scales.len(), 4);
+        let storage = page.store.host_view().expect("host store");
+        assert!(storage.data.is_empty());
+        assert!(storage.quantized_data.is_empty());
+        assert_eq!(storage.fp8_data.len(), config.f32_len_per_page());
+        assert_eq!(storage.quant_scales.len(), 4);
         assert_close(
-            &page.quant_scales,
+            storage.quant_scales,
             &[1.0 / 448.0, 100.0 / 448.0, 2.0 / 448.0, 200.0 / 448.0],
             1.0e-7,
         );
@@ -1892,8 +1894,9 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        assert_eq!(page.data.len(), 8);
-        assert_eq!(page.fp8_data.len(), 8);
+        let storage = page.store.host_view().expect("host store");
+        assert_eq!(storage.data.len(), 8);
+        assert_eq!(storage.fp8_data.len(), 8);
         let materialized = cache.materialize_sequence(seq).unwrap();
         assert_eq!(materialized.layers[1].key, token[1].0);
         assert_eq!(materialized.layers[1].value, token[1].1);
