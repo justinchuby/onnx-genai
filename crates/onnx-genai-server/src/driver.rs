@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +35,8 @@ pub(crate) struct EngineDriver {
     pub(crate) generation_capacity: Arc<Semaphore>,
     /// Lock-free mirror of the KV page pool, readable during a generation.
     pub(crate) kv_telemetry: Arc<KvTelemetry>,
+    /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
+    pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
 }
 
 pub(crate) enum DriverCommand {
@@ -82,6 +84,7 @@ pub(crate) enum DriverCommand {
         request: Box<TextToAudioRequest>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<SynthesizedAudio>>,
     },
+    #[cfg(test)]
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
     SetVramLimit {
         limit: ResourceLimit,
@@ -150,16 +153,29 @@ impl EngineDriver {
             kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
         }
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
+        let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
+            EngineBackend::Single(engine) => engine.resource_snapshot(),
+            EngineBackend::Pipeline(_) => unreachable!("single-engine owner just constructed"),
+        })));
+        let driver_snapshot = Arc::clone(&resource_snapshot);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
             .spawn(move || {
-                run_engine_driver(owner, rx, max_batch, max_queue_depth, driver_capacity)
+                run_engine_driver(
+                    owner,
+                    rx,
+                    max_batch,
+                    max_queue_depth,
+                    driver_capacity,
+                    driver_snapshot,
+                )
             })
             .expect("failed to spawn onnx-genai engine driver");
         Self {
             commands,
             generation_capacity,
             kv_telemetry,
+            resource_snapshot,
         }
     }
 
@@ -168,6 +184,8 @@ impl EngineDriver {
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
+        let resource_snapshot = Arc::new(Mutex::new(None));
+        let driver_snapshot = Arc::clone(&resource_snapshot);
         // A pipeline engine owns its components' caches rather than one page
         // table, so there is nothing here to mirror. Reported as an explicit
         // not-applicable rather than an all-zero pool, which would read as an
@@ -176,12 +194,22 @@ impl EngineDriver {
         kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, 1, max_queue_depth, driver_capacity))
+            .spawn(move || {
+                run_engine_driver(
+                    owner,
+                    rx,
+                    1,
+                    max_queue_depth,
+                    driver_capacity,
+                    driver_snapshot,
+                )
+            })
             .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
             generation_capacity,
             kv_telemetry,
+            resource_snapshot,
         }
     }
 
@@ -438,13 +466,11 @@ impl EngineDriver {
     }
 
     pub(crate) async fn resource_snapshot(&self) -> anyhow::Result<GovernorSnapshot> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.commands
-            .send(DriverCommand::ResourceSnapshot(reply))
-            .await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        self.resource_snapshot
+            .lock()
+            .expect("resource snapshot mirror lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("resource governor is not available for this model"))
     }
 
     pub(crate) async fn set_vram_limit(
@@ -467,6 +493,7 @@ fn run_engine_driver(
     max_batch: usize,
     max_queue_depth: usize,
     generation_capacity: Arc<Semaphore>,
+    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
 ) {
     let mut engine = match owner.0 {
         EngineBackend::Single(engine) => *engine,
@@ -484,10 +511,11 @@ fn run_engine_driver(
             max_batch,
             max_queue_depth,
             &generation_capacity,
+            &resource_snapshot,
         );
     } else {
         tracing::info!("continuous batch driver disabled; using per-request engine path");
-        run_fallback_engine_driver(&mut engine, rx);
+        run_fallback_engine_driver(&mut engine, rx, &resource_snapshot);
     }
 }
 
@@ -546,6 +574,7 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                     "embeddings are not supported by pipeline models"
                 )));
             }
+            #[cfg(test)]
             DriverCommand::ResourceSnapshot(reply) => {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "resource governor is not available for pipeline models"
@@ -560,9 +589,14 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
     }
 }
 
-fn run_fallback_engine_driver(engine: &mut Engine, mut rx: mpsc::Receiver<DriverCommand>) {
+fn run_fallback_engine_driver(
+    engine: &mut Engine,
+    mut rx: mpsc::Receiver<DriverCommand>,
+    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
+) {
     while let Some(command) = rx.blocking_recv() {
         handle_driver_command(engine, command);
+        refresh_resource_snapshot(resource_snapshot, engine);
     }
 }
 
@@ -572,6 +606,7 @@ fn run_static_engine_driver(
     max_batch: usize,
     max_queue_depth: usize,
     generation_capacity: &Semaphore,
+    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
 ) {
     // The current ContinuousBatchManager API accepts GenerateRequest only.
     // X-Session-Id requests keep using the driver's per-request engine path so
@@ -614,10 +649,20 @@ fn run_static_engine_driver(
                         permit,
                     },
                 );
+                refresh_resource_snapshot(resource_snapshot, engine);
             }
-            command => handle_driver_command(engine, command),
+            command => {
+                handle_driver_command(engine, command);
+                refresh_resource_snapshot(resource_snapshot, engine);
+            }
         }
     }
+}
+
+fn refresh_resource_snapshot(resource_snapshot: &Mutex<Option<GovernorSnapshot>>, engine: &Engine) {
+    *resource_snapshot
+        .lock()
+        .expect("resource snapshot mirror lock poisoned") = Some(engine.resource_snapshot());
 }
 
 fn run_static_batch_until_idle(
@@ -935,12 +980,13 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
 /// Commands that *reconfigure* engine state are deferred until the batch drains by design.
 /// Only read-only observability is answered immediately here.
 pub(crate) fn handle_or_defer_during_batch(
-    engine: &Engine,
+    _engine: &Engine,
     command: DriverCommand,
 ) -> Option<DriverCommand> {
     match command {
+        #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
-            let _ = reply.send(Ok(engine.resource_snapshot()));
+            let _ = reply.send(Ok(_engine.resource_snapshot()));
             None
         }
         other => Some(other),
@@ -1069,6 +1115,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                  How: request a model whose package declares a `run_on: final_only` waveform stage."
             )));
         }
+        #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
             let _ = reply.send(Ok(engine.resource_snapshot()));
         }
@@ -1172,6 +1219,28 @@ fn run_fim_generation(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resource_snapshot_uses_mirror_even_when_command_queue_is_full() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let engine = Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())
+            .expect("load tiny fixture");
+        let snapshot = engine.resource_snapshot();
+        let (commands, _rx) = mpsc::channel(1);
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        commands
+            .try_send(DriverCommand::ResourceSnapshot(reply))
+            .expect("fill command queue");
+        let driver = EngineDriver {
+            commands,
+            generation_capacity: Arc::new(Semaphore::new(1)),
+            kv_telemetry: Arc::new(KvTelemetry::default()),
+            resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
+        };
+
+        assert_eq!(driver.resource_snapshot().await.unwrap(), snapshot);
+    }
 
     /// A lone request with nothing else outstanding must be admitted at once.
     ///
