@@ -128,4 +128,4 @@ CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_GRAPH=1 \
 # repeat both with ONNX_GENAI_CUDA_GRAPH=0 to confirm capture-OFF parity.
 ```
 
-Do NOT merge. New HEAD sha: <filled in commit body after push>.
+Do NOT merge. Code-fix HEAD sha: 73053709 (this doc commit sits on top).
