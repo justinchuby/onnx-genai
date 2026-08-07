@@ -268,7 +268,7 @@ impl PagedKvCache {
                         head,
                         token_offset,
                         key,
-                    );
+                    )?;
                     page.write_head_token(
                         page_size,
                         geom.head_dim,
@@ -276,7 +276,7 @@ impl PagedKvCache {
                         head,
                         token_offset,
                         value,
-                    );
+                    )?;
                 }
             }
             page.filled = page.filled.max(token_offset + 1);
@@ -387,7 +387,7 @@ impl PagedKvCache {
                             head,
                             token_offset,
                             dim,
-                        );
+                        )?;
                         layer_out.value[dst] = page.value_at_slot(
                             page_size,
                             head_dim,
@@ -395,7 +395,7 @@ impl PagedKvCache {
                             head,
                             token_offset,
                             dim,
-                        );
+                        )?;
                     }
                 }
             }
@@ -729,20 +729,11 @@ impl PagedKvCache {
                     .pages
                     .get(&page_id)
                     .ok_or(KvError::PageNotFound(page_id))?;
-                (
-                    old.data.clone(),
-                    old.quantized_data.clone(),
-                    old.fp8_data.clone(),
-                    old.quant_scales.clone(),
-                    old.filled,
-                )
+                (old.store.clone(), old.filled)
             };
             if let Some(new_page) = self.page_table.pages.get_mut(&new_page_id) {
-                new_page.data = old_storage.0;
-                new_page.quantized_data = old_storage.1;
-                new_page.fp8_data = old_storage.2;
-                new_page.quant_scales = old_storage.3;
-                new_page.filled = old_storage.4;
+                new_page.store = old_storage.0;
+                new_page.filled = old_storage.1;
             }
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
@@ -1725,9 +1716,10 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        assert!(page.data.is_empty());
+        let storage = page.store.host_view().expect("host store");
+        assert!(storage.data.is_empty());
         assert_eq!(
-            page.quantized_data.len(),
+            storage.quantized_data.len(),
             small_config(KvDType::Int8).f32_len_per_page()
         );
         let materialized = cache.materialize_sequence(seq).unwrap();
@@ -1751,12 +1743,13 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        assert!(page.data.is_empty());
-        assert!(page.quantized_data.is_empty());
-        assert_eq!(page.fp8_data.len(), config.f32_len_per_page());
-        assert_eq!(page.quant_scales.len(), 4);
+        let storage = page.store.host_view().expect("host store");
+        assert!(storage.data.is_empty());
+        assert!(storage.quantized_data.is_empty());
+        assert_eq!(storage.fp8_data.len(), config.f32_len_per_page());
+        assert_eq!(storage.quant_scales.len(), 4);
         assert_close(
-            &page.quant_scales,
+            storage.quant_scales,
             &[1.0 / 448.0, 100.0 / 448.0, 2.0 / 448.0, 200.0 / 448.0],
             1.0e-7,
         );
@@ -1901,8 +1894,9 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        assert_eq!(page.data.len(), 8);
-        assert_eq!(page.fp8_data.len(), 8);
+        let storage = page.store.host_view().expect("host store");
+        assert_eq!(storage.data.len(), 8);
+        assert_eq!(storage.fp8_data.len(), 8);
         let materialized = cache.materialize_sequence(seq).unwrap();
         assert_eq!(materialized.layers[1].key, token[1].0);
         assert_eq!(materialized.layers[1].value, token[1].1);

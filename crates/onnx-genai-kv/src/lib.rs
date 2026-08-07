@@ -41,7 +41,8 @@ pub use connector::{
 pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
 pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
 pub use page_table::{
-    KvDType, KvKind, KvQuantConfig, LayerKvDType, LayerTensorConfig, Page, PageId, PageStats,
+    DevicePageSpan, HostPageStore, HostPageStoreView, HostPageStoreViewMut, KvDType, KvKind,
+    KvPageStore, KvQuantConfig, LayerKvDType, LayerTensorConfig, Page, PageId, PageStats,
     PageTable, PageTensorConfig, PageUsage, SequenceUsage,
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
@@ -296,6 +297,10 @@ pub enum KvError {
     InvalidWindowSize,
     #[error("Tensor storage is not configured for this cache")]
     TensorStorageNotConfigured,
+    #[error(
+        "Page {0} is not host-addressable; explicitly materialize it before requesting host slices"
+    )]
+    PageNotHostAddressable(PageId),
     #[error("Invalid KV tensor shape: {0}")]
     InvalidTensorShape(&'static str),
     #[error("Unsupported KV dtype: {0}")]
