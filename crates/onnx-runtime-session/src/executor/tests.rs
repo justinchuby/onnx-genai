@@ -524,6 +524,147 @@ impl Kernel for CaptureDecliningKernel {
     }
 }
 
+// Mirrors the bypass kernels Harry flagged (`UnaryMathKernel`, `NotKernel`,
+// `BitwiseNotKernel`): returns `CaptureSupport::Supported` unconditionally and
+// deliberately does NOT override `set_capture_seq_independent`, so the kernel
+// alone would happily admit a classifier-disqualified growing node into capture.
+struct UnconditionalCaptureKernel;
+
+impl Kernel for UnconditionalCaptureKernel {
+    fn execute(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Supported
+    }
+}
+
+// Build a minimal two-node static `Identity` executor whose kernels are warmed,
+// then return it alongside the per-node kernel keys and the fully-resolved
+// concrete shape map. Callers rewrite one node's IR output shape and cached
+// kernel to stage a capture-admission scenario for `node_capture_reason`.
+#[cfg(test)]
+fn build_identity_capture_fixture() -> (Executor, Vec<KernelKey>, HashMap<ValueId, Vec<usize>>) {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    for index in 0..2 {
+        let input = graph.create_named_value(
+            format!("input_{index}"),
+            DataType::Float32,
+            static_shape([1]),
+        );
+        let output = graph.create_named_value(
+            format!("output_{index}"),
+            DataType::Float32,
+            static_shape([1]),
+        );
+        graph.add_input(input);
+        graph.add_output(output);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(input)],
+            vec![output],
+        ));
+    }
+
+    let executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().expect("CPU EP"),
+    )
+    .expect("representative static graph");
+    let resolved = executor
+        .value_shapes
+        .iter()
+        .filter_map(|(&value, shape)| as_static_shape(shape).map(|shape| (value, shape)))
+        .collect::<HashMap<_, _>>();
+    let keys = executor
+        .plan
+        .iter()
+        .map(|plan| KernelKey {
+            node: plan.node_id.0,
+            shapes: plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| resolved[&value].clone())
+                        .unwrap_or_default()
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    (executor, keys, resolved)
+}
+
+// Round-7 central capture veto (PR #728): a classifier-DISQUALIFIED node (an
+// output shape references a GROWING KV/total-sequence-length symbol) wired to a
+// kernel that returns `CaptureSupport::Supported` unconditionally MUST still be
+// declined at the real capture-admission chokepoint (`node_capture_reason`). The
+// veto is applied BEFORE the kernel's own `capture_support()` is consulted, so no
+// bypass kernel can re-admit a disqualified node. Fail-pre (veto absent): the
+// node is admitted (`None`) because every structural check passes and the kernel
+// says Supported — silent decode corruption. Pass-post: `ClassifierDisqualified`.
+#[test]
+fn classifier_disqualified_node_is_vetoed_despite_supported_kernel() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // Mint a GROWING KV-length symbol and mark node 0's OUTPUT shape as carrying
+    // it, so the build-time classifier disqualifies the node — independent of the
+    // concrete warmed extent still present in `resolved`.
+    let growing = executor.graph.create_symbol(None);
+    executor.capture_growing_symbols.insert(growing);
+    let disqualified_output = executor.plan[0].outputs[0];
+    executor.graph.value_mut(disqualified_output).shape =
+        vec![Dim::Symbolic(growing), Dim::Static(1)];
+
+    // The kernel alone would admit capture (unconditional Supported, no flag
+    // override) — exactly the bypass path Harry called out.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    let decline = executor
+        .node_capture_reason(&executor.plan[0], &resolved)
+        .expect("classifier-disqualified node must be declined for capture");
+    assert_eq!(
+        decline.seam_reason,
+        Some(SeamReason::ClassifierDisqualified),
+        "the growing-symbol node must be vetoed centrally, not admitted by the kernel"
+    );
+}
+
+// Positive companion: a classifier-QUALIFIED (sequence-independent) node with the
+// same unconditional-`Supported` kernel is still admitted (`None`). The central
+// veto is strictly additive — it only ever declines disqualified nodes and never
+// suppresses a legitimately capturable one.
+#[test]
+fn classifier_qualified_node_with_supported_kernel_is_admitted() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // No growing symbol touches this node's edges; the classifier qualifies it.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    assert!(
+        executor
+            .node_capture_reason(&executor.plan[0], &resolved)
+            .is_none(),
+        "a sequence-independent node with a Supported kernel must remain capture-eligible"
+    );
+}
+
 #[test]
 fn kernel_capture_reason_propagates_into_structured_report() {
     let mut node = Node::new(NodeId(9), "MatMulNBits", vec![], vec![]);
@@ -3535,6 +3676,16 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
     // captures). Disable the now-default-ON memo so this executor records the
     // warm shapes exactly as a capture-capable EP would at runtime.
     exec.set_decode_memo_enabled(false);
+
+    // This test isolates warm-decode SEEDING — the unresolved-shape → resolved
+    // transition that seeding is responsible for. The central classifier veto
+    // (PR #728, exercised by its own tests) is an orthogonal, additional gate:
+    // under the default fail-safe classifier the Range output's untraceable
+    // data-dependent length is disqualifying, which would mask the
+    // unresolved-shape seam this test asserts. Clear the disqualifying set so the
+    // seeding transition is the sole observable, matching the Denylist view in
+    // which a non-growing, replay-guarded extent is capture-safe.
+    exec.capture_growing_symbols.clear();
 
     let zero = Tensor::from_raw(DataType::Int64, vec![], &0i64.to_le_bytes()).unwrap();
     let four = Tensor::from_raw(DataType::Int64, vec![], &4i64.to_le_bytes()).unwrap();
