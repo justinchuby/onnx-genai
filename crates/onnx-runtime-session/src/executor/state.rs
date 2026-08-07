@@ -117,6 +117,17 @@ pub(crate) struct Executor {
     /// genuinely-capturable ops still fold. Grows monotonically within an
     /// executor: a kernel that breaks recording once breaks it every time.
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
+    /// Build-time set of GROWING symbols: the KV/past/total-sequence-length
+    /// symbols that live on the sequence axis of attention `present`/`past` KV
+    /// caches and increment each decode step. Computed once at build from graph
+    /// metadata (see
+    /// [`compute_capture_growing_symbols`](super::kernel_cache::compute_capture_growing_symbols)).
+    /// The shared pointwise/elementwise/bitwise/prelu capture gate marks an op
+    /// seq-independent iff NONE of its output dims references a symbol in this
+    /// set — pinning batch/query-seq/heads (constant every replay) as capturable
+    /// while keeping any KV-length-dependent op eager. Empty for a pure-recurrent
+    /// graph (no attention KV cache), which correctly admits all pointwise ops.
+    pub(super) capture_growing_symbols: HashSet<SymbolId>,
     /// Node whose kernel returned an error while recording a captured segment,
     /// set transiently by [`Self::run_plan_segmented`] so the capture retry loop
     /// can quarantine its op-type. `None` outside a failed capture pass.

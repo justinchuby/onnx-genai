@@ -38,6 +38,125 @@ impl KernelKey {
     }
 }
 
+/// The past-KV-cache **input** indices for a recognized attention node, if any.
+///
+/// These are the tensors whose sequence axis GROWS each decode step (the KV
+/// cache), as opposed to a fixed-capacity recurrent state. The indices mirror
+/// the authoritative structural list in
+/// [`kernel_input_uses_physical_capacity`](super::geometry::kernel_input_uses_physical_capacity):
+/// GQA past_key/value = inputs 3,4; default-domain `Attention` = inputs 4,5;
+/// `pkg.nxrt::IndexShare` = inputs 3,4. Any other op returns `None`.
+fn attention_past_kv_input_indices(node: &Node) -> Option<[usize; 2]> {
+    if node.domain == "com.microsoft" && node.op_type == "GroupQueryAttention" {
+        return Some([3, 4]);
+    }
+    if node.is_default_domain() && node.op_type == "Attention" {
+        return Some([4, 5]);
+    }
+    if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
+        return Some([3, 4]);
+    }
+    None
+}
+
+/// If `shape` is a KV-cache tensor, the [`SymbolId`] on its **growing** sequence
+/// axis. The KV layout is `[batch, kv_heads, sequence, head_dim]`, so the
+/// sequence axis is the **penultimate** dim — this is the exact structural
+/// convention used by `is_recurrent_state_shape` (a static penultimate axis is a
+/// fixed recurrent state, a symbolic one is a growable KV cache). Returns `None`
+/// for a static penultimate axis (recurrent state) or a rank < 2 shape.
+fn kv_growing_symbol(shape: &Shape) -> Option<SymbolId> {
+    if shape.len() < 2 {
+        return None;
+    }
+    match shape[shape.len() - 2] {
+        Dim::Symbolic(sym) => Some(sym),
+        Dim::Static(_) => None,
+    }
+}
+
+/// Structurally identify the set of GROWING symbols at build/graph-load time.
+///
+/// A growing symbol is one that lives on the sequence axis of an attention KV
+/// cache (`past`/`present` key/value) — it increments each decode step, so any
+/// buffer sized by it has a different extent every replay and MUST stay eager.
+/// The QUERY `sequence_len` symbol is deliberately NOT collected here: it lives
+/// on the query/hidden tensor, never on a KV slot, and the decode capture region
+/// pins it constant (=1) across replays. This distinction is the whole point of
+/// the classifier: GDN pointwise ops carry only batch/query-seq/heads (all
+/// pinned) and no KV-length symbol → they become capture-eligible, while any op
+/// carrying a KV-length symbol stays eager.
+///
+/// We gather symbols from BOTH the past-KV **inputs** and the present-KV
+/// **outputs** (outputs[1]=present_key, outputs[2]=present_value) of every
+/// recognized attention node. The loader interns same-named dim-params to one
+/// `SymbolId` across layers, so the resulting set stays small.
+pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    let mut growing = HashSet::new();
+    for node in graph.nodes.values() {
+        let Some(past_inputs) = attention_past_kv_input_indices(node) else {
+            continue;
+        };
+        for idx in past_inputs {
+            if let Some(Some(vid)) = node.inputs.get(idx).copied()
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                growing.insert(sym);
+            }
+        }
+        // present_key = outputs[1], present_value = outputs[2] (see
+        // dynamic_shapes.rs GQA present handling: `[query[0], kv_heads,
+        // present_sequence, head_dim]`, seq axis = penultimate).
+        for idx in [1usize, 2usize] {
+            if let Some(&vid) = node.outputs.get(idx)
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                growing.insert(sym);
+            }
+        }
+    }
+    if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
+        eprintln!(
+            "[onnx-genai-capture] build-time growing-symbol set: {} symbol(s): {:?}",
+            growing.len(),
+            growing
+        );
+    }
+    growing
+}
+
+/// Whether `node` is capture-eligible under the **build-time growing-symbol**
+/// classifier: every output dim must be free of any GROWING (KV-length) symbol.
+///
+/// This replaces the strict all-`Dim::Static` rule (fully-static output shapes),
+/// which was too strict: it treats a PINNED symbolic dim (batch=1, query
+/// seq_len=1, heads) the same as a GROWING one and so kept every GDN pointwise
+/// op eager. Keying off the growing SET instead of dim staticness admits
+/// `[Symbolic(batch), Symbolic(seq=1), Static(16), Static(128)]` (both symbolic
+/// dims pinned) while correctly keeping anything with a KV-length dim eager.
+/// This also resolves the heads-vs-tokens ambiguity structurally:
+/// `[Symbolic(heads), Static(128)]` with `heads ∉ growing` → capturable;
+/// `[Symbolic(seq_kv), Static(128)]` with `seq_kv ∈ growing` → eager.
+///
+/// When `growing` is empty (a pure-recurrent graph with no attention KV cache),
+/// [`shape_references_any`] returns false for every op → all pointwise ops are
+/// capture-eligible, which is correct: nothing grows step-to-step. Nodes with no
+/// outputs are conservatively treated as not seq-independent.
+pub(super) fn node_capture_seq_independent(
+    graph: &Graph,
+    node: &Node,
+    growing: &HashSet<SymbolId>,
+) -> bool {
+    !node.outputs.is_empty()
+        && node.outputs.iter().all(|&vid| {
+            graph
+                .try_value(vid)
+                .is_some_and(|value| !shape_references_any(&value.shape, growing))
+        })
+}
+
 /// Observable kernel-cache statistics (§11.1) — enough to prove reuse in tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -110,6 +229,7 @@ impl KernelCache {
         input_dtypes: &[DataType],
         constant_inputs: &[bool],
         opset: u64,
+        capture_seq_independent: bool,
         ep: &dyn ExecutionProvider,
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
@@ -159,6 +279,7 @@ impl KernelCache {
                 Err(error) => return Err(error.into()),
             };
             kernel.set_constant_inputs(constant_inputs);
+            kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);
             self.misses += 1;
         }

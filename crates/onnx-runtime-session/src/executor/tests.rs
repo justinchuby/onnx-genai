@@ -784,6 +784,131 @@ fn only_gqa_cache_inputs_use_physical_capacity_as_kernel_geometry() {
     assert!(!kernel_input_uses_physical_capacity(&attention, 4));
 }
 
+// C1 (build-time growing-symbol classifier): a pointwise op is capture-eligible
+// iff NONE of its output dims references a GROWING (KV/past-sequence-length)
+// symbol. The growing set is derived structurally from attention KV cache slots
+// (`compute_capture_growing_symbols`): a KV tensor's penultimate axis carries the
+// growing sequence symbol. This test builds a synthetic graph — a GQA node whose
+// past_key input declares a symbolic penultimate axis (the KV-length symbol),
+// plus two pointwise ops — and asserts the negative (an op carrying the growing
+// symbol stays eager) and the positive (an op whose only symbolic dims are pinned
+// batch/heads is capturable). Metadata-driven, no model files, no per-model
+// hardcoding — the KV-length symbol vs a pinned head/batch symbol is
+// distinguished by SET membership, not dim position or runtime value.
+#[test]
+fn growing_symbol_classifier_keeps_kv_length_ops_eager_and_admits_pinned_ops() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    // Interned symbols. `seq_kv` is the KV/past-sequence-length axis that GROWS
+    // each decode step; `batch` and `heads` are PINNED (constant every replay).
+    let seq_kv = graph.create_symbol(None);
+    let batch = graph.create_symbol(None);
+    let heads = graph.create_symbol(None);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // GQA past_key (input index 3): [batch, kv_heads, seq_kv, head_dim] — the
+    // penultimate axis (index 2) is the growing KV-length symbol.
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    let past_value = graph.create_named_value(
+        "past_value",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    // Fill inputs 0..=2 with a placeholder so past_key/value land at 3/4.
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![Some(q), Some(q), Some(q), Some(past_key), Some(past_value)],
+        vec![],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the KV past-sequence-length symbol must be classified GROWING"
+    );
+    assert!(
+        !growing.contains(&batch) && !growing.contains(&heads),
+        "pinned batch/head symbols must NOT be classified growing"
+    );
+
+    // Negative: a pointwise op whose output carries the growing KV-length symbol
+    // MUST stay eager (a different buffer extent every decode step).
+    let kv_out = graph.create_named_value(
+        "kv_pointwise_out",
+        DataType::Float32,
+        vec![sym(seq_kv), st(128)],
+    );
+    let kv_op = Node::new(NodeId(1), "Mul", vec![Some(q), Some(q)], vec![kv_out]);
+    assert!(
+        !node_capture_seq_independent(&graph, &kv_op, &growing),
+        "an op whose output carries the growing KV-length symbol must stay eager"
+    );
+
+    // Positive: a pointwise op whose only symbolic output dims are PINNED
+    // (batch/query-seq/heads) — no growing symbol — is capture-eligible, even
+    // though its leading dims do not collapse to 1 (the head-major decode tensor
+    // the runtime-extent heuristic alone would reject).
+    let pinned_out = graph.create_named_value(
+        "pinned_pointwise_out",
+        DataType::Float32,
+        vec![sym(batch), sym(heads), st(128)],
+    );
+    let pinned_op = Node::new(NodeId(2), "Sigmoid", vec![Some(q)], vec![pinned_out]);
+    assert!(
+        node_capture_seq_independent(&graph, &pinned_op, &growing),
+        "an op whose only symbolic dims are pinned (batch/heads) must be capturable"
+    );
+}
+
+// A recurrent-state cache (GatedDeltaNet conv/recurrent state) has a STATIC
+// penultimate axis, so it must NOT contribute a growing symbol — the whole point
+// that lets GDN pointwise ops become capture-eligible. A pure-recurrent graph
+// with no attention KV cache yields an empty growing set (broaden all), which is
+// correct: nothing grows step-to-step.
+#[test]
+fn recurrent_state_shapes_contribute_no_growing_symbols() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let batch = graph.create_symbol(None);
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // A fixed-capacity recurrent conv state: penultimate axis is STATIC.
+    let conv_state = graph.create_named_value(
+        "conv_state",
+        DataType::Float32,
+        vec![sym(batch), st(16), st(4), st(128)],
+    );
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    // A default-domain `Attention` node with the recurrent state at input 4:
+    // because its penultimate axis is static, no growing symbol is collected.
+    let attention = Node::new(
+        NodeId(0),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(q), Some(conv_state)],
+        vec![],
+    );
+    graph.insert_node(attention);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.is_empty(),
+        "a static-penultimate recurrent state must contribute no growing symbols, got {growing:?}"
+    );
+}
+
 #[test]
 fn only_capacity_aware_inputs_keep_physical_capacity() {
     let shape = Node::new(NodeId(0), "Shape", vec![], vec![]);

@@ -425,6 +425,7 @@ impl KernelFactory for UnaryFactory {
                     .and_then(Attribute::as_int)
                     == Some(1),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -454,6 +455,7 @@ impl KernelFactory for StandardGeluFactory {
             runtime: self.runtime.clone(),
             decomposed_silu: false,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -465,6 +467,7 @@ pub struct UnaryKernel {
     runtime: Arc<CudaRuntime>,
     decomposed_silu: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -533,10 +536,13 @@ impl UnaryKernel {
                 "CUDA SwiGLU fusion was not selected because this Silu does not feed one eligible equal-shape Mul exclusively"
             );
         }
-        let current_signature = is_fixed_decode_shape(x.shape).then(|| UnaryCaptureSignature {
-            dtype,
-            shape: x.shape.to_vec(),
-        });
+        let current_signature =
+            capture_shape_eligible(self.capture_seq_independent, x.shape).then(|| {
+                UnaryCaptureSignature {
+                    dtype,
+                    shape: x.shape.to_vec(),
+                }
+            });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -597,6 +603,10 @@ impl Kernel for UnaryKernel {
             )),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 /// Factory for [`BinaryKernel`]; carries the op identity and shared runtime.
@@ -617,6 +627,7 @@ impl KernelFactory for BinaryFactory {
                     .and_then(Attribute::as_int)
                     == Some(1),
                 last_capture_safe_signature: Mutex::new(None),
+                capture_seq_independent: false,
             }));
         }
         Ok(Box::new(BinaryKernel {
@@ -624,6 +635,7 @@ impl KernelFactory for BinaryFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -635,6 +647,7 @@ pub struct BinaryKernel {
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<BroadcastMetadataCache>,
     last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -796,14 +809,15 @@ impl BinaryKernel {
                 "CUDA SwiGLU fusion was not selected because this Mul is not an eligible equal-shape, single-consumer Mul(Silu(gate), up) pattern"
             );
         }
-        let current_signature = is_fixed_decode_shape(&out_shape).then(|| BinaryCaptureSignature {
-            dtype: a.dtype,
-            shapes: BroadcastMetadataKey {
-                a_shape: a.shape.to_vec(),
-                b_shape: b.shape.to_vec(),
-                out_shape: out_shape.clone(),
-            },
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, &out_shape)
+            .then(|| BinaryCaptureSignature {
+                dtype: a.dtype,
+                shapes: BroadcastMetadataKey {
+                    a_shape: a.shape.to_vec(),
+                    b_shape: b.shape.to_vec(),
+                    out_shape: out_shape.clone(),
+                },
+            });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -874,6 +888,10 @@ impl Kernel for BinaryKernel {
             )),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 /// Fused equal-shape `silu(gate) * up` pointwise kernel.
@@ -882,6 +900,7 @@ struct SiluMulKernel {
     runtime: Arc<CudaRuntime>,
     decomposed: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 impl SiluMulKernel {
@@ -925,10 +944,11 @@ impl SiluMulKernel {
         let n = gate.numel();
         let n_u64 = u64::try_from(n)
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {OP}: {n} elements exceed u64")))?;
-        let current_signature = is_fixed_decode_shape(gate.shape).then(|| UnaryCaptureSignature {
-            dtype,
-            shape: gate.shape.to_vec(),
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, gate.shape)
+            .then(|| UnaryCaptureSignature {
+                dtype,
+                shape: gate.shape.to_vec(),
+            });
         require_matching_capture_signature(
             &self.runtime,
             OP,
@@ -995,6 +1015,10 @@ impl Kernel for SiluMulKernel {
             ),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 pub(crate) fn require_matching_capture_signature<T: PartialEq>(
@@ -1013,6 +1037,26 @@ pub(crate) fn require_matching_capture_signature<T: PartialEq>(
 
 pub(crate) fn is_fixed_decode_shape(shape: &[usize]) -> bool {
     !shape.is_empty() && shape[..shape.len() - 1].iter().product::<usize>() == 1
+}
+
+/// Whether a pointwise op may be admitted to CUDA-graph capture for this call.
+///
+/// Two independent, both-safe routes:
+/// * `seq_independent` — the graph's IR metadata says every output dimension is
+///   `Dim::Static`, so the shape cannot change across decode steps regardless of
+///   its extents. This admits fully-static head-major decode shapes such as
+///   `[1,1,heads,dim]` that the runtime-extent heuristic rejects, and is derived
+///   from metadata (not runtime values), so `[tokens,feat]` (a symbolic seq dim)
+///   is never wrongly admitted.
+/// * the runtime-extent heuristic — a single-token decode row whose leading dims
+///   collapse to 1 (`is_fixed_decode_shape`) or a scalar. This preserves the
+///   existing capture coverage for pure single-token decode, where the token
+///   axis is symbolic but pinned to 1.
+///
+/// The two are OR-ed so the metadata route only ever *adds* eligibility; it can
+/// never regress a shape that was already capturable.
+pub(crate) fn capture_shape_eligible(seq_independent: bool, shape: &[usize]) -> bool {
+    seq_independent || shape.iter().product::<usize>() == 1 || is_fixed_decode_shape(shape)
 }
 
 pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
@@ -1212,6 +1256,7 @@ mod tests {
             runtime: runtime.clone(),
             decomposed: false,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }
         .execute(&inputs, &mut outputs)
         .unwrap();
@@ -1297,6 +1342,7 @@ mod tests {
             runtime: runtime.clone(),
             decomposed_silu: true,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }
         .execute(&standalone_input, &mut standalone_output)
         .unwrap();
