@@ -204,4 +204,5 @@ CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_GRAPH=1 \
 # repeat both with ONNX_GENAI_CUDA_GRAPH=0 to confirm capture-OFF parity.
 ```
 
-Do NOT merge. New HEAD sha: recorded in the branch push below.
+Do NOT merge. New HEAD sha: `0fd87df3` (pushed to
+`squad/elementwise-capture-seqindep`; this doc commit sits on top of it).
