@@ -6,11 +6,198 @@ use crate::{
     telemetry::KvTelemetry,
 };
 use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+};
 
 /// Unique page identifier.
 pub type PageId = u32;
+
+/// Opaque device-resident page memory exposed for kernel binding.
+///
+/// The pointer is never dereferenced by `onnx-genai-kv`; it is only a stable
+/// handle that a backend can pass to its kernels together with the byte range
+/// occupied by this logical page. A future `CudaPageStore` backed by the VMM
+/// arena would reserve a stable virtual range, map committed granules behind it,
+/// and return a span inside that range. Prefix sharing would map the same
+/// physical handles into multiple virtual ranges, and CoW would copy/remap at
+/// the VMM granule boundary described in issue #721.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevicePageSpan {
+    pub device: Device,
+    pub ptr: NonNull<std::ffi::c_void>,
+    pub byte_offset: usize,
+    pub byte_len: usize,
+}
+
+/// Physical storage for one logical KV page.
+///
+/// The boundary is intentionally asymmetric: host-addressable stores may expose
+/// borrowed host slices, while device stores expose only opaque device spans.
+/// Code that needs a host view of a device page must perform an explicit
+/// materialization before it can obtain slices; that copy is visible to the
+/// caller and can be charged to the memory governor instead of being hidden
+/// behind an accessor such as `head_token_row()`.
+pub trait KvPageStore: fmt::Debug {
+    fn allocated_bytes(&self) -> u64;
+    fn reset_storage(&mut self);
+    fn host_view(&self) -> Option<HostPageStoreView<'_>>;
+    fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>>;
+    fn device_span(&self) -> Option<DevicePageSpan>;
+}
+
+/// Borrowed host slices for a page store.
+#[derive(Debug, Clone, Copy)]
+pub struct HostPageStoreView<'a> {
+    pub data: &'a [f32],
+    pub quantized_data: &'a [i8],
+    pub fp8_data: &'a [u8],
+    pub quant_scales: &'a [f32],
+}
+
+/// Mutable host slices for a page store.
+#[derive(Debug)]
+pub struct HostPageStoreViewMut<'a> {
+    pub data: &'a mut [f32],
+    pub quantized_data: &'a mut [i8],
+    pub fp8_data: &'a mut [u8],
+    pub quant_scales: &'a mut [f32],
+}
+
+/// Host-addressable storage for one logical KV page.
+///
+/// Both hot and cold tiers currently use this store; `Page::device` remains a
+/// vestigial tier label until stage 2 replaces enum assignment with real copies
+/// between stores.
+#[derive(Debug, Clone)]
+pub struct HostPageStore {
+    pub data: Vec<f32>,
+    pub quantized_data: Vec<i8>,
+    pub fp8_data: Vec<u8>,
+    pub quant_scales: Vec<f32>,
+}
+
+impl HostPageStore {
+    fn new(data_len: usize, quantized_len: usize, fp8_len: usize, scale_len: usize) -> Self {
+        Self {
+            data: vec![0.0; data_len],
+            quantized_data: vec![0; quantized_len],
+            fp8_data: vec![0; fp8_len],
+            quant_scales: vec![1.0; scale_len],
+        }
+    }
+}
+
+impl KvPageStore for HostPageStore {
+    fn allocated_bytes(&self) -> u64 {
+        let f32_bytes = size_of::<f32>() as u64;
+        (self.data.len() as u64) * f32_bytes
+            + (self.quantized_data.len() as u64)
+            + (self.fp8_data.len() as u64)
+            + (self.quant_scales.len() as u64) * f32_bytes
+    }
+
+    fn reset_storage(&mut self) {
+        self.data.fill(0.0);
+        self.quantized_data.fill(0);
+        self.fp8_data.fill(0);
+        self.quant_scales.fill(1.0);
+    }
+
+    fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+        Some(HostPageStoreView {
+            data: &self.data,
+            quantized_data: &self.quantized_data,
+            fp8_data: &self.fp8_data,
+            quant_scales: &self.quant_scales,
+        })
+    }
+
+    fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
+        Some(HostPageStoreViewMut {
+            data: &mut self.data,
+            quantized_data: &mut self.quantized_data,
+            fp8_data: &mut self.fp8_data,
+            quant_scales: &mut self.quant_scales,
+        })
+    }
+
+    fn device_span(&self) -> Option<DevicePageSpan> {
+        None
+    }
+}
+
+/// Cloneable page-store handle used by `Page`.
+///
+/// It is an enum rather than a trait object so cloning a `PageTable` continues
+/// to duplicate page storage while leaving the governor lease behind. A future
+/// CUDA variant can implement [`KvPageStore`] without changing cache-facing
+/// APIs; host-only callers will see `host_view() == None` until they explicitly
+/// materialize the page.
+#[derive(Debug, Clone)]
+pub enum PageStore {
+    Host(HostPageStore),
+}
+
+impl PageStore {
+    fn host(data_len: usize, quantized_len: usize, fp8_len: usize, scale_len: usize) -> Self {
+        Self::Host(HostPageStore::new(
+            data_len,
+            quantized_len,
+            fp8_len,
+            scale_len,
+        ))
+    }
+
+    fn expect_host(&self) -> &HostPageStore {
+        match self {
+            Self::Host(store) => store,
+        }
+    }
+
+    fn expect_host_mut(&mut self) -> &mut HostPageStore {
+        match self {
+            Self::Host(store) => store,
+        }
+    }
+}
+
+impl KvPageStore for PageStore {
+    fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Host(store) => store.allocated_bytes(),
+        }
+    }
+
+    fn reset_storage(&mut self) {
+        match self {
+            Self::Host(store) => store.reset_storage(),
+        }
+    }
+
+    fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+        match self {
+            Self::Host(store) => store.host_view(),
+        }
+    }
+
+    fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
+        match self {
+            Self::Host(store) => store.host_view_mut(),
+        }
+    }
+
+    fn device_span(&self) -> Option<DevicePageSpan> {
+        match self {
+            Self::Host(store) => store.device_span(),
+        }
+    }
+}
 
 /// Scalar storage type for KV page tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,27 +507,34 @@ pub struct Page {
     pub id: PageId,
     /// Number of active references (for CoW).
     pub ref_count: u32,
-    /// Which device tier this page lives on.
+    /// Vestigial tier label used by the current host-only backend.
+    ///
+    /// Stage 1 keeps this field so existing tiering behaviour and tests remain
+    /// unchanged. Stage 2 should derive residency from the store that holds the
+    /// page and replace assignments to this field with byte copies between
+    /// stores.
     pub device: Device,
     /// How many token slots in this page are filled (0..=page_size).
     pub filled: usize,
     /// Last access timestamp (for LRU eviction).
     pub last_access: u64,
-    /// Compact page-local f32 storage. Empty when every component is quantized.
-    pub data: Vec<f32>,
-    /// Compact signed int8 storage.
-    pub quantized_data: Vec<i8>,
-    /// Compact FP8 bit patterns.
-    pub fp8_data: Vec<u8>,
-    /// Per-layer, per-K/V, per-head, per-token dequantization scales.
-    ///
-    /// For a quantized component the scales are laid out `[head, token]`, so the
-    /// scale for `(head, token_offset)` lives at
-    /// `scale_offset + head * page_size + token_offset`. Each token owns its own
-    /// scale, which is what lets appends quantize a single token without ever
-    /// requantizing previously-stored tokens.
-    pub quant_scales: Vec<f32>,
+    /// Physical page storage.
+    pub store: PageStore,
     storage_layout: Vec<ComponentStorage>,
+}
+
+impl Deref for Page {
+    type Target = HostPageStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.store.expect_host()
+    }
+}
+
+impl DerefMut for Page {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.store.expect_host_mut()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -402,10 +596,7 @@ impl Page {
             device,
             filled: 0,
             last_access: 0,
-            data: vec![0.0; data_len],
-            quantized_data: vec![0; quantized_len],
-            fp8_data: vec![0; fp8_len],
-            quant_scales: vec![1.0; scale_len],
+            store: PageStore::host(data_len, quantized_len, fp8_len, scale_len),
             storage_layout,
         }
     }
@@ -417,19 +608,12 @@ impl Page {
     /// when the table was built with per-layer geometry; a bookkeeping-only
     /// table reports zero here, which is the honest answer.
     pub fn allocated_bytes(&self) -> u64 {
-        let f32_bytes = size_of::<f32>() as u64;
-        (self.data.len() as u64) * f32_bytes
-            + (self.quantized_data.len() as u64)
-            + (self.fp8_data.len() as u64)
-            + (self.quant_scales.len() as u64) * f32_bytes
+        self.store.allocated_bytes()
     }
 
     pub fn reset_storage(&mut self, _config: Option<PageTensorConfig>) {
         self.filled = 0;
-        self.data.fill(0.0);
-        self.quantized_data.fill(0);
-        self.fp8_data.fill(0);
-        self.quant_scales.fill(1.0);
+        self.store.reset_storage();
     }
 
     /// Read one scalar for `(component, head, token_offset, dim)`.

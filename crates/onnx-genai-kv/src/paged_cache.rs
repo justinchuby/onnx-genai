@@ -729,20 +729,11 @@ impl PagedKvCache {
                     .pages
                     .get(&page_id)
                     .ok_or(KvError::PageNotFound(page_id))?;
-                (
-                    old.data.clone(),
-                    old.quantized_data.clone(),
-                    old.fp8_data.clone(),
-                    old.quant_scales.clone(),
-                    old.filled,
-                )
+                (old.store.clone(), old.filled)
             };
             if let Some(new_page) = self.page_table.pages.get_mut(&new_page_id) {
-                new_page.data = old_storage.0;
-                new_page.quantized_data = old_storage.1;
-                new_page.fp8_data = old_storage.2;
-                new_page.quant_scales = old_storage.3;
-                new_page.filled = old_storage.4;
+                new_page.store = old_storage.0;
+                new_page.filled = old_storage.1;
             }
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
