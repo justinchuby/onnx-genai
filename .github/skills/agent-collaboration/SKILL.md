@@ -17,6 +17,19 @@ The coordinator's spawn prompt already instructs agents to read decisions.md and
 ### Worktree Awareness
 Use the `TEAM ROOT` path provided in your spawn prompt. All `.squad/` paths are relative to this root. If TEAM ROOT is not provided (rare), run `git rev-parse --show-toplevel` as fallback. Never assume CWD is the repo root.
 
+### Worktree Cleanup
+**Delete your worktree's `target/` directory when your work is done** — after the PR is open and validated, before you report back.
+
+This repository's `target/` directories reach 30–45 GB each. With parallel agents in separate worktrees they have totalled ~245 GB and filled the disk, which corrupts session-event persistence (`I/O error: There is not enough space on the disk`) and can silently break other agents mid-build. Cleaning up is not optional politeness; it is what keeps concurrent agents working.
+
+```powershell
+Remove-Item <your-worktree>\target -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+Do not delete another agent's worktree or `target/`. Do not delete your own before your validation commands have passed and your branch is pushed.
+
+Note for disk-reduction attempts: on `x86_64-pc-windows-msvc`, Cargo's `split-debuginfo` is **silently ignored** — `packed`, `unpacked` and `off` all produce identical output, with no error or warning. The knob that works is `debug = "line-tables-only"` (~37% smaller than `debug = 2`, keeps backtrace line numbers).
+
 ### Decision Recording
 After making a decision that affects other team members, write it to:
 `.squad/decisions/inbox/{your-name}-{brief-slug}.md`
