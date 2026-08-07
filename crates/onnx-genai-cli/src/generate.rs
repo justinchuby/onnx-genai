@@ -203,6 +203,24 @@ fn record_cuda_offload_counters(profile: &mut RunProfile, before: CudaOffloadSna
     #[cfg(not(feature = "native-cuda"))]
     let after = CudaOffloadSnapshot::default();
 
+    emit_cuda_offload_counters(profile, before, after);
+}
+
+/// Emit the weight-offload activity counters for the delta between two
+/// snapshots. Split out from [`record_cuda_offload_counters`] so it is testable
+/// without a CUDA device: the source of `after` is the only part that needs one.
+///
+/// Every counter this consults to decide whether the section is interesting
+/// MUST also be emitted. An earlier version computed `page_ins`, `hits` and
+/// `evictions`, gated the section on them, and then printed only the prefetch
+/// counters — so the section could appear with every printed row reading zero
+/// while the counters that actually fired stayed invisible. That made the
+/// residency cache look inert when it was busy.
+fn emit_cuda_offload_counters(
+    profile: &mut RunProfile,
+    before: CudaOffloadSnapshot,
+    after: CudaOffloadSnapshot,
+) {
     let page_ins = after.page_ins.saturating_sub(before.page_ins);
     let hits = after.hits.saturating_sub(before.hits);
     let evictions = after.evictions.saturating_sub(before.evictions);
@@ -226,6 +244,17 @@ fn record_cuda_offload_counters(profile: &mut RunProfile, before: CudaOffloadSna
         || prefetch_staging_allocs > 0
         || prefetch_staging_reuses > 0
     {
+        profile.counter("weight offload page-ins", page_ins as f64, "page-ins");
+        profile.counter("weight offload cache hits", hits as f64, "hits");
+        profile.counter("weight offload evictions", evictions as f64, "evictions");
+        let lookups = page_ins.saturating_add(hits);
+        if lookups > 0 {
+            profile.counter(
+                "weight offload hit rate",
+                (hits as f64 / lookups as f64) * 100.0,
+                "%",
+            );
+        }
         profile.counter(
             "weight offload prefetch issued",
             prefetch_issued as f64,
@@ -424,5 +453,123 @@ mod tests {
             false,
             GenerateOutputKind::Audio
         ));
+    }
+
+    /// The gate in `emit_cuda_offload_counters` consults eight counters to
+    /// decide the section is worth printing, so all eight must be printed.
+    /// Before this test, `page_ins`, `hits` and `evictions` were consulted and
+    /// then dropped: a run whose residency cache was paging hard printed a
+    /// weight-offload section in which every visible row read `0.00`.
+    #[test]
+    fn every_counter_the_offload_gate_consults_is_also_emitted() {
+        let before = CudaOffloadSnapshot::default();
+        for (label, after) in [
+            (
+                "page_ins",
+                CudaOffloadSnapshot {
+                    page_ins: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "hits",
+                CudaOffloadSnapshot {
+                    hits: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "evictions",
+                CudaOffloadSnapshot {
+                    evictions: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "prefetch_issued",
+                CudaOffloadSnapshot {
+                    prefetch_issued: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "prefetch_declined_guard",
+                CudaOffloadSnapshot {
+                    prefetch_declined_guard: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "prefetch_joined",
+                CudaOffloadSnapshot {
+                    prefetch_joined: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "prefetch_staging_allocs",
+                CudaOffloadSnapshot {
+                    prefetch_staging_allocs: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                "prefetch_staging_reuses",
+                CudaOffloadSnapshot {
+                    prefetch_staging_reuses: 7,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut profile = RunProfile::new("test".to_string());
+            emit_cuda_offload_counters(&mut profile, before, after);
+            assert!(
+                profile.counters.iter().any(|counter| counter.value == 7.0),
+                "{label} made the offload section print, but no emitted row \
+                 carries its value — the counter is invisible to the operator"
+            );
+        }
+    }
+
+    #[test]
+    fn offload_hit_rate_is_reported_as_a_percentage_of_lookups() {
+        let mut profile = RunProfile::new("test".to_string());
+        emit_cuda_offload_counters(
+            &mut profile,
+            CudaOffloadSnapshot::default(),
+            CudaOffloadSnapshot {
+                page_ins: 3,
+                hits: 1,
+                ..Default::default()
+            },
+        );
+        let rate = profile
+            .counters
+            .iter()
+            .find(|counter| counter.name == "weight offload hit rate")
+            .expect("hit rate is emitted when the cache was looked up");
+        assert_eq!(rate.value, 25.0);
+        assert_eq!(rate.unit, "%");
+    }
+
+    /// A cache that was never consulted has no hit rate; reporting `0%` would
+    /// be indistinguishable from a cache that missed on everything.
+    #[test]
+    fn offload_hit_rate_is_omitted_when_the_cache_was_never_looked_up() {
+        let mut profile = RunProfile::new("test".to_string());
+        emit_cuda_offload_counters(
+            &mut profile,
+            CudaOffloadSnapshot::default(),
+            CudaOffloadSnapshot {
+                evictions: 2,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !profile
+                .counters
+                .iter()
+                .any(|counter| counter.name == "weight offload hit rate")
+        );
     }
 }
