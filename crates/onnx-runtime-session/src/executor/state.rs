@@ -119,18 +119,19 @@ pub(crate) struct Executor {
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
     /// Build-time set of GROWING symbols: the KV/past/total-sequence-length
     /// symbols on the sequence axis of attention `present`/`past` KV caches (GQA,
-    /// default `Attention`, `IndexShare`, `CompressedSparseAttention`), unioned
-    /// with a generic scan of the model's declared `past…`/`present…` rank-4 KV
-    /// I/O. Computed once at build (see
+    /// default `Attention`, `IndexShare`, `CompressedSparseAttention` — incl. the
+    /// ratio-4 `selections` axis), unioned with a generic scan of the model's
+    /// declared `past…`/`present…` rank-4 KV I/O, and then CLOSED under shape
+    /// inference's broadcast symbol unification. Computed once at build (see
     /// [`compute_capture_growing_symbols`](super::kernel_cache::compute_capture_growing_symbols)).
     /// The shared pointwise/elementwise/bitwise/prelu capture gate rejects an op
     /// whose INPUT **or** OUTPUT references any of these symbols — a denylist on
     /// both edges. The OUTPUT check keeps eager any op sized by a growing length;
-    /// the INPUT check closes the finding-1 broadcast-alias hole (an op whose
-    /// OUTPUT aliases to a pinned representative but whose INPUT still carries the
-    /// growing KV symbol must stay eager). A benign FRESH symbol (warm-decode
-    /// seeded, non-growing) is absent from this set, so ops carrying it stay
-    /// capturable — preserving the 154→34 collapse.
+    /// the INPUT check plus the class closure keep eager both a first-hop alias
+    /// and any DOWNSTREAM consumer that only ever sees the pinned-looking
+    /// representative (finding 1). A benign FRESH symbol (warm-decode seeded,
+    /// non-growing, not unified with a growing one) is absent from this set, so
+    /// ops carrying it stay capturable — preserving the 154→34 collapse.
     pub(super) capture_growing_symbols: HashSet<SymbolId>,
     /// Node whose kernel returned an error while recording a captured segment,
     /// set transiently by [`Self::run_plan_segmented`] so the capture retry loop

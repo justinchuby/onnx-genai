@@ -794,11 +794,11 @@ fn only_gqa_cache_inputs_use_physical_capacity_as_kernel_geometry() {
 //
 // This test builds a synthetic decode graph (declared `inputs_embeds`/`logits`
 // I/O plus a GQA node minting a growing KV-length symbol) and asserts: an op
-// whose dims are batch/query-seq only is capturable; an op that carries a growing
-// KV symbol on its OUTPUT stays eager; and — the finding-1 alias case — an op
-// whose OUTPUT shows only a pinned representative but whose INPUT still carries
-// the growing symbol ALSO stays eager (inputs are checked too). No model files,
-// no per-model hardcoding — growing membership, not dim position.
+// whose dims are batch/query-seq only is capturable, and an op that carries a
+// growing KV symbol on its OUTPUT stays eager. The first-hop input alias and the
+// harder downstream-consumer alias are covered by their own tests below
+// (`growing_symbol_alias_keeps_downstream_consumer_eager`). No model files, no
+// per-model hardcoding — growing membership, not dim position.
 #[test]
 fn growing_symbol_classifier_admits_pinned_and_rejects_growing_and_aliased_ops() {
     let mut graph = Graph::new();
@@ -880,32 +880,113 @@ fn growing_symbol_classifier_admits_pinned_and_rejects_growing_and_aliased_ops()
         DataType::Float32,
         vec![sym(seq_kv), st(128)],
     );
-    let kv_op = Node::new(NodeId(2), "Mul", vec![Some(embeds)], vec![kv_out]);
+    let kv_op = Node::new(NodeId(2), "Sigmoid", vec![Some(embeds)], vec![kv_out]);
     assert!(
         !node_capture_seq_independent(&graph, &kv_op, &growing),
         "an op whose output carries the growing KV-length symbol must stay eager"
     );
+}
 
-    // Finding-1 alias case: broadcast substituted the lower-id `batch`
-    // representative on the OUTPUT, but an INPUT still carries the growing
-    // `seq_kv`. Checking inputs too keeps the op EAGER despite the clean output.
-    let kv_shaped = graph.create_named_value(
-        "kv_shaped_in",
+// Finding 1 (downstream-consumer alias — the hard case Harry called out).
+// Shape inference substitutes the lower-id representative when broadcasting two
+// distinct symbols (`context.rs::broadcast_dim`), so a growing KV symbol can be
+// unified INTO `batch` on an aliasing op's OUTPUT; a DOWNSTREAM pointwise op then
+// copies that shape, and BOTH its edges show only the pinned-looking `batch`.
+// Exact per-symbol membership on the raw growing set would wrongly admit that
+// consumer (silent decode corruption). `compute_capture_growing_symbols` closes
+// the growing set under that same unification, so `batch` is marked growing and
+// BOTH the aliasing op AND its downstream consumer stay EAGER. This asserts the
+// consumer, not just the first aliasing op — the exact hole the re-review flagged.
+#[test]
+fn growing_symbol_alias_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let embeds =
+        graph.create_named_value("inputs_embeds", DataType::Float32, vec![sym(batch), st(64)]);
+    graph.add_input(embeds);
+    // GQA mints the growing `seq_kv` on past_key's penultimate axis.
+    let past_key = graph.create_named_value(
+        "past_key",
         DataType::Float32,
-        vec![sym(seq_kv), st(128)],
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+    let logits = graph.create_named_value("logits", DataType::Float32, vec![sym(batch), st(32000)]);
+    graph.add_output(logits);
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_key),
+        ],
+        vec![],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa);
+
+    // Aliasing broadcast op: input carries the growing `seq_kv`, the other input
+    // carries `batch`; inference unified them and wrote the lower-id
+    // representative (`batch`) onto the OUTPUT `aliased_out`.
+    let kv_shaped =
+        graph.create_named_value("kv_shaped_in", DataType::Float32, vec![sym(seq_kv), st(64)]);
+    let batch_shaped = graph.create_named_value(
+        "batch_shaped_in",
+        DataType::Float32,
+        vec![sym(batch), st(64)],
     );
     let aliased_out =
-        graph.create_named_value("aliased_out", DataType::Float32, vec![sym(batch), st(128)]);
+        graph.create_named_value("aliased_out", DataType::Float32, vec![sym(batch), st(64)]);
     let aliased_op = Node::new(
-        NodeId(3),
+        NodeId(1),
         "Add",
-        vec![Some(kv_shaped), Some(embeds)],
+        vec![Some(kv_shaped), Some(batch_shaped)],
         vec![aliased_out],
+    );
+    graph.insert_node(aliased_op.clone());
+
+    // Downstream consumer: reads and re-emits ONLY the representative `batch` on
+    // both edges — no raw `seq_kv` anywhere on this op.
+    let consumer_out = graph.create_named_value(
+        "downstream_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(64)],
+    );
+    let consumer_op = Node::new(
+        NodeId(2),
+        "Sigmoid",
+        vec![Some(aliased_out)],
+        vec![consumer_out],
+    );
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&batch),
+        "the representative `batch` unified with a growing symbol must be in the CLOSED growing \
+         set, got {growing:?}"
     );
     assert!(
         !node_capture_seq_independent(&graph, &aliased_op, &growing),
-        "an op whose OUTPUT aliases to `batch` but whose INPUT carries the growing \
-         symbol must stay eager (inputs are checked too)"
+        "the first-hop aliasing op must stay eager"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer_op, &growing),
+        "the DOWNSTREAM consumer whose edges show only the representative must ALSO stay eager \
+         (this fails on an un-closed exact-membership denylist)"
     );
 }
 
@@ -982,6 +1063,105 @@ fn csa_cache_record_symbol_keeps_consuming_ops_eager() {
     assert!(
         !node_capture_seq_independent(&graph, &cache_op, &growing),
         "an op consuming a CSA cache-record tensor must stay eager"
+    );
+}
+
+// Finding 2 (CSA ratio-4 output 5 `selections`): the dynamic ratio-4 variant
+// mints a fresh, growing `selections` symbol on the LAST axis of output 5
+// (`[query[0], index_heads, query_seq, selections]`,
+// custom_ops.rs::compressed_sparse_attention). The penultimate scan that covers
+// outputs 1/3 would miss it, so `KvCacheSlots::last_axis_outputs` collects the
+// trailing axis of output 5. A pointwise op consuming that `selections`-shaped
+// value must therefore stay EAGER.
+#[test]
+fn csa_output5_selections_symbol_keeps_consuming_ops_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let records = graph.create_symbol(None); // total_sequence_length-derived
+    let selections = graph.create_symbol(None); // output-5 last axis (fresh, growing)
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    // Six ratio-4 outputs. Output 0 = attention; outputs 1/3 = cache records
+    // (penultimate `records`); outputs 2/4 = static compressor tensors; output 5
+    // = `[query[0], index_heads, query_seq, selections]` (selections on LAST
+    // axis). Only `records` and `selections` are growing.
+    let out0 = graph.create_named_value(
+        "csa_attn",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let out1 = graph.create_named_value(
+        "csa_cache",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let out2 = graph.create_named_value(
+        "csa_comp",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(2), st(128)],
+    );
+    let out3 = graph.create_named_value(
+        "csa_index",
+        DataType::Uint8,
+        vec![sym(batch), sym(records), st(8)],
+    );
+    let out4 = graph.create_named_value(
+        "csa_index_comp",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(2), st(64)],
+    );
+    let out5 = graph.create_named_value(
+        "csa_selections",
+        DataType::Int32,
+        vec![sym(batch), st(8), sym(seq), sym(selections)],
+    );
+    let mut csa = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        vec![Some(embeds)],
+        vec![out0, out1, out2, out3, out4, out5],
+    );
+    csa.domain = "pkg.nxrt".to_string();
+    graph.insert_node(csa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&selections),
+        "the CSA output-5 last-axis `selections` symbol must be GROWING, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&records),
+        "the CSA output-1/3 penultimate `records` symbol must be GROWING, got {growing:?}"
+    );
+
+    // A pointwise op consuming the CSA `selections`-shaped output stays eager.
+    let sel_pointwise = graph.create_named_value(
+        "csa_selections_pointwise",
+        DataType::Int32,
+        vec![sym(batch), st(8), sym(seq), sym(selections)],
+    );
+    let sel_op = Node::new(NodeId(1), "Sign", vec![Some(out5)], vec![sel_pointwise]);
+    assert!(
+        !node_capture_seq_independent(&graph, &sel_op, &growing),
+        "an op consuming the CSA output-5 `selections` axis must stay eager"
     );
 }
 

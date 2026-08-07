@@ -52,7 +52,11 @@ impl KernelKey {
 /// `pkg.nxrt`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
 /// past-KV inputs (its cache is stateful device state); instead its
 /// total-sequence-length-derived cache records land on `outputs[1]`/`outputs[3]`
-/// (`[query[0], records, width]`, penultimate = `records`). See
+/// (`[query[0], records, width]`, penultimate = `records`). Dynamic ratio-4 CSA
+/// additionally mints a fresh, growing `selections` symbol on the **last** axis
+/// of `outputs[5]` (`[query[0], index_heads, query_seq, selections]`); that axis
+/// is captured via [`KvCacheSlots::last_axis_outputs`], since it is the trailing
+/// (not penultimate) dim. See
 /// `onnx-runtime-shape-inference/src/handlers/custom_ops.rs::compressed_sparse_attention`.
 ///
 /// This op list is one of two complementary growing-symbol sources (see
@@ -62,8 +66,12 @@ impl KernelKey {
 /// silently admitting a growing op.
 #[derive(Default)]
 struct KvCacheSlots {
+    /// Inputs whose penultimate (sequence) axis grows each decode step.
     past_inputs: &'static [usize],
+    /// Outputs whose penultimate (sequence/record) axis grows each decode step.
     present_outputs: &'static [usize],
+    /// Outputs whose **last** axis is a growing symbol (CSA `selections`).
+    last_axis_outputs: &'static [usize],
 }
 
 fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
@@ -71,28 +79,35 @@ fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
         return Some(KvCacheSlots {
             past_inputs: &[3, 4],
             present_outputs: &[1, 2],
+            last_axis_outputs: &[],
         });
     }
     if node.is_default_domain() && node.op_type == "Attention" {
         return Some(KvCacheSlots {
             past_inputs: &[4, 5],
             present_outputs: &[1, 2],
+            last_axis_outputs: &[],
         });
     }
     if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
         return Some(KvCacheSlots {
             past_inputs: &[3, 4],
             present_outputs: &[1, 2],
+            last_axis_outputs: &[],
         });
     }
     if (node.domain == "pkg.nxrt" || node.domain == "com.microsoft")
         && node.op_type == "CompressedSparseAttention"
     {
         // CSA cache records (derived from total_sequence_length) live on the
-        // penultimate axis of outputs 1 and 3; it has no past-KV inputs.
+        // penultimate axis of outputs 1 and 3; it has no past-KV inputs. The
+        // ratio-4 variant additionally mints a growing `selections` symbol on
+        // the LAST axis of output 5 (`[query[0], index_heads, query_seq,
+        // selections]`), which the penultimate scan would miss.
         return Some(KvCacheSlots {
             past_inputs: &[],
             present_outputs: &[1, 3],
+            last_axis_outputs: &[5],
         });
     }
     None
@@ -114,6 +129,16 @@ fn kv_growing_symbol(shape: &Shape) -> Option<SymbolId> {
     }
 }
 
+/// If `shape`'s **last** axis is symbolic, its [`SymbolId`]. Used for the CSA
+/// ratio-4 `selections` axis, which is the trailing (not penultimate) dim and so
+/// is not covered by [`kv_growing_symbol`].
+fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
+    match shape.last()? {
+        Dim::Symbolic(sym) => Some(*sym),
+        Dim::Static(_) => None,
+    }
+}
+
 /// Structurally identify the set of GROWING symbols at build/graph-load time.
 ///
 /// A growing symbol is one that lives on the sequence axis of an attention KV
@@ -126,17 +151,33 @@ fn kv_growing_symbol(shape: &Shape) -> Option<SymbolId> {
 /// pinned) and no KV-length symbol → they become capture-eligible, while any op
 /// carrying a KV-length symbol stays eager.
 ///
-/// Symbols are gathered from TWO complementary sources so coverage does not
+/// Symbols are gathered from THREE complementary sources so coverage does not
 /// depend on a fixed op allowlist (the finding-2 gap):
 ///   1. The past-KV **inputs** and present-KV **outputs** of every recognized
 ///      stateful attention node ([`attention_kv_cache_slots`]: GQA, default
-///      `Attention`, `IndexShare`, and `CompressedSparseAttention`).
+///      `Attention`, `IndexShare`, and `CompressedSparseAttention`), including
+///      CSA ratio-4's growing `selections` symbol on the **last** axis of
+///      output 5 ([`KvCacheSlots::last_axis_outputs`]).
 ///   2. A GENERIC scan of the model's DECLARED past/present KV I/O — every graph
 ///      input named `past…`/output named `present…` with a rank-4 KV layout
 ///      `[batch, kv_heads, sequence, head_dim]` whose penultimate (sequence) axis
 ///      is symbolic. This catches an unrecognized attention variant's KV boundary
 ///      tensor without minting a fresh op entry, while the rank-4 guard excludes
 ///      fixed-capacity recurrent/conv states (rank 3, or a static penultimate).
+///   3. The EQUIVALENCE-CLASS CLOSURE of (1)∪(2) under shape inference's symbol
+///      unification. Broadcast inference replaces two distinct symbolic dims with
+///      a single representative (the lower `SymbolId`, see
+///      `onnx-runtime-shape-inference/src/context.rs`'s `broadcast_dim`), so a
+///      growing KV symbol can be unified INTO a pinned-looking representative that
+///      a downstream pointwise op then copies onto BOTH its edges — escaping an
+///      exact-membership test (finding 1). We rebuild that union-find from the
+///      graph's elementwise broadcast ops and mark a whole class growing if ANY of
+///      its members is growing, then add every class member to the set. Because
+///      `node_capture_seq_independent` tests exact membership on both edges, a
+///      closed set makes the growing property transitively correct: a consumer
+///      carrying only the representative is still rejected. Over-inclusion (a
+///      benign symbol unified with a growing one) only costs perf — the op stays
+///      eager — it never admits a growing op.
 ///
 /// The loader interns same-named dim-params to one `SymbolId` across layers, so
 /// the resulting set stays small.
@@ -166,6 +207,16 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
                 growing.insert(sym);
             }
         }
+        // CSA ratio-4 output 5 carries the growing `selections` symbol on its
+        // LAST axis (`[query[0], index_heads, query_seq, selections]`).
+        for &idx in slots.last_axis_outputs {
+            if let Some(&vid) = node.outputs.get(idx)
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = last_axis_growing_symbol(&value.shape)
+            {
+                growing.insert(sym);
+            }
+        }
     }
 
     // Generic derivation from the DECLARED past/present KV I/O (ONNX GenAI's
@@ -189,6 +240,9 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
         }
     }
 
+    // Close the growing set under shape-inference symbol unification (finding 1).
+    close_growing_under_symbol_unification(graph, &mut growing);
+
     if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
         eprintln!(
             "[onnx-genai-capture] build-time growing-symbol set: {} symbol(s): {:?}",
@@ -199,6 +253,151 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
     growing
 }
 
+/// A minimal hash-map union-find over [`SymbolId`], used to rebuild the symbol
+/// equivalence classes that shape inference's broadcast unification produces.
+#[derive(Default)]
+struct SymbolUnionFind {
+    parent: HashMap<SymbolId, SymbolId>,
+}
+
+impl SymbolUnionFind {
+    /// The class root of `s` (with path compression). A symbol never inserted is
+    /// its own singleton root.
+    fn find(&mut self, s: SymbolId) -> SymbolId {
+        let mut root = s;
+        while let Some(&p) = self.parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        let mut cur = s;
+        while let Some(&p) = self.parent.get(&cur) {
+            if p == root {
+                break;
+            }
+            self.parent.insert(cur, root);
+            cur = p;
+        }
+        root
+    }
+
+    /// Union the classes of `a` and `b`. The lower `SymbolId` becomes the root,
+    /// mirroring inference's lower-id-representative rule (`context.rs`
+    /// `broadcast_dim`), though correctness here does not depend on the choice.
+    fn union(&mut self, a: SymbolId, b: SymbolId) {
+        self.parent.entry(a).or_insert(a);
+        self.parent.entry(b).or_insert(b);
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            let (root, child) = if ra.0 <= rb.0 { (ra, rb) } else { (rb, ra) };
+            self.parent.insert(child, root);
+        }
+    }
+}
+
+/// The dimension of `shape` at right-aligned `axis` in a rank-`rank` view;
+/// leading positions absent from `shape` broadcast as static `1`.
+fn broadcast_dim_from_right(shape: &Shape, rank: usize, axis: usize) -> Dim {
+    let offset = rank - shape.len();
+    if axis < offset {
+        Dim::Static(1)
+    } else {
+        shape[axis - offset]
+    }
+}
+
+/// Whether `node`'s shape rule broadcasts its inputs elementwise and can
+/// therefore substitute one input symbol for another as the output
+/// representative (the `broadcast_dim` two-symbol case). This is the exact set of
+/// default-domain elementwise/comparison/variadic/`Where` ops that call
+/// `InferenceContext::broadcast` in
+/// `onnx-runtime-shape-inference/src/handlers/elementwise.rs`. Non-broadcasting
+/// ops (MatMul contraction axes, attention, reshape) do not alias two length
+/// symbols onto one representative, so restricting the union-find to this family
+/// avoids spurious unification.
+fn op_broadcasts_elementwise(node: &Node) -> bool {
+    node.is_default_domain()
+        && matches!(
+            node.op_type.as_str(),
+            "Add"
+                | "Sub"
+                | "Mul"
+                | "Div"
+                | "Pow"
+                | "Mod"
+                | "BitShift"
+                | "BitwiseAnd"
+                | "BitwiseOr"
+                | "BitwiseXor"
+                | "PRelu"
+                | "Less"
+                | "Greater"
+                | "Equal"
+                | "And"
+                | "Or"
+                | "Xor"
+                | "LessOrEqual"
+                | "GreaterOrEqual"
+                | "Min"
+                | "Max"
+                | "Sum"
+                | "Mean"
+                | "Where"
+        )
+}
+
+/// Grow `growing` to its equivalence-class closure under shape inference's
+/// broadcast symbol unification (finding 1).
+///
+/// We reconstruct the union-find that `broadcast_dim` builds implicitly: for
+/// every elementwise-broadcasting node, right-align each pair of input shapes and
+/// union the two symbols meeting at any axis (the `(Symbolic, Symbolic)` case
+/// that yields a single representative). Then every symbol whose class contains a
+/// growing member is itself marked growing. This makes a downstream consumer that
+/// only ever sees the pinned-looking representative on both its edges stay eager.
+fn close_growing_under_symbol_unification(graph: &Graph, growing: &mut HashSet<SymbolId>) {
+    let mut uf = SymbolUnionFind::default();
+    for node in graph.nodes.values() {
+        if !op_broadcasts_elementwise(node) {
+            continue;
+        }
+        let shapes: Vec<&Shape> = node
+            .inputs
+            .iter()
+            .filter_map(|input| input.and_then(|vid| graph.try_value(vid)).map(|v| &v.shape))
+            .collect();
+        for i in 0..shapes.len() {
+            for j in (i + 1)..shapes.len() {
+                let (a, b) = (shapes[i], shapes[j]);
+                let rank = a.len().max(b.len());
+                for axis in 0..rank {
+                    if let (Dim::Symbolic(sa), Dim::Symbolic(sb)) = (
+                        broadcast_dim_from_right(a, rank, axis),
+                        broadcast_dim_from_right(b, rank, axis),
+                    ) && sa != sb
+                    {
+                        uf.union(sa, sb);
+                    }
+                }
+            }
+        }
+    }
+    if uf.parent.is_empty() {
+        return;
+    }
+    // Roots of the classes that contain at least one growing symbol.
+    let growing_roots: HashSet<SymbolId> = growing.iter().map(|&s| uf.find(s)).collect();
+    // Every symbol that participated in a union and whose class is growing.
+    let members: Vec<SymbolId> = uf.parent.keys().copied().collect();
+    for sym in members {
+        if growing_roots.contains(&uf.find(sym)) {
+            growing.insert(sym);
+        }
+    }
+}
+
 /// Whether `node` is capture-eligible under the **build-time symbol** classifier.
 ///
 /// An op is capture-eligible iff NEITHER any OUTPUT nor any INPUT references a
@@ -206,19 +405,24 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
 /// applied to BOTH sides of the op.
 ///
 /// Checking the OUTPUT keeps eager any op whose result is sized by a KV-length
-/// symbol (the direct dependence the PR targets). Checking the INPUT as well is
-/// what closes finding-1's broadcast-alias hole: elementwise broadcast /
-/// shape-inference can substitute the lower-id `batch` representative on the
-/// OUTPUT while an INPUT still carries the raw growing KV symbol
-/// (`[seq_kv, D]` ⊕ `[batch, D]` → `[batch, D]`). An output-only test would
-/// wrongly admit that op; rejecting any input that references a growing symbol
-/// keeps it eager. Because the *first* op in any such alias chain must consume a
-/// tensor still carrying the raw growing symbol on its INPUT, the input-side
-/// denylist defeats representative aliasing without a full union-find pass.
+/// symbol (the direct dependence the PR targets). Checking the INPUT as well
+/// catches a first-hop alias whose OUTPUT was rewritten to a pinned-looking
+/// representative but whose INPUT still carries the raw growing KV symbol
+/// (`[seq_kv, D]` ⊕ `[batch, D]` → `[batch, D]`).
 ///
-/// The growing set itself is derived robustly (op allowlist ∪ generic declared
-/// KV I/O scan, see [`compute_capture_growing_symbols`]) so finding-2 variants
-/// (CSA and any `past…`/`present…` rank-4 boundary tensor) are covered.
+/// The remaining, harder case — a DOWNSTREAM consumer that copies the already
+/// aliased shape, so BOTH its edges show only the representative — is closed not
+/// here but in the growing SET itself: [`compute_capture_growing_symbols`] takes
+/// the equivalence-class closure of the growing symbols under shape inference's
+/// broadcast unification, so the representative a growing symbol was unified into
+/// is itself in the set. Exact both-edge membership on that closed set is
+/// therefore transitively correct, and no per-call union-find is needed.
+///
+/// The growing set itself is derived robustly (attention-op set ∪ generic
+/// declared KV I/O scan ∪ unification closure, see
+/// [`compute_capture_growing_symbols`]) so finding-2 variants (CSA outputs incl.
+/// the ratio-4 `selections` axis, and any `past…`/`present…` rank-4 boundary
+/// tensor) are covered.
 ///
 /// A growing DENYLIST (rather than a pinned ALLOWLIST) is deliberate: a
 /// capture-eligible op legitimately consumes/produces intermediates carrying
