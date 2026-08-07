@@ -349,6 +349,23 @@ impl EngineResourceGovernor {
     }
 
     #[cfg(feature = "native-backend")]
+    pub(crate) fn byte_budget_after_native_load(&self) -> onnx_genai_scheduler::ByteBudget {
+        use onnx_runtime_memory_governor::MemoryGovernor as _;
+
+        let kv_pool_bytes = self.plan().kv_pool_bytes_handle();
+        let limit = self
+            .memory
+            .available(onnx_runtime_memory_governor::Tier::Device)
+            .saturating_add(kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed));
+        onnx_genai_scheduler::ByteBudget::new(limit).with_ceiling(std::sync::Arc::new(
+            LedgerAdmissionCeiling {
+                memory: self.memory.clone(),
+                kv_pool_bytes,
+            },
+        ))
+    }
+
+    #[cfg(feature = "native-backend")]
     pub(crate) fn weight_offload_host_cache(&self) -> onnx_runtime_ep_cpu::WeightOffloadHostCache {
         self.weight_offload_host_cache.clone()
     }
@@ -474,6 +491,38 @@ pub(crate) fn governor_kv_config(
     Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
 }
 
+pub(crate) fn governor_native_kv_config(
+    kv_model: Option<&KvModelInfo>,
+    config: &EngineConfig,
+) -> anyhow::Result<ModelKvConfig> {
+    let tokens_per_page = governor_tokens_per_page(config)?;
+    let Some(kv_model) = kv_model else {
+        return Ok(ModelKvConfig::unknown(tokens_per_page));
+    };
+
+    let mut page_size_bytes = 0_u64;
+    for (layer, element_bytes) in kv_model
+        .layer_configs
+        .iter()
+        .zip(&kv_model.layer_element_bytes)
+    {
+        let heads = u64::try_from(layer.num_kv_heads)
+            .context("KV head count does not fit Resource Governor accounting")?;
+        let head_dim = u64::try_from(layer.head_dim)
+            .context("KV head dimension does not fit Resource Governor accounting")?;
+        let layer_bytes = 2_u64
+            .checked_mul(heads)
+            .and_then(|value| value.checked_mul(tokens_per_page))
+            .and_then(|value| value.checked_mul(head_dim))
+            .and_then(|value| value.checked_mul(*element_bytes))
+            .context("native KV page byte size overflowed Resource Governor accounting")?;
+        page_size_bytes = page_size_bytes
+            .checked_add(layer_bytes)
+            .context("total native KV page byte size overflowed Resource Governor accounting")?;
+    }
+    Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
+}
+
 pub(crate) fn governor_no_paged_kv_config(config: &EngineConfig) -> anyhow::Result<ModelKvConfig> {
     Ok(ModelKvConfig::no_paged_cache(governor_tokens_per_page(
         config,
@@ -542,8 +591,10 @@ mod tests {
 
     #[test]
     fn missing_kv_geometry_is_unknown_not_a_token_count_byte_size() {
-        let mut config = EngineConfig::default();
-        config.page_size = 16;
+        let config = EngineConfig {
+            page_size: 16,
+            ..EngineConfig::default()
+        };
 
         let kv_config = governor_kv_config(None, &config).unwrap();
 
@@ -554,8 +605,10 @@ mod tests {
 
     #[test]
     fn zero_page_size_fails_instead_of_manufacturing_one_byte_tokens() {
-        let mut config = EngineConfig::default();
-        config.page_size = 0;
+        let config = EngineConfig {
+            page_size: 0,
+            ..EngineConfig::default()
+        };
         let kv_model = KvModelInfo {
             tensor_config: onnx_genai_kv::PageTensorConfig {
                 num_layers: 1,
@@ -568,6 +621,7 @@ mod tests {
                 num_kv_heads: 1,
                 head_dim: 1,
             }],
+            layer_element_bytes: vec![4],
             layers: Vec::new(),
         };
 
@@ -582,6 +636,32 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn native_kv_accounting_uses_graph_storage_width() {
+        let config = EngineConfig::default();
+        let kv_model = KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                page_size: config.page_size,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 4,
+            }],
+            layer_element_bytes: vec![2],
+            layers: Vec::new(),
+        };
+
+        let native = governor_native_kv_config(Some(&kv_model), &config).unwrap();
+        let host_mirror = governor_kv_config(Some(&kv_model), &config).unwrap();
+
+        assert_eq!(native.bytes_per_token(), Some(32));
+        assert_eq!(host_mirror.bytes_per_token(), Some(64));
     }
 
     #[test]

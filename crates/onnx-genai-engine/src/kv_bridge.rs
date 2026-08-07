@@ -23,6 +23,8 @@ pub(crate) struct KvModelInfo {
     /// Per-layer KV geometry, indexed identically to [`KvModelInfo::layers`].
     /// Length equals the number of exported KV layers (post kv-sharing).
     pub(crate) layer_configs: Vec<LayerTensorConfig>,
+    /// Native graph storage width for each exported KV layer.
+    pub(crate) layer_element_bytes: Vec<u64>,
     pub(crate) layers: Vec<KvLayerIo>,
 }
 
@@ -77,6 +79,17 @@ pub(crate) fn infer_kv_model_info(
         .map(|layer| layer.key_present_info.clone())
         .collect::<Vec<_>>();
     let layer_configs = layer_configs_from_key_outputs(&key_outputs)?;
+    let layer_element_bytes = key_outputs
+        .iter()
+        .map(|info| match info.dtype {
+            DataType::Float32 => Ok(4),
+            DataType::Float16 | DataType::BFloat16 => Ok(2),
+            dtype => anyhow::bail!(
+                "present KV output '{}' has unsupported native storage dtype {dtype:?}",
+                info.name
+            ),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // Representative geometry (layer 0). The paged cache is built from the full
     // per-layer `layer_configs`; `tensor_config` remains a single-value view for
     // uniform-only consumers (connector payloads, num_layers/dtype).
@@ -100,6 +113,7 @@ pub(crate) fn infer_kv_model_info(
     Ok(Some(KvModelInfo {
         tensor_config: config,
         layer_configs,
+        layer_element_bytes,
         layers,
     }))
 }

@@ -266,7 +266,7 @@ impl Engine {
         };
         let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
         let governor_kv_config = match kv_model.as_ref() {
-            Some(kv_model) => governor_kv_config(Some(kv_model), &config)?,
+            Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
             None if model_io_declares_only_fixed_state(model_io) => {
                 governor_no_paged_kv_config(&config)?
             }
@@ -318,7 +318,6 @@ impl Engine {
             scheduler_config.bytes_per_token =
                 required_bytes_per_token_from_kv_config(governor_kv_config)?;
         }
-        let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
             build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
@@ -567,6 +566,12 @@ impl Engine {
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
+        // Native CUDA can replace its conservative startup weight reservation
+        // with the provider's smaller governed residency pool during load.
+        // Size the scheduler only after that handoff so its static maximum does
+        // not remain pinned to the single KV page deliberately left at startup.
+        let scheduler =
+            Scheduler::with_byte_budget(scheduler_config, governor.byte_budget_after_native_load());
 
         Ok(Self {
             decode_backend: EngineDecodeBackend::Native,
@@ -769,11 +774,6 @@ fn required_bytes_per_token_from_kv_config(
     })
 }
 
-/// Identifies the draft model's KV page pool, a second pool the engine holds
-/// that was previously sized and allocated without consulting any budget.
-const DRAFT_KV_POOL_HOLDER: onnx_runtime_memory_governor::HolderId =
-    onnx_runtime_memory_governor::HolderId::new(3);
-
 fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
@@ -941,14 +941,14 @@ fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
 fn device_weight_reservation_for(
     package_bytes: u64,
     offload_budget: Option<u64>,
-    kv_page_size_bytes: u64,
+    kv_page_size_bytes: Option<u64>,
 ) -> u64 {
     match offload_budget {
         // A budget larger than the model cannot be filled, so the device still
         // holds at most the package.
         Some(budget) => {
             let reservation = budget.min(package_bytes);
-            reservation.saturating_sub(kv_page_size_bytes.min(reservation))
+            reservation.saturating_sub(kv_page_size_bytes.unwrap_or(0).min(reservation))
         }
         None => package_bytes,
     }
@@ -1610,7 +1610,7 @@ mod pool_sizing_tests {
         .context("native graph I/O should expose KV geometry")?;
 
         let ort_config = governor_kv_config(Some(&ort_kv_model), &config)?;
-        let native_config = governor_kv_config(Some(&native_kv_model), &config)?;
+        let native_config = governor_native_kv_config(Some(&native_kv_model), &config)?;
 
         assert_eq!(native_config.page_size_bytes, ort_config.page_size_bytes);
         assert_eq!(
@@ -1842,12 +1842,12 @@ mod pool_sizing_tests {
         let package = 6u64 << 30;
 
         assert_eq!(
-            device_weight_reservation_for(package, None, 0),
+            device_weight_reservation_for(package, None, None),
             package,
             "with offload off every weight is resident"
         );
         assert_eq!(
-            device_weight_reservation_for(package, Some(2 << 30), 0),
+            device_weight_reservation_for(package, Some(2 << 30), None),
             2 << 30,
             "with offload on the device holds the residency budget, not the package"
         );
@@ -1862,7 +1862,7 @@ mod pool_sizing_tests {
     fn a_budget_larger_than_the_model_reserves_only_the_model() {
         let package = 1u64 << 30;
         assert_eq!(
-            device_weight_reservation_for(package, Some(4 << 30), 0),
+            device_weight_reservation_for(package, Some(4 << 30), None),
             package
         );
     }
@@ -1870,7 +1870,7 @@ mod pool_sizing_tests {
     #[test]
     fn offload_startup_reservation_leaves_one_kv_page_unwarned() {
         assert_eq!(
-            device_weight_reservation_for(10_000, Some(6_000), 128),
+            device_weight_reservation_for(10_000, Some(6_000), Some(128)),
             5_872,
             "the temporary startup claim must leave the governor a one-page KV floor; \
              the CUDA provider later adopts the full offload budget as the real claim"
