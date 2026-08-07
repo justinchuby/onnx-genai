@@ -237,12 +237,15 @@ fn ns_to_ms(ns: u64) -> f64 {
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
+    pub kv_committed_len: usize,
     pub hard_max_len: usize,
     pub max_len_source: String,
     pub device_ptrs: Vec<usize>,
     pub kv_committed_bytes: usize,
     pub kv_physical_bytes_by_binding: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
+    pub kv_growth_events: u64,
+    pub kv_growth_d2d_copy_bytes: u64,
     pub graph: CudaGraphDebugStats,
 }
 
@@ -267,6 +270,7 @@ pub struct CudaGraphDebugStats {
     pub captures: u64,
     pub replays: u64,
     pub fallbacks: u64,
+    pub invalidations: u64,
     pub allocation_counts: DeviceAllocationCounts,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
@@ -341,6 +345,9 @@ pub(crate) struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    graph_invalidations: u64,
+    kv_growth_events: u64,
+    kv_growth_d2d_copy_bytes: u64,
     capacity: CudaKvCapacity,
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
@@ -1277,6 +1284,10 @@ impl DecodeCudaState {
             self.apply_vmm_growth(new_capacity, valid_len)?;
             self.invalidate_graph(session)?;
             self.max_len = new_capacity;
+            self.kv_growth_events += 1;
+            self.kv_growth_d2d_copy_bytes = self.kv_growth_d2d_copy_bytes.saturating_add(
+                (valid_len as u64).saturating_mul(self.capacity.bytes_per_token as u64),
+            );
             tracing::info!(
                 old_len = old_capacity,
                 new_len = new_capacity,
@@ -1297,6 +1308,12 @@ impl DecodeCudaState {
                 new_capacity,
                 valid_len,
             } => {
+                backend.state.kv_growth_events += 1;
+                backend.state.kv_growth_d2d_copy_bytes =
+                    backend.state.kv_growth_d2d_copy_bytes.saturating_add(
+                        (valid_len as u64)
+                            .saturating_mul(backend.state.capacity.bytes_per_token as u64),
+                    );
                 tracing::info!(
                     old_len = old_capacity,
                     new_len = new_capacity,
@@ -1979,6 +1996,9 @@ impl DecodeCudaState {
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            graph_invalidations: 0,
+            kv_growth_events: 0,
+            kv_growth_d2d_copy_bytes: 0,
             capacity,
             kv_commits_on_demand,
             graph_fallback_reason: None,
@@ -2482,6 +2502,7 @@ impl DecodeCudaState {
         session.reset_decode_inline_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+        self.graph_invalidations += 1;
         Ok(())
     }
 
@@ -2533,17 +2554,21 @@ impl DecodeCudaState {
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
+            kv_committed_len: self.max_len,
             hard_max_len: self.capacity.max_len,
             max_len_source: self.capacity.source.clone(),
             device_ptrs,
             kv_committed_bytes,
             kv_physical_bytes_by_binding,
             kv_transfers: transfers,
+            kv_growth_events: self.kv_growth_events,
+            kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,
                 captures: self.graph_captures,
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
+                invalidations: self.graph_invalidations,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
                 fallback_report: self.graph_fallback_report.clone(),
             },
