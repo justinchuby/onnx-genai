@@ -725,6 +725,17 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
+    /// Resize a provider-owned weight-residency budget before it joins a
+    /// governor, returning the budget that will be adopted.
+    ///
+    /// `--vram-limit` is resolved after the model and backend are known, but a
+    /// CUDA EP is constructed before the engine can size native KV. This hook
+    /// lets load-time admission subtract the non-weight device claims first,
+    /// preventing #712's "weights took the whole limit, KV failed later" path.
+    fn set_weight_residency_budget(&self, _budget_bytes: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     fn adopt_memory_governor(
         &self,
         _governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,

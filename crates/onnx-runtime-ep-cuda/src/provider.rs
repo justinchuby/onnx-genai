@@ -101,10 +101,22 @@ impl CudaExecutionProvider {
     /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
+        Self::new_with_offload_policy(ordinal, DeviceOffloadPolicy::from_env())
+    }
+
+    /// Construct a CUDA EP with an already-resolved weight-offload policy.
+    ///
+    /// The engine uses this when `--vram-limit` is the authority that enables
+    /// offload. Reading only the process environment here would recreate #712:
+    /// the limit would be parsed by the CLI while weights still loaded under an
+    /// unrelated residency policy.
+    pub fn new_with_offload_policy(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+    ) -> Result<Self> {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
-        let offload_policy = DeviceOffloadPolicy::from_env();
         let residency = offload_policy.enabled.then(|| {
             let budget = offload_policy
                 .device_budget_bytes
@@ -222,6 +234,17 @@ impl CudaExecutionProvider {
     /// Construct and initialize a CUDA execution provider with default settings.
     pub fn initialized(ordinal: u32) -> Result<Self> {
         let mut provider = Self::new(ordinal)?;
+        <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
+        Ok(provider)
+    }
+
+    /// Construct and initialize a CUDA execution provider with an already
+    /// resolved weight-offload policy.
+    pub fn initialized_with_offload_policy(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+    ) -> Result<Self> {
+        let mut provider = Self::new_with_offload_policy(ordinal, offload_policy)?;
         <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
         Ok(provider)
     }
@@ -941,6 +964,21 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// moment it is asked for.
     fn commits_on_demand(&self) -> bool {
         self.memory().commits_on_demand()
+    }
+
+    fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(None);
+        };
+        residency
+            .set_ungoverned_budget(budget_bytes)
+            .map(Some)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: cannot set the device weight-residency budget to \
+                     {budget_bytes} bytes before governor adoption: {error}"
+                ))
+            })
     }
 
     fn adopt_memory_governor(

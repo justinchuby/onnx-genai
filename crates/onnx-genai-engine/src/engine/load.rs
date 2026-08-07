@@ -58,6 +58,14 @@ impl Engine {
                 EngineDecodeBackend::Native,
             );
         }
+        fail_explicit_vram_limit_without_offload(
+            &config,
+            device_weight_package_bytes(&model_directory.model_path),
+            session_options
+                .execution_providers
+                .iter()
+                .any(|provider| !provider.caps.is_host()),
+        )?;
 
         // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
         // outputs on some Foundry exports. SessionOptions still honors an explicit
@@ -240,13 +248,38 @@ impl Engine {
         };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let governor_kv_config = governor_kv_config(None, &config)?;
+        let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
+        #[cfg(feature = "cuda")]
+        let cuda_offload_resolution =
+            resolve_cuda_offload_policy(&native_device, &config.limits, model_weight_bytes);
+        #[cfg(feature = "cuda")]
+        let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
+        #[cfg(feature = "cuda")]
+        let weight_reservation_bytes = device_weight_reservation_for(
+            model_weight_bytes,
+            cuda_offload_resolution.and_then(|resolution| {
+                resolution.policy.enabled.then(|| {
+                    resolution
+                        .policy
+                        .device_budget_bytes
+                        .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+                })
+            }),
+            governor_kv_config.page_size_bytes,
+        );
+        #[cfg(not(feature = "cuda"))]
+        let weight_reservation_bytes = device_weight_reservation_for(
+            model_weight_bytes,
+            None,
+            governor_kv_config.page_size_bytes,
+        );
         let governor = {
             let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
             EngineResourceGovernor::new(
                 config.limits.clone(),
                 config.allow_runtime_override,
                 governor_kv_config,
-                device_weight_reservation_bytes(&model_directory.model_path),
+                weight_reservation_bytes,
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
@@ -277,18 +310,35 @@ impl Engine {
             crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
                 &model_directory.model_path,
                 native_device.clone(),
-                governor.weight_offload_host_cache(),
-                metadata.model.as_ref().and_then(|model| model.io.as_ref()),
-                metadata
-                    .model
-                    .as_ref()
-                    .and_then(|model| model.max_sequence_length),
-                crate::decode::key_sequence_lengths_policy(&metadata),
-                config.decode_precision,
+                crate::native_decode::NativeDecodeLoadOptions {
+                    host_cache: governor.weight_offload_host_cache(),
+                    #[cfg(feature = "cuda")]
+                    cuda_offload_policy,
+                    io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                    metadata_max_len: metadata
+                        .model
+                        .as_ref()
+                        .and_then(|model| model.max_sequence_length),
+                    key_sequence_lengths_policy: crate::decode::key_sequence_lengths_policy(
+                        &metadata,
+                    ),
+                    decode_precision: config.decode_precision,
+                },
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
+        #[cfg(feature = "cuda")]
+        let cuda_offload_policy = reconcile_cuda_offload_budget_after_native_load(
+            &native_session,
+            metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.max_sequence_length),
+            governor.snapshot().resolved_limits.vram_bytes,
+            model_weight_bytes,
+            cuda_offload_resolution,
+        )?;
         // End the second budget.
         //
         // The execution provider is built before this governor exists, so a
@@ -350,7 +400,7 @@ impl Engine {
         if matches!(
             native_device,
             crate::native_decode::NativeDecodeDevice::Cuda { .. }
-        ) && onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled
+        ) && cuda_offload_policy.is_some_and(|policy| policy.enabled)
             && !native_session.commits_on_demand()
         {
             let weights = governor.snapshot().breakdown.model_weights_bytes;
@@ -661,7 +711,7 @@ fn build_governor_and_scheduler(
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
-            device_weight_reservation_bytes(&model_directory.model_path),
+            device_weight_package_bytes(&model_directory.model_path),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
     };
@@ -828,36 +878,208 @@ pub(crate) fn kv_pages_for_budget(
 /// the residency budget -- capped at the package size, because a budget larger
 /// than the model cannot be filled.
 ///
-/// The budget itself stays the operator's to set (#649): this only stops the
-/// same bytes being counted on both sides of the ledger.
-fn device_weight_reservation_bytes(model_path: &std::path::Path) -> u64 {
-    let package = onnx_genai_ort::model_weight_bytes(model_path);
-    #[cfg(feature = "cuda")]
-    let offload_budget = {
-        let policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
-        policy.enabled.then(|| {
-            policy
-                .device_budget_bytes
-                .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
-        })
-    };
-    #[cfg(not(feature = "cuda"))]
-    let offload_budget = None;
-    weight_reservation_for(package, offload_budget)
+/// For native CUDA, an explicit VRAM limit can derive the offload budget before
+/// the provider exists; other paths still reserve the whole package.
+fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
+    onnx_genai_ort::model_weight_bytes(model_path)
 }
 
-/// The reservation, given the package size and the offload budget when offload
-/// is on.
+/// The temporary startup reservation, given the package size and offload budget.
 ///
-/// Split from the environment read so the rule can be tested without a process
-/// variable that every other test would then race against.
-fn weight_reservation_for(package_bytes: u64, offload_budget: Option<u64>) -> u64 {
+/// Native CUDA offload replaces this placeholder with the provider-owned
+/// residency lease after session load. Leaving one KV page unreserved prevents
+/// the governor from taking the "reservation does not fit; drop it" warning path
+/// that hid #712 while preserving the later ledger-enforced admission point.
+fn device_weight_reservation_for(
+    package_bytes: u64,
+    offload_budget: Option<u64>,
+    kv_page_size_bytes: u64,
+) -> u64 {
     match offload_budget {
         // A budget larger than the model cannot be filled, so the device still
         // holds at most the package.
-        Some(budget) => budget.min(package_bytes),
+        Some(budget) => {
+            let reservation = budget.min(package_bytes);
+            reservation.saturating_sub(kv_page_size_bytes.min(reservation))
+        }
         None => package_bytes,
     }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug)]
+struct CudaOffloadResolution {
+    policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+    device_budget_is_override: bool,
+    auto_enabled_from_vram_limit: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn resolve_cuda_offload_policy(
+    native_device: &crate::native_decode::NativeDecodeDevice,
+    limits: &ResourceLimits,
+    package_bytes: u64,
+) -> Option<CudaOffloadResolution> {
+    resolve_cuda_offload_policy_from_env_policy(
+        native_device,
+        limits,
+        package_bytes,
+        onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn resolve_cuda_offload_policy_from_env_policy(
+    native_device: &crate::native_decode::NativeDecodeDevice,
+    limits: &ResourceLimits,
+    package_bytes: u64,
+    env_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+) -> Option<CudaOffloadResolution> {
+    if !matches!(
+        native_device,
+        crate::native_decode::NativeDecodeDevice::Cuda { .. }
+    ) {
+        return None;
+    }
+
+    if env_policy.enabled {
+        return Some(CudaOffloadResolution {
+            policy: env_policy,
+            device_budget_is_override: env_policy.device_budget_bytes.is_some(),
+            auto_enabled_from_vram_limit: false,
+        });
+    }
+
+    let ResourceLimit::Bytes(resolved_vram_bytes) = limits.vram_limit else {
+        return None;
+    };
+    if package_bytes <= resolved_vram_bytes {
+        return None;
+    }
+
+    let offload_device_budget_bytes = env_policy
+        .device_budget_bytes
+        .unwrap_or(resolved_vram_bytes);
+    Some(CudaOffloadResolution {
+        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+            enabled: true,
+            device_budget_bytes: Some(offload_device_budget_bytes),
+            async_pagein: env_policy.async_pagein,
+        },
+        device_budget_is_override: env_policy.device_budget_bytes.is_some(),
+        auto_enabled_from_vram_limit: true,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn reconcile_cuda_offload_budget_after_native_load(
+    native_session: &crate::native_decode::NativeDecodeSession,
+    max_context: Option<usize>,
+    resolved_vram_bytes: u64,
+    model_weight_bytes: u64,
+    resolution: Option<CudaOffloadResolution>,
+) -> anyhow::Result<Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>> {
+    let Some(mut resolution) = resolution else {
+        return Ok(None);
+    };
+    if !resolution.policy.enabled {
+        return Ok(Some(resolution.policy));
+    }
+
+    let (native_kv_bytes, native_kv_tier) = match max_context {
+        Some(max_context) => native_session
+            .kv_reservation(max_context)
+            .context("sizing native CUDA KV before deriving the weight-offload budget")?,
+        None => (0, onnx_runtime_memory_governor::Tier::Device),
+    };
+    let native_kv_device_bytes = if native_kv_tier == onnx_runtime_memory_governor::Tier::Device {
+        native_kv_bytes
+    } else {
+        0
+    };
+    let (recurrent_state_bytes, recurrent_tier) = native_session
+        .recurrent_state_reservation()
+        .context("sizing native CUDA recurrent state before deriving the weight-offload budget")?;
+    let recurrent_device_bytes = if recurrent_tier == onnx_runtime_memory_governor::Tier::Device {
+        recurrent_state_bytes
+    } else {
+        0
+    };
+    let required_device_non_weight_bytes =
+        native_kv_device_bytes.saturating_add(recurrent_device_bytes);
+    let available_weight_offload_budget_bytes =
+        resolved_vram_bytes.saturating_sub(required_device_non_weight_bytes);
+    let minimum_useful_weight_budget_bytes = native_session.max_lazy_weight_working_set_bytes();
+    let requested_weight_offload_budget_bytes = resolution
+        .policy
+        .device_budget_bytes
+        .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
+
+    if available_weight_offload_budget_bytes == 0
+        || available_weight_offload_budget_bytes < minimum_useful_weight_budget_bytes
+        || requested_weight_offload_budget_bytes < minimum_useful_weight_budget_bytes
+        || (resolution.device_budget_is_override
+            && requested_weight_offload_budget_bytes > available_weight_offload_budget_bytes)
+    {
+        anyhow::bail!(
+            "explicit VRAM limit cannot fit native CUDA weights plus required device state: \
+             model_weight_bytes={model_weight_bytes} resolved_vram_bytes={resolved_vram_bytes} \
+             required_device_non_weight_bytes={required_device_non_weight_bytes} \
+             native_kv_bytes={native_kv_device_bytes} recurrent_state_bytes={recurrent_device_bytes} \
+             activations_bytes=unknown runtime_overhead_bytes=unknown \
+             minimum_useful_weight_budget_bytes={minimum_useful_weight_budget_bytes} \
+             available_weight_offload_budget_bytes={available_weight_offload_budget_bytes} \
+             requested_weight_offload_budget_bytes={requested_weight_offload_budget_bytes}"
+        );
+    }
+
+    let offload_device_budget_bytes = if resolution.device_budget_is_override {
+        requested_weight_offload_budget_bytes
+    } else {
+        requested_weight_offload_budget_bytes.min(available_weight_offload_budget_bytes)
+    };
+    let adopted = native_session
+        .set_weight_residency_budget(offload_device_budget_bytes)
+        .context("setting native CUDA weight-offload budget after reserving room for KV")?
+        .unwrap_or(offload_device_budget_bytes);
+    resolution.policy.device_budget_bytes = Some(adopted);
+
+    if resolution.auto_enabled_from_vram_limit {
+        tracing::info!(
+            model_weight_bytes,
+            resolved_vram_bytes,
+            required_device_non_weight_bytes,
+            native_kv_bytes = native_kv_device_bytes,
+            recurrent_state_bytes = recurrent_device_bytes,
+            minimum_useful_weight_budget_bytes,
+            offload_device_budget_bytes = adopted,
+            "enabled CUDA weight offload because model weights exceed the VRAM limit"
+        );
+    }
+
+    Ok(Some(resolution.policy))
+}
+
+fn fail_explicit_vram_limit_without_offload(
+    config: &EngineConfig,
+    package_bytes: u64,
+    device_weights_are_selected: bool,
+) -> anyhow::Result<()> {
+    if !device_weights_are_selected {
+        return Ok(());
+    }
+    let ResourceLimit::Bytes(resolved_vram_bytes) = config.limits.vram_limit else {
+        return Ok(());
+    };
+    if package_bytes <= resolved_vram_bytes {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "model weights require {package_bytes} bytes of device memory, but --vram-limit / \
+         serving.memory.limits.vram_limit allows {resolved_vram_bytes} bytes and this backend \
+         cannot automatically offload weights; select the native CUDA backend for automatic \
+         weight offload or raise the VRAM limit"
+    );
 }
 
 fn allocate_kv_cache(
@@ -1450,12 +1672,12 @@ mod pool_sizing_tests {
         let package = 6u64 << 30;
 
         assert_eq!(
-            weight_reservation_for(package, None),
+            device_weight_reservation_for(package, None, 0),
             package,
             "with offload off every weight is resident"
         );
         assert_eq!(
-            weight_reservation_for(package, Some(2 << 30)),
+            device_weight_reservation_for(package, Some(2 << 30), 0),
             2 << 30,
             "with offload on the device holds the residency budget, not the package"
         );
@@ -1469,6 +1691,102 @@ mod pool_sizing_tests {
     #[test]
     fn a_budget_larger_than_the_model_reserves_only_the_model() {
         let package = 1u64 << 30;
-        assert_eq!(weight_reservation_for(package, Some(4 << 30)), package);
+        assert_eq!(
+            device_weight_reservation_for(package, Some(4 << 30), 0),
+            package
+        );
+    }
+
+    #[test]
+    fn offload_startup_reservation_leaves_one_kv_page_unwarned() {
+        assert_eq!(
+            device_weight_reservation_for(10_000, Some(6_000), 128),
+            5_872,
+            "the temporary startup claim must leave the governor a one-page KV floor; \
+             the CUDA provider later adopts the full offload budget as the real claim"
+        );
+    }
+
+    #[test]
+    fn explicit_vram_limit_fails_without_an_offload_capable_backend() {
+        let error = fail_explicit_vram_limit_without_offload(
+            &EngineConfig {
+                limits: ResourceLimits {
+                    vram_limit: ResourceLimit::Bytes(6_000),
+                    ..ResourceLimits::default()
+                },
+                ..EngineConfig::default()
+            },
+            10_000,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("require 10000 bytes"), "{error}");
+        assert!(error.contains("allows 6000 bytes"), "{error}");
+        assert!(error.contains("automatically offload weights"), "{error}");
+    }
+
+    #[test]
+    fn explicit_vram_limit_does_not_reject_host_only_execution() {
+        fail_explicit_vram_limit_without_offload(
+            &EngineConfig {
+                limits: ResourceLimits {
+                    vram_limit: ResourceLimit::Bytes(6_000),
+                    ..ResourceLimits::default()
+                },
+                ..EngineConfig::default()
+            },
+            10_000,
+            false,
+        )
+        .expect("a VRAM limit should not reject a host-only execution provider");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn explicit_vram_limit_auto_enables_cuda_weight_offload() {
+        let policy = resolve_cuda_offload_policy_from_env_policy(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(6_000),
+                ..ResourceLimits::default()
+            },
+            10_000,
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                enabled: false,
+                device_budget_bytes: None,
+                async_pagein: true,
+            },
+        )
+        .expect("weights above an explicit CUDA VRAM limit should enable offload");
+
+        assert!(policy.policy.enabled);
+        assert_eq!(policy.policy.device_budget_bytes, Some(6_000));
+        assert!(policy.policy.async_pagein);
+        assert!(policy.auto_enabled_from_vram_limit);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn explicit_weight_offload_device_bytes_overrides_vram_limit_derivation() {
+        let policy = resolve_cuda_offload_policy_from_env_policy(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(6_000),
+                ..ResourceLimits::default()
+            },
+            10_000,
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                enabled: false,
+                device_budget_bytes: Some(4_000),
+                async_pagein: false,
+            },
+        )
+        .expect("the explicit limit still triggers offload");
+
+        assert_eq!(policy.policy.device_budget_bytes, Some(4_000));
+        assert!(policy.device_budget_is_override);
     }
 }

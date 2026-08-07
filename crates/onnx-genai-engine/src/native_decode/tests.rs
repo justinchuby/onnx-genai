@@ -1271,6 +1271,7 @@ fn build_cuda_decoder_with_fixed_state(
                 kv_max_len: Some(max_len),
                 metadata_max_len: None,
                 graph_capture: Some(graph_capture),
+                weight_offload_enabled: None,
             },
         )
     }
@@ -2283,6 +2284,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
             kv_max_len: Some(128),
             metadata_max_len: None,
             graph_capture: Some(false),
+            weight_offload_enabled: None,
         },
     )?;
     let eager_before = eager
@@ -2302,6 +2304,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
             kv_max_len: Some(128),
             metadata_max_len: None,
             graph_capture: Some(true),
+            weight_offload_enabled: None,
         },
     )?;
     let captured_before = captured.cuda_kv_debug_stats().unwrap();
@@ -2488,6 +2491,7 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
                 kv_max_len: Some(128),
                 metadata_max_len: None,
                 graph_capture: Some(graph),
+                weight_offload_enabled: None,
             },
         )
     };
