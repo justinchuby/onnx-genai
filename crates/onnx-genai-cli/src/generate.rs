@@ -183,6 +183,10 @@ struct CudaOffloadSnapshot {
     staging_fill_calls: u64,
     materialize_fallback_calls: u64,
     htod_bytes: u64,
+    vram_alloc_ns: u64,
+    vram_free_ns: u64,
+    budget_bytes: u64,
+    peak_resident_bytes: u64,
 }
 
 fn cuda_offload_stats() -> CudaOffloadSnapshot {
@@ -207,6 +211,10 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
             staging_fill_calls: stats.staging_fill_calls,
             materialize_fallback_calls: stats.materialize_fallback_calls,
             htod_bytes: stats.htod_bytes,
+            vram_alloc_ns: stats.vram_alloc_ns,
+            vram_free_ns: stats.vram_free_ns,
+            budget_bytes: stats.budget_bytes,
+            peak_resident_bytes: stats.peak_resident_bytes,
         }
     }
     #[cfg(not(feature = "native-cuda"))]
@@ -216,11 +224,7 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
 }
 
 fn record_cuda_offload_counters(profile: &mut RunProfile, before: CudaOffloadSnapshot) {
-    #[cfg(feature = "native-cuda")]
-    let after = onnx_runtime_ep_cuda::global_offload_stats();
-    #[cfg(not(feature = "native-cuda"))]
-    let after = CudaOffloadSnapshot::default();
-
+    let after = cuda_offload_stats();
     emit_cuda_offload_counters(profile, before, after);
 }
 
@@ -270,6 +274,10 @@ fn emit_cuda_offload_counters(
         .materialize_fallback_calls
         .saturating_sub(before.materialize_fallback_calls);
     let htod_bytes = after.htod_bytes.saturating_sub(before.htod_bytes);
+    let vram_alloc_ns = after.vram_alloc_ns.saturating_sub(before.vram_alloc_ns);
+    let vram_free_ns = after.vram_free_ns.saturating_sub(before.vram_free_ns);
+    let budget_bytes = after.budget_bytes;
+    let peak_resident_bytes = after.peak_resident_bytes.max(before.peak_resident_bytes);
     if page_ins > 0
         || hits > 0
         || evictions > 0
@@ -287,6 +295,10 @@ fn emit_cuda_offload_counters(
         || staging_fill_calls > 0
         || materialize_fallback_calls > 0
         || htod_bytes > 0
+        || vram_alloc_ns > 0
+        || vram_free_ns > 0
+        || budget_bytes > 0
+        || peak_resident_bytes > 0
     {
         profile.counter("weight offload page-ins", page_ins as f64, "page-ins");
         profile.counter("weight offload cache hits", hits as f64, "hits");
@@ -350,15 +362,31 @@ fn emit_cuda_offload_counters(
             "calls",
         );
         profile.counter(
-            "weight offload H2D enqueue/copy",
+            "weight offload H2D copy",
             htod_ns as f64 / 1_000_000.0,
             "ms",
         );
         profile.counter("weight offload H2D bytes", htod_bytes as f64, "bytes");
         profile.counter(
-            "weight offload copy wait",
+            "weight offload copy fence enqueue",
             copy_wait_ns as f64 / 1_000_000.0,
             "ms",
+        );
+        profile.counter(
+            "weight offload VRAM alloc",
+            vram_alloc_ns as f64 / 1_000_000.0,
+            "ms",
+        );
+        profile.counter(
+            "weight offload VRAM free",
+            vram_free_ns as f64 / 1_000_000.0,
+            "ms",
+        );
+        profile.counter("weight offload budget", budget_bytes as f64, "bytes");
+        profile.counter(
+            "weight offload peak resident",
+            peak_resident_bytes as f64,
+            "bytes",
         );
         profile.counter(
             "weight offload admit sync",

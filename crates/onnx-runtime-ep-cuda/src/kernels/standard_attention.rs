@@ -2064,7 +2064,7 @@ mod alias_tests {
         let cap = 8u64;
         let total = 5i32;
         let mut decode = vec![0.0f32; total as usize];
-        decode.extend(std::iter::repeat(NEG).take(cap as usize - total as usize));
+        decode.extend(std::iter::repeat_n(NEG, cap as usize - total as usize));
         assert_eq!(
             derive(&decode, cap, 0),
             total,

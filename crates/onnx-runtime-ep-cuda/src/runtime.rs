@@ -1015,13 +1015,51 @@ impl CudaRuntime {
         }
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract,
         // and the copy is ordered on the runtime-owned transfer stream.
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream()) }
+            .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))
+    }
+
+    /// Measure one host-to-device copy with CUDA events on the transfer stream.
+    ///
+    /// The span is: record start event, enqueue `cuMemcpyHtoDAsync`, record end
+    /// event, then synchronize the end event before calling `cuEventElapsedTime`.
+    /// This **does block the host** until the DMA completes; use only on paths
+    /// where honest attribution is more important than preserving overlap.
+    ///
+    /// # Safety
+    /// `dst` must cover at least `src.len()` bytes in this runtime's current
+    /// CUDA context and must remain valid until this function returns.
+    pub unsafe fn htod_async_elapsed_ms(&self, src: &[u8], dst: CUdeviceptr) -> Result<f32> {
+        self.bind()?;
+        if src.is_empty() {
+            return Ok(0.0);
+        }
+        let start = self
+            .context
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| driver_err("cuEventCreate(start)", e))?;
+        let end = self
+            .context
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| driver_err("cuEventCreate(end)", e))?;
+        start
+            .record(&self.copy_stream)
+            .map_err(|e| driver_err("cuEventRecord(start)", e))?;
+        // SAFETY: caller guarantees `dst` covers `src.len()` bytes. The source
+        // must remain live until `end.elapsed_ms` returns, which this method
+        // enforces by synchronizing the end event before returning.
         unsafe {
             cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
         }
         .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))?;
+        end.record(&self.copy_stream)
+            .map_err(|e| driver_err("cuEventRecord(end)", e))?;
+        let elapsed_ms = start
+            .elapsed_ms(&end)
+            .map_err(|e| driver_err("cuEventElapsedTime", e))?;
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(elapsed_ms)
     }
 
     /// Enqueue an asynchronous device → device copy on the transfer stream, so

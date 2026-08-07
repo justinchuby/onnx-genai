@@ -366,12 +366,8 @@ impl ExecutionProvider for CudaExecutionProvider {
         weight: &LazyWeight,
         source: &dyn onnx_runtime_ep_api::MmapRegionSource,
     ) -> Result<bool> {
-        let Some(residency) = self.residency.as_ref() else {
-            return Ok(false);
-        };
-        residency
-            .prefetch_mapped(key, weight, source)
-            .map_err(|error| EpError::KernelFailed(format!("weight offload prefetch: {error}")))
+        let _ = (self, key, weight, source);
+        Ok(false)
     }
 
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {

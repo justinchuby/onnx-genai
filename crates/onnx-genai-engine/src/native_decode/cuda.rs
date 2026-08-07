@@ -91,6 +91,8 @@ struct StepOffloadSnapshot {
     staging_fill_calls: u64,
     materialize_fallback_calls: u64,
     htod_bytes: u64,
+    vram_alloc_ns: u64,
+    vram_free_ns: u64,
 }
 
 impl StepOffloadSnapshot {
@@ -112,6 +114,8 @@ impl StepOffloadSnapshot {
                 staging_fill_calls: stats.staging_fill_calls,
                 materialize_fallback_calls: stats.materialize_fallback_calls,
                 htod_bytes: stats.htod_bytes,
+                vram_alloc_ns: stats.vram_alloc_ns,
+                vram_free_ns: stats.vram_free_ns,
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -145,6 +149,8 @@ impl StepOffloadSnapshot {
                 .materialize_fallback_calls
                 .saturating_sub(before.materialize_fallback_calls),
             htod_bytes: self.htod_bytes.saturating_sub(before.htod_bytes),
+            vram_alloc_ns: self.vram_alloc_ns.saturating_sub(before.vram_alloc_ns),
+            vram_free_ns: self.vram_free_ns.saturating_sub(before.vram_free_ns),
         }
     }
 }
@@ -184,9 +190,11 @@ impl CudaStepProfile {
         let delta = StepOffloadSnapshot::read().delta(self.before);
         let staging_ms = ns_to_ms(delta.materialize_ns);
         let h2d_ms = ns_to_ms(delta.htod_ns);
-        let copy_wait_ms = ns_to_ms(delta.copy_wait_ns);
+        let copy_fence_enqueue_ms = ns_to_ms(delta.copy_wait_ns);
         let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
-        let fence_sync_ms = copy_wait_ms + admit_sync_ms;
+        let vram_alloc_ms = ns_to_ms(delta.vram_alloc_ns);
+        let vram_free_ms = ns_to_ms(delta.vram_free_ns);
+        let fence_sync_ms = copy_fence_enqueue_ms + admit_sync_ms;
         let phase_stats = onnx_runtime_session::exec_phase_stats();
         let phase_ms = |phase: &str| -> f64 {
             phase_stats
@@ -197,13 +205,17 @@ impl CudaStepProfile {
         };
         let kernel_host_ms = phase_ms("exec_kernel.compute");
         let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
-        let build_inputs_unattributed_ms = build_inputs_ms - staging_ms - h2d_ms - fence_sync_ms;
+        let build_inputs_attributed_ms =
+            staging_ms + h2d_ms + fence_sync_ms + vram_alloc_ms + vram_free_ms;
+        let build_inputs_unattributed_ms = (build_inputs_ms - build_inputs_attributed_ms).max(0.0);
         let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
         let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
         let residual_ms = total_ms
             - staging_ms
             - h2d_ms
             - fence_sync_ms
+            - vram_alloc_ms
+            - vram_free_ms
             - kernel_host_ms
             - build_inputs_unattributed_ms
             - executor_other_ms
@@ -213,11 +225,11 @@ impl CudaStepProfile {
         static HEADER: std::sync::Once = std::sync::Once::new();
         HEADER.call_once(|| {
             eprintln!(
-                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_enqueue_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,copy_wait_ms,admit_sync_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,copy_fence_enqueue_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
             );
         });
         eprintln!(
-            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{copy_wait_ms:.3},{admit_sync_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{},{},{},{}",
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{copy_fence_enqueue_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{},{},{},{}",
             self.past_len,
             self.total_len,
             wall.logits_read_ms,
