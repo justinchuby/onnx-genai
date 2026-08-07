@@ -665,6 +665,73 @@ fn classifier_qualified_node_with_supported_kernel_is_admitted() {
     );
 }
 
+// Round-8 veto-precedence fix (PR #728): a host control-flow node (`If`) that
+// ALSO references a GROWING symbol is disqualified by the classifier AND
+// classified as `HostControlFlowOrSequence` by the EP structural policy. The
+// structural HOST seam must WIN so the public capture-segmentation report labels
+// it a HOST round trip, not an eager DEVICE seam. Fail-pre (veto placed first, as
+// on HEAD 9555b354): `node_capture_reason` returns `ClassifierDisqualified` whose
+// `path_kind()` is `EagerDeviceSeam` — a host node mislabeled as a device seam.
+// Pass-post (veto reordered after structural): `HostControlFlowOrSequence` whose
+// `path_kind()` is `HostSeam`.
+#[test]
+fn disqualified_control_flow_node_reports_host_seam_not_device_seam() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // Turn node 0 into a control-flow (`If`) node the EP structural policy
+    // classifies as `HostControlFlowOrSequence`.
+    executor.graph.node_mut(executor.plan[0].node_id).op_type = "If".to_string();
+    assert!(
+        is_control_flow_op(
+            &executor.graph.node(executor.plan[0].node_id).op_type,
+            &executor.graph.node(executor.plan[0].node_id).domain,
+        ),
+        "fixture node must be recognized as control flow"
+    );
+
+    // Also make it classifier-disqualified: an output shape references a GROWING
+    // KV/total-sequence-length symbol, so the veto would ALSO fire on this node.
+    let growing = executor.graph.create_symbol(None);
+    executor.capture_growing_symbols.insert(growing);
+    let disqualified_output = executor.plan[0].outputs[0];
+    executor.graph.value_mut(disqualified_output).shape =
+        vec![Dim::Symbolic(growing), Dim::Static(1)];
+    assert!(
+        !node_capture_seq_independent(
+            &executor.graph,
+            executor.graph.node(executor.plan[0].node_id),
+            &executor.capture_growing_symbols,
+        ),
+        "the growing-symbol output must make the node classifier-disqualified"
+    );
+
+    // A warmed unconditional-`Supported` kernel is present too; it must not matter
+    // because structural host classification precedes both the veto and the kernel.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    let decline = executor
+        .node_capture_reason(&executor.plan[0], &resolved)
+        .expect("control-flow node must be declined for capture");
+    assert_eq!(
+        decline.seam_reason,
+        Some(SeamReason::HostControlFlowOrSequence),
+        "a disqualified control-flow node must report the HOST control-flow seam, \
+         not ClassifierDisqualified"
+    );
+    assert_eq!(
+        decline
+            .seam_reason
+            .expect("seam reason present")
+            .path_kind(),
+        CapturePathKind::HostSeam,
+        "the disqualified control-flow node must land on the HOST seam path, not an \
+         eager DEVICE seam"
+    );
+}
+
 #[test]
 fn kernel_capture_reason_propagates_into_structured_report() {
     let mut node = Node::new(NodeId(9), "MatMulNBits", vec![], vec![]);
