@@ -139,7 +139,10 @@ fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
     }
 }
 
-/// Structurally identify the set of GROWING symbols at build/graph-load time.
+/// Compute the DENYLIST disqualifying set: the growing KV-length symbols closed
+/// over shape inference's lineage record. This is the fallback classifier mode
+/// ([`CaptureClassifier::Denylist`]); the default entry point is
+/// [`compute_capture_disqualifying_symbols`].
 ///
 /// A growing symbol is one that lives on the sequence axis of an attention KV
 /// cache (`past`/`present` key/value) — it increments each decode step, so any
@@ -151,44 +154,49 @@ fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
 /// pinned) and no KV-length symbol → they become capture-eligible, while any op
 /// carrying a KV-length symbol stays eager.
 ///
-/// Symbols are gathered from THREE complementary sources so coverage does not
-/// depend on a fixed op allowlist (the finding-2 gap):
+/// Symbols are gathered from complementary sources so coverage does not depend on
+/// a fixed op allowlist (the finding-2 gap):
 ///   1. The past-KV **inputs** and present-KV **outputs** of every recognized
 ///      stateful attention node ([`attention_kv_cache_slots`]: GQA, default
 ///      `Attention`, `IndexShare`, and `CompressedSparseAttention`), including
 ///      CSA ratio-4's growing `selections` symbol on the **last** axis of
-///      output 5 ([`KvCacheSlots::last_axis_outputs`]).
+///      output 5 ([`KvCacheSlots::last_axis_outputs`]) — see
+///      [`collect_structural_growing_symbols`].
 ///   2. A GENERIC scan of the model's DECLARED past/present KV I/O — every graph
 ///      input named `past…`/output named `present…` with a rank-4 KV layout
 ///      `[batch, kv_heads, sequence, head_dim]` whose penultimate (sequence) axis
 ///      is symbolic. This catches an unrecognized attention variant's KV boundary
 ///      tensor without minting a fresh op entry, while the rank-4 guard excludes
 ///      fixed-capacity recurrent/conv states (rank 3, or a static penultimate).
-///   3. The EQUIVALENCE-CLASS CLOSURE of (1)∪(2) under shape inference's symbol
-///      unification. Broadcast inference replaces two distinct symbolic dims with
-///      a single representative (the lower `SymbolId`, see
-///      `onnx-runtime-shape-inference/src/context.rs`'s `broadcast_dim`), so a
-///      growing KV symbol can be unified INTO a pinned-looking representative that
-///      a downstream pointwise op then copies onto BOTH its edges — escaping an
-///      exact-membership test (finding 1). Rather than re-derive a partial copy
-///      of that unification per op (the enumeration drift that caused earlier
-///      misses), we read the AUTHORITATIVE record inference itself keeps
-///      ([`Graph::symbol_unifications`](onnx_runtime_ir::Graph::symbol_unifications)):
-///      every handler that substitutes a symbol funnels through the single
-///      `broadcast_dim` chokepoint that appends there, so the record covers
-///      elementwise, `MatMul` batch dims, `Einsum` ellipsis, `Concat` non-concat
-///      axes, `Expand`, and any future handler — complete by construction. We
-///      close the growing set over those classes (see
-///      [`close_growing_under_symbol_unification`]) and mark a whole class growing
-///      if ANY of its members is growing. Because `node_capture_seq_independent`
-///      tests exact membership on both edges, a closed set makes the growing
-///      property transitively correct: a consumer carrying only the representative
-///      is still rejected. Over-inclusion (a benign symbol unified with a growing
-///      one) only costs perf — the op stays eager — it never admits a growing op.
+///   3. Any OPAQUE unknowable-extent symbol shape inference could not resolve
+///      (overflow / negative degrade — [`Graph::symbol_opaque`]).
+///   4. The TRANSITIVE LINEAGE CLOSURE of (1)∪(2)∪(3) over BOTH broadcast
+///      unifications ([`Graph::symbol_unifications`]) AND derivation provenance
+///      ([`Graph::symbol_derivations`], the round-4 fix): a growing KV symbol can
+///      be unified INTO a pinned-looking representative (finding 1) OR be baked
+///      into a DERIVED symbol like `seq_kv*8` by `Reshape`/`Flatten` (round-4).
+///      Both are the AUTHORITATIVE records inference keeps at its two lineage
+///      chokepoints (`broadcast_dim`, `lower`), so the closure
+///      ([`close_disqualifying_set`]) covers every op that substitutes or derives
+///      a symbol — complete by construction, no per-op enumeration.
 ///
-/// The loader interns same-named dim-params to one `SymbolId` across layers, so
-/// the resulting set stays small.
+/// [`Graph::symbol_opaque`]: onnx_runtime_ir::Graph::symbol_opaque
+/// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
+/// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
 pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    // Denylist seed: only the STRUCTURALLY-GROWING KV symbols (plus any opaque
+    // unknowable-extent symbol shape inference could not resolve). A symbol that
+    // is not proven growing is treated as capturable.
+    let mut growing = collect_structural_growing_symbols(graph);
+    growing.extend(graph.symbol_opaque.iter().copied());
+    close_disqualifying_set(graph, &mut growing);
+    growing
+}
+
+/// Collect the STRUCTURALLY-growing KV-length symbols from the graph — the raw
+/// seed, before any lineage closure. See [`compute_capture_growing_symbols`] for
+/// the source enumeration (recognized attention ops ∪ generic declared KV I/O).
+fn collect_structural_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
     let mut growing = HashSet::new();
     for node in graph.nodes.values() {
         let Some(slots) = attention_kv_cache_slots(node) else {
@@ -246,111 +254,190 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
             growing.insert(sym);
         }
     }
-
-    // Close the growing set under shape-inference symbol unification (finding 1).
-    close_growing_under_symbol_unification(graph, &mut growing);
-
-    if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
-        eprintln!(
-            "[onnx-genai-capture] build-time growing-symbol set: {} symbol(s): {:?}",
-            growing.len(),
-            growing
-        );
-    }
     growing
 }
 
-/// A minimal hash-map union-find over [`SymbolId`], used to rebuild the symbol
-/// equivalence classes that shape inference's broadcast unification produces.
-#[derive(Default)]
-struct SymbolUnionFind {
-    parent: HashMap<SymbolId, SymbolId>,
+/// The capture classifier's mode. See [`compute_capture_disqualifying_symbols`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CaptureClassifier {
+    /// FAIL-SAFE (default): an op is capture-safe only if every symbol on its
+    /// edges provably traces (via the lineage record) to graph-declared roots
+    /// that are not growing. Any symbol tracing to a growing root OR that is an
+    /// inference-minted symbol WITHOUT recorded provenance (untraceable /
+    /// data-dependent / overflow) disqualifies the op — it stays eager. This
+    /// structurally eliminates the whole "an unrecorded lineage site silently
+    /// admits a growing-dependent symbol" bug class: unknown ⇒ eager ⇒ safe.
+    FailSafe,
+    /// DENYLIST (over provenance): a symbol not proven growing is capturable.
+    /// Kept as a switchable fallback; only genuinely growing (or growing-derived,
+    /// via the closure) symbols disqualify. Recovers the maximal capture collapse
+    /// but relies on every growing-dependency being reachable through a recorded
+    /// lineage edge (see the completeness argument in sebastian-728-revision.md).
+    Denylist,
 }
 
-impl SymbolUnionFind {
-    /// The class root of `s` (with path compression). A symbol never inserted is
-    /// its own singleton root.
-    fn find(&mut self, s: SymbolId) -> SymbolId {
-        let mut root = s;
-        while let Some(&p) = self.parent.get(&root) {
-            if p == root {
-                break;
-            }
-            root = p;
-        }
-        let mut cur = s;
-        while let Some(&p) = self.parent.get(&cur) {
-            if p == root {
-                break;
-            }
-            self.parent.insert(cur, root);
-            cur = p;
-        }
-        root
-    }
-
-    /// Union the classes of `a` and `b`. The lower `SymbolId` becomes the root,
-    /// mirroring inference's lower-id-representative rule (`context.rs`
-    /// `broadcast_dim`), though correctness here does not depend on the choice.
-    fn union(&mut self, a: SymbolId, b: SymbolId) {
-        self.parent.entry(a).or_insert(a);
-        self.parent.entry(b).or_insert(b);
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra != rb {
-            let (root, child) = if ra.0 <= rb.0 { (ra, rb) } else { (rb, ra) };
-            self.parent.insert(child, root);
+impl CaptureClassifier {
+    /// Resolve the classifier from `ONNX_GENAI_CAPTURE_CLASSIFIER`
+    /// (`failsafe`|`fail-safe`|`1` ⇒ fail-safe, `denylist`|`deny`|`0` ⇒
+    /// denylist). Defaults to [`FailSafe`](Self::FailSafe): a false
+    /// "capture-safe" is silent decode corruption, so the safe-by-default choice
+    /// is to keep an op eager whenever its shape lineage is not provably pinned.
+    fn from_env() -> Self {
+        match std::env::var("ONNX_GENAI_CAPTURE_CLASSIFIER") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "denylist" | "deny" | "0" => Self::Denylist,
+                _ => Self::FailSafe,
+            },
+            Err(_) => Self::FailSafe,
         }
     }
 }
 
-/// Grow `growing` to its equivalence-class closure under shape inference's
-/// broadcast symbol unification (finding 1).
+/// The set of symbols that DISQUALIFY an op from CUDA-graph capture — the single
+/// production entry point ([`super::build`]). `node_capture_seq_independent`
+/// tests exact both-edge membership against this set, so its meaning is "any op
+/// whose shape references one of these must stay eager".
 ///
-/// The closure is fed by the graph's AUTHORITATIVE symbol-unification record
-/// ([`Graph::symbol_unifications`]), which shape inference populates from the
-/// single `broadcast_dim` chokepoint every broadcasting handler funnels through.
-/// That record therefore covers *every* op that can substitute one symbol for
-/// another as the output representative — elementwise `broadcast`, `MatMul` batch
-/// dims (`linalg.rs`), `Einsum` ellipsis (`einsum.rs`), `Concat` non-concat axes
-/// (`movement/concat_slice.rs`), `Expand` (`movement/transform.rs`), and any
-/// future handler — with zero per-op enumeration here (the enumeration drift that
-/// caused earlier misses). The authoritative call sites are, for reference:
+/// Which set is returned depends on [`CaptureClassifier`]:
+///   * [`FailSafe`](CaptureClassifier::FailSafe) (default): the NOT-PINNED set
+///     (structural growing ∪ opaque ∪ every inference-minted symbol without a
+///     provenance trace to a pinned root), transitively closed.
+///   * [`Denylist`](CaptureClassifier::Denylist): the GROWING set
+///     ([`compute_capture_growing_symbols`]).
 ///
+/// Both go through the same [`close_disqualifying_set`] closure; they differ ONLY
+/// in the seed, which is why the classifier body and the closure are shared.
+pub(super) fn compute_capture_disqualifying_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    let mode = CaptureClassifier::from_env();
+    let set = match mode {
+        CaptureClassifier::FailSafe => compute_not_pinned_symbols(graph),
+        CaptureClassifier::Denylist => compute_capture_growing_symbols(graph),
+    };
+    if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
+        eprintln!(
+            "[onnx-genai-capture] classifier={mode:?} build-time disqualifying-symbol set: \
+             {} symbol(s): {:?}",
+            set.len(),
+            set
+        );
+    }
+    set
+}
+
+/// The FAIL-SAFE not-pinned symbol set (see
+/// [`CaptureClassifier::FailSafe`]). Seeds the disqualifying set with the
+/// structural growing symbols, the opaque unknowable-extent symbols, AND every
+/// inference-minted symbol that lacks a recorded provenance edge (a
+/// data-dependent / untraceable fresh symbol — `NonZero`/`Unique`/`Range`/
+/// data-dependent `Slice`, a handler `fresh_dim`, etc.), then transitively
+/// closes over the lineage record. A minted symbol whose provenance traces only
+/// to pinned roots is NOT seeded, so — thanks to the derivation record — a fresh
+/// symbol derived purely from pinned sources (`Reshape`/`Flatten` of
+/// batch/heads) stays capturable and the capture collapse is preserved.
+pub(super) fn compute_not_pinned_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    let mut set = collect_structural_growing_symbols(graph);
+    set.extend(graph.symbol_opaque.iter().copied());
+
+    // Without a persisted floor (inference did not run) we cannot tell a minted
+    // symbol from a declared root; degrade to the denylist seed (structural ∪
+    // opaque) — never less safe than the prior behavior.
+    if let Some(floor) = graph.inference_symbol_floor {
+        // A symbol is "provably rooted" only if it is a derived symbol (has at
+        // least one recorded provenance edge) or a declared root (id < floor).
+        // Any inference-minted symbol (id >= floor) with NO provenance edge is
+        // untraceable ⇒ disqualifying.
+        let has_provenance: HashSet<SymbolId> =
+            graph.symbol_derivations.iter().map(|&(d, _)| d).collect();
+        // Enumerate every symbol known to the graph: declared/minted symbols are
+        // registered in `symbol_constraints`; also scan the lineage records in
+        // case any endpoint is not (defensive).
+        let candidates = graph
+            .symbol_constraints
+            .keys()
+            .copied()
+            .chain(graph.symbol_derivations.iter().flat_map(|&(d, s)| [d, s]))
+            .chain(graph.symbol_unifications.iter().flat_map(|&(a, b)| [a, b]));
+        for sym in candidates {
+            if sym.0 >= floor && !has_provenance.contains(&sym) {
+                set.insert(sym);
+            }
+        }
+    }
+
+    close_disqualifying_set(graph, &mut set);
+    set
+}
+
+/// Transitively close `set` over shape inference's symbol-lineage record so that
+/// a symbol is disqualifying whenever it *depends on* a disqualifying symbol.
+///
+/// Two lineage edge kinds are followed, both read from the graph's
+/// AUTHORITATIVE, complete-by-construction records:
+///
+///   * **Broadcast unifications** ([`Graph::symbol_unifications`], UNDIRECTED):
+///     shape inference collapses two distinct symbolic dims onto one
+///     representative at the single `broadcast_dim` chokepoint every broadcasting
+///     handler funnels through — elementwise `broadcast`, `MatMul` batch dims
+///     (`linalg.rs`), `Einsum` ellipsis (`einsum.rs`), `Concat` non-concat axes
+///     (`movement/concat_slice.rs`), `Expand` (`movement/transform.rs`), and any
+///     future handler. The two symbols denote the *same* dimension, so the
+///     relation is symmetric: if either is disqualifying, so is the other.
+///
+///   * **Derivation provenance** ([`Graph::symbol_derivations`], DIRECTED
+///     `source → derived`): when `SymbolInterner::lower` interns a derived
+///     expression such as `seq_kv * 8` (`Reshape([-1])`, `Flatten`) to a fresh
+///     symbol, it records `(derived, source)` for each constituent. A derived
+///     symbol is disqualifying if ANY source is — but NOT the reverse (a pinned
+///     `batch` must not be poisoned just because some `batch * seq_kv` product
+///     also depends on the growing `seq_kv`). Hence this edge is directed
+///     `source → derived` only.
+///
+/// The closure is a plain worklist BFS over the directed adjacency
+/// `{a↔b for broadcast} ∪ {source→derived for derivation}` from the current
+/// `set`. Because [`node_capture_seq_independent`] tests exact both-edge
+/// membership, a closed set makes the disqualifying property transitively
+/// correct: a downstream consumer that only ever sees a pinned-looking
+/// representative or a derived symbol on both edges still stays eager.
+/// Over-inclusion only costs perf (the op stays eager) — it never admits a
+/// growing-dependent op.
+///
+/// Drift-detection greps for the two chokepoints, for reference:
 /// ```text
 /// grep -rn "\.broadcast(\|\.broadcast_dim(" crates/onnx-runtime-shape-inference/src/handlers/
+/// grep -rn "\.lower(" crates/onnx-runtime-shape-inference/src/
 /// ```
 ///
-/// We rebuild the union-find from those recorded `(loser, winner)` pairs, then
-/// mark every symbol whose class contains a growing member as itself growing.
-/// Because [`node_capture_seq_independent`] tests exact both-edge membership, a
-/// closed set makes the growing property transitively correct: a downstream
-/// consumer that only ever sees the pinned-looking representative on both its
-/// edges still stays eager. Over-inclusion (a benign symbol unified with a
-/// growing one) only costs perf — the op stays eager — it never admits a growing
-/// op.
-///
 /// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
-fn close_growing_under_symbol_unification(graph: &Graph, growing: &mut HashSet<SymbolId>) {
-    if graph.symbol_unifications.is_empty() {
+/// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
+fn close_disqualifying_set(graph: &Graph, set: &mut HashSet<SymbolId>) {
+    if graph.symbol_unifications.is_empty() && graph.symbol_derivations.is_empty() {
         return;
     }
-    let mut uf = SymbolUnionFind::default();
+    // Directed adjacency: disqualifying-ness flows along these edges.
+    let mut adj: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
     for &(a, b) in &graph.symbol_unifications {
         if a != b {
-            uf.union(a, b);
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
         }
     }
-    if uf.parent.is_empty() {
+    for &(derived, source) in &graph.symbol_derivations {
+        if derived != source {
+            adj.entry(source).or_default().push(derived);
+        }
+    }
+    if adj.is_empty() {
         return;
     }
-    // Roots of the classes that contain at least one growing symbol.
-    let growing_roots: HashSet<SymbolId> = growing.iter().map(|&s| uf.find(s)).collect();
-    // Every symbol that participated in a union and whose class is growing.
-    let members: Vec<SymbolId> = uf.parent.keys().copied().collect();
-    for sym in members {
-        if growing_roots.contains(&uf.find(sym)) {
-            growing.insert(sym);
+    let mut work: Vec<SymbolId> = set.iter().copied().collect();
+    while let Some(sym) = work.pop() {
+        let Some(neighbors) = adj.get(&sym) else {
+            continue;
+        };
+        for &next in neighbors {
+            if set.insert(next) {
+                work.push(next);
+            }
         }
     }
 }

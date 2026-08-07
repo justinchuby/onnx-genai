@@ -495,7 +495,7 @@ impl Executor {
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
 
         let plan_len = plan.len();
-        let capture_growing_symbols = compute_capture_growing_symbols(&graph);
+        let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
             graph,
             weights,

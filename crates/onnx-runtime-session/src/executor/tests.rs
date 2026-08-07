@@ -1096,6 +1096,308 @@ fn matmul_batch_alias_keeps_downstream_consumer_eager() {
     );
 }
 
+// Round-4 escape (Harry): a DERIVED-symbol lineage loss. `Reshape([seq_kv,8],
+// [-1])` forms the derived expression `seq_kv*8`; `SymbolInterner::lower` interns
+// that non-bare expression to a BRAND-NEW fresh `SymbolId` and (pre-fix) records
+// NOTHING, so `symbol_unifications` carries no edge `seq_kv -> fresh`. A
+// downstream `Sigmoid` carrying only the fresh symbol was wrongly classified
+// capture-safe -> silent decode corruption. The fix records a derivation edge
+// `fresh -> seq_kv` at the `lower` chokepoint and closes the disqualifying set
+// over derivation edges, so the fresh symbol is disqualifying and the `Sigmoid`
+// stays EAGER. This drives REAL inference so the `lower`->record->close path is
+// exercised end to end; it FAILS on HEAD 571ea0d9 (no derivation provenance).
+#[test]
+fn reshape_derived_growing_symbol_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared `past_key` KV boundary mints the growing `seq_kv` (source-2 scan).
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    // A `[seq_kv, 8]` tensor carrying the growing symbol.
+    let kv2d = graph.create_named_value("kv2d", DataType::Float32, vec![sym(seq_kv), st(8)]);
+    graph.add_input(kv2d);
+
+    // Reshape target `[-1]` as an int64 initializer -> shape-data source. The
+    // derived output dim is `seq_kv*8`, which `lower` interns to a fresh symbol.
+    let target = graph.create_named_value("reshape_target", DataType::Int64, vec![st(1)]);
+    {
+        use onnx_runtime_ir::{TensorData, WeightRef};
+        graph.set_initializer(
+            target,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+    }
+    let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+    let reshape = Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(kv2d), Some(target)],
+        vec![reshaped],
+    );
+    graph.insert_node(reshape);
+
+    // Downstream consumer sees only the derived (fresh) symbol on both edges.
+    let sig_out = graph.create_named_value("reshape_sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(reshaped)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the reshape-derived graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    // The reshape output's fresh derived symbol must be in the CLOSED set (it
+    // depends on the growing `seq_kv` via the recorded derivation edge).
+    let reshaped_dim = graph
+        .try_value(reshaped)
+        .and_then(|v| v.shape.first().copied());
+    let Some(Dim::Symbolic(derived)) = reshaped_dim else {
+        panic!("reshape output must be a derived symbolic dim, got {reshaped_dim:?}");
+    };
+    assert!(
+        growing.contains(&derived),
+        "the fresh symbol `seq_kv*8` derived from a growing symbol must be in the CLOSED \
+         disqualifying set (this FAILS on HEAD 571ea0d9 — no derivation provenance), got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer of a growing-derived reshape output must stay EAGER"
+    );
+}
+
+// Same round-4 escape via `Flatten` (`transform.rs::flatten`), whose collapsed
+// axes form the derived product `prod(dims[axis..])`. `Flatten` of `[seq_kv, 8]`
+// at axis=1 keeps outer `seq_kv`, but at axis=0 forms `1 x (seq_kv*8)`; here we
+// flatten `[batch, seq_kv, 8]` at axis=1 so the trailing dim is the derived
+// `seq_kv*8`. Its fresh symbol must be disqualifying and the consumer EAGER.
+#[test]
+fn flatten_derived_growing_symbol_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    let kv3d = graph.create_named_value(
+        "kv3d",
+        DataType::Float32,
+        vec![sym(batch), sym(seq_kv), st(8)],
+    );
+    graph.add_input(kv3d);
+
+    // Flatten at axis=1 -> `[batch, seq_kv*8]`; the trailing dim is derived.
+    let flat = graph.create_named_value("flat", DataType::Float32, Shape::new());
+    let mut flatten = Node::new(NodeId(0), "Flatten", vec![Some(kv3d)], vec![flat]);
+    flatten.attributes.insert("axis".into(), Attribute::Int(1));
+    graph.insert_node(flatten);
+
+    let sig_out = graph.create_named_value("flatten_sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(flat)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the flatten-derived graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    let flat_dim = graph.try_value(flat).and_then(|v| v.shape.get(1).copied());
+    let Some(Dim::Symbolic(derived)) = flat_dim else {
+        panic!("flatten trailing dim must be a derived symbolic dim, got {flat_dim:?}");
+    };
+    assert!(
+        growing.contains(&derived),
+        "the fresh symbol `seq_kv*8` derived by Flatten from a growing symbol must be in the \
+         CLOSED disqualifying set (FAILS on HEAD 571ea0d9), got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer of a growing-derived flatten output must stay EAGER"
+    );
+}
+
+// FAIL-SAFE (Step 2), part 1 — provenance RECOVERS a pinned-derived fresh
+// symbol. `Reshape([batch, 8], [-1])` derives `batch*8`, interned to a fresh
+// symbol whose recorded provenance traces ONLY to the pinned root `batch`. The
+// fail-safe classifier therefore does NOT disqualify it, so the consumer stays
+// CAPTURABLE — this is precisely why the fail-safe (with the Step-1 provenance
+// record) does not regress into the naive pinned-allowlist's segment collapse:
+// a fresh symbol built purely from pinned sources is provably pinned.
+#[test]
+fn failsafe_pinned_derived_fresh_symbol_stays_capturable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+
+    let pinned_2d =
+        graph.create_named_value("pinned_2d", DataType::Float32, vec![sym(batch), st(8)]);
+    graph.add_input(pinned_2d);
+
+    let target = graph.create_named_value("reshape_target", DataType::Int64, vec![st(1)]);
+    {
+        use onnx_runtime_ir::{TensorData, WeightRef};
+        graph.set_initializer(
+            target,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+    }
+    let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+    let reshape = Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(pinned_2d), Some(target)],
+        vec![reshaped],
+    );
+    graph.insert_node(reshape);
+
+    let sig_out = graph.create_named_value("sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(reshaped)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference must succeed");
+
+    let derived = match graph
+        .try_value(reshaped)
+        .and_then(|v| v.shape.first().copied())
+    {
+        Some(Dim::Symbolic(s)) => s,
+        other => panic!("reshape output must be a derived symbolic dim, got {other:?}"),
+    };
+
+    let not_pinned = compute_not_pinned_symbols(&graph);
+    assert!(
+        !not_pinned.contains(&derived),
+        "a fresh symbol derived only from the pinned root `batch` must NOT be disqualifying \
+         under the fail-safe classifier, got {not_pinned:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &consumer, &not_pinned),
+        "a consumer of a pinned-derived reshape output must stay CAPTURABLE under fail-safe"
+    );
+}
+
+// FAIL-SAFE (Step 2), part 2 — the structural win. An inference-minted symbol
+// with NO recorded provenance (here a permissive-broadcast degrade of two
+// unequal static extents `[batch,4] (+) [batch,5]`, standing in for any
+// data-dependent `NonZero`/`Range`/`Slice` fresh dim) is UNTRACEABLE. The
+// DENYLIST admits it (not proven growing ⇒ capturable) — the latent
+// silent-corruption hole. The FAIL-SAFE classifier disqualifies it (unknown ⇒
+// eager ⇒ safe), structurally eliminating the whole "unrecorded lineage site"
+// bug class without a per-site whack-a-mole fix.
+#[test]
+fn failsafe_untraceable_minted_symbol_is_eager_but_denylist_admits_it() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+
+    let a = graph.create_named_value("a", DataType::Float32, vec![sym(batch), st(4)]);
+    let b = graph.create_named_value("b", DataType::Float32, vec![sym(batch), st(5)]);
+    graph.add_input(a);
+    graph.add_input(b);
+    // Permissive broadcast of unequal, non-1 static extents mints an honest
+    // "unknown" fresh symbol with no provenance (context.rs `broadcast_dim`).
+    let added = graph.create_named_value("added", DataType::Float32, Shape::new());
+    let add = Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![added]);
+    graph.insert_node(add);
+
+    let sig_out = graph.create_named_value("sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(added)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference must succeed");
+
+    let unknown = match graph.try_value(added).and_then(|v| v.shape.get(1).copied()) {
+        Some(Dim::Symbolic(s)) => s,
+        other => panic!("Add output last dim must be an unknown minted symbol, got {other:?}"),
+    };
+    assert!(
+        unknown.0
+            >= graph
+                .inference_symbol_floor
+                .expect("inference sets the floor"),
+        "the degrade symbol must be inference-minted (id above the floor)"
+    );
+
+    // DENYLIST: not growing, no provenance ⇒ capturable (the latent hole).
+    let denylist = compute_capture_growing_symbols(&graph);
+    assert!(
+        !denylist.contains(&unknown),
+        "the denylist does not disqualify an untraceable minted symbol, got {denylist:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &consumer, &denylist),
+        "under the denylist the consumer of an untraceable symbol is (unsafely) capturable"
+    );
+
+    // FAIL-SAFE: untraceable minted symbol ⇒ disqualifying ⇒ consumer EAGER.
+    let not_pinned = compute_not_pinned_symbols(&graph);
+    assert!(
+        not_pinned.contains(&unknown),
+        "the fail-safe classifier must disqualify an untraceable minted symbol, got {not_pinned:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &not_pinned),
+        "under fail-safe the consumer of an untraceable symbol must stay EAGER"
+    );
+}
+
 // Finding 2 (coverage of CompressedSparseAttention): CSA mints a growing
 // cache-record symbol from `total_sequence_length` on `outputs[1]`/`[3]`
 // (`[query[0], records, width]`). The `attention_kv_cache_slots` CSA entry
