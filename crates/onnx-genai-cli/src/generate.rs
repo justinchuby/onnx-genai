@@ -169,14 +169,8 @@ struct CudaOffloadSnapshot {
     page_ins: u64,
     hits: u64,
     evictions: u64,
-    prefetch_issued: u64,
-    prefetch_declined_guard: u64,
-    prefetch_joined: u64,
-    prefetch_staging_allocs: u64,
-    prefetch_staging_reuses: u64,
     materialize_ns: u64,
     htod_ns: u64,
-    copy_wait_ns: u64,
     admit_sync_ns: u64,
     staging_fill_bytes: u64,
     staging_fill_regions: u64,
@@ -197,14 +191,8 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
             page_ins: stats.page_ins,
             hits: stats.hits,
             evictions: stats.evictions,
-            prefetch_issued: stats.prefetch_issued,
-            prefetch_declined_guard: stats.prefetch_declined_guard,
-            prefetch_joined: stats.prefetch_joined,
-            prefetch_staging_allocs: stats.prefetch_staging_allocs,
-            prefetch_staging_reuses: stats.prefetch_staging_reuses,
             materialize_ns: stats.materialize_ns,
             htod_ns: stats.htod_ns,
-            copy_wait_ns: stats.copy_wait_ns,
             admit_sync_ns: stats.admit_sync_ns,
             staging_fill_bytes: stats.staging_fill_bytes,
             staging_fill_regions: stats.staging_fill_regions,
@@ -238,6 +226,10 @@ fn record_cuda_offload_counters(profile: &mut RunProfile, before: CudaOffloadSna
 /// counters — so the section could appear with every printed row reading zero
 /// while the counters that actually fired stayed invisible. That made the
 /// residency cache look inert when it was busy.
+///
+/// Every emitted row must also have a live writer in `weight_paging.rs`. Do not
+/// keep schema-compatibility zeros: removing a dead column is safer than making
+/// "not measured" look like "measured zero".
 fn emit_cuda_offload_counters(
     profile: &mut RunProfile,
     before: CudaOffloadSnapshot,
@@ -246,20 +238,8 @@ fn emit_cuda_offload_counters(
     let page_ins = after.page_ins.saturating_sub(before.page_ins);
     let hits = after.hits.saturating_sub(before.hits);
     let evictions = after.evictions.saturating_sub(before.evictions);
-    let prefetch_issued = after.prefetch_issued.saturating_sub(before.prefetch_issued);
-    let prefetch_declined_guard = after
-        .prefetch_declined_guard
-        .saturating_sub(before.prefetch_declined_guard);
-    let prefetch_joined = after.prefetch_joined.saturating_sub(before.prefetch_joined);
-    let prefetch_staging_allocs = after
-        .prefetch_staging_allocs
-        .saturating_sub(before.prefetch_staging_allocs);
-    let prefetch_staging_reuses = after
-        .prefetch_staging_reuses
-        .saturating_sub(before.prefetch_staging_reuses);
     let materialize_ns = after.materialize_ns.saturating_sub(before.materialize_ns);
     let htod_ns = after.htod_ns.saturating_sub(before.htod_ns);
-    let copy_wait_ns = after.copy_wait_ns.saturating_sub(before.copy_wait_ns);
     let admit_sync_ns = after.admit_sync_ns.saturating_sub(before.admit_sync_ns);
     let staging_fill_bytes = after
         .staging_fill_bytes
@@ -281,14 +261,8 @@ fn emit_cuda_offload_counters(
     if page_ins > 0
         || hits > 0
         || evictions > 0
-        || prefetch_issued > 0
-        || prefetch_declined_guard > 0
-        || prefetch_joined > 0
-        || prefetch_staging_allocs > 0
-        || prefetch_staging_reuses > 0
         || materialize_ns > 0
         || htod_ns > 0
-        || copy_wait_ns > 0
         || admit_sync_ns > 0
         || staging_fill_bytes > 0
         || staging_fill_regions > 0
@@ -311,31 +285,6 @@ fn emit_cuda_offload_counters(
                 "%",
             );
         }
-        profile.counter(
-            "weight offload prefetch issued",
-            prefetch_issued as f64,
-            "prefetches",
-        );
-        profile.counter(
-            "weight offload prefetch declined guard",
-            prefetch_declined_guard as f64,
-            "prefetches",
-        );
-        profile.counter(
-            "weight offload prefetch joined",
-            prefetch_joined as f64,
-            "prefetches",
-        );
-        profile.counter(
-            "weight offload pinned staging allocs",
-            prefetch_staging_allocs as f64,
-            "allocs",
-        );
-        profile.counter(
-            "weight offload pinned staging reuses",
-            prefetch_staging_reuses as f64,
-            "reuses",
-        );
         profile.counter(
             "weight offload staging fill",
             materialize_ns as f64 / 1_000_000.0,
@@ -367,11 +316,6 @@ fn emit_cuda_offload_counters(
             "ms",
         );
         profile.counter("weight offload H2D bytes", htod_bytes as f64, "bytes");
-        profile.counter(
-            "weight offload copy fence enqueue",
-            copy_wait_ns as f64 / 1_000_000.0,
-            "ms",
-        );
         profile.counter(
             "weight offload VRAM alloc",
             vram_alloc_ns as f64 / 1_000_000.0,
@@ -568,8 +512,8 @@ mod tests {
         ));
     }
 
-    /// The gate in `emit_cuda_offload_counters` consults eight counters to
-    /// decide the section is worth printing, so all eight must be printed.
+    /// The gate in `emit_cuda_offload_counters` consults activity counters to
+    /// decide the section is worth printing, so those counters must be printed.
     /// Before this test, `page_ins`, `hits` and `evictions` were consulted and
     /// then dropped: a run whose residency cache was paging hard printed a
     /// weight-offload section in which every visible row read `0.00`.
@@ -598,41 +542,6 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            (
-                "prefetch_issued",
-                CudaOffloadSnapshot {
-                    prefetch_issued: 7,
-                    ..Default::default()
-                },
-            ),
-            (
-                "prefetch_declined_guard",
-                CudaOffloadSnapshot {
-                    prefetch_declined_guard: 7,
-                    ..Default::default()
-                },
-            ),
-            (
-                "prefetch_joined",
-                CudaOffloadSnapshot {
-                    prefetch_joined: 7,
-                    ..Default::default()
-                },
-            ),
-            (
-                "prefetch_staging_allocs",
-                CudaOffloadSnapshot {
-                    prefetch_staging_allocs: 7,
-                    ..Default::default()
-                },
-            ),
-            (
-                "prefetch_staging_reuses",
-                CudaOffloadSnapshot {
-                    prefetch_staging_reuses: 7,
-                    ..Default::default()
-                },
-            ),
         ] {
             let mut profile = RunProfile::new("test".to_string());
             emit_cuda_offload_counters(&mut profile, before, after);
@@ -640,6 +549,42 @@ mod tests {
                 profile.counters.iter().any(|counter| counter.value == 7.0),
                 "{label} made the offload section print, but no emitted row \
                  carries its value — the counter is invisible to the operator"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_offload_counters_are_not_emitted_as_compatibility_zeroes() {
+        let mut profile = RunProfile::new("test".to_string());
+        emit_cuda_offload_counters(
+            &mut profile,
+            CudaOffloadSnapshot::default(),
+            CudaOffloadSnapshot {
+                page_ins: 1,
+                hits: 1,
+                evictions: 1,
+                materialize_ns: 1,
+                htod_ns: 1,
+                admit_sync_ns: 1,
+                staging_fill_bytes: 1,
+                staging_fill_regions: 1,
+                staging_fill_calls: 1,
+                materialize_fallback_calls: 1,
+                htod_bytes: 1,
+                vram_alloc_ns: 1,
+                vram_free_ns: 1,
+                budget_bytes: 1,
+                peak_resident_bytes: 1,
+            },
+        );
+
+        for dead_name_fragment in ["copy fence", "prefetch", "pinned staging"] {
+            assert!(
+                !profile
+                    .counters
+                    .iter()
+                    .any(|counter| counter.name.contains(dead_name_fragment)),
+                "{dead_name_fragment} counters have no writer and must not be emitted as 0.00"
             );
         }
     }

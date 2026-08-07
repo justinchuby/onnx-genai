@@ -38,20 +38,12 @@ use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_ISSUED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_DECLINED_GUARD: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_JOINED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_STAGING_ALLOCS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_STAGING_REUSES: AtomicU64 = AtomicU64::new(0);
 // Time spent filling the host staging buffer from mmap regions. This is a
 // host-blocking CPU memcpy span and contains no CUDA synchronization.
 static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
 // CUDA-event elapsed time for H2D DMA: start event before cuMemcpyHtoDAsync,
 // end event after it, then host-block on the end event to read elapsed time.
 static GLOBAL_HTOD_NS: AtomicU64 = AtomicU64::new(0);
-// Kept for profile-schema compatibility; the prefetch/in-flight path that used
-// to add non-blocking cuStreamWaitEvent enqueue time here has been removed.
-static GLOBAL_COPY_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 // Host-blocking compute-stream synchronize taken before evicting pages whose
 // VRAM might still be referenced by earlier kernels.
 static GLOBAL_ADMIT_SYNC_NS: AtomicU64 = AtomicU64::new(0);
@@ -77,14 +69,8 @@ pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
     pub evictions: u64,
-    pub prefetch_issued: u64,
-    pub prefetch_declined_guard: u64,
-    pub prefetch_joined: u64,
-    pub prefetch_staging_allocs: u64,
-    pub prefetch_staging_reuses: u64,
     pub materialize_ns: u64,
     pub htod_ns: u64,
-    pub copy_wait_ns: u64,
     pub admit_sync_ns: u64,
     pub staging_fill_bytes: u64,
     pub staging_fill_regions: u64,
@@ -103,14 +89,8 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
-        prefetch_issued: GLOBAL_PREFETCH_ISSUED.load(Ordering::Relaxed),
-        prefetch_declined_guard: GLOBAL_PREFETCH_DECLINED_GUARD.load(Ordering::Relaxed),
-        prefetch_joined: GLOBAL_PREFETCH_JOINED.load(Ordering::Relaxed),
-        prefetch_staging_allocs: GLOBAL_PREFETCH_STAGING_ALLOCS.load(Ordering::Relaxed),
-        prefetch_staging_reuses: GLOBAL_PREFETCH_STAGING_REUSES.load(Ordering::Relaxed),
         materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
         htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
-        copy_wait_ns: GLOBAL_COPY_WAIT_NS.load(Ordering::Relaxed),
         admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
         staging_fill_bytes: GLOBAL_STAGING_FILL_BYTES.load(Ordering::Relaxed),
         staging_fill_regions: GLOBAL_STAGING_FILL_REGIONS.load(Ordering::Relaxed),
@@ -129,14 +109,8 @@ pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_ISSUED.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_DECLINED_GUARD.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_JOINED.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_STAGING_ALLOCS.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_STAGING_REUSES.store(0, Ordering::Relaxed);
     GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
     GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
-    GLOBAL_COPY_WAIT_NS.store(0, Ordering::Relaxed);
     GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
     GLOBAL_STAGING_FILL_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_STAGING_FILL_REGIONS.store(0, Ordering::Relaxed);
@@ -245,16 +219,6 @@ pub struct CudaResidencyStats {
     pub hits: u64,
     /// LRU evictions that freed a page's VRAM.
     pub evictions: u64,
-    /// Lookahead page-ins issued on the transfer stream.
-    pub prefetch_issued: u64,
-    /// Lookahead requests declined because admitting them would evict or grow.
-    pub prefetch_declined_guard: u64,
-    /// Demand page-ins that consumed an in-flight lookahead page.
-    pub prefetch_joined: u64,
-    /// Pinned staging buffers allocated for prefetch.
-    pub prefetch_staging_allocs: u64,
-    /// Pinned staging buffers reused from the prefetch pool.
-    pub prefetch_staging_reuses: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -590,11 +554,6 @@ struct ResidencyInner {
     page_ins: u64,
     hits: u64,
     evictions: u64,
-    prefetch_issued: u64,
-    prefetch_declined_guard: u64,
-    prefetch_joined: u64,
-    prefetch_staging_allocs: u64,
-    prefetch_staging_reuses: u64,
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
@@ -637,11 +596,6 @@ impl CudaWeightResidency {
                 page_ins: 0,
                 hits: 0,
                 evictions: 0,
-                prefetch_issued: 0,
-                prefetch_declined_guard: 0,
-                prefetch_joined: 0,
-                prefetch_staging_allocs: 0,
-                prefetch_staging_reuses: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
             }),
@@ -692,11 +646,6 @@ impl CudaWeightResidency {
                 page_ins: 0,
                 hits: 0,
                 evictions: 0,
-                prefetch_issued: 0,
-                prefetch_declined_guard: 0,
-                prefetch_joined: 0,
-                prefetch_staging_allocs: 0,
-                prefetch_staging_reuses: 0,
                 order: Vec::new(),
                 pages: HashMap::new(),
             }),
@@ -986,11 +935,6 @@ impl CudaWeightResidency {
             page_ins: inner.page_ins,
             hits: inner.hits,
             evictions: inner.evictions,
-            prefetch_issued: inner.prefetch_issued,
-            prefetch_declined_guard: inner.prefetch_declined_guard,
-            prefetch_joined: inner.prefetch_joined,
-            prefetch_staging_allocs: inner.prefetch_staging_allocs,
-            prefetch_staging_reuses: inner.prefetch_staging_reuses,
         }
     }
 

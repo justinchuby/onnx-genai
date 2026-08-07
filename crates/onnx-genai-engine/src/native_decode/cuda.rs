@@ -80,12 +80,8 @@ fn cuda_step_profile_enabled() -> bool {
 struct StepOffloadSnapshot {
     materialize_ns: u64,
     htod_ns: u64,
-    copy_wait_ns: u64,
     admit_sync_ns: u64,
     page_ins: u64,
-    prefetch_issued: u64,
-    prefetch_joined: u64,
-    prefetch_declined_guard: u64,
     staging_fill_bytes: u64,
     staging_fill_regions: u64,
     staging_fill_calls: u64,
@@ -103,12 +99,8 @@ impl StepOffloadSnapshot {
             Self {
                 materialize_ns: stats.materialize_ns,
                 htod_ns: stats.htod_ns,
-                copy_wait_ns: stats.copy_wait_ns,
                 admit_sync_ns: stats.admit_sync_ns,
                 page_ins: stats.page_ins,
-                prefetch_issued: stats.prefetch_issued,
-                prefetch_joined: stats.prefetch_joined,
-                prefetch_declined_guard: stats.prefetch_declined_guard,
                 staging_fill_bytes: stats.staging_fill_bytes,
                 staging_fill_regions: stats.staging_fill_regions,
                 staging_fill_calls: stats.staging_fill_calls,
@@ -128,14 +120,8 @@ impl StepOffloadSnapshot {
         Self {
             materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
             htod_ns: self.htod_ns.saturating_sub(before.htod_ns),
-            copy_wait_ns: self.copy_wait_ns.saturating_sub(before.copy_wait_ns),
             admit_sync_ns: self.admit_sync_ns.saturating_sub(before.admit_sync_ns),
             page_ins: self.page_ins.saturating_sub(before.page_ins),
-            prefetch_issued: self.prefetch_issued.saturating_sub(before.prefetch_issued),
-            prefetch_joined: self.prefetch_joined.saturating_sub(before.prefetch_joined),
-            prefetch_declined_guard: self
-                .prefetch_declined_guard
-                .saturating_sub(before.prefetch_declined_guard),
             staging_fill_bytes: self
                 .staging_fill_bytes
                 .saturating_sub(before.staging_fill_bytes),
@@ -190,11 +176,9 @@ impl CudaStepProfile {
         let delta = StepOffloadSnapshot::read().delta(self.before);
         let staging_ms = ns_to_ms(delta.materialize_ns);
         let h2d_ms = ns_to_ms(delta.htod_ns);
-        let copy_fence_enqueue_ms = ns_to_ms(delta.copy_wait_ns);
         let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
         let vram_alloc_ms = ns_to_ms(delta.vram_alloc_ns);
         let vram_free_ms = ns_to_ms(delta.vram_free_ns);
-        let fence_sync_ms = copy_fence_enqueue_ms + admit_sync_ms;
         let phase_stats = onnx_runtime_session::exec_phase_stats();
         let phase_ms = |phase: &str| -> f64 {
             phase_stats
@@ -206,14 +190,14 @@ impl CudaStepProfile {
         let kernel_host_ms = phase_ms("exec_kernel.compute");
         let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
         let build_inputs_attributed_ms =
-            staging_ms + h2d_ms + fence_sync_ms + vram_alloc_ms + vram_free_ms;
+            staging_ms + h2d_ms + admit_sync_ms + vram_alloc_ms + vram_free_ms;
         let build_inputs_unattributed_ms = (build_inputs_ms - build_inputs_attributed_ms).max(0.0);
         let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
         let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
         let residual_ms = total_ms
             - staging_ms
             - h2d_ms
-            - fence_sync_ms
+            - admit_sync_ms
             - vram_alloc_ms
             - vram_free_ms
             - kernel_host_ms
@@ -225,20 +209,17 @@ impl CudaStepProfile {
         static HEADER: std::sync::Once = std::sync::Once::new();
         HEADER.call_once(|| {
             eprintln!(
-                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,fence_sync_wait_ms,copy_fence_enqueue_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,prefetch_issued,prefetch_joined,prefetch_declined_guard,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
             );
         });
         eprintln!(
-            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{fence_sync_ms:.3},{copy_fence_enqueue_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{},{},{},{}",
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{}",
             self.past_len,
             self.total_len,
             wall.logits_read_ms,
             wall.capture_check_ms,
             wall.finite_check_ms,
             delta.page_ins,
-            delta.prefetch_issued,
-            delta.prefetch_joined,
-            delta.prefetch_declined_guard,
             delta.staging_fill_bytes,
             delta.staging_fill_regions,
             delta.staging_fill_calls,
