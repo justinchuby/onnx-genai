@@ -117,16 +117,26 @@ impl CudaExecutionProvider {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
-        let residency = offload_policy.enabled.then(|| {
+        let residency = if offload_policy.enabled {
             let budget = offload_policy
                 .device_budget_bytes
                 .unwrap_or(DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES);
-            Arc::new(
-                CudaWeightResidency::new(runtime.clone(), budget)
-                    .with_async_pagein(offload_policy.async_pagein)
-                    .with_scan_resistant_dense(offload_policy.scan_resistant_dense),
-            )
-        });
+            let residency = CudaWeightResidency::new(runtime.clone(), budget)
+                .with_async_pagein(offload_policy.async_pagein)
+                .with_scan_resistant_dense(offload_policy.scan_resistant_dense);
+            let residency = if offload_policy.stable_vmm {
+                residency.with_stable_vmm().map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: could not build stable VMM weight residency: {error}"
+                    ))
+                })?
+            } else {
+                residency
+            };
+            Some(Arc::new(residency))
+        } else {
+            None
+        };
         Ok(Self {
             device: DeviceId::cuda(ordinal),
             memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(

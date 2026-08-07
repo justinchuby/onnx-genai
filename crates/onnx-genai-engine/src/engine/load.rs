@@ -362,46 +362,56 @@ impl Engine {
         // overhead, taken before any session existed because nothing else
         // accounted for them. An allocator that commits on demand accounts for
         // the weights itself, granule by granule, as they are actually
-        // allocated -- so holding a reservation for them too charges the same
-        // memory twice and the tier reads high by the weight size.
+        // allocated. Stable VMM weight offload similarly moves this claim into
+        // the provider's residency budget lease before any page-in can occur.
+        // Holding the startup reservation too charges the same memory twice.
         //
         // Only the weight portion is released. Activations and ONNX Runtime's
         // internal overhead do not flow through our allocator, so nothing else
         // is accounting for those and the reservation is still the only thing
         // that knows about them.
-        if native_session.commits_on_demand() {
-            let weights = governor.snapshot().breakdown.model_weights_bytes;
+        #[cfg(feature = "cuda")]
+        let stable_vmm_weight_offload = cuda_offload_policy.is_some_and(|policy| policy.stable_vmm);
+        #[cfg(not(feature = "cuda"))]
+        let stable_vmm_weight_offload = false;
+        if native_session.commits_on_demand() || stable_vmm_weight_offload {
+            let snapshot = governor.snapshot();
+            let weights = if stable_vmm_weight_offload {
+                snapshot.derived_budget.reserved_bytes
+            } else {
+                snapshot.breakdown.model_weights_bytes
+            };
             let released = governor
                 .plan()
                 .release(Holder::FixedDeviceReservation, weights);
             if released > 0 {
                 tracing::debug!(
-                    "released {released} bytes of the fixed device reservation: the allocator \
-                     commits on demand and charges the ledger for the model's weights as it \
-                     maps them, so reserving for them as well counted the same memory twice"
+                    "released {released} bytes of the fixed device reservation: the allocator or \
+                     stable weight residency now owns the device-weight claim, so reserving for \
+                     it as well counted the same memory twice"
                 );
             }
         }
         // End the residency double count.
         //
-        // With CUDA weight offload and the VMM arena off, the "model weights"
-        // portion of the fixed reservation is the residency budget: the device
-        // will hold at most that much of the package at once. The CUDA EP then
-        // adopts the same budget as the residency cache lease it owns. Leaving
-        // the fixed claim live while adoption calls `reserve` asks the ledger
-        // for the exact bytes it already charged, producing the #704 refusal.
+        // With CUDA weight offload, the "model weights" portion of the fixed
+        // reservation is the residency budget: the device will hold at most
+        // that much of the package at once. The CUDA EP either adopts the same
+        // budget as the residency cache lease it owns. Leaving the fixed claim
+        // live double-counts the cache budget and starves later claims.
         //
         // Release the startup placeholder only on the CUDA offload path, where
         // the provider is about to take over the same device claim. Non-CUDA
-        // providers do not hold this residency cache, and VMM has already
-        // released the weight portion above because its allocator records real
-        // commits instead of a standing weight budget.
+        // providers do not hold this residency cache. Stable VMM already
+        // released the fixed claim above so its provider can precharge the same
+        // weight budget while mapping physical granules only on demand.
         #[cfg(feature = "cuda")]
-        if matches!(
-            native_device,
-            crate::native_decode::NativeDecodeDevice::Cuda { .. }
-        ) && cuda_offload_policy.is_some_and(|policy| policy.enabled)
-            && !native_session.commits_on_demand()
+        if !stable_vmm_weight_offload
+            && matches!(
+                native_device,
+                crate::native_decode::NativeDecodeDevice::Cuda { .. }
+            )
+            && cuda_offload_policy.is_some_and(|policy| policy.enabled)
         {
             let weights = governor.snapshot().breakdown.model_weights_bytes;
             let released = governor
@@ -967,6 +977,7 @@ fn resolve_cuda_offload_policy_from_env_policy(
             device_budget_bytes: Some(offload_device_budget_bytes),
             async_pagein: env_policy.async_pagein,
             scan_resistant_dense: env_policy.scan_resistant_dense,
+            stable_vmm: env_policy.stable_vmm,
         },
         device_budget_is_override: env_policy.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: true,
@@ -1761,6 +1772,7 @@ mod pool_sizing_tests {
                 device_budget_bytes: None,
                 async_pagein: true,
                 scan_resistant_dense: true,
+                stable_vmm: false,
             },
         )
         .expect("weights above an explicit CUDA VRAM limit should enable offload");
@@ -1786,6 +1798,7 @@ mod pool_sizing_tests {
                 device_budget_bytes: Some(4_000),
                 async_pagein: false,
                 scan_resistant_dense: true,
+                stable_vmm: false,
             },
         )
         .expect("the explicit limit still triggers offload");

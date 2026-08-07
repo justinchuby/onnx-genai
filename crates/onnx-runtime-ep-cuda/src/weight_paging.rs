@@ -17,6 +17,7 @@
 //! page, and async prefetch overlap (issues #82/#87).
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +27,7 @@ use onnx_runtime_ep_api::{
     LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource, WeightHandleError,
 };
 use onnx_runtime_ir::DataType;
+use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, HolderId, MemoryRole};
 
 use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 
@@ -44,8 +46,8 @@ static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
 // CUDA-event elapsed time for H2D DMA: start event before cuMemcpyHtoDAsync,
 // end event after it, then host-block on the end event to read elapsed time.
 static GLOBAL_HTOD_NS: AtomicU64 = AtomicU64::new(0);
-// Host-blocking compute-stream synchronize taken before evicting pages whose
-// VRAM might still be referenced by earlier kernels.
+// Host-blocking compute-stream synchronize taken before evicting or unmapping
+// pages whose VRAM might still be referenced by earlier kernels.
 static GLOBAL_ADMIT_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_STAGING_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_STAGING_FILL_REGIONS: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +59,7 @@ static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PEAK_RESIDENT_CONTENT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn add_duration(counter: &AtomicU64, elapsed: Duration) {
     let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -81,6 +84,7 @@ pub struct GlobalOffloadStats {
     pub vram_free_ns: u64,
     pub budget_bytes: u64,
     pub peak_resident_bytes: u64,
+    pub peak_resident_content_bytes: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -101,6 +105,7 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         vram_free_ns: GLOBAL_VRAM_FREE_NS.load(Ordering::Relaxed),
         budget_bytes: GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed),
         peak_resident_bytes: GLOBAL_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed),
+        peak_resident_content_bytes: GLOBAL_PEAK_RESIDENT_CONTENT_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -121,6 +126,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
     GLOBAL_BUDGET_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_PEAK_RESIDENT_CONTENT_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -153,6 +159,14 @@ pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASY
 /// reduced evictions from 6,286 to 0 in the same harness.
 pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_SCAN_RESISTANT";
 
+/// Opt-in stage-1 path that backs weight pages with stable CUDA VMM virtual
+/// addresses instead of per-page-in `cuMemAlloc` allocations.
+///
+/// This is not the default yet: CUDA VMM physical memory cannot oversubscribe
+/// into WDDM shared memory the way `cudaMalloc` can, so enabling it can turn a
+/// spill-surviving run into a hard device OOM on Windows.
+pub const WEIGHT_OFFLOAD_VMM_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_VMM";
+
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
 /// unset (`None`) enables it, an explicit falsy value disables it, and truthy
 /// values keep it enabled.
@@ -178,6 +192,15 @@ pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
     }
 }
 
+fn truthy_env_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
@@ -196,6 +219,9 @@ pub struct DeviceOffloadPolicy {
     /// MoE boundaries stay on LRU even when this is enabled to avoid regressing
     /// skewed expert selection.
     pub scan_resistant_dense: bool,
+    /// Use stable CUDA VMM virtual addresses for paged weights. Stage 1 keeps
+    /// graph capture declined until residency guarantees are added.
+    pub stable_vmm: bool,
 }
 
 impl Default for DeviceOffloadPolicy {
@@ -205,6 +231,7 @@ impl Default for DeviceOffloadPolicy {
             device_budget_bytes: None,
             async_pagein: false,
             scan_resistant_dense: true,
+            stable_vmm: false,
         }
     }
 }
@@ -228,11 +255,13 @@ impl DeviceOffloadPolicy {
                 .ok()
                 .as_deref(),
         );
+        let stable_vmm = truthy_env_value(std::env::var(WEIGHT_OFFLOAD_VMM_ENV).ok().as_deref());
         Self {
             enabled,
             device_budget_bytes,
             async_pagein,
             scan_resistant_dense,
+            stable_vmm,
         }
     }
 }
@@ -254,6 +283,11 @@ pub struct CudaResidencyStats {
     pub resident_bytes: u64,
     /// High-water mark of `resident_bytes`.
     pub peak_resident_bytes: u64,
+    /// Canonical content bytes currently resident. This differs from
+    /// `resident_bytes` when stable VMM rounds mappings to CUDA granules.
+    pub resident_content_bytes: u64,
+    /// High-water mark of `resident_content_bytes`.
+    pub peak_resident_content_bytes: u64,
     /// Number of pages currently resident.
     pub pages_resident: u64,
     /// H2D page-ins performed (cache misses that allocated + copied a page).
@@ -271,11 +305,16 @@ pub struct CudaResidencyStats {
 /// pointer — never dereferenced on the host — exposed through [`Self::device_ptr`]
 /// for a consuming kernel's `TensorView`.
 pub struct CudaWeightPage {
-    runtime: Arc<CudaRuntime>,
+    storage: CudaWeightPageStorage,
     ptr: CUdeviceptr,
     len: usize,
     dtype: DataType,
     shape: Vec<usize>,
+}
+
+enum CudaWeightPageStorage {
+    Raw { runtime: Arc<CudaRuntime> },
+    StableVmm { slot: Arc<StableVmmSlot> },
 }
 
 impl CudaWeightPage {
@@ -297,7 +336,9 @@ impl CudaWeightPage {
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
-            runtime: Arc::clone(runtime),
+            storage: CudaWeightPageStorage::Raw {
+                runtime: Arc::clone(runtime),
+            },
             ptr,
             len: bytes.len(),
             dtype,
@@ -348,7 +389,9 @@ impl CudaWeightPage {
         // this function and is returned to the caller on success so it can keep
         // the source alive until the fence completes.
         let page = Self {
-            runtime: Arc::clone(runtime),
+            storage: CudaWeightPageStorage::Raw {
+                runtime: Arc::clone(runtime),
+            },
             ptr,
             len: bytes.len(),
             dtype,
@@ -397,7 +440,9 @@ impl CudaWeightPage {
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
-            runtime: Arc::clone(runtime),
+            storage: CudaWeightPageStorage::Raw {
+                runtime: Arc::clone(runtime),
+            },
             ptr,
             len,
             dtype,
@@ -420,6 +465,13 @@ impl CudaWeightPage {
     /// Number of canonical bytes resident in this VRAM page.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    fn accounting_len(&self) -> usize {
+        match &self.storage {
+            CudaWeightPageStorage::Raw { .. } => self.len,
+            CudaWeightPageStorage::StableVmm { slot } => slot.allocation_bytes,
+        }
     }
 
     /// Whether the page is empty (never true for a validated binding).
@@ -487,13 +539,113 @@ impl std::fmt::Debug for CudaWeightPage {
     }
 }
 
+struct StableVmmSlot {
+    runtime: Arc<CudaRuntime>,
+    allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+    ptr: NonNull<u8>,
+    allocation_bytes: usize,
+    committed: Mutex<bool>,
+}
+
+unsafe impl Send for StableVmmSlot {}
+unsafe impl Sync for StableVmmSlot {}
+
+impl StableVmmSlot {
+    fn new(
+        runtime: Arc<CudaRuntime>,
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        len: usize,
+    ) -> Result<Self, WeightHandleError> {
+        let granularity = allocator.granularity();
+        let allocation_bytes = len.next_multiple_of(granularity);
+        let ptr = allocator
+            .allocate_committed(allocation_bytes, granularity, &[])
+            .map_err(|error| {
+                WeightHandleError::DeviceBinding(format!(
+                    "stable weight VA reserve ({allocation_bytes} bytes): {error}"
+                ))
+            })?;
+        Ok(Self {
+            runtime,
+            allocator,
+            ptr,
+            allocation_bytes,
+            committed: Mutex::new(false),
+        })
+    }
+
+    fn device_ptr(&self) -> CUdeviceptr {
+        self.ptr.as_ptr() as CUdeviceptr
+    }
+
+    fn commit(&self, len: usize) -> Result<(), WeightHandleError> {
+        self.allocator
+            .commit_allocation_range(
+                self.ptr,
+                self.allocation_bytes,
+                self.allocator.granularity(),
+                0,
+                len,
+            )
+            .map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("stable weight commit: {error}"))
+            })?;
+        *self.committed.lock().expect("stable slot lock poisoned") = true;
+        Ok(())
+    }
+
+    fn decommit(&self) {
+        let mut committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*committed {
+            return;
+        }
+        let sync_start = std::time::Instant::now();
+        if self.runtime.synchronize().is_ok() {
+            add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
+        }
+        let _ = self.allocator.decommit_allocation_range(
+            self.ptr,
+            self.allocation_bytes,
+            self.allocator.granularity(),
+            0,
+            self.allocation_bytes,
+        );
+        *committed = false;
+    }
+}
+
+impl Drop for StableVmmSlot {
+    fn drop(&mut self) {
+        self.decommit();
+        // SAFETY: `ptr` came from this allocator, and this slot is the only
+        // owner that deallocates the stable virtual span.
+        unsafe {
+            self.allocator.deallocate(
+                self.ptr,
+                self.allocation_bytes,
+                self.allocator.granularity(),
+            );
+        }
+    }
+}
+
 impl Drop for CudaWeightPage {
     fn drop(&mut self) {
-        // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
-        // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
-        let free_start = std::time::Instant::now();
-        let _ = unsafe { self.runtime.free_raw(self.ptr) };
-        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+        match &self.storage {
+            CudaWeightPageStorage::Raw { runtime } => {
+                // SAFETY: `ptr` came from this runtime's `alloc_raw` and is freed
+                // exactly once here; no alias to it escapes `CudaWeightPage`.
+                let free_start = std::time::Instant::now();
+                let _ = unsafe { runtime.free_raw(self.ptr) };
+                add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+            }
+            CudaWeightPageStorage::StableVmm { slot } => {
+                slot.decommit();
+            }
+        }
     }
 }
 
@@ -532,7 +684,9 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
             .alloc_raw(total)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         let page = CudaWeightPage {
-            runtime: Arc::clone(&self.runtime),
+            storage: CudaWeightPageStorage::Raw {
+                runtime: Arc::clone(&self.runtime),
+            },
             ptr,
             len: total,
             dtype: weight.dtype,
@@ -589,11 +743,13 @@ pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
     scan_resistant_dense: bool,
     inner: Mutex<ResidencyInner>,
+    stable_vmm: Option<Arc<crate::vmm_allocator::CudaVmmAllocator>>,
 }
 
 struct ResidencyInner {
     policy: WeightResidencyPolicy,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
+    stable_slots: HashMap<u64, Arc<StableVmmSlot>>,
     /// The governor grant this budget came from, when it came from one.
     ///
     /// Held for its `Drop`: releasing the lease is how the tier learns these
@@ -638,12 +794,15 @@ struct WeightResidencyPolicy {
     budget: u64,
     resident_bytes: u64,
     peak_resident_bytes: u64,
+    resident_content_bytes: u64,
+    peak_resident_content_bytes: u64,
     page_ins: u64,
     hits: u64,
     evictions: u64,
     /// LRU order: front = least-recently-used, back = most-recently-used.
     order: Vec<u64>,
     bytes_by_key: HashMap<u64, u64>,
+    content_bytes_by_key: HashMap<u64, u64>,
 }
 
 impl WeightResidencyPolicy {
@@ -652,11 +811,14 @@ impl WeightResidencyPolicy {
             budget,
             resident_bytes: 0,
             peak_resident_bytes: 0,
+            resident_content_bytes: 0,
+            peak_resident_content_bytes: 0,
             page_ins: 0,
             hits: 0,
             evictions: 0,
             order: Vec::new(),
             bytes_by_key: HashMap::new(),
+            content_bytes_by_key: HashMap::new(),
         }
     }
 
@@ -684,7 +846,7 @@ impl WeightResidencyPolicy {
             };
         }
         let evicted = self.evict_to_fit(bytes, eviction, |_| true);
-        self.insert_page(key, bytes);
+        self.insert_page(key, bytes, bytes);
         WeightPolicyAccess {
             hit: false,
             admitted: true,
@@ -708,11 +870,16 @@ impl WeightResidencyPolicy {
         self.hits += 1;
     }
 
-    fn insert_page(&mut self, key: u64, bytes: u64) {
+    fn insert_page(&mut self, key: u64, bytes: u64, content_bytes: u64) {
         self.bytes_by_key.insert(key, bytes);
+        self.content_bytes_by_key.insert(key, content_bytes);
         self.order.push(key);
         self.resident_bytes += bytes;
         self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
+        self.resident_content_bytes += content_bytes;
+        self.peak_resident_content_bytes = self
+            .peak_resident_content_bytes
+            .max(self.resident_content_bytes);
         self.record_page_in();
     }
 
@@ -737,6 +904,10 @@ impl WeightResidencyPolicy {
             let key = self.order.remove(index);
             if let Some(bytes) = self.bytes_by_key.remove(&key) {
                 self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+                if let Some(content_bytes) = self.content_bytes_by_key.remove(&key) {
+                    self.resident_content_bytes =
+                        self.resident_content_bytes.saturating_sub(content_bytes);
+                }
                 self.evictions += 1;
                 evicted.push(key);
             }
@@ -793,7 +964,9 @@ impl CudaWeightResidency {
                 policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
                 pages: HashMap::new(),
+                stable_slots: HashMap::new(),
             }),
+            stable_vmm: None,
         }
     }
 
@@ -838,7 +1011,9 @@ impl CudaWeightResidency {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
                 pages: HashMap::new(),
+                stable_slots: HashMap::new(),
             }),
+            stable_vmm: None,
         })
     }
 
@@ -893,6 +1068,13 @@ impl CudaWeightResidency {
         tier: onnx_runtime_memory_governor::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
+        if let Some(stable_vmm) = &self.stable_vmm {
+            let _ = stable_vmm.adopt_governor(governor, holder);
+            let inner = self.inner.lock().expect("residency lock poisoned");
+            stable_vmm.precharge_budget(inner.policy.budget)?;
+            GLOBAL_BUDGET_BYTES.store(inner.policy.budget, Ordering::Relaxed);
+            return Ok(inner.policy.budget);
+        }
         let requested = {
             let inner = self.inner.lock().expect("residency lock poisoned");
             if inner.lease.is_some() {
@@ -926,6 +1108,22 @@ impl CudaWeightResidency {
         self
     }
 
+    /// Use CUDA VMM for weight pages, keeping one stable virtual address per
+    /// weight key while mapping/unmapping physical granules on page-in/eviction.
+    pub fn with_stable_vmm(mut self) -> Result<Self, onnx_runtime_memory_governor::MemoryError> {
+        const RESERVATION_BYTES: usize = 64 << 30;
+        let allocator = crate::vmm_allocator::CudaVmmAllocator::detached(
+            self.runtime.cuda_context(),
+            DeviceKey::device(self.runtime.ordinal()),
+            self.runtime.ordinal() as i32,
+            RESERVATION_BYTES,
+            HolderId::new(716),
+            MemoryRole::Weights,
+        )?;
+        self.stable_vmm = Some(Arc::new(allocator));
+        Ok(self)
+    }
+
     /// Return the device page for `key`, paging it in from `source` on a miss and
     /// evicting LRU pages to respect the budget. The returned [`Arc`] keeps the
     /// page resident for as long as the caller holds it.
@@ -937,6 +1135,9 @@ impl CudaWeightResidency {
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
+        }
+        if self.stable_vmm.is_some() {
+            return self.resident_mapped(key, weight, source);
         }
         // Copy region bytes host→device before re-locking so a failed bind never
         // mutates cache accounting.
@@ -968,6 +1169,9 @@ impl CudaWeightResidency {
         let materialize_start = std::time::Instant::now();
         fill_staging_from_regions(weight, source, &mut staging)?;
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        if self.stable_vmm.is_some() {
+            return self.admit_stable_staged(key, weight, len, staging);
+        }
         let (page, _, _staging) = CudaWeightPage::upload_staged_async(
             &self.runtime,
             weight.dtype,
@@ -995,6 +1199,16 @@ impl CudaWeightResidency {
         let resident = weight.materialize()?;
         GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        if self.stable_vmm.is_some() {
+            let mut staging =
+                self.runtime
+                    .alloc_pinned(resident.bytes().len())
+                    .map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!("pinned alloc: {error}"))
+                    })?;
+            staging.as_mut_slice()[..resident.bytes().len()].copy_from_slice(resident.bytes());
+            return self.admit_stable_staged(key, weight, resident.bytes().len(), staging);
+        }
         let page = Arc::new(CudaWeightPage::upload(
             &self.runtime,
             resident.dtype,
@@ -1006,6 +1220,99 @@ impl CudaWeightResidency {
 
     fn eviction_for(&self, boundary: LazyWeightBoundary) -> WeightEvictionPolicy {
         eviction_for_boundary(self.scan_resistant_dense, boundary)
+    }
+
+    fn admit_stable_staged(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        len: usize,
+        staging: PinnedStaging,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        let allocator = self
+            .stable_vmm
+            .as_ref()
+            .expect("stable VMM caller checked")
+            .clone();
+        let mut inner = self.lock();
+        if let Some(existing) = inner.pages.get(&key).cloned() {
+            inner.record_hit(key);
+            return Ok(existing);
+        }
+        let slot = match inner.stable_slots.get(&key).cloned() {
+            Some(slot) => slot,
+            None => {
+                let slot = Arc::new(StableVmmSlot::new(
+                    Arc::clone(&self.runtime),
+                    allocator,
+                    len,
+                )?);
+                inner.stable_slots.insert(key, Arc::clone(&slot));
+                slot
+            }
+        };
+        let accounting_bytes = slot.allocation_bytes as u64;
+        let content_bytes = len as u64;
+        let eviction = self.eviction_for(weight.boundary);
+        let mut admit_after_copy = true;
+        if !inner.policy.can_fit(accounting_bytes) {
+            drop(inner);
+            let sync_start = std::time::Instant::now();
+            self.runtime.synchronize().map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("stream sync: {error}"))
+            })?;
+            add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
+            let mut inner_after_sync = self.lock();
+            if let Some(existing) = inner_after_sync.pages.get(&key).cloned() {
+                inner_after_sync.record_hit(key);
+                return Ok(existing);
+            }
+            if eviction == WeightEvictionPolicy::StableResident {
+                inner_after_sync.evict_to_fit(accounting_bytes, WeightEvictionPolicy::Lru);
+                admit_after_copy = false;
+            } else {
+                inner_after_sync.evict_to_fit(accounting_bytes, eviction);
+            }
+            if !inner_after_sync.policy.can_fit(accounting_bytes) {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "stable VMM weight page requires {accounting_bytes} bytes after granule \
+                     rounding, but eviction left {} of {} bytes resident",
+                    inner_after_sync.policy.resident_bytes, inner_after_sync.policy.budget
+                )));
+            }
+            drop(inner_after_sync);
+        } else {
+            drop(inner);
+        }
+        slot.commit(len)?;
+        let staged = &staging.as_slice()[..len];
+        let copy_ms = unsafe {
+            self.runtime
+                .htod_async_elapsed_ms(staged, slot.device_ptr())
+        }
+        .map_err(|error| {
+            slot.decommit();
+            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+        })?;
+        GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
+        GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        let page = Arc::new(CudaWeightPage {
+            storage: CudaWeightPageStorage::StableVmm {
+                slot: Arc::clone(&slot),
+            },
+            ptr: slot.device_ptr(),
+            len,
+            dtype: weight.dtype,
+            shape: weight.shape.clone(),
+        });
+        if !admit_after_copy {
+            let mut inner = self.lock();
+            inner.record_bypassed_page_in();
+            return Ok(page);
+        }
+        let mut inner = self.lock();
+        inner.insert_page(key, Arc::clone(&page), accounting_bytes, content_bytes);
+        Ok(page)
     }
 
     /// Look up `key`, marking it most-recently-used and counting a hit.
@@ -1044,7 +1351,8 @@ impl CudaWeightResidency {
         page: Arc<CudaWeightPage>,
         eviction: WeightEvictionPolicy,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
-        let bytes = page.len() as u64;
+        let bytes = page.accounting_len() as u64;
+        let content_bytes = page.len() as u64;
         {
             let mut inner = self.lock();
             // A concurrent caller may have populated `key` while we paged in;
@@ -1059,7 +1367,7 @@ impl CudaWeightResidency {
             // Fits without eviction: nothing is freed, so no consumer drain is
             // needed. Admit directly so the async transfer keeps overlapping.
             if inner.policy.can_fit(bytes) {
-                inner.insert_page(key, Arc::clone(&page), bytes);
+                inner.insert_page(key, Arc::clone(&page), bytes, content_bytes);
                 return Ok(page);
             }
         }
@@ -1124,7 +1432,7 @@ impl CudaWeightResidency {
                 }
             }
         }
-        inner.insert_page(key, Arc::clone(&page), bytes);
+        inner.insert_page(key, Arc::clone(&page), bytes, content_bytes);
         Ok(page)
     }
 
@@ -1137,6 +1445,8 @@ impl CudaWeightResidency {
             budget_bytes: inner.policy.budget,
             resident_bytes: inner.policy.resident_bytes,
             peak_resident_bytes: inner.policy.peak_resident_bytes,
+            resident_content_bytes: inner.policy.resident_content_bytes,
+            peak_resident_content_bytes: inner.policy.peak_resident_content_bytes,
             pages_resident: inner.pages.len() as u64,
             page_ins: inner.policy.page_ins,
             hits: inner.policy.hits,
@@ -1170,10 +1480,12 @@ impl ResidencyInner {
 
     /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the
     /// order, residency accounting, and the page-in counters.
-    fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64) {
+    fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64, content_bytes: u64) {
         self.pages.insert(key, page);
-        self.policy.insert_page(key, bytes);
+        self.policy.insert_page(key, bytes, content_bytes);
         GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(self.policy.peak_resident_bytes, Ordering::Relaxed);
+        GLOBAL_PEAK_RESIDENT_CONTENT_BYTES
+            .fetch_max(self.policy.peak_resident_content_bytes, Ordering::Relaxed);
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1247,6 +1559,17 @@ mod tests {
         assert!(!scan_resistant_from_env_value(Some("  off ")));
         assert!(scan_resistant_from_env_value(Some("")));
         assert!(scan_resistant_from_env_value(Some("maybe")));
+    }
+
+    #[test]
+    fn stable_vmm_env_is_explicit_opt_in() {
+        assert!(!truthy_env_value(None));
+        assert!(truthy_env_value(Some("1")));
+        assert!(truthy_env_value(Some("true")));
+        assert!(truthy_env_value(Some("YES")));
+        assert!(truthy_env_value(Some("  on ")));
+        assert!(!truthy_env_value(Some("0")));
+        assert!(!truthy_env_value(Some("false")));
     }
 
     #[test]
@@ -1424,5 +1747,122 @@ mod tests {
         assert_eq!(moe.hits, 178);
         assert_eq!(moe.page_ins, 62);
         assert_eq!(moe.evictions, 59);
+    }
+
+    #[test]
+    fn stable_vmm_weight_slots_keep_their_virtual_address_across_eviction() {
+        use onnx_runtime_ep_api::{ExternalMmapRegion, LazyWeightBoundary};
+
+        struct Source {
+            a: Vec<u8>,
+            b: Vec<u8>,
+        }
+
+        impl MmapRegionSource for Source {
+            fn region_bytes(
+                &self,
+                region: &ExternalMmapRegion,
+            ) -> Result<&[u8], WeightHandleError> {
+                let bytes = match region.mapping_id {
+                    1 => &self.a,
+                    2 => &self.b,
+                    other => {
+                        return Err(WeightHandleError::DeviceBinding(format!(
+                            "unexpected mapping id {other}"
+                        )));
+                    }
+                };
+                Ok(&bytes[region.offset..region.offset + region.len])
+            }
+        }
+
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the stable VMM weight-slot test did NOT run.");
+            return;
+        };
+        crate::vmm_allocator::reset_global_vmm_stats();
+        let len = 4096;
+        let source = Source {
+            a: vec![0x11; len],
+            b: vec![0x22; len],
+        };
+        let make_weight = |mapping_id| {
+            LazyWeight::new(
+                LazyWeightBoundary::QMoe,
+                DataType::Uint8,
+                vec![len],
+                vec![ExternalMmapRegion {
+                    mapping_id,
+                    offset: 0,
+                    len,
+                }],
+                {
+                    let bytes = if mapping_id == 1 {
+                        source.a.clone()
+                    } else {
+                        source.b.clone()
+                    };
+                    move || {
+                        onnx_runtime_ep_api::ResidentWeight::new(
+                            DataType::Uint8,
+                            vec![len],
+                            bytes.clone(),
+                        )
+                    }
+                },
+            )
+            .expect("valid lazy weight")
+        };
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), 2 * 1024 * 1024)
+            .with_stable_vmm()
+            .expect("stable VMM residency");
+        let weight_a = make_weight(1);
+        let weight_b = make_weight(2);
+        let raw_counts_before = runtime.allocation_counts();
+
+        let first = residency
+            .resident_mapped(1, &weight_a, &source)
+            .expect("first page-in");
+        let first_ptr = first.device_ptr();
+        let mut readback = vec![0u8; len];
+        unsafe { runtime.dtoh(&mut readback, first_ptr as CUdeviceptr) }.expect("read first");
+        assert!(readback.iter().all(|&byte| byte == 0x11));
+        drop(first);
+
+        let second = residency
+            .resident_mapped(2, &weight_b, &source)
+            .expect("second page-in evicts first");
+        assert_ne!(
+            second.device_ptr(),
+            first_ptr,
+            "different keys get different VAs"
+        );
+        drop(second);
+
+        let remapped = residency
+            .resident_mapped(1, &weight_a, &source)
+            .expect("first key pages back into its stable VA");
+        assert_eq!(
+            remapped.device_ptr(),
+            first_ptr,
+            "the key's captured kernel parameter would remain stable"
+        );
+        readback.fill(0);
+        unsafe { runtime.dtoh(&mut readback, remapped.device_ptr() as CUdeviceptr) }
+            .expect("read remapped");
+        assert!(readback.iter().all(|&byte| byte == 0x11));
+
+        let stats = residency.stats();
+        assert_eq!(stats.page_ins, 3);
+        assert_eq!(stats.hits, 0);
+        assert!(stats.evictions >= 2);
+        let vmm = crate::vmm_allocator::global_vmm_stats();
+        assert!(vmm.commits >= 3, "page-ins should map VMM granules");
+        assert!(vmm.releases >= 2, "evictions should unmap VMM granules");
+        assert_eq!(
+            runtime.allocation_counts(),
+            raw_counts_before,
+            "stable VMM weight page-ins should not churn cuMemAlloc/cuMemFree"
+        );
     }
 }

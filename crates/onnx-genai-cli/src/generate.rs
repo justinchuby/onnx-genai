@@ -181,12 +181,15 @@ struct CudaOffloadSnapshot {
     vram_free_ns: u64,
     budget_bytes: u64,
     peak_resident_bytes: u64,
+    peak_resident_content_bytes: u64,
+    vmm_peak_committed_bytes: u64,
 }
 
 fn cuda_offload_stats() -> CudaOffloadSnapshot {
     #[cfg(feature = "native-cuda")]
     {
         let stats = onnx_runtime_ep_cuda::global_offload_stats();
+        let vmm_stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
         CudaOffloadSnapshot {
             page_ins: stats.page_ins,
             hits: stats.hits,
@@ -203,6 +206,8 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
             vram_free_ns: stats.vram_free_ns,
             budget_bytes: stats.budget_bytes,
             peak_resident_bytes: stats.peak_resident_bytes,
+            peak_resident_content_bytes: stats.peak_resident_content_bytes,
+            vmm_peak_committed_bytes: vmm_stats.peak_committed_bytes,
         }
     }
     #[cfg(not(feature = "native-cuda"))]
@@ -258,6 +263,12 @@ fn emit_cuda_offload_counters(
     let vram_free_ns = after.vram_free_ns.saturating_sub(before.vram_free_ns);
     let budget_bytes = after.budget_bytes;
     let peak_resident_bytes = after.peak_resident_bytes.max(before.peak_resident_bytes);
+    let peak_resident_content_bytes = after
+        .peak_resident_content_bytes
+        .max(before.peak_resident_content_bytes);
+    let vmm_peak_committed_bytes = after
+        .vmm_peak_committed_bytes
+        .max(before.vmm_peak_committed_bytes);
     if page_ins > 0
         || hits > 0
         || evictions > 0
@@ -273,6 +284,7 @@ fn emit_cuda_offload_counters(
         || vram_free_ns > 0
         || budget_bytes > 0
         || peak_resident_bytes > 0
+        || vmm_peak_committed_bytes > 0
     {
         profile.counter("weight offload page-ins", page_ins as f64, "page-ins");
         profile.counter("weight offload cache hits", hits as f64, "hits");
@@ -332,6 +344,25 @@ fn emit_cuda_offload_counters(
             peak_resident_bytes as f64,
             "bytes",
         );
+        if peak_resident_content_bytes > 0 && peak_resident_content_bytes != peak_resident_bytes {
+            profile.counter(
+                "weight offload peak resident content",
+                peak_resident_content_bytes as f64,
+                "bytes",
+            );
+        }
+        if vmm_peak_committed_bytes > 0 {
+            profile.counter(
+                "weight offload VMM peak committed",
+                vmm_peak_committed_bytes as f64,
+                "bytes",
+            );
+            profile.counter(
+                "weight offload VMM granule overhead",
+                vmm_peak_committed_bytes.saturating_sub(peak_resident_content_bytes) as f64,
+                "bytes",
+            );
+        }
         profile.counter(
             "weight offload admit sync",
             admit_sync_ns as f64 / 1_000_000.0,
@@ -542,6 +573,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "vmm_peak_committed_bytes",
+                CudaOffloadSnapshot {
+                    vmm_peak_committed_bytes: 7,
+                    ..Default::default()
+                },
+            ),
         ] {
             let mut profile = RunProfile::new("test".to_string());
             emit_cuda_offload_counters(&mut profile, before, after);
@@ -575,6 +613,8 @@ mod tests {
                 vram_free_ns: 1,
                 budget_bytes: 1,
                 peak_resident_bytes: 1,
+                peak_resident_content_bytes: 1,
+                vmm_peak_committed_bytes: 1,
             },
         );
 

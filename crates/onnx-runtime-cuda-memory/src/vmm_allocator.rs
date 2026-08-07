@@ -313,8 +313,12 @@ struct Spans {
     /// granules this allocation claimed even when it reserved more address
     /// space than it committed.
     live: BTreeMap<usize, LiveSpan>,
-    /// Bytes currently committed, which is `lease.bytes()` when a lease exists.
+    /// Bytes currently committed to physical memory.
     committed: usize,
+    /// Bytes leased up front for an owning pool. Commits inside this envelope
+    /// do not grow or shrink the tier lease; the pool lease already keeps the
+    /// rest of the engine from spending these bytes elsewhere.
+    precharged: usize,
 }
 
 #[derive(Debug)]
@@ -333,6 +337,7 @@ impl Spans {
             free,
             live: BTreeMap::new(),
             committed: 0,
+            precharged: 0,
         }
     }
 
@@ -572,6 +577,24 @@ impl CudaVmmAllocator {
         (arena.spans.committed, arena.spans.capacity())
     }
 
+    /// Lease a standing byte budget for users that manage their own eviction
+    /// policy while this arena maps only the currently resident granules.
+    pub fn precharge_budget(&self, bytes: u64) -> Result<u64, MemoryError> {
+        let mut arena = self.lock();
+        let already = arena.spans.precharged as u64;
+        if bytes <= already {
+            return Ok(already);
+        }
+        arena.lease.grow(bytes - already)?;
+        arena.spans.precharged = bytes as usize;
+        Ok(bytes)
+    }
+
+    /// CUDA allocation granularity for this arena.
+    pub fn granularity(&self) -> usize {
+        self.lock().spans.granularity
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Arena> {
         self.arena
             .lock()
@@ -624,11 +647,19 @@ impl CudaVmmAllocator {
     }
 
     fn take(&self, arena: &mut Arena, bytes: usize) -> Result<(), MemoryError> {
+        if arena.spans.committed.saturating_add(bytes) <= arena.spans.precharged {
+            return Ok(());
+        }
         arena.lease.grow(bytes as u64)
     }
 
     fn give_back_lease(&self, arena: &mut Arena, bytes: usize) {
-        arena.lease.shrink(bytes as u64);
+        let committed_before_release = arena.spans.committed.saturating_add(bytes);
+        let excess = committed_before_release.saturating_sub(arena.spans.precharged);
+        let shrink = bytes.min(excess);
+        if shrink > 0 {
+            arena.lease.shrink(shrink as u64);
+        }
     }
 
     /// Drop this allocation's claims, unmapping whatever it was the last user
