@@ -188,6 +188,17 @@ pub struct SymbolInterner {
     cache: HashMap<DimExpr, SymbolId>,
     /// Symbols minted during inference, to be registered on the graph.
     fresh: Vec<SymbolId>,
+    /// Every `(loser, winner)` symbol pair that [`broadcast_dim`] unified when
+    /// broadcasting two *distinct* symbolic dimensions onto one representative.
+    /// This is additive bookkeeping: recording a pair never changes the returned
+    /// representative or any inferred dim, so inference output stays byte-
+    /// identical. Persisted onto [`Graph::symbol_unifications`] so downstream
+    /// consumers (e.g. capture-eligibility) can close over the equivalence
+    /// classes without re-implementing a partial copy of inference's unification.
+    ///
+    /// [`broadcast_dim`]: InferenceContext::broadcast_dim
+    /// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
+    unifications: Vec<(SymbolId, SymbolId)>,
 }
 
 impl SymbolInterner {
@@ -198,7 +209,22 @@ impl SymbolInterner {
             next,
             cache: HashMap::new(),
             fresh: Vec::new(),
+            unifications: Vec::new(),
         }
+    }
+
+    /// Record that inference unified two distinct symbolic dimensions onto a
+    /// single representative (the `(loser, winner)` substitution in
+    /// [`broadcast_dim`](InferenceContext::broadcast_dim)). Order is irrelevant
+    /// to consumers (they build an undirected equivalence relation); this is a
+    /// pure append and does not influence the inferred shape.
+    fn record_unification(&mut self, a: SymbolId, b: SymbolId) {
+        self.unifications.push((a, b));
+    }
+
+    /// The symbol pairs unified during inference (to persist on the graph).
+    pub fn unifications(&self) -> &[(SymbolId, SymbolId)] {
+        &self.unifications
     }
 
     /// Mint a brand-new opaque symbol (not tied to any expression).
@@ -478,7 +504,17 @@ impl<'a> InferenceContext<'a> {
             // (not a bare symbol) has no id to compare, so it stays a fresh
             // opaque symbol — the honest "unknown".
             (None, None) => match (a.as_symbol(), b.as_symbol()) {
-                (Some(sa), Some(sb)) => Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() }),
+                (Some(sa), Some(sb)) => {
+                    // Record the equivalence before returning. This is the SINGLE
+                    // chokepoint every broadcasting handler funnels through
+                    // (elementwise `broadcast`, `MatMul` batch dims, `Einsum`
+                    // ellipsis, `Concat` non-concat axes, `Expand`), so recording
+                    // here captures every symbol substitution inference performs —
+                    // complete by construction, with no per-op enumeration. It is
+                    // additive: the returned representative is unchanged.
+                    self.interner.record_unification(sa, sb);
+                    Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() })
+                }
                 _ => Ok(self.fresh_dim()),
             },
         }

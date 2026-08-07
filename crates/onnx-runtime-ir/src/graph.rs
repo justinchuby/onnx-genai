@@ -28,6 +28,22 @@ pub struct Graph {
     pub initializers: HashMap<ValueId, WeightRef>,
     /// Constraints on symbolic dimensions.
     pub symbol_constraints: HashMap<SymbolId, SymbolConstraints>,
+    /// Symbol pairs that shape inference unified while broadcasting two distinct
+    /// symbolic dimensions onto a single representative (the `(loser, winner)`
+    /// substitution in
+    /// `onnx-runtime-shape-inference`'s `InferenceContext::broadcast_dim`).
+    ///
+    /// This is the *authoritative, complete-by-construction* record of every
+    /// symbol equivalence inference introduced — elementwise broadcast, `MatMul`
+    /// batch dims, `Einsum` ellipsis, `Concat` non-concat axes, `Expand`, and any
+    /// future handler — because all of them funnel through the single
+    /// `broadcast_dim` chokepoint that appends here. It is populated by
+    /// [`crate::shape`]-driven inference (`infer_graph`) and left empty otherwise;
+    /// it never affects an inferred dimension. Consumers that must reason about a
+    /// symbol's full equivalence class (e.g. the CUDA-graph capture-eligibility
+    /// classifier, which closes its growing-symbol set over these pairs) read it
+    /// instead of re-deriving a partial copy of inference's unification per op.
+    pub symbol_unifications: Vec<(SymbolId, SymbolId)>,
     /// Imported opsets: domain → version.
     pub opset_imports: HashMap<String, u64>,
     /// Subgraph bodies for control-flow ops, keyed by `(node, attr_name)`.

@@ -936,15 +936,17 @@ fn growing_symbol_alias_keeps_downstream_consumer_eager() {
     graph.insert_node(gqa);
 
     // Aliasing broadcast op: input carries the growing `seq_kv`, the other input
-    // carries `batch`; inference unified them and wrote the lower-id
-    // representative (`batch`) onto the OUTPUT `aliased_out`.
+    // carries `batch`; inference unifies them and writes the lower-id
+    // representative (`batch`, created first) onto the OUTPUT `aliased_out`.
     let kv_shaped =
         graph.create_named_value("kv_shaped_in", DataType::Float32, vec![sym(seq_kv), st(64)]);
+    graph.add_input(kv_shaped);
     let batch_shaped = graph.create_named_value(
         "batch_shaped_in",
         DataType::Float32,
         vec![sym(batch), st(64)],
     );
+    graph.add_input(batch_shaped);
     let aliased_out =
         graph.create_named_value("aliased_out", DataType::Float32, vec![sym(batch), st(64)]);
     let aliased_op = Node::new(
@@ -969,6 +971,15 @@ fn growing_symbol_alias_keeps_downstream_consumer_eager() {
         vec![consumer_out],
     );
 
+    // Drive REAL inference: the `Add` broadcast records union(seq_kv, batch) via
+    // the single `broadcast_dim` chokepoint, persisting it onto
+    // `graph.symbol_unifications` — the authoritative record the closure reads.
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the alias graph must succeed");
+
     let growing = compute_capture_growing_symbols(&graph);
     assert!(
         growing.contains(&seq_kv),
@@ -987,6 +998,101 @@ fn growing_symbol_alias_keeps_downstream_consumer_eager() {
         !node_capture_seq_independent(&graph, &consumer_op, &growing),
         "the DOWNSTREAM consumer whose edges show only the representative must ALSO stay eager \
          (this fails on an un-closed exact-membership denylist)"
+    );
+}
+
+// Finding 1, NON-elementwise aliasing (the escape Harry reproduced). Shape
+// inference substitutes the lower-id representative for two distinct symbols not
+// only in elementwise `broadcast`, but wherever any handler broadcasts — here a
+// `MatMul` batch-dim broadcast (`linalg.rs::matmul_shape` → `ctx.broadcast`):
+// `[seq_kv, M, K] @ [batch, K, N] -> [batch, M, N]` ERASES the growing `seq_kv`
+// batch symbol into the pinned-looking `batch`. A downstream pointwise op then
+// copies `[batch, M, N]` onto both edges. An elementwise-only closure (the prior
+// revision) does NOT union MatMul batch dims, so it wrongly admitted that
+// consumer — silent decode corruption. The authoritative
+// `Graph::symbol_unifications` record (populated at the single `broadcast_dim`
+// chokepoint that MatMul also funnels through) closes the growing set over
+// `union(seq_kv, batch)`, so `batch` is marked growing and the consumer stays
+// EAGER — with zero per-op enumeration in the executor. This drives REAL
+// inference so the record→close path is exercised end to end; it FAILS on
+// HEAD 817eee53 (elementwise-only closure ignores the MatMul alias).
+#[test]
+fn matmul_batch_alias_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // `batch` is created first, so its id is lower and it becomes the surviving
+    // representative — the case where the growing symbol is genuinely erased.
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared `past_key` KV boundary mints the growing `seq_kv` (source-2 scan).
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    // MatMul batch-dim broadcast: lhs batch axis = growing `seq_kv`, rhs batch
+    // axis = `batch`; the contraction (last two) axes are static and match.
+    let lhs = graph.create_named_value("qk", DataType::Float32, vec![sym(seq_kv), st(8), st(16)]);
+    graph.add_input(lhs);
+    let rhs = graph.create_named_value("w", DataType::Float32, vec![sym(batch), st(16), st(32)]);
+    graph.add_input(rhs);
+    let matmul_out = graph.create_named_value(
+        "matmul_out",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(32)],
+    );
+    let matmul = Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(lhs), Some(rhs)],
+        vec![matmul_out],
+    );
+    graph.insert_node(matmul);
+
+    // Downstream consumer sees ONLY the representative `batch` on both edges.
+    let consumer_out = graph.create_named_value(
+        "matmul_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(32)],
+    );
+    let consumer = Node::new(
+        NodeId(1),
+        "Sigmoid",
+        vec![Some(matmul_out)],
+        vec![consumer_out],
+    );
+    graph.insert_node(consumer.clone());
+    graph.add_output(consumer_out);
+
+    // Real inference records union(seq_kv, batch) at the MatMul batch broadcast.
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the MatMul-alias graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&batch),
+        "the representative `batch` a MatMul batch-dim broadcast unified with the growing \
+         `seq_kv` must be in the CLOSED growing set — this FAILS on an elementwise-only closure, \
+         got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer whose edges show only the MatMul-aliased representative must \
+         stay EAGER"
     );
 }
 

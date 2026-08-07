@@ -170,14 +170,21 @@ fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
 ///      `onnx-runtime-shape-inference/src/context.rs`'s `broadcast_dim`), so a
 ///      growing KV symbol can be unified INTO a pinned-looking representative that
 ///      a downstream pointwise op then copies onto BOTH its edges — escaping an
-///      exact-membership test (finding 1). We rebuild that union-find from the
-///      graph's elementwise broadcast ops and mark a whole class growing if ANY of
-///      its members is growing, then add every class member to the set. Because
-///      `node_capture_seq_independent` tests exact membership on both edges, a
-///      closed set makes the growing property transitively correct: a consumer
-///      carrying only the representative is still rejected. Over-inclusion (a
-///      benign symbol unified with a growing one) only costs perf — the op stays
-///      eager — it never admits a growing op.
+///      exact-membership test (finding 1). Rather than re-derive a partial copy
+///      of that unification per op (the enumeration drift that caused earlier
+///      misses), we read the AUTHORITATIVE record inference itself keeps
+///      ([`Graph::symbol_unifications`](onnx_runtime_ir::Graph::symbol_unifications)):
+///      every handler that substitutes a symbol funnels through the single
+///      `broadcast_dim` chokepoint that appends there, so the record covers
+///      elementwise, `MatMul` batch dims, `Einsum` ellipsis, `Concat` non-concat
+///      axes, `Expand`, and any future handler — complete by construction. We
+///      close the growing set over those classes (see
+///      [`close_growing_under_symbol_unification`]) and mark a whole class growing
+///      if ANY of its members is growing. Because `node_capture_seq_independent`
+///      tests exact membership on both edges, a closed set makes the growing
+///      property transitively correct: a consumer carrying only the representative
+///      is still rejected. Over-inclusion (a benign symbol unified with a growing
+///      one) only costs perf — the op stays eager — it never admits a growing op.
 ///
 /// The loader interns same-named dim-params to one `SymbolId` across layers, so
 /// the resulting set stays small.
@@ -297,91 +304,41 @@ impl SymbolUnionFind {
     }
 }
 
-/// The dimension of `shape` at right-aligned `axis` in a rank-`rank` view;
-/// leading positions absent from `shape` broadcast as static `1`.
-fn broadcast_dim_from_right(shape: &Shape, rank: usize, axis: usize) -> Dim {
-    let offset = rank - shape.len();
-    if axis < offset {
-        Dim::Static(1)
-    } else {
-        shape[axis - offset]
-    }
-}
-
-/// Whether `node`'s shape rule broadcasts its inputs elementwise and can
-/// therefore substitute one input symbol for another as the output
-/// representative (the `broadcast_dim` two-symbol case). This is the exact set of
-/// default-domain elementwise/comparison/variadic/`Where` ops that call
-/// `InferenceContext::broadcast` in
-/// `onnx-runtime-shape-inference/src/handlers/elementwise.rs`. Non-broadcasting
-/// ops (MatMul contraction axes, attention, reshape) do not alias two length
-/// symbols onto one representative, so restricting the union-find to this family
-/// avoids spurious unification.
-fn op_broadcasts_elementwise(node: &Node) -> bool {
-    node.is_default_domain()
-        && matches!(
-            node.op_type.as_str(),
-            "Add"
-                | "Sub"
-                | "Mul"
-                | "Div"
-                | "Pow"
-                | "Mod"
-                | "BitShift"
-                | "BitwiseAnd"
-                | "BitwiseOr"
-                | "BitwiseXor"
-                | "PRelu"
-                | "Less"
-                | "Greater"
-                | "Equal"
-                | "And"
-                | "Or"
-                | "Xor"
-                | "LessOrEqual"
-                | "GreaterOrEqual"
-                | "Min"
-                | "Max"
-                | "Sum"
-                | "Mean"
-                | "Where"
-        )
-}
-
 /// Grow `growing` to its equivalence-class closure under shape inference's
 /// broadcast symbol unification (finding 1).
 ///
-/// We reconstruct the union-find that `broadcast_dim` builds implicitly: for
-/// every elementwise-broadcasting node, right-align each pair of input shapes and
-/// union the two symbols meeting at any axis (the `(Symbolic, Symbolic)` case
-/// that yields a single representative). Then every symbol whose class contains a
-/// growing member is itself marked growing. This makes a downstream consumer that
-/// only ever sees the pinned-looking representative on both its edges stay eager.
+/// The closure is fed by the graph's AUTHORITATIVE symbol-unification record
+/// ([`Graph::symbol_unifications`]), which shape inference populates from the
+/// single `broadcast_dim` chokepoint every broadcasting handler funnels through.
+/// That record therefore covers *every* op that can substitute one symbol for
+/// another as the output representative — elementwise `broadcast`, `MatMul` batch
+/// dims (`linalg.rs`), `Einsum` ellipsis (`einsum.rs`), `Concat` non-concat axes
+/// (`movement/concat_slice.rs`), `Expand` (`movement/transform.rs`), and any
+/// future handler — with zero per-op enumeration here (the enumeration drift that
+/// caused earlier misses). The authoritative call sites are, for reference:
+///
+/// ```text
+/// grep -rn "\.broadcast(\|\.broadcast_dim(" crates/onnx-runtime-shape-inference/src/handlers/
+/// ```
+///
+/// We rebuild the union-find from those recorded `(loser, winner)` pairs, then
+/// mark every symbol whose class contains a growing member as itself growing.
+/// Because [`node_capture_seq_independent`] tests exact both-edge membership, a
+/// closed set makes the growing property transitively correct: a downstream
+/// consumer that only ever sees the pinned-looking representative on both its
+/// edges still stays eager. Over-inclusion (a benign symbol unified with a
+/// growing one) only costs perf — the op stays eager — it never admits a growing
+/// op.
+///
+/// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
 fn close_growing_under_symbol_unification(graph: &Graph, growing: &mut HashSet<SymbolId>) {
+    if graph.symbol_unifications.is_empty() {
+        return;
+    }
     let mut uf = SymbolUnionFind::default();
-    for node in graph.nodes.values() {
-        if !op_broadcasts_elementwise(node) {
-            continue;
-        }
-        let shapes: Vec<&Shape> = node
-            .inputs
-            .iter()
-            .filter_map(|input| input.and_then(|vid| graph.try_value(vid)).map(|v| &v.shape))
-            .collect();
-        for i in 0..shapes.len() {
-            for j in (i + 1)..shapes.len() {
-                let (a, b) = (shapes[i], shapes[j]);
-                let rank = a.len().max(b.len());
-                for axis in 0..rank {
-                    if let (Dim::Symbolic(sa), Dim::Symbolic(sb)) = (
-                        broadcast_dim_from_right(a, rank, axis),
-                        broadcast_dim_from_right(b, rank, axis),
-                    ) && sa != sb
-                    {
-                        uf.union(sa, sb);
-                    }
-                }
-            }
+    for &(a, b) in &graph.symbol_unifications {
+        if a != b {
+            uf.union(a, b);
         }
     }
     if uf.parent.is_empty() {

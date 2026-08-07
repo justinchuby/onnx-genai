@@ -172,6 +172,14 @@ impl InferenceRegistry {
                 .or_insert_with(|| SymbolConstraints::new(sym, None));
         }
 
+        // Persist the authoritative symbol-unification record for this graph. A
+        // fresh (overwriting) assignment, not an append: each inference run is a
+        // complete pass, so the last run's unifications are the ones that match
+        // the shapes just written back. Consumers (e.g. the CUDA-graph
+        // capture-eligibility classifier) read this instead of re-deriving a
+        // partial copy of `broadcast_dim`'s unification per op.
+        graph.symbol_unifications = interner.unifications().to_vec();
+
         let unresolved: Vec<ValueId> = graph
             .values
             .keys()
