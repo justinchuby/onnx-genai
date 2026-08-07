@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_memory_governor::{
-    HolderId, LeaseAccounting, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    DeviceKey, HolderId, LeaseAccounting, MemoryAuthorityId, MemoryError, MemoryGovernor,
+    MemoryLease, MemoryRole, Tier,
 };
 
 /// A memory manager written entirely against the public API, sharing no code
@@ -81,9 +82,14 @@ impl LeaseAccounting for MyOwnManager {
 
 struct MyOwnGovernor {
     accounting: Arc<MyOwnManager>,
+    authority_id: MemoryAuthorityId,
 }
 
 impl MemoryGovernor for MyOwnGovernor {
+    fn authority_id(&self) -> MemoryAuthorityId {
+        self.authority_id
+    }
+
     fn reserve(
         &self,
         tier: Tier,
@@ -131,6 +137,7 @@ fn governor(capacity: u64) -> (MyOwnGovernor, Arc<MyOwnManager>) {
     (
         MyOwnGovernor {
             accounting: Arc::clone(&accounting),
+            authority_id: MemoryAuthorityId::new(DeviceKey::HOST),
         },
         accounting,
     )

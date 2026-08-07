@@ -47,6 +47,23 @@
 //! CPU. Typing both as `*mut u8` would invite exactly that.
 
 use crate::VirtualMemoryError;
+use onnx_runtime_memory_governor::MemoryAuthorityId;
+
+/// Who charges physical memory committed by a [`VirtualBacking`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalMemoryAccounting {
+    /// [`VirtualBuffer`](crate::VirtualBuffer) leases mapped physical bytes.
+    Buffer,
+    /// The backing's authority owns physical bytes independently of mappings.
+    ///
+    /// This is the contract for a physical-handle pool: pooled-unmapped bytes
+    /// remain charged to `authority`, while mapped holder/zone bytes are only
+    /// attribution and must not be charged as additional physical ownership.
+    Backing {
+        /// The one ledger that owns every physical byte held by the backing.
+        authority: MemoryAuthorityId,
+    },
+}
 
 /// The platform operations a [`VirtualBuffer`](crate::VirtualBuffer) is built
 /// from.
@@ -78,6 +95,15 @@ pub unsafe trait VirtualBacking: Send + Sync + std::fmt::Debug {
 
     /// Allocation granularity: every offset and length is a multiple of this.
     fn granularity(&self) -> usize;
+
+    /// Who owns accounting for committed physical memory.
+    ///
+    /// Backings that retain physical allocations after unmapping must return
+    /// [`PhysicalMemoryAccounting::Backing`]. A buffer validates the authority
+    /// before reserving address space and does not take a second physical lease.
+    fn physical_memory_accounting(&self) -> PhysicalMemoryAccounting {
+        PhysicalMemoryAccounting::Buffer
+    }
 
     /// Reserve `len` bytes of address space, committing nothing.
     fn reserve(&self, len: usize) -> Result<Self::Reservation, VirtualMemoryError>;

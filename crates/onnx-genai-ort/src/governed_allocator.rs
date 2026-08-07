@@ -1287,6 +1287,10 @@ mod tests {
     }
 
     impl onnx_runtime_memory_governor::MemoryGovernor for RecordingGovernor {
+        fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+            self.inner.authority_id()
+        }
+
         fn reserve(
             &self,
             tier: Tier,
