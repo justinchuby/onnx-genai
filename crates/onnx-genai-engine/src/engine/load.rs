@@ -890,6 +890,7 @@ fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
 /// residency lease after session load. Leaving one KV page unreserved prevents
 /// the governor from taking the "reservation does not fit; drop it" warning path
 /// that hid #712 while preserving the later ledger-enforced admission point.
+#[cfg(any(feature = "native-backend", test))]
 fn device_weight_reservation_for(
     package_bytes: u64,
     offload_budget: Option<u64>,

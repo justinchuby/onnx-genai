@@ -664,6 +664,7 @@ mod tests {
                 // asserted not-applicable: nothing here has determined a
                 // decode path, and "pending" is the only claim that holds.
                 kv_telemetry: Default::default(),
+                resource_snapshot: Default::default(),
             },
             tokenizer,
             chat_template: None,
