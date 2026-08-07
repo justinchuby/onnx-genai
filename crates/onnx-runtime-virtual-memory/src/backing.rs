@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | reserve | `VirtualAlloc2` placeholder / `mmap(PROT_NONE)` | `cuMemAddressReserve` |
 //! | commit | `MapViewOfFile3` / `mmap(MAP_FIXED)` | `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` |
-//! | release | `UnmapViewOfFile2` / `mmap(PROT_NONE)` | `cuMemUnmap` + `cuMemRelease` |
+//! | release | `UnmapViewOfFile2` / `mmap(PROT_NONE)` | `cuMemUnmap`; pool or `cuMemRelease` |
 //! | granularity | 64 KiB / page size | `cuMemGetAllocationGranularity` |
 //!
 //! Measured on the hardware this was developed against: **64 KiB** on Windows,
@@ -28,9 +28,8 @@
 //! before a block is mapped into part of it, and whether a split is needed
 //! depends on the block's already-mapped neighbours — so committing needs to
 //! know what else is mapped in the same reservation. CUDA needs the same shape
-//! for a different reason: `cuMemUnmap` releases the mapping but the physical
-//! handle from `cuMemCreate` has to be released separately, so the handles have
-//! to be kept somewhere.
+//! because mappings still belong to a reservation even when their physical
+//! handles outlive them in a shared pool.
 //!
 //! Putting that state in an associated type rather than in the backing keeps
 //! one backing able to serve many reservations, and keeps the state next to the

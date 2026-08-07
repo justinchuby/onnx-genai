@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_cuda_memory::virtual_memory::CudaVirtualBacking;
+use onnx_runtime_cuda_memory::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool};
 use onnx_runtime_memory_governor::{
     HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
 };
@@ -184,5 +184,221 @@ fn a_device_buffer_grows_without_moving() {
         governor.available(Tier::Device),
         64 << 20,
         "shrinking must return the device memory to the governor"
+    );
+}
+
+/// A multi-granule growth is recorded as independently releasable blocks.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn a_multi_granule_growth_can_shrink_one_granule() {
+    let backing = require_cuda_backing();
+    let granule = backing.granularity();
+    let governor = LedgerGovernor::new(LeaseLedger::new(64 << 20, 0, 0));
+    let mut buffer = VirtualBuffer::with_backing(
+        backing,
+        granule * 2,
+        Arc::new(governor.clone()),
+        Tier::Device,
+        MemoryRole::KvCache,
+        HOLDER,
+    )
+    .expect("device address space");
+
+    buffer.grow_to(granule * 2).expect("two-granule commit");
+    buffer.shrink_to(granule).expect("release upper granule");
+    assert_eq!(buffer.committed(), granule);
+    assert_eq!(
+        (64u64 << 20) - governor.available(Tier::Device),
+        granule as u64
+    );
+    buffer
+        .grow_to(granule * 2)
+        .expect("released granule can be mapped again");
+}
+
+/// Granule handles move between independently reserved ranges without a
+/// create/release cycle, while the governor remains charged for every owned
+/// physical byte.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn pooled_handles_move_between_separate_reservations() {
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);
+    let granule = probe.granularity();
+    let count = 3usize;
+    let bytes = granule * count;
+    let pool = PhysicalHandlePool::new(context, 0, bytes, &governor, HOLDER, MemoryRole::KvCache)
+        .expect("pool lease");
+    let stats = pool.stats();
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool));
+    let mut a = backing.reserve(bytes).expect("range A");
+    let mut b = backing.reserve(bytes).expect("range B");
+
+    backing.commit(&mut a, 0, bytes).expect("map A");
+    let after_a = stats.snapshot();
+    assert_eq!(after_a.creates, count as u64);
+    assert_eq!(after_a.releases, 0);
+    assert_eq!(after_a.mapped_bytes, bytes as u64);
+    assert_eq!(after_a.pooled_unmapped_bytes, 0);
+    assert_eq!(after_a.total_owned_bytes, bytes as u64);
+    assert_eq!(
+        (8u64 << 30) - governor.available(Tier::Device),
+        bytes as u64,
+        "the governor lease covers all pool-owned VRAM"
+    );
+
+    backing.release(&mut a, 0, bytes).expect("unmap A");
+    let pooled = stats.snapshot();
+    assert_eq!(pooled.creates, after_a.creates);
+    assert_eq!(pooled.releases, 0);
+    assert_eq!(pooled.mapped_bytes, 0);
+    assert_eq!(pooled.pooled_unmapped_bytes, bytes as u64);
+    assert_eq!(pooled.total_owned_bytes, bytes as u64);
+    assert_eq!(
+        (8u64 << 30) - governor.available(Tier::Device),
+        bytes as u64,
+        "unmapping must not report pool-owned VRAM as free"
+    );
+
+    backing.commit(&mut b, 0, bytes).expect("map B");
+    let after_b = stats.snapshot();
+    assert_eq!(
+        after_b.creates, after_a.creates,
+        "mapping B must not create replacement handles"
+    );
+    assert_eq!(
+        after_b.releases, 0,
+        "transferring handles A to B must not release physical memory"
+    );
+    assert_eq!(after_b.pool_hits, count as u64);
+    assert_eq!(after_b.mapped_bytes, bytes as u64);
+    assert_eq!(after_b.pooled_unmapped_bytes, 0);
+    assert_eq!(after_b.total_owned_bytes, bytes as u64);
+
+    let base = CudaVirtualBacking::base(&b);
+    let pattern: Vec<u8> = (0..bytes).map(|index| (index % 251) as u8).collect();
+    unsafe {
+        use cudarc::driver::sys as cu;
+        assert_eq!(
+            cu::cuMemcpyHtoD_v2(base as cu::CUdeviceptr, pattern.as_ptr().cast(), bytes),
+            cu::CUresult::CUDA_SUCCESS
+        );
+        let mut read_back = vec![0u8; bytes];
+        assert_eq!(
+            cu::cuMemcpyDtoH_v2(
+                read_back.as_mut_ptr().cast(),
+                base as cu::CUdeviceptr,
+                bytes
+            ),
+            cu::CUresult::CUDA_SUCCESS
+        );
+        assert_eq!(read_back, pattern);
+    }
+
+    backing.release(&mut b, 0, bytes).expect("unmap B");
+    drop(a);
+    drop(b);
+    drop(backing);
+    drop(pool);
+
+    let torn_down = stats.snapshot();
+    assert_eq!(torn_down.creates, count as u64);
+    assert_eq!(
+        torn_down.releases, count as u64,
+        "pool teardown releases each created handle exactly once"
+    );
+    assert_eq!(torn_down.mapped_bytes, 0);
+    assert_eq!(torn_down.pooled_unmapped_bytes, 0);
+    assert_eq!(torn_down.total_owned_bytes, 0);
+    assert_eq!(governor.available(Tier::Device), 8 << 30);
+    eprintln!(
+        "physical pool transfer: creates={} releases={} hits={} mapped={} pooled={} owned={}",
+        torn_down.creates,
+        torn_down.releases,
+        torn_down.pool_hits,
+        torn_down.mapped_bytes,
+        torn_down.pooled_unmapped_bytes,
+        torn_down.total_owned_bytes
+    );
+}
+
+/// The pool retains at most its configured whole-granule bound.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn physical_pool_releases_handles_above_its_bound() {
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);
+    let granule = probe.granularity();
+    let pool = PhysicalHandlePool::new(context, 0, granule, &governor, HOLDER, MemoryRole::KvCache)
+        .expect("pool lease");
+    let stats = pool.stats();
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool));
+    let mut reservation = backing.reserve(granule * 2).expect("range");
+
+    backing
+        .commit(&mut reservation, 0, granule * 2)
+        .expect("two handles");
+    backing
+        .release(&mut reservation, 0, granule * 2)
+        .expect("return handles");
+
+    let bounded = stats.snapshot();
+    assert_eq!(pool.max_retained_bytes(), granule);
+    assert_eq!(bounded.creates, 2);
+    assert_eq!(bounded.releases, 1);
+    assert_eq!(bounded.pooled_unmapped_bytes, granule as u64);
+    assert_eq!(bounded.total_owned_bytes, granule as u64);
+    assert_eq!(
+        (8u64 << 30) - governor.available(Tier::Device),
+        granule as u64
+    );
+}
+
+/// `VirtualBuffer` delegates accounting to a pooled backing instead of taking
+/// a second lease for the same physical handle.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn pooled_virtual_buffer_is_not_double_charged() {
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
+    let pool = PhysicalHandlePool::new(context, 0, granule, &governor, HOLDER, MemoryRole::KvCache)
+        .expect("pool lease");
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool));
+    let mut buffer = VirtualBuffer::with_backing(
+        backing,
+        granule,
+        Arc::new(governor.clone()),
+        Tier::Device,
+        MemoryRole::KvCache,
+        HOLDER,
+    )
+    .expect("buffer reservation");
+
+    buffer.grow_to(1).expect("map one granule");
+    assert_eq!(
+        (8u64 << 30) - governor.available(Tier::Device),
+        granule as u64,
+        "the pool lease, not a pool lease plus a buffer lease, covers the handle"
+    );
+    buffer.shrink_to(0).expect("return handle to pool");
+    assert_eq!(
+        (8u64 << 30) - governor.available(Tier::Device),
+        granule as u64,
+        "the retained unmapped handle remains charged"
     );
 }
