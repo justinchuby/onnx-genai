@@ -829,14 +829,33 @@ fn main() -> Result<()> {
             .as_ref()
             .expect("CUDA stats before measurement");
         println!(
-            "cuda_graph: enabled={} captures={} replays={} fallbacks={}",
-            stats.graph.enabled, stats.graph.captures, stats.graph.replays, stats.graph.fallbacks
+            "cuda_graph: enabled={} captures={} replays={} fallbacks={} invalidations={}",
+            stats.graph.enabled,
+            stats.graph.captures,
+            stats.graph.replays,
+            stats.graph.fallbacks,
+            stats.graph.invalidations
         );
         println!(
-            "cuda_graph_measured: captures={} replays={} fallbacks={}",
+            "cuda_graph_measured: captures={} replays={} fallbacks={} invalidations={}",
             stats.graph.captures - before.graph.captures,
             stats.graph.replays - before.graph.replays,
-            stats.graph.fallbacks - before.graph.fallbacks
+            stats.graph.fallbacks - before.graph.fallbacks,
+            stats.graph.invalidations - before.graph.invalidations
+        );
+        println!(
+            "cuda_kv_growth_measured: events={} d2d_copy_bytes={}",
+            stats.kv_growth_events - before.kv_growth_events,
+            stats.kv_growth_d2d_copy_bytes - before.kv_growth_d2d_copy_bytes
+        );
+        println!(
+            "cuda_kv: logical_len={} max_len={} committed_len={} hard_max_len={} committed_bytes={} physical_bytes={}",
+            stats.logical_len,
+            stats.max_len,
+            stats.kv_committed_len,
+            stats.hard_max_len,
+            stats.kv_committed_bytes,
+            stats.kv_physical_bytes_by_binding.iter().sum::<usize>()
         );
         println!(
             "device_kv_measured: h2d_calls={} h2d_bytes={} d2h_calls={} d2h_bytes={}",
