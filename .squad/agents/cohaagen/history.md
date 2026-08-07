@@ -121,3 +121,5 @@ _Entries before 2026-07-31T03:03:15Z archived to `history-archive.md` (Scribe ro
 ## 2026-08-06T19:40:00Z — 35B-A3B CUDA-graph capture C3 shipped
 
 - Shipped PR #708/C3 making GatedDeltaNet Split capture-safe (resolved output-shape sizes, no host-read/sync): 13.415 → 12.132 ms/tok, 184 → 154 segments, token@119 `33803`; rejected unsafe C2 sync elision and moved on to pinned-vs-growing symbol classification after strict-C1 proved a no-op.
+
+- 2026-08-07: C1 build-time growing-symbol classifier mechanically collapsed capture segments (154→34, +4.3% tok/s) but was shelved behind #722 due to a 35B QMoE fp16 captured-vs-eager near-tie; revive after fp32-teacher-forcing oracle re-anchor.
