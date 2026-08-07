@@ -111,6 +111,14 @@ const ORACLE_TOKEN: u32 = 33803;
 /// DENSE int4 CUDA's autoregressive pick — the lower-precision decode-drift
 /// outlier that must NOT be what QMoE emits. "Windows".
 const DENSE_CUDA_TOKEN: u32 = 5342;
+/// The autoregressive token@[`DIVERGENCE_INDEX`] that BROADER pointwise capture
+/// (C1) lands on: the eager-side token of the fp16 near-tie (top-2 gap < 0.1
+/// logit, within fp16 noise of the fp32 oracle). The baseline's partial
+/// segmentation instead reproduces [`ORACLE_TOKEN`]. These two — and ONLY these
+/// two — are the KNOWN BENIGN outcomes of the documented coin-flip (#722); any
+/// other token at this position is a genuine captured-decode corruption (e.g.
+/// the dense outlier [`DENSE_CUDA_TOKEN`] or an unrelated token) and MUST fail.
+const C1_CAPTURE_TOKEN: u32 = 46283;
 /// Teacher-forced logit(33803) − logit(5342) spans ~+0.078..+0.094 across
 /// fp32/f16 references; the band guards against silent drift of the tie.
 const MARGIN_BAND: std::ops::RangeInclusive<f32> = 0.04..=0.14;
@@ -281,14 +289,19 @@ fn qwen36_35b_a3b_qmoe_native_cuda_matches_fp32_oracle() -> anyhow::Result<()> {
     );
     drop(qmoe_tf);
 
-    // 2) #722 tripwire (DOCUMENTED, NON-FATAL): the *autoregressive* captured
-    //    stream lands on ORACLE_TOKEN only on the baseline's partial segmentation;
-    //    with broader pointwise capture (C1) it lands on the eager token 46283.
-    //    Both are within fp16 noise of the fp32 oracle (top-2 gap < 0.1 logit) —
-    //    the captured decode is not byte-exact with the eager decode on this hybrid
-    //    (diverges at token 20). We LOG this coin-flip rather than assert on which
-    //    side it falls, so the fragility stays visible without pinning correctness
-    //    to a capture-dependent token. The primary lock above is the real gate.
+    // 2) #722 tripwire (BOUNDED, FATAL on real corruption): the *autoregressive*
+    //    captured stream lands on ORACLE_TOKEN only on the baseline's partial
+    //    segmentation; with broader pointwise capture (C1) it lands on the eager
+    //    token C1_CAPTURE_TOKEN. Both are within fp16 noise of the fp32 oracle
+    //    (top-2 gap < 0.1 logit) — the captured decode is not byte-exact with the
+    //    eager decode on this hybrid (diverges at token 20). We TOLERATE the
+    //    documented coin-flip between exactly those two outcomes, but ASSERT the
+    //    token is one of them: any OTHER token (a genuine captured-decode
+    //    corruption — the dense outlier 5342, the reused-state 279, or anything
+    //    unrelated) still FAILS CI. This restores a real regression tripwire on
+    //    the changed captured autoregressive path without re-pinning correctness
+    //    to which side of the benign tie a given segmentation happens to pick. The
+    //    fp32-oracle teacher-forced primary lock above remains the ground truth.
     let mut qmoe = engine(
         &qmoe_dir,
         EngineDecodeBackend::Native,
@@ -296,20 +309,27 @@ fn qwen36_35b_a3b_qmoe_native_cuda_matches_fp32_oracle() -> anyhow::Result<()> {
     )?;
     let qmoe_stream = greedy_stream(&mut qmoe, n)?;
     drop(qmoe);
-    if qmoe_stream[DIVERGENCE_INDEX] == ORACLE_TOKEN {
+    let autoregressive = qmoe_stream[DIVERGENCE_INDEX];
+    if autoregressive == ORACLE_TOKEN {
         eprintln!(
             "#722 note: autoregressive token {DIVERGENCE_INDEX} == {ORACLE_TOKEN} \
              (this build's capture segmentation reproduces the fp32-oracle side of the tie)"
         );
     } else {
         eprintln!(
-            "#722 note: autoregressive token {DIVERGENCE_INDEX} == {} != fp32-oracle {ORACLE_TOKEN} \
-             — expected fp16 near-tie coin-flip (captured != eager on this hybrid; both within \
-             fp16 noise of the oracle). The capture-independent teacher-forced lock above still \
-             adjudicates {ORACLE_TOKEN}. See #722.",
-            qmoe_stream[DIVERGENCE_INDEX],
+            "#722 note: autoregressive token {DIVERGENCE_INDEX} == {autoregressive} != fp32-oracle \
+             {ORACLE_TOKEN} — expected fp16 near-tie coin-flip (captured != eager on this hybrid; \
+             both within fp16 noise of the oracle). The capture-independent teacher-forced lock \
+             above still adjudicates {ORACLE_TOKEN}. See #722."
         );
     }
+    assert!(
+        autoregressive == ORACLE_TOKEN || autoregressive == C1_CAPTURE_TOKEN,
+        "captured autoregressive token@{DIVERGENCE_INDEX} = {autoregressive} is neither known \
+         benign fp16-tie outcome ({ORACLE_TOKEN} baseline-capture | {C1_CAPTURE_TOKEN} C1-capture); \
+         a value outside this set is a genuine captured-decode corruption (e.g. dense outlier \
+         {DENSE_CUDA_TOKEN} or token 279), not the documented coin-flip. See #722.",
+    );
 
     // 3) DENSE int4 CUDA is the lower-precision sibling (byte-identical int4 expert
     //    weights, per-expert MatMulNBits instead of fused QMoE). Its *autoregressive*

@@ -784,49 +784,67 @@ fn only_gqa_cache_inputs_use_physical_capacity_as_kernel_geometry() {
     assert!(!kernel_input_uses_physical_capacity(&attention, 4));
 }
 
-// C1 (build-time growing-symbol classifier): a pointwise op is capture-eligible
-// iff NONE of its output dims references a GROWING (KV/past-sequence-length)
-// symbol. The growing set is derived structurally from attention KV cache slots
-// (`compute_capture_growing_symbols`): a KV tensor's penultimate axis carries the
-// growing sequence symbol. This test builds a synthetic graph — a GQA node whose
-// past_key input declares a symbolic penultimate axis (the KV-length symbol),
-// plus two pointwise ops — and asserts the negative (an op carrying the growing
-// symbol stays eager) and the positive (an op whose only symbolic dims are pinned
-// batch/heads is capturable). Metadata-driven, no model files, no per-model
-// hardcoding — the KV-length symbol vs a pinned head/batch symbol is
-// distinguished by SET membership, not dim position or runtime value.
+// C1 (build-time growing-symbol classifier, DENYLIST on BOTH edges): a pointwise
+// op is capture-eligible iff NEITHER any input NOR any output references a symbol
+// in the GROWING set (`compute_capture_growing_symbols`) — the KV/total-sequence
+// length symbols on attention `past`/`present` cache sequence axes. Benign FRESH
+// symbols (warm-decode-seeded non-growing extents) are absent from that set, so
+// ops carrying only batch/query-seq/fresh dims stay capturable, preserving the
+// 154→34 collapse.
+//
+// This test builds a synthetic decode graph (declared `inputs_embeds`/`logits`
+// I/O plus a GQA node minting a growing KV-length symbol) and asserts: an op
+// whose dims are batch/query-seq only is capturable; an op that carries a growing
+// KV symbol on its OUTPUT stays eager; and — the finding-1 alias case — an op
+// whose OUTPUT shows only a pinned representative but whose INPUT still carries
+// the growing symbol ALSO stays eager (inputs are checked too). No model files,
+// no per-model hardcoding — growing membership, not dim position.
 #[test]
-fn growing_symbol_classifier_keeps_kv_length_ops_eager_and_admits_pinned_ops() {
+fn growing_symbol_classifier_admits_pinned_and_rejects_growing_and_aliased_ops() {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
-
-    // Interned symbols. `seq_kv` is the KV/past-sequence-length axis that GROWS
-    // each decode step; `batch` and `heads` are PINNED (constant every replay).
-    let seq_kv = graph.create_symbol(None);
-    let batch = graph.create_symbol(None);
-    let heads = graph.create_symbol(None);
 
     let sym = Dim::Symbolic;
     let st = Dim::Static;
 
-    // GQA past_key (input index 3): [batch, kv_heads, seq_kv, head_dim] — the
-    // penultimate axis (index 2) is the growing KV-length symbol.
+    // Interned symbols. `batch`/`seq` are pinned (never on a KV sequence axis);
+    // `seq_kv` GROWS each decode step (KV penultimate).
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared decode I/O: inputs_embeds `[batch, seq, 512]`, logits
+    // `[batch, seq, vocab]`.
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    // GQA past_key input (index 3): `[batch, kv_heads, seq_kv, head_dim]`.
     let past_key = graph.create_named_value(
         "past_key",
         DataType::Float32,
         vec![sym(batch), st(4), sym(seq_kv), st(64)],
     );
-    let past_value = graph.create_named_value(
-        "past_value",
+    graph.add_input(past_key);
+    let logits = graph.create_named_value(
+        "logits",
         DataType::Float32,
-        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+        vec![sym(batch), sym(seq), st(32000)],
     );
-    // Fill inputs 0..=2 with a placeholder so past_key/value land at 3/4.
-    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    graph.add_output(logits);
+
     let mut gqa = Node::new(
         NodeId(0),
         "GroupQueryAttention",
-        vec![Some(q), Some(q), Some(q), Some(past_key), Some(past_value)],
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_key),
+        ],
         vec![],
     );
     gqa.domain = "com.microsoft".to_string();
@@ -835,39 +853,228 @@ fn growing_symbol_classifier_keeps_kv_length_ops_eager_and_admits_pinned_ops() {
     let growing = compute_capture_growing_symbols(&graph);
     assert!(
         growing.contains(&seq_kv),
-        "the KV past-sequence-length symbol must be classified GROWING"
+        "the growing KV-length symbol (past_key penultimate) must be collected, got {growing:?}"
     );
     assert!(
-        !growing.contains(&batch) && !growing.contains(&heads),
-        "pinned batch/head symbols must NOT be classified growing"
+        !growing.contains(&batch) && !growing.contains(&seq),
+        "batch/query-seq must NOT be growing, got {growing:?}"
     );
 
-    // Negative: a pointwise op whose output carries the growing KV-length symbol
+    // Positive: a pointwise op whose only symbolic dims are batch/seq (no growing
+    // symbol on any edge) is capture-eligible.
+    let pinned_out = graph.create_named_value(
+        "pinned_pointwise_out",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let pinned_op = Node::new(NodeId(1), "Sigmoid", vec![Some(embeds)], vec![pinned_out]);
+    assert!(
+        node_capture_seq_independent(&graph, &pinned_op, &growing),
+        "an op whose only symbolic dims are batch/seq must be capturable"
+    );
+
+    // Negative: a pointwise op whose OUTPUT carries the growing KV-length symbol
     // MUST stay eager (a different buffer extent every decode step).
     let kv_out = graph.create_named_value(
         "kv_pointwise_out",
         DataType::Float32,
         vec![sym(seq_kv), st(128)],
     );
-    let kv_op = Node::new(NodeId(1), "Mul", vec![Some(q), Some(q)], vec![kv_out]);
+    let kv_op = Node::new(NodeId(2), "Mul", vec![Some(embeds)], vec![kv_out]);
     assert!(
         !node_capture_seq_independent(&graph, &kv_op, &growing),
         "an op whose output carries the growing KV-length symbol must stay eager"
     );
 
-    // Positive: a pointwise op whose only symbolic output dims are PINNED
-    // (batch/query-seq/heads) — no growing symbol — is capture-eligible, even
-    // though its leading dims do not collapse to 1 (the head-major decode tensor
-    // the runtime-extent heuristic alone would reject).
-    let pinned_out = graph.create_named_value(
-        "pinned_pointwise_out",
+    // Finding-1 alias case: broadcast substituted the lower-id `batch`
+    // representative on the OUTPUT, but an INPUT still carries the growing
+    // `seq_kv`. Checking inputs too keeps the op EAGER despite the clean output.
+    let kv_shaped = graph.create_named_value(
+        "kv_shaped_in",
         DataType::Float32,
-        vec![sym(batch), sym(heads), st(128)],
+        vec![sym(seq_kv), st(128)],
     );
-    let pinned_op = Node::new(NodeId(2), "Sigmoid", vec![Some(q)], vec![pinned_out]);
+    let aliased_out =
+        graph.create_named_value("aliased_out", DataType::Float32, vec![sym(batch), st(128)]);
+    let aliased_op = Node::new(
+        NodeId(3),
+        "Add",
+        vec![Some(kv_shaped), Some(embeds)],
+        vec![aliased_out],
+    );
     assert!(
-        node_capture_seq_independent(&graph, &pinned_op, &growing),
-        "an op whose only symbolic dims are pinned (batch/heads) must be capturable"
+        !node_capture_seq_independent(&graph, &aliased_op, &growing),
+        "an op whose OUTPUT aliases to `batch` but whose INPUT carries the growing \
+         symbol must stay eager (inputs are checked too)"
+    );
+}
+
+// Finding 2 (coverage of CompressedSparseAttention): CSA mints a growing
+// cache-record symbol from `total_sequence_length` on `outputs[1]`/`[3]`
+// (`[query[0], records, width]`). The `attention_kv_cache_slots` CSA entry
+// collects that symbol as GROWING, so any pointwise op consuming a CSA cache
+// tensor stays EAGER on the denylist — closing the finding-2 gap that the old
+// 3-op collector left open.
+#[test]
+fn csa_cache_record_symbol_keeps_consuming_ops_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let records = graph.create_symbol(None); // total_sequence_length-derived
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    // CSA output[1] cache record: `[query[0], records, width]`, penultimate =
+    // records (the growing total-sequence-length-derived axis).
+    let attn_out = graph.create_named_value(
+        "csa_attn",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let cache_out = graph.create_named_value(
+        "csa_cache",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let mut csa = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        vec![Some(embeds)],
+        vec![attn_out, cache_out],
+    );
+    csa.domain = "pkg.nxrt".to_string();
+    graph.insert_node(csa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&records),
+        "the CSA total_sequence_length-derived cache-record symbol must be GROWING, got {growing:?}"
+    );
+
+    // A pointwise op consuming the CSA cache tensor stays eager.
+    let cache_pointwise = graph.create_named_value(
+        "csa_cache_pointwise",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let cache_op = Node::new(
+        NodeId(1),
+        "Relu",
+        vec![Some(cache_out)],
+        vec![cache_pointwise],
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &cache_op, &growing),
+        "an op consuming a CSA cache-record tensor must stay eager"
+    );
+}
+
+// Finding 2 (generic declared-KV-I/O coverage): even without any recognized
+// attention op, a model that declares a `present…` rank-4 KV output boundary
+// tensor (`[batch, kv_heads, present_seq, head_dim]`) has its growing sequence
+// symbol collected by the generic scan, so a pointwise op sized by it stays
+// eager. This is what makes finding-2 robust against unrecognized attention
+// variants without minting a per-op entry.
+#[test]
+fn generic_declared_present_kv_output_is_collected_as_growing() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let present_seq = graph.create_symbol(None);
+
+    // Declared `present.0.key` KV output with a rank-4 layout and a symbolic
+    // penultimate (sequence) axis — the ONNX GenAI KV-cache contract.
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(present_seq), st(64)],
+    );
+    graph.add_output(present_key);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&present_seq),
+        "a declared present.* rank-4 KV output's sequence symbol must be GROWING, got {growing:?}"
+    );
+
+    let out = graph.create_named_value(
+        "kv_sized_out",
+        DataType::Float32,
+        vec![sym(batch), sym(present_seq), st(64)],
+    );
+    let op = Node::new(NodeId(0), "Sigmoid", vec![Some(present_key)], vec![out]);
+    assert!(
+        !node_capture_seq_independent(&graph, &op, &growing),
+        "an op sized by a declared present.* KV sequence symbol must stay eager"
+    );
+}
+
+// Design tradeoff of the growing DENYLIST (the accepted fallback): a benign
+// FRESH symbol — one warm-decode-seeded from a data-dependent extent, neither
+// batch/query-seq nor on a KV sequence axis — is NOT in the growing set, so an op
+// carrying it stays CAPTURABLE. This is deliberate and load-bearing: a pinned
+// ALLOWLIST would keep all such ops eager and dissolve the 154→34 collapse. Only
+// a genuinely growing dim disqualifies an op.
+#[test]
+fn benign_fresh_symbol_is_not_growing_and_stays_capturable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let fresh = graph.create_symbol(None); // warm-seeded data-dependent extent
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        !growing.contains(&fresh),
+        "a fresh non-KV symbol must NOT be growing, got {growing:?}"
+    );
+
+    let out = graph.create_named_value(
+        "fresh_out",
+        DataType::Float32,
+        vec![sym(batch), sym(fresh), st(128)],
+    );
+    let op = Node::new(NodeId(0), "Sigmoid", vec![Some(embeds)], vec![out]);
+    assert!(
+        node_capture_seq_independent(&graph, &op, &growing),
+        "an op carrying only a benign fresh (non-growing) symbol must stay capturable"
     );
 }
 

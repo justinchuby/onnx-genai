@@ -38,23 +38,62 @@ impl KernelKey {
     }
 }
 
-/// The past-KV-cache **input** indices for a recognized attention node, if any.
+/// The KV-cache I/O **slot indices** of a recognized stateful attention node.
 ///
-/// These are the tensors whose sequence axis GROWS each decode step (the KV
-/// cache), as opposed to a fixed-capacity recurrent state. The indices mirror
+/// `.past_inputs` are the input tensors whose sequence axis GROWS each decode
+/// step (the KV cache), as opposed to a fixed-capacity recurrent state;
+/// `.present_outputs` are the corresponding grown outputs. The indices mirror
 /// the authoritative structural list in
 /// [`kernel_input_uses_physical_capacity`](super::geometry::kernel_input_uses_physical_capacity):
 /// GQA past_key/value = inputs 3,4; default-domain `Attention` = inputs 4,5;
-/// `pkg.nxrt::IndexShare` = inputs 3,4. Any other op returns `None`.
-fn attention_past_kv_input_indices(node: &Node) -> Option<[usize; 2]> {
+/// `pkg.nxrt::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
+/// GQA-family `outputs[1]`/`outputs[2]`.
+///
+/// `pkg.nxrt`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
+/// past-KV inputs (its cache is stateful device state); instead its
+/// total-sequence-length-derived cache records land on `outputs[1]`/`outputs[3]`
+/// (`[query[0], records, width]`, penultimate = `records`). See
+/// `onnx-runtime-shape-inference/src/handlers/custom_ops.rs::compressed_sparse_attention`.
+///
+/// This op list is one of two complementary growing-symbol sources (see
+/// [`compute_capture_growing_symbols`]); an attention variant not listed here is
+/// still covered by the generic declared-KV-I/O scan (any `past…`/`present…`
+/// rank-4 boundary tensor), so a missing entry degrades gracefully rather than
+/// silently admitting a growing op.
+#[derive(Default)]
+struct KvCacheSlots {
+    past_inputs: &'static [usize],
+    present_outputs: &'static [usize],
+}
+
+fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
     if node.domain == "com.microsoft" && node.op_type == "GroupQueryAttention" {
-        return Some([3, 4]);
+        return Some(KvCacheSlots {
+            past_inputs: &[3, 4],
+            present_outputs: &[1, 2],
+        });
     }
     if node.is_default_domain() && node.op_type == "Attention" {
-        return Some([4, 5]);
+        return Some(KvCacheSlots {
+            past_inputs: &[4, 5],
+            present_outputs: &[1, 2],
+        });
     }
     if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
-        return Some([3, 4]);
+        return Some(KvCacheSlots {
+            past_inputs: &[3, 4],
+            present_outputs: &[1, 2],
+        });
+    }
+    if (node.domain == "pkg.nxrt" || node.domain == "com.microsoft")
+        && node.op_type == "CompressedSparseAttention"
+    {
+        // CSA cache records (derived from total_sequence_length) live on the
+        // penultimate axis of outputs 1 and 3; it has no past-KV inputs.
+        return Some(KvCacheSlots {
+            past_inputs: &[],
+            present_outputs: &[1, 3],
+        });
     }
     None
 }
@@ -87,17 +126,27 @@ fn kv_growing_symbol(shape: &Shape) -> Option<SymbolId> {
 /// pinned) and no KV-length symbol → they become capture-eligible, while any op
 /// carrying a KV-length symbol stays eager.
 ///
-/// We gather symbols from BOTH the past-KV **inputs** and the present-KV
-/// **outputs** (outputs[1]=present_key, outputs[2]=present_value) of every
-/// recognized attention node. The loader interns same-named dim-params to one
-/// `SymbolId` across layers, so the resulting set stays small.
+/// Symbols are gathered from TWO complementary sources so coverage does not
+/// depend on a fixed op allowlist (the finding-2 gap):
+///   1. The past-KV **inputs** and present-KV **outputs** of every recognized
+///      stateful attention node ([`attention_kv_cache_slots`]: GQA, default
+///      `Attention`, `IndexShare`, and `CompressedSparseAttention`).
+///   2. A GENERIC scan of the model's DECLARED past/present KV I/O — every graph
+///      input named `past…`/output named `present…` with a rank-4 KV layout
+///      `[batch, kv_heads, sequence, head_dim]` whose penultimate (sequence) axis
+///      is symbolic. This catches an unrecognized attention variant's KV boundary
+///      tensor without minting a fresh op entry, while the rank-4 guard excludes
+///      fixed-capacity recurrent/conv states (rank 3, or a static penultimate).
+///
+/// The loader interns same-named dim-params to one `SymbolId` across layers, so
+/// the resulting set stays small.
 pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
     let mut growing = HashSet::new();
     for node in graph.nodes.values() {
-        let Some(past_inputs) = attention_past_kv_input_indices(node) else {
+        let Some(slots) = attention_kv_cache_slots(node) else {
             continue;
         };
-        for idx in past_inputs {
+        for &idx in slots.past_inputs {
             if let Some(Some(vid)) = node.inputs.get(idx).copied()
                 && let Some(value) = graph.try_value(vid)
                 && let Some(sym) = kv_growing_symbol(&value.shape)
@@ -107,8 +156,9 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
         }
         // present_key = outputs[1], present_value = outputs[2] (see
         // dynamic_shapes.rs GQA present handling: `[query[0], kv_heads,
-        // present_sequence, head_dim]`, seq axis = penultimate).
-        for idx in [1usize, 2usize] {
+        // present_sequence, head_dim]`, seq axis = penultimate). CSA cache
+        // records land on outputs[1]/[3] (`[query[0], records, width]`).
+        for &idx in slots.present_outputs {
             if let Some(&vid) = node.outputs.get(idx)
                 && let Some(value) = graph.try_value(vid)
                 && let Some(sym) = kv_growing_symbol(&value.shape)
@@ -117,6 +167,28 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
             }
         }
     }
+
+    // Generic derivation from the DECLARED past/present KV I/O (ONNX GenAI's
+    // standard `past_key_values.*` / `present.*` contract). A rank-4 boundary
+    // tensor with a symbolic penultimate axis is a growable KV cache regardless
+    // of which op produced/consumed it; a rank-3 conv state or a static
+    // penultimate recurrent state is excluded.
+    let boundary_is_growing_kv = |vid: ValueId| -> Option<SymbolId> {
+        let value = graph.try_value(vid)?;
+        let name = value.name.as_deref()?;
+        let is_kv_boundary = name.starts_with("past") || name.starts_with("present");
+        if is_kv_boundary && value.shape.len() == 4 {
+            kv_growing_symbol(&value.shape)
+        } else {
+            None
+        }
+    };
+    for &vid in graph.inputs.iter().chain(graph.outputs.iter()) {
+        if let Some(sym) = boundary_is_growing_kv(vid) {
+            growing.insert(sym);
+        }
+    }
+
     if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
         eprintln!(
             "[onnx-genai-capture] build-time growing-symbol set: {} symbol(s): {:?}",
@@ -127,34 +199,56 @@ pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId
     growing
 }
 
-/// Whether `node` is capture-eligible under the **build-time growing-symbol**
-/// classifier: every output dim must be free of any GROWING (KV-length) symbol.
+/// Whether `node` is capture-eligible under the **build-time symbol** classifier.
 ///
-/// This replaces the strict all-`Dim::Static` rule (fully-static output shapes),
-/// which was too strict: it treats a PINNED symbolic dim (batch=1, query
-/// seq_len=1, heads) the same as a GROWING one and so kept every GDN pointwise
-/// op eager. Keying off the growing SET instead of dim staticness admits
-/// `[Symbolic(batch), Symbolic(seq=1), Static(16), Static(128)]` (both symbolic
-/// dims pinned) while correctly keeping anything with a KV-length dim eager.
-/// This also resolves the heads-vs-tokens ambiguity structurally:
-/// `[Symbolic(heads), Static(128)]` with `heads ∉ growing` → capturable;
-/// `[Symbolic(seq_kv), Static(128)]` with `seq_kv ∈ growing` → eager.
+/// An op is capture-eligible iff NEITHER any OUTPUT nor any INPUT references a
+/// symbol in the GROWING set ([`compute_capture_growing_symbols`]) — a denylist
+/// applied to BOTH sides of the op.
 ///
-/// When `growing` is empty (a pure-recurrent graph with no attention KV cache),
-/// [`shape_references_any`] returns false for every op → all pointwise ops are
-/// capture-eligible, which is correct: nothing grows step-to-step. Nodes with no
-/// outputs are conservatively treated as not seq-independent.
+/// Checking the OUTPUT keeps eager any op whose result is sized by a KV-length
+/// symbol (the direct dependence the PR targets). Checking the INPUT as well is
+/// what closes finding-1's broadcast-alias hole: elementwise broadcast /
+/// shape-inference can substitute the lower-id `batch` representative on the
+/// OUTPUT while an INPUT still carries the raw growing KV symbol
+/// (`[seq_kv, D]` ⊕ `[batch, D]` → `[batch, D]`). An output-only test would
+/// wrongly admit that op; rejecting any input that references a growing symbol
+/// keeps it eager. Because the *first* op in any such alias chain must consume a
+/// tensor still carrying the raw growing symbol on its INPUT, the input-side
+/// denylist defeats representative aliasing without a full union-find pass.
+///
+/// The growing set itself is derived robustly (op allowlist ∪ generic declared
+/// KV I/O scan, see [`compute_capture_growing_symbols`]) so finding-2 variants
+/// (CSA and any `past…`/`present…` rank-4 boundary tensor) are covered.
+///
+/// A growing DENYLIST (rather than a pinned ALLOWLIST) is deliberate: a
+/// capture-eligible op legitimately consumes/produces intermediates carrying
+/// benign FRESH symbols (warm-decode-seeded data-dependent extents on
+/// Cast/Mul/QMoE/ScatterElements). Requiring every symbolic dim to be provably
+/// *pinned* would keep all of those eager and dissolve the 154→34 capture
+/// collapse that is this PR's entire purpose; only a genuinely GROWING dim on
+/// either side is disqualifying.
+///
+/// Nodes with no outputs are conservatively treated as not seq-independent; a
+/// value with an unresolved (missing) shape is treated as carrying no growing
+/// symbol on that edge.
 pub(super) fn node_capture_seq_independent(
     graph: &Graph,
     node: &Node,
     growing: &HashSet<SymbolId>,
 ) -> bool {
-    !node.outputs.is_empty()
-        && node.outputs.iter().all(|&vid| {
-            graph
-                .try_value(vid)
-                .is_some_and(|value| !shape_references_any(&value.shape, growing))
-        })
+    if node.outputs.is_empty() {
+        return false;
+    }
+    let edge_free_of_growing = |vid: ValueId| {
+        graph
+            .try_value(vid)
+            .is_none_or(|value| !shape_references_any(&value.shape, growing))
+    };
+    node.outputs.iter().all(|&vid| edge_free_of_growing(vid))
+        && node
+            .inputs
+            .iter()
+            .all(|input| input.is_none_or(edge_free_of_growing))
 }
 
 /// Observable kernel-cache statistics (§11.1) — enough to prove reuse in tests.
