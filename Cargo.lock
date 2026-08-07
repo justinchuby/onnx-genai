@@ -2273,6 +2273,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
+ "onnx-runtime-ep-cuda",
  "reqwest",
  "serde",
  "serde_json",

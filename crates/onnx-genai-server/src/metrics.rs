@@ -310,7 +310,61 @@ pub(crate) fn encode_prometheus() -> String {
         "HTTP requests rejected for overload.",
         REGISTRY.rejections.load(Ordering::Relaxed),
     );
+    output.push_str(&encode_weight_offload());
     output
+}
+
+#[cfg(all(feature = "metrics", feature = "cuda"))]
+fn encode_weight_offload() -> String {
+    let mut output = String::new();
+    let stats = onnx_runtime_ep_cuda::global_offload_stats();
+    counter(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_page_ins_total",
+        "CUDA weight residency page-ins.",
+        stats.page_ins,
+    );
+    counter(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_hits_total",
+        "CUDA weight residency cache hits.",
+        stats.hits,
+    );
+    counter(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_evictions_total",
+        "CUDA weight residency evictions.",
+        stats.evictions,
+    );
+    output.push_str(
+        "# HELP onnx_genai_cuda_weight_offload_hit_rate CUDA weight residency hit ratio.\n",
+    );
+    output.push_str("# TYPE onnx_genai_cuda_weight_offload_hit_rate gauge\n");
+    let lookups = stats.hits + stats.page_ins;
+    let hit_rate = if lookups == 0 {
+        0.0
+    } else {
+        stats.hits as f64 / lookups as f64
+    };
+    writeln!(output, "onnx_genai_cuda_weight_offload_hit_rate {hit_rate}").expect("String write");
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_budget_bytes",
+        "Configured CUDA device-residency budget for weight offload.",
+        stats.budget_bytes,
+    );
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_peak_resident_bytes",
+        "Peak CUDA device-resident bytes in the weight offload cache.",
+        stats.peak_resident_bytes,
+    );
+    output
+}
+
+#[cfg(not(all(feature = "metrics", feature = "cuda")))]
+fn encode_weight_offload() -> String {
+    String::new()
 }
 
 /// Name of the gauge that says whether the governor family below is real.
