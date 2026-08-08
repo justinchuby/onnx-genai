@@ -49,7 +49,8 @@ pub use env::Environment;
 pub use error::{OrtError, Result};
 pub use loader::{
     ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths,
-    graph_io_from_model_path, model_weight_bytes,
+    graph_io_from_model_path, graph_io_from_model_path_for_kv_pairs,
+    graph_io_from_model_path_for_names, model_weight_bytes,
 };
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,

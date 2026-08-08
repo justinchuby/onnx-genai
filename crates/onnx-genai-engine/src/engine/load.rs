@@ -252,17 +252,23 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
-            let graph_io = onnx_genai_ort::graph_io_from_model_path(&model_directory.model_path)
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to read native decoder graph I/O for KV geometry: {e}")
-                })?;
-            infer_kv_model_info(
-                &graph_io,
-                metadata.model.as_ref().and_then(|model| model.io.as_ref()),
-                config.page_size,
-                config.kv_cache_dtype,
+            let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+            let kv_inputs = model_io
+                .and_then(|io| io.kv_inputs.clone())
+                .unwrap_or_default();
+            let kv_outputs = model_io
+                .and_then(|io| io.kv_outputs.clone())
+                .unwrap_or_default();
+            let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
+                &model_directory.model_path,
+                &kv_inputs,
+                &kv_outputs,
             )
-            .context("failed to infer native decoder KV geometry from model graph I/O")?
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to read native decoder graph I/O for KV geometry: {e}")
+            })?;
+            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
+                .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
         let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
         let governor_kv_config = match kv_model.as_ref() {
