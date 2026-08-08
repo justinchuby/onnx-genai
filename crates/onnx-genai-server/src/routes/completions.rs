@@ -864,6 +864,20 @@ mod stream_admission_tests {
         .unwrap_err();
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    #[tokio::test]
+    async fn continuous_row_refusal_is_internal_not_memory_overload() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(DriverFailure::internal(
+            "continuous decode row assignment failed",
+        )))
+        .unwrap();
+
+        let error = await_driver_admission(rx).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+        assert_eq!(error.retry_after_secs, None);
+    }
 }
 
 pub(crate) async fn collect_generation_result(

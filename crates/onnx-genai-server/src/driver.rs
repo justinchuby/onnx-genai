@@ -13,9 +13,9 @@ use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
 use onnx_genai_engine::{
-    ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
-    GovernorSnapshot, KvNotApplicable, KvTelemetry, PipelineEngine, PipelineGenerateRequest,
-    ResourceLimit, SchedulerAdmissionError,
+    ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
+    EmbeddingOptions, EngineGovernorError, FimConfig, GovernorSnapshot, KvNotApplicable,
+    KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -167,6 +167,7 @@ pub(crate) enum GenerateSubmitError {
 }
 
 struct DriverRoute {
+    admission: Option<oneshot::Sender<Result<(), DriverFailure>>>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
     metrics: GenerationMetrics,
@@ -974,10 +975,16 @@ fn run_static_batch_until_idle(
             }
         }
 
+        cancel_abandoned_pending_admissions(&mut manager, &mut routes);
+        manager.admit_pending();
+        route_continuous_admissions(manager.poll_admissions(), &mut routes);
         if let Err(err) = manager.step() {
             let mut failure = DriverFailure::from_engine_error(&err);
             failure.message = format!("continuous batch generation failed: {err}");
-            for (_, route) in routes.drain() {
+            for (_, mut route) in routes.drain() {
+                if let Some(sender) = route.admission.take() {
+                    let _ = sender.send(Err(failure.clone()));
+                }
                 let _ = route.events.try_send(DriverEvent::Error(DriverFailure {
                     message: failure.message.clone(),
                     kind: failure.kind,
@@ -985,6 +992,7 @@ fn run_static_batch_until_idle(
             }
             break;
         }
+        route_continuous_admissions(manager.poll_admissions(), &mut routes);
         route_continuous_events(manager.poll(), &mut routes, &mut abandoned);
         if manager.is_idle() {
             break;
@@ -1100,15 +1108,16 @@ fn submit_to_continuous_manager(
 ) {
     match manager.submit(request) {
         Ok(handle) => {
-            let _ = admission.send(Ok(()));
             routes.insert(
                 handle.id,
                 DriverRoute {
+                    admission: Some(admission),
                     events,
                     _permit: permit,
                     metrics: GenerationMetrics::start(),
                 },
             );
+            route_continuous_admissions(manager.poll_admissions(), routes);
             route_continuous_events(manager.poll(), routes, abandoned);
         }
         Err(err) => {
@@ -1116,6 +1125,56 @@ fn submit_to_continuous_manager(
             let failure = DriverFailure::from_engine_error(&err);
             let _ = admission.send(Err(failure.clone()));
             let _ = events.try_send(DriverEvent::Error(failure));
+        }
+    }
+}
+
+fn route_continuous_admissions(
+    admissions: Vec<ContinuousBatchAdmission>,
+    routes: &mut HashMap<usize, DriverRoute>,
+) {
+    for admission in admissions {
+        match admission {
+            ContinuousBatchAdmission::Assigned { handle } => {
+                if let Some(route) = routes.get_mut(&handle.id)
+                    && let Some(sender) = route.admission.take()
+                {
+                    let _ = sender.send(Ok(()));
+                }
+            }
+            ContinuousBatchAdmission::Rejected { handle, error } => {
+                let Some(mut route) = routes.remove(&handle.id) else {
+                    continue;
+                };
+                let failure = DriverFailure::from_engine_error(&error);
+                if let Some(sender) = route.admission.take() {
+                    let _ = sender.send(Err(failure.clone()));
+                }
+                let _ = route.events.try_send(DriverEvent::Error(failure));
+            }
+        }
+    }
+}
+
+fn cancel_abandoned_pending_admissions(
+    manager: &mut ContinuousBatchManager<'_>,
+    routes: &mut HashMap<usize, DriverRoute>,
+) {
+    let cancelled = routes
+        .iter()
+        .filter_map(|(&id, route)| {
+            route
+                .admission
+                .as_ref()
+                .is_some_and(oneshot::Sender::is_closed)
+                .then_some(id)
+                .filter(|_| route.events.is_closed())
+        })
+        .collect::<Vec<_>>();
+    for id in cancelled {
+        if manager.cancel_pending(ContinuousBatchHandle { id }) {
+            routes.remove(&id);
+            crate::metrics::generation_queue_cancelled();
         }
     }
 }
@@ -1377,6 +1436,73 @@ fn run_fim_generation(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    fn pending_route() -> (
+        DriverRoute,
+        oneshot::Receiver<Result<(), DriverFailure>>,
+        mpsc::Receiver<DriverEvent>,
+    ) {
+        let (admission, admission_rx) = oneshot::channel();
+        let (events, events_rx) = mpsc::channel(1);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        (
+            DriverRoute {
+                admission: Some(admission),
+                events,
+                _permit: permit,
+                metrics: GenerationMetrics::start(),
+            },
+            admission_rx,
+            events_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn continuous_admission_waits_for_row_assignment_not_queue_insertion() {
+        let (route, mut admission_rx, mut events_rx) = pending_route();
+        let mut routes = HashMap::from([(7, route)]);
+
+        assert!(matches!(
+            admission_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(events_rx.try_recv().is_err(), "no token is required");
+
+        route_continuous_admissions(
+            vec![ContinuousBatchAdmission::Assigned {
+                handle: ContinuousBatchHandle { id: 7 },
+            }],
+            &mut routes,
+        );
+
+        assert!(admission_rx.await.unwrap().is_ok());
+        assert!(events_rx.try_recv().is_err(), "headers precede first token");
+    }
+
+    #[tokio::test]
+    async fn continuous_row_failure_rejects_before_headers_without_memory_misclassification() {
+        let (route, admission_rx, mut events_rx) = pending_route();
+        let mut routes = HashMap::from([(9, route)]);
+
+        route_continuous_admissions(
+            vec![ContinuousBatchAdmission::Rejected {
+                handle: ContinuousBatchHandle { id: 9 },
+                error: anyhow::anyhow!("row assignment failed"),
+            }],
+            &mut routes,
+        );
+
+        let failure = admission_rx.await.unwrap().unwrap_err();
+        assert_eq!(failure.kind, DriverFailureKind::Internal);
+        assert!(routes.is_empty());
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(DriverEvent::Error(DriverFailure {
+                kind: DriverFailureKind::Internal,
+                ..
+            }))
+        ));
+    }
 
     #[test]
     fn only_kv_byte_budget_admission_is_memory_overload() {
