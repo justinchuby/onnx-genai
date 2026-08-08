@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
-use onnx_runtime_cuda_memory::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool};
+use onnx_runtime_cuda_memory::virtual_memory::{
+    CudaVirtualBacking, PhysicalHandlePool, trim_physical_handle_pools,
+};
 use onnx_runtime_memory_governor::{
     HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
 };
@@ -333,6 +335,49 @@ fn pooled_handles_move_between_separate_reservations() {
         torn_down.mapped_bytes,
         torn_down.pooled_unmapped_bytes,
         torn_down.total_owned_bytes
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn lowering_an_authority_can_trim_unmapped_pool_handles() {
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule * 2,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool");
+    let stats = pool.stats();
+    let backing = CudaVirtualBacking::with_physical_pool(pool);
+    let mut reservation = backing.reserve(granule * 2).expect("reservation");
+    backing
+        .commit(&mut reservation, 0, granule * 2)
+        .expect("commit");
+    backing
+        .release(&mut reservation, 0, granule * 2)
+        .expect("return");
+
+    assert_eq!(
+        trim_physical_handle_pools(governor.authority_id(), granule as u64)
+            .expect("trim one granule"),
+        granule as u64
+    );
+    let trimmed = stats.snapshot();
+    assert_eq!(trimmed.total_owned_bytes, granule as u64);
+    assert_eq!(trimmed.pooled_unmapped_bytes, granule as u64);
+    assert_eq!(trimmed.releases, 1);
+    assert_eq!(
+        (8u64 << 30) - governor.available(Tier::Device),
+        granule as u64
     );
 }
 

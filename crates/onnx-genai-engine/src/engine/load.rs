@@ -1086,7 +1086,7 @@ fn device_weight_reservation_for(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 #[derive(Clone, Copy, Debug)]
 struct CudaOffloadResolution {
     policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
@@ -1094,7 +1094,7 @@ struct CudaOffloadResolution {
     auto_enabled_from_vram_limit: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn resolve_cuda_offload_policy(
     native_device: &crate::native_decode::NativeDecodeDevice,
     limits: &ResourceLimits,
@@ -1108,7 +1108,7 @@ fn resolve_cuda_offload_policy(
     )
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn resolve_cuda_offload_policy_from_env_policy(
     native_device: &crate::native_decode::NativeDecodeDevice,
     limits: &ResourceLimits,
@@ -1152,7 +1152,7 @@ fn resolve_cuda_offload_policy_from_env_policy(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn reconcile_cuda_offload_budget_after_native_load(
     native_session: &crate::native_decode::NativeDecodeSession,
     max_context: Option<usize>,

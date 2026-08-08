@@ -513,6 +513,7 @@ fn build_step_component_session<'a>(
 /// nothing from the pipeline decode state. Requesting the native decoder in a
 /// build without the `native-backend` feature is a clear error, mirroring
 /// [`build_step_component_session`].
+#[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
 fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
@@ -762,16 +763,6 @@ impl PipelineEngine {
                         .checked_add(onnx_genai_ort::model_weight_bytes(path))
                         .ok_or_else(|| anyhow::anyhow!("pipeline component weight size overflow"))
                 })?;
-        // Reserve every component's package bytes before constructing the
-        // first session. This covers non-autoregressive pipelines too, and RAII
-        // releases the reservation if any later component fails to load.
-        let resource_governor = component_governor(
-            &config,
-            None,
-            model_weights_bytes,
-            authority_provider.as_ref(),
-            &authority_domain,
-        )?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
         // backends resolve without touching the model directory (so a bad
         // request fails fast); `Auto` inspects the components' declared
@@ -781,34 +772,40 @@ impl PipelineEngine {
             EngineDecodeBackend::Native => PipelineBackend::Native,
             EngineDecodeBackend::Auto => resolve_auto_pipeline_backend(&directory)?,
         };
-        #[cfg(feature = "cuda")]
-        let native_cuda_authority = if backend == PipelineBackend::Native {
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let authority_domain = if backend == PipelineBackend::Native {
             match native_decoder_device(config.native_device.as_ref()) {
                 crate::native_decode_device::NativeDecodeDevice::Cuda { index } => {
-                    let domain = crate::memory_authority::DeviceCompatibilityDomain::Cuda(
-                        index.unwrap_or(0),
-                    );
-                    crate::engine::validate_shared_authority_limit(
-                        authority_provider.as_ref(),
-                        &domain,
-                        config.limits.vram_limit,
-                    )?;
-                    Some(match authority_provider.as_ref() {
-                        Some(provider) => provider.authority(
-                            &domain,
-                            resource_governor.snapshot().resolved_limits.vram_bytes,
-                        )?,
-                        None => crate::memory_authority::DeviceMemoryAuthority::new(
-                            domain,
-                            resource_governor.snapshot().resolved_limits.vram_bytes,
-                        ),
-                    })
+                    crate::memory_authority::DeviceCompatibilityDomain::Cuda(index.unwrap_or(0))
+                }
+                _ => authority_domain,
+            }
+        } else {
+            authority_domain
+        };
+        // Reserve every component's package bytes before constructing the
+        // first session. Native CUDA components and their VMM pool share this
+        // same authority, including in standalone pipelines.
+        let resource_governor = component_governor(
+            &config,
+            None,
+            model_weights_bytes,
+            authority_provider.as_ref(),
+            &authority_domain,
+        )?;
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let native_cuda_authority = if backend == PipelineBackend::Native {
+            match native_decoder_device(config.native_device.as_ref()) {
+                crate::native_decode_device::NativeDecodeDevice::Cuda { .. } => {
+                    Some(resource_governor.device_authority())
                 }
                 _ => None,
             }
         } else {
             None
         };
+        #[cfg(all(feature = "cuda", not(feature = "native-backend")))]
+        let native_cuda_authority = None;
         if backend == PipelineBackend::Native {
             // The native backend constructs every declared component through the
             // backend-neutral `ComponentSession` seam (GAP 1). When the crate is
@@ -1036,12 +1033,7 @@ impl PipelineEngine {
         limit: onnx_genai_scheduler::ResourceLimit,
     ) -> Result<onnx_genai_scheduler::GovernorReconfigureOutcome, crate::engine::EngineGovernorError>
     {
-        let outcome = self.resource_governor.set_vram_limit(limit)?;
-        #[cfg(feature = "cuda")]
-        if let Some(authority) = &self.native_cuda_authority {
-            authority.set_limit_bytes(outcome.new_limits.vram_bytes);
-        }
-        Ok(outcome)
+        self.resource_governor.set_vram_limit(limit)
     }
 
     /// Generate text from a pipeline with no extra non-text tensors.

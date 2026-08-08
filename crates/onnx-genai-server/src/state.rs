@@ -88,17 +88,7 @@ impl ServerMemoryAuthorities {
         let resolved = onnx_genai_engine::resolve_limit(limit, &capacity, "vram")
             .map_err(anyhow::Error::new)?;
         for authority in authorities.values() {
-            if authority.used_bytes() > resolved {
-                anyhow::bail!(
-                    "cannot satisfy lowered resource limit of {resolved} bytes: {} currently has \
-                     {} committed bytes",
-                    authority.domain(),
-                    authority.used_bytes()
-                );
-            }
-        }
-        for authority in authorities.values() {
-            authority.set_limit_bytes(resolved);
+            authority.try_set_limit_bytes(resolved)?;
         }
         *effective = limit;
         Ok(())

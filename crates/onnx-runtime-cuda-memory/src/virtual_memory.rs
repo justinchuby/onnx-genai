@@ -231,6 +231,7 @@ pub struct PhysicalHandlePool {
     granularity: usize,
     authority: MemoryAuthorityId,
     max_retained_bytes: usize,
+    authority_operation: Arc<Mutex<()>>,
     state: Mutex<PoolState>,
     counters: Arc<PoolCounters>,
 }
@@ -287,6 +288,14 @@ impl PhysicalHandlePool {
             return Ok(pool);
         }
 
+        let authority_operation = registry
+            .iter()
+            .filter(|(candidate, _)| candidate.authority == authority)
+            .find_map(|(_, pool)| pool.upgrade())
+            .map_or_else(
+                || Arc::new(Mutex::new(())),
+                |pool| pool.authority_operation.clone(),
+            );
         let retained_granules = max_retained_bytes / granularity;
         let lease = governor.reserve(Tier::Device, 0, role, holder)?;
         let pool = Arc::new(Self {
@@ -295,6 +304,7 @@ impl PhysicalHandlePool {
             granularity,
             authority,
             max_retained_bytes: retained_granules * granularity,
+            authority_operation,
             state: Mutex::new(PoolState {
                 available: Vec::new(),
                 lease: Some(lease),
@@ -344,6 +354,10 @@ impl PhysicalHandlePool {
     }
 
     fn acquire(&self) -> Result<cu::CUmemGenericAllocationHandle, VirtualMemoryError> {
+        let _operation = self
+            .authority_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(handle) = {
             let mut state = self.lock();
             state.available.pop()
@@ -406,6 +420,10 @@ impl PhysicalHandlePool {
         handle: cu::CUmemGenericAllocationHandle,
         was_mapped: bool,
     ) -> Result<(), VirtualMemoryError> {
+        let _operation = self
+            .authority_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if was_mapped {
             self.counters
                 .mapped_bytes
@@ -456,6 +474,69 @@ impl PhysicalHandlePool {
         }
         Ok(())
     }
+}
+
+/// Release retained, unmapped handles owned by `authority`.
+///
+/// Checkout and return use the same authority gate, so a concurrent return
+/// cannot race past a limit shrink. Mapped handles are never released here.
+pub fn trim_physical_handle_pools(
+    authority: MemoryAuthorityId,
+    bytes_to_release: u64,
+) -> Result<u64, VirtualMemoryError> {
+    if bytes_to_release == 0 {
+        return Ok(0);
+    }
+    let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let pools = {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, pool| pool.strong_count() > 0);
+        registry
+            .iter()
+            .filter(|(key, _)| key.authority == authority)
+            .filter_map(|(_, pool)| pool.upgrade())
+            .collect::<Vec<_>>()
+    };
+    let Some(first) = pools.first() else {
+        return Ok(0);
+    };
+    let authority_operation = Arc::clone(&first.authority_operation);
+    let _operation = authority_operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut released = 0_u64;
+    for pool in pools {
+        while released < bytes_to_release {
+            let Some(handle) = pool.lock().available.pop() else {
+                break;
+            };
+            if let Err(error) = pool.bind("trimming pooled CUDA physical memory") {
+                pool.lock().available.push(handle);
+                return Err(error);
+            }
+            if let Err(error) =
+                CudaVirtualBacking::check("cuMemRelease", unsafe { cu::cuMemRelease(handle) })
+            {
+                pool.lock().available.push(handle);
+                return Err(error);
+            }
+            let bytes = pool.granularity as u64;
+            pool.counters.releases.fetch_add(1, Ordering::Relaxed);
+            pool.counters
+                .pooled_unmapped_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            pool.counters
+                .total_owned_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            if let Some(lease) = pool.lock().lease.as_mut() {
+                lease.shrink(bytes);
+            }
+            released = released.saturating_add(bytes);
+        }
+    }
+    Ok(released)
 }
 
 impl Drop for PhysicalHandlePool {

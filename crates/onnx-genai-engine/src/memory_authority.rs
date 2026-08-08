@@ -72,6 +72,33 @@ impl DeviceMemoryAuthority {
     pub fn set_limit_bytes(&self, bytes: u64) {
         self.governor.ledger().set_limit(Tier::Device, bytes);
     }
+
+    /// Lower the device limit after releasing any retained, unmapped CUDA
+    /// handles. Mapped or otherwise leased bytes make the shrink fail without
+    /// changing the old limit.
+    pub fn try_set_limit_bytes(&self, bytes: u64) -> anyhow::Result<()> {
+        let used = self.used_bytes();
+        if used > bytes {
+            #[cfg(feature = "cuda")]
+            {
+                onnx_runtime_ep_cuda::virtual_memory::trim_physical_handle_pools(
+                    self.authority_id(),
+                    used - bytes,
+                )
+                .map_err(anyhow::Error::new)?;
+            }
+        }
+        let remaining = self.used_bytes();
+        if remaining > bytes {
+            anyhow::bail!(
+                "cannot satisfy lowered resource limit of {bytes} bytes: {} currently has \
+                 {remaining} mapped or otherwise leased bytes",
+                self.domain
+            );
+        }
+        self.set_limit_bytes(bytes);
+        Ok(())
+    }
 }
 
 impl MemoryGovernor for DeviceMemoryAuthority {
@@ -150,10 +177,6 @@ impl EngineMemoryGovernor {
 
     pub(crate) fn device_authority(&self) -> DeviceMemoryAuthority {
         self.device.clone()
-    }
-
-    pub(crate) fn set_device_limit(&self, bytes: u64) {
-        self.device.set_limit_bytes(bytes);
     }
 
     fn governor(&self, tier: Tier) -> &LedgerGovernor {

@@ -504,6 +504,36 @@ impl CudaVmmAllocator {
         )
     }
 
+    /// Construct a standalone arena with a unique device authority.
+    ///
+    /// Unlike [`detached`](Self::detached), this follows the production pool
+    /// option. The private authority keeps independent providers isolated while
+    /// allowing all reservations within one provider to share physical handles.
+    pub fn standalone(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+    ) -> Result<Self, MemoryError> {
+        let private = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
+        );
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+            },
+            &private,
+        )
+    }
+
     /// Move this arena's claim onto `governor`, reporting what was recorded.
     ///
     /// The bytes are already committed and mapped, so adoption records an
