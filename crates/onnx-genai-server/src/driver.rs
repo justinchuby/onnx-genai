@@ -18,7 +18,7 @@ use onnx_genai_engine::{
     ResourceLimit, SchedulerAdmissionError,
 };
 use onnx_genai_ort::Tokenizer;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
@@ -52,12 +52,14 @@ pub(crate) enum DriverCommand {
     Generate {
         session_id: Option<SessionId>,
         request: Box<GenerateRequest>,
+        admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
     GeneratePipeline {
         request: Box<GenerateRequest>,
         input: Option<MultimodalInput>,
+        admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -66,6 +68,7 @@ pub(crate) enum DriverCommand {
         suffix: String,
         fim_config: FimConfig,
         options: Box<GenerateOptions>,
+        admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -107,10 +110,15 @@ pub(crate) enum DriverFailureKind {
     MemoryOverload,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DriverFailure {
     pub(crate) message: String,
     pub(crate) kind: DriverFailureKind,
+}
+
+pub(crate) struct DriverGeneration {
+    pub(crate) admission: oneshot::Receiver<Result<(), DriverFailure>>,
+    pub(crate) events: mpsc::Receiver<DriverEvent>,
 }
 
 impl std::fmt::Display for DriverFailure {
@@ -166,6 +174,7 @@ struct DriverRoute {
 
 struct PendingGeneration {
     request: GenerateRequest,
+    admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
     permit: OwnedSemaphorePermit,
 }
@@ -307,19 +316,21 @@ impl EngineDriver {
         &self,
         session_id: Option<SessionId>,
         request: GenerateRequest,
-    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+    ) -> Result<DriverGeneration, GenerateSubmitError> {
         let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
         if self
             .commands
             .send(DriverCommand::Generate {
                 session_id,
                 request: Box::new(request),
+                admission,
                 events,
                 permit,
             })
@@ -329,7 +340,10 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
-        Ok(rx)
+        Ok(DriverGeneration {
+            admission: admission_rx,
+            events: rx,
+        })
     }
 
     /// Run a small generation while blocking the calling thread. Used only by
@@ -341,10 +355,12 @@ impl EngineDriver {
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
         let (events, mut receiver) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let (admission, _admission_rx) = oneshot::channel();
         let command = if pipeline {
             DriverCommand::GeneratePipeline {
                 request: Box::new(request),
                 input: None,
+                admission,
                 events,
                 permit,
             }
@@ -352,6 +368,7 @@ impl EngineDriver {
             DriverCommand::Generate {
                 session_id: None,
                 request: Box::new(request),
+                admission,
                 events,
                 permit,
             }
@@ -373,19 +390,21 @@ impl EngineDriver {
         &self,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
-    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+    ) -> Result<DriverGeneration, GenerateSubmitError> {
         let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
         if self
             .commands
             .send(DriverCommand::GeneratePipeline {
                 request: Box::new(request),
                 input,
+                admission,
                 events,
                 permit,
             })
@@ -395,7 +414,10 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
-        Ok(rx)
+        Ok(DriverGeneration {
+            admission: admission_rx,
+            events: rx,
+        })
     }
 
     /// Render images on the engine thread that owns the pipeline.
@@ -464,13 +486,14 @@ impl EngineDriver {
         suffix: String,
         fim_config: FimConfig,
         options: GenerateOptions,
-    ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
+    ) -> Result<DriverGeneration, GenerateSubmitError> {
         let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
         if self
             .commands
@@ -479,6 +502,7 @@ impl EngineDriver {
                 suffix,
                 fim_config,
                 options: Box::new(options),
+                admission,
                 events,
                 permit,
             })
@@ -488,7 +512,10 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
-        Ok(rx)
+        Ok(DriverGeneration {
+            admission: admission_rx,
+            events: rx,
+        })
     }
 
     pub(crate) async fn embed(
@@ -569,9 +596,10 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
             DriverCommand::GeneratePipeline {
                 request,
                 input,
+                admission,
                 events,
                 permit,
-            } => run_pipeline_generation(engine, *request, input, events, permit),
+            } => run_pipeline_generation(engine, *request, input, admission, events, permit),
             DriverCommand::RenderImages {
                 pipeline_dir,
                 request,
@@ -607,11 +635,17 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                     "sessions are not supported by pipeline models"
                 )));
             }
-            DriverCommand::Generate { events, .. } | DriverCommand::GenerateFim { events, .. } => {
+            DriverCommand::Generate {
+                admission, events, ..
+            }
+            | DriverCommand::GenerateFim {
+                admission, events, ..
+            } => {
                 crate::metrics::generation_queue_cancelled();
-                let _ = events.try_send(DriverEvent::Error(DriverFailure::internal(
-                    "invalid generation route for pipeline model",
-                )));
+                let failure =
+                    DriverFailure::internal("invalid generation route for pipeline model");
+                let _ = admission.send(Err(failure.clone()));
+                let _ = events.try_send(DriverEvent::Error(failure));
             }
             DriverCommand::Embed { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!(
@@ -675,6 +709,7 @@ fn run_static_engine_driver(
             DriverCommand::Generate {
                 session_id: None,
                 request,
+                admission,
                 events,
                 permit,
             } => {
@@ -689,6 +724,7 @@ fn run_static_engine_driver(
                     },
                     PendingGeneration {
                         request: *request,
+                        admission,
                         events,
                         permit,
                     },
@@ -730,11 +766,13 @@ fn run_static_batch_until_idle(
                 Some(DriverCommand::Generate {
                     session_id: None,
                     request,
+                    admission,
                     events,
                     permit,
                 }) => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        admission,
                         events,
                         permit,
                     });
@@ -752,11 +790,13 @@ fn run_static_batch_until_idle(
                 Ok(DriverCommand::Generate {
                     session_id: None,
                     request,
+                    admission,
                     events,
                     permit,
                 }) => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        admission,
                         events,
                         permit,
                     });
@@ -828,6 +868,7 @@ fn run_static_batch_until_idle(
             engine,
             None,
             pending.request,
+            pending.admission,
             pending.events,
             pending.permit,
         );
@@ -844,11 +885,10 @@ fn run_static_batch_until_idle(
         Err(err) => {
             crate::metrics::generation_queue_cancelled();
             for pending in initial {
-                let _ = pending
-                    .events
-                    .try_send(DriverEvent::Error(DriverFailure::internal(format!(
-                        "continuous batch setup failed: {err}"
-                    ))));
+                let failure =
+                    DriverFailure::internal(format!("continuous batch setup failed: {err}"));
+                let _ = pending.admission.send(Err(failure.clone()));
+                let _ = pending.events.try_send(DriverEvent::Error(failure));
             }
             return;
         }
@@ -861,6 +901,7 @@ fn run_static_batch_until_idle(
             &mut routes,
             &mut abandoned,
             pending.request,
+            pending.admission,
             pending.events,
             pending.permit,
         );
@@ -872,6 +913,7 @@ fn run_static_batch_until_idle(
                 Some(DriverCommand::Generate {
                     session_id: None,
                     request,
+                    admission,
                     events,
                     permit,
                 }) => {
@@ -880,6 +922,7 @@ fn run_static_batch_until_idle(
                         &mut routes,
                         &mut abandoned,
                         *request,
+                        admission,
                         events,
                         permit,
                     );
@@ -896,6 +939,7 @@ fn run_static_batch_until_idle(
                 DriverCommand::Generate {
                     session_id: None,
                     request,
+                    admission,
                     events,
                     permit,
                 } => {
@@ -905,6 +949,7 @@ fn run_static_batch_until_idle(
                             &mut routes,
                             &mut abandoned,
                             *request,
+                            admission,
                             events,
                             permit,
                         );
@@ -912,6 +957,7 @@ fn run_static_batch_until_idle(
                         deferred.push_back(DriverCommand::Generate {
                             session_id: None,
                             request,
+                            admission,
                             events,
                             permit,
                         });
@@ -1048,11 +1094,13 @@ fn submit_to_continuous_manager(
     routes: &mut HashMap<usize, DriverRoute>,
     abandoned: &mut HashMap<usize, DriverRoute>,
     request: GenerateRequest,
+    admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
     permit: OwnedSemaphorePermit,
 ) {
     match manager.submit(request) {
         Ok(handle) => {
+            let _ = admission.send(Ok(()));
             routes.insert(
                 handle.id,
                 DriverRoute {
@@ -1065,7 +1113,9 @@ fn submit_to_continuous_manager(
         }
         Err(err) => {
             crate::metrics::generation_queue_cancelled();
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
+            let failure = DriverFailure::from_engine_error(&err);
+            let _ = admission.send(Err(failure.clone()));
+            let _ = events.try_send(DriverEvent::Error(failure));
         }
     }
 }
@@ -1127,22 +1177,34 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         DriverCommand::Generate {
             session_id,
             request,
+            admission,
             events,
             permit,
-        } => run_fallback_generation(engine, session_id, *request, events, permit),
+        } => run_fallback_generation(engine, session_id, *request, admission, events, permit),
         DriverCommand::GenerateFim {
             prefix,
             suffix,
             fim_config,
             options,
+            admission,
             events,
             permit,
-        } => run_fim_generation(engine, prefix, suffix, fim_config, *options, events, permit),
-        DriverCommand::GeneratePipeline { events, .. } => {
+        } => run_fim_generation(
+            engine,
+            prefix,
+            suffix,
+            fim_config,
+            *options,
+            (admission, events, permit),
+        ),
+        DriverCommand::GeneratePipeline {
+            admission, events, ..
+        } => {
             crate::metrics::generation_queue_cancelled();
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::internal(
-                "invalid pipeline generation route for single model",
-            )));
+            let failure =
+                DriverFailure::internal("invalid pipeline generation route for single model");
+            let _ = admission.send(Err(failure.clone()));
+            let _ = events.try_send(DriverEvent::Error(failure));
         }
         DriverCommand::Embed {
             input_ids,
@@ -1182,6 +1244,7 @@ fn run_pipeline_generation(
     engine: &mut PipelineEngine,
     request: GenerateRequest,
     input: Option<MultimodalInput>,
+    admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -1193,12 +1256,13 @@ fn run_pipeline_generation(
         Ok(Some(bound)) => bound,
         Ok(None) => PipelineGenerateRequest::new(request),
         Err(error) => {
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::internal(format!(
-                "{error:#}"
-            ))));
+            let failure = DriverFailure::internal(format!("{error:#}"));
+            let _ = admission.send(Err(failure.clone()));
+            let _ = events.try_send(DriverEvent::Error(failure));
             return;
         }
     };
+    let _ = admission.send(Ok(()));
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
         events
@@ -1220,21 +1284,35 @@ fn run_fallback_generation(
     engine: &mut Engine,
     session_id: Option<SessionId>,
     request: GenerateRequest,
+    admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
     let mut metrics = GenerationMetrics::start();
+    let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
         events
             .try_send(DriverEvent::Token(token))
             .context("stream receiver closed")
     };
-    let result = match session_id {
-        Some(session_id) => {
-            engine.generate_in_session_with_callback(session_id, request, Some(&mut callback))
+    let result = {
+        let mut admitted = || {
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Ok(()));
+            }
+        };
+        match session_id {
+            Some(session_id) => engine.generate_in_session_with_callbacks(
+                session_id,
+                request,
+                Some(&mut admitted),
+                Some(&mut callback),
+            ),
+            None => {
+                engine.generate_with_callbacks(request, Some(&mut admitted), Some(&mut callback))
+            }
         }
-        None => engine.generate_with_callback(request, Some(&mut callback)),
     };
     match result {
         Ok(result) => {
@@ -1242,7 +1320,11 @@ fn run_fallback_generation(
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
+            let failure = DriverFailure::from_engine_error(&err);
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Err(failure.clone()));
+            }
+            let _ = events.try_send(DriverEvent::Error(failure));
         }
     }
 }
@@ -1253,17 +1335,41 @@ fn run_fim_generation(
     suffix: String,
     fim_config: FimConfig,
     options: GenerateOptions,
-    events: mpsc::Sender<DriverEvent>,
-    _permit: OwnedSemaphorePermit,
+    delivery: (
+        oneshot::Sender<Result<(), DriverFailure>>,
+        mpsc::Sender<DriverEvent>,
+        OwnedSemaphorePermit,
+    ),
 ) {
+    let (admission, events, _permit) = delivery;
     let mut metrics = GenerationMetrics::start();
-    match engine.generate_fim_with_config(prefix, suffix, options, &fim_config) {
+    let mut admission = Some(admission);
+    let result = {
+        let mut admitted = || {
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Ok(()));
+            }
+        };
+        engine.generate_fim_with_config_and_callbacks(
+            prefix,
+            suffix,
+            options,
+            &fim_config,
+            Some(&mut admitted),
+            None,
+        )
+    };
+    match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
+            let failure = DriverFailure::from_engine_error(&err);
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Err(failure.clone()));
+            }
+            let _ = events.try_send(DriverEvent::Error(failure));
         }
     }
 }

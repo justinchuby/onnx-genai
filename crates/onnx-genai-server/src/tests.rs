@@ -1981,6 +1981,99 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
 }
 
 #[tokio::test]
+async fn fim_stream_returns_headers_before_generation_finishes() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
+        .expect("load fixture")
+        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        }));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "model": "tiny-llm",
+                "prompt": "prefix",
+                "suffix": "suffix",
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = timeout(Duration::from_millis(100), app(state).oneshot(request))
+        .await
+        .expect("SSE headers must follow admission, not completed FIM generation")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(
+        Duration::from_secs(10),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("FIM stream did not terminate")
+    .unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
+    );
+}
+
+#[tokio::test]
+async fn accepted_zero_visible_output_stream_returns_headers_and_terminates() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                        "stop": "tok22",
+                        "logprobs": 1,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let events = sse_json_events(&body);
+    assert!(
+        events.iter().all(|event| event["choices"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()),
+        "the stop sequence must suppress all visible token text: {}",
+        std::str::from_utf8(&body).unwrap()
+    );
+    assert_eq!(
+        events.last().unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
+    );
+}
+
+#[tokio::test]
 async fn loaded_server_model_reports_nonzero_device_ledger_usage() {
     let state = tiny_state();
     let handle = state.registry.resolve("").unwrap().unwrap();
@@ -2069,6 +2162,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
     }))
     .unwrap();
     let (slow_tx, _slow_rx) = mpsc::channel(1);
+    let (slow_admission, _slow_admission_rx) = tokio::sync::oneshot::channel();
     let slow_permit = driver
         .generation_capacity
         .clone()
@@ -2079,6 +2173,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .send(DriverCommand::Generate {
             session_id: None,
             request: Box::new(build_generate_request(&slow_request)),
+            admission: slow_admission,
             events: slow_tx,
             permit: slow_permit,
         })
@@ -2089,10 +2184,13 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
 
-    let fast_result = timeout(Duration::from_secs(5), collect_generation_result(fast_rx))
-        .await
-        .expect("fast request timed out behind stalled consumer")
-        .expect("fast request failed");
+    let fast_result = timeout(
+        Duration::from_secs(5),
+        collect_generation_result(fast_rx.events),
+    )
+    .await
+    .expect("fast request timed out behind stalled consumer")
+    .expect("fast request failed");
     assert_eq!(fast_result.token_ids.len(), 2);
 }
 
@@ -2117,11 +2215,14 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let rx = driver.generate(Some(session_id), request).await.unwrap();
-    let result = timeout(Duration::from_secs(5), collect_generation_result(rx))
-        .await
-        .expect("native session generation timed out")
-        .expect("native session generation failed");
+    let generation = driver.generate(Some(session_id), request).await.unwrap();
+    let result = timeout(
+        Duration::from_secs(5),
+        collect_generation_result(generation.events),
+    )
+    .await
+    .expect("native session generation timed out")
+    .expect("native session generation failed");
 
     assert_eq!(result.token_ids, vec![1, 1]);
     assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);

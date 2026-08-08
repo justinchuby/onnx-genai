@@ -118,6 +118,7 @@ impl Engine {
     fn generate_native_cold_with_callback(
         &mut self,
         mut request: GenerateRequest,
+        mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
@@ -143,6 +144,9 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
 
         // Speculation ON (implemented greedy prompt-lookup) → the native
         // speculative driver. Every other request stays on the untouched plain
@@ -211,6 +215,7 @@ impl Engine {
     fn generate_native_cold_with_callback(
         &mut self,
         _request: GenerateRequest,
+        _admission_callback: Option<&mut dyn FnMut()>,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         anyhow::bail!(
@@ -479,10 +484,23 @@ impl Engine {
         options: GenerateOptions,
         fim_config: &FimConfig,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_fim_with_config_and_callbacks(prefix, suffix, options, fim_config, None, None)
+    }
+
+    /// Generate FIM text and notify the caller immediately after scheduler admission.
+    pub fn generate_fim_with_config_and_callbacks(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+        fim_config: &FimConfig,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
         request.options = self.fim_options(fim_config, options);
-        self.generate(request)
+        self.generate_with_callbacks(request, admission_callback, token_callback)
     }
 
     /// Generate text and optionally stream each generated token to `callback`.
@@ -490,6 +508,17 @@ impl Engine {
         &mut self,
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callbacks(request, None, callback)
+    }
+
+    /// Generate text, notifying `admission_callback` after scheduler admission
+    /// and before backend execution, then streaming tokens to `token_callback`.
+    pub fn generate_with_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
@@ -500,21 +529,41 @@ impl Engine {
             let native_spec_requested = request.options.speculative_mode.is_some()
                 || request.options.num_speculative_tokens.is_some();
             if request.options.cold_start || native_spec_requested {
-                let result = self.generate_native_cold_with_callback(request, callback);
+                let result = self.generate_native_cold_with_callback(
+                    request,
+                    admission_callback,
+                    token_callback,
+                );
                 self.native_active_session = None;
                 return result;
             }
             let session_id = self.default_native_session()?;
-            return self.generate_native_in_session_with_callback(session_id, request, callback);
+            return self.generate_native_in_session_with_callbacks(
+                session_id,
+                request,
+                admission_callback,
+                token_callback,
+            );
         }
         if !generate_uses_scheduler(self.decode_backend) {
             #[cfg(not(feature = "native-backend"))]
             {
-                return self.generate_native_cold_with_callback(request, callback);
+                return self.generate_native_cold_with_callback(
+                    request,
+                    admission_callback,
+                    token_callback,
+                );
             }
         }
         let session_id = self.create_session()?;
-        let result = self.generate_in_session_with_callback(session_id, request, callback);
+        let result = self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            admission_callback,
+            token_callback,
+        );
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -540,7 +589,7 @@ impl Engine {
         priority: Priority,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_in_session_with_priority_and_callback(
-            session_id, request, priority, None, None,
+            session_id, request, priority, None, None, None,
         )
     }
 
@@ -556,7 +605,26 @@ impl Engine {
             request,
             Priority::Normal,
             None,
+            None,
             callback,
+        )
+    }
+
+    /// Generate in a persistent session with an explicit admission notification.
+    pub fn generate_in_session_with_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            admission_callback,
+            token_callback,
         )
     }
 
@@ -580,6 +648,7 @@ impl Engine {
             Priority::Normal,
             Some(sampler),
             None,
+            None,
         )
     }
 
@@ -589,6 +658,7 @@ impl Engine {
         request: GenerateRequest,
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
+        mut admission_callback: Option<&mut dyn FnMut()>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         #[cfg(feature = "native-backend")]
@@ -599,7 +669,12 @@ impl Engine {
             if custom_sampler.is_some() {
                 anyhow::bail!("custom samplers are not supported on the native backend");
             }
-            return self.generate_native_in_session_with_callback(session_id, request, callback);
+            return self.generate_native_in_session_with_callbacks(
+                session_id,
+                request,
+                admission_callback,
+                callback,
+            );
         }
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
@@ -624,6 +699,9 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
 
         let Some(mut state) = self.sessions.remove(&session_id) else {
             self.scheduler.complete(session_id);
@@ -1920,13 +1998,14 @@ impl Engine {
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_impl(session_id, request, callback)
+        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
     }
 
-    fn generate_native_in_session_impl(
+    fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
         request: GenerateRequest,
+        mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
@@ -1956,6 +2035,9 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             let active_matches = self.native_active_session == Some(session_id);
@@ -2212,7 +2294,12 @@ mod tests {
         request.options.max_new_tokens = 1;
         request.options.stop_on_eos = false;
 
-        let error = engine.generate(request).unwrap_err().to_string();
+        let mut admitted = false;
+        let mut on_admitted = || admitted = true;
+        let error = engine
+            .generate_with_callbacks(request, Some(&mut on_admitted), None)
+            .unwrap_err()
+            .to_string();
 
         assert!(
             error.contains("scheduler admission failed: KV byte budget"),
@@ -2222,6 +2309,7 @@ mod tests {
             !error.contains("native decoder session is unavailable"),
             "native backend was touched before scheduler admission rejected: {error}"
         );
+        assert!(!admitted, "refused requests must not signal admission");
         Ok(())
     }
 }

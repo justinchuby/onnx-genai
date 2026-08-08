@@ -162,17 +162,16 @@ async fn run_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let result = collect_generation_result(
-        submit_completion(
-            &handle,
-            &state.sessions,
-            prepared.generation,
-            client_session_id.as_deref(),
-        )
-        .await?,
+    let generation = submit_completion(
+        &handle,
+        &state.sessions,
+        prepared.generation,
+        client_session_id.as_deref(),
     )
-    .await
-    .map_err(generation_failure)?;
+    .await?;
+    let result = collect_generation_result(generation.events)
+        .await
+        .map_err(generation_failure)?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
@@ -219,14 +218,15 @@ async fn stream_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let driver_rx = submit_completion(
+    let generation = submit_completion(
         &handle,
         &state.sessions,
         prepared.generation,
         client_session_id.as_deref(),
     )
     .await?;
-    let mut driver_stream = AcceptedDriverStream::new(driver_rx).await?;
+    await_driver_admission(generation.admission).await?;
+    let mut driver_rx = generation.events;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
@@ -234,7 +234,7 @@ async fn stream_completion(
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut emitted_text = false;
         let result = loop {
-            match driver_stream.recv().await {
+            match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
                     if requested_logprobs.is_some() {
                         continue;
@@ -433,7 +433,7 @@ async fn run_chat_completion(
 
     let session_for_count = session_lookup;
     let wants_constrained_json = request.wants_constrained_json();
-    let result = collect_generation_result(if handle.pipeline {
+    let generation = if handle.pipeline {
         handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
@@ -445,9 +445,10 @@ async fn run_chat_completion(
             .generate(session_lookup, generation_request)
             .await
             .map_err(map_generate_submit_error)?
-    })
-    .await
-    .map_err(generation_failure);
+    };
+    let result = collect_generation_result(generation.events)
+        .await
+        .map_err(generation_failure);
     crate::metrics::add_prompt_tokens(prompt_tokens);
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
@@ -590,7 +591,7 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    let driver_rx = if handle.pipeline {
+    let generation = if handle.pipeline {
         handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
@@ -603,7 +604,8 @@ async fn stream_chat_completion(
             .await
             .map_err(map_generate_submit_error)?
     };
-    let mut driver_stream = AcceptedDriverStream::new(driver_rx).await?;
+    await_driver_admission(generation.admission).await?;
+    let mut driver_rx = generation.events;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
 
     tokio::spawn(async move {
@@ -614,7 +616,7 @@ async fn stream_chat_completion(
         let buffer_for_tool_detection =
             request.has_tool_context() && tools_parseable_from_output(&request);
         let result = loop {
-            match driver_stream.recv().await {
+            match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
                     if requested_top_logprobs.is_some() {
                         continue;
@@ -774,30 +776,15 @@ async fn stream_chat_completion(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
-struct AcceptedDriverStream {
-    first_event: Option<DriverEvent>,
-    receiver: mpsc::Receiver<DriverEvent>,
-}
-
-impl AcceptedDriverStream {
-    async fn new(mut receiver: mpsc::Receiver<DriverEvent>) -> Result<Self, ApiError> {
-        match receiver.recv().await {
-            Some(DriverEvent::Error(error)) => Err(generation_failure(error)),
-            Some(first_event) => Ok(Self {
-                first_event: Some(first_event),
-                receiver,
-            }),
-            None => Err(generation_failure(DriverFailure::internal(
-                "generation stream ended before admission",
-            ))),
-        }
-    }
-
-    async fn recv(&mut self) -> Option<DriverEvent> {
-        match self.first_event.take() {
-            Some(event) => Some(event),
-            None => self.receiver.recv().await,
-        }
+async fn await_driver_admission(
+    admission: oneshot::Receiver<Result<(), DriverFailure>>,
+) -> Result<(), ApiError> {
+    match admission.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(generation_failure(error)),
+        Err(_) => Err(ApiError::internal(
+            "generation driver stopped before admission completed",
+        )),
     }
 }
 
@@ -814,14 +801,12 @@ mod stream_admission_tests {
     }
 
     async fn assert_streaming_overload_response() {
-        let (tx, rx) = mpsc::channel(1);
-        tx.send(DriverEvent::Error(memory_overload()))
-            .await
-            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(memory_overload())).unwrap();
 
-        let error = match AcceptedDriverStream::new(rx).await {
+        let error = match await_driver_admission(rx).await {
             Err(error) => error,
-            Ok(_) => panic!("memory refusal must happen before constructing SSE"),
+            Ok(()) => panic!("memory refusal must happen before constructing SSE"),
         };
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -845,20 +830,39 @@ mod stream_admission_tests {
     }
 
     #[tokio::test]
-    async fn accepted_stream_preserves_first_driver_event() {
-        let first = onnx_genai::GenerateToken {
-            token_id: 42,
-            text: "first".to_string(),
-            finish_reason: None,
-        };
-        let (tx, rx) = mpsc::channel(1);
-        tx.send(DriverEvent::Token(first.clone())).await.unwrap();
+    async fn accepted_stream_does_not_wait_for_first_token() {
+        let (admission_tx, admission_rx) = oneshot::channel();
+        let (_events_tx, mut events_rx) = mpsc::channel::<DriverEvent>(1);
+        admission_tx.send(Ok(())).unwrap();
 
-        let mut stream = AcceptedDriverStream::new(rx).await.unwrap();
-        match stream.recv().await {
-            Some(DriverEvent::Token(actual)) => assert_eq!(actual, first),
-            _ => panic!("the admission handshake must preserve the first token"),
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            await_driver_admission(admission_rx),
+        )
+        .await
+        .expect("admission must not wait for output")
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), events_rx.recv())
+                .await
+                .is_err(),
+            "the test driver deliberately delays its first event"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_admission_sender_fails_without_hanging() {
+        let (tx, rx) = oneshot::channel::<Result<(), DriverFailure>>();
+        drop(tx);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            await_driver_admission(rx),
+        )
+        .await
+        .expect("dropped sender must resolve promptly")
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
 
@@ -1253,7 +1257,7 @@ async fn submit_completion(
     sessions: &SessionRegistry,
     generation: CompletionGeneration,
     client_session_id: Option<&str>,
-) -> Result<mpsc::Receiver<DriverEvent>, ApiError> {
+) -> Result<DriverGeneration, ApiError> {
     match generation {
         CompletionGeneration::Plain(request) => {
             let session_id = if let Some(id) = client_session_id {

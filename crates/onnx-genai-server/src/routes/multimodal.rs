@@ -94,15 +94,14 @@ pub(crate) async fn audio_transcriptions(
             ..GenerateOptions::default()
         },
     };
-    let result = collect_generation_result(
-        handle
-            .engine
-            .generate_pipeline(request, Some(input))
-            .await
-            .map_err(map_generate_submit_error)?,
-    )
-    .await
-    .map_err(generation_failure)?;
+    let generation = handle
+        .engine
+        .generate_pipeline(request, Some(input))
+        .await
+        .map_err(map_generate_submit_error)?;
+    let result = collect_generation_result(generation.events)
+        .await
+        .map_err(generation_failure)?;
     crate::metrics::add_prompt_tokens(prompt_tokens);
 
     match response_format.as_str() {

@@ -26,11 +26,14 @@ use onnx_genai_engine::{
 use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, DriverFailure, DriverFailureKind, EngineDriver, GenerateSubmitError},
+    driver::{
+        DriverEvent, DriverFailure, DriverFailureKind, DriverGeneration, EngineDriver,
+        GenerateSubmitError,
+    },
     multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
