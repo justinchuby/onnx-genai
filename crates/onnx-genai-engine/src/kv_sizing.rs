@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(feature = "native-backend"),
+    expect(
+        dead_code,
+        reason = "exact native KV sizing is consumed only by the native backend"
+    )
+)]
+
 use anyhow::{Context, bail};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KvDimension {

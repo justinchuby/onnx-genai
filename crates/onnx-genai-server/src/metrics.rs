@@ -86,20 +86,37 @@ struct Registry {
     trace_ids: AtomicU64,
 }
 
-static REGISTRY: Registry = Registry {
-    requests: [const { [const { AtomicU64::new(0) }; STATUS_CODES] }; ENDPOINTS.len()],
-    prompt_tokens: AtomicU64::new(0),
-    completion_tokens: AtomicU64::new(0),
-    ttft: Histogram::new(),
-    e2e: Histogram::new(),
-    active_sessions: AtomicU64::new(0),
-    pending: AtomicU64::new(0),
-    batch_size: AtomicU64::new(0),
-    prefix_cache_hits: AtomicU64::new(0),
-    prefix_cache_lookups: AtomicU64::new(0),
-    rejections: AtomicU64::new(0),
-    trace_ids: AtomicU64::new(1),
-};
+impl Registry {
+    const fn new() -> Self {
+        Self {
+            requests: [const { [const { AtomicU64::new(0) }; STATUS_CODES] }; ENDPOINTS.len()],
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            ttft: Histogram::new(),
+            e2e: Histogram::new(),
+            active_sessions: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            batch_size: AtomicU64::new(0),
+            prefix_cache_hits: AtomicU64::new(0),
+            prefix_cache_lookups: AtomicU64::new(0),
+            rejections: AtomicU64::new(0),
+            trace_ids: AtomicU64::new(1),
+        }
+    }
+
+    fn request_finished(&self, path: &str, status: StatusCode) {
+        let endpoint = endpoint_index(path);
+        let code = usize::from(status.as_u16());
+        if code < STATUS_CODES {
+            self.requests[endpoint][code].fetch_add(1, Ordering::Relaxed);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static REGISTRY: Registry = Registry::new();
 
 pub(crate) struct GenerationMetrics {
     started: Instant,
@@ -147,14 +164,7 @@ impl Drop for GenerationMetrics {
 }
 
 pub(crate) fn request_finished(path: &str, status: StatusCode) {
-    let endpoint = endpoint_index(path);
-    let code = usize::from(status.as_u16());
-    if code < STATUS_CODES {
-        REGISTRY.requests[endpoint][code].fetch_add(1, Ordering::Relaxed);
-    }
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        REGISTRY.rejections.fetch_add(1, Ordering::Relaxed);
-    }
+    REGISTRY.request_finished(path, status);
 }
 
 pub(crate) fn request_started() -> u64 {
@@ -577,6 +587,29 @@ fn signed_gauge(output: &mut String, name: &str, help: &str, value: i64) {
     writeln!(output, "# HELP {name} {help}").expect("String write");
     writeln!(output, "# TYPE {name} gauge").expect("String write");
     writeln!(output, "{name} {value}").expect("String write");
+}
+
+#[cfg(test)]
+mod request_metric_tests {
+    use super::*;
+
+    #[test]
+    fn overload_response_increments_rejections_exactly_once() {
+        let registry = Registry::new();
+
+        registry.request_finished("/v1/chat/completions", StatusCode::TOO_MANY_REQUESTS);
+
+        assert_eq!(registry.rejections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unrelated_error_does_not_increment_rejections() {
+        let registry = Registry::new();
+
+        registry.request_finished("/v1/chat/completions", StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert_eq!(registry.rejections.load(Ordering::Relaxed), 0);
+    }
 }
 
 #[cfg(feature = "metrics")]

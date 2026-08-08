@@ -34,7 +34,11 @@ pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
 
-pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
+pub use onnx_genai_scheduler::SchedulerAdmissionError;
+
+pub use batched::{
+    ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
+};
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
