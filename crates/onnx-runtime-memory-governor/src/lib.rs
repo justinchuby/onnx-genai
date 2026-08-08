@@ -440,6 +440,22 @@ impl MemoryLease {
         self.holder
     }
 
+    /// Reserve a temporary sibling lease from the same accounting authority.
+    ///
+    /// This is for transactional replacement allocations that must coexist
+    /// briefly with memory already covered by this lease. The returned lease
+    /// releases automatically on every success and error path.
+    pub fn reserve_sibling(&self, bytes: u64) -> Result<Self, MemoryError> {
+        self.accounting.try_claim(self.tier, bytes, self.role)?;
+        Ok(Self::new(
+            self.tier,
+            bytes,
+            self.role,
+            self.holder,
+            Arc::clone(&self.accounting),
+        ))
+    }
+
     /// Extend this lease by `extra` bytes, or fail leaving it exactly as it was.
     ///
     /// Growing in place matters because the alternative — reserve a bigger lease

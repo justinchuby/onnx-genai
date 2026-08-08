@@ -716,7 +716,7 @@ impl PagedKvCache {
                 return Ok(page_id);
             }
 
-            let checkpoint = self.page_table.allocation_checkpoint(Device::Gpu(0));
+            let checkpoint = self.page_table.allocation_checkpoint(Device::Gpu(0))?;
             let new_page_id =
                 self.page_table
                     .allocate(Device::Gpu(0))
@@ -1074,6 +1074,10 @@ mod tests {
     }
 
     impl KvPageStoreFactory for ToggleCopyFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
         fn create(
             &self,
             residency: Device,
@@ -1783,6 +1787,7 @@ mod tests {
                 .append_token_kv(unrelated, &borrowed_layers(&small_layers(values)))
                 .unwrap();
         }
+
         cache.page_table.touch(shared_page);
         fail_copy.store(true, Ordering::Relaxed);
 
@@ -1832,6 +1837,59 @@ mod tests {
             .unwrap();
         assert_eq!(cache.len(forked).unwrap(), 2);
         assert_eq!(cache.page_table.pages[&shared_page].ref_count, 1);
+    }
+
+    #[test]
+    fn full_budget_refuses_cow_snapshot_before_allocation() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let config = PageTensorConfig {
+            page_size: 2,
+            ..small_config(KvDType::F32)
+        };
+        let layer_configs = vec![LayerTensorConfig::new(config.num_kv_heads, config.head_dim)];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 1);
+        let pool_bytes = PageTable::planned_pool_bytes(2, 1, &layer_configs, Some(&quant));
+        let ledger = LeaseLedger::new(0, pool_bytes, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut cache = PagedKvCache::new_leased(
+            2,
+            KvDType::F32,
+            layer_configs,
+            1,
+            &governor,
+            Tier::Host,
+            HolderId::new(99),
+        )
+        .unwrap();
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+        let shared = cache.page_table.get_sequence(source).unwrap()[0];
+        let free_before = cache.page_table.free_count(Device::Gpu(0));
+        let stats_before = cache.page_table.stats();
+        let resident_before = cache.resident_bytes();
+
+        assert!(matches!(
+            cache.append_token_kv(
+                forked,
+                &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+            ),
+            Err(KvError::MigrationPressure(_))
+        ));
+        assert_eq!(governor.used(Tier::Host), pool_bytes);
+        assert_eq!(cache.page_table.free_count(Device::Gpu(0)), free_before);
+        assert_eq!(cache.page_table.stats(), stats_before);
+        assert_eq!(cache.resident_bytes(), resident_before);
+        assert_eq!(cache.page_table.pages[&shared].ref_count, 2);
+        assert_eq!(cache.len(forked).unwrap(), 1);
     }
 
     #[test]

@@ -76,11 +76,24 @@ pub struct PageStoreLayout {
     pub scale_len: usize,
 }
 
+impl PageStoreLayout {
+    pub fn host_allocated_bytes(self) -> u64 {
+        (self.f32_len as u64 + self.scale_len as u64) * size_of::<f32>() as u64
+            + self.int8_len as u64
+            + self.fp8_len as u64
+    }
+}
+
 /// Creates an empty target store for a transactional page migration.
 ///
 /// Cache callers depend only on this contract. Stage 3 can supply a factory
 /// that creates `CudaPageStore` for GPU locations without changing them.
 pub trait KvPageStoreFactory: fmt::Debug + Send + Sync {
+    /// Maximum bytes allocated by `create` for this layout and residency.
+    ///
+    /// The page table reserves this amount before calling `create`, making it
+    /// impossible for a governed migration to allocate first and account later.
+    fn allocation_bytes(&self, residency: Device, layout: PageStoreLayout) -> u64;
     fn create(
         &self,
         residency: Device,
@@ -88,30 +101,15 @@ pub trait KvPageStoreFactory: fmt::Debug + Send + Sync {
     ) -> Result<Box<dyn KvPageStore>, KvError>;
 }
 
-/// Result hook for future per-tier transfer charging.
+/// Completed migration details for telemetry and future transfer accounting.
 ///
-/// Stage 2 deliberately retains the page table's single pool lease. Host-backed
-/// emulation must not double-lease the same bytes; Stage 3 can use
-/// `bytes_copied` and the source/target locations to charge a physical transfer.
+/// Replacement allocation is already covered by a transient sibling lease
+/// before this result can be returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageMigration {
     pub from: Device,
     pub to: Device,
     pub bytes_copied: u64,
-    pub accounting: MigrationAccounting,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MigrationAccounting {
-    /// Covered only by the existing aggregate page-pool lease.
-    ExistingPoolLeaseOnly,
-    /// The source remains live while the replacement is allocated and copied.
-    ///
-    /// The current host-emulation table retains only its aggregate pool lease,
-    /// so this temporary extra allocation is reported honestly rather than
-    /// claimed against that lease. Stage 3 must replace this with a charged
-    /// transient lease when physical per-tier stores gain governor authority.
-    UnleasedTransient(u64),
 }
 
 impl Clone for Box<dyn KvPageStore> {
@@ -235,6 +233,10 @@ impl KvPageStore for HostPageStore {
 pub struct HostPageStoreFactory;
 
 impl KvPageStoreFactory for HostPageStoreFactory {
+    fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+        layout.host_allocated_bytes()
+    }
+
     fn create(
         &self,
         residency: Device,
@@ -674,7 +676,6 @@ impl Page {
                 from,
                 to: target,
                 bytes_copied: 0,
-                accounting: MigrationAccounting::ExistingPoolLeaseOnly,
             });
         }
         let mut replacement = factory.create(target, self.store_layout)?;
@@ -684,14 +685,12 @@ impl Page {
                 actual: replacement.residency(),
             });
         }
-        let transient_bytes = replacement.allocated_bytes();
         let bytes_copied = self.store.copy_to(replacement.as_mut())?;
         self.store = replacement;
         Ok(PageMigration {
             from,
             to: target,
             bytes_copied,
-            accounting: MigrationAccounting::UnleasedTransient(transient_bytes),
         })
     }
 
@@ -1036,6 +1035,7 @@ pub(crate) struct PageAllocationCheckpoint {
     stats: PageStats,
     clock: u64,
     next_page_id: PageId,
+    _transient_lease: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 
 impl PageTable {
@@ -1053,20 +1053,50 @@ impl PageTable {
         target: Device,
     ) -> Result<PageMigration, KvError> {
         let factory = Arc::clone(&self.migration_factory);
+        let page = self
+            .pages
+            .get(&page_id)
+            .ok_or(KvError::PageNotFound(page_id))?;
+        if page.residency() == target {
+            return Ok(PageMigration {
+                from: target,
+                to: target,
+                bytes_copied: 0,
+            });
+        }
+        let transient_bytes = factory.allocation_bytes(target, page.store_layout);
+        let _transient_lease = self.reserve_transient(transient_bytes)?;
         self.pages
             .get_mut(&page_id)
             .ok_or(KvError::PageNotFound(page_id))?
             .migrate(target, factory.as_ref())
     }
 
-    pub(crate) fn allocation_checkpoint(&self, device: Device) -> PageAllocationCheckpoint {
+    fn reserve_transient(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>, KvError> {
+        self.pool_lease
+            .as_ref()
+            .map(|lease| {
+                lease
+                    .reserve_sibling(bytes)
+                    .map_err(KvError::MigrationPressure)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn allocation_checkpoint(
+        &self,
+        device: Device,
+    ) -> Result<PageAllocationCheckpoint, KvError> {
         let reused_page = self
             .free_pages
             .get(&device)
             .and_then(|pages| pages.last())
             .and_then(|page_id| self.pages.get(page_id))
             .cloned();
-        let evicted_hot = if matches!(device, Device::Gpu(_))
+        let evicted_page = if matches!(device, Device::Gpu(_))
             && self.free_count(device) == 0
             && self.hot_used_count() >= self.hot_capacity
         {
@@ -1076,11 +1106,15 @@ impl PageTable {
                     page.ref_count > 0 && matches!(page.residency(), Device::Gpu(_))
                 })
                 .min_by_key(|(_, page)| page.last_access)
-                .map(|(page_id, page)| (*page_id, page.clone_physical_store()))
+                .map(|(page_id, page)| (*page_id, page))
         } else {
             None
         };
-        PageAllocationCheckpoint {
+        let transient_bytes = evicted_page.map_or(0, |(_, page)| page.allocated_bytes());
+        let transient_lease = self.reserve_transient(transient_bytes)?;
+        let evicted_hot =
+            evicted_page.map(|(page_id, page)| (page_id, page.clone_physical_store()));
+        Ok(PageAllocationCheckpoint {
             device,
             reused_page,
             evicted_hot,
@@ -1088,7 +1122,8 @@ impl PageTable {
             stats: self.stats,
             clock: self.clock,
             next_page_id: self.next_page_id,
-        }
+            _transient_lease: transient_lease,
+        })
     }
 
     pub(crate) fn rollback_allocation(
@@ -1829,6 +1864,10 @@ mod migration_tests {
     struct AllocationFailureFactory;
 
     impl KvPageStoreFactory for AllocationFailureFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
         fn create(
             &self,
             _residency: Device,
@@ -1842,6 +1881,10 @@ mod migration_tests {
     struct CopyFailureFactory;
 
     impl KvPageStoreFactory for CopyFailureFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
         fn create(
             &self,
             residency: Device,
@@ -1903,6 +1946,10 @@ mod migration_tests {
     struct DeviceOnlyFactory;
 
     impl KvPageStoreFactory for DeviceOnlyFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
         fn create(
             &self,
             residency: Device,
@@ -2047,10 +2094,6 @@ mod migration_tests {
         assert_eq!(
             demoted.bytes_copied,
             table.pages[&page_id].allocated_bytes()
-        );
-        assert_eq!(
-            demoted.accounting,
-            MigrationAccounting::UnleasedTransient(demoted.bytes_copied)
         );
         assert_eq!(snapshot(&table.pages[&page_id]), before);
         let page = &table.pages[&page_id];
@@ -2265,6 +2308,7 @@ mod pool_lease_tests {
     use onnx_runtime_memory_governor::{
         HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
     };
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     const HOLDER: HolderId = HolderId::new(7);
 
@@ -2280,6 +2324,105 @@ mod pool_lease_tests {
     fn planned(pages: usize, layers: usize) -> u64 {
         let quant = KvQuantConfig::homogeneous(KvDType::F32, layers);
         PageTable::planned_pool_bytes(16, pages, &configs(layers), Some(&quant))
+    }
+
+    #[derive(Debug)]
+    struct ObservingFactory {
+        ledger: Arc<LeaseLedger>,
+        observed_used: Arc<AtomicU64>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl KvPageStoreFactory for ObservingFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
+        fn create(
+            &self,
+            residency: Device,
+            layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            self.observed_used
+                .store(self.ledger.used(Tier::Host), Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(KvError::PageStoreAllocationFailed("injected".into()));
+            }
+            HostPageStoreFactory.create(residency, layout)
+        }
+    }
+
+    #[test]
+    fn full_budget_refuses_migration_before_target_allocation() {
+        let want = planned(1, 2);
+        let ledger = LeaseLedger::new(0, want, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut table = PageTable::new_leased(
+            16,
+            1,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Host,
+            HOLDER,
+        )
+        .unwrap();
+        let page_id = table.allocate(Device::Gpu(0)).unwrap();
+        let before = table.pages[&page_id].host_view().unwrap().data.to_vec();
+        let free_before = table.free_pages.clone();
+        let stats_before = table.stats();
+        let observed = Arc::new(AtomicU64::new(0));
+        table.set_migration_factory(Arc::new(ObservingFactory {
+            ledger: Arc::clone(&ledger),
+            observed_used: Arc::clone(&observed),
+            fail: Arc::new(AtomicBool::new(false)),
+        }));
+
+        assert!(matches!(
+            table.migrate_page(page_id, Device::Cpu),
+            Err(KvError::MigrationPressure(_))
+        ));
+        assert_eq!(observed.load(Ordering::Relaxed), 0);
+        assert_eq!(ledger.used(Tier::Host), want);
+        assert_eq!(table.pages[&page_id].residency(), Device::Gpu(0));
+        assert_eq!(table.pages[&page_id].host_view().unwrap().data, before);
+        assert_eq!(table.free_pages, free_before);
+        assert_eq!(table.stats(), stats_before);
+    }
+
+    #[test]
+    fn transient_migration_lease_covers_success_and_failure_then_releases() {
+        let page_bytes = planned(1, 2);
+        let ledger = LeaseLedger::new(0, page_bytes * 2, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut table = PageTable::new_leased(
+            16,
+            1,
+            KvDType::F32,
+            configs(2),
+            &governor,
+            Tier::Host,
+            HOLDER,
+        )
+        .unwrap();
+        let page_id = table.allocate(Device::Gpu(0)).unwrap();
+        let observed = Arc::new(AtomicU64::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        table.set_migration_factory(Arc::new(ObservingFactory {
+            ledger: Arc::clone(&ledger),
+            observed_used: Arc::clone(&observed),
+            fail: Arc::clone(&fail),
+        }));
+
+        table.migrate_page(page_id, Device::Cpu).unwrap();
+        assert_eq!(observed.load(Ordering::Relaxed), page_bytes * 2);
+        assert_eq!(ledger.used(Tier::Host), page_bytes);
+
+        fail.store(true, Ordering::Relaxed);
+        assert!(table.migrate_page(page_id, Device::Gpu(0)).is_err());
+        assert_eq!(observed.load(Ordering::Relaxed), page_bytes * 2);
+        assert_eq!(ledger.used(Tier::Host), page_bytes);
+        assert_eq!(table.pages[&page_id].residency(), Device::Cpu);
     }
 
     /// A governed pool leases exactly what it occupies.

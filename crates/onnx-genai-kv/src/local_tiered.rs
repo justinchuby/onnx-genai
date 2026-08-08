@@ -707,6 +707,10 @@ mod tests {
     struct CpuFailureFactory;
 
     impl KvPageStoreFactory for CpuFailureFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
         fn create(
             &self,
             residency: Device,

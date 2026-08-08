@@ -43,8 +43,8 @@ pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
 pub use page_table::{
     DevicePageSpan, HostPageStore, HostPageStoreFactory, HostPageStoreView, HostPageStoreViewMut,
     KvDType, KvKind, KvPageStore, KvPageStoreFactory, KvQuantConfig, LayerKvDType,
-    LayerTensorConfig, MigrationAccounting, Page, PageId, PageMigration, PageStats,
-    PageStoreLayout, PageTable, PageTensorConfig, PageUsage, SequenceUsage,
+    LayerTensorConfig, Page, PageId, PageMigration, PageStats, PageStoreLayout, PageTable,
+    PageTensorConfig, PageUsage, SequenceUsage,
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;
@@ -269,6 +269,8 @@ pub enum KvError {
         /// What was allocated.
         actual: u64,
     },
+    #[error("cannot reserve transient KV migration memory: {0}")]
+    MigrationPressure(onnx_runtime_memory_governor::MemoryError),
     #[error("Sequence {0} not found")]
     SequenceNotFound(SequenceId),
     #[error("Out of memory: need {needed} pages, have {available}")]
