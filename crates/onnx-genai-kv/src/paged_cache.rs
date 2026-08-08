@@ -716,6 +716,7 @@ impl PagedKvCache {
                 return Ok(page_id);
             }
 
+            let checkpoint = self.page_table.allocation_checkpoint(Device::Gpu(0));
             let new_page_id =
                 self.page_table
                     .allocate(Device::Gpu(0))
@@ -731,10 +732,22 @@ impl PagedKvCache {
                     .ok_or(KvError::PageNotFound(page_id))?;
                 (old.clone_physical_store(), old.filled)
             };
-            if let Some(new_page) = self.page_table.pages.get_mut(&new_page_id) {
-                new_page.copy_physical_store_from(old_storage.0.as_ref())?;
-                new_page.filled = old_storage.1;
+            let copy_result = self
+                .page_table
+                .pages
+                .get_mut(&new_page_id)
+                .ok_or(KvError::PageNotFound(new_page_id))?
+                .copy_physical_store_from(old_storage.0.as_ref());
+            if let Err(copy_error) = copy_result {
+                self.page_table
+                    .rollback_allocation(checkpoint, new_page_id)?;
+                return Err(copy_error);
             }
+            self.page_table
+                .pages
+                .get_mut(&new_page_id)
+                .ok_or(KvError::PageNotFound(new_page_id))?
+                .filled = old_storage.1;
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
             return Ok(new_page_id);
@@ -1046,6 +1059,111 @@ impl KvCacheOps for PagedKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        DevicePageSpan, HostPageStoreView, HostPageStoreViewMut, KvPageStore, KvPageStoreFactory,
+        PageStoreLayout,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct ToggleCopyFactory {
+        fail_copy: Arc<AtomicBool>,
+    }
+
+    impl KvPageStoreFactory for ToggleCopyFactory {
+        fn create(
+            &self,
+            residency: Device,
+            layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            Ok(Box::new(ToggleCopyStore {
+                residency,
+                data: vec![0.0; layout.f32_len],
+                quantized_data: vec![0; layout.int8_len],
+                fp8_data: vec![0; layout.fp8_len],
+                quant_scales: vec![1.0; layout.scale_len],
+                fail_copy: Arc::clone(&self.fail_copy),
+            }))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ToggleCopyStore {
+        residency: Device,
+        data: Vec<f32>,
+        quantized_data: Vec<i8>,
+        fp8_data: Vec<u8>,
+        quant_scales: Vec<f32>,
+        fail_copy: Arc<AtomicBool>,
+    }
+
+    impl KvPageStore for ToggleCopyStore {
+        fn residency(&self) -> Device {
+            self.residency
+        }
+
+        fn allocated_bytes(&self) -> u64 {
+            (self.data.len() * std::mem::size_of::<f32>()
+                + self.quantized_data.len()
+                + self.fp8_data.len()
+                + self.quant_scales.len() * std::mem::size_of::<f32>()) as u64
+        }
+
+        fn reset_storage(&mut self) {
+            self.data.fill(0.0);
+            self.quantized_data.fill(0);
+            self.fp8_data.fill(0);
+            self.quant_scales.fill(1.0);
+        }
+
+        fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+            Some(HostPageStoreView {
+                data: &self.data,
+                quantized_data: &self.quantized_data,
+                fp8_data: &self.fp8_data,
+                quant_scales: &self.quant_scales,
+            })
+        }
+
+        fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
+            Some(HostPageStoreViewMut {
+                data: &mut self.data,
+                quantized_data: &mut self.quantized_data,
+                fp8_data: &mut self.fp8_data,
+                quant_scales: &mut self.quant_scales,
+            })
+        }
+
+        fn device_span(&self) -> Option<DevicePageSpan> {
+            None
+        }
+
+        fn copy_to(&self, target: &mut dyn KvPageStore) -> Result<u64, KvError> {
+            if self.fail_copy.load(Ordering::Relaxed) {
+                return Err(KvError::PageStoreCopyUnsupported {
+                    from: self.residency,
+                    to: target.residency(),
+                });
+            }
+            target.copy_from_host(self.host_view().unwrap())?;
+            Ok(self.allocated_bytes())
+        }
+
+        fn copy_from_host(&mut self, source: HostPageStoreView<'_>) -> Result<(), KvError> {
+            self.data.copy_from_slice(source.data);
+            self.quantized_data.copy_from_slice(source.quantized_data);
+            self.fp8_data.copy_from_slice(source.fp8_data);
+            self.quant_scales.copy_from_slice(source.quant_scales);
+            Ok(())
+        }
+
+        fn clone_store(&self) -> Box<dyn KvPageStore> {
+            Box::new(self.clone())
+        }
+    }
     use crate::{KvDType, KvKind, PageTensorConfig};
     use onnx_genai_metadata::{
         KvCacheSpec, KvComponentTolerance, KvQuantTolerance, LayerPrecisionOverride,
@@ -1629,6 +1747,91 @@ mod tests {
         assert_eq!(cache.page_table.pages[&forked_page].ref_count, 1);
         assert_eq!(cache.len(seq).unwrap(), 2);
         assert_eq!(cache.len(forked).unwrap(), 3);
+    }
+
+    #[test]
+    fn failed_cow_copy_rolls_back_allocation_without_capacity_loss() {
+        let mut cache = PagedKvCache::new_with_tensor_config(
+            PageTensorConfig {
+                page_size: 2,
+                ..small_config(KvDType::F32)
+            },
+            3,
+        );
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+        let shared_page = cache.page_table.get_sequence(source).unwrap()[0];
+        let fail_copy = Arc::new(AtomicBool::new(false));
+        cache
+            .page_table
+            .set_migration_factory(Arc::new(ToggleCopyFactory {
+                fail_copy: Arc::clone(&fail_copy),
+            }));
+        cache
+            .page_table
+            .migrate_page(shared_page, Device::Gpu(1))
+            .unwrap();
+        for values in [[9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]] {
+            let unrelated = cache.create_sequence();
+            cache
+                .append_token_kv(unrelated, &borrowed_layers(&small_layers(values)))
+                .unwrap();
+        }
+        cache.page_table.touch(shared_page);
+        fail_copy.store(true, Ordering::Relaxed);
+
+        let free_before = cache.page_table.free_count(Device::Gpu(0));
+        let refs_before = cache.page_table.pages[&shared_page].ref_count;
+        let resident_before = cache.resident_bytes();
+        let stats_before = cache.page_table.stats();
+        let hot_before = cache.page_table.hot_used_count();
+        let residency_before = cache
+            .page_table
+            .pages
+            .iter()
+            .map(|(page_id, page)| (*page_id, page.residency()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for _ in 0..4 {
+            assert!(
+                cache
+                    .append_token_kv(
+                        forked,
+                        &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+                    )
+                    .is_err()
+            );
+            assert_eq!(cache.page_table.free_count(Device::Gpu(0)), free_before);
+            assert_eq!(cache.page_table.pages[&shared_page].ref_count, refs_before);
+            assert_eq!(cache.resident_bytes(), resident_before);
+            assert_eq!(cache.page_table.stats(), stats_before);
+            assert_eq!(cache.page_table.hot_used_count(), hot_before);
+            assert_eq!(
+                cache
+                    .page_table
+                    .pages
+                    .iter()
+                    .map(|(page_id, page)| (*page_id, page.residency()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                residency_before
+            );
+            assert_eq!(cache.len(forked).unwrap(), 1);
+        }
+
+        fail_copy.store(false, Ordering::Relaxed);
+        cache
+            .append_token_kv(
+                forked,
+                &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+            )
+            .unwrap();
+        assert_eq!(cache.len(forked).unwrap(), 2);
+        assert_eq!(cache.page_table.pages[&shared_page].ref_count, 1);
     }
 
     #[test]

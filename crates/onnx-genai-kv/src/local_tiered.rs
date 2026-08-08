@@ -632,8 +632,12 @@ impl KvCacheConnector for LocalTieredConnector {
                 }
                 if inner.page_table.free_count(Device::Gpu(0)) == 0
                     && inner.page_table.hot_used_count() >= inner.page_table.hot_capacity()
+                    && inner.demote_one(priority).is_err()
                 {
-                    let _ = inner.demote_one(priority);
+                    break;
+                }
+                if inner.page_table.hot_used_count() >= inner.page_table.hot_capacity() {
+                    break;
                 }
                 let _ = inner.page_table.migrate_page(pid, Device::Gpu(0));
             }
@@ -696,6 +700,26 @@ impl KvCacheConnector for LocalTieredConnector {
 mod tests {
     use super::*;
     use crate::connector::{KvLayerPayload, KvPayload, KvPayloadDtype};
+    use crate::{HostPageStoreFactory, KvError, KvPageStore, KvPageStoreFactory, PageStoreLayout};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct CpuFailureFactory;
+
+    impl KvPageStoreFactory for CpuFailureFactory {
+        fn create(
+            &self,
+            residency: Device,
+            layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            if residency == Device::Cpu {
+                return Err(KvError::PageStoreAllocationFailed(
+                    "injected CPU target failure".into(),
+                ));
+            }
+            HostPageStoreFactory.create(residency, layout)
+        }
+    }
 
     fn key(model: &str, chunk_index: u32, chunk_hash: u64, num_tokens: u32) -> KvCacheKey {
         KvCacheKey {
@@ -1183,6 +1207,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+
         assert!(matches!(
             conn.lookup(&k0).await.unwrap(),
             KvCacheLocation::LocalCpu { .. }
@@ -1192,6 +1217,38 @@ mod tests {
             conn.lookup(&k0).await.unwrap(),
             KvCacheLocation::LocalGpu { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn prefetch_aborts_promotion_when_required_demotion_fails() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let k0 = key("m", 0, 1, 4);
+        let k1 = key("m", 1, 2, 4);
+        let k2 = key("m", 2, 3, 4);
+        for k in [&k0, &k1, &k2] {
+            conn.store(store_entry(k.clone(), CachePriority::Session))
+                .await
+                .unwrap();
+        }
+        {
+            let mut inner = conn.inner.lock().unwrap();
+            assert_eq!(inner.page_table.hot_used_count(), 2);
+            inner
+                .page_table
+                .set_migration_factory(Arc::new(CpuFailureFactory));
+        }
+
+        conn.prefetch(&k0, Device::Gpu(0));
+
+        let inner = conn.inner.lock().unwrap();
+        assert_eq!(inner.page_table.hot_used_count(), 2);
+        let entry = inner.chunks.get(&k0).unwrap();
+        assert!(
+            entry
+                .page_ids
+                .iter()
+                .all(|page_id| inner.page_table.pages[page_id].residency() == Device::Cpu)
+        );
     }
 
     #[tokio::test]

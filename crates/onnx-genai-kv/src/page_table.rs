@@ -105,6 +105,13 @@ pub struct PageMigration {
 pub enum MigrationAccounting {
     /// Covered only by the existing aggregate page-pool lease.
     ExistingPoolLeaseOnly,
+    /// The source remains live while the replacement is allocated and copied.
+    ///
+    /// The current host-emulation table retains only its aggregate pool lease,
+    /// so this temporary extra allocation is reported honestly rather than
+    /// claimed against that lease. Stage 3 must replace this with a charged
+    /// transient lease when physical per-tier stores gain governor authority.
+    UnleasedTransient(u64),
 }
 
 impl Clone for Box<dyn KvPageStore> {
@@ -677,13 +684,14 @@ impl Page {
                 actual: replacement.residency(),
             });
         }
+        let transient_bytes = replacement.allocated_bytes();
         let bytes_copied = self.store.copy_to(replacement.as_mut())?;
         self.store = replacement;
         Ok(PageMigration {
             from,
             to: target,
             bytes_copied,
-            accounting: MigrationAccounting::ExistingPoolLeaseOnly,
+            accounting: MigrationAccounting::UnleasedTransient(transient_bytes),
         })
     }
 
@@ -1020,6 +1028,16 @@ impl Clone for PageTable {
     }
 }
 
+pub(crate) struct PageAllocationCheckpoint {
+    device: Device,
+    reused_page: Option<Page>,
+    evicted_hot: Option<(PageId, Box<dyn KvPageStore>)>,
+    free_pages: HashMap<Device, Vec<PageId>>,
+    stats: PageStats,
+    clock: u64,
+    next_page_id: PageId,
+}
+
 impl PageTable {
     /// Replace the factory used for subsequent tier migrations.
     ///
@@ -1039,6 +1057,65 @@ impl PageTable {
             .get_mut(&page_id)
             .ok_or(KvError::PageNotFound(page_id))?
             .migrate(target, factory.as_ref())
+    }
+
+    pub(crate) fn allocation_checkpoint(&self, device: Device) -> PageAllocationCheckpoint {
+        let reused_page = self
+            .free_pages
+            .get(&device)
+            .and_then(|pages| pages.last())
+            .and_then(|page_id| self.pages.get(page_id))
+            .cloned();
+        let evicted_hot = if matches!(device, Device::Gpu(_))
+            && self.free_count(device) == 0
+            && self.hot_used_count() >= self.hot_capacity
+        {
+            self.pages
+                .iter()
+                .filter(|(_, page)| {
+                    page.ref_count > 0 && matches!(page.residency(), Device::Gpu(_))
+                })
+                .min_by_key(|(_, page)| page.last_access)
+                .map(|(page_id, page)| (*page_id, page.clone_physical_store()))
+        } else {
+            None
+        };
+        PageAllocationCheckpoint {
+            device,
+            reused_page,
+            evicted_hot,
+            free_pages: self.free_pages.clone(),
+            stats: self.stats,
+            clock: self.clock,
+            next_page_id: self.next_page_id,
+        }
+    }
+
+    pub(crate) fn rollback_allocation(
+        &mut self,
+        checkpoint: PageAllocationCheckpoint,
+        allocated_page: PageId,
+    ) -> Result<(), KvError> {
+        if let Some(page) = checkpoint.reused_page {
+            self.pages.insert(allocated_page, page);
+        } else {
+            self.pages.remove(&allocated_page);
+        }
+        self.free_pages = checkpoint.free_pages;
+        self.stats = checkpoint.stats;
+        self.clock = checkpoint.clock;
+        self.next_page_id = checkpoint.next_page_id;
+        if let Some((page_id, store)) = checkpoint.evicted_hot {
+            let page = self
+                .pages
+                .get_mut(&page_id)
+                .ok_or(KvError::PageNotFound(page_id))?;
+            debug_assert_eq!(store.residency(), checkpoint.device);
+            page.store = store;
+        }
+        self.note_ref_count_change(1, 0);
+        self.publish_counters();
+        Ok(())
     }
 
     pub fn new(page_size: usize, num_gpu_pages: usize) -> Self {
@@ -1970,6 +2047,10 @@ mod migration_tests {
         assert_eq!(
             demoted.bytes_copied,
             table.pages[&page_id].allocated_bytes()
+        );
+        assert_eq!(
+            demoted.accounting,
+            MigrationAccounting::UnleasedTransient(demoted.bytes_copied)
         );
         assert_eq!(snapshot(&table.pages[&page_id]), before);
         let page = &table.pages[&page_id];
