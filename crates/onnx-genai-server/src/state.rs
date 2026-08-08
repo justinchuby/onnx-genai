@@ -87,8 +87,34 @@ impl ServerMemoryAuthorities {
         );
         let resolved = onnx_genai_engine::resolve_limit(limit, &capacity, "vram")
             .map_err(anyhow::Error::new)?;
-        for authority in authorities.values() {
-            authority.try_set_limit_bytes(resolved)?;
+        let mut ordered = authorities.values().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|authority| authority.domain().to_string());
+        let guards = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::pause_reconfiguration)
+            .collect::<Vec<_>>();
+        for (authority, guard) in ordered.iter().zip(&guards) {
+            let used = guard.used();
+            if used > resolved {
+                authority.trim_unmapped_bytes(used - resolved)?;
+            }
+        }
+        for (authority, guard) in ordered.iter().zip(&guards) {
+            if guard.used() > resolved {
+                anyhow::bail!(
+                    "cannot satisfy lowered resource limit of {resolved} bytes: {} currently has \
+                     {} mapped or otherwise leased bytes",
+                    authority.domain(),
+                    guard.used()
+                );
+            }
+        }
+        for guard in &guards {
+            let result = guard.try_set_limit(resolved);
+            debug_assert!(
+                result.is_ok(),
+                "claims are paused and usage was prevalidated"
+            );
         }
         *effective = limit;
         Ok(())
@@ -579,6 +605,7 @@ fn build_pipeline_handle(
 
 #[cfg(test)]
 mod authority_tests {
+    #[cfg(not(feature = "native-backend"))]
     use std::path::PathBuf;
 
     use super::*;
@@ -668,5 +695,63 @@ mod authority_tests {
             .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
             .unwrap();
         assert_ne!(first.authority_id(), second.authority_id());
+    }
+
+    #[test]
+    fn multi_device_limit_failure_leaves_every_limit_and_policy_unchanged() {
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+        let _first_lease = first
+            .reserve(Tier::Device, 20, MemoryRole::Weights, HolderId::new(1))
+            .unwrap();
+        let _second_lease = second
+            .reserve(Tier::Device, 80, MemoryRole::Weights, HolderId::new(2))
+            .unwrap();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(50))
+            .unwrap_err();
+        assert_eq!(first.limit_bytes(), 100);
+        assert_eq!(second.limit_bytes(), 100);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(100)
+        );
+        let future = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(2), 100)
+            .unwrap();
+        assert_eq!(future.limit_bytes(), 100);
+    }
+
+    #[test]
+    fn multi_device_limit_success_updates_every_authority_and_policy() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(50))
+            .unwrap();
+        assert_eq!(first.limit_bytes(), 50);
+        assert_eq!(second.limit_bytes(), 50);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(50)
+        );
+        let future = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(2), 50)
+            .unwrap();
+        assert_eq!(future.limit_bytes(), 50);
     }
 }

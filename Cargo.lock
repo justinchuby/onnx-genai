@@ -2274,6 +2274,7 @@ dependencies = [
  "onnx-genai-ort",
  "onnx-genai-preprocess",
  "onnx-runtime-ep-cuda",
+ "onnx-runtime-memory-governor",
  "reqwest",
  "serde",
  "serde_json",

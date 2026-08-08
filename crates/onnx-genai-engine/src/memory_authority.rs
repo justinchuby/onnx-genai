@@ -69,34 +69,42 @@ impl DeviceMemoryAuthority {
         self.governor.available(Tier::Device)
     }
 
-    pub fn set_limit_bytes(&self, bytes: u64) {
-        self.governor.ledger().set_limit(Tier::Device, bytes);
+    pub fn pause_reconfiguration(&self) -> onnx_runtime_memory_governor::LeaseLimitGuard<'_> {
+        self.governor.ledger().pause_claims(Tier::Device)
+    }
+
+    pub fn trim_unmapped_bytes(&self, bytes: u64) -> anyhow::Result<u64> {
+        #[cfg(feature = "cuda")]
+        {
+            onnx_runtime_ep_cuda::virtual_memory::trim_physical_handle_pools(
+                self.authority_id(),
+                bytes,
+            )
+            .map_err(anyhow::Error::new)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = bytes;
+            Ok(0)
+        }
     }
 
     /// Lower the device limit after releasing any retained, unmapped CUDA
     /// handles. Mapped or otherwise leased bytes make the shrink fail without
     /// changing the old limit.
     pub fn try_set_limit_bytes(&self, bytes: u64) -> anyhow::Result<()> {
-        let used = self.used_bytes();
+        let guard = self.pause_reconfiguration();
+        let used = guard.used();
         if used > bytes {
-            #[cfg(feature = "cuda")]
-            {
-                onnx_runtime_ep_cuda::virtual_memory::trim_physical_handle_pools(
-                    self.authority_id(),
-                    used - bytes,
-                )
-                .map_err(anyhow::Error::new)?;
-            }
+            self.trim_unmapped_bytes(used - bytes)?;
         }
-        let remaining = self.used_bytes();
-        if remaining > bytes {
+        if let Err(remaining) = guard.try_set_limit(bytes) {
             anyhow::bail!(
                 "cannot satisfy lowered resource limit of {bytes} bytes: {} currently has \
                  {remaining} mapped or otherwise leased bytes",
                 self.domain
             );
         }
-        self.set_limit_bytes(bytes);
         Ok(())
     }
 }

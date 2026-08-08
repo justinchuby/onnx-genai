@@ -439,6 +439,7 @@ struct VmmConstruction {
     holder: HolderId,
     role: MemoryRole,
     pool_bytes: Option<usize>,
+    teardown_synchronizer: Option<crate::virtual_memory::TeardownSynchronizer>,
 }
 
 // `MemoryGovernor` is a replaceable contract and does not require `Debug`, so
@@ -499,6 +500,7 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: None,
+                teardown_synchronizer: None,
             },
             &private,
         )
@@ -529,6 +531,34 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: None,
+            },
+            &private,
+        )
+    }
+
+    pub fn standalone_with_teardown_synchronizer(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+        teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+    ) -> Result<Self, MemoryError> {
+        let private = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
+        );
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: Some(teardown_synchronizer),
             },
             &private,
         )
@@ -606,6 +636,33 @@ impl CudaVmmAllocator {
                 holder,
                 role,
                 pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: None,
+            },
+            governor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_teardown_synchronizer(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+        teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+    ) -> Result<Self, MemoryError> {
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: Some(teardown_synchronizer),
             },
             governor,
         )
@@ -623,6 +680,7 @@ impl CudaVmmAllocator {
             holder,
             role,
             pool_bytes,
+            teardown_synchronizer,
         } = construction;
         let backing = if let Some(pool_bytes) = pool_bytes {
             let pool = PhysicalHandlePool::get_or_create(
@@ -636,6 +694,10 @@ impl CudaVmmAllocator {
             CudaVirtualBacking::with_physical_pool(pool)
         } else {
             CudaVirtualBacking::new(context, device_ordinal)
+        };
+        let backing = match teardown_synchronizer {
+            Some(synchronizer) => backing.with_teardown_synchronizer(synchronizer),
+            None => backing,
         };
         let granularity = backing.granularity();
         if granularity == 0 {

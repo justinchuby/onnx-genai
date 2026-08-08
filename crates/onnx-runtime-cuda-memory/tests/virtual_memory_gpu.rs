@@ -381,6 +381,94 @@ fn lowering_an_authority_can_trim_unmapped_pool_handles() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn failed_teardown_synchronization_never_reuses_or_releases_a_live_handle() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool");
+    let stats = pool.stats();
+    let sync_attempts = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&sync_attempts);
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool))
+        .with_teardown_synchronizer(Arc::new(move || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(String::from("injected synchronization failure"))
+        }));
+    let mut reservation = backing.reserve(granule).expect("reservation");
+    backing
+        .commit(&mut reservation, 0, granule)
+        .expect("commit");
+    drop(reservation);
+
+    let snapshot = stats.snapshot();
+    assert_eq!(sync_attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(snapshot.creates, 1);
+    assert_eq!(snapshot.releases, 0);
+    assert_eq!(snapshot.pool_hits, 0);
+    assert_eq!(snapshot.mapped_bytes, granule as u64);
+    assert_eq!(snapshot.pooled_unmapped_bytes, 0);
+    assert_eq!(snapshot.total_owned_bytes, granule as u64);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn successful_teardown_synchronization_allows_later_reuse() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool");
+    let stats = pool.stats();
+    let sync_attempts = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&sync_attempts);
+    let backing = CudaVirtualBacking::with_physical_pool(pool).with_teardown_synchronizer(
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }),
+    );
+    let mut first = backing.reserve(granule).expect("first reservation");
+    backing
+        .commit(&mut first, 0, granule)
+        .expect("first commit");
+    drop(first);
+    let mut second = backing.reserve(granule).expect("second reservation");
+    backing
+        .commit(&mut second, 0, granule)
+        .expect("second commit");
+
+    assert_eq!(sync_attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.snapshot().creates, 1);
+    assert_eq!(stats.snapshot().pool_hits, 1);
+}
+
 /// The pool retains at most its configured whole-granule bound.
 #[cfg_attr(
     not(feature = "gpu-tests"),

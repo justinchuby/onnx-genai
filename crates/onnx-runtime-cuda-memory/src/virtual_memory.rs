@@ -57,11 +57,28 @@ use cudarc::driver::CudaContext;
 /// Holds the runtime so the CUDA context is bound before every driver call —
 /// the reservation and its mappings belong to a context, and touching them from
 /// an unbound thread is a driver error rather than a silent wrong answer.
-#[derive(Debug, Clone)]
+pub type TeardownSynchronizer = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct CudaVirtualBacking {
     context: Arc<CudaContext>,
     device_ordinal: i32,
     pool: Option<Arc<PhysicalHandlePool>>,
+    teardown_synchronizer: Option<TeardownSynchronizer>,
+}
+
+impl std::fmt::Debug for CudaVirtualBacking {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CudaVirtualBacking")
+            .field("device_ordinal", &self.device_ordinal)
+            .field("pooled", &self.pool.is_some())
+            .field(
+                "has_teardown_synchronizer",
+                &self.teardown_synchronizer.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl CudaVirtualBacking {
@@ -82,6 +99,7 @@ impl CudaVirtualBacking {
             context,
             device_ordinal,
             pool: None,
+            teardown_synchronizer: None,
         }
     }
 
@@ -100,7 +118,13 @@ impl CudaVirtualBacking {
             context: Arc::clone(&pool.context),
             device_ordinal: pool.device_ordinal,
             pool: Some(pool),
+            teardown_synchronizer: None,
         }
+    }
+
+    pub fn with_teardown_synchronizer(mut self, synchronizer: TeardownSynchronizer) -> Self {
+        self.teardown_synchronizer = Some(synchronizer);
+        self
     }
 
     pub(crate) fn physical_pool(&self) -> Option<&Arc<PhysicalHandlePool>> {
@@ -188,6 +212,7 @@ struct PoolCounters {
 struct PoolState {
     available: Vec<cu::CUmemGenericAllocationHandle>,
     lease: Option<MemoryLease>,
+    pending_lease_shrink: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -231,8 +256,8 @@ pub struct PhysicalHandlePool {
     granularity: usize,
     authority: MemoryAuthorityId,
     max_retained_bytes: usize,
-    authority_operation: Arc<Mutex<()>>,
     state: Mutex<PoolState>,
+    lease_checkout: Mutex<()>,
     counters: Arc<PoolCounters>,
 }
 
@@ -271,6 +296,10 @@ impl PhysicalHandlePool {
             granularity,
             authority,
         };
+        // Claim before taking the registry lock. Limit reconfiguration takes
+        // the authority claim gate before inspecting the registry, so the
+        // opposite order here would deadlock with concurrent pool creation.
+        let lease = governor.reserve(Tier::Device, 0, role, holder)?;
         let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry = registry
             .lock()
@@ -287,28 +316,19 @@ impl PhysicalHandlePool {
             }
             return Ok(pool);
         }
-
-        let authority_operation = registry
-            .iter()
-            .filter(|(candidate, _)| candidate.authority == authority)
-            .find_map(|(_, pool)| pool.upgrade())
-            .map_or_else(
-                || Arc::new(Mutex::new(())),
-                |pool| pool.authority_operation.clone(),
-            );
         let retained_granules = max_retained_bytes / granularity;
-        let lease = governor.reserve(Tier::Device, 0, role, holder)?;
         let pool = Arc::new(Self {
             context,
             device_ordinal,
             granularity,
             authority,
             max_retained_bytes: retained_granules * granularity,
-            authority_operation,
             state: Mutex::new(PoolState {
                 available: Vec::new(),
                 lease: Some(lease),
+                pending_lease_shrink: 0,
             }),
+            lease_checkout: Mutex::new(()),
             counters: Arc::new(PoolCounters::default()),
         });
         registry.insert(key, Arc::downgrade(&pool));
@@ -354,10 +374,6 @@ impl PhysicalHandlePool {
     }
 
     fn acquire(&self) -> Result<cu::CUmemGenericAllocationHandle, VirtualMemoryError> {
-        let _operation = self
-            .authority_operation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(handle) = {
             let mut state = self.lock();
             state.available.pop()
@@ -369,37 +385,43 @@ impl PhysicalHandlePool {
             return Ok(handle);
         }
 
+        let _checkout = self
+            .lease_checkout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut lease = {
+            let mut state = self.lock();
+            state.lease.take().ok_or_else(|| VirtualMemoryError::Os {
+                operation: "growing physical handle pool lease",
+                reason: String::from("the physical handle pool is tearing down"),
+                code: 0,
+            })?
+        };
+        let growth = lease
+            .grow(self.granularity as u64)
+            .map_err(|error| VirtualMemoryError::Os {
+                operation: "growing physical handle pool lease",
+                reason: error.to_string(),
+                code: 0,
+            });
         {
             let mut state = self.lock();
-            state
-                .lease
-                .as_mut()
-                .ok_or_else(|| VirtualMemoryError::Os {
-                    operation: "growing physical handle pool lease",
-                    reason: String::from("the physical handle pool is tearing down"),
-                    code: 0,
-                })?
-                .grow(self.granularity as u64)
-                .map_err(|error| VirtualMemoryError::Os {
-                    operation: "growing physical handle pool lease",
-                    reason: error.to_string(),
-                    code: 0,
-                })?;
+            let pending = std::mem::take(&mut state.pending_lease_shrink);
+            lease.shrink(pending);
+            state.lease = Some(lease);
         }
+        growth?;
+        drop(_checkout);
 
         if let Err(error) = self.bind("creating pooled CUDA physical memory") {
-            if let Some(lease) = self.lock().lease.as_mut() {
-                lease.shrink(self.granularity as u64);
-            }
+            self.shrink_lease_or_defer(self.granularity as u64);
             return Err(error);
         }
         let prop = allocation_prop(self.device_ordinal);
         let mut handle: cu::CUmemGenericAllocationHandle = 0;
         let result = unsafe { cu::cuMemCreate(&mut handle, self.granularity, &prop, 0) };
         if let Err(error) = CudaVirtualBacking::check("cuMemCreate", result) {
-            if let Some(lease) = self.lock().lease.as_mut() {
-                lease.shrink(self.granularity as u64);
-            }
+            self.shrink_lease_or_defer(self.granularity as u64);
             return Err(error);
         }
         self.counters.creates.fetch_add(1, Ordering::Relaxed);
@@ -407,6 +429,15 @@ impl PhysicalHandlePool {
             .total_owned_bytes
             .fetch_add(self.granularity as u64, Ordering::AcqRel);
         Ok(handle)
+    }
+
+    fn shrink_lease_or_defer(&self, bytes: u64) {
+        let mut state = self.lock();
+        if let Some(lease) = state.lease.as_mut() {
+            lease.shrink(bytes);
+        } else {
+            state.pending_lease_shrink = state.pending_lease_shrink.saturating_add(bytes);
+        }
     }
 
     fn note_mapped(&self) {
@@ -420,10 +451,6 @@ impl PhysicalHandlePool {
         handle: cu::CUmemGenericAllocationHandle,
         was_mapped: bool,
     ) -> Result<(), VirtualMemoryError> {
-        let _operation = self
-            .authority_operation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if was_mapped {
             self.counters
                 .mapped_bytes
@@ -469,17 +496,16 @@ impl PhysicalHandlePool {
         self.counters
             .total_owned_bytes
             .fetch_sub(self.granularity as u64, Ordering::AcqRel);
-        if let Some(lease) = self.lock().lease.as_mut() {
-            lease.shrink(self.granularity as u64);
-        }
+        self.shrink_lease_or_defer(self.granularity as u64);
         Ok(())
     }
 }
 
 /// Release retained, unmapped handles owned by `authority`.
 ///
-/// Checkout and return use the same authority gate, so a concurrent return
-/// cannot race past a limit shrink. Mapped handles are never released here.
+/// Pool locks serialize checkout/return with trimming. The caller must pause
+/// authority lease growth until trimming and the final limit commit complete.
+/// Mapped handles are never released here.
 pub fn trim_physical_handle_pools(
     authority: MemoryAuthorityId,
     bytes_to_release: u64,
@@ -499,13 +525,6 @@ pub fn trim_physical_handle_pools(
             .filter_map(|(_, pool)| pool.upgrade())
             .collect::<Vec<_>>()
     };
-    let Some(first) = pools.first() else {
-        return Ok(0);
-    };
-    let authority_operation = Arc::clone(&first.authority_operation);
-    let _operation = authority_operation
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut released = 0_u64;
     for pool in pools {
         while released < bytes_to_release {
@@ -530,9 +549,7 @@ pub fn trim_physical_handle_pools(
             pool.counters
                 .total_owned_bytes
                 .fetch_sub(bytes, Ordering::AcqRel);
-            if let Some(lease) = pool.lock().lease.as_mut() {
-                lease.shrink(bytes);
-            }
+            pool.shrink_lease_or_defer(bytes);
             released = released.saturating_add(bytes);
         }
     }
@@ -627,14 +644,25 @@ fn allocation_granularity(device_ordinal: i32) -> usize {
 }
 
 /// One reserved device address range and the physical handles mapped into it.
-#[derive(Debug)]
 pub struct CudaReservation {
     base: cu::CUdeviceptr,
     len: usize,
     context: Arc<CudaContext>,
     pool: Option<Arc<PhysicalHandlePool>>,
+    teardown_synchronizer: Option<TeardownSynchronizer>,
     /// `(offset, len, handle)` for every mapped block.
     blocks: Vec<(usize, usize, cu::CUmemGenericAllocationHandle)>,
+}
+
+impl std::fmt::Debug for CudaReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CudaReservation")
+            .field("base", &self.base)
+            .field("len", &self.len)
+            .field("blocks", &self.blocks.len())
+            .finish()
+    }
 }
 
 // The reservation is an owned device address range; nothing in it is
@@ -645,6 +673,22 @@ unsafe impl Sync for CudaReservation {}
 
 impl Drop for CudaReservation {
     fn drop(&mut self) {
+        if !self.blocks.is_empty()
+            && let Some(synchronize) = &self.teardown_synchronizer
+            && let Err(error) = synchronize()
+        {
+            eprintln!(
+                "cuda_ep: WARNING: reservation teardown synchronization failed; retaining {} \
+                 mapped block(s) until CUDA context teardown: {error}",
+                self.blocks.len()
+            );
+            // The mappings and handles may still be in use. Forget the VA range
+            // and mapped handles rather than making either reusable or
+            // advertising their physical bytes as free.
+            self.blocks.clear();
+            self.len = 0;
+            return;
+        }
         let _ = self.context.bind_to_thread();
         for (offset, len, handle) in std::mem::take(&mut self.blocks) {
             // SAFETY: each block was mapped by `commit` and is unmapped once.
@@ -707,6 +751,7 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
             len,
             context: Arc::clone(&self.context),
             pool: self.pool.clone(),
+            teardown_synchronizer: self.teardown_synchronizer.clone(),
             blocks: Vec::new(),
         })
     }
