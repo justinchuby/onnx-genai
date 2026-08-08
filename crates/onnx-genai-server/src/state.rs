@@ -495,6 +495,7 @@ pub(crate) fn build_handle_with_authorities(
     config: &ServerConfig,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
+    onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
@@ -588,7 +589,34 @@ fn build_pipeline_handle(
 
 #[cfg(test)]
 mod authority_tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    #[cfg(not(feature = "native-backend"))]
+    #[test]
+    fn shared_server_load_validates_native_backend_before_model_io() {
+        let spec = ModelSpec {
+            id: "missing-native".to_string(),
+            path: PathBuf::from("this-model-directory-does-not-exist"),
+            eager: true,
+            warmup: false,
+        };
+        let config = ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                ..EngineConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+
+        let error = build_handle(&spec, &config)
+            .err()
+            .expect("native backend validation must fail")
+            .to_string();
+        assert!(error.contains("compiled without the 'native-backend' feature"));
+        assert!(!error.contains("does not exist"), "{error}");
+    }
 
     #[test]
     fn concurrent_requests_create_one_authority() {

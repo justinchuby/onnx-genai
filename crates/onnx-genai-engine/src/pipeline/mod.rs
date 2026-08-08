@@ -316,6 +316,20 @@ fn native_backend_not_compiled_error() -> anyhow::Error {
     )
 }
 
+/// Resolve and validate an explicitly requested pipeline backend without
+/// touching model files. Server construction calls this before its own package
+/// discovery so both entry points preserve the same fail-fast behavior.
+pub fn validate_pipeline_backend_request(
+    requested: EngineDecodeBackend,
+) -> anyhow::Result<EngineDecodeBackend> {
+    let backend = requested_decode_backend(requested)?;
+    #[cfg(not(feature = "native-backend"))]
+    if backend == EngineDecodeBackend::Native {
+        return Err(native_backend_not_compiled_error());
+    }
+    Ok(backend)
+}
+
 /// Construct all pipeline components through the native
 /// [`ComponentSession`](onnx_genai_metadata::ComponentSession) seam, then report
 /// that native decode does not yet cover this pipeline's (non-flat-autoregressive)
@@ -723,11 +737,7 @@ impl PipelineEngine {
         // Explicit backend requests must fail before touching the model
         // directory. In particular, a binary without native support should
         // report the actionable rebuild error even when the path is invalid.
-        let decode_backend = requested_decode_backend(config.decode_backend)?;
-        #[cfg(not(feature = "native-backend"))]
-        if decode_backend == EngineDecodeBackend::Native {
-            return Err(native_backend_not_compiled_error());
-        }
+        let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
             authority_provider.as_ref(),

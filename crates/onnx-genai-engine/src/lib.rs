@@ -166,7 +166,7 @@ pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     ImageOutput, ImageRequest, ImageStep, ImageStepCallback, ImageStream, IterativeOverrides,
     PipelineEngine, PipelineGenerateRequest, PipelineSynthesis, PipelineTensors, Scheduler,
-    SchedulerFactory, SchedulerRegistry,
+    SchedulerFactory, SchedulerRegistry, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
