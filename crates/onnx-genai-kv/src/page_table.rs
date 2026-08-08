@@ -1035,6 +1035,7 @@ pub(crate) struct PageAllocationCheckpoint {
     stats: PageStats,
     clock: u64,
     next_page_id: PageId,
+    persistent_growth: Option<onnx_runtime_memory_governor::MemoryLease>,
     _transient_lease: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 
@@ -1087,7 +1088,7 @@ impl PageTable {
     }
 
     pub(crate) fn allocation_checkpoint(
-        &self,
+        &mut self,
         source_page: PageId,
         device: Device,
     ) -> Result<PageAllocationCheckpoint, KvError> {
@@ -1122,10 +1123,10 @@ impl PageTable {
         } else {
             0
         };
+        let persistent_growth = self.reserve_transient(replacement_bytes)?;
         let transient_bytes = source_snapshot_bytes
             .saturating_add(reused_snapshot_bytes)
-            .saturating_add(victim_snapshot_bytes)
-            .saturating_add(replacement_bytes);
+            .saturating_add(victim_snapshot_bytes);
         let transient_lease = self.reserve_transient(transient_bytes)?;
         let reused_page = reused_page_ref.cloned();
         let evicted_hot =
@@ -1138,8 +1139,25 @@ impl PageTable {
             stats: self.stats,
             clock: self.clock,
             next_page_id: self.next_page_id,
+            persistent_growth,
             _transient_lease: transient_lease,
         })
+    }
+
+    pub(crate) fn commit_allocation(
+        &mut self,
+        checkpoint: &mut PageAllocationCheckpoint,
+    ) -> Result<(), KvError> {
+        let Some(growth) = checkpoint.persistent_growth.take() else {
+            return Ok(());
+        };
+        self.pool_lease
+            .as_mut()
+            .ok_or(KvError::MigrationLeaseInvariant(
+                "governed growth lost its owning pool lease",
+            ))?
+            .absorb_sibling(growth)
+            .map_err(KvError::MigrationPressure)
     }
 
     pub(crate) fn rollback_allocation(

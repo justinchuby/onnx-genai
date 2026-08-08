@@ -271,6 +271,8 @@ pub enum KvError {
     },
     #[error("cannot reserve transient KV migration memory: {0}")]
     MigrationPressure(onnx_runtime_memory_governor::MemoryError),
+    #[error("KV migration lease invariant failed: {0}")]
+    MigrationLeaseInvariant(&'static str),
     #[error("Sequence {0} not found")]
     SequenceNotFound(SequenceId),
     #[error("Out of memory: need {needed} pages, have {available}")]

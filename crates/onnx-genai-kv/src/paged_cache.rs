@@ -734,22 +734,28 @@ impl PagedKvCache {
                     .ok_or(KvError::PageNotFound(page_id))?;
                 (old.clone_physical_store(), old.filled)
             };
-            let copy_result = self
-                .page_table
-                .pages
-                .get_mut(&new_page_id)
-                .ok_or(KvError::PageNotFound(new_page_id))?
-                .copy_physical_store_from(old_storage.0.as_ref());
+            let copy_result = {
+                let new_page = self
+                    .page_table
+                    .pages
+                    .get_mut(&new_page_id)
+                    .ok_or(KvError::PageNotFound(new_page_id))?;
+                let result = new_page.copy_physical_store_from(old_storage.0.as_ref());
+                if result.is_ok() {
+                    new_page.filled = old_storage.1;
+                }
+                result
+            };
             if let Err(copy_error) = copy_result {
                 self.page_table
                     .rollback_allocation(&mut checkpoint, new_page_id)?;
                 return Err(copy_error);
             }
-            self.page_table
-                .pages
-                .get_mut(&new_page_id)
-                .ok_or(KvError::PageNotFound(new_page_id))?
-                .filled = old_storage.1;
+            if let Err(commit_error) = self.page_table.commit_allocation(&mut checkpoint) {
+                self.page_table
+                    .rollback_allocation(&mut checkpoint, new_page_id)?;
+                return Err(commit_error);
+            }
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
             return Ok(new_page_id);
@@ -2166,6 +2172,7 @@ mod tests {
             .unwrap();
         assert_eq!(observed_copy.load(Ordering::Relaxed), baseline * 2);
         assert_eq!(observed_drop.load(Ordering::Relaxed), baseline * 2);
+        assert_eq!(cache.pool_lease_bytes(), Some(baseline));
         assert_eq!(ledger.used(Tier::Host), baseline);
     }
 
@@ -2207,6 +2214,161 @@ mod tests {
         assert_eq!(observed_copy.load(Ordering::Relaxed), 0);
         assert_eq!(observed_drop.load(Ordering::Relaxed), 0);
         assert_eq!(ledger.used(Tier::Host), baseline);
+        assert_eq!(cache.len(forked).unwrap(), 1);
+    }
+
+    #[test]
+    fn cow_persistent_growth_is_absorbed_into_pool_lease() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        let config = PageTensorConfig {
+            page_size: 2,
+            ..small_config(KvDType::F32)
+        };
+        let layer_configs = vec![LayerTensorConfig::new(config.num_kv_heads, config.head_dim)];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 1);
+        let page_bytes = PageTable::planned_pool_bytes(2, 1, &layer_configs, Some(&quant));
+        let ledger = LeaseLedger::new(0, page_bytes * 5, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut cache = PagedKvCache::new_leased(
+            2,
+            KvDType::F32,
+            layer_configs,
+            1,
+            &governor,
+            Tier::Host,
+            HolderId::new(102),
+        )
+        .unwrap();
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+
+        cache
+            .append_token_kv(
+                forked,
+                &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+            )
+            .unwrap();
+
+        assert_eq!(cache.pool_lease_bytes(), Some(page_bytes * 2));
+        assert_eq!(ledger.used(Tier::Host), page_bytes * 2);
+        assert_eq!(cache.page_table.total_pages(), 2);
+    }
+
+    #[test]
+    fn repeated_cow_growth_accumulates_exact_persistent_pool_bytes() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        const GROWTHS: usize = 3;
+        let config = PageTensorConfig {
+            page_size: 4,
+            ..small_config(KvDType::F32)
+        };
+        let layer_configs = vec![LayerTensorConfig::new(config.num_kv_heads, config.head_dim)];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 1);
+        let page_bytes = PageTable::planned_pool_bytes(4, 1, &layer_configs, Some(&quant));
+        let ledger = LeaseLedger::new(0, page_bytes * (GROWTHS as u64 + 4), 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut cache = PagedKvCache::new_leased(
+            4,
+            KvDType::F32,
+            layer_configs,
+            1,
+            &governor,
+            Tier::Host,
+            HolderId::new(103),
+        )
+        .unwrap();
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forks = (0..GROWTHS)
+            .map(|_| cache.fork(source, 1).unwrap())
+            .collect::<Vec<_>>();
+
+        for (index, forked) in forks.into_iter().enumerate() {
+            cache
+                .append_token_kv(
+                    forked,
+                    &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+                )
+                .unwrap();
+            let expected = page_bytes * (index as u64 + 2);
+            assert_eq!(cache.pool_lease_bytes(), Some(expected));
+            assert_eq!(ledger.used(Tier::Host), expected);
+        }
+    }
+
+    #[test]
+    fn failed_cow_growth_releases_persistent_preflight_after_page_drop() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        let config = PageTensorConfig {
+            page_size: 2,
+            ..small_config(KvDType::F32)
+        };
+        let layer_configs = vec![LayerTensorConfig::new(config.num_kv_heads, config.head_dim)];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 1);
+        let page_bytes = PageTable::planned_pool_bytes(2, 1, &layer_configs, Some(&quant));
+        let ledger = LeaseLedger::new(0, page_bytes * 5, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut cache = PagedKvCache::new_leased(
+            2,
+            KvDType::F32,
+            layer_configs,
+            1,
+            &governor,
+            Tier::Host,
+            HolderId::new(104),
+        )
+        .unwrap();
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+        let shared = cache.page_table.get_sequence(source).unwrap()[0];
+        let observed_copy = Arc::new(AtomicU64::new(0));
+        let observed_drop = Arc::new(AtomicU64::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        cache
+            .page_table
+            .set_migration_factory(Arc::new(LeaseTrackedFactory {
+                ledger: Arc::clone(&ledger),
+                observed_copy_used: observed_copy,
+                observed_snapshot_drop_used: observed_drop,
+                fail_copy: Arc::clone(&fail),
+            }));
+        cache
+            .page_table
+            .migrate_page(shared, Device::Gpu(1))
+            .unwrap();
+        fail.store(true, Ordering::Relaxed);
+
+        assert!(
+            cache
+                .append_token_kv(
+                    forked,
+                    &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+                )
+                .is_err()
+        );
+        assert_eq!(cache.pool_lease_bytes(), Some(page_bytes));
+        assert_eq!(ledger.used(Tier::Host), page_bytes);
+        assert_eq!(cache.page_table.total_pages(), 1);
         assert_eq!(cache.len(forked).unwrap(), 1);
     }
 
