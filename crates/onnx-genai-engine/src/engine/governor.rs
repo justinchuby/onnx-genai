@@ -500,26 +500,8 @@ pub(crate) fn governor_native_kv_config(
         return Ok(ModelKvConfig::unknown(tokens_per_page));
     };
 
-    let mut page_size_bytes = 0_u64;
-    for (layer, element_bytes) in kv_model
-        .layer_configs
-        .iter()
-        .zip(&kv_model.layer_element_bytes)
-    {
-        let heads = u64::try_from(layer.num_kv_heads)
-            .context("KV head count does not fit Resource Governor accounting")?;
-        let head_dim = u64::try_from(layer.head_dim)
-            .context("KV head dimension does not fit Resource Governor accounting")?;
-        let layer_bytes = 2_u64
-            .checked_mul(heads)
-            .and_then(|value| value.checked_mul(tokens_per_page))
-            .and_then(|value| value.checked_mul(head_dim))
-            .and_then(|value| value.checked_mul(*element_bytes))
-            .context("native KV page byte size overflowed Resource Governor accounting")?;
-        page_size_bytes = page_size_bytes
-            .checked_add(layer_bytes)
-            .context("total native KV page byte size overflowed Resource Governor accounting")?;
-    }
+    let page_size_bytes =
+        crate::kv_sizing::kv_cache_bytes_for_tensors(&kv_model.native_kv_tensors, tokens_per_page)?;
     Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
 }
 
@@ -621,7 +603,7 @@ mod tests {
                 num_kv_heads: 1,
                 head_dim: 1,
             }],
-            layer_element_bytes: vec![4],
+            native_kv_tensors: Vec::new(),
             layers: Vec::new(),
         };
 
@@ -653,7 +635,28 @@ mod tests {
                 num_kv_heads: 2,
                 head_dim: 4,
             }],
-            layer_element_bytes: vec![2],
+            native_kv_tensors: vec![
+                crate::kv_sizing::KvTensorSpec {
+                    name: "key".into(),
+                    dtype: crate::kv_sizing::KvStorageType::Float16,
+                    shape: vec![
+                        crate::kv_sizing::KvDimension::PerSequenceBatch,
+                        crate::kv_sizing::KvDimension::Fixed(2),
+                        crate::kv_sizing::KvDimension::Context,
+                        crate::kv_sizing::KvDimension::Fixed(4),
+                    ],
+                },
+                crate::kv_sizing::KvTensorSpec {
+                    name: "value".into(),
+                    dtype: crate::kv_sizing::KvStorageType::Float16,
+                    shape: vec![
+                        crate::kv_sizing::KvDimension::PerSequenceBatch,
+                        crate::kv_sizing::KvDimension::Fixed(2),
+                        crate::kv_sizing::KvDimension::Context,
+                        crate::kv_sizing::KvDimension::Fixed(4),
+                    ],
+                },
+            ],
             layers: Vec::new(),
         };
 
@@ -662,6 +665,77 @@ mod tests {
 
         assert_eq!(native.bytes_per_token(), Some(32));
         assert_eq!(host_mirror.bytes_per_token(), Some(64));
+    }
+
+    fn native_kv_model_with_specs(specs: Vec<crate::kv_sizing::KvTensorSpec>) -> KvModelInfo {
+        KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                page_size: 16,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 4,
+            }],
+            native_kv_tensors: specs,
+            layers: Vec::new(),
+        }
+    }
+
+    fn native_kv_spec(
+        name: &str,
+        dtype: crate::kv_sizing::KvStorageType,
+        head_dim: u64,
+    ) -> crate::kv_sizing::KvTensorSpec {
+        crate::kv_sizing::KvTensorSpec {
+            name: name.into(),
+            dtype,
+            shape: vec![
+                crate::kv_sizing::KvDimension::PerSequenceBatch,
+                crate::kv_sizing::KvDimension::Fixed(2),
+                crate::kv_sizing::KvDimension::Context,
+                crate::kv_sizing::KvDimension::Fixed(head_dim),
+            ],
+        }
+    }
+
+    #[test]
+    fn native_kv_accounting_sums_asymmetric_key_and_value_geometry() {
+        let config = EngineConfig::default();
+        let model = native_kv_model_with_specs(vec![
+            native_kv_spec("key", crate::kv_sizing::KvStorageType::Float16, 4),
+            native_kv_spec("value", crate::kv_sizing::KvStorageType::Float16, 8),
+        ]);
+
+        let admission = governor_native_kv_config(Some(&model), &config).unwrap();
+
+        assert_eq!(admission.bytes_per_token(), Some(48));
+        assert_eq!(
+            admission.page_size_bytes,
+            Some(
+                crate::kv_sizing::kv_cache_bytes_for_tensors(
+                    &model.native_kv_tensors,
+                    config.page_size as u64
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn native_kv_accounting_sums_asymmetric_storage_widths() {
+        let config = EngineConfig::default();
+        let model = native_kv_model_with_specs(vec![
+            native_kv_spec("key", crate::kv_sizing::KvStorageType::Float16, 4),
+            native_kv_spec("value", crate::kv_sizing::KvStorageType::Float32, 4),
+        ]);
+
+        let admission = governor_native_kv_config(Some(&model), &config).unwrap();
+
+        assert_eq!(admission.bytes_per_token(), Some(48));
     }
 
     #[test]

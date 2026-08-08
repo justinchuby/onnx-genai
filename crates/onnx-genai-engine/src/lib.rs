@@ -16,6 +16,7 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub(crate) mod kv_bridge;
+pub(crate) mod kv_sizing;
 pub mod logits;
 #[cfg(feature = "native-backend")]
 pub mod native_component;
