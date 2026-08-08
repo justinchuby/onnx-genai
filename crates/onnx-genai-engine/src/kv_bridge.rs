@@ -2,6 +2,7 @@
 
 use crate::config::SessionId;
 use crate::decode::DecodeState;
+use crate::kv_sizing::{KvDimension, KvStorageType, KvTensorSpec};
 use crate::logits::TokenId;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
@@ -23,6 +24,9 @@ pub(crate) struct KvModelInfo {
     /// Per-layer KV geometry, indexed identically to [`KvModelInfo::layers`].
     /// Length equals the number of exported KV layers (post kv-sharing).
     pub(crate) layer_configs: Vec<LayerTensorConfig>,
+    /// Native past tensors, retained independently so asymmetric K/V geometry
+    /// and storage types are charged exactly as the allocator sizes them.
+    pub(crate) native_kv_tensors: Vec<KvTensorSpec>,
     pub(crate) layers: Vec<KvLayerIo>,
 }
 
@@ -51,15 +55,15 @@ pub(crate) struct KvLayerIo {
 }
 
 /// One self-attention layer's four paged-KV port names, resolved WITHOUT
-/// reading any tensor name. `key_present_info` is the present KEY output's shape
-/// record, the authoritative source of this layer's `num_kv_heads`/`head_dim`
-/// geometry (read structurally from the ONNX shape, never from a name).
+/// reading any tensor name.
 struct ResolvedKvLayer {
     key_past: String,
     key_present: String,
     value_past: String,
     value_present: String,
     key_present_info: TensorInfo,
+    key_past_info: TensorInfo,
+    value_past_info: TensorInfo,
 }
 
 pub(crate) fn infer_kv_model_info(
@@ -77,6 +81,11 @@ pub(crate) fn infer_kv_model_info(
         .map(|layer| layer.key_present_info.clone())
         .collect::<Vec<_>>();
     let layer_configs = layer_configs_from_key_outputs(&key_outputs)?;
+    let native_kv_tensors = resolved_layers
+        .iter()
+        .flat_map(|layer| [&layer.key_past_info, &layer.value_past_info])
+        .map(native_kv_tensor_spec)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // Representative geometry (layer 0). The paged cache is built from the full
     // per-layer `layer_configs`; `tensor_config` remains a single-value view for
     // uniform-only consumers (connector payloads, num_layers/dtype).
@@ -100,8 +109,43 @@ pub(crate) fn infer_kv_model_info(
     Ok(Some(KvModelInfo {
         tensor_config: config,
         layer_configs,
+        native_kv_tensors,
         layers,
     }))
+}
+
+fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
+    if !is_supported_kv_dtype(info.dtype) {
+        anyhow::bail!(
+            "past KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
+            info.name,
+            info.dtype
+        );
+    }
+    let shape = info
+        .shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| {
+            if dim >= 0 {
+                KvDimension::Fixed(dim as u64)
+            } else if axis == 0 {
+                KvDimension::PerSequenceBatch
+            } else {
+                KvDimension::Context
+            }
+        })
+        .collect();
+    Ok(KvTensorSpec {
+        name: info.name.clone(),
+        dtype: match info.dtype {
+            DataType::Float32 => KvStorageType::Float32,
+            DataType::Float16 => KvStorageType::Float16,
+            DataType::BFloat16 => KvStorageType::BFloat16,
+            _ => unreachable!("validated above"),
+        },
+        shape,
+    })
 }
 
 /// Resolve the paged-KV self-attention layer ports strictly from explicit
@@ -150,14 +194,16 @@ fn resolve_kv_layers(
     for ports in port_layers {
         let key_present_info = require_present_kv_output(graph, &ports.key_present)?;
         require_present_kv_output(graph, &ports.value_present)?;
-        require_kv_input(graph, &ports.key_past)?;
-        require_kv_input(graph, &ports.value_past)?;
+        let key_past_info = require_kv_input(graph, &ports.key_past)?;
+        let value_past_info = require_kv_input(graph, &ports.value_past)?;
         layers.push(ResolvedKvLayer {
             key_past: ports.key_past,
             key_present: ports.key_present,
             value_past: ports.value_past,
             value_present: ports.value_present,
             key_present_info,
+            key_past_info,
+            value_past_info,
         });
     }
     Ok(Some(layers))
@@ -235,11 +281,15 @@ fn require_present_kv_output(graph: &dyn GraphIo, name: &str) -> anyhow::Result<
 
 /// Validate that a declared past-KV input exists; errors name the exact missing
 /// `model.io.kv_inputs` port.
-fn require_kv_input(graph: &dyn GraphIo, name: &str) -> anyhow::Result<()> {
-    if !graph.inputs().iter().any(|input| input.name == name) {
-        anyhow::bail!("declared model.io.kv_inputs port '{name}' is not exposed by the graph");
-    }
-    Ok(())
+fn require_kv_input(graph: &dyn GraphIo, name: &str) -> anyhow::Result<TensorInfo> {
+    graph
+        .inputs()
+        .iter()
+        .find(|input| input.name == name)
+        .cloned()
+        .with_context(|| {
+            format!("declared model.io.kv_inputs port '{name}' is not exposed by the graph")
+        })
 }
 
 /// Build the per-layer KV geometry from each exported present-KV output shape.
@@ -1223,6 +1273,48 @@ mod tests {
         assert_eq!(configs[full_group_target].head_dim, 16);
         // A sliding group targeting layer 0 must pick (2, 8), not the full geometry.
         assert_eq!(configs[0].head_dim, 8);
+    }
+
+    #[test]
+    fn native_kv_specs_retain_asymmetric_past_tensor_geometry_and_dtype() -> anyhow::Result<()> {
+        let graph = onnx_genai_ort::GraphIoMetadata::new(
+            vec![
+                TensorInfo {
+                    name: "past_key_values.0.key".into(),
+                    dtype: DataType::Float16,
+                    shape: vec![-1, 2, -1, 4],
+                },
+                TensorInfo {
+                    name: "past_key_values.0.value".into(),
+                    dtype: DataType::Float32,
+                    shape: vec![-1, 2, -1, 8],
+                },
+            ],
+            vec![
+                TensorInfo {
+                    name: "present.0.key".into(),
+                    dtype: DataType::Float16,
+                    shape: vec![-1, 2, -1, 4],
+                },
+                TensorInfo {
+                    name: "present.0.value".into(),
+                    dtype: DataType::Float32,
+                    shape: vec![-1, 2, -1, 8],
+                },
+            ],
+        );
+        let io = fixture_io("tiny-llm")?;
+
+        let info = infer_kv_model_info(&graph, Some(&io), 16, KvDType::F32)?
+            .context("declared KV pairs should produce model info")?;
+
+        assert_eq!(info.native_kv_tensors.len(), 2);
+        assert_eq!(
+            crate::kv_sizing::kv_cache_bytes_for_tensors(&info.native_kv_tensors, 1)?,
+            80,
+            "f16 key (16 B/token) plus wider f32 value (64 B/token)"
+        );
+        Ok(())
     }
 
     #[test]

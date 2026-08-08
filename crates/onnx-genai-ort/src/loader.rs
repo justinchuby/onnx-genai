@@ -1,6 +1,6 @@
 //! Model directory resolution for Phase 1 runtime loading.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_genai_config::{
@@ -438,6 +438,69 @@ impl PipelineModels {
 /// or materializing external weights. Dynamic axes are represented as `-1`, the
 /// same convention [`TensorInfo`] uses for an ORT session's declared I/O.
 pub fn graph_io_from_model_path(path: &Path) -> Result<GraphIoMetadata> {
+    graph_io_from_model_path_filtered(path, None, None)
+}
+
+/// Read only the named graph ports needed by a caller.
+///
+/// Unlike [`graph_io_from_model_path`], unrelated non-dense ports are never
+/// parsed. A selected port is still validated strictly and reports its own
+/// unsupported type.
+pub fn graph_io_from_model_path_for_names(
+    path: &Path,
+    input_names: &[String],
+    output_names: &[String],
+) -> Result<GraphIoMetadata> {
+    let inputs = input_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let outputs = output_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    graph_io_from_model_path_filtered(path, Some((&inputs, &outputs)), None)
+}
+
+/// Read declared KV pairs without inspecting unrelated graph ports.
+///
+/// Some exported models omit type metadata on graph outputs even though their
+/// paired past inputs are fully typed. An untyped present output inherits its
+/// paired past input's tensor metadata; an explicitly non-tensor present output
+/// remains an unsupported KV error.
+pub fn graph_io_from_model_path_for_kv_pairs(
+    path: &Path,
+    input_names: &[String],
+    output_names: &[String],
+) -> Result<GraphIoMetadata> {
+    if input_names.len() != output_names.len() {
+        return Err(OrtError::InvalidArgument(format!(
+            "KV input/output mapping length mismatch: {} inputs, {} outputs",
+            input_names.len(),
+            output_names.len()
+        )));
+    }
+    let inputs = input_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let outputs = output_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let output_fallbacks = output_names
+        .iter()
+        .zip(input_names)
+        .map(|(output, input)| (output.as_str(), input.as_str()))
+        .collect::<HashMap<_, _>>();
+    graph_io_from_model_path_filtered(path, Some((&inputs, &outputs)), Some(&output_fallbacks))
+}
+
+fn graph_io_from_model_path_filtered(
+    path: &Path,
+    selected_names: Option<(&HashSet<&str>, &HashSet<&str>)>,
+    untyped_output_fallbacks: Option<&HashMap<&str, &str>>,
+) -> Result<GraphIoMetadata> {
     let bytes = model_proto_bytes(path)?;
     let model = onnx_runtime_loader::proto::decode_model(&bytes).map_err(|error| {
         OrtError::InvalidArgument(format!(
@@ -465,15 +528,42 @@ pub fn graph_io_from_model_path(path: &Path) -> Result<GraphIoMetadata> {
         .input
         .iter()
         .filter(|value_info| !initializer_names.contains(value_info.name.as_str()))
+        .filter(|value_info| {
+            selected_names.is_none_or(|(inputs, _)| inputs.contains(value_info.name.as_str()))
+        })
         .map(value_info_to_tensor_info)
         .collect::<Result<Vec<_>>>()?;
-    // A graph output that lacks a declared dense tensor type is a hard error
-    // below (via `value_info_to_tensor_info`): fail loud rather than silently
-    // dropping an output whose contract we cannot recover without an ORT session.
     let outputs = graph
         .output
         .iter()
-        .map(value_info_to_tensor_info)
+        .filter(|value_info| {
+            selected_names.is_none_or(|(_, outputs)| outputs.contains(value_info.name.as_str()))
+        })
+        .map(|value_info| {
+            if value_info
+                .r#type
+                .as_ref()
+                .and_then(|ty| ty.value.as_ref())
+                .is_none()
+                && let Some(input_name) = untyped_output_fallbacks
+                    .and_then(|fallbacks| fallbacks.get(value_info.name.as_str()))
+            {
+                let mut info = inputs
+                    .iter()
+                    .find(|info| info.name == *input_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "declared KV output '{}' has no type metadata and its paired input \
+                             '{}' is unavailable",
+                            value_info.name, input_name
+                        ))
+                    })?;
+                info.name = value_info.name.clone();
+                return Ok(info);
+            }
+            value_info_to_tensor_info(value_info)
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(GraphIoMetadata::new(inputs, outputs))
 }
@@ -923,6 +1013,59 @@ mod tests {
         prefer_binary_onnx_twins(&mut paths);
 
         assert_eq!(paths, vec![binary]);
+    }
+
+    fn non_dense_logits_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx")
+    }
+
+    #[test]
+    fn selected_dense_kv_ignores_unrelated_non_dense_logits() {
+        let inputs = vec![
+            "past_key_values.0.key".to_string(),
+            "past_key_values.0.value".to_string(),
+        ];
+        let outputs = vec!["present.0.key".to_string(), "present.0.value".to_string()];
+
+        let graph =
+            graph_io_from_model_path_for_kv_pairs(&non_dense_logits_fixture(), &inputs, &outputs)
+                .expect("unrelated non-dense logits must not block selected KV geometry");
+
+        assert_eq!(graph.inputs().len(), 2);
+        assert_eq!(graph.outputs().len(), 2);
+    }
+
+    #[test]
+    fn selected_non_dense_candidate_fails_explicitly() {
+        let error = graph_io_from_model_path_for_names(
+            &non_dense_logits_fixture(),
+            &[],
+            &["logits".to_string()],
+        )
+        .expect_err("a selected non-dense candidate must fail")
+        .to_string();
+
+        assert!(error.contains("graph I/O 'logits' is not a dense tensor type"));
+    }
+
+    #[test]
+    fn explicitly_non_dense_kv_candidate_fails_instead_of_using_pair_fallback() {
+        use onnx_runtime_loader::proto::onnx::{TypeProto, ValueInfoProto, type_proto};
+
+        let candidate = ValueInfoProto {
+            name: "present.0.key".to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::SequenceType(Box::default())),
+                ..TypeProto::default()
+            }),
+            ..ValueInfoProto::default()
+        };
+
+        let error = value_info_to_tensor_info(&candidate)
+            .expect_err("an explicitly non-dense KV candidate must fail")
+            .to_string();
+        assert!(error.contains("graph I/O 'present.0.key' is not a dense tensor type"));
     }
 }
 

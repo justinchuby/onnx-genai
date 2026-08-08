@@ -349,6 +349,23 @@ impl EngineResourceGovernor {
     }
 
     #[cfg(feature = "native-backend")]
+    pub(crate) fn byte_budget_after_native_load(&self) -> onnx_genai_scheduler::ByteBudget {
+        use onnx_runtime_memory_governor::MemoryGovernor as _;
+
+        let kv_pool_bytes = self.plan().kv_pool_bytes_handle();
+        let limit = self
+            .memory
+            .available(onnx_runtime_memory_governor::Tier::Device)
+            .saturating_add(kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed));
+        onnx_genai_scheduler::ByteBudget::new(limit).with_ceiling(std::sync::Arc::new(
+            LedgerAdmissionCeiling {
+                memory: self.memory.clone(),
+                kv_pool_bytes,
+            },
+        ))
+    }
+
+    #[cfg(feature = "native-backend")]
     pub(crate) fn weight_offload_host_cache(&self) -> onnx_runtime_ep_cpu::WeightOffloadHostCache {
         self.weight_offload_host_cache.clone()
     }
@@ -436,18 +453,12 @@ pub(crate) fn governor_kv_config(
     kv_model: Option<&KvModelInfo>,
     config: &EngineConfig,
 ) -> anyhow::Result<ModelKvConfig> {
-    let tokens_per_page = u64::try_from(config.page_size)
-        .context("KV page size does not fit the Resource Governor's u64 accounting")?
-        .max(1);
+    let tokens_per_page = governor_tokens_per_page(config)?;
     let Some(kv_model) = kv_model else {
-        return Ok(ModelKvConfig {
-            page_size_bytes: tokens_per_page,
-            tokens_per_page,
-        });
+        return Ok(ModelKvConfig::unknown(tokens_per_page));
     };
 
-    let page_size = u64::try_from(config.page_size)
-        .context("KV page size does not fit the Resource Governor's u64 accounting")?;
+    let page_size = tokens_per_page;
     let mut page_size_bytes = 0_u64;
     for layer in &kv_model.layer_configs {
         let heads = u64::try_from(layer.num_kv_heads)
@@ -477,10 +488,57 @@ pub(crate) fn governor_kv_config(
             .checked_add(layer_bytes)
             .context("total KV page byte size overflowed Resource Governor accounting")?;
     }
-    Ok(ModelKvConfig {
-        page_size_bytes: page_size_bytes.max(1),
-        tokens_per_page,
-    })
+    Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
+}
+
+pub(crate) fn governor_native_kv_config(
+    kv_model: Option<&KvModelInfo>,
+    config: &EngineConfig,
+) -> anyhow::Result<ModelKvConfig> {
+    let tokens_per_page = governor_tokens_per_page(config)?;
+    let Some(kv_model) = kv_model else {
+        return Ok(ModelKvConfig::unknown(tokens_per_page));
+    };
+
+    let page_size_bytes =
+        crate::kv_sizing::kv_cache_bytes_for_tensors(&kv_model.native_kv_tensors, tokens_per_page)?;
+    Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
+}
+
+pub(crate) fn governor_no_paged_kv_config(config: &EngineConfig) -> anyhow::Result<ModelKvConfig> {
+    Ok(ModelKvConfig::no_paged_cache(governor_tokens_per_page(
+        config,
+    )?))
+}
+
+fn governor_tokens_per_page(config: &EngineConfig) -> anyhow::Result<u64> {
+    let tokens_per_page = u64::try_from(config.page_size)
+        .context("KV page_size does not fit the Resource Governor's u64 accounting")?;
+    if tokens_per_page == 0 {
+        anyhow::bail!(
+            "KV page_size must be greater than zero; set EngineConfig::page_size to the number of tokens per KV page"
+        );
+    }
+    Ok(tokens_per_page)
+}
+
+#[cfg(any(feature = "native-backend", test))]
+pub(crate) fn model_io_declares_only_fixed_state(
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> bool {
+    let Some(io) = io else {
+        return false;
+    };
+    let has_state_pairs = io
+        .state_pairs
+        .as_ref()
+        .is_some_and(|pairs| !pairs.is_empty());
+    let has_kv_pairs = io.kv_inputs.as_ref().is_some_and(|ports| !ports.is_empty())
+        || io
+            .kv_outputs
+            .as_ref()
+            .is_some_and(|ports| !ports.is_empty());
+    has_state_pairs && !has_kv_pairs
 }
 
 /// Build a governor for a component that owns memory but is not the engine.
@@ -494,13 +552,205 @@ pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
 ) -> anyhow::Result<EngineResourceGovernor> {
+    let kv_config = match kv_model {
+        Some(kv_model) => governor_kv_config(Some(kv_model), config)?,
+        None => governor_no_paged_kv_config(config)?,
+    };
     EngineResourceGovernor::new(
         config.limits.clone(),
         config.allow_runtime_override,
-        governor_kv_config(kv_model, config)?,
+        kv_config,
         // This resolves ceilings only; the model path is not in scope here, so
         // the weight reservation is left at zero.
         0,
     )
     .context("failed to resolve the engine memory budget for decoder fixed state")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_kv_geometry_is_unknown_not_a_token_count_byte_size() {
+        let config = EngineConfig {
+            page_size: 16,
+            ..EngineConfig::default()
+        };
+
+        let kv_config = governor_kv_config(None, &config).unwrap();
+
+        assert_eq!(kv_config.tokens_per_page, 16);
+        assert_eq!(kv_config.page_size_bytes, None);
+        assert_eq!(kv_config.bytes_per_token(), None);
+    }
+
+    #[test]
+    fn zero_page_size_fails_instead_of_manufacturing_one_byte_tokens() {
+        let config = EngineConfig {
+            page_size: 0,
+            ..EngineConfig::default()
+        };
+        let kv_model = KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 1,
+                head_dim: 1,
+                page_size: 0,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 1,
+                head_dim: 1,
+            }],
+            native_kv_tensors: Vec::new(),
+            layers: Vec::new(),
+        };
+
+        for result in [
+            governor_kv_config(None, &config),
+            governor_kv_config(Some(&kv_model), &config),
+            governor_no_paged_kv_config(&config),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("page_size must be greater than zero"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_kv_accounting_uses_graph_storage_width() {
+        let config = EngineConfig::default();
+        let kv_model = KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                page_size: config.page_size,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 4,
+            }],
+            native_kv_tensors: vec![
+                crate::kv_sizing::KvTensorSpec {
+                    name: "key".into(),
+                    dtype: crate::kv_sizing::KvStorageType::Float16,
+                    shape: vec![
+                        crate::kv_sizing::KvDimension::PerSequenceBatch,
+                        crate::kv_sizing::KvDimension::Fixed(2),
+                        crate::kv_sizing::KvDimension::Context,
+                        crate::kv_sizing::KvDimension::Fixed(4),
+                    ],
+                },
+                crate::kv_sizing::KvTensorSpec {
+                    name: "value".into(),
+                    dtype: crate::kv_sizing::KvStorageType::Float16,
+                    shape: vec![
+                        crate::kv_sizing::KvDimension::PerSequenceBatch,
+                        crate::kv_sizing::KvDimension::Fixed(2),
+                        crate::kv_sizing::KvDimension::Context,
+                        crate::kv_sizing::KvDimension::Fixed(4),
+                    ],
+                },
+            ],
+            layers: Vec::new(),
+        };
+
+        let native = governor_native_kv_config(Some(&kv_model), &config).unwrap();
+        let host_mirror = governor_kv_config(Some(&kv_model), &config).unwrap();
+
+        assert_eq!(native.bytes_per_token(), Some(32));
+        assert_eq!(host_mirror.bytes_per_token(), Some(64));
+    }
+
+    fn native_kv_model_with_specs(specs: Vec<crate::kv_sizing::KvTensorSpec>) -> KvModelInfo {
+        KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                page_size: 16,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 4,
+            }],
+            native_kv_tensors: specs,
+            layers: Vec::new(),
+        }
+    }
+
+    fn native_kv_spec(
+        name: &str,
+        dtype: crate::kv_sizing::KvStorageType,
+        head_dim: u64,
+    ) -> crate::kv_sizing::KvTensorSpec {
+        crate::kv_sizing::KvTensorSpec {
+            name: name.into(),
+            dtype,
+            shape: vec![
+                crate::kv_sizing::KvDimension::PerSequenceBatch,
+                crate::kv_sizing::KvDimension::Fixed(2),
+                crate::kv_sizing::KvDimension::Context,
+                crate::kv_sizing::KvDimension::Fixed(head_dim),
+            ],
+        }
+    }
+
+    #[test]
+    fn native_kv_accounting_sums_asymmetric_key_and_value_geometry() {
+        let config = EngineConfig::default();
+        let model = native_kv_model_with_specs(vec![
+            native_kv_spec("key", crate::kv_sizing::KvStorageType::Float16, 4),
+            native_kv_spec("value", crate::kv_sizing::KvStorageType::Float16, 8),
+        ]);
+
+        let admission = governor_native_kv_config(Some(&model), &config).unwrap();
+
+        assert_eq!(admission.bytes_per_token(), Some(48));
+        assert_eq!(
+            admission.page_size_bytes,
+            Some(
+                crate::kv_sizing::kv_cache_bytes_for_tensors(
+                    &model.native_kv_tensors,
+                    config.page_size as u64
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn native_kv_accounting_sums_asymmetric_storage_widths() {
+        let config = EngineConfig::default();
+        let model = native_kv_model_with_specs(vec![
+            native_kv_spec("key", crate::kv_sizing::KvStorageType::Float16, 4),
+            native_kv_spec("value", crate::kv_sizing::KvStorageType::Float32, 4),
+        ]);
+
+        let admission = governor_native_kv_config(Some(&model), &config).unwrap();
+
+        assert_eq!(admission.bytes_per_token(), Some(48));
+    }
+
+    #[test]
+    fn state_only_metadata_is_a_valid_non_paged_cache_not_unknown_geometry() {
+        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+            "state_pairs": [
+                { "input": "conv_state_in", "output": "conv_state_out" }
+            ]
+        }))
+        .unwrap();
+
+        assert!(model_io_declares_only_fixed_state(Some(&io)));
+        let kv_config = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
+        assert_eq!(kv_config.page_size_bytes, None);
+        assert!(!kv_config.page_geometry_required);
+        assert_eq!(kv_config.bytes_per_token(), None);
+    }
 }
