@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, EngineDriver, GenerateSubmitError},
+    driver::{DriverEvent, DriverFailure, DriverFailureKind, EngineDriver, GenerateSubmitError},
     multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
@@ -307,6 +307,7 @@ struct ErrorBody {
 pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
+    kind: &'static str,
     retry_after_secs: Option<u64>,
 }
 
@@ -333,6 +334,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -341,6 +343,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -349,6 +352,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -357,6 +361,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -365,6 +370,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -373,7 +379,20 @@ impl ApiError {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
+            kind: "resource_limit_error",
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
+        }
+    }
+}
+
+fn generation_failure(error: DriverFailure) -> ApiError {
+    match error.kind {
+        DriverFailureKind::MemoryOverload => ApiError::too_many_requests(format!(
+            "KV memory resource limit exceeded: {}",
+            error.message
+        )),
+        DriverFailureKind::Internal => {
+            ApiError::internal(format!("generation failed: {}", error.message))
         }
     }
 }
@@ -444,7 +463,7 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorResponse {
             error: ErrorBody {
                 message: self.message,
-                kind: "server_error",
+                kind: self.kind,
             },
         });
         let mut response = (self.status, body).into_response();
@@ -537,4 +556,42 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn memory_admission_failure_maps_to_stable_overload_response() {
+        let response = generation_failure(DriverFailure {
+            message: "scheduler admission failed: KV byte budget exhausted".to_string(),
+            kind: DriverFailureKind::MemoryOverload,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("KV memory resource limit exceeded"))
+        );
+    }
+
+    #[test]
+    fn unrelated_generation_failure_remains_internal() {
+        let error = generation_failure(DriverFailure {
+            message: "backend execution failed".to_string(),
+            kind: DriverFailureKind::Internal,
+        });
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+    }
 }

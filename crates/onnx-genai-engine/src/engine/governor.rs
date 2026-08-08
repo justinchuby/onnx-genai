@@ -491,6 +491,13 @@ pub(crate) fn governor_kv_config(
     Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
 }
 
+#[cfg_attr(
+    not(feature = "native-backend"),
+    expect(
+        dead_code,
+        reason = "native KV admission is used only by the native backend"
+    )
+)]
 pub(crate) fn governor_native_kv_config(
     kv_model: Option<&KvModelInfo>,
     config: &EngineConfig,

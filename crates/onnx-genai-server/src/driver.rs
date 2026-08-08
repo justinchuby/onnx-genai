@@ -15,7 +15,7 @@ use onnx_genai::{
 use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
     GovernorSnapshot, KvNotApplicable, KvTelemetry, PipelineEngine, PipelineGenerateRequest,
-    ResourceLimit,
+    ResourceLimit, SchedulerAdmissionError,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -98,7 +98,51 @@ pub(crate) enum DriverCommand {
 pub(crate) enum DriverEvent {
     Token(GenerateToken),
     Finished(GenerateResult),
-    Error(String),
+    Error(DriverFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverFailureKind {
+    Internal,
+    MemoryOverload,
+}
+
+#[derive(Debug)]
+pub(crate) struct DriverFailure {
+    pub(crate) message: String,
+    pub(crate) kind: DriverFailureKind,
+}
+
+impl std::fmt::Display for DriverFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl DriverFailure {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: DriverFailureKind::Internal,
+        }
+    }
+
+    fn from_engine_error(error: &anyhow::Error) -> Self {
+        let memory_overload = error.chain().any(|source| {
+            matches!(
+                source.downcast_ref::<SchedulerAdmissionError>(),
+                Some(SchedulerAdmissionError::ByteBudget { .. })
+            )
+        });
+        Self {
+            message: error.to_string(),
+            kind: if memory_overload {
+                DriverFailureKind::MemoryOverload
+            } else {
+                DriverFailureKind::Internal
+            },
+        }
+    }
 }
 
 enum EngineBackend {
@@ -319,7 +363,7 @@ impl EngineDriver {
             match event {
                 DriverEvent::Token(_) => {}
                 DriverEvent::Finished(_) => return Ok(()),
-                DriverEvent::Error(message) => anyhow::bail!(message),
+                DriverEvent::Error(error) => anyhow::bail!(error.message),
             }
         }
         anyhow::bail!("generation stream ended before result")
@@ -565,9 +609,9 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
             }
             DriverCommand::Generate { events, .. } | DriverCommand::GenerateFim { events, .. } => {
                 crate::metrics::generation_queue_cancelled();
-                let _ = events.try_send(DriverEvent::Error(
-                    "invalid generation route for pipeline model".to_string(),
-                ));
+                let _ = events.try_send(DriverEvent::Error(DriverFailure::internal(
+                    "invalid generation route for pipeline model",
+                )));
             }
             DriverCommand::Embed { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!(
@@ -800,9 +844,11 @@ fn run_static_batch_until_idle(
         Err(err) => {
             crate::metrics::generation_queue_cancelled();
             for pending in initial {
-                let _ = pending.events.try_send(DriverEvent::Error(format!(
-                    "continuous batch setup failed: {err}"
-                )));
+                let _ = pending
+                    .events
+                    .try_send(DriverEvent::Error(DriverFailure::internal(format!(
+                        "continuous batch setup failed: {err}"
+                    ))));
             }
             return;
         }
@@ -883,9 +929,13 @@ fn run_static_batch_until_idle(
         }
 
         if let Err(err) = manager.step() {
-            let message = format!("continuous batch generation failed: {err}");
+            let mut failure = DriverFailure::from_engine_error(&err);
+            failure.message = format!("continuous batch generation failed: {err}");
             for (_, route) in routes.drain() {
-                let _ = route.events.try_send(DriverEvent::Error(message.clone()));
+                let _ = route.events.try_send(DriverEvent::Error(DriverFailure {
+                    message: failure.message.clone(),
+                    kind: failure.kind,
+                }));
             }
             break;
         }
@@ -1015,7 +1065,7 @@ fn submit_to_continuous_manager(
         }
         Err(err) => {
             crate::metrics::generation_queue_cancelled();
-            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
         }
     }
 }
@@ -1090,9 +1140,9 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         } => run_fim_generation(engine, prefix, suffix, fim_config, *options, events, permit),
         DriverCommand::GeneratePipeline { events, .. } => {
             crate::metrics::generation_queue_cancelled();
-            let _ = events.try_send(DriverEvent::Error(
-                "invalid pipeline generation route for single model".to_string(),
-            ));
+            let _ = events.try_send(DriverEvent::Error(DriverFailure::internal(
+                "invalid pipeline generation route for single model",
+            )));
         }
         DriverCommand::Embed {
             input_ids,
@@ -1143,7 +1193,9 @@ fn run_pipeline_generation(
         Ok(Some(bound)) => bound,
         Ok(None) => PipelineGenerateRequest::new(request),
         Err(error) => {
-            let _ = events.try_send(DriverEvent::Error(format!("{error:#}")));
+            let _ = events.try_send(DriverEvent::Error(DriverFailure::internal(format!(
+                "{error:#}"
+            ))));
             return;
         }
     };
@@ -1159,7 +1211,7 @@ fn run_pipeline_generation(
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
         }
     }
 }
@@ -1190,7 +1242,7 @@ fn run_fallback_generation(
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
         }
     }
 }
@@ -1211,7 +1263,7 @@ fn run_fim_generation(
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(err.to_string()));
+            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
         }
     }
 }
@@ -1219,6 +1271,40 @@ fn run_fim_generation(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn only_kv_byte_budget_admission_is_memory_overload() {
+        let memory_error: anyhow::Error = SchedulerAdmissionError::ByteBudget {
+            request_id: 1,
+            seq_id: 2,
+            prompt_tokens: 10,
+            max_tokens: 20,
+            bytes_per_token: 1024,
+            requested: 30_720,
+            minimum_required: 11_264,
+            used: 4096,
+            limit: 8192,
+            available: 4096,
+            shortfall: 7168,
+            running: 1,
+            max_batch_size: 32,
+        }
+        .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&memory_error).kind,
+            DriverFailureKind::MemoryOverload
+        );
+
+        let batch_error: anyhow::Error = SchedulerAdmissionError::BatchFull {
+            running: 32,
+            max_batch_size: 32,
+        }
+        .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&batch_error).kind,
+            DriverFailureKind::Internal
+        );
+    }
 
     #[tokio::test]
     async fn resource_snapshot_uses_mirror_even_when_command_queue_is_full() {

@@ -172,7 +172,7 @@ async fn run_completion(
         .await?,
     )
     .await
-    .map_err(|err| ApiError::internal(format!("generation failed: {err}")))?;
+    .map_err(generation_failure)?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
@@ -253,8 +253,12 @@ async fn stream_completion(
                     }
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(message)) => break Err(message),
-                None => break Err("generation stream ended before result".to_string()),
+                Some(DriverEvent::Error(error)) => break Err(error),
+                None => {
+                    break Err(DriverFailure::internal(
+                        "generation stream ended before result",
+                    ));
+                }
             }
         };
 
@@ -298,11 +302,12 @@ async fn stream_completion(
                 .await?;
             }
             Err(err) => {
+                let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
-                            message: format!("generation failed: {err}"),
-                            kind: "server_error",
+                            message: error.message,
+                            kind: error.kind,
                         },
                     })?,
                 )))
@@ -441,7 +446,7 @@ async fn run_chat_completion(
             .map_err(map_generate_submit_error)?
     })
     .await
-    .map_err(|err| ApiError::internal(format!("generation failed: {err}")));
+    .map_err(generation_failure);
     crate::metrics::add_prompt_tokens(prompt_tokens);
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
@@ -625,8 +630,12 @@ async fn stream_chat_completion(
                     }
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(message)) => break Err(message),
-                None => break Err("generation stream ended before result".to_string()),
+                Some(DriverEvent::Error(error)) => break Err(error),
+                None => {
+                    break Err(DriverFailure::internal(
+                        "generation stream ended before result",
+                    ));
+                }
             }
         };
 
@@ -729,7 +738,8 @@ async fn stream_chat_completion(
                 }
             }
             Err(err)
-                if wants_constrained_json && json_constraint_stopped_incomplete_message(&err) =>
+                if wants_constrained_json
+                    && json_constraint_stopped_incomplete_message(&err.message) =>
             {
                 send_stream_chunk(
                     &tx,
@@ -739,11 +749,12 @@ async fn stream_chat_completion(
                 send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
             }
             Err(err) => {
+                let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
-                            message: format!("generation failed: {err}"),
-                            kind: "server_error",
+                            message: error.message,
+                            kind: error.kind,
                         },
                     })?,
                 )))
@@ -763,15 +774,17 @@ async fn stream_chat_completion(
 
 pub(crate) async fn collect_generation_result(
     mut rx: mpsc::Receiver<DriverEvent>,
-) -> Result<GenerateResult, String> {
+) -> Result<GenerateResult, DriverFailure> {
     while let Some(event) = rx.recv().await {
         match event {
             DriverEvent::Token(_) => {}
             DriverEvent::Finished(result) => return Ok(result),
-            DriverEvent::Error(message) => return Err(message),
+            DriverEvent::Error(error) => return Err(error),
         }
     }
-    Err("generation stream ended before result".to_string())
+    Err(DriverFailure::internal(
+        "generation stream ended before result",
+    ))
 }
 
 fn preprocess_chat_audio(

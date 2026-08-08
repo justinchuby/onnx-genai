@@ -26,6 +26,13 @@ pub(crate) struct KvModelInfo {
     pub(crate) layer_configs: Vec<LayerTensorConfig>,
     /// Native past tensors, retained independently so asymmetric K/V geometry
     /// and storage types are charged exactly as the allocator sizes them.
+    #[cfg_attr(
+        not(feature = "native-backend"),
+        expect(
+            dead_code,
+            reason = "native KV tensors are consumed only by the native backend"
+        )
+    )]
     pub(crate) native_kv_tensors: Vec<KvTensorSpec>,
     pub(crate) layers: Vec<KvLayerIo>,
 }
