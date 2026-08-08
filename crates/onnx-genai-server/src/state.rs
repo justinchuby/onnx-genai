@@ -93,17 +93,29 @@ impl ServerMemoryAuthorities {
             .iter()
             .map(DeviceMemoryAuthority::pause_reconfiguration)
             .collect::<Vec<_>>();
+        let mut trim_plan = Vec::with_capacity(ordered.len());
         for (authority, guard) in ordered.iter().zip(&guards) {
             let used = guard.used();
-            if used > resolved {
-                authority.trim_unmapped_bytes(used - resolved)?;
-            }
-        }
-        for (authority, guard) in ordered.iter().zip(&guards) {
-            if guard.used() > resolved {
+            let required = used.saturating_sub(resolved);
+            let releasable = authority.releasable_unmapped_bytes();
+            if required > releasable {
                 anyhow::bail!(
-                    "cannot satisfy lowered resource limit of {resolved} bytes: {} currently has \
-                     {} mapped or otherwise leased bytes",
+                    "cannot satisfy lowered resource limit of {resolved} bytes: {} has {used} \
+                     leased bytes but only {releasable} pooled-unmapped bytes are releasable",
+                    authority.domain()
+                );
+            }
+            trim_plan.push(required);
+        }
+        for ((authority, guard), required) in
+            ordered.iter().zip(&guards).zip(trim_plan.iter().copied())
+        {
+            let released = authority.trim_unmapped_bytes(required)?;
+            if released < required || guard.used() > resolved {
+                anyhow::bail!(
+                    "could not complete lowered resource limit of {resolved} bytes for {}: \
+                     planned to release {required} pooled bytes, released {released}, and {} \
+                     bytes remain leased; limits and server policy remain unchanged",
                     authority.domain(),
                     guard.used()
                 );
@@ -728,6 +740,71 @@ mod authority_tests {
             .authority(&DeviceCompatibilityDomain::Cuda(2), 100)
             .unwrap();
         assert_eq!(future.limit_bytes(), 100);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn failed_multi_device_preflight_does_not_trim_an_earlier_pool() {
+        use cudarc::driver::CudaContext;
+        use onnx_runtime_ep_cuda::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        use onnx_runtime_virtual_memory::VirtualBacking;
+
+        let context = CudaContext::new(0).expect("CUDA driver");
+        let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);
+        let granule = probe.granularity() as u64;
+        let initial_limit = granule * 4;
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(initial_limit));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), initial_limit)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), initial_limit)
+            .unwrap();
+        let pool = PhysicalHandlePool::get_or_create(
+            context,
+            0,
+            (granule * 2) as usize,
+            &first,
+            HolderId::new(10),
+            MemoryRole::Weights,
+        )
+        .expect("first-device pool");
+        let stats = pool.stats();
+        let backing = CudaVirtualBacking::with_physical_pool(pool);
+        let mut reservation = backing
+            .reserve((granule * 2) as usize)
+            .expect("reservation");
+        backing
+            .commit(&mut reservation, 0, (granule * 2) as usize)
+            .expect("commit pooled bytes");
+        backing
+            .release(&mut reservation, 0, (granule * 2) as usize)
+            .expect("return pooled bytes");
+        let _mapped_second = second
+            .reserve(
+                Tier::Device,
+                granule * 2,
+                MemoryRole::Weights,
+                HolderId::new(11),
+            )
+            .expect("non-releasable second-device bytes");
+        let before = stats.snapshot();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(granule))
+            .expect_err("second device prevents shrink");
+        let after = stats.snapshot();
+        assert_eq!(after.releases, before.releases);
+        assert_eq!(after.creates, before.creates);
+        assert_eq!(after.pooled_unmapped_bytes, before.pooled_unmapped_bytes);
+        assert_eq!(first.used_bytes(), granule * 2);
+        assert_eq!(first.limit_bytes(), initial_limit);
+        assert_eq!(second.limit_bytes(), initial_limit);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(initial_limit)
+        );
     }
 
     #[test]

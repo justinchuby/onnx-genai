@@ -531,15 +531,15 @@ pub fn trim_physical_handle_pools(
             let Some(handle) = pool.lock().available.pop() else {
                 break;
             };
-            if let Err(error) = pool.bind("trimming pooled CUDA physical memory") {
+            if pool.bind("trimming pooled CUDA physical memory").is_err() {
                 pool.lock().available.push(handle);
-                return Err(error);
+                break;
             }
-            if let Err(error) =
-                CudaVirtualBacking::check("cuMemRelease", unsafe { cu::cuMemRelease(handle) })
+            if CudaVirtualBacking::check("cuMemRelease", unsafe { cu::cuMemRelease(handle) })
+                .is_err()
             {
                 pool.lock().available.push(handle);
-                return Err(error);
+                break;
             }
             let bytes = pool.granularity as u64;
             pool.counters.releases.fetch_add(1, Ordering::Relaxed);
@@ -554,6 +554,22 @@ pub fn trim_physical_handle_pools(
         }
     }
     Ok(released)
+}
+
+/// Bytes that can be released without disturbing live mappings for `authority`.
+pub fn pooled_unmapped_bytes_for_authority(authority: MemoryAuthorityId) -> u64 {
+    let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, pool| pool.strong_count() > 0);
+    registry
+        .iter()
+        .filter(|(key, _)| key.authority == authority)
+        .filter_map(|(_, pool)| pool.upgrade())
+        .fold(0_u64, |total, pool| {
+            total.saturating_add(pool.counters.pooled_unmapped_bytes.load(Ordering::Acquire))
+        })
 }
 
 impl Drop for PhysicalHandlePool {

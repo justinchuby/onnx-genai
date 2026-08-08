@@ -82,10 +82,24 @@ impl DeviceMemoryAuthority {
             )
             .map_err(anyhow::Error::new)
         }
+
         #[cfg(not(feature = "cuda"))]
         {
             let _ = bytes;
             Ok(0)
+        }
+    }
+
+    pub fn releasable_unmapped_bytes(&self) -> u64 {
+        #[cfg(feature = "cuda")]
+        {
+            onnx_runtime_ep_cuda::virtual_memory::pooled_unmapped_bytes_for_authority(
+                self.authority_id(),
+            )
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
         }
     }
 
