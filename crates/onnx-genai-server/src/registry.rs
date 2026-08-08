@@ -19,7 +19,7 @@ use crate::{
     driver::EngineDriver,
     models_config::ModelSpec,
     multimodal::MultimodalSpecs,
-    state::{ServerConfig, build_handle},
+    state::{ServerConfig, ServerMemoryAuthorities, build_handle_with_authorities},
 };
 
 /// Policy used to choose which loaded model to evict when the loaded-model cap is
@@ -243,6 +243,7 @@ pub(crate) struct ModelRegistry {
     /// Per-id load guards, ensuring two concurrent requests for the same lazy id
     /// build the model only once; the second waiter observes the first result.
     load_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    authority_provider: Arc<ServerMemoryAuthorities>,
 }
 
 impl ModelRegistry {
@@ -269,14 +270,23 @@ impl ModelRegistry {
             default_id,
             available,
         };
+        let authority_provider = Arc::new(ServerMemoryAuthorities::new(
+            config.engine_config.limits.vram_limit,
+        ));
         let registry = Self {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(config.clone()),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authority_provider,
         };
         for spec in specs.iter().filter(|s| s.eager) {
             tracing::info!(id = %spec.id, path = %spec.path.display(), "loading model");
-            let handle = build_handle(spec, &config).with_context(|| {
+            let handle = build_handle_with_authorities(
+                spec,
+                &config,
+                Arc::clone(&registry.authority_provider),
+            )
+            .with_context(|| {
                 format!(
                     "failed to load model '{}' from '{}'",
                     spec.id,
@@ -303,6 +313,9 @@ impl ModelRegistry {
     /// not recorded in `available` and therefore cannot be lazily reloaded after
     /// an unload.
     pub(crate) fn from_handle(handle: Arc<ModelHandle>, config: ServerConfig) -> Self {
+        let authority_provider = Arc::new(ServerMemoryAuthorities::new(
+            config.engine_config.limits.vram_limit,
+        ));
         let default_id = Some(handle.id.clone());
         let mut inner = RegistryInner {
             models: HashMap::new(),
@@ -315,6 +328,7 @@ impl ModelRegistry {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(config),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authority_provider,
         }
     }
 
@@ -411,18 +425,21 @@ impl ModelRegistry {
         }
 
         let config = Arc::clone(&self.config);
+        let authority_provider = Arc::clone(&self.authority_provider);
         let spec_for_build = spec.clone();
         tracing::info!(id = %spec.id, path = %spec.path.display(), "lazy-loading model");
-        let handle = tokio::task::spawn_blocking(move || build_handle(&spec_for_build, &config))
-            .await
-            .context("model load task panicked")?
-            .with_context(|| {
-                format!(
-                    "failed to load model '{}' from '{}'",
-                    spec.id,
-                    spec.path.display()
-                )
-            })?;
+        let handle = tokio::task::spawn_blocking(move || {
+            build_handle_with_authorities(&spec_for_build, &config, authority_provider)
+        })
+        .await
+        .context("model load task panicked")?
+        .with_context(|| {
+            format!(
+                "failed to load model '{}' from '{}'",
+                spec.id,
+                spec.path.display()
+            )
+        })?;
         let handle = Arc::new(handle);
 
         // Insert + evict under the write lock (no await held).
@@ -579,6 +596,9 @@ impl ModelRegistry {
             })),
             config: Arc::new(ServerConfig::default()),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authority_provider: Arc::new(ServerMemoryAuthorities::new(
+                ServerConfig::default().engine_config.limits.vram_limit,
+            )),
         }
     }
 
@@ -665,6 +685,7 @@ mod tests {
                 // decode path, and "pending" is the only claim that holds.
                 kv_telemetry: Default::default(),
                 resource_snapshot: Default::default(),
+                device_authority: None,
             },
             tokenizer,
             chat_template: None,
@@ -704,6 +725,61 @@ mod tests {
         assert_eq!(resolved.id, "gamma");
         assert_eq!(registry.default_id().unwrap().as_deref(), Some("gamma"));
         assert_eq!(registry.ids().unwrap(), ids);
+    }
+
+    #[tokio::test]
+    async fn production_load_path_shares_device_authority_and_metrics_ledger() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![
+            ModelSpec {
+                id: "first".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "second".to_string(),
+                path: model_dir,
+                eager: true,
+                warmup: false,
+            },
+        ];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let first = registry.resolve("first").unwrap().unwrap();
+        let second = registry.resolve("second").unwrap().unwrap();
+        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
+        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
+
+        assert_eq!(
+            first_authority.authority_id(),
+            second_authority.authority_id()
+        );
+        let aggregate_used = first_authority.used_bytes();
+        assert!(aggregate_used > 0);
+        assert_eq!(
+            first.engine.resource_snapshot().await.unwrap().vram.used,
+            aggregate_used
+        );
+        assert_eq!(
+            second.engine.resource_snapshot().await.unwrap().vram.used,
+            aggregate_used
+        );
+
+        drop(first);
+        registry.unload("first").unwrap();
+        for _ in 0..100 {
+            if first_authority.used_bytes() < aggregate_used {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(first_authority.used_bytes() < aggregate_used);
+        assert!(first_authority.used_bytes() > 0);
+        assert_eq!(
+            second.engine.resource_snapshot().await.unwrap().vram.used,
+            first_authority.used_bytes()
+        );
     }
 
     #[test]

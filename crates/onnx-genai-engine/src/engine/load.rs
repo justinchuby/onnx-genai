@@ -2,11 +2,29 @@
 
 use super::*;
 use crate::engine::memory_plan::Holder;
+use crate::memory_authority::{
+    DeviceCompatibilityDomain, MemoryAuthorityProvider, SharedMemoryAuthorityProvider,
+};
 
 impl Engine {
     /// Load a model from a directory.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false)
+        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
+    }
+
+    /// Load a model using a caller-owned device authority provider.
+    pub fn from_dir_with_memory_authority_provider(
+        model_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::from_dir_impl(
+            model_dir,
+            config,
+            SessionOptions::default(),
+            false,
+            Some(provider),
+        )
     }
 
     /// Load a model from a directory with explicit ORT session options.
@@ -15,7 +33,7 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        Self::from_dir_impl(model_dir, config, session_options, true)
+        Self::from_dir_impl(model_dir, config, session_options, true, None)
     }
 
     fn from_dir_impl(
@@ -23,6 +41,7 @@ impl Engine {
         mut config: EngineConfig,
         mut session_options: SessionOptions,
         session_options_are_programmatic: bool,
+        authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
@@ -48,16 +67,48 @@ impl Engine {
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?
         };
         if decode_backend == EngineDecodeBackend::Native {
-            return augment_backend_error(
-                Self::from_native_model_directory(
-                    model_directory,
-                    config,
-                    &session_options,
-                    metadata_hints,
-                ),
-                EngineDecodeBackend::Native,
-            );
+            #[cfg(feature = "native-backend")]
+            {
+                let native_device =
+                    resolve_native_decode_device(config.native_device.clone(), &session_options)?;
+                let domain = native_device_domain(&native_device);
+                validate_shared_authority_limit(
+                    authority_provider.as_ref(),
+                    &domain,
+                    config.limits.vram_limit,
+                )?;
+                return augment_backend_error(
+                    Self::from_native_model_directory(
+                        model_directory,
+                        config,
+                        &session_options,
+                        metadata_hints,
+                        native_device,
+                        authority_provider.as_ref(),
+                        &domain,
+                    ),
+                    EngineDecodeBackend::Native,
+                );
+            }
+            #[cfg(not(feature = "native-backend"))]
+            {
+                return augment_backend_error(
+                    Self::from_native_model_directory(
+                        model_directory,
+                        config,
+                        &session_options,
+                        metadata_hints,
+                    ),
+                    EngineDecodeBackend::Native,
+                );
+            }
         }
+        let domain = session_device_domain(&session_options)?;
+        validate_shared_authority_limit(
+            authority_provider.as_ref(),
+            &domain,
+            config.limits.vram_limit,
+        )?;
         fail_explicit_vram_limit_without_offload(
             &config,
             device_weight_package_bytes(&model_directory.model_path),
@@ -119,6 +170,8 @@ impl Engine {
             &model_directory,
             kv_model.as_ref(),
             &decode_path,
+            authority_provider.as_ref(),
+            &domain,
         )?;
 
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
@@ -210,8 +263,11 @@ impl Engine {
     fn from_native_model_directory(
         model_directory: ModelDirectory,
         config: EngineConfig,
-        session_options: &SessionOptions,
+        _session_options: &SessionOptions,
         metadata_hints: MetadataHints,
+        native_device: crate::native_decode::NativeDecodeDevice,
+        authority_provider: Option<&SharedMemoryAuthorityProvider>,
+        authority_domain: &DeviceCompatibilityDomain,
     ) -> anyhow::Result<Self> {
         if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
         {
@@ -222,9 +278,6 @@ impl Engine {
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
         }
-        let native_device =
-            resolve_native_decode_device(config.native_device.clone(), session_options)?;
-
         let metadata = {
             let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
             if let Some(metadata_path) = &model_directory.metadata_path {
@@ -305,11 +358,13 @@ impl Engine {
         );
         let governor = {
             let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
-            EngineResourceGovernor::new(
+            EngineResourceGovernor::new_with_authority(
                 config.limits.clone(),
                 config.allow_runtime_override,
                 governor_kv_config,
                 weight_reservation_bytes,
+                authority_provider,
+                Some(authority_domain),
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
@@ -736,6 +791,8 @@ fn build_governor_and_scheduler(
     model_directory: &ModelDirectory,
     kv_model: Option<&KvModelInfo>,
     decode_path: &ModelDecodePath,
+    authority_provider: Option<&SharedMemoryAuthorityProvider>,
+    authority_domain: &DeviceCompatibilityDomain,
 ) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
     let governor_kv_config = match (kv_model, decode_path) {
         (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Legacy) => {
@@ -745,11 +802,13 @@ fn build_governor_and_scheduler(
     };
     let governor = {
         let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
-        EngineResourceGovernor::new(
+        EngineResourceGovernor::new_with_authority(
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
             device_weight_package_bytes(&model_directory.model_path),
+            authority_provider,
+            Some(authority_domain),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
     };
@@ -763,8 +822,65 @@ fn build_governor_and_scheduler(
             None => None,
         };
     }
+
     let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
     Ok((governor, scheduler))
+}
+
+pub(crate) fn validate_shared_authority_limit(
+    provider: Option<&SharedMemoryAuthorityProvider>,
+    domain: &DeviceCompatibilityDomain,
+    limit: ResourceLimit,
+) -> anyhow::Result<()> {
+    if let Some(provider) = provider {
+        provider.validate_limit(domain, limit)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn session_device_domain(
+    session_options: &SessionOptions,
+) -> anyhow::Result<DeviceCompatibilityDomain> {
+    let Some(provider) = session_options
+        .execution_providers
+        .iter()
+        .find(|provider| !provider.caps.is_host())
+    else {
+        return Ok(DeviceCompatibilityDomain::Host);
+    };
+    let index = provider.caps.device_id().unwrap_or(0);
+    let index = u32::try_from(index).map_err(|_| {
+        anyhow::anyhow!(
+            "execution provider {} has negative device id {index}",
+            provider.caps.name
+        )
+    })?;
+    if provider.caps.is_nvidia() {
+        Ok(DeviceCompatibilityDomain::Cuda(index))
+    } else {
+        Ok(DeviceCompatibilityDomain::Accelerator {
+            backend: provider.caps.name.to_ascii_lowercase(),
+            index,
+        })
+    }
+}
+
+#[cfg(feature = "native-backend")]
+fn native_device_domain(
+    device: &crate::native_decode::NativeDecodeDevice,
+) -> DeviceCompatibilityDomain {
+    match device {
+        crate::native_decode::NativeDecodeDevice::Cpu => DeviceCompatibilityDomain::Host,
+        crate::native_decode::NativeDecodeDevice::Cuda { index } => {
+            DeviceCompatibilityDomain::Cuda(index.unwrap_or(0))
+        }
+        crate::native_decode::NativeDecodeDevice::Plugin { provider_name, .. } => {
+            DeviceCompatibilityDomain::Accelerator {
+                backend: provider_name.to_ascii_lowercase(),
+                index: 0,
+            }
+        }
+    }
 }
 
 fn required_bytes_per_token_from_kv_config(

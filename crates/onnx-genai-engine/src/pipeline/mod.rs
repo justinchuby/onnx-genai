@@ -13,6 +13,7 @@ use crate::kv_bridge::{
     sequence_pages_for_len,
 };
 use crate::logits::TokenId;
+use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
@@ -617,6 +618,14 @@ impl Engine {
         PipelineEngine::from_dir_with_config(pipeline_dir, config)
     }
 
+    pub fn from_pipeline_dir_with_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<PipelineEngine> {
+        PipelineEngine::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
+    }
+
     /// Load a pipeline directory with a custom [`SchedulerRegistry`] so users
     /// can plug in their own [`Scheduler`] implementations.
     pub fn from_pipeline_dir_with_schedulers(
@@ -660,6 +669,22 @@ impl PipelineEngine {
             config,
             &SchedulerRegistry::builtin(),
             session_options,
+            None,
+        )
+    }
+
+    /// Load a pipeline using a caller-owned device authority provider.
+    pub fn from_dir_with_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            pipeline_dir,
+            config,
+            &SchedulerRegistry::builtin(),
+            SessionOptions::default(),
+            Some(provider),
         )
     }
 
@@ -672,7 +697,13 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
     ) -> anyhow::Result<Self> {
-        Self::build(pipeline_dir, config, schedulers, SessionOptions::default())
+        Self::build(
+            pipeline_dir,
+            config,
+            schedulers,
+            SessionOptions::default(),
+            None,
+        )
     }
 
     fn build(
@@ -680,7 +711,14 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
         session_options: SessionOptions,
+        authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
+        let authority_domain = crate::engine::session_device_domain(&session_options)?;
+        crate::engine::validate_shared_authority_limit(
+            authority_provider.as_ref(),
+            &authority_domain,
+            config.limits.vram_limit,
+        )?;
         let decode_backend = requested_decode_backend(config.decode_backend)?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
         // backends resolve without touching the model directory (so a bad
@@ -771,7 +809,12 @@ impl PipelineEngine {
                         config.page_size,
                         config.kv_cache_dtype,
                     )?;
-                    let component_governor = component_governor(&config, kv_model.as_ref())?;
+                    let component_governor = component_governor(
+                        &config,
+                        kv_model.as_ref(),
+                        authority_provider.as_ref(),
+                        &authority_domain,
+                    )?;
                     let fixed_state_budget_bytes =
                         component_governor.snapshot().resolved_limits.host_ram_bytes;
                     let pipeline_pages = match kv_model.as_ref() {

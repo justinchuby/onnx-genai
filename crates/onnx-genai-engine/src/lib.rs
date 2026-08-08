@@ -18,6 +18,7 @@ pub mod fim;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
+mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_component;
 #[cfg(feature = "native-backend")]
@@ -57,6 +58,9 @@ pub use fim::{FimConfig, FimFormat};
 pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+};
+pub use memory_authority::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
 };
 #[cfg(feature = "native-backend")]
 pub use native_component::NativeComponentSession;

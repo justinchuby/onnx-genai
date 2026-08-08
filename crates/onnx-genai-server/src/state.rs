@@ -1,10 +1,17 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context;
 use onnx_genai::{Engine, EngineConfig};
-use onnx_genai_engine::KvDType;
 #[cfg(feature = "native-backend")]
 use onnx_genai_engine::NativeDecodeDevice;
+use onnx_genai_engine::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MemoryAuthorityProvider,
+    ResourceLimit,
+};
 use onnx_genai_ort::{
     ChatTemplate, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
 };
@@ -23,6 +30,81 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
+
+#[derive(Debug)]
+pub(crate) struct ServerMemoryAuthorities {
+    effective_limit: Mutex<ResourceLimit>,
+    authorities: Mutex<HashMap<DeviceCompatibilityDomain, DeviceMemoryAuthority>>,
+}
+
+impl ServerMemoryAuthorities {
+    pub(crate) fn new(configured_limit: ResourceLimit) -> Self {
+        Self {
+            effective_limit: Mutex::new(configured_limit),
+            authorities: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl MemoryAuthorityProvider for ServerMemoryAuthorities {
+    fn validate_limit(
+        &self,
+        domain: &DeviceCompatibilityDomain,
+        requested: ResourceLimit,
+    ) -> anyhow::Result<()> {
+        let mut effective = self
+            .effective_limit
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))?;
+        if *effective == ResourceLimit::Auto && requested != ResourceLimit::Auto {
+            *effective = requested;
+            return Ok(());
+        }
+        if requested != *effective {
+            anyhow::bail!(
+                "model device limit {} conflicts with server device-authority limit {} for {}; \
+                 configure --vram-limit once at server launch instead of per model",
+                describe_limit(requested),
+                describe_limit(*effective),
+                domain
+            );
+        }
+        Ok(())
+    }
+
+    fn authority(
+        &self,
+        domain: &DeviceCompatibilityDomain,
+        resolved_limit_bytes: u64,
+    ) -> anyhow::Result<DeviceMemoryAuthority> {
+        let mut authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        if let Some(authority) = authorities.get(domain) {
+            if authority.limit_bytes() != resolved_limit_bytes {
+                anyhow::bail!(
+                    "resolved model device limit {resolved_limit_bytes} bytes conflicts with \
+                     existing server device-authority limit {} bytes for {}",
+                    authority.limit_bytes(),
+                    domain
+                );
+            }
+            return Ok(authority.clone());
+        }
+        let authority = DeviceMemoryAuthority::new(domain.clone(), resolved_limit_bytes);
+        authorities.insert(domain.clone(), authority.clone());
+        Ok(authority)
+    }
+}
+
+fn describe_limit(limit: ResourceLimit) -> String {
+    match limit {
+        ResourceLimit::Auto => "auto".to_string(),
+        ResourceLimit::Bytes(bytes) => format!("{bytes} bytes"),
+        ResourceLimit::Fraction(fraction) => format!("{fraction} of detected capacity"),
+    }
+}
 
 /// Parse a user-supplied KV cache dtype string.
 ///
@@ -345,7 +427,19 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
 /// loading (`ModelRegistry::load`).  It is a **blocking** function (it calls
 /// `Engine::from_dir`, which takes seconds) and must therefore be invoked from a
 /// blocking context (e.g. at startup or via `tokio::task::spawn_blocking`).
+#[cfg(test)]
 pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::Result<ModelHandle> {
+    let authorities = Arc::new(ServerMemoryAuthorities::new(
+        config.engine_config.limits.vram_limit,
+    ));
+    build_handle_with_authorities(spec, config, authorities)
+}
+
+pub(crate) fn build_handle_with_authorities(
+    spec: &ModelSpec,
+    config: &ServerConfig,
+    authorities: Arc<ServerMemoryAuthorities>,
+) -> anyhow::Result<ModelHandle> {
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
@@ -360,6 +454,7 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
             model_max_context,
             chat_template,
             directory,
+            authorities,
         );
     }
     let model_directory = ModelDirectory::load(model_dir)
@@ -367,7 +462,11 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-    let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
+    let engine = Engine::from_dir_with_memory_authority_provider(
+        model_dir,
+        config.engine_config.clone(),
+        authorities,
+    )?;
     let fim_config = engine.fim_config().cloned();
     // Capture the model author's declared generation defaults before the engine
     // is moved into the driver, so every request built for this handle can honor
@@ -397,6 +496,7 @@ fn build_pipeline_handle(
     model_max_context: Option<usize>,
     chat_template: Option<ChatTemplate>,
     directory: PipelineModelDirectory,
+    authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -411,7 +511,11 @@ fn build_pipeline_handle(
     // whose pipeline ends in a waveform stage can serve speech.
     let text_to_image = directory.spec.strategy.denoiser.is_some();
     let text_to_audio = onnx_genai::text_to_audio::is_text_to_audio(&directory.spec);
-    let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
+    let engine = Engine::from_pipeline_dir_with_memory_authority_provider(
+        model_dir,
+        config.engine_config.clone(),
+        authorities,
+    )?;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
@@ -429,4 +533,56 @@ fn build_pipeline_handle(
         text_to_image,
         text_to_audio,
     }))
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_requests_create_one_authority() {
+        let provider = Arc::new(ServerMemoryAuthorities::new(ResourceLimit::Bytes(100)));
+        let threads = (0..8)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                std::thread::spawn(move || {
+                    provider
+                        .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+                        .unwrap()
+                        .authority_id()
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+    }
+
+    #[test]
+    fn conflicting_model_limit_names_both_values() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let error = provider
+            .validate_limit(
+                &DeviceCompatibilityDomain::Cuda(0),
+                ResourceLimit::Bytes(90),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("90 bytes"));
+        assert!(error.contains("100 bytes"));
+    }
+
+    #[test]
+    fn different_device_keys_create_different_authorities() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+        assert_ne!(first.authority_id(), second.authority_id());
+    }
 }

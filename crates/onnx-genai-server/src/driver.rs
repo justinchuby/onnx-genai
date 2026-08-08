@@ -14,8 +14,9 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
-    EmbeddingOptions, EngineGovernorError, FimConfig, GovernorSnapshot, KvNotApplicable,
-    KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
+    DeviceMemoryAuthority, EmbeddingOptions, EngineGovernorError, FimConfig, GovernorSnapshot,
+    KvNotApplicable, KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
+    SchedulerAdmissionError,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -37,6 +38,7 @@ pub(crate) struct EngineDriver {
     pub(crate) kv_telemetry: Arc<KvTelemetry>,
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
     pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    pub(crate) device_authority: Option<DeviceMemoryAuthority>,
 }
 
 pub(crate) enum DriverCommand {
@@ -200,6 +202,7 @@ impl EngineDriver {
         // last point at which it is reachable from here, and the mirror must
         // outlive that move because reading it is the whole reason it exists.
         let mut engine = engine;
+        let device_authority = Some(engine.governor().device_authority());
         let kv_telemetry = Arc::new(KvTelemetry::default());
         if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
             kv_telemetry.set_applicable();
@@ -230,6 +233,7 @@ impl EngineDriver {
             generation_capacity,
             kv_telemetry,
             resource_snapshot,
+            device_authority,
         }
     }
 
@@ -264,6 +268,7 @@ impl EngineDriver {
             generation_capacity,
             kv_telemetry,
             resource_snapshot,
+            device_authority: None,
         }
     }
 
@@ -538,11 +543,21 @@ impl EngineDriver {
     }
 
     pub(crate) async fn resource_snapshot(&self) -> anyhow::Result<GovernorSnapshot> {
-        self.resource_snapshot
+        let mut snapshot = self
+            .resource_snapshot
             .lock()
             .expect("resource snapshot mirror lock poisoned")
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("resource governor is not available for this model"))
+            .ok_or_else(|| anyhow::anyhow!("resource governor is not available for this model"))?;
+        if let Some(authority) = &self.device_authority {
+            let used = authority.used_bytes();
+            let limit = authority.limit_bytes();
+            snapshot.vram.used = used;
+            snapshot.vram.limit = limit;
+            snapshot.vram.headroom = limit.saturating_sub(used);
+            snapshot.resolved_limits.vram_bytes = limit;
+        }
+        Ok(snapshot)
     }
 
     pub(crate) async fn set_vram_limit(
@@ -1555,6 +1570,7 @@ mod admission_tests {
             generation_capacity: Arc::new(Semaphore::new(1)),
             kv_telemetry: Arc::new(KvTelemetry::default()),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
+            device_authority: None,
         };
 
         assert_eq!(driver.resource_snapshot().await.unwrap(), snapshot);
