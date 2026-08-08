@@ -51,6 +51,23 @@ impl ServerMemoryAuthorities {
             .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))
     }
 
+    pub(crate) fn aggregate_vram(&self) -> anyhow::Result<Option<(u64, u64, u64)>> {
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        if authorities.is_empty() {
+            return Ok(None);
+        }
+        let used = authorities.values().fold(0_u64, |total, authority| {
+            total.saturating_add(authority.used_bytes())
+        });
+        let limit = authorities.values().fold(0_u64, |total, authority| {
+            total.saturating_add(authority.limit_bytes())
+        });
+        Ok(Some((used, limit, limit.saturating_sub(used))))
+    }
+
     /// Atomically apply one operator policy to every device authority.
     ///
     /// The server flag is process-wide, so the scope is deliberately all

@@ -262,12 +262,16 @@ impl ModelRegistry {
     pub(crate) async fn set_vram_limit(
         &self,
         limit: onnx_genai_engine::ResourceLimit,
-    ) -> anyhow::Result<onnx_genai_engine::GovernorSnapshot> {
+    ) -> anyhow::Result<Option<onnx_genai_engine::GovernorSnapshot>> {
         let _policy = self.policy_lock.write().await;
+        if !self.config.engine_config.allow_runtime_override {
+            return Err(onnx_genai_engine::EngineGovernorError::RuntimeOverrideDisabled.into());
+        }
         let old_limit = self.authority_provider.configured_limit()?;
         let handles = self.read()?.models.values().cloned().collect::<Vec<_>>();
         if handles.is_empty() {
-            anyhow::bail!("no model loaded");
+            self.authority_provider.reconfigure_limit(limit)?;
+            return Ok(None);
         }
         // Drain and hold every admission permit so no request can consume
         // newly exposed headroom between provider commit and per-engine commit.
@@ -305,7 +309,28 @@ impl ModelRegistry {
                 }
             }
         }
-        latest.ok_or_else(|| anyhow::anyhow!("no model loaded"))
+        Ok(latest)
+    }
+
+    pub(crate) async fn aggregate_resource_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<onnx_genai_engine::GovernorSnapshot>> {
+        let handle = self.read()?.models.values().next().cloned();
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let mut snapshot = handle.engine.resource_snapshot().await?;
+        if let Some((used, limit, headroom)) = self.authority_provider.aggregate_vram()? {
+            snapshot.vram.used = used;
+            snapshot.vram.limit = limit;
+            snapshot.vram.headroom = headroom;
+            snapshot.resolved_limits.vram_bytes = limit;
+        }
+        Ok(Some(snapshot))
+    }
+
+    pub(crate) fn any_loaded(&self) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
+        Ok(self.read()?.models.values().next().cloned())
     }
 
     /// Build a registry from a list of specs, loading the eager ones immediately.
@@ -846,6 +871,17 @@ mod tests {
             second.engine.resource_snapshot().await.unwrap().vram.used,
             first_authority.used_bytes()
         );
+        let metrics_snapshot = registry
+            .aggregate_resource_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics_snapshot.vram.used, first_authority.used_bytes());
+        assert_eq!(metrics_snapshot.vram.limit, first_authority.limit_bytes());
+        assert_eq!(
+            metrics_snapshot.vram.headroom,
+            first_authority.headroom_bytes()
+        );
     }
 
     #[tokio::test]
@@ -920,7 +956,7 @@ mod tests {
         config.engine_config.allow_runtime_override = true;
         let registry = ModelRegistry::from_specs(&specs, config).unwrap();
         let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
-        let snapshot = registry.set_vram_limit(new_limit).await.unwrap();
+        let snapshot = registry.set_vram_limit(new_limit).await.unwrap().unwrap();
         let effective_limit = snapshot.vram.limit;
 
         let lazy = registry.load("lazy").await.unwrap();
@@ -963,6 +999,42 @@ mod tests {
         assert_eq!(
             registry.authority_provider.configured_limit().unwrap(),
             old_policy
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_limit_update_with_no_loaded_models_applies_to_future_load() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![
+            ModelSpec {
+                id: "eager".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "lazy".to_string(),
+                path: model_dir,
+                eager: false,
+                warmup: false,
+            },
+        ];
+        let mut config = ServerConfig::default();
+        config.engine_config.allow_runtime_override = true;
+        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        registry.unload("eager").unwrap();
+        let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
+
+        assert!(registry.set_vram_limit(new_limit).await.unwrap().is_none());
+        assert_eq!(
+            registry.authority_provider.configured_limit().unwrap(),
+            new_limit
+        );
+        let lazy = registry.load("lazy").await.unwrap();
+        assert_eq!(
+            lazy.engine.resource_snapshot().await.unwrap().vram.limit,
+            7 << 30
         );
     }
 

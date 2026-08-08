@@ -2611,6 +2611,65 @@ fn lazy_state(config: ServerConfig) -> AppState {
     AppState::load_from_specs(specs, config).expect("load lazy two-model state")
 }
 
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_keep_shared_vram_after_default_model_unload() {
+    let state = lazy_state(ServerConfig::default());
+    state.registry.load("model-b").await.unwrap();
+    state.registry.unload("model-a").unwrap();
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let used = prometheus_sample(&body, "onnx_genai_vram_used_bytes");
+    let limit = prometheus_sample(&body, "onnx_genai_vram_limit_bytes");
+    let headroom = prometheus_sample(&body, "onnx_genai_vram_headroom_bytes");
+    assert!(used > 0);
+    assert!(limit > used);
+    assert_eq!(headroom, limit - used);
+}
+
+#[tokio::test]
+async fn admin_vram_update_with_no_loaded_models_sets_future_policy() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        engine_config: EngineConfig {
+            allow_runtime_override: true,
+            ..EngineConfig::default()
+        },
+        ..ServerConfig::default()
+    });
+    state.registry.unload("model-a").unwrap();
+
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/resources/vram-limit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": "7GiB"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let loaded = state.registry.load("model-b").await.unwrap();
+    assert_eq!(
+        loaded.engine.resource_snapshot().await.unwrap().vram.limit,
+        7 << 30
+    );
+}
+
 fn chat_request(model: &str) -> Request<Body> {
     Request::builder()
         .method("POST")

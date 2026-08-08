@@ -160,7 +160,7 @@ pub(crate) async fn resources(
 pub(crate) async fn admin_set_vram_limit(
     State(state): State<AppState>,
     Json(request): Json<SetVramLimitRequest>,
-) -> Result<Json<ResourcesResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = parse_resource_limit(&request.limit)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let snapshot = state.registry.set_vram_limit(limit).await.map_err(|err| {
@@ -173,7 +173,10 @@ pub(crate) async fn admin_set_vram_limit(
             ApiError::conflict(format!("resource override failed: {err}"))
         }
     })?;
-    Ok(Json(snapshot.into()))
+    Ok(match snapshot {
+        Some(snapshot) => Json(ResourcesResponse::from(snapshot)).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 /// `GET /v1/debug/profile` — where the server's decode time went.
@@ -401,7 +404,7 @@ pub(crate) async fn prometheus_metrics(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let mut output = crate::metrics::encode_prometheus();
-    let handle = state.registry.resolve("").map_err(map_registry_error)?;
+    let handle = state.registry.any_loaded().map_err(map_registry_error)?;
 
     // Read the KV mirror before awaiting the governor snapshot. The mirror is a
     // handful of relaxed loads and never touches the driver thread, so it
@@ -416,10 +419,12 @@ pub(crate) async fn prometheus_metrics(
         ));
     }
 
-    let snapshot = match handle {
-        Some(handle) => handle.engine.resource_snapshot().await.ok(),
-        None => None,
-    };
+    let snapshot = state
+        .registry
+        .aggregate_resource_snapshot()
+        .await
+        .ok()
+        .flatten();
     match snapshot {
         Some(snapshot) => output.push_str(&crate::metrics::encode_resource_governor(&snapshot)),
         None => output.push_str(&crate::metrics::encode_resource_governor_unavailable()),

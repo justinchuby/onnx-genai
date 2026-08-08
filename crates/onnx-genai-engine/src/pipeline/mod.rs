@@ -720,6 +720,14 @@ impl PipelineEngine {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
+        // Explicit backend requests must fail before touching the model
+        // directory. In particular, a binary without native support should
+        // report the actionable rebuild error even when the path is invalid.
+        let decode_backend = requested_decode_backend(config.decode_backend)?;
+        #[cfg(not(feature = "native-backend"))]
+        if decode_backend == EngineDecodeBackend::Native {
+            return Err(native_backend_not_compiled_error());
+        }
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
             authority_provider.as_ref(),
@@ -747,7 +755,6 @@ impl PipelineEngine {
             authority_provider.as_ref(),
             &authority_domain,
         )?;
-        let decode_backend = requested_decode_backend(config.decode_backend)?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
         // backends resolve without touching the model directory (so a bad
         // request fails fast); `Auto` inspects the components' declared
