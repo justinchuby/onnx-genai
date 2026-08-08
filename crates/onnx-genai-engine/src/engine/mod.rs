@@ -75,7 +75,9 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor};
-pub(crate) use load::kv_pages_for_budget;
+pub(crate) use load::{
+    kv_pages_for_budget, session_device_domain, validate_shared_authority_limit,
+};
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
 pub(crate) use metadata::*;

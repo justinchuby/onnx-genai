@@ -202,7 +202,7 @@ impl Holder {
 /// holder.
 #[derive(Debug)]
 pub(crate) struct ModelMemoryPlan {
-    governor: onnx_runtime_memory_governor::LedgerGovernor,
+    governor: crate::memory_authority::EngineMemoryGovernor,
     entries: Vec<PlanEntry>,
     /// Device KV pool grants taken through [`ModelMemoryPlan::kv_pool`].
     ///
@@ -222,7 +222,7 @@ struct PlanEntry {
 
 impl ModelMemoryPlan {
     /// A plan that leases from `governor`.
-    pub(crate) fn new(governor: onnx_runtime_memory_governor::LedgerGovernor) -> Self {
+    pub(crate) fn new(governor: crate::memory_authority::EngineMemoryGovernor) -> Self {
         Self {
             governor,
             entries: Vec::new(),
@@ -459,10 +459,16 @@ impl ModelMemoryPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
-    fn governor(device_bytes: u64) -> LedgerGovernor {
-        LedgerGovernor::new(LeaseLedger::new(device_bytes, 0, 0))
+    fn governor(device_bytes: u64) -> crate::memory_authority::EngineMemoryGovernor {
+        crate::memory_authority::EngineMemoryGovernor::new(
+            crate::DeviceMemoryAuthority::new(
+                crate::DeviceCompatibilityDomain::Cuda(0),
+                device_bytes,
+            ),
+            0,
+            0,
+        )
     }
 
     /// The admission ceiling adds device-tier KV pool grants back to

@@ -18,6 +18,7 @@ pub mod fim;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
+mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_component;
 #[cfg(feature = "native-backend")]
@@ -58,6 +59,9 @@ pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
 };
+pub use memory_authority::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
+};
 #[cfg(feature = "native-backend")]
 pub use native_component::NativeComponentSession;
 #[cfg(feature = "native-backend")]
@@ -72,7 +76,8 @@ pub use onnx_genai_kv::{
 };
 pub use onnx_genai_metadata::GenerationDefaults;
 pub use onnx_genai_scheduler::{
-    GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
+    FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
+    resolve_limit,
 };
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;
@@ -161,7 +166,7 @@ pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     ImageOutput, ImageRequest, ImageStep, ImageStepCallback, ImageStream, IterativeOverrides,
     PipelineEngine, PipelineGenerateRequest, PipelineSynthesis, PipelineTensors, Scheduler,
-    SchedulerFactory, SchedulerRegistry,
+    SchedulerFactory, SchedulerRegistry, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

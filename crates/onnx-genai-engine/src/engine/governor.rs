@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::engine::memory_plan::{Holder, ModelMemoryPlan};
+use crate::memory_authority::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryGovernor,
+    SharedMemoryAuthorityProvider,
+};
 
 #[cfg(feature = "native-backend")]
 pub(crate) fn resolve_native_decode_device(
@@ -99,7 +103,7 @@ pub struct EngineResourceGovernor {
     /// Shared, so every lease this engine hands out is counted against the same
     /// ledger; a per-caller governor would let each holder believe it had the
     /// whole tier to itself.
-    memory: onnx_runtime_memory_governor::LedgerGovernor,
+    memory: EngineMemoryGovernor,
     /// The fixed device reservation -- weights and runtime overhead -- held as a
     /// lease rather than subtracted before the ledger sees it.
     ///
@@ -110,6 +114,7 @@ pub struct EngineResourceGovernor {
 }
 
 impl EngineResourceGovernor {
+    #[cfg(test)]
     pub(crate) fn new(
         limits: ResourceLimits,
         allow_runtime_override: bool,
@@ -126,6 +131,7 @@ impl EngineResourceGovernor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_capacities(
         limits: ResourceLimits,
         allow_runtime_override: bool,
@@ -133,6 +139,67 @@ impl EngineResourceGovernor {
         kv_config: ModelKvConfig,
         model_weights_bytes: u64,
     ) -> Result<Self, ResourceError> {
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (model_weights_bytes, model_weights_bytes),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_authority(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        model_weights_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: Option<&DeviceCompatibilityDomain>,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (model_weights_bytes, model_weights_bytes),
+            provider,
+            domain,
+        )
+    }
+
+    pub(crate) fn new_for_shared_pipeline_kv(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        existing_device_usage_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: &DeviceCompatibilityDomain,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (existing_device_usage_bytes, 0),
+            provider,
+            Some(domain),
+        )
+    }
+
+    fn new_with_capacities_and_authority(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        capacities: CapacityProviders,
+        kv_config: ModelKvConfig,
+        model_weight_bytes: (u64, u64),
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: Option<&DeviceCompatibilityDomain>,
+    ) -> Result<Self, ResourceError> {
+        let (model_weights_bytes, reservation_bytes) = model_weight_bytes;
         // Model weights are measured from the package on disk (graph plus its
         // ONNX external-data blob), so the KV budget is derived from what is
         // actually left rather than from the whole ceiling.
@@ -182,28 +249,51 @@ impl EngineResourceGovernor {
         // what remains after a claim the ledger can see, rather than after
         // arithmetic it cannot.
         let snapshot = inner.snapshot();
-        let memory = onnx_runtime_memory_governor::LedgerGovernor::new(
-            onnx_runtime_memory_governor::LeaseLedger::new(
+        let device = match (provider, domain) {
+            (Some(provider), Some(domain)) => provider
+                .authority(domain, snapshot.resolved_limits.vram_bytes)
+                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                    operation: "acquiring the shared device memory authority",
+                    reason: error.to_string(),
+                })?,
+            _ => DeviceMemoryAuthority::new(
+                DeviceCompatibilityDomain::Accelerator {
+                    backend: "standalone".to_string(),
+                    index: 0,
+                },
                 snapshot.resolved_limits.vram_bytes,
-                snapshot.resolved_limits.host_ram_bytes,
-                snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
             ),
+        };
+        let memory = EngineMemoryGovernor::new(
+            device,
+            snapshot.resolved_limits.host_ram_bytes,
+            snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
         );
+        if provider.is_some()
+            && reservation_bytes > 0
+            && !snapshot.derived_budget.reservation_applied
+        {
+            return Err(ResourceError::BudgetArithmeticOverflow {
+                operation: "reserving production model weights before session load",
+                reason: format!(
+                    "{reservation_bytes} bytes of model weights do not fit under the resolved \
+                     {} byte device-authority limit",
+                    snapshot.resolved_limits.vram_bytes
+                ),
+            });
+        }
         // `reservation_applied` is false when honouring the reservation would
         // have left no room for even one KV page. It is an estimate over a
         // ceiling that may itself be provisional, so it must never be the reason
         // a model refuses to start -- and when it was not applied there is
         // nothing to charge.
         let mut plan = ModelMemoryPlan::new(memory.clone());
-        if snapshot.derived_budget.reservation_applied {
-            plan.reserve(
-                Holder::FixedDeviceReservation,
-                snapshot.derived_budget.reserved_bytes,
-            )
-            .map_err(|error| ResourceError::BudgetArithmeticOverflow {
-                operation: "charging the fixed device reservation to the memory ledger",
-                reason: error.to_string(),
-            })?;
+        if snapshot.derived_budget.reservation_applied && reservation_bytes > 0 {
+            plan.reserve(Holder::FixedDeviceReservation, reservation_bytes)
+                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                    operation: "charging the fixed device reservation to the memory ledger",
+                    reason: error.to_string(),
+                })?;
         }
         #[cfg(feature = "native-backend")]
         // A host-cache lease is a standing claim on RAM. Take it only when the
@@ -290,8 +380,13 @@ impl EngineResourceGovernor {
         )
     }
 
-    pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {
+    #[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+    pub(crate) fn memory(&self) -> &EngineMemoryGovernor {
         &self.memory
+    }
+
+    pub fn device_authority(&self) -> DeviceMemoryAuthority {
+        self.memory.device_authority()
     }
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
@@ -299,8 +394,11 @@ impl EngineResourceGovernor {
         use onnx_runtime_memory_governor::Tier;
 
         let mut snapshot = self.inner.snapshot();
-        snapshot.vram =
-            Self::tier_snapshot_from_ledger(&self.memory, Tier::Device, snapshot.vram.limit);
+        snapshot.vram = Self::tier_snapshot_from_ledger(
+            &self.memory,
+            Tier::Device,
+            self.memory.device_authority().limit_bytes(),
+        );
         snapshot.host_ram =
             Self::tier_snapshot_from_ledger(&self.memory, Tier::Host, snapshot.host_ram.limit);
         if let Some(disk) = snapshot.disk_spill.as_mut() {
@@ -319,7 +417,10 @@ impl EngineResourceGovernor {
         }
         // TODO(§26.11.2): execute the returned priority/offload/eviction order
         // across live engine sessions when the outcome reports an overage.
-        Ok(self.inner.set_vram_limit(limit)?)
+        let outcome = self.inner.set_vram_limit(limit)?;
+        self.memory
+            .set_device_limit(self.inner.snapshot().resolved_limits.vram_bytes);
+        Ok(outcome)
     }
 
     /// Report live use from the lease ledger, not from the scheduler's transient
@@ -327,7 +428,7 @@ impl EngineResourceGovernor {
     /// the budget here made a loaded model look like 0 bytes until a scheduled
     /// request happened to be active, so admission saw an empty card (#706).
     fn tier_snapshot_from_ledger(
-        memory: &onnx_runtime_memory_governor::LedgerGovernor,
+        memory: &EngineMemoryGovernor,
         tier: onnx_runtime_memory_governor::Tier,
         limit: u64,
     ) -> onnx_genai_scheduler::TierSnapshot {
@@ -400,7 +501,7 @@ impl EngineResourceGovernor {
 /// and `a_device_tier_pool_is_added_back` in `memory_plan` pin both halves.
 #[derive(Debug)]
 struct LedgerAdmissionCeiling {
-    memory: onnx_runtime_memory_governor::LedgerGovernor,
+    memory: EngineMemoryGovernor,
     kv_pool_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -558,18 +659,21 @@ pub(crate) fn model_io_declares_only_fixed_state(
 pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
+    model_weights_bytes: u64,
+    provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
+    domain: &crate::memory_authority::DeviceCompatibilityDomain,
 ) -> anyhow::Result<EngineResourceGovernor> {
     let kv_config = match kv_model {
         Some(kv_model) => governor_kv_config(Some(kv_model), config)?,
         None => governor_no_paged_kv_config(config)?,
     };
-    EngineResourceGovernor::new(
+    EngineResourceGovernor::new_with_authority(
         config.limits.clone(),
         config.allow_runtime_override,
         kv_config,
-        // This resolves ceilings only; the model path is not in scope here, so
-        // the weight reservation is left at zero.
-        0,
+        model_weights_bytes,
+        provider,
+        Some(domain),
     )
     .context("failed to resolve the engine memory budget for decoder fixed state")
 }
