@@ -665,7 +665,7 @@ impl Page {
     ///
     /// Allocation and copying finish before the owning store is replaced, so
     /// any error leaves the source store and all logical page metadata intact.
-    pub fn migrate(
+    fn migrate(
         &mut self,
         target: Device,
         factory: &dyn KvPageStoreFactory,
@@ -1088,14 +1088,14 @@ impl PageTable {
 
     pub(crate) fn allocation_checkpoint(
         &self,
+        source_page: PageId,
         device: Device,
     ) -> Result<PageAllocationCheckpoint, KvError> {
-        let reused_page = self
+        let reused_page_ref = self
             .free_pages
             .get(&device)
             .and_then(|pages| pages.last())
-            .and_then(|page_id| self.pages.get(page_id))
-            .cloned();
+            .and_then(|page_id| self.pages.get(page_id));
         let evicted_page = if matches!(device, Device::Gpu(_))
             && self.free_count(device) == 0
             && self.hot_used_count() >= self.hot_capacity
@@ -1110,8 +1110,24 @@ impl PageTable {
         } else {
             None
         };
-        let transient_bytes = evicted_page.map_or(0, |(_, page)| page.allocated_bytes());
+        let source_snapshot_bytes = self
+            .pages
+            .get(&source_page)
+            .ok_or(KvError::PageNotFound(source_page))?
+            .allocated_bytes();
+        let reused_snapshot_bytes = reused_page_ref.map_or(0, Page::allocated_bytes);
+        let victim_snapshot_bytes = evicted_page.map_or(0, |(_, page)| page.allocated_bytes());
+        let replacement_bytes = if reused_page_ref.is_none() {
+            source_snapshot_bytes
+        } else {
+            0
+        };
+        let transient_bytes = source_snapshot_bytes
+            .saturating_add(reused_snapshot_bytes)
+            .saturating_add(victim_snapshot_bytes)
+            .saturating_add(replacement_bytes);
         let transient_lease = self.reserve_transient(transient_bytes)?;
+        let reused_page = reused_page_ref.cloned();
         let evicted_hot =
             evicted_page.map(|(page_id, page)| (page_id, page.clone_physical_store()));
         Ok(PageAllocationCheckpoint {
@@ -1128,19 +1144,19 @@ impl PageTable {
 
     pub(crate) fn rollback_allocation(
         &mut self,
-        checkpoint: PageAllocationCheckpoint,
+        checkpoint: &mut PageAllocationCheckpoint,
         allocated_page: PageId,
     ) -> Result<(), KvError> {
-        if let Some(page) = checkpoint.reused_page {
+        if let Some(page) = checkpoint.reused_page.take() {
             self.pages.insert(allocated_page, page);
         } else {
             self.pages.remove(&allocated_page);
         }
-        self.free_pages = checkpoint.free_pages;
+        self.free_pages = std::mem::take(&mut checkpoint.free_pages);
         self.stats = checkpoint.stats;
         self.clock = checkpoint.clock;
         self.next_page_id = checkpoint.next_page_id;
-        if let Some((page_id, store)) = checkpoint.evicted_hot {
+        if let Some((page_id, store)) = checkpoint.evicted_hot.take() {
             let page = self
                 .pages
                 .get_mut(&page_id)

@@ -716,7 +716,9 @@ impl PagedKvCache {
                 return Ok(page_id);
             }
 
-            let checkpoint = self.page_table.allocation_checkpoint(Device::Gpu(0))?;
+            let mut checkpoint = self
+                .page_table
+                .allocation_checkpoint(page_id, Device::Gpu(0))?;
             let new_page_id =
                 self.page_table
                     .allocate(Device::Gpu(0))
@@ -740,7 +742,7 @@ impl PagedKvCache {
                 .copy_physical_store_from(old_storage.0.as_ref());
             if let Err(copy_error) = copy_result {
                 self.page_table
-                    .rollback_allocation(checkpoint, new_page_id)?;
+                    .rollback_allocation(&mut checkpoint, new_page_id)?;
                 return Err(copy_error);
             }
             self.page_table
@@ -1065,7 +1067,7 @@ mod tests {
     };
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     #[derive(Debug)]
@@ -1166,6 +1168,144 @@ mod tests {
 
         fn clone_store(&self) -> Box<dyn KvPageStore> {
             Box::new(self.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct LeaseTrackedFactory {
+        ledger: Arc<onnx_runtime_memory_governor::LeaseLedger>,
+        observed_copy_used: Arc<AtomicU64>,
+        observed_snapshot_drop_used: Arc<AtomicU64>,
+        fail_copy: Arc<AtomicBool>,
+    }
+
+    impl KvPageStoreFactory for LeaseTrackedFactory {
+        fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
+            layout.host_allocated_bytes()
+        }
+
+        fn create(
+            &self,
+            residency: Device,
+            layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            Ok(Box::new(LeaseTrackedStore {
+                residency,
+                data: vec![0.0; layout.f32_len],
+                quantized_data: vec![0; layout.int8_len],
+                fp8_data: vec![0; layout.fp8_len],
+                quant_scales: vec![1.0; layout.scale_len],
+                ledger: Arc::clone(&self.ledger),
+                observed_copy_used: Arc::clone(&self.observed_copy_used),
+                observed_snapshot_drop_used: Arc::clone(&self.observed_snapshot_drop_used),
+                fail_copy: Arc::clone(&self.fail_copy),
+                snapshot: false,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LeaseTrackedStore {
+        residency: Device,
+        data: Vec<f32>,
+        quantized_data: Vec<i8>,
+        fp8_data: Vec<u8>,
+        quant_scales: Vec<f32>,
+        ledger: Arc<onnx_runtime_memory_governor::LeaseLedger>,
+        observed_copy_used: Arc<AtomicU64>,
+        observed_snapshot_drop_used: Arc<AtomicU64>,
+        fail_copy: Arc<AtomicBool>,
+        snapshot: bool,
+    }
+
+    impl Drop for LeaseTrackedStore {
+        fn drop(&mut self) {
+            if self.snapshot {
+                self.observed_snapshot_drop_used.store(
+                    self.ledger.used(onnx_runtime_memory_governor::Tier::Host),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    impl KvPageStore for LeaseTrackedStore {
+        fn residency(&self) -> Device {
+            self.residency
+        }
+
+        fn allocated_bytes(&self) -> u64 {
+            (self.data.len() * std::mem::size_of::<f32>()
+                + self.quantized_data.len()
+                + self.fp8_data.len()
+                + self.quant_scales.len() * std::mem::size_of::<f32>()) as u64
+        }
+
+        fn reset_storage(&mut self) {
+            self.data.fill(0.0);
+            self.quantized_data.fill(0);
+            self.fp8_data.fill(0);
+            self.quant_scales.fill(1.0);
+        }
+
+        fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+            Some(HostPageStoreView {
+                data: &self.data,
+                quantized_data: &self.quantized_data,
+                fp8_data: &self.fp8_data,
+                quant_scales: &self.quant_scales,
+            })
+        }
+
+        fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
+            Some(HostPageStoreViewMut {
+                data: &mut self.data,
+                quantized_data: &mut self.quantized_data,
+                fp8_data: &mut self.fp8_data,
+                quant_scales: &mut self.quant_scales,
+            })
+        }
+
+        fn device_span(&self) -> Option<DevicePageSpan> {
+            None
+        }
+
+        fn copy_to(&self, target: &mut dyn KvPageStore) -> Result<u64, KvError> {
+            self.observed_copy_used.store(
+                self.ledger.used(onnx_runtime_memory_governor::Tier::Host),
+                Ordering::Relaxed,
+            );
+            if self.fail_copy.load(Ordering::Relaxed) {
+                return Err(KvError::PageStoreCopyUnsupported {
+                    from: self.residency,
+                    to: target.residency(),
+                });
+            }
+            target.copy_from_host(self.host_view().unwrap())?;
+            Ok(self.allocated_bytes())
+        }
+
+        fn copy_from_host(&mut self, source: HostPageStoreView<'_>) -> Result<(), KvError> {
+            self.data.copy_from_slice(source.data);
+            self.quantized_data.copy_from_slice(source.quantized_data);
+            self.fp8_data.copy_from_slice(source.fp8_data);
+            self.quant_scales.copy_from_slice(source.quant_scales);
+            Ok(())
+        }
+
+        fn clone_store(&self) -> Box<dyn KvPageStore> {
+            Box::new(Self {
+                residency: self.residency,
+                data: self.data.clone(),
+                quantized_data: self.quantized_data.clone(),
+                fp8_data: self.fp8_data.clone(),
+                quant_scales: self.quant_scales.clone(),
+                ledger: Arc::clone(&self.ledger),
+                observed_copy_used: Arc::clone(&self.observed_copy_used),
+                observed_snapshot_drop_used: Arc::clone(&self.observed_snapshot_drop_used),
+                fail_copy: Arc::clone(&self.fail_copy),
+                snapshot: true,
+            })
         }
     }
     use crate::{KvDType, KvKind, PageTensorConfig};
@@ -1889,6 +2029,184 @@ mod tests {
         assert_eq!(cache.page_table.stats(), stats_before);
         assert_eq!(cache.resident_bytes(), resident_before);
         assert_eq!(cache.page_table.pages[&shared].ref_count, 2);
+        assert_eq!(cache.len(forked).unwrap(), 1);
+    }
+
+    #[test]
+    fn full_budget_with_free_page_refuses_cow_before_snapshot_clone() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        let config = PageTensorConfig {
+            page_size: 2,
+            ..small_config(KvDType::F32)
+        };
+        let layer_configs = vec![LayerTensorConfig::new(config.num_kv_heads, config.head_dim)];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 1);
+        let pool_bytes = PageTable::planned_pool_bytes(2, 2, &layer_configs, Some(&quant));
+        let ledger = LeaseLedger::new(0, pool_bytes, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut cache = PagedKvCache::new_leased(
+            2,
+            KvDType::F32,
+            layer_configs,
+            2,
+            &governor,
+            Tier::Host,
+            HolderId::new(100),
+        )
+        .unwrap();
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+        let shared = cache.page_table.get_sequence(source).unwrap()[0];
+        let free_before = cache.page_table.free_count(Device::Gpu(0));
+        let stats_before = cache.page_table.stats();
+        let resident_before = cache.resident_bytes();
+
+        assert!(matches!(
+            cache.append_token_kv(
+                forked,
+                &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+            ),
+            Err(KvError::MigrationPressure(_))
+        ));
+        assert_eq!(ledger.used(Tier::Host), pool_bytes);
+        assert_eq!(cache.page_table.free_count(Device::Gpu(0)), free_before);
+        assert_eq!(cache.page_table.stats(), stats_before);
+        assert_eq!(cache.resident_bytes(), resident_before);
+        assert_eq!(cache.page_table.pages[&shared].ref_count, 2);
+        assert_eq!(cache.len(forked).unwrap(), 1);
+    }
+
+    fn governed_tracked_cow(
+        fail_copy: bool,
+    ) -> (
+        PagedKvCache,
+        SequenceId,
+        Arc<onnx_runtime_memory_governor::LeaseLedger>,
+        u64,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+
+        let config = PageTensorConfig {
+            page_size: 2,
+            ..small_config(KvDType::F32)
+        };
+        let layer_configs = vec![LayerTensorConfig::new(config.num_kv_heads, config.head_dim)];
+        let quant = KvQuantConfig::homogeneous(KvDType::F32, 1);
+        let pool_bytes = PageTable::planned_pool_bytes(2, 2, &layer_configs, Some(&quant));
+        let page_bytes = pool_bytes / 2;
+        let ledger = LeaseLedger::new(0, pool_bytes + page_bytes * 2, 0);
+        let governor = LedgerGovernor::new(Arc::clone(&ledger));
+        let mut cache = PagedKvCache::new_leased(
+            2,
+            KvDType::F32,
+            layer_configs,
+            2,
+            &governor,
+            Tier::Host,
+            HolderId::new(101),
+        )
+        .unwrap();
+        let source = cache.create_sequence();
+        cache
+            .append_token_kv(
+                source,
+                &borrowed_layers(&small_layers([1.0, 2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let forked = cache.fork(source, 1).unwrap();
+        let shared = cache.page_table.get_sequence(source).unwrap()[0];
+        let observed_copy = Arc::new(AtomicU64::new(0));
+        let observed_drop = Arc::new(AtomicU64::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        cache
+            .page_table
+            .set_migration_factory(Arc::new(LeaseTrackedFactory {
+                ledger: Arc::clone(&ledger),
+                observed_copy_used: Arc::clone(&observed_copy),
+                observed_snapshot_drop_used: Arc::clone(&observed_drop),
+                fail_copy: Arc::clone(&fail),
+            }));
+        cache
+            .page_table
+            .migrate_page(shared, Device::Gpu(1))
+            .unwrap();
+        observed_copy.store(0, Ordering::Relaxed);
+        observed_drop.store(0, Ordering::Relaxed);
+        fail.store(fail_copy, Ordering::Relaxed);
+        (
+            cache,
+            forked,
+            ledger,
+            pool_bytes,
+            observed_copy,
+            observed_drop,
+        )
+    }
+
+    #[test]
+    fn cow_lease_covers_both_snapshots_and_outlives_them_on_success() {
+        use onnx_runtime_memory_governor::Tier;
+
+        let (mut cache, forked, ledger, baseline, observed_copy, observed_drop) =
+            governed_tracked_cow(false);
+        cache
+            .append_token_kv(
+                forked,
+                &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+            )
+            .unwrap();
+        assert_eq!(observed_copy.load(Ordering::Relaxed), baseline * 2);
+        assert_eq!(observed_drop.load(Ordering::Relaxed), baseline * 2);
+        assert_eq!(ledger.used(Tier::Host), baseline);
+    }
+
+    #[test]
+    fn cow_failure_keeps_lease_until_snapshots_drop_then_returns_to_baseline() {
+        use onnx_runtime_memory_governor::Tier;
+
+        let (mut cache, forked, ledger, baseline, observed_copy, observed_drop) =
+            governed_tracked_cow(true);
+        assert!(
+            cache
+                .append_token_kv(
+                    forked,
+                    &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+                )
+                .is_err()
+        );
+        assert_eq!(observed_copy.load(Ordering::Relaxed), baseline * 2);
+        assert_eq!(observed_drop.load(Ordering::Relaxed), baseline * 2);
+        assert_eq!(ledger.used(Tier::Host), baseline);
+        assert_eq!(cache.len(forked).unwrap(), 1);
+    }
+
+    #[test]
+    fn cow_pressure_refusal_happens_before_tracked_snapshot_clone() {
+        use onnx_runtime_memory_governor::Tier;
+
+        let (mut cache, forked, ledger, baseline, observed_copy, observed_drop) =
+            governed_tracked_cow(false);
+        ledger.set_limit(Tier::Host, baseline);
+
+        assert!(matches!(
+            cache.append_token_kv(
+                forked,
+                &borrowed_layers(&small_layers([5.0, 6.0, 7.0, 8.0])),
+            ),
+            Err(KvError::MigrationPressure(_))
+        ));
+        assert_eq!(observed_copy.load(Ordering::Relaxed), 0);
+        assert_eq!(observed_drop.load(Ordering::Relaxed), 0);
+        assert_eq!(ledger.used(Tier::Host), baseline);
         assert_eq!(cache.len(forked).unwrap(), 1);
     }
 
