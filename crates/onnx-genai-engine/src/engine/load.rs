@@ -49,6 +49,7 @@ impl Engine {
             ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
+        let operator_vram_limit = config.limits.vram_limit;
         let metadata_hints = load_model_metadata_hints(&model_directory.model_path)?;
         report_metadata_hint_warnings(&metadata_hints);
         if metadata_hints.has_errors() {
@@ -57,6 +58,13 @@ impl Engine {
             );
         }
         apply_model_memory_hints(&mut config, &metadata_hints)?;
+        // A shared production authority is process policy. Model metadata may
+        // advise placement inside that policy, but must never establish or
+        // lower the device ceiling (especially when the operator selected
+        // Auto). Standalone engines keep the historical metadata behavior.
+        if authority_provider.is_some() {
+            config.limits.vram_limit = operator_vram_limit;
+        }
         apply_model_placement_hints(
             &mut session_options,
             &metadata_hints,

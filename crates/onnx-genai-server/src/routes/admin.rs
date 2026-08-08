@@ -163,20 +163,16 @@ pub(crate) async fn admin_set_vram_limit(
 ) -> Result<Json<ResourcesResponse>, ApiError> {
     let limit = parse_resource_limit(&request.limit)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let handle = state
-        .registry
-        .resolve("")
-        .map_err(map_registry_error)?
-        .ok_or_else(|| ApiError::internal("no model loaded"))?;
-    let snapshot = handle
-        .engine
-        .set_vram_limit(limit)
-        .await
-        .map_err(|err| ApiError::internal(format!("resource override failed: {err}")))?
-        .map_err(|err| match err {
-            EngineGovernorError::RuntimeOverrideDisabled => ApiError::forbidden(err.to_string()),
-            EngineGovernorError::Resource(_) => ApiError::conflict(err.to_string()),
-        })?;
+    let snapshot = state.registry.set_vram_limit(limit).await.map_err(|err| {
+        if matches!(
+            err.downcast_ref::<EngineGovernorError>(),
+            Some(EngineGovernorError::RuntimeOverrideDisabled)
+        ) {
+            ApiError::forbidden(err.to_string())
+        } else {
+            ApiError::conflict(format!("resource override failed: {err}"))
+        }
+    })?;
     Ok(Json(snapshot.into()))
 }
 

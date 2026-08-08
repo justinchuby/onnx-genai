@@ -76,7 +76,8 @@ pub use onnx_genai_kv::{
 };
 pub use onnx_genai_metadata::GenerationDefaults;
 pub use onnx_genai_scheduler::{
-    GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
+    FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
+    resolve_limit,
 };
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;

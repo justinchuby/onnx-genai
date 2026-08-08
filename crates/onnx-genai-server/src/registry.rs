@@ -243,10 +243,71 @@ pub(crate) struct ModelRegistry {
     /// Per-id load guards, ensuring two concurrent requests for the same lazy id
     /// build the model only once; the second waiter observes the first result.
     load_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    policy_lock: Arc<tokio::sync::RwLock<()>>,
     authority_provider: Arc<ServerMemoryAuthorities>,
 }
 
 impl ModelRegistry {
+    fn config_for_load(&self) -> anyhow::Result<ServerConfig> {
+        let mut config = (*self.config).clone();
+        config.engine_config.limits.vram_limit = self.authority_provider.configured_limit()?;
+        Ok(config)
+    }
+
+    /// Reconfigure the process-wide device policy and every loaded engine.
+    ///
+    /// The server exposes one unqualified VRAM flag, so this applies to all
+    /// device compatibility domains. A failed shrink is rejected by the
+    /// provider before either current ledgers or future-load policy changes.
+    pub(crate) async fn set_vram_limit(
+        &self,
+        limit: onnx_genai_engine::ResourceLimit,
+    ) -> anyhow::Result<onnx_genai_engine::GovernorSnapshot> {
+        let _policy = self.policy_lock.write().await;
+        let old_limit = self.authority_provider.configured_limit()?;
+        let handles = self.read()?.models.values().cloned().collect::<Vec<_>>();
+        if handles.is_empty() {
+            anyhow::bail!("no model loaded");
+        }
+        // Drain and hold every admission permit so no request can consume
+        // newly exposed headroom between provider commit and per-engine commit.
+        let mut admission_guards = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            admission_guards.push(
+                Arc::clone(&handle.engine.generation_capacity)
+                    .acquire_many_owned(handle.engine.generation_capacity_size)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("engine admission semaphore closed"))?,
+            );
+        }
+        self.authority_provider.reconfigure_limit(limit)?;
+        let mut latest = None;
+        let mut updated = Vec::new();
+        for handle in handles {
+            match handle.engine.set_vram_limit(limit).await {
+                Ok(Ok(snapshot)) => {
+                    latest = Some(snapshot);
+                    updated.push(handle);
+                }
+                Ok(Err(error)) => {
+                    let _ = self.authority_provider.reconfigure_limit(old_limit);
+                    for updated_handle in updated {
+                        let _ = updated_handle.engine.set_vram_limit(old_limit).await;
+                    }
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    let _ = self.authority_provider.reconfigure_limit(old_limit);
+                    for updated_handle in updated {
+                        let _ = updated_handle.engine.set_vram_limit(old_limit).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        latest.ok_or_else(|| anyhow::anyhow!("no model loaded"))
+    }
+
     /// Build a registry from a list of specs, loading the eager ones immediately.
     ///
     /// All specs (eager or not) are recorded in `available`.  Eager specs are also
@@ -277,6 +338,7 @@ impl ModelRegistry {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(config.clone()),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
             authority_provider,
         };
         for spec in specs.iter().filter(|s| s.eager) {
@@ -328,6 +390,7 @@ impl ModelRegistry {
             inner: Arc::new(RwLock::new(inner)),
             config: Arc::new(config),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
             authority_provider,
         }
     }
@@ -424,7 +487,8 @@ impl ModelRegistry {
             return Ok(handle);
         }
 
-        let config = Arc::clone(&self.config);
+        let _policy = self.policy_lock.read().await;
+        let config = self.config_for_load()?;
         let authority_provider = Arc::clone(&self.authority_provider);
         let spec_for_build = spec.clone();
         tracing::info!(id = %spec.id, path = %spec.path.display(), "lazy-loading model");
@@ -596,6 +660,7 @@ impl ModelRegistry {
             })),
             config: Arc::new(ServerConfig::default()),
             load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
             authority_provider: Arc::new(ServerMemoryAuthorities::new(
                 ServerConfig::default().engine_config.limits.vram_limit,
             )),
@@ -679,6 +744,7 @@ mod tests {
             engine: EngineDriver {
                 commands: tx,
                 generation_capacity: Arc::new(Semaphore::new(0)),
+                generation_capacity_size: 0,
                 // A test double drives no engine, so there is no pool to
                 // mirror. Left in the default `Unknown` state rather than
                 // asserted not-applicable: nothing here has determined a
@@ -779,6 +845,124 @@ mod tests {
         assert_eq!(
             second.engine.resource_snapshot().await.unwrap().vram.used,
             first_authority.used_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn production_pipeline_loads_reserve_all_components_on_shared_ledger() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-txt2img");
+        let specs = vec![
+            ModelSpec {
+                id: "pipeline-a".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "pipeline-b".to_string(),
+                path: model_dir,
+                eager: true,
+                warmup: false,
+            },
+        ];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let first = registry.resolve("pipeline-a").unwrap().unwrap();
+        let second = registry.resolve("pipeline-b").unwrap().unwrap();
+        assert!(first.pipeline);
+        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
+        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
+        assert_eq!(
+            first_authority.authority_id(),
+            second_authority.authority_id()
+        );
+        assert!(first_authority.used_bytes() > 0);
+        assert_eq!(
+            first.engine.resource_snapshot().await.unwrap().vram.used,
+            first_authority.used_bytes()
+        );
+        assert_eq!(
+            second.engine.resource_snapshot().await.unwrap().vram.used,
+            first_authority.used_bytes()
+        );
+        let aggregate_used = first_authority.used_bytes();
+        drop(first);
+        registry.unload("pipeline-a").unwrap();
+        for _ in 0..500 {
+            if first_authority.used_bytes() < aggregate_used {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(first_authority.used_bytes() < aggregate_used);
+        assert!(first_authority.used_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_limit_update_applies_to_future_lazy_loads() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![
+            ModelSpec {
+                id: "eager".to_string(),
+                path: model_dir.clone(),
+                eager: true,
+                warmup: false,
+            },
+            ModelSpec {
+                id: "lazy".to_string(),
+                path: model_dir,
+                eager: false,
+                warmup: false,
+            },
+        ];
+        let mut config = ServerConfig::default();
+        config.engine_config.allow_runtime_override = true;
+        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
+        let snapshot = registry.set_vram_limit(new_limit).await.unwrap();
+        let effective_limit = snapshot.vram.limit;
+
+        let lazy = registry.load("lazy").await.unwrap();
+        assert_eq!(
+            lazy.engine.resource_snapshot().await.unwrap().vram.limit,
+            effective_limit
+        );
+        assert_eq!(
+            registry.authority_provider.configured_limit().unwrap(),
+            new_limit
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_shrink_preserves_policy_and_ledger_limit() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let specs = vec![ModelSpec {
+            id: "model".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let mut config = ServerConfig::default();
+        config.engine_config.allow_runtime_override = true;
+        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let old_policy = registry.authority_provider.configured_limit().unwrap();
+        let handle = registry.resolve("model").unwrap().unwrap();
+        let before = handle.engine.resource_snapshot().await.unwrap();
+
+        let error = registry
+            .set_vram_limit(onnx_genai_engine::ResourceLimit::Bytes(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("committed bytes"));
+        let after = handle.engine.resource_snapshot().await.unwrap();
+        assert_eq!(after.vram.limit, before.vram.limit);
+        assert_eq!(after.vram.used, before.vram.used);
+        assert_eq!(
+            registry.authority_provider.configured_limit().unwrap(),
+            old_policy
         );
     }
 

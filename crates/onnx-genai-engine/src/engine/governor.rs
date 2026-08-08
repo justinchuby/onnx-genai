@@ -144,7 +144,7 @@ impl EngineResourceGovernor {
             allow_runtime_override,
             capacities,
             kv_config,
-            model_weights_bytes,
+            (model_weights_bytes, model_weights_bytes),
             None,
             None,
         )
@@ -164,9 +164,29 @@ impl EngineResourceGovernor {
             allow_runtime_override,
             capacities,
             kv_config,
-            model_weights_bytes,
+            (model_weights_bytes, model_weights_bytes),
             provider,
             domain,
+        )
+    }
+
+    pub(crate) fn new_for_shared_pipeline_kv(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        existing_device_usage_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: &DeviceCompatibilityDomain,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (existing_device_usage_bytes, 0),
+            provider,
+            Some(domain),
         )
     }
 
@@ -175,10 +195,11 @@ impl EngineResourceGovernor {
         allow_runtime_override: bool,
         capacities: CapacityProviders,
         kv_config: ModelKvConfig,
-        model_weights_bytes: u64,
+        model_weight_bytes: (u64, u64),
         provider: Option<&SharedMemoryAuthorityProvider>,
         domain: Option<&DeviceCompatibilityDomain>,
     ) -> Result<Self, ResourceError> {
+        let (model_weights_bytes, reservation_bytes) = model_weight_bytes;
         // Model weights are measured from the package on disk (graph plus its
         // ONNX external-data blob), so the KV budget is derived from what is
         // actually left rather than from the whole ceiling.
@@ -248,21 +269,31 @@ impl EngineResourceGovernor {
             snapshot.resolved_limits.host_ram_bytes,
             snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
         );
+        if provider.is_some()
+            && reservation_bytes > 0
+            && !snapshot.derived_budget.reservation_applied
+        {
+            return Err(ResourceError::BudgetArithmeticOverflow {
+                operation: "reserving production model weights before session load",
+                reason: format!(
+                    "{reservation_bytes} bytes of model weights do not fit under the resolved \
+                     {} byte device-authority limit",
+                    snapshot.resolved_limits.vram_bytes
+                ),
+            });
+        }
         // `reservation_applied` is false when honouring the reservation would
         // have left no room for even one KV page. It is an estimate over a
         // ceiling that may itself be provisional, so it must never be the reason
         // a model refuses to start -- and when it was not applied there is
         // nothing to charge.
         let mut plan = ModelMemoryPlan::new(memory.clone());
-        if snapshot.derived_budget.reservation_applied {
-            plan.reserve(
-                Holder::FixedDeviceReservation,
-                snapshot.derived_budget.reserved_bytes,
-            )
-            .map_err(|error| ResourceError::BudgetArithmeticOverflow {
-                operation: "charging the fixed device reservation to the memory ledger",
-                reason: error.to_string(),
-            })?;
+        if snapshot.derived_budget.reservation_applied && reservation_bytes > 0 {
+            plan.reserve(Holder::FixedDeviceReservation, reservation_bytes)
+                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                    operation: "charging the fixed device reservation to the memory ledger",
+                    reason: error.to_string(),
+                })?;
         }
         #[cfg(feature = "native-backend")]
         // A host-cache lease is a standing claim on RAM. Take it only when the
@@ -363,8 +394,11 @@ impl EngineResourceGovernor {
         use onnx_runtime_memory_governor::Tier;
 
         let mut snapshot = self.inner.snapshot();
-        snapshot.vram =
-            Self::tier_snapshot_from_ledger(&self.memory, Tier::Device, snapshot.vram.limit);
+        snapshot.vram = Self::tier_snapshot_from_ledger(
+            &self.memory,
+            Tier::Device,
+            self.memory.device_authority().limit_bytes(),
+        );
         snapshot.host_ram =
             Self::tier_snapshot_from_ledger(&self.memory, Tier::Host, snapshot.host_ram.limit);
         if let Some(disk) = snapshot.disk_spill.as_mut() {
@@ -625,6 +659,7 @@ pub(crate) fn model_io_declares_only_fixed_state(
 pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
+    model_weights_bytes: u64,
     provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
     domain: &crate::memory_authority::DeviceCompatibilityDomain,
 ) -> anyhow::Result<EngineResourceGovernor> {
@@ -636,9 +671,7 @@ pub(crate) fn component_governor(
         config.limits.clone(),
         config.allow_runtime_override,
         kv_config,
-        // This resolves ceilings only; the model path is not in scope here, so
-        // the weight reservation is left at zero.
-        0,
+        model_weights_bytes,
         provider,
         Some(domain),
     )

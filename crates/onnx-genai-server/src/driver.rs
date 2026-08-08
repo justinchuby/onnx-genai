@@ -34,6 +34,7 @@ const MICROBATCH_POLL_WAIT: Duration = Duration::from_micros(250);
 pub(crate) struct EngineDriver {
     pub(crate) commands: mpsc::Sender<DriverCommand>,
     pub(crate) generation_capacity: Arc<Semaphore>,
+    pub(crate) generation_capacity_size: u32,
     /// Lock-free mirror of the KV page pool, readable during a generation.
     pub(crate) kv_telemetry: Arc<KvTelemetry>,
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
@@ -231,6 +232,7 @@ impl EngineDriver {
         Self {
             commands,
             generation_capacity,
+            generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
             kv_telemetry,
             resource_snapshot,
             device_authority,
@@ -241,8 +243,12 @@ impl EngineDriver {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
+        let device_authority = Some(engine.device_authority());
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
-        let resource_snapshot = Arc::new(Mutex::new(None));
+        let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
+            EngineBackend::Pipeline(engine) => engine.resource_snapshot(),
+            EngineBackend::Single(_) => unreachable!("pipeline owner just constructed"),
+        })));
         let driver_snapshot = Arc::clone(&resource_snapshot);
         // A pipeline engine owns its components' caches rather than one page
         // table, so there is nothing here to mirror. Reported as an explicit
@@ -266,9 +272,10 @@ impl EngineDriver {
         Self {
             commands,
             generation_capacity,
+            generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
             kv_telemetry,
             resource_snapshot,
-            device_authority: None,
+            device_authority,
         }
     }
 
@@ -529,6 +536,10 @@ impl EngineDriver {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
     ) -> anyhow::Result<Vec<f32>> {
+        let _permit = Arc::clone(&self.generation_capacity)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("engine admission semaphore closed"))?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.commands
             .send(DriverCommand::Embed {
@@ -585,7 +596,7 @@ fn run_engine_driver(
     let mut engine = match owner.0 {
         EngineBackend::Single(engine) => *engine,
         EngineBackend::Pipeline(mut pipeline) => {
-            run_pipeline_driver(&mut pipeline, rx);
+            run_pipeline_driver(&mut pipeline, rx, &resource_snapshot);
             return;
         }
     };
@@ -606,7 +617,11 @@ fn run_engine_driver(
     }
 }
 
-fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<DriverCommand>) {
+fn run_pipeline_driver(
+    engine: &mut PipelineEngine,
+    mut rx: mpsc::Receiver<DriverCommand>,
+    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
+) {
     while let Some(command) = rx.blocking_recv() {
         match command {
             DriverCommand::GeneratePipeline {
@@ -670,15 +685,17 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
             }
             #[cfg(test)]
             DriverCommand::ResourceSnapshot(reply) => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "resource governor is not available for pipeline models"
-                )));
+                let _ = reply.send(Ok(engine.resource_snapshot()));
             }
-            DriverCommand::SetVramLimit { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "resource governor is not available for pipeline models"
-                )));
+            DriverCommand::SetVramLimit { limit, reply } => {
+                let result = engine
+                    .set_vram_limit(limit)
+                    .map(|_| engine.resource_snapshot());
+                let _ = reply.send(Ok(result));
             }
+        }
+        if let Ok(mut snapshot) = resource_snapshot.lock() {
+            *snapshot = Some(engine.resource_snapshot());
         }
     }
 }
@@ -1568,6 +1585,7 @@ mod admission_tests {
         let driver = EngineDriver {
             commands,
             generation_capacity: Arc::new(Semaphore::new(1)),
+            generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
             device_authority: None,

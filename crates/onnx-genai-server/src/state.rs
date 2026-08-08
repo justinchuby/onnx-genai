@@ -12,9 +12,7 @@ use onnx_genai_engine::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MemoryAuthorityProvider,
     ResourceLimit,
 };
-use onnx_genai_ort::{
-    ChatTemplate, ModelDirectory, PipelineModelDirectory, PipelineModels, Tokenizer,
-};
+use onnx_genai_ort::{ChatTemplate, ModelDirectory, PipelineModelDirectory, Tokenizer};
 
 #[cfg(test)]
 use onnx_genai_engine::FimConfig;
@@ -30,6 +28,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
+const PROVISIONAL_VRAM_CAPACITY_BYTES: u64 = 8 << 30;
 
 #[derive(Debug)]
 pub(crate) struct ServerMemoryAuthorities {
@@ -44,6 +43,49 @@ impl ServerMemoryAuthorities {
             authorities: Mutex::new(HashMap::new()),
         }
     }
+
+    pub(crate) fn configured_limit(&self) -> anyhow::Result<ResourceLimit> {
+        self.effective_limit
+            .lock()
+            .map(|limit| *limit)
+            .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))
+    }
+
+    /// Atomically apply one operator policy to every device authority.
+    ///
+    /// The server flag is process-wide, so the scope is deliberately all
+    /// devices. Validation completes for every ledger before any mutation.
+    pub(crate) fn reconfigure_limit(&self, limit: ResourceLimit) -> anyhow::Result<()> {
+        let mut effective = self
+            .effective_limit
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))?;
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        let capacity = onnx_genai_engine::FixedCapacity::new(
+            PROVISIONAL_VRAM_CAPACITY_BYTES,
+            PROVISIONAL_VRAM_CAPACITY_BYTES,
+        );
+        let resolved = onnx_genai_engine::resolve_limit(limit, &capacity, "vram")
+            .map_err(anyhow::Error::new)?;
+        for authority in authorities.values() {
+            if authority.used_bytes() > resolved {
+                anyhow::bail!(
+                    "cannot satisfy lowered resource limit of {resolved} bytes: {} currently has \
+                     {} committed bytes",
+                    authority.domain(),
+                    authority.used_bytes()
+                );
+            }
+        }
+        for authority in authorities.values() {
+            authority.set_limit_bytes(resolved);
+        }
+        *effective = limit;
+        Ok(())
+    }
 }
 
 impl MemoryAuthorityProvider for ServerMemoryAuthorities {
@@ -52,14 +94,10 @@ impl MemoryAuthorityProvider for ServerMemoryAuthorities {
         domain: &DeviceCompatibilityDomain,
         requested: ResourceLimit,
     ) -> anyhow::Result<()> {
-        let mut effective = self
+        let effective = self
             .effective_limit
             .lock()
             .map_err(|_| anyhow::anyhow!("server device-limit lock poisoned"))?;
-        if *effective == ResourceLimit::Auto && requested != ResourceLimit::Auto {
-            *effective = requested;
-            return Ok(());
-        }
         if requested != *effective {
             anyhow::bail!(
                 "model device limit {} conflicts with server device-authority limit {} for {}; \
@@ -502,11 +540,6 @@ fn build_pipeline_handle(
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
 
-    let models = PipelineModels::load(model_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to inspect pipeline models: {e}"))?;
-    let multimodal = crate::multimodal::build(&directory, &models)?;
-    drop(models);
-
     // A package that declares a denoise loop can serve image generation; one
     // whose pipeline ends in a waveform stage can serve speech.
     let text_to_image = directory.spec.strategy.denoiser.is_some();
@@ -516,6 +549,7 @@ fn build_pipeline_handle(
         config.engine_config.clone(),
         authorities,
     )?;
+    let multimodal = crate::multimodal::build(&directory, engine.models())?;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
@@ -572,6 +606,21 @@ mod authority_tests {
             .to_string();
         assert!(error.contains("90 bytes"));
         assert!(error.contains("100 bytes"));
+    }
+
+    #[test]
+    fn auto_policy_cannot_be_replaced_by_model_metadata() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Auto);
+        provider
+            .validate_limit(&DeviceCompatibilityDomain::Cuda(0), ResourceLimit::Auto)
+            .unwrap();
+        provider
+            .validate_limit(
+                &DeviceCompatibilityDomain::Cuda(0),
+                ResourceLimit::Bytes(90),
+            )
+            .unwrap_err();
+        assert_eq!(provider.configured_limit().unwrap(), ResourceLimit::Auto);
     }
 
     #[test]
