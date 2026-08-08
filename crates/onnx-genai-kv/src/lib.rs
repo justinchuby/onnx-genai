@@ -41,9 +41,10 @@ pub use connector::{
 pub use fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8};
 pub use local_tiered::{DiskTierConfig, LocalTieredConfig, LocalTieredConnector};
 pub use page_table::{
-    DevicePageSpan, HostPageStore, HostPageStoreView, HostPageStoreViewMut, KvDType, KvKind,
-    KvPageStore, KvQuantConfig, LayerKvDType, LayerTensorConfig, Page, PageId, PageStats,
-    PageTable, PageTensorConfig, PageUsage, SequenceUsage,
+    DevicePageSpan, HostPageStore, HostPageStoreFactory, HostPageStoreView, HostPageStoreViewMut,
+    KvDType, KvKind, KvPageStore, KvPageStoreFactory, KvQuantConfig, LayerKvDType,
+    LayerTensorConfig, MigrationAccounting, Page, PageId, PageMigration, PageStats,
+    PageStoreLayout, PageTable, PageTensorConfig, PageUsage, SequenceUsage,
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
 pub use prefix_cache::PrefixCache;
@@ -148,7 +149,10 @@ where
     })
 }
 
-/// Device tier for page storage.
+/// Declared page-store residency.
+///
+/// `Gpu` is currently a host-backed emulation location in `onnx-genai-kv`;
+/// addressability is reported separately by `KvPageStore::host_view`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
     Gpu(usize), // GPU index
@@ -301,6 +305,14 @@ pub enum KvError {
         "Page {0} is not host-addressable; explicitly materialize it before requesting host slices"
     )]
     PageNotHostAddressable(PageId),
+    #[error("KV page stores have incompatible storage layouts")]
+    PageStoreLayoutMismatch,
+    #[error("KV page store cannot copy from {from:?} to {to:?}")]
+    PageStoreCopyUnsupported { from: Device, to: Device },
+    #[error("KV page store factory returned residency {actual:?} when {requested:?} was requested")]
+    PageStoreWrongResidency { requested: Device, actual: Device },
+    #[error("KV page store allocation failed: {0}")]
+    PageStoreAllocationFailed(String),
     #[error("Invalid KV tensor shape: {0}")]
     InvalidTensorShape(&'static str),
     #[error("Unsupported KV dtype: {0}")]

@@ -633,7 +633,7 @@ impl PagedKvCache {
                 .page_table
                 .pages
                 .get(&page_id)
-                .is_some_and(|page| !matches!(page.device, Device::Gpu(_)));
+                .is_some_and(|page| !matches!(page.residency(), Device::Gpu(_)));
             self.page_table.promote_to_hot(page_id)?;
             if was_cold {
                 promoted += 1;
@@ -646,16 +646,16 @@ impl PagedKvCache {
     /// the cold CPU tier, releasing hot residency without dropping any KV.
     ///
     /// This is the engine-side execution of a scheduler
-    /// `ScheduleDecision::preempt` entry. Only the device tier changes — the KV
-    /// data stays in place — so [`restore_sequence`](Self::restore_sequence)
+    /// `ScheduleDecision::preempt` entry. Each page is copied into a cold-tier
+    /// store transactionally, so [`restore_sequence`](Self::restore_sequence)
     /// brings back byte-identical KV and a preempted-then-restored sequence
-    /// decodes the same tokens as if it had never been preempted. Returns the
-    /// number of pages demoted.
+    /// decodes the same tokens as if it had never been preempted. Both stores
+    /// remain host-backed emulation until Stage 3. Returns pages demoted.
     pub fn preempt_sequence(&mut self, seq: SequenceId) -> Result<usize, KvError> {
         // Validate the sequence exists so a bogus id surfaces as an error
         // rather than a silent no-op.
         self.len(seq)?;
-        Ok(self.page_table.evict_sequence_to_cold(seq))
+        self.page_table.evict_sequence_to_cold(seq)
     }
 
     /// Restore `seq`: promote every page backing its retained range back to the
@@ -729,10 +729,10 @@ impl PagedKvCache {
                     .pages
                     .get(&page_id)
                     .ok_or(KvError::PageNotFound(page_id))?;
-                (old.store.clone(), old.filled)
+                (old.clone_physical_store(), old.filled)
             };
             if let Some(new_page) = self.page_table.pages.get_mut(&new_page_id) {
-                new_page.store = old_storage.0;
+                new_page.copy_physical_store_from(old_storage.0.as_ref())?;
                 new_page.filled = old_storage.1;
             }
             self.page_table.replace_page(seq, page_index, new_page_id);
@@ -1646,7 +1646,7 @@ mod tests {
 
         cache.append_token_kv(seq, &borrowed_layers(&t2)).unwrap();
 
-        assert_eq!(cache.page_table.pages[&first_page].device, Device::Cpu);
+        assert_eq!(cache.page_table.pages[&first_page].residency(), Device::Cpu);
         assert_eq!(cache.page_table.hot_used_count(), 2);
         let materialized = cache.materialize_sequence(seq).unwrap();
         assert_eq!(
@@ -1674,15 +1674,18 @@ mod tests {
                 .unwrap();
         }
         let pages = cache.page_table.get_sequence(seq).unwrap().to_vec();
-        assert_eq!(cache.page_table.pages[&pages[0]].device, Device::Cpu);
+        assert_eq!(cache.page_table.pages[&pages[0]].residency(), Device::Cpu);
         assert_eq!(cache.prefetch(seq, 0, 1).unwrap(), 1);
 
-        assert_eq!(cache.page_table.pages[&pages[0]].device, Device::Gpu(0));
+        assert_eq!(
+            cache.page_table.pages[&pages[0]].residency(),
+            Device::Gpu(0)
+        );
         assert_eq!(cache.page_table.hot_used_count(), 2);
         assert!(
             pages[1..]
                 .iter()
-                .any(|page_id| cache.page_table.pages[page_id].device == Device::Cpu)
+                .any(|page_id| cache.page_table.pages[page_id].residency() == Device::Cpu)
         );
     }
 
@@ -1700,8 +1703,11 @@ mod tests {
         cache.write_token_kv(seq, 0, &borrowed_layers(&t0)).unwrap();
         cache.append_token_kv(seq, &borrowed_layers(&t2)).unwrap();
 
-        assert_eq!(cache.page_table.pages[&pages[0]].device, Device::Gpu(0));
-        assert_eq!(cache.page_table.pages[&pages[1]].device, Device::Cpu);
+        assert_eq!(
+            cache.page_table.pages[&pages[0]].residency(),
+            Device::Gpu(0)
+        );
+        assert_eq!(cache.page_table.pages[&pages[1]].residency(), Device::Cpu);
     }
 
     #[test]
@@ -1716,7 +1722,7 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        let storage = page.store.host_view().expect("host store");
+        let storage = page.host_view().expect("host store");
         assert!(storage.data.is_empty());
         assert_eq!(
             storage.quantized_data.len(),
@@ -1743,7 +1749,7 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        let storage = page.store.host_view().expect("host store");
+        let storage = page.host_view().expect("host store");
         assert!(storage.data.is_empty());
         assert!(storage.quantized_data.is_empty());
         assert_eq!(storage.fp8_data.len(), config.f32_len_per_page());
@@ -1894,7 +1900,7 @@ mod tests {
 
         let page_id = cache.page_table.get_sequence(seq).unwrap()[0];
         let page = &cache.page_table.pages[&page_id];
-        let storage = page.store.host_view().expect("host store");
+        let storage = page.host_view().expect("host store");
         assert_eq!(storage.data.len(), 8);
         assert_eq!(storage.fp8_data.len(), 8);
         let materialized = cache.materialize_sequence(seq).unwrap();
@@ -1921,7 +1927,7 @@ mod tests {
         assert!(
             pages
                 .iter()
-                .any(|id| cache.page_table.pages[id].device == Device::Cpu)
+                .any(|id| cache.page_table.pages[id].residency() == Device::Cpu)
         );
         let materialized = cache.materialize_sequence(seq).unwrap();
         let expected_key = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4];
@@ -2275,7 +2281,12 @@ mod tests {
         // The shared page stays resident; only the exclusively-owned pages move.
         assert_eq!(demoted, hot_before - 1);
         assert!(matches!(
-            cache.page_table.pages.get(&shared_page).unwrap().device,
+            cache
+                .page_table
+                .pages
+                .get(&shared_page)
+                .unwrap()
+                .residency(),
             Device::Gpu(_)
         ));
     }

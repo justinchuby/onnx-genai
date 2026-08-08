@@ -43,12 +43,68 @@ pub struct DevicePageSpan {
 /// caller and can be charged to the memory governor instead of being hidden
 /// behind an accessor such as `head_token_row()`.
 pub trait KvPageStore: fmt::Debug + Send + Sync {
+    /// Declared cache residency. A store may be host-addressable even when this
+    /// is a GPU emulation location; callers must use `host_view` to determine
+    /// addressability rather than inferring it from this value.
+    fn residency(&self) -> Device;
     fn allocated_bytes(&self) -> u64;
     fn reset_storage(&mut self);
     fn host_view(&self) -> Option<HostPageStoreView<'_>>;
     fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>>;
     fn device_span(&self) -> Option<DevicePageSpan>;
+    /// Copy this store's complete payload into an already allocated target.
+    fn copy_to(&self, target: &mut dyn KvPageStore) -> Result<u64, KvError>;
+    /// Accept a complete payload from host-addressable storage.
+    ///
+    /// A future device store can implement this with an explicit host-to-device
+    /// transfer. The default refuses rather than hiding a copy.
+    fn copy_from_host(&mut self, _source: HostPageStoreView<'_>) -> Result<(), KvError> {
+        Err(KvError::PageStoreCopyUnsupported {
+            from: Device::Cpu,
+            to: self.residency(),
+        })
+    }
     fn clone_store(&self) -> Box<dyn KvPageStore>;
+}
+
+/// Storage lengths needed to allocate one physical page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageStoreLayout {
+    pub f32_len: usize,
+    pub int8_len: usize,
+    pub fp8_len: usize,
+    pub scale_len: usize,
+}
+
+/// Creates an empty target store for a transactional page migration.
+///
+/// Cache callers depend only on this contract. Stage 3 can supply a factory
+/// that creates `CudaPageStore` for GPU locations without changing them.
+pub trait KvPageStoreFactory: fmt::Debug + Send + Sync {
+    fn create(
+        &self,
+        residency: Device,
+        layout: PageStoreLayout,
+    ) -> Result<Box<dyn KvPageStore>, KvError>;
+}
+
+/// Result hook for future per-tier transfer charging.
+///
+/// Stage 2 deliberately retains the page table's single pool lease. Host-backed
+/// emulation must not double-lease the same bytes; Stage 3 can use
+/// `bytes_copied` and the source/target locations to charge a physical transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageMigration {
+    pub from: Device,
+    pub to: Device,
+    pub bytes_copied: u64,
+    pub accounting: MigrationAccounting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationAccounting {
+    /// Covered only by the existing aggregate page-pool lease.
+    ExistingPoolLeaseOnly,
 }
 
 impl Clone for Box<dyn KvPageStore> {
@@ -77,11 +133,12 @@ pub struct HostPageStoreViewMut<'a> {
 
 /// Host-addressable storage for one logical KV page.
 ///
-/// Both hot and cold tiers currently use this store; `Page::device` remains a
-/// vestigial tier label until stage 2 replaces enum assignment with real copies
-/// between stores.
+/// Both hot and cold tiers currently use this store. Its residency is therefore
+/// an emulated cache location, not a claim that GPU-labelled bytes are device
+/// memory. `host_view` remains available for both locations.
 #[derive(Debug, Clone)]
 pub struct HostPageStore {
+    residency: Device,
     pub data: Vec<f32>,
     pub quantized_data: Vec<i8>,
     pub fp8_data: Vec<u8>,
@@ -89,17 +146,22 @@ pub struct HostPageStore {
 }
 
 impl HostPageStore {
-    fn new(data_len: usize, quantized_len: usize, fp8_len: usize, scale_len: usize) -> Self {
+    fn new(residency: Device, layout: PageStoreLayout) -> Self {
         Self {
-            data: vec![0.0; data_len],
-            quantized_data: vec![0; quantized_len],
-            fp8_data: vec![0; fp8_len],
-            quant_scales: vec![1.0; scale_len],
+            residency,
+            data: vec![0.0; layout.f32_len],
+            quantized_data: vec![0; layout.int8_len],
+            fp8_data: vec![0; layout.fp8_len],
+            quant_scales: vec![1.0; layout.scale_len],
         }
     }
 }
 
 impl KvPageStore for HostPageStore {
+    fn residency(&self) -> Device {
+        self.residency
+    }
+
     fn allocated_bytes(&self) -> u64 {
         let f32_bytes = size_of::<f32>() as u64;
         (self.data.len() as u64) * f32_bytes
@@ -137,23 +199,42 @@ impl KvPageStore for HostPageStore {
         None
     }
 
+    fn copy_to(&self, target: &mut dyn KvPageStore) -> Result<u64, KvError> {
+        target.copy_from_host(self.host_view().expect("host store"))?;
+        Ok(self.allocated_bytes())
+    }
+
+    fn copy_from_host(&mut self, source: HostPageStoreView<'_>) -> Result<(), KvError> {
+        if self.data.len() != source.data.len()
+            || self.quantized_data.len() != source.quantized_data.len()
+            || self.fp8_data.len() != source.fp8_data.len()
+            || self.quant_scales.len() != source.quant_scales.len()
+        {
+            return Err(KvError::PageStoreLayoutMismatch);
+        }
+        self.data.copy_from_slice(source.data);
+        self.quantized_data.copy_from_slice(source.quantized_data);
+        self.fp8_data.copy_from_slice(source.fp8_data);
+        self.quant_scales.copy_from_slice(source.quant_scales);
+        Ok(())
+    }
+
     fn clone_store(&self) -> Box<dyn KvPageStore> {
         Box::new(self.clone())
     }
 }
 
-fn host_page_store(
-    data_len: usize,
-    quantized_len: usize,
-    fp8_len: usize,
-    scale_len: usize,
-) -> Box<dyn KvPageStore> {
-    Box::new(HostPageStore::new(
-        data_len,
-        quantized_len,
-        fp8_len,
-        scale_len,
-    ))
+#[derive(Debug, Default)]
+pub struct HostPageStoreFactory;
+
+impl KvPageStoreFactory for HostPageStoreFactory {
+    fn create(
+        &self,
+        residency: Device,
+        layout: PageStoreLayout,
+    ) -> Result<Box<dyn KvPageStore>, KvError> {
+        Ok(Box::new(HostPageStore::new(residency, layout)))
+    }
 }
 
 /// Scalar storage type for KV page tensors.
@@ -464,19 +545,13 @@ pub struct Page {
     pub id: PageId,
     /// Number of active references (for CoW).
     pub ref_count: u32,
-    /// Vestigial tier label used by the current host-only backend.
-    ///
-    /// Stage 1 keeps this field so existing tiering behaviour and tests remain
-    /// unchanged. Stage 2 should derive residency from the store that holds the
-    /// page and replace assignments to this field with byte copies between
-    /// stores.
-    pub device: Device,
     /// How many token slots in this page are filled (0..=page_size).
     pub filled: usize,
     /// Last access timestamp (for LRU eviction).
     pub last_access: u64,
     /// Physical page storage.
-    pub store: Box<dyn KvPageStore>,
+    store: Box<dyn KvPageStore>,
+    store_layout: PageStoreLayout,
     storage_layout: Vec<ComponentStorage>,
 }
 
@@ -533,15 +608,83 @@ impl Page {
                 }
             }
         }
+        let store_layout = PageStoreLayout {
+            f32_len: data_len,
+            int8_len: quantized_len,
+            fp8_len,
+            scale_len,
+        };
         Self {
             id,
             ref_count: 0,
-            device,
             filled: 0,
             last_access: 0,
-            store: host_page_store(data_len, quantized_len, fp8_len, scale_len),
+            store: HostPageStoreFactory
+                .create(device, store_layout)
+                .expect("host store allocation is infallible"),
+            store_layout,
             storage_layout,
         }
+    }
+
+    /// Declared residency of the store that owns this page's bytes.
+    pub fn residency(&self) -> Device {
+        self.store.residency()
+    }
+
+    /// Borrow host storage only when the owning store is host-addressable.
+    pub fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+        self.store.host_view()
+    }
+
+    pub fn device_span(&self) -> Option<DevicePageSpan> {
+        self.store.device_span()
+    }
+
+    pub(crate) fn clone_physical_store(&self) -> Box<dyn KvPageStore> {
+        self.store.clone()
+    }
+
+    pub(crate) fn copy_physical_store_from(
+        &mut self,
+        source: &dyn KvPageStore,
+    ) -> Result<u64, KvError> {
+        source.copy_to(self.store.as_mut())
+    }
+
+    /// Transactionally migrate the complete physical payload to `target`.
+    ///
+    /// Allocation and copying finish before the owning store is replaced, so
+    /// any error leaves the source store and all logical page metadata intact.
+    pub fn migrate(
+        &mut self,
+        target: Device,
+        factory: &dyn KvPageStoreFactory,
+    ) -> Result<PageMigration, KvError> {
+        let from = self.residency();
+        if from == target {
+            return Ok(PageMigration {
+                from,
+                to: target,
+                bytes_copied: 0,
+                accounting: MigrationAccounting::ExistingPoolLeaseOnly,
+            });
+        }
+        let mut replacement = factory.create(target, self.store_layout)?;
+        if replacement.residency() != target {
+            return Err(KvError::PageStoreWrongResidency {
+                requested: target,
+                actual: replacement.residency(),
+            });
+        }
+        let bytes_copied = self.store.copy_to(replacement.as_mut())?;
+        self.store = replacement;
+        Ok(PageMigration {
+            from,
+            to: target,
+            bytes_copied,
+            accounting: MigrationAccounting::ExistingPoolLeaseOnly,
+        })
     }
 
     /// Bytes this page's storage actually occupies.
@@ -830,6 +973,7 @@ pub struct PageTable {
     /// `None` on every path that does not observe the pool, so the cost when
     /// absent is one `Option` check per mutation and no stores.
     telemetry: TelemetryHandle,
+    migration_factory: Arc<dyn KvPageStoreFactory>,
 }
 
 /// Holds the optional telemetry mirror, and **drops it on clone**.
@@ -864,6 +1008,7 @@ impl Clone for PageTable {
             quant_config: self.quant_config.clone(),
             stats: self.stats,
             telemetry: self.telemetry.clone(),
+            migration_factory: Arc::clone(&self.migration_factory),
             clock: self.clock,
             hot_capacity: self.hot_capacity,
             next_page_id: self.next_page_id,
@@ -876,6 +1021,26 @@ impl Clone for PageTable {
 }
 
 impl PageTable {
+    /// Replace the factory used for subsequent tier migrations.
+    ///
+    /// Existing page stores are unchanged until explicitly migrated.
+    pub fn set_migration_factory(&mut self, factory: Arc<dyn KvPageStoreFactory>) {
+        self.migration_factory = factory;
+    }
+
+    /// Migrate one page while preserving its logical identity and metadata.
+    pub fn migrate_page(
+        &mut self,
+        page_id: PageId,
+        target: Device,
+    ) -> Result<PageMigration, KvError> {
+        let factory = Arc::clone(&self.migration_factory);
+        self.pages
+            .get_mut(&page_id)
+            .ok_or(KvError::PageNotFound(page_id))?
+            .migrate(target, factory.as_ref())
+    }
+
     pub fn new(page_size: usize, num_gpu_pages: usize) -> Self {
         Self::new_with_storage(page_size, num_gpu_pages, None, None)
     }
@@ -1043,6 +1208,7 @@ impl PageTable {
             quant_config,
             stats: PageStats::default(),
             telemetry: TelemetryHandle::default(),
+            migration_factory: Arc::new(HostPageStoreFactory),
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
@@ -1247,9 +1413,10 @@ impl PageTable {
             in_use += 1;
             filled_slots += page.filled;
             *references.entry(page.ref_count).or_default() += 1;
-            match tiers.iter_mut().find(|(device, _)| *device == page.device) {
+            let residency = page.residency();
+            match tiers.iter_mut().find(|(device, _)| *device == residency) {
                 Some((_, count)) => *count += 1,
-                None => tiers.push((page.device, 1)),
+                None => tiers.push((residency, 1)),
             }
         }
         let mut sequences = self
@@ -1310,7 +1477,6 @@ impl PageTable {
         {
             if let Some(page) = self.pages.get_mut(&page_id) {
                 page.ref_count = 1;
-                page.device = device;
                 page.reset_storage(self.tensor_config);
                 self.clock += 1;
                 page.last_access = self.clock;
@@ -1348,7 +1514,7 @@ impl PageTable {
             transition = Some((previous, page.ref_count));
             if page.ref_count == 0 {
                 page.reset_storage(self.tensor_config);
-                let device = page.device;
+                let device = page.residency();
                 self.free_pages.entry(device).or_default().push(page_id);
                 self.stats.frees += 1;
             }
@@ -1450,7 +1616,7 @@ impl PageTable {
         let Some(page) = self.pages.get(&page_id) else {
             return Err(KvError::PageNotFound(page_id));
         };
-        if matches!(page.device, Device::Gpu(_)) {
+        if matches!(page.residency(), Device::Gpu(_)) {
             self.touch(page_id);
             return Ok(());
         }
@@ -1463,11 +1629,11 @@ impl PageTable {
         if self.hot_used_count() >= self.hot_capacity {
             self.evict_lru_hot(Some(page_id))?;
         }
+        self.migrate_page(page_id, Device::Gpu(0))?;
         let page = self
             .pages
             .get_mut(&page_id)
             .ok_or(KvError::PageNotFound(page_id))?;
-        page.device = Device::Gpu(0);
         self.clock += 1;
         page.last_access = self.clock;
         Ok(())
@@ -1479,7 +1645,9 @@ impl PageTable {
             .pages
             .iter()
             .filter(|(id, page)| {
-                Some(**id) != exclude && page.ref_count > 0 && matches!(page.device, Device::Gpu(_))
+                Some(**id) != exclude
+                    && page.ref_count > 0
+                    && matches!(page.residency(), Device::Gpu(_))
             })
             .min_by_key(|(_, page)| page.last_access)
         else {
@@ -1488,11 +1656,7 @@ impl PageTable {
                 available: 0,
             });
         };
-        let victim = self
-            .pages
-            .get_mut(&victim_id)
-            .ok_or(KvError::PageNotFound(victim_id))?;
-        victim.device = Device::Cpu;
+        self.migrate_page(victim_id, Device::Cpu)?;
         self.stats.hot_evictions += 1;
         self.publish_counters();
         Ok(victim_id)
@@ -1507,26 +1671,25 @@ impl PageTable {
     /// sequence or a retained prefix (`ref_count > 1`) are left resident so a
     /// preemption never steals KV still needed by a running peer.
     ///
-    /// Only the [`Page::device`] tier tag changes; the page's KV data is left
-    /// untouched, so a later [`promote_to_hot`](Self::promote_to_hot) restores
-    /// byte-identical KV. Returns the number of pages demoted.
-    pub fn evict_sequence_to_cold(&mut self, seq: SequenceId) -> usize {
+    /// Each page is copied transactionally into a cold-tier store. Returns the
+    /// number of pages demoted.
+    pub fn evict_sequence_to_cold(&mut self, seq: SequenceId) -> Result<usize, KvError> {
         let Some(page_ids) = self.sequences.get(&seq).cloned() else {
-            return 0;
+            return Ok(0);
         };
         let mut demoted = 0;
         for page_id in page_ids {
-            if let Some(page) = self.pages.get_mut(&page_id)
-                && page.ref_count <= 1
-                && matches!(page.device, Device::Gpu(_))
-            {
-                page.device = Device::Cpu;
+            let should_demote = self.pages.get(&page_id).is_some_and(|page| {
+                page.ref_count <= 1 && matches!(page.residency(), Device::Gpu(_))
+            });
+            if should_demote {
+                self.migrate_page(page_id, Device::Cpu)?;
                 demoted += 1;
             }
         }
         self.stats.hot_evictions += demoted as u64;
         self.publish_counters();
-        demoted
+        Ok(demoted)
     }
 
     /// Number of pages backing `seq` currently resident on the hot tier.
@@ -1537,7 +1700,7 @@ impl PageTable {
                 .filter(|page_id| {
                     self.pages
                         .get(page_id)
-                        .is_some_and(|page| matches!(page.device, Device::Gpu(_)))
+                        .is_some_and(|page| matches!(page.residency(), Device::Gpu(_)))
                 })
                 .count()
         })
@@ -1566,7 +1729,7 @@ impl PageTable {
     pub fn hot_used_count(&self) -> usize {
         self.pages
             .values()
-            .filter(|page| page.ref_count > 0 && matches!(page.device, Device::Gpu(_)))
+            .filter(|page| page.ref_count > 0 && matches!(page.residency(), Device::Gpu(_)))
             .count()
     }
 
@@ -1578,6 +1741,280 @@ impl PageTable {
     /// Total number of pages.
     pub fn total_pages(&self) -> usize {
         self.pages.len()
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct AllocationFailureFactory;
+
+    impl KvPageStoreFactory for AllocationFailureFactory {
+        fn create(
+            &self,
+            _residency: Device,
+            _layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            Err(KvError::PageStoreAllocationFailed("injected".into()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CopyFailureFactory;
+
+    impl KvPageStoreFactory for CopyFailureFactory {
+        fn create(
+            &self,
+            residency: Device,
+            layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            Ok(Box::new(CopyFailureStore {
+                inner: HostPageStore::new(residency, layout),
+            }))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CopyFailureStore {
+        inner: HostPageStore,
+    }
+
+    impl KvPageStore for CopyFailureStore {
+        fn residency(&self) -> Device {
+            self.inner.residency()
+        }
+
+        fn allocated_bytes(&self) -> u64 {
+            self.inner.allocated_bytes()
+        }
+
+        fn reset_storage(&mut self) {
+            self.inner.reset_storage();
+        }
+
+        fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+            self.inner.host_view()
+        }
+
+        fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
+            self.inner.host_view_mut()
+        }
+
+        fn device_span(&self) -> Option<DevicePageSpan> {
+            None
+        }
+
+        fn copy_to(&self, target: &mut dyn KvPageStore) -> Result<u64, KvError> {
+            self.inner.copy_to(target)
+        }
+
+        fn copy_from_host(&mut self, _source: HostPageStoreView<'_>) -> Result<(), KvError> {
+            Err(KvError::PageStoreCopyUnsupported {
+                from: Device::Cpu,
+                to: self.residency(),
+            })
+        }
+
+        fn clone_store(&self) -> Box<dyn KvPageStore> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeviceOnlyFactory;
+
+    impl KvPageStoreFactory for DeviceOnlyFactory {
+        fn create(
+            &self,
+            residency: Device,
+            layout: PageStoreLayout,
+        ) -> Result<Box<dyn KvPageStore>, KvError> {
+            Ok(Box::new(DeviceOnlyStore {
+                residency,
+                bytes: vec![
+                    0;
+                    layout.f32_len * size_of::<f32>()
+                        + layout.int8_len
+                        + layout.fp8_len
+                        + layout.scale_len * size_of::<f32>()
+                ],
+            }))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DeviceOnlyStore {
+        residency: Device,
+        bytes: Vec<u8>,
+    }
+
+    impl KvPageStore for DeviceOnlyStore {
+        fn residency(&self) -> Device {
+            self.residency
+        }
+
+        fn allocated_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn reset_storage(&mut self) {
+            self.bytes.fill(0);
+        }
+
+        fn host_view(&self) -> Option<HostPageStoreView<'_>> {
+            None
+        }
+
+        fn host_view_mut(&mut self) -> Option<HostPageStoreViewMut<'_>> {
+            None
+        }
+
+        fn device_span(&self) -> Option<DevicePageSpan> {
+            None
+        }
+
+        fn copy_to(&self, _target: &mut dyn KvPageStore) -> Result<u64, KvError> {
+            Err(KvError::PageStoreCopyUnsupported {
+                from: self.residency,
+                to: Device::Cpu,
+            })
+        }
+
+        fn copy_from_host(&mut self, source: HostPageStoreView<'_>) -> Result<(), KvError> {
+            let mut offset = 0;
+            for value in source.data.iter().chain(source.quant_scales) {
+                let bytes = value.to_ne_bytes();
+                self.bytes[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                offset += bytes.len();
+            }
+            for value in source.quantized_data {
+                self.bytes[offset] = value.to_ne_bytes()[0];
+                offset += 1;
+            }
+            for value in source.fp8_data {
+                self.bytes[offset] = *value;
+                offset += 1;
+            }
+            Ok(())
+        }
+
+        fn clone_store(&self) -> Box<dyn KvPageStore> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn mixed_table() -> (PageTable, PageId) {
+        let quant = KvQuantConfig {
+            layers: vec![
+                LayerKvDType {
+                    key: KvDType::F32,
+                    value: KvDType::Int8,
+                },
+                LayerKvDType {
+                    key: KvDType::Fp8E4M3Fn,
+                    value: KvDType::F32,
+                },
+            ],
+        };
+        let mut table = PageTable::new_with_layer_quant_config(
+            2,
+            1,
+            KvDType::F32,
+            vec![
+                LayerTensorConfig {
+                    num_kv_heads: 1,
+                    head_dim: 2,
+                },
+                LayerTensorConfig {
+                    num_kv_heads: 1,
+                    head_dim: 2,
+                },
+            ],
+            quant,
+        )
+        .unwrap();
+        let page_id = table.allocate(Device::Gpu(0)).unwrap();
+        let page = table.pages.get_mut(&page_id).unwrap();
+        page.write_head_token(2, 2, 0, 0, 0, &[1.25, -2.5]).unwrap();
+        page.write_head_token(2, 2, 1, 0, 0, &[3.0, -6.0]).unwrap();
+        page.write_head_token(2, 2, 2, 0, 0, &[0.75, -1.5]).unwrap();
+        page.write_head_token(2, 2, 3, 0, 0, &[9.5, -4.25]).unwrap();
+        page.filled = 1;
+        page.ref_count = 3;
+        page.last_access = 77;
+        (table, page_id)
+    }
+
+    fn snapshot(page: &Page) -> (Vec<f32>, Vec<i8>, Vec<u8>, Vec<f32>) {
+        let view = page.host_view().unwrap();
+        (
+            view.data.to_vec(),
+            view.quantized_data.to_vec(),
+            view.fp8_data.to_vec(),
+            view.quant_scales.to_vec(),
+        )
+    }
+
+    #[test]
+    fn migration_copies_every_component_and_preserves_logical_metadata() {
+        let (mut table, page_id) = mixed_table();
+        let before = snapshot(&table.pages[&page_id]);
+        assert!(before.0.iter().any(|value| *value != 0.0));
+        assert!(before.1.iter().any(|value| *value != 0));
+        assert!(before.2.iter().any(|value| *value != 0));
+        assert!(before.3.iter().any(|value| *value != 1.0));
+
+        let demoted = table.migrate_page(page_id, Device::Cpu).unwrap();
+        assert_eq!(
+            demoted.bytes_copied,
+            table.pages[&page_id].allocated_bytes()
+        );
+        assert_eq!(snapshot(&table.pages[&page_id]), before);
+        let page = &table.pages[&page_id];
+        assert_eq!(page.id, page_id);
+        assert_eq!(page.ref_count, 3);
+        assert_eq!(page.filled, 1);
+        assert_eq!(page.last_access, 77);
+
+        table.migrate_page(page_id, Device::Gpu(0)).unwrap();
+        assert_eq!(snapshot(&table.pages[&page_id]), before);
+    }
+
+    #[test]
+    fn migration_failures_leave_source_unchanged_and_retry_succeeds() {
+        let (mut table, page_id) = mixed_table();
+        let before = snapshot(&table.pages[&page_id]);
+
+        table.set_migration_factory(Arc::new(AllocationFailureFactory));
+        assert!(table.migrate_page(page_id, Device::Cpu).is_err());
+        assert_eq!(table.pages[&page_id].residency(), Device::Gpu(0));
+        assert_eq!(snapshot(&table.pages[&page_id]), before);
+
+        table.set_migration_factory(Arc::new(CopyFailureFactory));
+        assert!(table.migrate_page(page_id, Device::Cpu).is_err());
+        assert_eq!(table.pages[&page_id].residency(), Device::Gpu(0));
+        assert_eq!(snapshot(&table.pages[&page_id]), before);
+
+        table.set_migration_factory(Arc::new(HostPageStoreFactory));
+        table.migrate_page(page_id, Device::Cpu).unwrap();
+        assert_eq!(snapshot(&table.pages[&page_id]), before);
+    }
+
+    #[test]
+    fn device_only_store_has_no_implicit_host_view_or_materialization() {
+        let (mut table, page_id) = mixed_table();
+        table.set_migration_factory(Arc::new(DeviceOnlyFactory));
+        table.migrate_page(page_id, Device::Gpu(1)).unwrap();
+        let page = &table.pages[&page_id];
+        assert_eq!(page.residency(), Device::Gpu(1));
+        assert!(page.host_view().is_none());
+        assert!(matches!(
+            page.value_at_slot(2, 2, 0, 0, 0, 0),
+            Err(KvError::PageNotHostAddressable(id)) if id == page_id
+        ));
+        assert!(table.migrate_page(page_id, Device::Cpu).is_err());
     }
 }
 
@@ -1918,8 +2355,9 @@ mod pool_lease_tests {
     }
     /// A page is host memory, so the pool must be charged to the host tier.
     ///
-    /// `Page` holds `Vec<f32>`. Charging it to the device tier -- which the
-    /// `num_gpu_pages` lineage invites -- would let the pool exhaust host RAM
+    /// `HostPageStore` owns host vectors for both emulated locations. Charging
+    /// them to the device tier -- which the `num_gpu_pages` lineage invites --
+    /// would let the pool exhaust host RAM
     /// while the device ledger still reported headroom, which is the governor
     /// failing at the one thing it exists to do. Caught in review before it
     /// shipped, so this test is what keeps it caught.

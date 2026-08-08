@@ -254,7 +254,7 @@ impl Interior {
         if self.page_table.free_count(Device::Gpu(0)) == 0
             && self.page_table.hot_used_count() >= self.page_table.hot_capacity()
         {
-            self.demote_one(priority);
+            self.demote_one(priority)?;
         }
         self.page_table
             .allocate(Device::Gpu(0))
@@ -264,7 +264,7 @@ impl Interior {
     /// Demote the lowest-priority, least-recently-used unpinned hot page to the
     /// cold CPU tier. `incoming` is the priority of the chunk needing room; a
     /// victim is only chosen if it is no higher priority than `incoming`.
-    fn demote_one(&mut self, incoming: CachePriority) {
+    fn demote_one(&mut self, incoming: CachePriority) -> ConnectorResult<()> {
         let pinned_pages: HashSet<PageId> = self
             .chunks
             .iter()
@@ -283,7 +283,7 @@ impl Interior {
             .values()
             .filter(|p| {
                 p.ref_count > 0
-                    && matches!(p.device, Device::Gpu(_))
+                    && matches!(p.residency(), Device::Gpu(_))
                     && !pinned_pages.contains(&p.id)
             })
             .filter_map(|p| page_priority.get(&p.id).map(|prio| (p, *prio)))
@@ -295,11 +295,12 @@ impl Interior {
             })
             .map(|(p, _)| p.id);
 
-        if let Some(pid) = victim
-            && let Some(page) = self.page_table.pages.get_mut(&pid)
-        {
-            page.device = Device::Cpu;
+        if let Some(pid) = victim {
+            self.page_table
+                .migrate_page(pid, Device::Cpu)
+                .map_err(|err| ConnectorError::Backend(err.to_string()))?;
         }
+        Ok(())
     }
 
     /// Persist fully cold payloads and release their host-RAM copies.
@@ -310,7 +311,10 @@ impl Interior {
         for (key, entry) in &mut self.chunks {
             let all_cold = entry.page_ids.iter().all(|page_id| {
                 !matches!(
-                    self.page_table.pages.get(page_id).map(|page| page.device),
+                    self.page_table
+                        .pages
+                        .get(page_id)
+                        .map(|page| page.residency()),
                     Some(Device::Gpu(_))
                 )
             });
@@ -370,7 +374,7 @@ impl Interior {
     fn locate(&self, entry: &ChunkEntry, cpu_load_ms_per_page: f64) -> KvCacheLocation {
         let all_hot = entry.page_ids.iter().all(|pid| {
             matches!(
-                self.page_table.pages.get(pid).map(|p| p.device),
+                self.page_table.pages.get(pid).map(|p| p.residency()),
                 Some(Device::Gpu(_))
             )
         });
@@ -384,7 +388,7 @@ impl Interior {
                 .iter()
                 .filter(|pid| {
                     !matches!(
-                        self.page_table.pages.get(pid).map(|p| p.device),
+                        self.page_table.pages.get(pid).map(|p| p.residency()),
                         Some(Device::Gpu(_))
                     )
                 })
@@ -577,7 +581,7 @@ impl KvCacheConnector for LocalTieredConnector {
             let priority = entry.priority;
             for &pid in &entry.page_ids {
                 let already_hot = matches!(
-                    inner.page_table.pages.get(&pid).map(|p| p.device),
+                    inner.page_table.pages.get(&pid).map(|p| p.residency()),
                     Some(Device::Gpu(_))
                 );
                 if already_hot {
@@ -588,11 +592,12 @@ impl KvCacheConnector for LocalTieredConnector {
                 if inner.page_table.free_count(Device::Gpu(0)) == 0
                     && inner.page_table.hot_used_count() >= inner.page_table.hot_capacity()
                 {
-                    inner.demote_one(priority);
+                    inner.demote_one(priority)?;
                 }
-                if let Some(page) = inner.page_table.pages.get_mut(&pid) {
-                    page.device = Device::Gpu(0);
-                }
+                inner
+                    .page_table
+                    .migrate_page(pid, Device::Gpu(0))
+                    .map_err(|err| ConnectorError::Backend(err.to_string()))?;
                 inner.page_table.touch(pid);
             }
         }
@@ -619,7 +624,7 @@ impl KvCacheConnector for LocalTieredConnector {
             let priority = entry.priority;
             for &pid in &entry.page_ids {
                 let already_hot = matches!(
-                    inner.page_table.pages.get(&pid).map(|p| p.device),
+                    inner.page_table.pages.get(&pid).map(|p| p.residency()),
                     Some(Device::Gpu(_))
                 );
                 if already_hot {
@@ -628,11 +633,9 @@ impl KvCacheConnector for LocalTieredConnector {
                 if inner.page_table.free_count(Device::Gpu(0)) == 0
                     && inner.page_table.hot_used_count() >= inner.page_table.hot_capacity()
                 {
-                    inner.demote_one(priority);
+                    let _ = inner.demote_one(priority);
                 }
-                if let Some(page) = inner.page_table.pages.get_mut(&pid) {
-                    page.device = Device::Gpu(0);
-                }
+                let _ = inner.page_table.migrate_page(pid, Device::Gpu(0));
             }
             let _ = inner.spill_cold_payloads();
         }
