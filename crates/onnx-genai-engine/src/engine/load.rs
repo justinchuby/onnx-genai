@@ -403,6 +403,8 @@ impl Engine {
                     host_cache: governor.weight_offload_host_cache(),
                     #[cfg(feature = "cuda")]
                     cuda_offload_policy,
+                    #[cfg(feature = "cuda")]
+                    cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
                     io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                     metadata_max_len: metadata
                         .model

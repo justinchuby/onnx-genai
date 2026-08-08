@@ -97,6 +97,12 @@ impl PipelineEngine {
                     &self.models,
                     &ar.decoder,
                     self.native_device.as_ref(),
+                    #[cfg(feature = "cuda")]
+                    std::sync::Arc::new(
+                        self.native_cuda_authority
+                            .clone()
+                            .unwrap_or_else(|| self.resource_governor.device_authority()),
+                    ),
                 )?)
             } else {
                 None

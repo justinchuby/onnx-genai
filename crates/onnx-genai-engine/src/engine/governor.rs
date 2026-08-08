@@ -256,6 +256,9 @@ impl EngineResourceGovernor {
                     operation: "acquiring the shared device memory authority",
                     reason: error.to_string(),
                 })?,
+            (None, Some(domain)) => {
+                DeviceMemoryAuthority::new(domain.clone(), snapshot.resolved_limits.vram_bytes)
+            }
             _ => DeviceMemoryAuthority::new(
                 DeviceCompatibilityDomain::Accelerator {
                     backend: "standalone".to_string(),

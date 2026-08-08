@@ -40,14 +40,15 @@
 //! instead returns unmapped granule handles to a device-scoped pool, so the
 //! same physical allocation can be mapped into a different reservation later.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cudarc::driver::sys as cu;
 use onnx_runtime_memory_governor::{
-    HolderId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    HolderId, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
 };
-use onnx_runtime_virtual_memory::{VirtualBacking, VirtualMemoryError};
+use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking, VirtualMemoryError};
 
 use cudarc::driver::CudaContext;
 
@@ -100,6 +101,10 @@ impl CudaVirtualBacking {
             device_ordinal: pool.device_ordinal,
             pool: Some(pool),
         }
+    }
+
+    pub(crate) fn physical_pool(&self) -> Option<&Arc<PhysicalHandlePool>> {
+        self.pool.as_ref()
     }
 
     fn allocation_prop(&self) -> cu::CUmemAllocationProp {
@@ -185,6 +190,25 @@ struct PoolState {
     lease: Option<MemoryLease>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AllocationCompatibility {
+    allocation_type: i32,
+    location_type: i32,
+    location_id: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PoolKey {
+    context: usize,
+    device_ordinal: i32,
+    allocation: AllocationCompatibility,
+    granularity: usize,
+    authority: MemoryAuthorityId,
+}
+
+static PHYSICAL_POOLS: OnceLock<Mutex<HashMap<PoolKey, Weak<PhysicalHandlePool>>>> =
+    OnceLock::new();
+
 /// Device-scoped owner of fungible, granule-sized CUDA physical allocations.
 ///
 /// Handles returned after unmap are retained up to `max_retained_bytes`.
@@ -205,14 +229,15 @@ pub struct PhysicalHandlePool {
     context: Arc<CudaContext>,
     device_ordinal: i32,
     granularity: usize,
+    authority: MemoryAuthorityId,
     max_retained_bytes: usize,
     state: Mutex<PoolState>,
     counters: Arc<PoolCounters>,
 }
 
 impl PhysicalHandlePool {
-    /// Create a pool whose physical ownership is charged to `governor`.
-    pub fn new(
+    /// Get the one live compatible pool for this CUDA context and authority.
+    pub fn get_or_create(
         context: Arc<CudaContext>,
         device_ordinal: i32,
         max_retained_bytes: usize,
@@ -220,20 +245,64 @@ impl PhysicalHandlePool {
         holder: HolderId,
         role: MemoryRole,
     ) -> Result<Arc<Self>, MemoryError> {
+        let authority = governor.authority_id();
+        if authority.device()
+            != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason: "the physical-handle pool governor authority names a different device",
+            });
+        }
         let granularity = allocation_granularity(device_ordinal);
+        let allocation = allocation_compatibility(device_ordinal);
+        let context_id =
+            current_context_id(&context).map_err(|reason| MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason,
+            })?;
+        let key = PoolKey {
+            context: context_id,
+            device_ordinal,
+            allocation,
+            granularity,
+            authority,
+        };
+        let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, pool| pool.strong_count() > 0);
+        if let Some(pool) = registry.get(&key).and_then(Weak::upgrade) {
+            let requested_bound = (max_retained_bytes / granularity) * granularity;
+            if pool.max_retained_bytes != requested_bound {
+                return Err(MemoryError::InvalidRequest {
+                    tier: Tier::Device.name(),
+                    requested: max_retained_bytes as u64,
+                    reason: "the compatible physical-handle pool already has a different retained-byte bound",
+                });
+            }
+            return Ok(pool);
+        }
+
         let retained_granules = max_retained_bytes / granularity;
         let lease = governor.reserve(Tier::Device, 0, role, holder)?;
-        Ok(Arc::new(Self {
+        let pool = Arc::new(Self {
             context,
             device_ordinal,
             granularity,
+            authority,
             max_retained_bytes: retained_granules * granularity,
             state: Mutex::new(PoolState {
                 available: Vec::new(),
                 lease: Some(lease),
             }),
             counters: Arc::new(PoolCounters::default()),
-        }))
+        });
+        registry.insert(key, Arc::downgrade(&pool));
+        Ok(pool)
     }
 
     /// Allocation granularity shared by every handle in this pool.
@@ -244,6 +313,11 @@ impl PhysicalHandlePool {
     /// Maximum bytes retained after unmap.
     pub fn max_retained_bytes(&self) -> usize {
         self.max_retained_bytes
+    }
+
+    /// Accounting authority that owns every physical handle in this pool.
+    pub fn authority(&self) -> MemoryAuthorityId {
+        self.authority
     }
 
     /// A stats handle that remains valid through pool teardown.
@@ -433,6 +507,27 @@ fn allocation_prop(device_ordinal: i32) -> cu::CUmemAllocationProp {
     prop
 }
 
+fn allocation_compatibility(device_ordinal: i32) -> AllocationCompatibility {
+    let prop = allocation_prop(device_ordinal);
+    AllocationCompatibility {
+        allocation_type: prop.type_ as i32,
+        location_type: prop.location.type_ as i32,
+        location_id: prop.location.id,
+    }
+}
+
+fn current_context_id(context: &CudaContext) -> Result<usize, String> {
+    context
+        .bind_to_thread()
+        .map_err(|error| format!("could not bind CUDA context: {error}"))?;
+    let mut current: cu::CUcontext = std::ptr::null_mut();
+    let result = unsafe { cu::cuCtxGetCurrent(&mut current) };
+    if result != cu::CUresult::CUDA_SUCCESS || current.is_null() {
+        return Err(format!("cuCtxGetCurrent failed: {result:?}"));
+    }
+    Ok(current as usize)
+}
+
 fn allocation_granularity(device_ordinal: i32) -> usize {
     let prop = allocation_prop(device_ordinal);
     let mut granularity = 0usize;
@@ -508,8 +603,14 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
         )
     }
 
-    fn owns_physical_memory_accounting(&self) -> bool {
-        self.pool.is_some()
+    fn physical_memory_accounting(&self) -> PhysicalMemoryAccounting {
+        self.pool
+            .as_ref()
+            .map_or(PhysicalMemoryAccounting::Buffer, |pool| {
+                PhysicalMemoryAccounting::Backing {
+                    authority: pool.authority,
+                }
+            })
     }
 
     fn reserve(&self, len: usize) -> Result<Self::Reservation, VirtualMemoryError> {

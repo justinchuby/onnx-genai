@@ -234,8 +234,15 @@ fn pooled_handles_move_between_separate_reservations() {
     let granule = probe.granularity();
     let count = 3usize;
     let bytes = granule * count;
-    let pool = PhysicalHandlePool::new(context, 0, bytes, &governor, HOLDER, MemoryRole::KvCache)
-        .expect("pool lease");
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        bytes,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool lease");
     let stats = pool.stats();
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool));
     let mut a = backing.reserve(bytes).expect("range A");
@@ -340,8 +347,15 @@ fn physical_pool_releases_handles_above_its_bound() {
     let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
     let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);
     let granule = probe.granularity();
-    let pool = PhysicalHandlePool::new(context, 0, granule, &governor, HOLDER, MemoryRole::KvCache)
-        .expect("pool lease");
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool lease");
     let stats = pool.stats();
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool));
     let mut reservation = backing.reserve(granule * 2).expect("range");
@@ -365,6 +379,54 @@ fn physical_pool_releases_handles_above_its_bound() {
     );
 }
 
+/// Different accounting authorities never exchange physical handles.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn different_authorities_use_different_pools() {
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let first_governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let second_governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
+    let first = PhysicalHandlePool::get_or_create(
+        Arc::clone(&context),
+        0,
+        granule,
+        &first_governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("first authority pool");
+    let second = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule,
+        &second_governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("second authority pool");
+    assert_ne!(first.authority(), second.authority());
+
+    let first_backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&first));
+    let second_backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&second));
+    let mut a = first_backing.reserve(granule).expect("range A");
+    let mut b = second_backing.reserve(granule).expect("range B");
+    first_backing.commit(&mut a, 0, granule).expect("map A");
+    first_backing.release(&mut a, 0, granule).expect("return A");
+    second_backing.commit(&mut b, 0, granule).expect("map B");
+
+    assert_eq!(first.stats().snapshot().creates, 1);
+    assert_eq!(second.stats().snapshot().creates, 1);
+    assert_eq!(
+        second.stats().snapshot().pool_hits,
+        0,
+        "authority B must not reuse authority A's retained handle"
+    );
+}
+
 /// `VirtualBuffer` delegates accounting to a pooled backing instead of taking
 /// a second lease for the same physical handle.
 #[cfg_attr(
@@ -376,8 +438,15 @@ fn pooled_virtual_buffer_is_not_double_charged() {
     let context = CudaContext::new(0).expect("CUDA driver");
     let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
     let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
-    let pool = PhysicalHandlePool::new(context, 0, granule, &governor, HOLDER, MemoryRole::KvCache)
-        .expect("pool lease");
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool lease");
     let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&pool));
     let mut buffer = VirtualBuffer::with_backing(
         backing,

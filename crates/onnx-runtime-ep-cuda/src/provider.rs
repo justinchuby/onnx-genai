@@ -114,6 +114,24 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
+        Self::new_with_policy_and_governor(ordinal, offload_policy, None)
+    }
+
+    /// Construct a CUDA EP with the device authority available before the
+    /// allocator reserves or commits memory.
+    pub fn new_with_offload_policy_and_governor(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<Self> {
+        Self::new_with_policy_and_governor(ordinal, offload_policy, Some(governor))
+    }
+
+    fn new_with_policy_and_governor(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+    ) -> Result<Self> {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
@@ -146,14 +164,30 @@ impl CudaExecutionProvider {
                 let cell = std::sync::OnceLock::new();
                 if crate::vmm_allocator::vmm_enabled() {
                     const RESERVATION_BYTES: usize = 64 << 30;
-                    match crate::vmm_allocator::CudaVmmAllocator::detached(
-                        runtime.cuda_context(),
-                        onnx_runtime_memory_governor::DeviceKey::device(ordinal),
-                        ordinal as i32,
-                        RESERVATION_BYTES,
-                        onnx_runtime_memory_governor::HolderId::new(64),
-                        onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-                    ) {
+                    let arena = match governor.as_deref() {
+                        Some(governor) => crate::vmm_allocator::CudaVmmAllocator::new(
+                            runtime.cuda_context(),
+                            onnx_runtime_memory_governor::DeviceKey::device(ordinal),
+                            ordinal as i32,
+                            RESERVATION_BYTES,
+                            governor,
+                            onnx_runtime_memory_governor::HolderId::new(64),
+                            onnx_runtime_memory_governor::MemoryRole::Workspace {
+                                step_scoped: false,
+                            },
+                        ),
+                        None => crate::vmm_allocator::CudaVmmAllocator::detached(
+                            runtime.cuda_context(),
+                            onnx_runtime_memory_governor::DeviceKey::device(ordinal),
+                            ordinal as i32,
+                            RESERVATION_BYTES,
+                            onnx_runtime_memory_governor::HolderId::new(64),
+                            onnx_runtime_memory_governor::MemoryRole::Workspace {
+                                step_scoped: false,
+                            },
+                        ),
+                    };
+                    match arena {
                         Ok(arena) => {
                             eprintln!(
                                 "cuda_ep: device allocations go through a VMM arena over \
@@ -246,6 +280,19 @@ impl CudaExecutionProvider {
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
         let mut provider = Self::new_with_offload_policy(ordinal, offload_policy)?;
+        <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
+        Ok(provider)
+    }
+
+    /// Construct and initialize with a device authority available to allocator
+    /// construction.
+    pub fn initialized_with_offload_policy_and_governor(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<Self> {
+        let mut provider =
+            Self::new_with_offload_policy_and_governor(ordinal, offload_policy, governor)?;
         <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
         Ok(provider)
     }
@@ -997,6 +1044,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         if crate::vmm_allocator::vmm_enabled()
             && let Some(arena) = self.vmm.get()
         {
+            if let Some(authority) = arena.physical_pool_authority()
+                && authority != governor.authority_id()
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: physical-handle pool uses {authority}, but adoption supplied {}; \
+                     both must use the same memory authority",
+                    governor.authority_id()
+                )));
+            }
             // The arena has been serving allocations against its own ledger
             // since construction. Move the claim to the real one now that it
             // exists.

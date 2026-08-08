@@ -255,6 +255,8 @@ pub struct PipelineEngine {
     /// `--ep cuda`), honored by the native pipeline decoder when the
     /// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` override is unset.
     native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
+    #[cfg(feature = "cuda")]
+    native_cuda_authority: Option<crate::memory_authority::DeviceMemoryAuthority>,
 }
 
 /// Paged KV storage for an autoregressive pipeline decoder.
@@ -515,6 +517,9 @@ fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
     config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+    #[cfg(feature = "cuda")] governor: std::sync::Arc<
+        dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+    >,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
@@ -540,6 +545,8 @@ fn build_native_pipeline_decoder(
             path,
             native_decoder_device(config_device),
             io,
+            #[cfg(feature = "cuda")]
+            governor,
         )?;
         Ok(Box::new(native))
     }
@@ -774,6 +781,34 @@ impl PipelineEngine {
             EngineDecodeBackend::Native => PipelineBackend::Native,
             EngineDecodeBackend::Auto => resolve_auto_pipeline_backend(&directory)?,
         };
+        #[cfg(feature = "cuda")]
+        let native_cuda_authority = if backend == PipelineBackend::Native {
+            match native_decoder_device(config.native_device.as_ref()) {
+                crate::native_decode_device::NativeDecodeDevice::Cuda { index } => {
+                    let domain = crate::memory_authority::DeviceCompatibilityDomain::Cuda(
+                        index.unwrap_or(0),
+                    );
+                    crate::engine::validate_shared_authority_limit(
+                        authority_provider.as_ref(),
+                        &domain,
+                        config.limits.vram_limit,
+                    )?;
+                    Some(match authority_provider.as_ref() {
+                        Some(provider) => provider.authority(
+                            &domain,
+                            resource_governor.snapshot().resolved_limits.vram_bytes,
+                        )?,
+                        None => crate::memory_authority::DeviceMemoryAuthority::new(
+                            domain,
+                            resource_governor.snapshot().resolved_limits.vram_bytes,
+                        ),
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         if backend == PipelineBackend::Native {
             // The native backend constructs every declared component through the
             // backend-neutral `ComponentSession` seam (GAP 1). When the crate is
@@ -961,11 +996,27 @@ impl PipelineEngine {
             retained: None,
             paged,
             native_device: config.native_device.clone(),
+            #[cfg(feature = "cuda")]
+            native_cuda_authority,
         })
     }
 
     pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
-        self.resource_governor.snapshot()
+        #[cfg(feature = "cuda")]
+        {
+            let mut snapshot = self.resource_governor.snapshot();
+            if let Some(authority) = &self.native_cuda_authority {
+                snapshot.vram.used = authority.used_bytes();
+                snapshot.vram.limit = authority.limit_bytes();
+                snapshot.vram.headroom = authority.headroom_bytes();
+                snapshot.resolved_limits.vram_bytes = authority.limit_bytes();
+            }
+            snapshot
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.resource_governor.snapshot()
+        }
     }
 
     pub fn models(&self) -> &PipelineModels {
@@ -973,6 +1024,10 @@ impl PipelineEngine {
     }
 
     pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {
+        #[cfg(feature = "cuda")]
+        if let Some(authority) = &self.native_cuda_authority {
+            return authority.clone();
+        }
         self.resource_governor.device_authority()
     }
 
@@ -981,7 +1036,12 @@ impl PipelineEngine {
         limit: onnx_genai_scheduler::ResourceLimit,
     ) -> Result<onnx_genai_scheduler::GovernorReconfigureOutcome, crate::engine::EngineGovernorError>
     {
-        self.resource_governor.set_vram_limit(limit)
+        let outcome = self.resource_governor.set_vram_limit(limit)?;
+        #[cfg(feature = "cuda")]
+        if let Some(authority) = &self.native_cuda_authority {
+            authority.set_limit_bytes(outcome.new_limits.vram_bytes);
+        }
+        Ok(outcome)
     }
 
     /// Generate text from a pipeline with no extra non-text tensors.
