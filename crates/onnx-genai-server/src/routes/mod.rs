@@ -78,6 +78,8 @@ pub(crate) use sessions::{create_session, delete_session};
 const SESSION_ID_HEADER: &str = "x-session-id";
 const MAX_SESSION_ID_LEN: usize = 128;
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+const MEMORY_OVERLOAD_MESSAGE: &str =
+    "request exceeds the configured KV memory limit; retry later or reduce context/output length";
 const MAX_CHAT_TOP_LOGPROBS: usize = 20;
 const MAX_COMPLETION_LOGPROBS: usize = 5;
 /// Path of the downloadable Perfetto trace endpoint, reported by the trace
@@ -387,10 +389,13 @@ impl ApiError {
 
 fn generation_failure(error: DriverFailure) -> ApiError {
     match error.kind {
-        DriverFailureKind::MemoryOverload => ApiError::too_many_requests(format!(
-            "KV memory resource limit exceeded: {}",
-            error.message
-        )),
+        DriverFailureKind::MemoryOverload => {
+            tracing::warn!(
+                error = %error,
+                "generation rejected by the KV memory governor"
+            );
+            ApiError::too_many_requests(MEMORY_OVERLOAD_MESSAGE)
+        }
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }
@@ -577,11 +582,8 @@ mod overload_tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"]["type"], "resource_limit_error");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("KV memory resource limit exceeded"))
-        );
+        assert_eq!(body["error"]["message"], MEMORY_OVERLOAD_MESSAGE);
+        assert!(!body.to_string().contains("scheduler admission failed"));
     }
 
     #[test]

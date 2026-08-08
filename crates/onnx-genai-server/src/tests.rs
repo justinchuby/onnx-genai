@@ -608,6 +608,81 @@ async fn streaming_chat_and_completion_chunks_include_logprobs() {
 }
 
 #[tokio::test]
+async fn accepted_streams_preserve_first_chunk_and_chat_protocol_order() {
+    let chat = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), StatusCode::OK);
+    let chat_events = sse_json_events(&to_bytes(chat.into_body(), usize::MAX).await.unwrap());
+    assert_eq!(
+        chat_events[0]["choices"][0]["delta"]["role"], "assistant",
+        "the role chunk must remain first after admission"
+    );
+    assert_eq!(
+        chat_events
+            .iter()
+            .filter(|event| event["choices"][0]["delta"]["content"].is_string())
+            .count(),
+        2,
+        "the admission handshake must not consume the first content token"
+    );
+
+    let completion = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completion.status(), StatusCode::OK);
+    let completion_events =
+        sse_json_events(&to_bytes(completion.into_body(), usize::MAX).await.unwrap());
+    assert_eq!(
+        completion_events
+            .iter()
+            .filter(|event| {
+                !event["choices"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .count(),
+        2,
+        "the admission handshake must not consume the first completion token"
+    );
+}
+
+#[tokio::test]
 async fn logprobs_validation_enforces_openai_limits() {
     for body in [
         json!({

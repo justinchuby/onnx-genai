@@ -219,13 +219,14 @@ async fn stream_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let mut driver_rx = submit_completion(
+    let driver_rx = submit_completion(
         &handle,
         &state.sessions,
         prepared.generation,
         client_session_id.as_deref(),
     )
     .await?;
+    let mut driver_stream = AcceptedDriverStream::new(driver_rx).await?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
@@ -233,7 +234,7 @@ async fn stream_completion(
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut emitted_text = false;
         let result = loop {
-            match driver_rx.recv().await {
+            match driver_stream.recv().await {
                 Some(DriverEvent::Token(token)) => {
                     if requested_logprobs.is_some() {
                         continue;
@@ -589,7 +590,7 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    let mut driver_rx = if handle.pipeline {
+    let driver_rx = if handle.pipeline {
         handle
             .engine
             .generate_pipeline(generation_request, pipeline_input)
@@ -602,6 +603,7 @@ async fn stream_chat_completion(
             .await
             .map_err(map_generate_submit_error)?
     };
+    let mut driver_stream = AcceptedDriverStream::new(driver_rx).await?;
     crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
 
     tokio::spawn(async move {
@@ -612,7 +614,7 @@ async fn stream_chat_completion(
         let buffer_for_tool_detection =
             request.has_tool_context() && tools_parseable_from_output(&request);
         let result = loop {
-            match driver_rx.recv().await {
+            match driver_stream.recv().await {
                 Some(DriverEvent::Token(token)) => {
                     if requested_top_logprobs.is_some() {
                         continue;
@@ -770,6 +772,94 @@ async fn stream_chat_completion(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
+}
+
+struct AcceptedDriverStream {
+    first_event: Option<DriverEvent>,
+    receiver: mpsc::Receiver<DriverEvent>,
+}
+
+impl AcceptedDriverStream {
+    async fn new(mut receiver: mpsc::Receiver<DriverEvent>) -> Result<Self, ApiError> {
+        match receiver.recv().await {
+            Some(DriverEvent::Error(error)) => Err(generation_failure(error)),
+            Some(first_event) => Ok(Self {
+                first_event: Some(first_event),
+                receiver,
+            }),
+            None => Err(generation_failure(DriverFailure::internal(
+                "generation stream ended before admission",
+            ))),
+        }
+    }
+
+    async fn recv(&mut self) -> Option<DriverEvent> {
+        match self.first_event.take() {
+            Some(event) => Some(event),
+            None => self.receiver.recv().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_admission_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    fn memory_overload() -> DriverFailure {
+        DriverFailure {
+            message: "request_id=7 seq_id=9 available=1024 shortfall=2048".to_string(),
+            kind: DriverFailureKind::MemoryOverload,
+        }
+    }
+
+    async fn assert_streaming_overload_response() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(DriverEvent::Error(memory_overload()))
+            .await
+            .unwrap();
+
+        let error = match AcceptedDriverStream::new(rx).await {
+            Err(error) => error,
+            Ok(_) => panic!("memory refusal must happen before constructing SSE"),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+        assert_eq!(body["error"]["message"], MEMORY_OVERLOAD_MESSAGE);
+        assert!(!body.to_string().contains("request_id"));
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_refusal_is_http_overload_before_sse() {
+        assert_streaming_overload_response().await;
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_refusal_is_http_overload_before_role_chunk() {
+        assert_streaming_overload_response().await;
+    }
+
+    #[tokio::test]
+    async fn accepted_stream_preserves_first_driver_event() {
+        let first = onnx_genai::GenerateToken {
+            token_id: 42,
+            text: "first".to_string(),
+            finish_reason: None,
+        };
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(DriverEvent::Token(first.clone())).await.unwrap();
+
+        let mut stream = AcceptedDriverStream::new(rx).await.unwrap();
+        match stream.recv().await {
+            Some(DriverEvent::Token(actual)) => assert_eq!(actual, first),
+            _ => panic!("the admission handshake must preserve the first token"),
+        }
+    }
 }
 
 pub(crate) async fn collect_generation_result(
