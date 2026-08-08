@@ -501,6 +501,53 @@ impl MemoryLease {
         self.holder
     }
 
+    /// Reserve a temporary sibling lease from the same accounting authority.
+    ///
+    /// This is for transactional replacement allocations that must coexist
+    /// briefly with memory already covered by this lease. The returned lease
+    /// releases automatically on every success and error path.
+    pub fn reserve_sibling(&self, bytes: u64) -> Result<Self, MemoryError> {
+        self.accounting.try_claim(self.tier, bytes, self.role)?;
+        Ok(Self::new(
+            self.tier,
+            bytes,
+            self.role,
+            self.holder,
+            Arc::clone(&self.accounting),
+        ))
+    }
+
+    /// Transfer a sibling lease into this long-lived owner without changing
+    /// the ledger's total charge.
+    ///
+    /// Both leases must originate from the same accounting authority and name
+    /// the same tier, role, and holder. This is the commit step for
+    /// transactions that preflight persistent growth with an independently
+    /// droppable lease.
+    pub fn absorb_sibling(&mut self, mut sibling: Self) -> Result<(), MemoryError> {
+        if self.tier != sibling.tier
+            || self.role != sibling.role
+            || self.holder != sibling.holder
+            || !Arc::ptr_eq(&self.accounting, &sibling.accounting)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: sibling.bytes,
+                reason: "sibling lease belongs to a different owner or accounting authority",
+            });
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(sibling.bytes)
+            .ok_or(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: sibling.bytes,
+                reason: "absorbing the sibling lease would overflow the owner lease",
+            })?;
+        sibling.bytes = 0;
+        Ok(())
+    }
+
     /// Extend this lease by `extra` bytes, or fail leaving it exactly as it was.
     ///
     /// Growing in place matters because the alternative — reserve a bigger lease
