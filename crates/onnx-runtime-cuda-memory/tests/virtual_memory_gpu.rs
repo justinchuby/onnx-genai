@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use onnx_runtime_cuda_memory::virtual_memory::{
-    CudaVirtualBacking, PhysicalHandlePool, trim_physical_handle_pools,
+    CudaVirtualBacking, PhysicalHandlePool, physical_pool_authority_gate,
+    trim_physical_handle_pools,
 };
 use onnx_runtime_memory_governor::{
     HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
@@ -467,6 +468,126 @@ fn successful_teardown_synchronization_allows_later_reuse() {
     assert_eq!(sync_attempts.load(Ordering::Relaxed), 1);
     assert_eq!(stats.snapshot().creates, 1);
     assert_eq!(stats.snapshot().pool_hits, 1);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn authority_write_gate_freezes_pool_checkout_and_return() {
+    use std::{
+        sync::{Barrier, mpsc},
+        time::Duration,
+    };
+
+    let context = CudaContext::new(0).expect("CUDA driver");
+    let governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let granule = CudaVirtualBacking::new(Arc::clone(&context), 0).granularity();
+    let pool = PhysicalHandlePool::get_or_create(
+        context,
+        0,
+        granule,
+        &governor,
+        HOLDER,
+        MemoryRole::KvCache,
+    )
+    .expect("pool");
+    let stats = pool.stats();
+    let backing = CudaVirtualBacking::with_physical_pool(pool);
+    let mut first = backing.reserve(granule).expect("first reservation");
+    backing
+        .commit(&mut first, 0, granule)
+        .expect("first commit");
+    backing.release(&mut first, 0, granule).expect("seed pool");
+
+    let gate = physical_pool_authority_gate(governor.authority_id());
+    let writer = gate
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_backing = backing.clone();
+    let (send, receive) = mpsc::channel();
+    let checkout = std::thread::spawn(move || {
+        let mut reservation = worker_backing.reserve(granule).expect("reservation");
+        worker_barrier.wait();
+        worker_backing
+            .commit(&mut reservation, 0, granule)
+            .expect("checkout after transaction");
+        send.send(reservation).expect("return reservation");
+    });
+    barrier.wait();
+    assert!(
+        receive.recv_timeout(Duration::from_millis(50)).is_err(),
+        "checkout must wait while reconfiguration owns the write gate"
+    );
+    let before = stats.snapshot();
+    drop(writer);
+    let mut checked_out = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("checkout completes after transaction");
+    checkout.join().expect("checkout thread");
+    assert_eq!(stats.snapshot().pool_hits, before.pool_hits + 1);
+
+    let writer = gate
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_backing = backing.clone();
+    let (send, receive) = mpsc::channel();
+    let returned = std::thread::spawn(move || {
+        worker_barrier.wait();
+        worker_backing
+            .release(&mut checked_out, 0, granule)
+            .expect("return after transaction");
+        send.send(()).expect("return completion");
+    });
+    barrier.wait();
+    assert!(
+        receive.recv_timeout(Duration::from_millis(50)).is_err(),
+        "return must wait while reconfiguration owns the write gate"
+    );
+    assert_eq!(stats.snapshot().pooled_unmapped_bytes, 0);
+    drop(writer);
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("return completes after transaction");
+    returned.join().expect("return thread");
+    assert_eq!(stats.snapshot().pooled_unmapped_bytes, granule as u64);
+
+    let writer = gate
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let before_trim = stats.snapshot();
+    assert_eq!(
+        trim_physical_handle_pools(governor.authority_id(), granule as u64)
+            .expect("transaction trim"),
+        granule as u64
+    );
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_backing = backing.clone();
+    let (send, receive) = mpsc::channel();
+    let post_trim_checkout = std::thread::spawn(move || {
+        let mut reservation = worker_backing.reserve(granule).expect("reservation");
+        worker_barrier.wait();
+        worker_backing
+            .commit(&mut reservation, 0, granule)
+            .expect("post-trim checkout");
+        send.send(()).expect("checkout completion");
+    });
+    barrier.wait();
+    assert!(receive.recv_timeout(Duration::from_millis(50)).is_err());
+    drop(writer);
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("post-trim checkout completes");
+    post_trim_checkout.join().expect("checkout thread");
+    let after_trim_checkout = stats.snapshot();
+    assert_eq!(after_trim_checkout.pool_hits, before_trim.pool_hits);
+    assert_eq!(after_trim_checkout.creates, before_trim.creates + 1);
 }
 
 /// The pool retains at most its configured whole-granule bound.

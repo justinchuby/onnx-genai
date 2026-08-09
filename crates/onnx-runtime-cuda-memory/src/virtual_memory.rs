@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use cudarc::driver::sys as cu;
 use onnx_runtime_memory_governor::{
@@ -233,6 +233,24 @@ struct PoolKey {
 
 static PHYSICAL_POOLS: OnceLock<Mutex<HashMap<PoolKey, Weak<PhysicalHandlePool>>>> =
     OnceLock::new();
+static PHYSICAL_POOL_AUTHORITY_GATES: OnceLock<
+    Mutex<HashMap<MemoryAuthorityId, Weak<RwLock<()>>>>,
+> = OnceLock::new();
+
+/// Shared operation gate for every physical pool owned by `authority`.
+pub fn physical_pool_authority_gate(authority: MemoryAuthorityId) -> Arc<RwLock<()>> {
+    let gates = PHYSICAL_POOL_AUTHORITY_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&authority).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(RwLock::new(()));
+    gates.insert(authority, Arc::downgrade(&gate));
+    gate
+}
 
 /// Device-scoped owner of fungible, granule-sized CUDA physical allocations.
 ///
@@ -256,6 +274,7 @@ pub struct PhysicalHandlePool {
     granularity: usize,
     authority: MemoryAuthorityId,
     max_retained_bytes: usize,
+    authority_gate: Arc<RwLock<()>>,
     state: Mutex<PoolState>,
     lease_checkout: Mutex<()>,
     counters: Arc<PoolCounters>,
@@ -272,6 +291,7 @@ impl PhysicalHandlePool {
         role: MemoryRole,
     ) -> Result<Arc<Self>, MemoryError> {
         let authority = governor.authority_id();
+        let authority_gate = physical_pool_authority_gate(authority);
         if authority.device()
             != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
         {
@@ -323,6 +343,7 @@ impl PhysicalHandlePool {
             granularity,
             authority,
             max_retained_bytes: retained_granules * granularity,
+            authority_gate,
             state: Mutex::new(PoolState {
                 available: Vec::new(),
                 lease: Some(lease),
@@ -374,6 +395,10 @@ impl PhysicalHandlePool {
     }
 
     fn acquire(&self) -> Result<cu::CUmemGenericAllocationHandle, VirtualMemoryError> {
+        let operation = self
+            .authority_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(handle) = {
             let mut state = self.lock();
             state.available.pop()
@@ -384,6 +409,7 @@ impl PhysicalHandlePool {
             self.counters.pool_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(handle);
         }
+        drop(operation);
 
         let _checkout = self
             .lease_checkout
@@ -412,6 +438,10 @@ impl PhysicalHandlePool {
         }
         growth?;
         drop(_checkout);
+        let _operation = self
+            .authority_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Err(error) = self.bind("creating pooled CUDA physical memory") {
             self.shrink_lease_or_defer(self.granularity as u64);
@@ -451,6 +481,10 @@ impl PhysicalHandlePool {
         handle: cu::CUmemGenericAllocationHandle,
         was_mapped: bool,
     ) -> Result<(), VirtualMemoryError> {
+        let _operation = self
+            .authority_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if was_mapped {
             self.counters
                 .mapped_bytes
@@ -574,6 +608,10 @@ pub fn pooled_unmapped_bytes_for_authority(authority: MemoryAuthorityId) -> u64 
 
 impl Drop for PhysicalHandlePool {
     fn drop(&mut self) {
+        let _operation = self
+            .authority_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (handles, mut lease) = {
             let state = self
                 .state

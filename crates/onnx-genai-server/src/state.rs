@@ -93,6 +93,19 @@ impl ServerMemoryAuthorities {
             .iter()
             .map(DeviceMemoryAuthority::pause_reconfiguration)
             .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let pool_gates = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::physical_pool_operation_gate)
+            .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let _pool_operations = pool_gates
+            .iter()
+            .map(|gate| {
+                gate.write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<Vec<_>>();
         let mut trim_plan = Vec::with_capacity(ordered.len());
         for (authority, guard) in ordered.iter().zip(&guards) {
             let used = guard.used();

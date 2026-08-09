@@ -97,10 +97,16 @@ impl DeviceMemoryAuthority {
                 self.authority_id(),
             )
         }
+
         #[cfg(not(feature = "cuda"))]
         {
             0
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn physical_pool_operation_gate(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
+        onnx_runtime_ep_cuda::virtual_memory::physical_pool_authority_gate(self.authority_id())
     }
 
     /// Lower the device limit after releasing any retained, unmapped CUDA
@@ -108,6 +114,12 @@ impl DeviceMemoryAuthority {
     /// changing the old limit.
     pub fn try_set_limit_bytes(&self, bytes: u64) -> anyhow::Result<()> {
         let guard = self.pause_reconfiguration();
+        #[cfg(feature = "cuda")]
+        let pool_gate = self.physical_pool_operation_gate();
+        #[cfg(feature = "cuda")]
+        let _pool_operations = pool_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let used = guard.used();
         if used > bytes {
             self.trim_unmapped_bytes(used - bytes)?;
