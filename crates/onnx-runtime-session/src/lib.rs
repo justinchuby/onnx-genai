@@ -37,6 +37,7 @@ pub use executor::{
     enable_exec_phase_profile_for_process, exec_phase_stats, plan_double_buffer,
     print_exec_phase_profile, reset_dense_prefetch_gap_stats, reset_exec_phase_profile,
 };
+pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };

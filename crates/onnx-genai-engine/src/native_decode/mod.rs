@@ -857,14 +857,14 @@ impl NativeDecodeSession {
     pub(crate) fn prepare_generation_workspace(
         &mut self,
         prompt_tokens: &[TokenId],
-    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         self.prepare_generation_workspace_inner(prompt_tokens, true)
     }
 
     pub(crate) fn prepare_generation_workspace_preserving_state(
         &mut self,
         prompt_tokens: &[TokenId],
-    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         self.prepare_generation_workspace_inner(prompt_tokens, false)
     }
 
@@ -873,14 +873,14 @@ impl NativeDecodeSession {
         tokens: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         if tokens.is_empty() {
             bail!("native workspace preparation requires at least one input token");
         }
         if self.cuda.is_some() {
             self.prepare_cuda_prefill_workspace_with_step_inputs(tokens, past_len, step_inputs)
         } else {
-            Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE)
+            Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
         }
     }
 
@@ -888,7 +888,7 @@ impl NativeDecodeSession {
         &mut self,
         prompt_tokens: &[TokenId],
         reset: bool,
-    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         if prompt_tokens.is_empty() {
             bail!("native workspace preparation requires at least one prompt token");
         }
@@ -898,7 +898,7 @@ impl NativeDecodeSession {
         if self.cuda.is_some() {
             self.prepare_cuda_prefill_workspace(prompt_tokens)
         } else {
-            Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE)
+            Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
         }
     }
 

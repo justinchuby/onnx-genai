@@ -482,7 +482,7 @@ impl NativeDecodeSession {
     pub(crate) fn prepare_cuda_prefill_workspace(
         &mut self,
         token_ids: &[TokenId],
-    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         self.prepare_cuda_prefill_workspace_with_step_inputs(token_ids, 0, &[])
     }
 
@@ -491,11 +491,11 @@ impl NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         if self.has_eager_step_inputs() {
             let workspace_nodes = self.session.workspace_node_locations();
             if workspace_nodes.is_empty() {
-                return Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE);
+                return Ok(onnx_runtime_session::WorkspaceRequirement::NONE);
             }
         }
         let position_input = self
