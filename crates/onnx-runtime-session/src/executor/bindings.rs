@@ -36,23 +36,8 @@ impl Executor {
         self.workspace_preparation_required = true;
         let external = self.prepare_external_bindings(bindings)?;
         let symbols = self.bind_symbols(inputs, &external)?;
-        self.validate_required_inputs(inputs, &external)?;
         let resolved = self.resolve_soft(&symbols);
         let mut peak = WorkspaceRequirement::NONE;
-        let nested_workspace = self
-            .workspace_node_locations()
-            .into_iter()
-            .filter(|location| location.contains('/'))
-            .collect::<Vec<_>>();
-        if !nested_workspace.is_empty() {
-            return Err(SessionError::Internal(format!(
-                "prepare-only workspace planning found workspace-bearing control-flow children \
-                 whose formal/captured input shapes are selected at runtime: {}; no exact \
-                 graph-metadata bound is available, so governed execution is refused before \
-                 admission",
-                nested_workspace.join(", ")
-            )));
-        }
 
         for pi in 0..self.plan.len() {
             let node_id = self.plan[pi].node_id;
@@ -125,6 +110,10 @@ impl Executor {
                 peak.alignment = peak.alignment.max(requirement.alignment);
             }
         }
+        let child_graphs = self.graph.subgraphs.values().collect::<Vec<_>>();
+        for child in child_graphs {
+            self.collect_nested_workspace_requirement(child, &symbols, "control-flow/", &mut peak)?;
+        }
 
         if peak.bytes == 0 {
             return Ok(peak);
@@ -155,6 +144,79 @@ impl Executor {
             alignment: peak.alignment,
         });
         Ok(peak)
+    }
+
+    fn collect_nested_workspace_requirement(
+        &self,
+        graph: &Graph,
+        symbols: &HashMap<SymbolId, usize>,
+        scope: &str,
+        peak: &mut WorkspaceRequirement,
+    ) -> Result<()> {
+        for (node_id, node) in graph.nodes.iter() {
+            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN || node.op_type != "BlockQuantizedMoE"
+            {
+                continue;
+            }
+            let input_shapes = node
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    match input {
+                    None => Ok(Vec::new()),
+                    Some(value) => substitute(&graph.value(*value).shape, symbols).ok_or_else(|| {
+                        let value_name = graph
+                            .value(*value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve nested input {index} \
+                             '{value_name}' for {scope}node#{} ('{}::{}'); its formal/captured \
+                             shape is runtime-dependent and no exact graph-metadata bound is \
+                             available",
+                            node_id.0, node.domain, node.op_type
+                        ))
+                    }),
+                }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut kernel =
+                self.ep
+                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let constant_inputs = node
+                .inputs
+                .iter()
+                .map(|input| input.is_some_and(|value| graph.initializers.contains_key(&value)))
+                .collect::<Vec<_>>();
+            kernel.set_constant_inputs(&constant_inputs);
+            let metadata = input_shapes
+                .iter()
+                .zip(&node.inputs)
+                .map(|(shape, input)| {
+                    let dtype = input
+                        .map(|value| graph.value(value).dtype)
+                        .unwrap_or(DataType::Undefined);
+                    TensorMetadata::new(dtype, shape, input.is_some())
+                })
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes > peak.bytes {
+                *peak = requirement;
+            } else if requirement.bytes == peak.bytes {
+                peak.alignment = peak.alignment.max(requirement.alignment);
+            }
+        }
+        for ((node_id, attribute), child) in &graph.subgraphs {
+            self.collect_nested_workspace_requirement(
+                child,
+                symbols,
+                &format!("{scope}node#{}/{attribute}/", node_id.0),
+                peak,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {

@@ -424,6 +424,9 @@ impl Executor {
             pinned: &mut self.pinned,
             persistent_workspace: &mut self.persistent_workspace,
             step_workspace: &mut self.step_workspace,
+            inherited_workspace: self
+                .inherited_workspace
+                .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes)),
             workspace_preparation_required: self.workspace_preparation_required,
         };
 
@@ -1159,6 +1162,7 @@ struct KernelDispatchContext<'a> {
     pinned: &'a mut HashSet<ValueId>,
     persistent_workspace: &'a mut Option<PreparedWorkspace>,
     step_workspace: &'a mut Option<PreparedWorkspace>,
+    inherited_workspace: Option<WorkspaceView>,
     workspace_preparation_required: bool,
 }
 
@@ -1432,6 +1436,24 @@ impl KernelDispatchContext<'_> {
             };
             let workspace = if requirement.bytes == 0 {
                 None
+            } else if let Some(inherited) = self.inherited_workspace {
+                let required = usize::try_from(requirement.bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "kernel workspace requirement {} does not fit usize",
+                        requirement.bytes
+                    ))
+                })?;
+                if required > inherited.bytes() {
+                    Err(EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes, enclosing preparation supplied {} bytes",
+                        node.id.0,
+                        node.domain,
+                        node.op_type,
+                        required,
+                        inherited.bytes()
+                    )))?;
+                }
+                Some(inherited)
             } else {
                 let required = usize::try_from(requirement.bytes).map_err(|_| {
                     EpError::KernelFailed(format!(

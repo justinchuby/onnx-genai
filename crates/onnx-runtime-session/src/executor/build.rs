@@ -557,6 +557,7 @@ impl Executor {
             kernel_bindings: vec![None; plan_len],
             persistent_workspace: None,
             step_workspace: None,
+            inherited_workspace: None,
             workspace_preparation_required: false,
         };
 

@@ -488,27 +488,44 @@ impl NativeDecodeSession {
             if workspace_nodes.is_empty() {
                 return Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE);
             }
-            bail!(
-                "prepare-only QMoE workspace planning cannot resolve routed/inputs_embeds prefill \
-                 values before their producing pipeline component executes; workspace-bearing \
-                 dependencies are {}; no conservative graph-metadata bound is available",
-                workspace_nodes.join(", ")
-            );
         }
-        let token_input = self
-            .step_input_name(NativeStepInputSource::TokenIds)
-            .context("native CUDA decoder has no token input binding")?
-            .to_owned();
         let position_input = self
             .step_input_name(NativeStepInputSource::PositionIds)
             .map(str::to_owned);
         let total_len = token_ids.len();
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
-        let input_ids = Tensor::from_i64(&[1, total_len], &ids)?;
-        let mut owned = vec![(token_input, input_ids)];
+        let mut owned =
+            if let Some(name) = self.step_input_name(NativeStepInputSource::InputsEmbeds) {
+                let meta = self
+                    .session
+                    .inputs()
+                    .iter()
+                    .find(|meta| meta.name == name)
+                    .with_context(|| {
+                        format!("missing native CUDA inputs_embeds metadata for '{name}'")
+                    })?;
+                let hidden = match meta.shape.last() {
+                    Some(Dim::Static(hidden)) => *hidden,
+                    _ => bail!(
+                        "prepare-only QMoE workspace planning cannot conservatively bind \
+                     inputs_embeds '{name}': expected a static hidden width, got {:?}",
+                        meta.shape
+                    ),
+                };
+                vec![(
+                    name.to_owned(),
+                    Tensor::zeros(meta.dtype, vec![1, total_len, hidden])?,
+                )]
+            } else {
+                let token_input = self
+                    .step_input_name(NativeStepInputSource::TokenIds)
+                    .context("native CUDA decoder has no token or inputs_embeds input binding")?
+                    .to_owned();
+                let ids = token_ids
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect::<Vec<_>>();
+                vec![(token_input, Tensor::from_i64(&[1, total_len], &ids)?)]
+            };
         if let Some(position_input) = position_input {
             owned.push((position_input, self.build_step_positions(0, total_len)?));
         }

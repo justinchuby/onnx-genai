@@ -272,6 +272,10 @@ pub(crate) struct Executor {
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
+    /// Non-owning view of an enclosing executor's prepared workspace. Nested
+    /// control-flow executors run sequentially, so they may reuse the parent's
+    /// peak allocation without reserving or allocating a second buffer.
+    pub(super) inherited_workspace: Option<(usize, usize)>,
     pub(super) workspace_preparation_required: bool,
 }
 
