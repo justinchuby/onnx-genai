@@ -854,18 +854,19 @@ impl NativeDecodeSession {
         )
     }
 
-    pub(crate) fn prepare_generation_workspace(
+    pub(crate) fn prepare_generation_workspace_for_query_rows(
         &mut self,
         prompt_tokens: &[TokenId],
+        query_rows: usize,
     ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
-        self.prepare_generation_workspace_inner(prompt_tokens, true)
+        self.prepare_generation_workspace_inner(prompt_tokens, query_rows, true)
     }
 
     pub(crate) fn prepare_generation_workspace_preserving_state(
         &mut self,
         prompt_tokens: &[TokenId],
     ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
-        self.prepare_generation_workspace_inner(prompt_tokens, false)
+        self.prepare_generation_workspace_inner(prompt_tokens, prompt_tokens.len(), false)
     }
 
     pub(crate) fn prepare_generation_workspace_with_step_inputs(
@@ -887,6 +888,7 @@ impl NativeDecodeSession {
     fn prepare_generation_workspace_inner(
         &mut self,
         prompt_tokens: &[TokenId],
+        query_rows: usize,
         reset: bool,
     ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
         if prompt_tokens.is_empty() {
@@ -896,7 +898,14 @@ impl NativeDecodeSession {
             self.reset()?;
         }
         if self.cuda.is_some() {
-            self.prepare_cuda_prefill_workspace(prompt_tokens)
+            if query_rows <= prompt_tokens.len() {
+                self.prepare_cuda_prefill_workspace(prompt_tokens)
+            } else {
+                let mut planning_tokens = Vec::with_capacity(query_rows);
+                planning_tokens.extend_from_slice(prompt_tokens);
+                planning_tokens.resize(query_rows, prompt_tokens[0]);
+                self.prepare_cuda_prefill_workspace(&planning_tokens)
+            }
         } else {
             Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
         }
