@@ -1135,6 +1135,15 @@ impl InferenceSession {
         self.exec.run_with_device_bindings(inputs, bindings)
     }
 
+    /// Prepare exact kernel workspace for a bound run without launching kernels.
+    pub fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.exec.prepare_with_device_bindings(inputs, bindings)
+    }
+
     /// Lazily build the decode-specialized inlined-body sibling executor
     /// (Inc-1b PR-2, `cohaagen-27b-inc1b-design.md` §1). Idempotent: a second
     /// call is a no-op. Returns `true` when a decode-inline plan is now

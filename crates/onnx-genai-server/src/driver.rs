@@ -143,6 +143,9 @@ impl DriverFailure {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),
                 Some(SchedulerAdmissionError::ByteBudget { .. })
+            ) || matches!(
+                source.downcast_ref::<onnx_runtime_memory_governor::MemoryError>(),
+                Some(onnx_runtime_memory_governor::MemoryError::TierExhausted { .. })
             )
         });
         Self {
@@ -1556,6 +1559,20 @@ mod admission_tests {
         .into();
         assert_eq!(
             DriverFailure::from_engine_error(&memory_error).kind,
+            DriverFailureKind::MemoryOverload
+        );
+        let workspace_error: anyhow::Error =
+            onnx_runtime_memory_governor::MemoryError::TierExhausted {
+                tier: "device",
+                requested: 4096,
+                used: 8192,
+                limit: 8192,
+                available: 0,
+                role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            }
+            .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&workspace_error).kind,
             DriverFailureKind::MemoryOverload
         );
 

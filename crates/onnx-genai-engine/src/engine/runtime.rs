@@ -144,6 +144,15 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        if let Err(error) = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?
+            .prepare_generation_workspace(&prompt_tokens)
+        {
+            self.scheduler.complete(scheduler_session_id);
+            return Err(error);
+        }
         if let Some(callback) = admission_callback.as_mut() {
             callback();
         }

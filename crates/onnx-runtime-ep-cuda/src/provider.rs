@@ -721,16 +721,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         let ptr = self
             .memory()
             .allocate_committed(size, alignment, committed_ranges)
-            .map_err(|error| {
-            // Keep what the allocator said. Reporting every failure as "out of
-            // memory" would describe an alignment rejection or a dead context
-            // as exhausted VRAM and send the reader looking in the wrong place.
-            EpError::KernelFailed(format!(
-                "cuda_ep: could not allocate {size} bytes aligned to {alignment} on CUDA device \
-                 {}: {error}",
-                self.device.index
-            ))
-        })?;
+            .map_err(EpError::Memory)?;
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` is a fresh, unique, non-null device allocation of
         // >= `size` bytes owned by this EP and freed exactly once in

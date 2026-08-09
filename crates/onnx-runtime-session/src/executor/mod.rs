@@ -51,7 +51,8 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
     ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMut, TensorView, WeightHandle,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -606,6 +607,12 @@ impl Drop for Executor {
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
+        }
+        if let Some(workspace) = self.persistent_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
+        }
+        if let Some(workspace) = self.step_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
         }
         self.shared_buffers.clear();
     }

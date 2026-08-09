@@ -479,6 +479,49 @@ pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDecli
 }
 
 impl NativeDecodeSession {
+    pub(crate) fn prepare_cuda_prefill_workspace(
+        &mut self,
+        token_ids: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        if self.has_eager_step_inputs() {
+            bail!(
+                "prepare-only QMoE workspace planning cannot resolve routed/inputs_embeds prefill \
+                 values before their producing pipeline component executes; no conservative graph \
+                 metadata bound is available"
+            );
+        }
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+        let total_len = token_ids.len();
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let input_ids = Tensor::from_i64(&[1, total_len], &ids)?;
+        let mut owned = vec![(token_input, input_ids)];
+        if let Some(position_input) = position_input {
+            owned.push((position_input, self.build_step_positions(0, total_len)?));
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(0, total_len, total_len)?;
+        let inputs = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        self.session
+            .prepare_with_device_bindings(&inputs, &mut state.bindings[..state.base_binding_count])
+            .context("prepare native CUDA prefill workspace")
+    }
+
     /// Run one eager (uncaptured) `[1, K]` device forward pass and return host
     /// `[K, vocab]` logits.
     ///

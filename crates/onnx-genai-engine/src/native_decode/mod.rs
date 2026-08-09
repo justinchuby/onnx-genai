@@ -854,6 +854,21 @@ impl NativeDecodeSession {
         )
     }
 
+    pub(crate) fn prepare_generation_workspace(
+        &mut self,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        if prompt_tokens.is_empty() {
+            bail!("native workspace preparation requires at least one prompt token");
+        }
+        self.reset()?;
+        if self.cuda.is_some() {
+            self.prepare_cuda_prefill_workspace(prompt_tokens)
+        } else {
+            Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE)
+        }
+    }
+
     /// Generate incrementally: reuse KV state up to `resume_from` and only
     /// prefill `prompt_tokens[resume_from..]`. The caller must ensure that
     /// `prompt_tokens[..resume_from]` matches the tokens already in the KV cache.
