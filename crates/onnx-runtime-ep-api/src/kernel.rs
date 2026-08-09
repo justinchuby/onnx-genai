@@ -3,9 +3,10 @@
 use std::borrow::Cow;
 
 use onnx_runtime_ir::TensorLayout;
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::Result;
-use crate::tensor::{TensorMut, TensorView};
+use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
@@ -446,6 +447,70 @@ impl<'a> KernelInput<'a> {
     }
 }
 
+/// Concrete tensor facts available during prepare-only graph traversal.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorMetadata<'a> {
+    pub dtype: onnx_runtime_ir::DataType,
+    pub shape: &'a [usize],
+    pub present: bool,
+}
+
+impl<'a> TensorMetadata<'a> {
+    pub const fn new(dtype: onnx_runtime_ir::DataType, shape: &'a [usize], present: bool) -> Self {
+        Self {
+            dtype,
+            shape,
+            present,
+        }
+    }
+}
+
+/// How long prepared kernel workspace remains live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceLifetime {
+    StepScoped,
+    SessionPersistent,
+}
+
+/// A kernel's exact owned-scratch request for one concrete input geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceRequirement {
+    pub bytes: u64,
+    pub alignment: usize,
+    pub lifetime: WorkspaceLifetime,
+    pub role: MemoryRole,
+}
+
+impl WorkspaceRequirement {
+    pub const NONE: Self = Self {
+        bytes: 0,
+        alignment: 1,
+        lifetime: WorkspaceLifetime::StepScoped,
+        role: MemoryRole::Workspace { step_scoped: true },
+    };
+}
+
+/// Executor-owned prepared workspace handed to a kernel for one dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceView {
+    ptr: DevicePtrMut,
+    bytes: usize,
+}
+
+impl WorkspaceView {
+    pub const fn new(ptr: DevicePtrMut, bytes: usize) -> Self {
+        Self { ptr, bytes }
+    }
+
+    pub const fn ptr(self) -> DevicePtrMut {
+        self.ptr
+    }
+
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send {
     /// Tell the kernel which positional inputs are immutable graph constants.
@@ -459,6 +524,23 @@ pub trait Kernel: Send {
 
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
+
+    /// Report exact owned scratch needed for these concrete inputs.
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let _ = inputs;
+        Ok(WorkspaceRequirement::NONE)
+    }
+
+    /// Execute using workspace prepared before request admission.
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let _ = workspace;
+        self.execute(inputs, outputs)
+    }
 
     /// Execute through the general weight-delivery seam.
     ///

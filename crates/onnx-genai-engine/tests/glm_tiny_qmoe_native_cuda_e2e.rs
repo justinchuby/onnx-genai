@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
+    SpeculativeMode,
 };
 
 const ANCHOR_IDS: &[u32] = &[62, 164, 59, 205, 48, 166, 27, 9, 221, 190, 123, 108];
@@ -150,5 +151,73 @@ fn glm_tiny_qmoe_native_cuda_eager_matches_cpu_and_declines_capture() -> anyhow:
         "concat/logical IndexShare form must remain eager before S3 capacity emission"
     );
     assert_eq!(stats.graph.replays, 0);
+    Ok(())
+}
+
+#[test]
+fn glm_tiny_qmoe_native_cuda_session_admits_after_workspace_preparation() -> anyhow::Result<()> {
+    let Some(dir) = fixture_dir() else {
+        return Ok(());
+    };
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping GLM-5.2 native CUDA admission regression: {error}");
+        return Ok(());
+    }
+    let mut engine = native_engine(&dir, NativeDecodeDevice::Cuda { index: Some(0) })?;
+    for turn in 0..2 {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let admission_events = events.clone();
+        let mut admitted = move || admission_events.lock().unwrap().push("admission");
+        let token_events = events.clone();
+        let mut token = move |_| {
+            token_events.lock().unwrap().push("token");
+            Ok(())
+        };
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![123]));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        let result =
+            engine.generate_with_callbacks(request, Some(&mut admitted), Some(&mut token))?;
+        assert_eq!(result.token_ids, ANCHOR_IDS[..2]);
+        let events = events.lock().unwrap();
+        assert_eq!(events.first(), Some(&"admission"), "turn {turn}");
+        assert!(events[1..].contains(&"token"), "turn {turn}: {events:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn glm_tiny_qmoe_native_cuda_speculative_verify_uses_width_workspace() -> anyhow::Result<()> {
+    let Some(dir) = fixture_dir() else {
+        return Ok(());
+    };
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping GLM-5.2 native CUDA speculative regression: {error}");
+        return Ok(());
+    }
+    let device = NativeDecodeDevice::Cuda { index: Some(0) };
+    let mut baseline = native_engine(&dir, device.clone())?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![123]));
+    request.options.max_new_tokens = ANCHOR_IDS.len() * 2;
+    request.options.temperature = 0.0;
+    request.options.greedy = true;
+    request.options.stop_on_eos = false;
+    let expected = baseline.generate(request.clone())?;
+
+    let mut engine = native_engine(&dir, device)?;
+    request.options.speculative_mode = Some(SpeculativeMode::PromptLookup {
+        ngram: 1,
+        max_tokens: 4,
+    });
+
+    let result = engine.generate(request)?;
+    let stats = engine.last_speculative_stats();
+    assert_eq!(result.token_ids, expected.token_ids);
+    assert!(
+        stats.verification_steps > 0 && stats.proposed_tokens > 1,
+        "prompt-length-one regression must execute a multi-row verify: {stats:?}"
+    );
     Ok(())
 }

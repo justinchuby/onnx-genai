@@ -42,6 +42,14 @@ use crate::speculative::{
 use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 
+pub(crate) fn verification_width(
+    draft_width: usize,
+    remaining_tokens: usize,
+    remaining_context: usize,
+) -> usize {
+    draft_width.min(remaining_tokens).min(remaining_context)
+}
+
 /// Outer speculative token loop bound to a single [`NativeDecodeSession`].
 ///
 /// Peer to the plain [`NativeDecodeSession::generate_with_callback`] loop; it
@@ -173,11 +181,8 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 .max_context
                 .map(|limit| limit.saturating_sub(context_len))
                 .unwrap_or(remaining_tokens);
-            let width = self
-                .draft_width
-                .min(remaining_tokens)
-                .min(remaining_context)
-                .max(1);
+            let width = verification_width(self.draft_width, remaining_tokens, remaining_context);
+            debug_assert!(width > 0);
 
             let context_tokens: Vec<TokenId> = prompt_tokens
                 .iter()

@@ -126,8 +126,94 @@ def build_decoder_routed(path: Path) -> None:
     past_key = tensor_value("past_key_values.0.key", ir.DataType.FLOAT, [1, 1, "past_sequence", HIDDEN])
     past_value = tensor_value("past_key_values.0.value", ir.DataType.FLOAT, [1, 1, "past_sequence", HIDDEN])
 
+    # A zero-valued block-quantized MoE sits on the live inputs_embeds path. Its
+    # output is added residually, preserving the fixture's closed-form tokens
+    # while making workspace scale with the exact routed prefill sequence.
+    qmoe_hidden = 32
+    qmoe_projection = initializer(
+        "qmoe_projection", np.zeros((HIDDEN, qmoe_hidden), dtype=np.float32)
+    )
+    qmoe_projected = node(
+        "MatMul", [inputs_embeds, qmoe_projection], "qmoe_projected"
+    )
+    qmoe_input_shape = constant(
+        "qmoe_input_shape", np.array([-1, qmoe_hidden], dtype=np.int64)
+    )
+    qmoe_input = node(
+        "Reshape",
+        [qmoe_projected.outputs[0], qmoe_input_shape.outputs[0]],
+        "qmoe_input",
+    )
+    router_logits_3d = node(
+        "ReduceMean",
+        [router_state],
+        "qmoe_router_logits_3d",
+        attributes=[
+            ir.AttrInt64s("axes", [2]),
+            ir.AttrInt64("keepdims", 1),
+        ],
+    )
+    router_shape = constant("qmoe_router_shape", np.array([-1, 1], dtype=np.int64))
+    router_logits = node(
+        "Reshape",
+        [router_logits_3d.outputs[0], router_shape.outputs[0]],
+        "qmoe_router_logits",
+    )
+    packed_zero = np.zeros((1, qmoe_hidden, 1, 17), dtype=np.uint8)
+    qmoe_fc1 = initializer("qmoe_fc1", packed_zero)
+    qmoe_fc2 = initializer("qmoe_fc2", packed_zero.copy())
+    qmoe_fc1_bias = initializer(
+        "qmoe_fc1_bias", np.zeros((1, qmoe_hidden), dtype=np.float32)
+    )
+    qmoe_fc2_bias = initializer(
+        "qmoe_fc2_bias", np.zeros((1, qmoe_hidden), dtype=np.float32)
+    )
+    qmoe = ir.Node(
+        "pkg.nxrt",
+        "BlockQuantizedMoE",
+        [
+            qmoe_input.outputs[0],
+            router_logits.outputs[0],
+            qmoe_fc1,
+            qmoe_fc1_bias,
+            qmoe_fc2,
+            qmoe_fc2_bias,
+        ],
+        {
+            "k": ir.AttrInt64("k", 1),
+            "activation_type": ir.AttrString("activation_type", "identity"),
+            "normalize_routing_weights": ir.AttrInt64("normalize_routing_weights", 0),
+            "swiglu_fusion": ir.AttrInt64("swiglu_fusion", 0),
+            "format": ir.AttrString("format", "mxfp4"),
+            "block_layout_version": ir.AttrInt64("block_layout_version", 1),
+        },
+        outputs=[ir.Value(name="qmoe_output")],
+    )
+    qmoe.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    qmoe.outputs[0].shape = ir.Shape(["rows", qmoe_hidden])
+    qmoe_reduce = node(
+        "ReduceMean",
+        [qmoe.outputs[0]],
+        "qmoe_reduce",
+        attributes=[
+            ir.AttrInt64s("axes", [1]),
+            ir.AttrInt64("keepdims", 1),
+        ],
+    )
+    qmoe_restore_shape = constant(
+        "qmoe_restore_shape", np.array([1, -1, 1], dtype=np.int64)
+    )
+    qmoe_restored = node(
+        "Reshape",
+        [qmoe_reduce.outputs[0], qmoe_restore_shape.outputs[0]],
+        "qmoe_restored",
+    )
+    qmoe_residual = node(
+        "Add", [inputs_embeds, qmoe_restored.outputs[0]], "qmoe_residual"
+    )
+
     lm_head = initializer("lm_head", LM_HEAD)
-    matmul = node("MatMul", [inputs_embeds, lm_head], "logits_base")
+    matmul = node("MatMul", [qmoe_residual.outputs[0], lm_head], "logits_base")
     tie_bias = initializer("tie_bias", TIE_BIAS)
     logits_biased = node("Add", [matmul.outputs[0], tie_bias], "logits_biased")
 
@@ -153,6 +239,17 @@ def build_decoder_routed(path: Path) -> None:
         [inputs_embeds, router_state, attention_mask, position_ids, past_key, past_value],
         [logits.outputs[0], present_key.outputs[0], present_value.outputs[0]],
         nodes=[
+            qmoe_projected,
+            qmoe_input_shape,
+            qmoe_input,
+            router_logits_3d,
+            router_shape,
+            router_logits,
+            qmoe,
+            qmoe_reduce,
+            qmoe_restore_shape,
+            qmoe_restored,
+            qmoe_residual,
             matmul,
             logits_biased,
             router_contrib,
@@ -163,8 +260,18 @@ def build_decoder_routed(path: Path) -> None:
             present_key,
             present_value,
         ],
-        initializers=[lm_head, tie_bias, router_zero, value_offset],
-        opset_imports={"": 13},
+        initializers=[
+            qmoe_fc1,
+            qmoe_fc2,
+            qmoe_fc1_bias,
+            qmoe_fc2_bias,
+            qmoe_projection,
+            lm_head,
+            tie_bias,
+            router_zero,
+            value_offset,
+        ],
+        opset_imports={"": 13, "pkg.nxrt": 1},
         name="tiny_gemma4_decoder_routed",
     )
     save_model(

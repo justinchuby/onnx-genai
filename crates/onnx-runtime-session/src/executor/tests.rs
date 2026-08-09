@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
     CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
@@ -813,6 +813,8 @@ fn only_capacity_aware_inputs_keep_physical_capacity() {
 
 struct WeightDeliveryKernel {
     deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    workspace_bytes: u64,
+    workspace_bytes_per_row: u64,
 }
 
 impl WeightDeliveryKernel {
@@ -832,6 +834,30 @@ impl WeightDeliveryKernel {
 }
 
 impl Kernel for WeightDeliveryKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        let rows = inputs
+            .first()
+            .and_then(|input| input.shape.first())
+            .copied()
+            .unwrap_or(1) as u64;
+        let bytes = if self.workspace_bytes_per_row == 0 {
+            self.workspace_bytes
+        } else {
+            self.workspace_bytes_per_row
+                .checked_mul(rows)
+                .ok_or_else(|| EpError::KernelFailed("test workspace overflow".into()))?
+        };
+        Ok(WorkspaceRequirement {
+            bytes,
+            alignment: if rows >= 4 { 512 } else { 256 },
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        })
+    }
+
     fn execute(
         &self,
         inputs: &[TensorView],
@@ -875,6 +901,10 @@ struct WeightDeliveryEp {
     device: onnx_runtime_ir::DeviceId,
     allocations: Arc<AtomicUsize>,
     host_uploads: Arc<AtomicUsize>,
+    workspace_bytes: u64,
+    workspace_bytes_per_row: u64,
+    fail_next_allocation: Arc<AtomicBool>,
+    fail_allocation_size: Arc<AtomicUsize>,
 }
 
 impl WeightDeliveryEp {
@@ -920,6 +950,10 @@ impl WeightDeliveryEp {
             device,
             allocations,
             host_uploads,
+            workspace_bytes: 0,
+            workspace_bytes_per_row: 0,
+            fail_next_allocation: Arc::new(AtomicBool::new(false)),
+            fail_allocation_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1017,10 +1051,28 @@ impl ExecutionProvider for WeightDeliveryEp {
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(WeightDeliveryKernel {
             deliveries: Arc::clone(&self.deliveries),
+            workspace_bytes: self.workspace_bytes,
+            workspace_bytes_per_row: self.workspace_bytes_per_row,
         }))
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        if self.fail_next_allocation.swap(false, Ordering::Relaxed) {
+            return Err(EpError::OutOfMemory {
+                requested: size,
+                available: 0,
+            });
+        }
+        if self
+            .fail_allocation_size
+            .compare_exchange(size, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Err(EpError::OutOfMemory {
+                requested: size,
+                available: 0,
+            });
+        }
         self.allocations.fetch_add(1, Ordering::Relaxed);
         if self.device.is_host_accessible() {
             return self.cpu.allocate(size, alignment);
@@ -1151,6 +1203,160 @@ fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     let mut store = WeightStore::new();
     store.map_external(&path).unwrap();
     (graph, Arc::new(store), path)
+}
+
+#[test]
+fn prepare_reserves_static_nested_qmoe_workspace_and_child_reuses_it() {
+    fn branch(name: &str) -> Graph {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value(
+            format!("{name}_input"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        graph.set_initializer(
+            input,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let output = graph.create_named_value(
+            format!("{name}_output"),
+            DataType::Float32,
+            static_shape([4]),
+        );
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(input)],
+            vec![output],
+        );
+        node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+        graph.insert_node(node);
+        graph.add_output(output);
+        graph
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
+    graph.add_input(cond);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.add_output(output);
+    let if_id = NodeId(0);
+    graph.insert_node(Node::new(if_id, "If", vec![Some(cond)], vec![output]));
+    graph
+        .subgraphs
+        .insert((if_id, "then_branch".into()), branch("then"));
+    graph
+        .subgraphs
+        .insert((if_id, "else_branch".into()), branch("else"));
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes = 4096;
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    let requirement = executor
+        .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
+        .unwrap();
+    assert_eq!(requirement.bytes, 4096);
+    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 4096);
+
+    let output = executor.run(&[("cond", &cond)]).unwrap();
+    assert_eq!(output[0].to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn inference_session_fallback_workspace_grows_retries_and_reuses() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = SymbolId(0);
+    let shape = vec![Dim::Symbolic(rows)];
+    let input = graph.create_named_value("input", DataType::Float32, shape.clone());
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, shape);
+    graph.add_output(output);
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(input)],
+        vec![output],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let inputs = crate::io_meta(&graph, &graph.inputs);
+    let outputs = crate::io_meta(&graph, &graph.outputs);
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, deliveries);
+    ep.workspace_bytes_per_row = 1024;
+    let fail_size = Arc::clone(&ep.fail_allocation_size);
+    let exec = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let mut session = crate::InferenceSession {
+        inputs,
+        outputs,
+        model_metadata: crate::ModelMetadata::default(),
+        exec,
+        decode_inline_exec: None,
+        ep_context_config: crate::EpContextDumpConfig::default(),
+    };
+
+    let small = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    assert_eq!(
+        session.run(&[("input", &small)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        2048
+    );
+    assert_eq!(
+        session
+            .exec
+            .persistent_workspace
+            .as_ref()
+            .unwrap()
+            .alignment,
+        256
+    );
+
+    let large = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    fail_size.store(4096, Ordering::Relaxed);
+    let _error = session
+        .run(&[("input", &large)])
+        .expect_err("workspace replacement allocation must fail once");
+    assert!(
+        session.exec.persistent_workspace.is_none(),
+        "failed growth must leave a valid empty slot"
+    );
+
+    assert_eq!(
+        session.run(&[("input", &large)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(grown.bytes, 4096);
+    assert_eq!(grown.alignment, 512);
+    let ptr = grown.buffer.as_ptr();
+
+    assert_eq!(
+        session.run(&[("input", &small)]).unwrap()[0].to_vec_f32(),
+        vec![1.0, 2.0]
+    );
+    let reused = session.exec.persistent_workspace.as_ref().unwrap();
+    assert_eq!(reused.bytes, 4096);
+    assert_eq!(reused.buffer.as_ptr(), ptr);
 }
 
 fn two_node_weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {

@@ -1056,15 +1056,30 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callbacks(pipeline_request, None, callback)
+    }
+
+    /// Generate text with a pre-token admission callback. For a native routed
+    /// decoder, admission fires only after exact step inputs have prepared and
+    /// reserved governed workspace.
+    pub fn generate_with_callbacks(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+        mut admission: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
         // loops; `generate` returns the flattened per-frame code tokens (use
         // `synthesize` to also run the post-decode vocoder into a waveform).
         if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
+            if let Some(admitted) = admission.as_mut() {
+                admitted();
+            }
             return self
                 .run_nested_autoregressive(pipeline_request)
                 .map(|(result, _pool)| result);
         }
-        self.run_autoregressive(pipeline_request, callback)
+        self.run_autoregressive(pipeline_request, admission, callback)
             .map(|(result, _pool)| result)
     }
 
@@ -1092,7 +1107,7 @@ impl PipelineEngine {
         if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
             return self.synthesize_nested(pipeline_request);
         }
-        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None)?;
+        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None, None)?;
         let ar = self.plan.autoregressive_plan()?.clone();
 
         // Publish the AR decoder's generated code sequence into the shared pool

@@ -1,6 +1,233 @@
 use super::*;
 
 impl Executor {
+    pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
+        fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
+            for (node_id, node) in graph.nodes.iter() {
+                if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+                    && node.op_type == "BlockQuantizedMoE"
+                {
+                    out.push(format!(
+                        "{scope}node#{} '{}::{}'",
+                        node_id.0, node.domain, node.op_type
+                    ));
+                }
+            }
+            for ((node_id, attribute), child) in &graph.subgraphs {
+                collect(
+                    child,
+                    &format!("{scope}node#{}/{attribute}/", node_id.0),
+                    out,
+                );
+            }
+        }
+        let mut locations = Vec::new();
+        collect(&self.graph, "", &mut locations);
+        locations
+    }
+
+    /// Resolve concrete metadata and reserve kernel workspace without executing
+    /// any graph node.
+    pub(crate) fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<WorkspaceRequirement> {
+        self.workspace_preparation_required = true;
+        let external = self.prepare_external_bindings(bindings)?;
+        let symbols = self.bind_symbols(inputs, &external)?;
+        let resolved = self.resolve_soft(&symbols);
+        let mut peak = WorkspaceRequirement::NONE;
+
+        for pi in 0..self.plan.len() {
+            let node_id = self.plan[pi].node_id;
+            let node = self.graph.node(node_id);
+            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN || node.op_type != "BlockQuantizedMoE"
+            {
+                continue;
+            }
+            let input_shapes = self.plan[pi]
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| match input {
+                    None => Ok(Vec::new()),
+                    Some(value) => resolved.get(value).cloned().ok_or_else(|| {
+                        let value_name = self
+                            .graph
+                            .value(*value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve input {index} \
+                             '{value_name}' for node {} ('{}::{}'); its shape is runtime-dependent \
+                             and no exact graph-metadata bound is available",
+                            node_id.0, node.domain, node.op_type
+                        ))
+                    }),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let constant_inputs = self.plan[pi]
+                .inputs
+                .iter()
+                .map(|input| {
+                    input.is_some_and(|value| self.graph.initializers.contains_key(&value))
+                })
+                .collect::<Vec<_>>();
+            let opset = effective_opset(&self.graph, node);
+            let (kernel, key) = self.cache.get_or_create(
+                node_id,
+                node,
+                &input_shapes,
+                &self.plan[pi].input_dtypes,
+                &constant_inputs,
+                opset,
+                self.ep.as_ref(),
+            )?;
+            self.kernel_bindings[pi] = Some(key);
+            let metadata = input_shapes
+                .iter()
+                .zip(&self.plan[pi].input_dtypes)
+                .zip(&self.plan[pi].inputs)
+                .map(|((shape, dtype), input)| TensorMetadata::new(*dtype, shape, input.is_some()))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            match requirement.role {
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                    if step_scoped
+                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
+                _ => {
+                    return Err(SessionError::Internal(format!(
+                        "node {} ('{}::{}') returned an inconsistent workspace role/lifetime",
+                        node_id.0, node.domain, node.op_type
+                    )));
+                }
+            }
+            if requirement.bytes > peak.bytes {
+                peak = requirement;
+            } else if requirement.bytes == peak.bytes {
+                peak.alignment = peak.alignment.max(requirement.alignment);
+            }
+        }
+        let child_graphs = self.graph.subgraphs.values().collect::<Vec<_>>();
+        for child in child_graphs {
+            self.collect_nested_workspace_requirement(child, &symbols, "control-flow/", &mut peak)?;
+        }
+
+        if peak.bytes == 0 {
+            return Ok(peak);
+        }
+        let bytes = usize::try_from(peak.bytes).map_err(|_| {
+            SessionError::Internal(format!(
+                "workspace requirement {} does not fit usize",
+                peak.bytes
+            ))
+        })?;
+        let slot = match peak.lifetime {
+            WorkspaceLifetime::SessionPersistent => &mut self.persistent_workspace,
+            WorkspaceLifetime::StepScoped => &mut self.step_workspace,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes >= bytes && prepared.alignment >= peak.alignment)
+        {
+            return Ok(peak);
+        }
+        if let Some(old) = slot.take() {
+            self.ep.deallocate(old.buffer)?;
+        }
+        let lease = self.ep.reserve_workspace(peak.bytes, peak.role)?;
+        let fresh = self.ep.allocate(bytes, peak.alignment)?;
+        *slot = Some(PreparedWorkspace {
+            buffer: fresh,
+            _lease: lease,
+            bytes,
+            alignment: peak.alignment,
+        });
+        Ok(peak)
+    }
+
+    fn collect_nested_workspace_requirement(
+        &self,
+        graph: &Graph,
+        symbols: &HashMap<SymbolId, usize>,
+        scope: &str,
+        peak: &mut WorkspaceRequirement,
+    ) -> Result<()> {
+        for (node_id, node) in graph.nodes.iter() {
+            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN || node.op_type != "BlockQuantizedMoE"
+            {
+                continue;
+            }
+            let input_shapes = node
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    match input {
+                    None => Ok(Vec::new()),
+                    Some(value) => substitute(&graph.value(*value).shape, symbols).ok_or_else(|| {
+                        let value_name = graph
+                            .value(*value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve nested input {index} \
+                             '{value_name}' for {scope}node#{} ('{}::{}'); its formal/captured \
+                             shape is runtime-dependent and no exact graph-metadata bound is \
+                             available",
+                            node_id.0, node.domain, node.op_type
+                        ))
+                    }),
+                }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut kernel =
+                self.ep
+                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let constant_inputs = node
+                .inputs
+                .iter()
+                .map(|input| input.is_some_and(|value| graph.initializers.contains_key(&value)))
+                .collect::<Vec<_>>();
+            kernel.set_constant_inputs(&constant_inputs);
+            let metadata = input_shapes
+                .iter()
+                .zip(&node.inputs)
+                .map(|(shape, input)| {
+                    let dtype = input
+                        .map(|value| graph.value(value).dtype)
+                        .unwrap_or(DataType::Undefined);
+                    TensorMetadata::new(dtype, shape, input.is_some())
+                })
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes > peak.bytes {
+                *peak = requirement;
+            } else if requirement.bytes == peak.bytes {
+                peak.alignment = peak.alignment.max(requirement.alignment);
+            }
+        }
+        for ((node_id, attribute), child) in &graph.subgraphs {
+            self.collect_nested_workspace_requirement(
+                child,
+                symbols,
+                &format!("{scope}node#{}/{attribute}/", node_id.0),
+                peak,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+        if let Some(workspace) = self.step_workspace.take() {
+            self.ep.deallocate(workspace.buffer)?;
+        }
+        Ok(())
+    }
+
     /// Bind the graph's symbols to concrete sizes from the actual bound-input
     /// shapes, validating rank and static dims and detecting symbol conflicts.
     pub(super) fn bind_symbols(
@@ -105,7 +332,9 @@ impl Executor {
     }
 
     pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
-        self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default())?
+        let result = self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default());
+        self.release_step_workspace()?;
+        result?
             .into_iter()
             .map(|output| {
                 output.ok_or_else(|| {
@@ -123,7 +352,9 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         let external = self.prepare_external_bindings(bindings)?;
-        self.run_scoped(inputs, &HashMap::new(), &external)?
+        let result = self.run_scoped(inputs, &HashMap::new(), &external);
+        self.release_step_workspace()?;
+        result?
             .into_iter()
             .map(|output| match output {
                 None => Ok(None),
@@ -142,7 +373,9 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
         let external = self.prepare_external_bindings(bindings)?;
-        match self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture)? {
+        let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
+        self.release_step_workspace()?;
+        match result? {
             ScopedRunResult::Executed(outputs) => {
                 let mut tensors = Vec::with_capacity(outputs.len());
                 for output in outputs {
@@ -195,7 +428,9 @@ impl Executor {
             self.ep.replay_device_graph()?;
             return Ok(true);
         }
-        match self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay)? {
+        let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
+        self.release_step_workspace()?;
+        match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.
             ScopedRunResult::Executed(_) => Ok(self.capture_schedule.is_some()),

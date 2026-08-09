@@ -143,6 +143,9 @@ impl DriverFailure {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),
                 Some(SchedulerAdmissionError::ByteBudget { .. })
+            ) || matches!(
+                source.downcast_ref::<onnx_runtime_memory_governor::MemoryError>(),
+                Some(onnx_runtime_memory_governor::MemoryError::TierExhausted { .. })
             )
         });
         Self {
@@ -1353,20 +1356,32 @@ fn run_pipeline_generation(
             return;
         }
     };
-    let _ = admission.send(Ok(()));
+    let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
         events
             .try_send(DriverEvent::Token(token))
             .context("stream receiver closed")
     };
-    match engine.generate_with_callback(pipeline_request, Some(&mut callback)) {
+    let result = {
+        let mut admitted = || {
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Ok(()));
+            }
+        };
+        engine.generate_with_callbacks(pipeline_request, Some(&mut admitted), Some(&mut callback))
+    };
+    match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
+            let failure = DriverFailure::from_engine_error(&err);
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Err(failure.clone()));
+            }
+            let _ = events.try_send(DriverEvent::Error(failure));
         }
     }
 }
@@ -1556,6 +1571,20 @@ mod admission_tests {
         .into();
         assert_eq!(
             DriverFailure::from_engine_error(&memory_error).kind,
+            DriverFailureKind::MemoryOverload
+        );
+        let workspace_error: anyhow::Error =
+            onnx_runtime_memory_governor::MemoryError::TierExhausted {
+                tier: "device",
+                requested: 4096,
+                used: 8192,
+                limit: 8192,
+                available: 0,
+                role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            }
+            .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&workspace_error).kind,
             DriverFailureKind::MemoryOverload
         );
 

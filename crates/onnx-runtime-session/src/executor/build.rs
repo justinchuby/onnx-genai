@@ -555,6 +555,10 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            persistent_workspace: None,
+            step_workspace: None,
+            inherited_workspace: None,
+            workspace_preparation_required: false,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole

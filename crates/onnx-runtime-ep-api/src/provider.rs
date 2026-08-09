@@ -692,6 +692,20 @@ pub trait ExecutionProvider: Send + Sync {
         None
     }
 
+    /// Reserve governed bytes for executor-owned kernel workspace.
+    ///
+    /// Providers whose allocator already charges committed bytes may return
+    /// `None`; providers backed by an eager allocator retain the returned lease
+    /// alongside the allocation. The default preserves compatibility for
+    /// providers without a device-memory governor.
+    fn reserve_workspace(
+        &self,
+        _bytes: u64,
+        _role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        Ok(None)
+    }
+
     /// Place any long-lived device memory this provider holds under `governor`.
     ///
     /// Some providers keep a standing pool for as long as a model is loaded --

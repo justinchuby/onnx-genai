@@ -138,10 +138,20 @@ impl ChildExecutor {
 
     /// Execute the body with formal inputs in declared order and lexical values
     /// supplied by name. A cached plan is reused for matching dtype/shapes.
+    #[cfg(test)]
     pub(crate) fn run(
         &mut self,
         formal_inputs: &[&Tensor],
         outer_scope: &HashMap<String, Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        self.run_with_workspace(formal_inputs, outer_scope, None)
+    }
+
+    pub(crate) fn run_with_workspace(
+        &mut self,
+        formal_inputs: &[&Tensor],
+        outer_scope: &HashMap<String, Tensor>,
+        workspace: Option<WorkspaceView>,
     ) -> Result<Vec<Tensor>> {
         if self.formal_names.len() != formal_inputs.len() {
             return Err(SessionError::Internal(format!(
@@ -188,6 +198,11 @@ impl ChildExecutor {
         };
 
         self.runs += 1;
+        self.compiled[cache_index].exec.inherited_workspace =
+            workspace.map(|view| (view.ptr().0 as usize, view.bytes()));
+        self.compiled[cache_index]
+            .exec
+            .workspace_preparation_required = workspace.is_some();
         let inputs = self
             .input_names
             .iter()
@@ -540,12 +555,23 @@ impl Executor {
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
 
+        let workspace = self
+            .persistent_workspace
+            .as_mut()
+            .or(self.step_workspace.as_mut())
+            .map(|prepared| {
+                WorkspaceView::new(DevicePtrMut(prepared.buffer.as_mut_ptr()), prepared.bytes)
+            })
+            .or_else(|| {
+                self.inherited_workspace
+                    .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes))
+            });
         let child = self
             .subgraph_execs
             .get_mut(&prepared.key)
             .expect("child present");
         let before = child.stats();
-        let result = child.run(formal_inputs, &prepared.captures);
+        let result = child.run_with_workspace(formal_inputs, &prepared.captures, workspace);
         let after = child.stats();
         self.control_flow_stats.subgraph_builds += after.builds - before.builds;
         self.control_flow_stats.subgraph_runs += after.runs - before.runs;

@@ -479,6 +479,99 @@ pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDecli
 }
 
 impl NativeDecodeSession {
+    pub(crate) fn prepare_cuda_prefill_workspace(
+        &mut self,
+        token_ids: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        self.prepare_cuda_prefill_workspace_with_step_inputs(token_ids, 0, &[])
+    }
+
+    pub(crate) fn prepare_cuda_prefill_workspace_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        if self.has_eager_step_inputs() {
+            let workspace_nodes = self.session.workspace_node_locations();
+            if workspace_nodes.is_empty() {
+                return Ok(onnx_runtime_session::WorkspaceRequirement::NONE);
+            }
+        }
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+        let input_len = token_ids.len();
+        let total_len = past_len
+            .checked_add(input_len)
+            .context("native CUDA workspace preparation length overflow")?;
+        let supplied = step_inputs
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<HashMap<_, _>>();
+        let mut owned =
+            if let Some(name) = self.step_input_name(NativeStepInputSource::InputsEmbeds) {
+                if let Some(tensor) = supplied.get(name) {
+                    vec![(name.to_owned(), (*tensor).try_clone()?)]
+                } else {
+                    let meta = self
+                        .session
+                        .inputs()
+                        .iter()
+                        .find(|meta| meta.name == name)
+                        .with_context(|| {
+                            format!("missing native CUDA inputs_embeds metadata for '{name}'")
+                        })?;
+                    let hidden = match meta.shape.last() {
+                        Some(Dim::Static(hidden)) => *hidden,
+                        _ => bail!(
+                            "prepare-only QMoE workspace planning cannot conservatively bind \
+                             inputs_embeds '{name}': expected a static hidden width, got {:?}",
+                            meta.shape
+                        ),
+                    };
+                    vec![(
+                        name.to_owned(),
+                        Tensor::zeros(meta.dtype, vec![1, input_len, hidden])?,
+                    )]
+                }
+            } else {
+                let token_input = self
+                    .step_input_name(NativeStepInputSource::TokenIds)
+                    .context("native CUDA decoder has no token or inputs_embeds input binding")?
+                    .to_owned();
+                let ids = token_ids
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect::<Vec<_>>();
+                vec![(token_input, Tensor::from_i64(&[1, input_len], &ids)?)]
+            };
+        for (name, tensor) in step_inputs {
+            if !owned.iter().any(|(bound, _)| bound == name) {
+                owned.push((name.clone(), tensor.try_clone()?));
+            }
+        }
+        if let Some(position_input) = position_input {
+            owned.push((
+                position_input,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(past_len, total_len, total_len)?;
+        let inputs = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        self.session
+            .prepare_with_device_bindings(&inputs, &mut state.bindings[..state.base_binding_count])
+            .context("prepare native CUDA prefill workspace")
+    }
+
     /// Run one eager (uncaptured) `[1, K]` device forward pass and return host
     /// `[K, vocab]` logits.
     ///

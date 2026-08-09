@@ -422,6 +422,12 @@ impl Executor {
             shared_buffers: &mut self.shared_buffers,
             views_meta: &mut self.views,
             pinned: &mut self.pinned,
+            persistent_workspace: &mut self.persistent_workspace,
+            step_workspace: &mut self.step_workspace,
+            inherited_workspace: self
+                .inherited_workspace
+                .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes)),
+            workspace_preparation_required: self.workspace_preparation_required,
         };
 
         // Build the (possibly strided) input views once; they feed both the
@@ -1154,6 +1160,10 @@ struct KernelDispatchContext<'a> {
     shared_buffers: &'a mut HashMap<ValueId, Arc<SharedTensorBuffer>>,
     views_meta: &'a mut HashMap<ValueId, ValueView>,
     pinned: &'a mut HashSet<ValueId>,
+    persistent_workspace: &'a mut Option<PreparedWorkspace>,
+    step_workspace: &'a mut Option<PreparedWorkspace>,
+    inherited_workspace: Option<WorkspaceView>,
+    workspace_preparation_required: bool,
 }
 
 impl KernelDispatchContext<'_> {
@@ -1415,9 +1425,94 @@ impl KernelDispatchContext<'_> {
         });
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
+            let metadata = views
+                .iter()
+                .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            let prepared = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,
+                WorkspaceLifetime::StepScoped => &mut *self.step_workspace,
+            };
+            let workspace = if requirement.bytes == 0 {
+                None
+            } else if let Some(inherited) = self.inherited_workspace {
+                let required = usize::try_from(requirement.bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "kernel workspace requirement {} does not fit usize",
+                        requirement.bytes
+                    ))
+                })?;
+                if required > inherited.bytes() {
+                    Err(EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes, enclosing preparation supplied {} bytes",
+                        node.id.0,
+                        node.domain,
+                        node.op_type,
+                        required,
+                        inherited.bytes()
+                    )))?;
+                }
+                Some(inherited)
+            } else {
+                let required = usize::try_from(requirement.bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "kernel workspace requirement {} does not fit usize",
+                        requirement.bytes
+                    ))
+                })?;
+                let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
+                    required > workspace.bytes || requirement.alignment > workspace.alignment
+                });
+                if needs_replacement && !self.workspace_preparation_required {
+                    // Sequential dispatch is the scratch hand-off boundary. An
+                    // EP may enqueue asynchronous device work, so synchronize
+                    // before retiring the old disposable workspace. Release it
+                    // before acquiring the replacement to avoid charging both.
+                    self.ep.sync()?;
+                    if let Some(old) = prepared.take() {
+                        self.ep.deallocate(old.buffer)?;
+                    }
+                    let lease = self
+                        .ep
+                        .reserve_workspace(requirement.bytes, requirement.role)?;
+                    let buffer = self.ep.allocate(required, requirement.alignment)?;
+                    *prepared = Some(PreparedWorkspace {
+                        buffer,
+                        _lease: lease,
+                        bytes: required,
+                        alignment: requirement.alignment,
+                    });
+                }
+                let prepared = prepared.as_mut().ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') reached execution without prepared {:?} workspace",
+                        node.id.0, node.domain, node.op_type, requirement.lifetime
+                    ))
+                })?;
+                if required > prepared.bytes || requirement.alignment > prepared.alignment {
+                    Err(EpError::KernelFailed(format!(
+                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes aligned to {}, prepared {} bytes aligned to {}",
+                        node.id.0,
+                        node.domain,
+                        node.op_type,
+                        required,
+                        requirement.alignment,
+                        prepared.bytes,
+                        prepared.alignment
+                    )))?;
+                }
+                Some(WorkspaceView::new(
+                    DevicePtrMut(prepared.buffer.as_mut_ptr()),
+                    prepared.bytes,
+                ))
+            };
             match &kernel_inputs {
-                Some(inputs) => kernel.execute_with_inputs(inputs, outs),
-                None => kernel.execute(views, outs),
+                Some(inputs) if requirement.bytes == 0 => kernel.execute_with_inputs(inputs, outs),
+                Some(_) => Err(EpError::KernelFailed(
+                    "workspace-bearing lazy-input kernels are not supported".into(),
+                )),
+                None => kernel.execute_with_workspace(views, outs, workspace),
             }
         };
         execution.map_err(|error| {
