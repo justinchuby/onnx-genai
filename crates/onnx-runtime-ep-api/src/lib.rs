@@ -129,7 +129,7 @@ mod error {
         #[error(transparent)]
         WeightHandle(#[from] crate::weight::WeightHandleError),
 
-        #[error(transparent)]
+        #[error("{0}")]
         Memory(#[from] onnx_runtime_memory_governor::MemoryError),
     }
 }

@@ -56,6 +56,7 @@ pub struct CudaExecutionProvider {
     /// Defaults to CudaDeviceAllocator, which is the cuMemAlloc call this
     /// EP used to make directly.
     memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
     /// Installed by `adopt_memory_governor` when VMM is enabled, and read in
     /// place of `memory` from then on.
     ///
@@ -150,6 +151,7 @@ impl CudaExecutionProvider {
             memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
                 runtime.cuda_context(),
             )),
+            governor: governor.clone(),
             // Built here rather than at governor adoption, because on the
             // native path the session allocates every tensor it will use while
             // loading -- which is before any governor reaches this provider.
@@ -1051,6 +1053,28 @@ impl ExecutionProvider for CudaExecutionProvider {
             counts.allocations + self.ep_allocations.load(Ordering::Relaxed),
             counts.frees + self.ep_frees.load(Ordering::Relaxed),
         ))
+    }
+
+    fn reserve_workspace(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        if self.memory().commits_on_demand() {
+            return Ok(None);
+        }
+        self.governor
+            .as_deref()
+            .map(|governor| {
+                governor.reserve(
+                    onnx_runtime_memory_governor::Tier::Device,
+                    bytes,
+                    role,
+                    onnx_runtime_memory_governor::HolderId::new(64),
+                )
+            })
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// True when the VMM arena is in use: it maps 2 MiB granules as spans are

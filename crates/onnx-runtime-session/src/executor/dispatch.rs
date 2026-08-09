@@ -1461,10 +1461,25 @@ impl KernelDispatchContext<'_> {
                         requirement.bytes
                     ))
                 })?;
-                if prepared.is_none() && !self.workspace_preparation_required {
+                let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
+                    required > workspace.bytes || requirement.alignment > workspace.alignment
+                });
+                if needs_replacement && !self.workspace_preparation_required {
+                    // Sequential dispatch is the scratch hand-off boundary. An
+                    // EP may enqueue asynchronous device work, so synchronize
+                    // before retiring the old disposable workspace. Release it
+                    // before acquiring the replacement to avoid charging both.
+                    self.ep.sync()?;
+                    if let Some(old) = prepared.take() {
+                        self.ep.deallocate(old.buffer)?;
+                    }
+                    let lease = self
+                        .ep
+                        .reserve_workspace(requirement.bytes, requirement.role)?;
                     let buffer = self.ep.allocate(required, requirement.alignment)?;
                     *prepared = Some(PreparedWorkspace {
                         buffer,
+                        _lease: lease,
                         bytes: required,
                         alignment: requirement.alignment,
                     });

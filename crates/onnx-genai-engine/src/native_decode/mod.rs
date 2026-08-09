@@ -868,6 +868,22 @@ impl NativeDecodeSession {
         self.prepare_generation_workspace_inner(prompt_tokens, false)
     }
 
+    pub(crate) fn prepare_generation_workspace_with_step_inputs(
+        &mut self,
+        tokens: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        if tokens.is_empty() {
+            bail!("native workspace preparation requires at least one input token");
+        }
+        if self.cuda.is_some() {
+            self.prepare_cuda_prefill_workspace_with_step_inputs(tokens, past_len, step_inputs)
+        } else {
+            Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE)
+        }
+    }
+
     fn prepare_generation_workspace_inner(
         &mut self,
         prompt_tokens: &[TokenId],

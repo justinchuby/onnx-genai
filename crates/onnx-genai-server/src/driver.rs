@@ -1356,20 +1356,32 @@ fn run_pipeline_generation(
             return;
         }
     };
-    let _ = admission.send(Ok(()));
+    let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
         events
             .try_send(DriverEvent::Token(token))
             .context("stream receiver closed")
     };
-    match engine.generate_with_callback(pipeline_request, Some(&mut callback)) {
+    let result = {
+        let mut admitted = || {
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Ok(()));
+            }
+        };
+        engine.generate_with_callbacks(pipeline_request, Some(&mut admitted), Some(&mut callback))
+    };
+    match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
             let _ = events.try_send(DriverEvent::Finished(result));
         }
         Err(err) => {
-            let _ = events.try_send(DriverEvent::Error(DriverFailure::from_engine_error(&err)));
+            let failure = DriverFailure::from_engine_error(&err);
+            if let Some(sender) = admission.take() {
+                let _ = sender.send(Err(failure.clone()));
+            }
+            let _ = events.try_send(DriverEvent::Error(failure));
         }
     }
 }

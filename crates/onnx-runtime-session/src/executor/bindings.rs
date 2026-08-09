@@ -137,9 +137,11 @@ impl Executor {
         if let Some(old) = slot.take() {
             self.ep.deallocate(old.buffer)?;
         }
+        let lease = self.ep.reserve_workspace(peak.bytes, peak.role)?;
         let fresh = self.ep.allocate(bytes, peak.alignment)?;
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
+            _lease: lease,
             bytes,
             alignment: peak.alignment,
         });
