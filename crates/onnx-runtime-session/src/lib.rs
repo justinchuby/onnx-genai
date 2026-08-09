@@ -1445,7 +1445,7 @@ impl InferenceSession {
         holder: onnx_runtime_memory_governor::HolderId,
         required_owned_bytes: u64,
         required_mapped_bytes: u64,
-    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthReport> {
         Ok(self
             .exec
             .request_mapped_growth(holder, required_owned_bytes, required_mapped_bytes)?)

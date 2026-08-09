@@ -244,8 +244,6 @@ pub struct DeviceOffloadPolicy {
     /// MoE boundaries stay on LRU even when this is enabled to avoid regressing
     /// skewed expert selection.
     pub scan_resistant_dense: bool,
-    /// Authority-owned physical handle pool selected by governed serving.
-    pub governed_vmm_pool_bytes: Option<usize>,
 }
 
 impl Default for DeviceOffloadPolicy {
@@ -255,7 +253,6 @@ impl Default for DeviceOffloadPolicy {
             device_budget_bytes: None,
             async_pagein: false,
             scan_resistant_dense: true,
-            governed_vmm_pool_bytes: None,
         }
     }
 }
@@ -284,7 +281,6 @@ impl DeviceOffloadPolicy {
             device_budget_bytes,
             async_pagein,
             scan_resistant_dense,
-            governed_vmm_pool_bytes: None,
         }
     }
 }
@@ -1099,16 +1095,8 @@ impl CudaWeightResidency {
         };
         let participant: Arc<dyn onnx_runtime_memory_governor::ReclaimableMappedHolder> =
             self.clone();
-        let registration =
-            governor.register_reclaimable_mapped_holder(participant, allowance.clone())?;
+        let registration = governor.register_reclaimable_mapped_holder(participant, allowance)?;
         self.lock().reclaim_registration = Some(registration);
-        eprintln!(
-            "cuda_ep: registered dynamic-lending weight reclaim participant; holder={:?} \
-             mapped_allowance_bytes={} mapped_bytes={}",
-            allowance.holder(),
-            allowance.limit(),
-            allowance.mapped_bytes()
-        );
         Ok(())
     }
 

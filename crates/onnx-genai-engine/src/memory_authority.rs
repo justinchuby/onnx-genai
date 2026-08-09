@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use onnx_genai_scheduler::ResourceLimit;
 use onnx_runtime_memory_governor::{
-    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthGrant,
+    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthReport,
     MappedReclaimStats, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
     ReclaimRegistration, ReclaimableMappedHolder, Tier,
 };
@@ -185,13 +185,13 @@ impl MemoryGovernor for DeviceMemoryAuthority {
             .register_reclaimable_mapped_holder(participant, allowance)
     }
 
-    fn prepare_mapped_growth(
+    fn request_mapped_growth(
         &self,
         tier: Tier,
         requester: HolderId,
         bytes: u64,
-    ) -> Result<MappedGrowthGrant, MemoryError> {
-        self.governor.prepare_mapped_growth(tier, requester, bytes)
+    ) -> Result<MappedGrowthReport, MemoryError> {
+        self.governor.request_mapped_growth(tier, requester, bytes)
     }
 
     fn mapped_reclaim_stats(&self, tier: Tier) -> MappedReclaimStats {
@@ -305,15 +305,15 @@ impl MemoryGovernor for EngineMemoryGovernor {
             .register_reclaimable_mapped_holder(participant, allowance)
     }
 
-    fn prepare_mapped_growth(
+    fn request_mapped_growth(
         &self,
         tier: Tier,
         requester: HolderId,
         bytes: u64,
-    ) -> Result<MappedGrowthGrant, MemoryError> {
+    ) -> Result<MappedGrowthReport, MemoryError> {
         match tier {
-            Tier::Device => self.device.prepare_mapped_growth(tier, requester, bytes),
-            _ => self.local.prepare_mapped_growth(tier, requester, bytes),
+            Tier::Device => self.device.request_mapped_growth(tier, requester, bytes),
+            _ => self.local.request_mapped_growth(tier, requester, bytes),
         }
     }
 

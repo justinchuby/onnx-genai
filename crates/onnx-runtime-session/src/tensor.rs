@@ -582,64 +582,6 @@ impl DeviceIoBinding {
             .incremental_commit_bytes(buffer, byte_offset, bytes)?)
     }
 
-    pub fn incremental_commit_bytes_batch(
-        bindings: &[Self],
-        ranges: &[(usize, usize, usize)],
-    ) -> Result<(u64, u64)> {
-        let Some(first) = bindings.first() else {
-            return Ok((0, 0));
-        };
-        let ep_ranges = ranges
-            .iter()
-            .map(|&(index, offset, bytes)| {
-                let binding = bindings
-                    .get(index)
-                    .ok_or_else(|| SessionError::ExternalBuffer {
-                        binding: format!("binding index {index}"),
-                        reason: "batch commit index is out of range".into(),
-                    })?;
-                let buffer = binding
-                    .buffer
-                    .as_ref()
-                    .expect("DeviceIoBinding buffer taken only in Drop");
-                Ok(onnx_runtime_ep_api::DeviceCommitRange {
-                    buffer,
-                    offset,
-                    bytes,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(first.allocator.incremental_commit_bytes_batch(&ep_ranges)?)
-    }
-
-    pub fn commit_ranges(bindings: &[Self], ranges: &[(usize, usize, usize)]) -> Result<()> {
-        let Some(first) = bindings.first() else {
-            return Ok(());
-        };
-        let ep_ranges = ranges
-            .iter()
-            .map(|&(index, offset, bytes)| {
-                let binding = bindings
-                    .get(index)
-                    .ok_or_else(|| SessionError::ExternalBuffer {
-                        binding: format!("binding index {index}"),
-                        reason: "batch commit index is out of range".into(),
-                    })?;
-                let buffer = binding
-                    .buffer
-                    .as_ref()
-                    .expect("DeviceIoBinding buffer taken only in Drop");
-                Ok(onnx_runtime_ep_api::DeviceCommitRange {
-                    buffer,
-                    offset,
-                    bytes,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        first.allocator.commit_allocation_ranges(&ep_ranges)?;
-        Ok(())
-    }
-
     pub fn decommit_range(&mut self, byte_offset: usize, bytes: usize) -> Result<()> {
         let buffer = self
             .buffer

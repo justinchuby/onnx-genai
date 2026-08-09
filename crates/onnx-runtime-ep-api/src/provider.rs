@@ -350,13 +350,6 @@ impl StructuralCaptureDecline {
 }
 
 /// The core EP interface. Every backend crate implements this (§4.1).
-#[derive(Clone, Copy)]
-pub struct DeviceCommitRange<'a> {
-    pub buffer: &'a DeviceBuffer,
-    pub offset: usize,
-    pub bytes: usize,
-}
-
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
     fn name(&self) -> &str;
@@ -533,37 +526,15 @@ pub trait ExecutionProvider: Send + Sync {
         Ok((0, 0))
     }
 
-    fn incremental_commit_bytes_batch(
-        &self,
-        ranges: &[DeviceCommitRange<'_>],
-    ) -> Result<(u64, u64)> {
-        let mut mapped = 0u64;
-        let mut owned = 0u64;
-        for range in ranges {
-            let (range_mapped, range_owned) =
-                self.incremental_commit_bytes(range.buffer, range.offset, range.bytes)?;
-            mapped = mapped.saturating_add(range_mapped);
-            owned = owned.saturating_add(range_owned);
-        }
-        Ok((mapped, owned))
-    }
-
-    fn commit_allocation_ranges(&self, ranges: &[DeviceCommitRange<'_>]) -> Result<()> {
-        for range in ranges {
-            self.commit_allocation_range(range.buffer, range.offset, range.bytes)?;
-        }
-        Ok(())
-    }
-
     /// Reclaim reloadable mappings before growing non-recomputable device state.
     fn request_mapped_growth(
         &self,
         holder: onnx_runtime_memory_governor::HolderId,
         required_owned_bytes: u64,
         required_mapped_bytes: u64,
-    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthReport> {
         let _ = (holder, required_owned_bytes, required_mapped_bytes);
-        Ok(None)
+        Ok(onnx_runtime_memory_governor::MappedGrowthReport::default())
     }
 
     /// Authority-owned physical bytes currently retained by this provider.

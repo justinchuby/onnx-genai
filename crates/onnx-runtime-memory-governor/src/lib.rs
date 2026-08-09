@@ -75,7 +75,7 @@ pub mod allocator;
 pub use allocator::{DeviceAllocator, DeviceKey, HostAllocator};
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// Stable identity of one physical-memory accounting authority.
 ///
@@ -307,8 +307,7 @@ pub struct LeaseLedger {
     used: [AtomicU64; 3],
     mapped_allowance_reserved: [AtomicU64; 3],
     claim_gates: [Mutex<()>; 3],
-    reclaim_phase: Mutex<AuthorityAccessState>,
-    reclaim_phase_changed: Condvar,
+    reclaim_gate: Mutex<()>,
     reclaimers: Mutex<Vec<ReclaimEntry>>,
     next_reclaimer: AtomicU64,
     reclaim_attempts: AtomicU64,
@@ -323,11 +322,13 @@ struct ReclaimEntry {
     participant: Weak<dyn ReclaimableMappedHolder>,
 }
 
-#[derive(Debug, Default)]
-struct AuthorityAccessState {
-    reclaim_active: bool,
-    active_maps: usize,
-}
+type ReclaimPlan = (
+    MappedAllowance,
+    Arc<dyn ReclaimableMappedHolder>,
+    u64,
+    u64,
+    u64,
+);
 
 impl LeaseLedger {
     /// A single-device ledger with the given per-tier ceilings.
@@ -355,8 +356,7 @@ impl LeaseLedger {
             used: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             mapped_allowance_reserved: std::array::from_fn(|_| AtomicU64::new(0)),
             claim_gates: std::array::from_fn(|_| Mutex::new(())),
-            reclaim_phase: Mutex::new(AuthorityAccessState::default()),
-            reclaim_phase_changed: Condvar::new(),
+            reclaim_gate: Mutex::new(()),
             reclaimers: Mutex::new(Vec::new()),
             next_reclaimer: AtomicU64::new(1),
             reclaim_attempts: AtomicU64::new(0),
@@ -577,18 +577,21 @@ impl LeaseLedger {
         })
     }
 
-    fn prepare_mapped_growth(
-        self: &Arc<Self>,
+    fn request_mapped_growth(
+        &self,
         tier: Tier,
         requester: HolderId,
         bytes: u64,
-    ) -> Result<MappedGrowthGrant, MemoryError> {
+    ) -> Result<MappedGrowthReport, MemoryError> {
         if bytes == 0 {
-            return Ok(MappedGrowthGrant::empty(Arc::clone(self), tier));
+            return Ok(MappedGrowthReport::default());
         }
 
         self.reclaim_attempts.fetch_add(1, Ordering::Relaxed);
-        self.begin_reclaim_phase();
+        let _transaction = self
+            .reclaim_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut candidates = {
             let mut entries = self
                 .reclaimers
@@ -630,15 +633,10 @@ impl LeaseLedger {
                     continue;
                 }
                 let new_limit = old_limit - reclaim;
+                let target_mapped = mapped - reclaim;
                 allowance.set_limit_under_authority(new_limit)?;
                 self.release_mapped_allowance(tier, reclaim);
-                plans.push((
-                    allowance,
-                    participant,
-                    old_limit,
-                    new_limit,
-                    mapped - reclaim,
-                ));
+                plans.push((allowance, participant, old_limit, new_limit, target_mapped));
                 remaining -= reclaim;
             }
         }
@@ -646,7 +644,6 @@ impl LeaseLedger {
         if remaining > 0 {
             self.restore_reclaim_plans(tier, &plans);
             self.reclaim_failures.fetch_add(1, Ordering::Relaxed);
-            self.end_reclaim_phase();
             return Err(MemoryError::TierExhausted {
                 tier: tier.name(),
                 requested: bytes,
@@ -671,7 +668,6 @@ impl LeaseLedger {
         if failed || reclaimed < bytes {
             self.restore_reclaim_plans(tier, &plans);
             self.reclaim_failures.fetch_add(1, Ordering::Relaxed);
-            self.end_reclaim_phase();
             return Err(MemoryError::TierExhausted {
                 tier: tier.name(),
                 requested: bytes,
@@ -681,70 +677,12 @@ impl LeaseLedger {
                 role: MemoryRole::KvCache,
             });
         }
-        self.mapped_allowance_reserved[tier.index()].fetch_add(bytes, Ordering::AcqRel);
         self.reclaimed_bytes.fetch_add(reclaimed, Ordering::Relaxed);
-        let participants = plans.len() as u64;
-        Ok(MappedGrowthGrant {
-            ledger: Arc::clone(self),
-            tier,
-            reserved_bytes: bytes,
-            plans,
-            report: MappedGrowthReport {
-                requested_bytes: bytes,
-                reclaimed_bytes: reclaimed,
-                participants,
-            },
-            active: true,
+        Ok(MappedGrowthReport {
+            requested_bytes: bytes,
+            reclaimed_bytes: reclaimed,
+            participants: plans.len() as u64,
         })
-    }
-
-    fn begin_reclaim_phase(&self) {
-        let mut state = self
-            .reclaim_phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while state.reclaim_active || state.active_maps != 0 {
-            state = self
-                .reclaim_phase_changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        state.reclaim_active = true;
-    }
-
-    fn end_reclaim_phase(&self) {
-        let mut state = self
-            .reclaim_phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.reclaim_active = false;
-        self.reclaim_phase_changed.notify_all();
-    }
-
-    fn begin_mapped_admission(self: &Arc<Self>) -> LedgerMappedAdmission {
-        let mut state = self
-            .reclaim_phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while state.reclaim_active {
-            state = self
-                .reclaim_phase_changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        state.active_maps += 1;
-        LedgerMappedAdmission {
-            ledger: Arc::clone(self),
-        }
-    }
-
-    fn end_mapped_admission(&self) {
-        let mut state = self
-            .reclaim_phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.active_maps = state.active_maps.saturating_sub(1);
-        self.reclaim_phase_changed.notify_all();
     }
 
     fn mapped_reclaim_stats(&self, tier: Tier) -> MappedReclaimStats {
@@ -781,14 +719,6 @@ impl LeaseLedger {
     }
 }
 
-type ReclaimPlan = (
-    MappedAllowance,
-    Arc<dyn ReclaimableMappedHolder>,
-    u64,
-    u64,
-    u64,
-);
-
 /// Authority-owned capacity reservation for mapped bytes attributed to one holder.
 #[derive(Clone, Debug)]
 pub struct MappedAllowance {
@@ -810,13 +740,7 @@ struct MappedAllowanceInner {
 /// Releases mapped-capacity reservations created by a governor.
 pub trait MappedAllowanceAccounting: Send + Sync + std::fmt::Debug {
     fn release(&self, tier: Tier, bytes: u64);
-
-    fn begin_map(&self) -> Option<Box<dyn MappedAdmissionGuard>> {
-        None
-    }
 }
-
-pub trait MappedAdmissionGuard: Send {}
 
 impl MappedAllowance {
     pub fn new(
@@ -858,33 +782,6 @@ impl MappedAllowance {
     }
 
     pub fn try_map(&self, bytes: u64) -> Result<(), MemoryError> {
-        {
-            let _gate = self
-                .inner
-                .map_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mapped = self.inner.mapped.load(Ordering::Acquire);
-            let next = mapped
-                .checked_add(bytes)
-                .ok_or(MemoryError::InvalidRequest {
-                    tier: self.inner.tier.name(),
-                    requested: bytes,
-                    reason: "mapped-byte attribution overflows its byte counter",
-                })?;
-            let limit = self.limit();
-            if next > limit {
-                return Err(MemoryError::TierExhausted {
-                    tier: self.inner.tier.name(),
-                    requested: bytes,
-                    used: mapped,
-                    limit,
-                    available: limit.saturating_sub(mapped),
-                    role: self.inner.role,
-                });
-            }
-        }
-        let _authority_admission = self.inner.accounting.begin_map();
         let _gate = self
             .inner
             .map_gate
@@ -987,80 +884,6 @@ pub struct MappedGrowthReport {
     pub requested_bytes: u64,
     pub reclaimed_bytes: u64,
     pub participants: u64,
-}
-
-pub struct MappedGrowthGrant {
-    ledger: Arc<LeaseLedger>,
-    tier: Tier,
-    reserved_bytes: u64,
-    plans: Vec<ReclaimPlan>,
-    report: MappedGrowthReport,
-    active: bool,
-}
-
-impl MappedGrowthGrant {
-    fn empty(ledger: Arc<LeaseLedger>, tier: Tier) -> Self {
-        ledger.begin_reclaim_phase();
-        Self {
-            ledger,
-            tier,
-            reserved_bytes: 0,
-            plans: Vec::new(),
-            report: MappedGrowthReport::default(),
-            active: true,
-        }
-    }
-
-    pub fn report(&self) -> MappedGrowthReport {
-        self.report
-    }
-
-    pub fn commit(mut self) -> CommittedMappedGrowth {
-        self.active = false;
-        self.ledger.end_reclaim_phase();
-        CommittedMappedGrowth {
-            ledger: Arc::clone(&self.ledger),
-            tier: self.tier,
-            reserved_bytes: self.reserved_bytes,
-        }
-    }
-}
-
-impl std::fmt::Debug for MappedGrowthGrant {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MappedGrowthGrant")
-            .field("tier", &self.tier)
-            .field("reserved_bytes", &self.reserved_bytes)
-            .field("report", &self.report)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for MappedGrowthGrant {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.ledger
-            .release_mapped_allowance(self.tier, self.reserved_bytes);
-        self.ledger.restore_reclaim_plans(self.tier, &self.plans);
-        self.ledger.end_reclaim_phase();
-    }
-}
-
-#[derive(Debug)]
-pub struct CommittedMappedGrowth {
-    ledger: Arc<LeaseLedger>,
-    tier: Tier,
-    reserved_bytes: u64,
-}
-
-impl Drop for CommittedMappedGrowth {
-    fn drop(&mut self) {
-        self.ledger
-            .release_mapped_allowance(self.tier, self.reserved_bytes);
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1338,12 +1161,12 @@ pub trait MemoryGovernor {
     }
 
     /// Make mapped capacity available before a non-reclaimable holder grows.
-    fn prepare_mapped_growth(
+    fn request_mapped_growth(
         &self,
         tier: Tier,
         _requester: HolderId,
         bytes: u64,
-    ) -> Result<MappedGrowthGrant, MemoryError> {
+    ) -> Result<MappedGrowthReport, MemoryError> {
         Err(MemoryError::InvalidRequest {
             tier: tier.name(),
             requested: bytes,
@@ -1424,25 +1247,9 @@ struct LedgerMappedAllowanceAccounting {
     ledger: Arc<LeaseLedger>,
 }
 
-struct LedgerMappedAdmission {
-    ledger: Arc<LeaseLedger>,
-}
-
-impl MappedAdmissionGuard for LedgerMappedAdmission {}
-
-impl Drop for LedgerMappedAdmission {
-    fn drop(&mut self) {
-        self.ledger.end_mapped_admission();
-    }
-}
-
 impl MappedAllowanceAccounting for LedgerMappedAllowanceAccounting {
     fn release(&self, tier: Tier, bytes: u64) {
         self.ledger.release_mapped_allowance(tier, bytes);
-    }
-
-    fn begin_map(&self) -> Option<Box<dyn MappedAdmissionGuard>> {
-        Some(Box::new(self.ledger.begin_mapped_admission()))
     }
 }
 
@@ -1512,13 +1319,13 @@ impl MemoryGovernor for LedgerGovernor {
         self.ledger.register_reclaimable(participant, allowance)
     }
 
-    fn prepare_mapped_growth(
+    fn request_mapped_growth(
         &self,
         tier: Tier,
         requester: HolderId,
         bytes: u64,
-    ) -> Result<MappedGrowthGrant, MemoryError> {
-        self.ledger.prepare_mapped_growth(tier, requester, bytes)
+    ) -> Result<MappedGrowthReport, MemoryError> {
+        self.ledger.request_mapped_growth(tier, requester, bytes)
     }
 
     fn mapped_reclaim_stats(&self, tier: Tier) -> MappedReclaimStats {
@@ -2088,11 +1895,9 @@ mod tests {
             .register_reclaimable_mapped_holder(participant.clone(), allowance.clone())
             .unwrap();
 
-        let grant = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 30)
+        let report = governor
+            .request_mapped_growth(Tier::Device, HolderId::new(8), 30)
             .unwrap();
-        let report = grant.report();
-        let _committed = grant.commit();
 
         assert_eq!(report.reclaimed_bytes, 30);
         assert_eq!(allowance.limit(), 50);
@@ -2100,7 +1905,7 @@ mod tests {
         assert_eq!(
             governor.mapped_reclaim_stats(Tier::Device),
             MappedReclaimStats {
-                mapped_allowance_bytes: 80,
+                mapped_allowance_bytes: 50,
                 reclaimable_mapped_bytes: 50,
                 reclaim_attempts: 1,
                 reclaim_failures: 0,
@@ -2111,6 +1916,37 @@ mod tests {
             allowance.try_map(1),
             Err(MemoryError::TierExhausted { .. })
         ));
+    }
+
+    #[test]
+    fn reclaim_preserves_unused_allowance_above_current_mapping() {
+        let governor = governor(100, 0, 0);
+        let allowance = governor
+            .reserve_mapped_allowance(Tier::Device, 80, MemoryRole::Weights, HolderId::new(4))
+            .unwrap();
+        allowance.try_map(20).unwrap();
+        let participant = Arc::new(TestReclaimer {
+            holder: HolderId::new(4),
+            priority: ReclaimPriority(0),
+            allowance: allowance.clone(),
+            release: true,
+        });
+        let _registration = governor
+            .register_reclaimable_mapped_holder(participant.clone(), allowance.clone())
+            .unwrap();
+
+        governor
+            .request_mapped_growth(Tier::Device, HolderId::new(8), 5)
+            .unwrap();
+
+        assert_eq!(allowance.limit(), 75);
+        assert_eq!(allowance.mapped_bytes(), 15);
+        assert_eq!(
+            governor
+                .mapped_reclaim_stats(Tier::Device)
+                .mapped_allowance_bytes,
+            75
+        );
     }
 
     #[test]
@@ -2131,7 +1967,7 @@ mod tests {
             .unwrap();
 
         governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 30)
+            .request_mapped_growth(Tier::Device, HolderId::new(8), 30)
             .expect_err("pinned mappings prevent release");
 
         assert_eq!(allowance.limit(), 80);
@@ -2185,10 +2021,9 @@ mod tests {
         let _registration = governor
             .register_reclaimable_mapped_holder(participant.clone(), allowance)
             .unwrap();
-        let grant = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 20)
+        governor
+            .request_mapped_growth(Tier::Device, HolderId::new(8), 20)
             .expect("callback may re-enter ordinary authority accounting");
-        let _committed = grant.commit();
     }
 
     #[test]
@@ -2243,7 +2078,7 @@ mod tests {
         let worker_governor = governor.clone();
         let worker = thread::spawn(move || {
             let _registration = registration;
-            worker_governor.prepare_mapped_growth(Tier::Device, HolderId::new(8), 30)
+            worker_governor.request_mapped_growth(Tier::Device, HolderId::new(8), 30)
         });
 
         entered.wait();
@@ -2253,8 +2088,7 @@ mod tests {
             Err(MemoryError::TierExhausted { .. })
         ));
         resume.wait();
-        let grant = worker.join().unwrap().unwrap();
-        let _committed = grant.commit();
+        worker.join().unwrap().unwrap();
         assert_eq!(allowance.mapped_bytes(), 50);
     }
 
@@ -2288,10 +2122,9 @@ mod tests {
             .register_reclaimable_mapped_holder(registered_second.clone(), first_priority.clone())
             .unwrap();
 
-        let grant = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 20)
+        governor
+            .request_mapped_growth(Tier::Device, HolderId::new(8), 20)
             .unwrap();
-        let _committed = grant.commit();
 
         assert_eq!(first_priority.mapped_bytes(), 30);
         assert_eq!(later_priority.mapped_bytes(), 50);
@@ -2316,7 +2149,7 @@ mod tests {
         drop(registration);
 
         governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 1)
+            .request_mapped_growth(Tier::Device, HolderId::new(8), 1)
             .expect_err("dropped registrations are not reclaim candidates");
         assert_eq!(
             governor
@@ -2324,149 +2157,5 @@ mod tests {
                 .reclaimable_mapped_bytes,
             0
         );
-    }
-
-    #[test]
-    fn reclaim_preserves_unused_allowance_above_current_mapping() {
-        let governor = governor(100, 0, 0);
-        let allowance = governor
-            .reserve_mapped_allowance(Tier::Device, 80, MemoryRole::Weights, HolderId::new(4))
-            .unwrap();
-        allowance.try_map(20).unwrap();
-        let participant = Arc::new(TestReclaimer {
-            holder: HolderId::new(4),
-            priority: ReclaimPriority(0),
-            allowance: allowance.clone(),
-            release: true,
-        });
-        let _registration = governor
-            .register_reclaimable_mapped_holder(participant.clone(), allowance.clone())
-            .unwrap();
-
-        let grant = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 5)
-            .unwrap();
-
-        assert_eq!(allowance.limit(), 75);
-        assert_eq!(allowance.mapped_bytes(), 15);
-        let _committed = grant.commit();
-    }
-
-    #[test]
-    fn dropping_uncommitted_grant_restores_allowance_and_reservation() {
-        let governor = governor(100, 0, 0);
-        let allowance = governor
-            .reserve_mapped_allowance(Tier::Device, 80, MemoryRole::Weights, HolderId::new(4))
-            .unwrap();
-        allowance.try_map(80).unwrap();
-        let participant = Arc::new(TestReclaimer {
-            holder: HolderId::new(4),
-            priority: ReclaimPriority(0),
-            allowance: allowance.clone(),
-            release: true,
-        });
-        let _registration = governor
-            .register_reclaimable_mapped_holder(participant.clone(), allowance.clone())
-            .unwrap();
-
-        let grant = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 30)
-            .unwrap();
-        assert_eq!(allowance.limit(), 50);
-        drop(grant);
-
-        assert_eq!(allowance.limit(), 80);
-        assert_eq!(
-            governor
-                .mapped_reclaim_stats(Tier::Device)
-                .mapped_allowance_bytes,
-            80
-        );
-    }
-
-    #[test]
-    fn competing_growth_waits_until_the_live_grant_commits() {
-        use std::sync::mpsc;
-        use std::thread;
-
-        let governor = governor(100, 0, 0);
-        let allowance = governor
-            .reserve_mapped_allowance(Tier::Device, 80, MemoryRole::Weights, HolderId::new(4))
-            .unwrap();
-        allowance.try_map(80).unwrap();
-        let participant = Arc::new(TestReclaimer {
-            holder: HolderId::new(4),
-            priority: ReclaimPriority(0),
-            allowance: allowance.clone(),
-            release: true,
-        });
-        let registration = governor
-            .register_reclaimable_mapped_holder(participant.clone(), allowance)
-            .unwrap();
-        let first = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 20)
-            .unwrap();
-
-        let (sent, received) = mpsc::channel();
-        let second_governor = governor.clone();
-        let worker = thread::spawn(move || {
-            let _registration = registration;
-            let second = second_governor.prepare_mapped_growth(Tier::Device, HolderId::new(9), 10);
-            sent.send(second).unwrap();
-        });
-
-        thread::sleep(std::time::Duration::from_millis(20));
-        assert!(
-            received.try_recv().is_err(),
-            "a competing growth escaped while the first grant was live"
-        );
-        let _committed = first.commit();
-        let second = received
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("competitor resumes after commit")
-            .unwrap();
-        let _second_committed = second.commit();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn competing_page_in_cannot_steal_a_live_growth_grant() {
-        use std::sync::mpsc;
-        use std::thread;
-
-        let governor = governor(100, 0, 0);
-        let victim = governor
-            .reserve_mapped_allowance(Tier::Device, 60, MemoryRole::Weights, HolderId::new(4))
-            .unwrap();
-        victim.try_map(60).unwrap();
-        let competitor = governor
-            .reserve_mapped_allowance(Tier::Device, 40, MemoryRole::Weights, HolderId::new(5))
-            .unwrap();
-        let participant = Arc::new(TestReclaimer {
-            holder: HolderId::new(4),
-            priority: ReclaimPriority(0),
-            allowance: victim.clone(),
-            release: true,
-        });
-        let _registration = governor
-            .register_reclaimable_mapped_holder(participant.clone(), victim)
-            .unwrap();
-        let grant = governor
-            .prepare_mapped_growth(Tier::Device, HolderId::new(8), 20)
-            .unwrap();
-
-        let (sent, received) = mpsc::channel();
-        let worker = thread::spawn(move || sent.send(competitor.try_map(10)).unwrap());
-        thread::sleep(std::time::Duration::from_millis(20));
-        assert!(
-            received.try_recv().is_err(),
-            "a competing page-in escaped while the growth grant was live"
-        );
-        let _committed = grant.commit();
-        received
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("page-in resumes after commit")
-            .unwrap();
-        worker.join().unwrap();
     }
 }
