@@ -31,12 +31,8 @@ use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
 use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 
-/// Process-global weight-offload activity counters. Every [`CudaWeightResidency`]
-/// updates these in addition to its own instance stats, so an end-to-end decode
-/// driven through an opaque engine (where the residency handle is not reachable)
-/// can still be observed — e.g. a token-parity test asserting that paging and
-/// eviction actually happened. Instance [`CudaResidencyStats`] remain the precise
-/// per-cache view; these are a coarse cross-cache tally.
+/// Process-global weight-offload activity counters. These may be reset between
+/// benchmark measurement windows while caches remain alive.
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -57,8 +53,13 @@ static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
 // Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
 static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
+// High-water mark for the current measurement window. A reset starts it at
+// current live content residency rather than zero.
 static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+// Process-global live-state gauges. Unlike the activity counters above, these
+// are changed only when a cache, page, or mapping changes state. Resetting a
+// benchmark window must preserve them because hits do not rewrite residency.
+static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_CONTENT_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_WEIGHT_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -147,7 +148,13 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
     }
 }
 
-/// Reset the process-global weight-offload counters (test observability helper).
+/// Reset cumulative weight-offload activity for a new measurement window.
+///
+/// Live gauges (`budget_bytes`, `content_resident_bytes`,
+/// `mapped_physical_bytes`, and authority-owned physical bytes) are preserved,
+/// and the new peak window starts at current content residency. Caches and
+/// mappings may outlive a benchmark warmup reset, and cache hits do not rewrite
+/// those values.
 pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
@@ -162,10 +169,10 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
-    GLOBAL_BUDGET_BYTES.store(0, Ordering::Relaxed);
-    GLOBAL_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
-    GLOBAL_CONTENT_RESIDENT_BYTES.store(0, Ordering::Relaxed);
-    GLOBAL_WEIGHT_MAPPED_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_PEAK_RESIDENT_BYTES.store(
+        GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -1800,6 +1807,7 @@ mod tests {
             );
             return;
         };
+        let baseline_global = global_offload_stats();
         let granule = 2usize << 20;
         let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
             (granule * 2) as u64,
@@ -1881,6 +1889,44 @@ mod tests {
         assert_eq!(runtime.allocation_counts(), before);
         assert_eq!(governor.used(Tier::Device), granule as u64);
 
+        let live_before_reset = global_offload_stats();
+        assert_eq!(
+            live_before_reset.content_resident_bytes,
+            baseline_global.content_resident_bytes + granule as u64
+        );
+        assert_eq!(
+            live_before_reset.mapped_physical_bytes,
+            baseline_global.mapped_physical_bytes + granule as u64
+        );
+        assert_eq!(
+            live_before_reset.budget_bytes,
+            baseline_global.budget_bytes + granule as u64
+        );
+        assert!(live_before_reset.page_ins > 0);
+        assert!(live_before_reset.evictions > 0);
+
+        reset_global_offload_stats();
+        let live_after_reset = global_offload_stats();
+        assert_eq!(live_after_reset.page_ins, 0);
+        assert_eq!(live_after_reset.hits, 0);
+        assert_eq!(live_after_reset.evictions, 0);
+        assert_eq!(
+            live_after_reset.content_resident_bytes,
+            live_before_reset.content_resident_bytes
+        );
+        assert_eq!(
+            live_after_reset.mapped_physical_bytes,
+            live_before_reset.mapped_physical_bytes
+        );
+        assert_eq!(
+            live_after_reset.budget_bytes,
+            live_before_reset.budget_bytes
+        );
+        assert_eq!(
+            live_after_reset.peak_resident_bytes,
+            live_after_reset.content_resident_bytes
+        );
+
         let second_authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
             governor.clone();
         let other = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
@@ -1912,8 +1958,15 @@ mod tests {
         drop(other);
         drop(residency);
         let unloaded = global_offload_stats();
-        assert_eq!(unloaded.content_resident_bytes, 0);
-        assert_eq!(unloaded.mapped_physical_bytes, 0);
+        assert_eq!(
+            unloaded.content_resident_bytes,
+            baseline_global.content_resident_bytes
+        );
+        assert_eq!(
+            unloaded.mapped_physical_bytes,
+            baseline_global.mapped_physical_bytes
+        );
+        assert_eq!(unloaded.budget_bytes, baseline_global.budget_bytes);
         let retained = allocator
             .physical_pool_stats()
             .expect("pool stats after unload")
