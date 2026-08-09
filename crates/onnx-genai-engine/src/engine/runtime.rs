@@ -17,8 +17,23 @@ fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
 }
 
 #[cfg(feature = "native-backend")]
-fn native_workspace_query_rows(prompt_rows: usize, plan: Option<&NativeSpeculationPlan>) -> usize {
-    plan.map_or(prompt_rows, |plan| prompt_rows.max(plan.width))
+fn native_workspace_query_rows(
+    prompt_rows: usize,
+    plan: Option<&NativeSpeculationPlan>,
+    effective_max_new_tokens: usize,
+    max_context: Option<usize>,
+) -> usize {
+    let remaining_context = max_context
+        .map(|limit| limit.saturating_sub(prompt_rows))
+        .unwrap_or(effective_max_new_tokens);
+    let verify_rows = plan.map_or(0, |plan| {
+        crate::native_speculative::verification_width(
+            plan.width,
+            effective_max_new_tokens,
+            remaining_context,
+        )
+    });
+    prompt_rows.max(verify_rows)
 }
 
 fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
@@ -141,8 +156,6 @@ impl Engine {
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
         let speculation_plan = native_speculation_plan(&options, &chain);
-        let workspace_query_rows =
-            native_workspace_query_rows(prompt_tokens.len(), speculation_plan.as_ref());
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
@@ -152,6 +165,12 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        let workspace_query_rows = native_workspace_query_rows(
+            prompt_tokens.len(),
+            speculation_plan.as_ref(),
+            options.max_new_tokens,
+            options.max_context,
+        );
         if let Err(error) = self
             .native_session
             .as_mut()
@@ -2278,12 +2297,22 @@ mod tests {
             ..GenerateOptions::default()
         };
         let plan = native_speculation_plan(&options, &chain).unwrap();
-        assert_eq!(native_workspace_query_rows(1, Some(&plan)), 4);
-        assert_eq!(native_workspace_query_rows(8, Some(&plan)), 8);
+        assert_eq!(native_workspace_query_rows(1, Some(&plan), 8, None), 4);
+        assert_eq!(native_workspace_query_rows(8, Some(&plan), 8, None), 8);
 
-        options.num_speculative_tokens = Some(7);
+        options.num_speculative_tokens = Some(1024);
         let widened = native_speculation_plan(&options, &chain).unwrap();
-        assert_eq!(native_workspace_query_rows(1, Some(&widened)), 7);
+        assert_eq!(widened.width, 1024);
+        assert_eq!(native_workspace_query_rows(1, Some(&widened), 1, None), 1);
+        assert_eq!(
+            native_workspace_query_rows(1, Some(&widened), 8, Some(3)),
+            2
+        );
+        let runtime_width = crate::native_speculative::verification_width(widened.width, 5, 3);
+        assert_eq!(
+            native_workspace_query_rows(1, Some(&widened), 5, Some(4)),
+            1usize.max(runtime_width)
+        );
 
         options.num_speculative_tokens = None;
         options.speculative_mode = Some(SpeculativeMode::SharedKv(
@@ -2299,9 +2328,9 @@ mod tests {
         ));
         let shared_kv = native_speculation_plan(&options, &chain).unwrap();
         assert_eq!(shared_kv.width, 4);
-        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv)), 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
 
-        assert_eq!(native_workspace_query_rows(3, None), 3);
+        assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
 
     #[cfg(feature = "native-backend")]
