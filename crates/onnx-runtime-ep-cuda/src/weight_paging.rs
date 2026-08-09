@@ -53,8 +53,8 @@ static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
 // Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
 static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
-// High-water mark for the current measurement window. A reset starts it at
-// current live content residency rather than zero.
+// Process-lifetime high-water gauge. Resetting activity counters must not write
+// it: a concurrent page-in could otherwise be overwritten with a stale value.
 static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
 // Process-global live-state gauges. Unlike the activity counters above, these
 // are changed only when a cache, page, or mapping changes state. Resetting a
@@ -151,10 +151,10 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
 /// Reset cumulative weight-offload activity for a new measurement window.
 ///
 /// Live gauges (`budget_bytes`, `content_resident_bytes`,
-/// `mapped_physical_bytes`, and authority-owned physical bytes) are preserved,
-/// and the new peak window starts at current content residency. Caches and
-/// mappings may outlive a benchmark warmup reset, and cache hits do not rewrite
-/// those values.
+/// `mapped_physical_bytes`, authority-owned physical bytes, and the
+/// process-lifetime `peak_resident_bytes`) are preserved. Caches and mappings
+/// may outlive a benchmark warmup reset, and cache hits do not rewrite those
+/// values. Benchmarks needing an interval peak must track it locally.
 pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
@@ -169,10 +169,6 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
-    GLOBAL_PEAK_RESIDENT_BYTES.store(
-        GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -1905,6 +1901,15 @@ mod tests {
         assert!(live_before_reset.page_ins > 0);
         assert!(live_before_reset.evictions > 0);
 
+        // Model an earlier lifetime high-water above current live residency.
+        // The reset must perform no write to the peak; storing either zero or a
+        // sampled live value would make this assertion fail.
+        let lifetime_peak = live_before_reset
+            .content_resident_bytes
+            .saturating_add(granule as u64);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(lifetime_peak, Ordering::Relaxed);
+        let live_before_reset = global_offload_stats();
+
         reset_global_offload_stats();
         let live_after_reset = global_offload_stats();
         assert_eq!(live_after_reset.page_ins, 0);
@@ -1924,8 +1929,9 @@ mod tests {
         );
         assert_eq!(
             live_after_reset.peak_resident_bytes,
-            live_after_reset.content_resident_bytes
+            live_before_reset.peak_resident_bytes
         );
+        assert!(live_after_reset.peak_resident_bytes >= live_after_reset.content_resident_bytes);
 
         let second_authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
             governor.clone();
