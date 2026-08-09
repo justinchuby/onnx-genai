@@ -61,9 +61,16 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [dev-dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-virtual-memory = { workspace = true }
 tower = { workspace = true }
 image = { workspace = true, features = ["png"] }
 tempfile = "3"
+
+[dev-dependencies.cudarc]
+version = "0.19"
+default-features = false
+features = ["std", "driver", "cuda-13000", "dynamic-loading"]
 
 [lints]
 workspace = true

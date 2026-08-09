@@ -74,8 +74,8 @@ pub mod allocator;
 
 pub use allocator::{DeviceAllocator, DeviceKey, HostAllocator};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Stable identity of one physical-memory accounting authority.
 ///
@@ -275,6 +275,7 @@ pub struct LeaseLedger {
     authority_id: MemoryAuthorityId,
     limits: [AtomicU64; 3],
     used: [AtomicU64; 3],
+    claim_gates: [Mutex<()>; 3],
 }
 
 impl LeaseLedger {
@@ -301,6 +302,7 @@ impl LeaseLedger {
                 AtomicU64::new(disk_bytes),
             ],
             used: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            claim_gates: std::array::from_fn(|_| Mutex::new(())),
         })
     }
 
@@ -330,11 +332,30 @@ impl LeaseLedger {
     /// under G3 nothing is taken from a live holder. The tier simply grants
     /// nothing further until usage falls back under the new ceiling.
     pub fn set_limit(&self, tier: Tier, bytes: u64) {
+        let _gate = self.claim_gate(tier);
         self.limits[tier.index()].store(bytes, Ordering::Release);
+    }
+
+    /// Pause new claims on `tier` while an authority validates and commits a
+    /// limit change. Releases remain lock-free, so reclaim can run while this
+    /// guard is held.
+    pub fn pause_claims(&self, tier: Tier) -> LeaseLimitGuard<'_> {
+        LeaseLimitGuard {
+            ledger: self,
+            tier,
+            _gate: self.claim_gate(tier),
+        }
+    }
+
+    fn claim_gate(&self, tier: Tier) -> MutexGuard<'_, ()> {
+        self.claim_gates[tier.index()]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Claim `bytes` on `tier`, or fail without changing anything (G1, G4).
     fn try_claim(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError> {
+        let _gate = self.claim_gate(tier);
         let index = tier.index();
         let mut used = self.used[index].load(Ordering::Acquire);
         loop {
@@ -372,6 +393,7 @@ impl LeaseLedger {
 
     /// Record bytes that are already committed, even if the tier is over limit.
     fn record_claim(&self, tier: Tier, bytes: u64) -> Result<(), MemoryError> {
+        let _gate = self.claim_gate(tier);
         let index = tier.index();
         let mut used = self.used[index].load(Ordering::Acquire);
         loop {
@@ -412,6 +434,34 @@ impl LeaseLedger {
                 Err(observed) => used = observed,
             }
         }
+    }
+}
+
+/// Exclusive limit-reconfiguration access for one ledger tier.
+pub struct LeaseLimitGuard<'a> {
+    ledger: &'a LeaseLedger,
+    tier: Tier,
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl LeaseLimitGuard<'_> {
+    pub fn used(&self) -> u64 {
+        self.ledger.used(self.tier)
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.ledger.limit(self.tier)
+    }
+
+    /// Commit `bytes` only when current usage fits. New claims cannot race this
+    /// check because the guard owns the same gate used by reserve/grow.
+    pub fn try_set_limit(&self, bytes: u64) -> Result<(), u64> {
+        let used = self.used();
+        if used > bytes {
+            return Err(used);
+        }
+        self.ledger.limits[self.tier.index()].store(bytes, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -998,6 +1048,36 @@ mod tests {
             .expect("the extra 40 fits; reserving 100 afresh would not");
         assert_eq!(lease.bytes(), 100);
         assert_eq!(gov.available(Tier::Device), 0);
+    }
+
+    #[test]
+    fn reserve_racing_limit_shrink_never_exceeds_the_committed_limit() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        for _ in 0..100 {
+            let ledger = LeaseLedger::new(100, 0, 0);
+            let governor = LedgerGovernor::new(Arc::clone(&ledger));
+            let barrier = Arc::new(Barrier::new(2));
+            let reserve_barrier = Arc::clone(&barrier);
+            let reserve_governor = governor.clone();
+            let reserve = thread::spawn(move || {
+                reserve_barrier.wait();
+                reserve_governor.reserve(Tier::Device, 80, MemoryRole::KvCache, H)
+            });
+            barrier.wait();
+            let shrink = {
+                let guard = ledger.pause_claims(Tier::Device);
+                guard.try_set_limit(50)
+            };
+            let lease = reserve.join().expect("reserve thread");
+
+            assert!(
+                (shrink.is_ok() && lease.is_err()) || (shrink.is_err() && lease.is_ok()),
+                "exactly one racing operation must win"
+            );
+            assert!(ledger.used(Tier::Device) <= ledger.limit(Tier::Device));
+        }
     }
 
     /// A refused growth leaves the lease exactly as it was.

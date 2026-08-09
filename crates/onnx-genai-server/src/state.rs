@@ -87,18 +87,59 @@ impl ServerMemoryAuthorities {
         );
         let resolved = onnx_genai_engine::resolve_limit(limit, &capacity, "vram")
             .map_err(anyhow::Error::new)?;
-        for authority in authorities.values() {
-            if authority.used_bytes() > resolved {
+        let mut ordered = authorities.values().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|authority| authority.domain().to_string());
+        let guards = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::pause_reconfiguration)
+            .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let pool_gates = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::physical_pool_operation_gate)
+            .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let _pool_operations = pool_gates
+            .iter()
+            .map(|gate| {
+                gate.write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<Vec<_>>();
+        let mut trim_plan = Vec::with_capacity(ordered.len());
+        for (authority, guard) in ordered.iter().zip(&guards) {
+            let used = guard.used();
+            let required = used.saturating_sub(resolved);
+            let releasable = authority.releasable_unmapped_bytes();
+            if required > releasable {
                 anyhow::bail!(
-                    "cannot satisfy lowered resource limit of {resolved} bytes: {} currently has \
-                     {} committed bytes",
+                    "cannot satisfy lowered resource limit of {resolved} bytes: {} has {used} \
+                     leased bytes but only {releasable} pooled-unmapped bytes are releasable",
+                    authority.domain()
+                );
+            }
+            trim_plan.push(required);
+        }
+        for ((authority, guard), required) in
+            ordered.iter().zip(&guards).zip(trim_plan.iter().copied())
+        {
+            let released = authority.trim_unmapped_bytes(required)?;
+            if released < required || guard.used() > resolved {
+                anyhow::bail!(
+                    "could not complete lowered resource limit of {resolved} bytes for {}: \
+                     planned to release {required} pooled bytes, released {released}, and {} \
+                     bytes remain leased; limits and server policy remain unchanged",
                     authority.domain(),
-                    authority.used_bytes()
+                    guard.used()
                 );
             }
         }
-        for authority in authorities.values() {
-            authority.set_limit_bytes(resolved);
+        for guard in &guards {
+            let result = guard.try_set_limit(resolved);
+            debug_assert!(
+                result.is_ok(),
+                "claims are paused and usage was prevalidated"
+            );
         }
         *effective = limit;
         Ok(())
@@ -589,6 +630,7 @@ fn build_pipeline_handle(
 
 #[cfg(test)]
 mod authority_tests {
+    #[cfg(not(feature = "native-backend"))]
     use std::path::PathBuf;
 
     use super::*;
@@ -678,5 +720,128 @@ mod authority_tests {
             .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
             .unwrap();
         assert_ne!(first.authority_id(), second.authority_id());
+    }
+
+    #[test]
+    fn multi_device_limit_failure_leaves_every_limit_and_policy_unchanged() {
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+        let _first_lease = first
+            .reserve(Tier::Device, 20, MemoryRole::Weights, HolderId::new(1))
+            .unwrap();
+        let _second_lease = second
+            .reserve(Tier::Device, 80, MemoryRole::Weights, HolderId::new(2))
+            .unwrap();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(50))
+            .unwrap_err();
+        assert_eq!(first.limit_bytes(), 100);
+        assert_eq!(second.limit_bytes(), 100);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(100)
+        );
+        let future = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(2), 100)
+            .unwrap();
+        assert_eq!(future.limit_bytes(), 100);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn failed_multi_device_preflight_does_not_trim_an_earlier_pool() {
+        use cudarc::driver::CudaContext;
+        use onnx_runtime_ep_cuda::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        use onnx_runtime_virtual_memory::VirtualBacking;
+
+        let context = CudaContext::new(0).expect("CUDA driver");
+        let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);
+        let granule = probe.granularity() as u64;
+        let initial_limit = granule * 4;
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(initial_limit));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), initial_limit)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), initial_limit)
+            .unwrap();
+        let pool = PhysicalHandlePool::get_or_create(
+            context,
+            0,
+            (granule * 2) as usize,
+            &first,
+            HolderId::new(10),
+            MemoryRole::Weights,
+        )
+        .expect("first-device pool");
+        let stats = pool.stats();
+        let backing = CudaVirtualBacking::with_physical_pool(pool);
+        let mut reservation = backing
+            .reserve((granule * 2) as usize)
+            .expect("reservation");
+        backing
+            .commit(&mut reservation, 0, (granule * 2) as usize)
+            .expect("commit pooled bytes");
+        backing
+            .release(&mut reservation, 0, (granule * 2) as usize)
+            .expect("return pooled bytes");
+        let _mapped_second = second
+            .reserve(
+                Tier::Device,
+                granule * 2,
+                MemoryRole::Weights,
+                HolderId::new(11),
+            )
+            .expect("non-releasable second-device bytes");
+        let before = stats.snapshot();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(granule))
+            .expect_err("second device prevents shrink");
+        let after = stats.snapshot();
+        assert_eq!(after.releases, before.releases);
+        assert_eq!(after.creates, before.creates);
+        assert_eq!(after.pooled_unmapped_bytes, before.pooled_unmapped_bytes);
+        assert_eq!(first.used_bytes(), granule * 2);
+        assert_eq!(first.limit_bytes(), initial_limit);
+        assert_eq!(second.limit_bytes(), initial_limit);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(initial_limit)
+        );
+    }
+
+    #[test]
+    fn multi_device_limit_success_updates_every_authority_and_policy() {
+        let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
+        let first = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(0), 100)
+            .unwrap();
+        let second = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(1), 100)
+            .unwrap();
+
+        provider
+            .reconfigure_limit(ResourceLimit::Bytes(50))
+            .unwrap();
+        assert_eq!(first.limit_bytes(), 50);
+        assert_eq!(second.limit_bytes(), 50);
+        assert_eq!(
+            provider.configured_limit().unwrap(),
+            ResourceLimit::Bytes(50)
+        );
+        let future = provider
+            .authority(&DeviceCompatibilityDomain::Cuda(2), 50)
+            .unwrap();
+        assert_eq!(future.limit_bytes(), 50);
     }
 }

@@ -58,9 +58,9 @@ use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
     Tier,
 };
-use onnx_runtime_virtual_memory::VirtualBacking;
+use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
-use crate::virtual_memory::CudaVirtualBacking;
+use crate::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats};
 use cudarc::driver::CudaContext;
 
 /// Environment switch selecting the VMM arena over `cuMemAlloc`.
@@ -84,6 +84,8 @@ use cudarc::driver::CudaContext;
 /// default should move only after it is measured against `cuMemAlloc` on real
 /// models -- and after there is something to measure.
 pub const CUDA_VMM_ENV: &str = "ONNX_GENAI_CUDA_VMM";
+/// Opt-in retained-byte bound for the production physical-handle pool.
+pub const CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV: &str = "ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES";
 
 /// Whether the VMM arena is enabled. Any of `1`/`true`/`yes`/`on`.
 pub fn vmm_enabled() -> bool {
@@ -93,6 +95,13 @@ pub fn vmm_enabled() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn physical_handle_pool_bytes() -> Option<usize> {
+    std::env::var(CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&bytes| bytes > 0)
 }
 /// The device tier name used in errors raised before a governor is consulted.
 const TIER: &str = "device";
@@ -422,6 +431,17 @@ pub struct CudaVmmAllocator {
     device: DeviceKey,
 }
 
+struct VmmConstruction {
+    context: Arc<CudaContext>,
+    device: DeviceKey,
+    device_ordinal: i32,
+    capacity: usize,
+    holder: HolderId,
+    role: MemoryRole,
+    pool_bytes: Option<usize>,
+    teardown_synchronizer: Option<crate::virtual_memory::TeardownSynchronizer>,
+}
+
 // `MemoryGovernor` is a replaceable contract and does not require `Debug`, so
 // the derive cannot see through it. Reporting what the arena is doing is more
 // useful in a log than the governor's identity would be anyway.
@@ -471,14 +491,76 @@ impl CudaVmmAllocator {
         let private = onnx_runtime_memory_governor::LedgerGovernor::new(
             onnx_runtime_memory_governor::LeaseLedger::new(u64::MAX, 0, 0),
         );
-        Self::new(
-            context,
-            device,
-            device_ordinal,
-            capacity,
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: None,
+                teardown_synchronizer: None,
+            },
             &private,
-            holder,
-            role,
+        )
+    }
+
+    /// Construct a standalone arena with a unique device authority.
+    ///
+    /// Unlike [`detached`](Self::detached), this follows the production pool
+    /// option. The private authority keeps independent providers isolated while
+    /// allowing all reservations within one provider to share physical handles.
+    pub fn standalone(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+    ) -> Result<Self, MemoryError> {
+        let private = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
+        );
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: None,
+            },
+            &private,
+        )
+    }
+
+    pub fn standalone_with_teardown_synchronizer(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+        teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+    ) -> Result<Self, MemoryError> {
+        let private = onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
+        );
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: Some(teardown_synchronizer),
+            },
+            &private,
         )
     }
 
@@ -490,6 +572,21 @@ impl CudaVmmAllocator {
     /// its private claim and records a visible accounting fault instead of
     /// failing a load that can otherwise run.
     pub fn adopt_governor(&self, governor: &dyn MemoryGovernor, holder: HolderId) -> VmmAdoption {
+        if let Some(pool) = self.backing.physical_pool() {
+            let owned = pool.stats().snapshot().total_owned_bytes;
+            return if pool.authority() == governor.authority_id() {
+                VmmAdoption {
+                    recorded_bytes: 0,
+                    unaccounted_bytes: 0,
+                }
+            } else {
+                GLOBAL_UNACCOUNTED_COMMITTED_BYTES.fetch_add(owned, Ordering::Relaxed);
+                VmmAdoption {
+                    recorded_bytes: 0,
+                    unaccounted_bytes: owned,
+                }
+            };
+        }
         let mut arena = self.lock();
         let committed = arena.spans.committed as u64;
         match governor.record_committed(Tier::Device, committed, self.role, holder) {
@@ -530,7 +627,78 @@ impl CudaVmmAllocator {
         holder: HolderId,
         role: MemoryRole,
     ) -> Result<Self, MemoryError> {
-        let backing = CudaVirtualBacking::new(context, device_ordinal);
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: None,
+            },
+            governor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_teardown_synchronizer(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+        teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+    ) -> Result<Self, MemoryError> {
+        Self::build(
+            VmmConstruction {
+                context,
+                device,
+                device_ordinal,
+                capacity,
+                holder,
+                role,
+                pool_bytes: physical_handle_pool_bytes(),
+                teardown_synchronizer: Some(teardown_synchronizer),
+            },
+            governor,
+        )
+    }
+
+    fn build(
+        construction: VmmConstruction,
+        governor: &dyn MemoryGovernor,
+    ) -> Result<Self, MemoryError> {
+        let VmmConstruction {
+            context,
+            device,
+            device_ordinal,
+            capacity,
+            holder,
+            role,
+            pool_bytes,
+            teardown_synchronizer,
+        } = construction;
+        let backing = if let Some(pool_bytes) = pool_bytes {
+            let pool = PhysicalHandlePool::get_or_create(
+                context,
+                device_ordinal,
+                pool_bytes,
+                governor,
+                holder,
+                role,
+            )?;
+            CudaVirtualBacking::with_physical_pool(pool)
+        } else {
+            CudaVirtualBacking::new(context, device_ordinal)
+        };
+        let backing = match teardown_synchronizer {
+            Some(synchronizer) => backing.with_teardown_synchronizer(synchronizer),
+            None => backing,
+        };
         let granularity = backing.granularity();
         if granularity == 0 {
             return Err(invalid(
@@ -559,6 +727,18 @@ impl CudaVmmAllocator {
             role,
             device,
         })
+    }
+
+    /// Stats for this allocator's compatible shared physical pool.
+    pub fn physical_pool_stats(&self) -> Option<PhysicalHandlePoolStats> {
+        self.backing.physical_pool().map(|pool| pool.stats())
+    }
+
+    /// Authority owning the shared pool, when production pooling is enabled.
+    pub fn physical_pool_authority(
+        &self,
+    ) -> Option<onnx_runtime_memory_governor::MemoryAuthorityId> {
+        self.backing.physical_pool().map(|pool| pool.authority())
     }
 
     /// Bytes of physical memory mapped right now, and the address space
@@ -624,11 +804,23 @@ impl CudaVmmAllocator {
     }
 
     fn take(&self, arena: &mut Arena, bytes: usize) -> Result<(), MemoryError> {
-        arena.lease.grow(bytes as u64)
+        if matches!(
+            self.backing.physical_memory_accounting(),
+            PhysicalMemoryAccounting::Backing { .. }
+        ) {
+            Ok(())
+        } else {
+            arena.lease.grow(bytes as u64)
+        }
     }
 
     fn give_back_lease(&self, arena: &mut Arena, bytes: usize) {
-        arena.lease.shrink(bytes as u64);
+        if matches!(
+            self.backing.physical_memory_accounting(),
+            PhysicalMemoryAccounting::Buffer
+        ) {
+            arena.lease.shrink(bytes as u64);
+        }
     }
 
     /// Drop this allocation's claims, unmapping whatever it was the last user

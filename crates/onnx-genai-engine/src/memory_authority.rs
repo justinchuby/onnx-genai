@@ -69,8 +69,69 @@ impl DeviceMemoryAuthority {
         self.governor.available(Tier::Device)
     }
 
-    pub fn set_limit_bytes(&self, bytes: u64) {
-        self.governor.ledger().set_limit(Tier::Device, bytes);
+    pub fn pause_reconfiguration(&self) -> onnx_runtime_memory_governor::LeaseLimitGuard<'_> {
+        self.governor.ledger().pause_claims(Tier::Device)
+    }
+
+    pub fn trim_unmapped_bytes(&self, bytes: u64) -> anyhow::Result<u64> {
+        #[cfg(feature = "cuda")]
+        {
+            onnx_runtime_ep_cuda::virtual_memory::trim_physical_handle_pools(
+                self.authority_id(),
+                bytes,
+            )
+            .map_err(anyhow::Error::new)
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = bytes;
+            Ok(0)
+        }
+    }
+
+    pub fn releasable_unmapped_bytes(&self) -> u64 {
+        #[cfg(feature = "cuda")]
+        {
+            onnx_runtime_ep_cuda::virtual_memory::pooled_unmapped_bytes_for_authority(
+                self.authority_id(),
+            )
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn physical_pool_operation_gate(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
+        onnx_runtime_ep_cuda::virtual_memory::physical_pool_authority_gate(self.authority_id())
+    }
+
+    /// Lower the device limit after releasing any retained, unmapped CUDA
+    /// handles. Mapped or otherwise leased bytes make the shrink fail without
+    /// changing the old limit.
+    pub fn try_set_limit_bytes(&self, bytes: u64) -> anyhow::Result<()> {
+        let guard = self.pause_reconfiguration();
+        #[cfg(feature = "cuda")]
+        let pool_gate = self.physical_pool_operation_gate();
+        #[cfg(feature = "cuda")]
+        let _pool_operations = pool_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let used = guard.used();
+        if used > bytes {
+            self.trim_unmapped_bytes(used - bytes)?;
+        }
+        if let Err(remaining) = guard.try_set_limit(bytes) {
+            anyhow::bail!(
+                "cannot satisfy lowered resource limit of {bytes} bytes: {} currently has \
+                 {remaining} mapped or otherwise leased bytes",
+                self.domain
+            );
+        }
+        Ok(())
     }
 }
 
@@ -150,10 +211,6 @@ impl EngineMemoryGovernor {
 
     pub(crate) fn device_authority(&self) -> DeviceMemoryAuthority {
         self.device.clone()
-    }
-
-    pub(crate) fn set_device_limit(&self, bytes: u64) {
-        self.device.set_limit_bytes(bytes);
     }
 
     fn governor(&self, tier: Tier) -> &LedgerGovernor {

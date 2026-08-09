@@ -256,6 +256,9 @@ impl EngineResourceGovernor {
                     operation: "acquiring the shared device memory authority",
                     reason: error.to_string(),
                 })?,
+            (None, Some(domain)) => {
+                DeviceMemoryAuthority::new(domain.clone(), snapshot.resolved_limits.vram_bytes)
+            }
             _ => DeviceMemoryAuthority::new(
                 DeviceCompatibilityDomain::Accelerator {
                     backend: "standalone".to_string(),
@@ -418,8 +421,19 @@ impl EngineResourceGovernor {
         // TODO(§26.11.2): execute the returned priority/offload/eviction order
         // across live engine sessions when the outcome reports an overage.
         let outcome = self.inner.set_vram_limit(limit)?;
-        self.memory
-            .set_device_limit(self.inner.snapshot().resolved_limits.vram_bytes);
+        let authority = self.memory.device_authority();
+        if let Err(error) = authority.try_set_limit_bytes(outcome.new_limits.vram_bytes) {
+            let _ = self
+                .inner
+                .set_vram_limit(ResourceLimit::Bytes(outcome.old_limits.vram_bytes));
+            return Err(EngineGovernorError::Resource(
+                ResourceError::CannotSatisfyLoweredLimit {
+                    requested_bytes: outcome.new_limits.vram_bytes,
+                    minimum_bytes: authority.used_bytes(),
+                    reason: error.to_string(),
+                },
+            ));
+        }
         Ok(outcome)
     }
 

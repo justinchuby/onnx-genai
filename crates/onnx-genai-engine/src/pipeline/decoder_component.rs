@@ -219,7 +219,21 @@ impl NativePipelineDecoder {
         path: &std::path::Path,
         device: crate::native_decode::NativeDecodeDevice,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        #[cfg(feature = "cuda")] governor: std::sync::Arc<
+            dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+        >,
     ) -> anyhow::Result<Self> {
+        #[cfg(feature = "cuda")]
+        let session = crate::native_decode::NativeDecodeSession::load_with_io_and_cuda_governor(
+            path, device, io, governor,
+        )
+        .with_context(|| {
+            format!(
+                "failed to load native pipeline decoder '{}'",
+                path.display()
+            )
+        })?;
+        #[cfg(not(feature = "cuda"))]
         let session = crate::native_decode::NativeDecodeSession::load_with_io(path, device, io)
             .with_context(|| {
                 format!(

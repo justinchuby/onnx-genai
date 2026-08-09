@@ -114,6 +114,24 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
+        Self::new_with_policy_and_governor(ordinal, offload_policy, None)
+    }
+
+    /// Construct a CUDA EP with the device authority available before the
+    /// allocator reserves or commits memory.
+    pub fn new_with_offload_policy_and_governor(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<Self> {
+        Self::new_with_policy_and_governor(ordinal, offload_policy, Some(governor))
+    }
+
+    fn new_with_policy_and_governor(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+    ) -> Result<Self> {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
@@ -146,14 +164,45 @@ impl CudaExecutionProvider {
                 let cell = std::sync::OnceLock::new();
                 if crate::vmm_allocator::vmm_enabled() {
                     const RESERVATION_BYTES: usize = 64 << 30;
-                    match crate::vmm_allocator::CudaVmmAllocator::detached(
-                        runtime.cuda_context(),
-                        onnx_runtime_memory_governor::DeviceKey::device(ordinal),
-                        ordinal as i32,
-                        RESERVATION_BYTES,
-                        onnx_runtime_memory_governor::HolderId::new(64),
-                        onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-                    ) {
+                    let synchronization_runtime = Arc::clone(&runtime);
+                    let teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer =
+                        Arc::new(move || {
+                            synchronization_runtime
+                                .synchronize()
+                                .map_err(|error| error.to_string())?;
+                            synchronization_runtime
+                                .copy_stream()
+                                .synchronize()
+                                .map_err(|error| error.to_string())
+                        });
+                    let arena = match governor.as_deref() {
+                        Some(governor) => {
+                            crate::vmm_allocator::CudaVmmAllocator::new_with_teardown_synchronizer(
+                            runtime.cuda_context(),
+                            onnx_runtime_memory_governor::DeviceKey::device(ordinal),
+                            ordinal as i32,
+                            RESERVATION_BYTES,
+                            governor,
+                            onnx_runtime_memory_governor::HolderId::new(64),
+                            onnx_runtime_memory_governor::MemoryRole::Workspace {
+                                step_scoped: false,
+                            },
+                            Arc::clone(&teardown_synchronizer),
+                        )
+                        }
+                        None => crate::vmm_allocator::CudaVmmAllocator::standalone_with_teardown_synchronizer(
+                            runtime.cuda_context(),
+                            onnx_runtime_memory_governor::DeviceKey::device(ordinal),
+                            ordinal as i32,
+                            RESERVATION_BYTES,
+                            onnx_runtime_memory_governor::HolderId::new(64),
+                            onnx_runtime_memory_governor::MemoryRole::Workspace {
+                                step_scoped: false,
+                            },
+                            teardown_synchronizer,
+                        ),
+                    };
+                    match arena {
                         Ok(arena) => {
                             eprintln!(
                                 "cuda_ep: device allocations go through a VMM arena over \
@@ -197,6 +246,28 @@ impl CudaExecutionProvider {
             Some(arena) => arena.as_ref(),
             None => self.memory.as_ref(),
         }
+    }
+
+    fn synchronize_before_pooled_unmap(&self) -> Result<()> {
+        if self
+            .vmm
+            .get()
+            .is_some_and(|arena| arena.physical_pool_stats().is_some())
+        {
+            self.runtime.synchronize().map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not synchronize before returning pooled physical memory: \
+                     {error}"
+                ))
+            })?;
+            self.runtime.copy_stream().synchronize().map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not synchronize the copy stream before returning pooled \
+                     physical memory: {error}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Take device buffers from `memory` instead of calling `cuMemAlloc`
@@ -246,6 +317,19 @@ impl CudaExecutionProvider {
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
         let mut provider = Self::new_with_offload_policy(ordinal, offload_policy)?;
+        <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
+        Ok(provider)
+    }
+
+    /// Construct and initialize with a device authority available to allocator
+    /// construction.
+    pub fn initialized_with_offload_policy_and_governor(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<Self> {
+        let mut provider =
+            Self::new_with_offload_policy_and_governor(ordinal, offload_policy, governor)?;
         <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
         Ok(provider)
     }
@@ -685,6 +769,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
             return Ok(());
         };
+        self.synchronize_before_pooled_unmap()?;
         self.memory()
             .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
@@ -718,6 +803,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(());
         }
+        self.synchronize_before_pooled_unmap()?;
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw();
@@ -997,6 +1083,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         if crate::vmm_allocator::vmm_enabled()
             && let Some(arena) = self.vmm.get()
         {
+            if let Some(authority) = arena.physical_pool_authority()
+                && authority != governor.authority_id()
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: physical-handle pool uses {authority}, but adoption supplied {}; \
+                     both must use the same memory authority",
+                    governor.authority_id()
+                )));
+            }
             // The arena has been serving allocations against its own ledger
             // since construction. Move the claim to the real one now that it
             // exists.
@@ -1041,6 +1136,146 @@ impl ExecutionProvider for CudaExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn public_constructor_installs_configured_physical_pool() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        unsafe {
+            std::env::set_var(crate::vmm_allocator::CUDA_VMM_ENV, "1");
+            std::env::set_var(
+                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+                (64usize << 20).to_string(),
+            );
+        }
+        let provider = CudaExecutionProvider::new(0).expect("public CUDA provider");
+        assert!(
+            provider
+                .vmm
+                .get()
+                .is_some_and(|arena| arena.physical_pool_stats().is_some()),
+            "public constructor must use the configured physical pool"
+        );
+        let stats = provider
+            .vmm
+            .get()
+            .and_then(|arena| arena.physical_pool_stats())
+            .expect("pool stats");
+
+        let runtime = provider.runtime().clone();
+        let write_after_delay = runtime
+            .nvrtc_function(
+                "cuda_ep_pool_reuse_sync_test",
+                r#"
+extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+    *out = 0x736u;
+}
+"#,
+                "write_after_delay",
+            )
+            .expect("compile delayed writer");
+        let first = provider.allocate(4, 256).expect("first allocation");
+        let first_ptr = cuptr(first.as_ptr());
+        let spin = 8_000_000_i64;
+        let mut launch = runtime.stream().launch_builder(&write_after_delay);
+        launch.arg(&first_ptr).arg(&spin);
+        unsafe {
+            launch
+                .launch(LaunchConfig::for_num_elems(1))
+                .expect("enqueue delayed write")
+        };
+
+        provider
+            .deallocate(first)
+            .expect("deallocation synchronizes before pooled return");
+        let second = provider.allocate(4, 256).expect("reused allocation");
+        assert_eq!(stats.snapshot().pool_hits, 1);
+        let mut value = [0_u8; 4];
+        unsafe { runtime.dtoh(&mut value, cuptr(second.as_ptr())) }.expect("read reused mapping");
+        assert_eq!(u32::from_ne_bytes(value), 0x736);
+        provider.deallocate(second).expect("final deallocation");
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn provider_drop_synchronizes_before_handle_reuse() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+
+        unsafe {
+            std::env::set_var(crate::vmm_allocator::CUDA_VMM_ENV, "1");
+            std::env::set_var(
+                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+                (64usize << 20).to_string(),
+            );
+        }
+        let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+        let first = CudaExecutionProvider::new_with_offload_policy_and_governor(
+            0,
+            DeviceOffloadPolicy::default(),
+            Arc::clone(&governor),
+        )
+        .expect("first provider");
+        let runtime = first.runtime().clone();
+        let stats = first
+            .vmm
+            .get()
+            .and_then(|arena| arena.physical_pool_stats())
+            .expect("pool stats");
+        let write_after_delay = runtime
+            .nvrtc_function(
+                "cuda_ep_pool_drop_sync_test",
+                r#"
+extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+    *out = 0x736u;
+}
+"#,
+                "write_after_delay",
+            )
+            .expect("compile delayed writer");
+        let allocation = first.allocate(4, 256).expect("first allocation");
+        let pointer = cuptr(allocation.as_ptr());
+        let spin = 8_000_000_i64;
+        let mut launch = runtime.stream().launch_builder(&write_after_delay);
+        launch.arg(&pointer).arg(&spin);
+        unsafe {
+            launch
+                .launch(LaunchConfig::for_num_elems(1))
+                .expect("enqueue delayed write")
+        };
+        drop(allocation);
+        drop(first);
+        let after_teardown = stats.snapshot();
+        assert_eq!(after_teardown.releases, 1);
+        assert_eq!(after_teardown.pool_hits, 0);
+        assert_eq!(after_teardown.total_owned_bytes, 0);
+
+        let second = CudaExecutionProvider::new_with_offload_policy_and_governor(
+            0,
+            DeviceOffloadPolicy::default(),
+            governor,
+        )
+        .expect("second provider");
+        let later = second.allocate(4, 256).expect("later allocation");
+        assert_eq!(
+            stats.snapshot().pool_hits,
+            0,
+            "the old handle was synchronized and released, never reused early"
+        );
+        second.deallocate(later).expect("final deallocation");
+    }
 
     #[test]
     fn runtime_availability_matches_constructability() {
