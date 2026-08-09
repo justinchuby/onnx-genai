@@ -484,10 +484,15 @@ impl NativeDecodeSession {
         token_ids: &[TokenId],
     ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
         if self.has_eager_step_inputs() {
+            let workspace_nodes = self.session.workspace_node_locations();
+            if workspace_nodes.is_empty() {
+                return Ok(onnx_runtime_ep_api::WorkspaceRequirement::NONE);
+            }
             bail!(
                 "prepare-only QMoE workspace planning cannot resolve routed/inputs_embeds prefill \
-                 values before their producing pipeline component executes; no conservative graph \
-                 metadata bound is available"
+                 values before their producing pipeline component executes; workspace-bearing \
+                 dependencies are {}; no conservative graph-metadata bound is available",
+                workspace_nodes.join(", ")
             );
         }
         let token_input = self

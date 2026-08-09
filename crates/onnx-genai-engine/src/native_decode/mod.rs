@@ -858,10 +858,27 @@ impl NativeDecodeSession {
         &mut self,
         prompt_tokens: &[TokenId],
     ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.prepare_generation_workspace_inner(prompt_tokens, true)
+    }
+
+    pub(crate) fn prepare_generation_workspace_preserving_state(
+        &mut self,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.prepare_generation_workspace_inner(prompt_tokens, false)
+    }
+
+    fn prepare_generation_workspace_inner(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        reset: bool,
+    ) -> anyhow::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
         if prompt_tokens.is_empty() {
             bail!("native workspace preparation requires at least one prompt token");
         }
-        self.reset()?;
+        if reset {
+            self.reset()?;
+        }
         if self.cuda.is_some() {
             self.prepare_cuda_prefill_workspace(prompt_tokens)
         } else {

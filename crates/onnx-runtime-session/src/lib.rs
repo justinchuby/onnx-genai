@@ -1144,6 +1144,11 @@ impl InferenceSession {
         self.exec.prepare_with_device_bindings(inputs, bindings)
     }
 
+    /// Locations of graph nodes that declare owned kernel workspace.
+    pub fn workspace_node_locations(&self) -> Vec<String> {
+        self.exec.workspace_node_locations()
+    }
+
     /// Lazily build the decode-specialized inlined-body sibling executor
     /// (Inc-1b PR-2, `cohaagen-27b-inc1b-design.md` §1). Idempotent: a second
     /// call is a no-op. Returns `true` when a decode-inline plan is now

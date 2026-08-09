@@ -1,6 +1,31 @@
 use super::*;
 
 impl Executor {
+    pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
+        fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
+            for (node_id, node) in graph.nodes.iter() {
+                if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+                    && node.op_type == "BlockQuantizedMoE"
+                {
+                    out.push(format!(
+                        "{scope}node#{} '{}::{}'",
+                        node_id.0, node.domain, node.op_type
+                    ));
+                }
+            }
+            for ((node_id, attribute), child) in &graph.subgraphs {
+                collect(
+                    child,
+                    &format!("{scope}node#{}/{attribute}/", node_id.0),
+                    out,
+                );
+            }
+        }
+        let mut locations = Vec::new();
+        collect(&self.graph, "", &mut locations);
+        locations
+    }
+
     /// Resolve concrete metadata and reserve kernel workspace without executing
     /// any graph node.
     pub(crate) fn prepare_with_device_bindings(
@@ -14,6 +39,20 @@ impl Executor {
         self.validate_required_inputs(inputs, &external)?;
         let resolved = self.resolve_soft(&symbols);
         let mut peak = WorkspaceRequirement::NONE;
+        let nested_workspace = self
+            .workspace_node_locations()
+            .into_iter()
+            .filter(|location| location.contains('/'))
+            .collect::<Vec<_>>();
+        if !nested_workspace.is_empty() {
+            return Err(SessionError::Internal(format!(
+                "prepare-only workspace planning found workspace-bearing control-flow children \
+                 whose formal/captured input shapes are selected at runtime: {}; no exact \
+                 graph-metadata bound is available, so governed execution is refused before \
+                 admission",
+                nested_workspace.join(", ")
+            )));
+        }
 
         for pi in 0..self.plan.len() {
             let node_id = self.plan[pi].node_id;
@@ -106,14 +145,15 @@ impl Executor {
         {
             return Ok(peak);
         }
+        if let Some(old) = slot.take() {
+            self.ep.deallocate(old.buffer)?;
+        }
         let fresh = self.ep.allocate(bytes, peak.alignment)?;
-        if let Some(old) = slot.replace(PreparedWorkspace {
+        *slot = Some(PreparedWorkspace {
             buffer: fresh,
             bytes,
             alignment: peak.alignment,
-        }) {
-            self.ep.deallocate(old.buffer)?;
-        }
+        });
         Ok(peak)
     }
 
