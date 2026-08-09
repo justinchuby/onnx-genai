@@ -82,6 +82,122 @@ impl std::fmt::Debug for CudaVirtualBacking {
 }
 
 impl CudaVirtualBacking {
+    pub(crate) fn commit_with_owned_limit(
+        &self,
+        reservation: &mut CudaReservation,
+        offset: usize,
+        len: usize,
+        max_additional_owned_bytes: u64,
+    ) -> Result<u64, VirtualMemoryError> {
+        let granularity = self.granularity();
+        let offsets = (offset..offset + len)
+            .step_by(granularity)
+            .collect::<Vec<_>>();
+        self.commit_offsets_with_owned_limit(reservation, &offsets, max_additional_owned_bytes)
+    }
+
+    pub(crate) fn commit_offsets_with_owned_limit(
+        &self,
+        reservation: &mut CudaReservation,
+        offsets: &[usize],
+        max_additional_owned_bytes: u64,
+    ) -> Result<u64, VirtualMemoryError> {
+        self.bind("committing CUDA memory")?;
+        if let Some(pool) = &self.pool {
+            let granularity = pool.granularity;
+            let count = offsets.len();
+            let mut checkouts = Vec::with_capacity(count);
+            let mut additional_owned = 0_u64;
+            for _ in 0..count {
+                let remaining = max_additional_owned_bytes.saturating_sub(additional_owned);
+                let (checkout, created_bytes) = match pool.acquire_with_owned_limit(remaining) {
+                    Ok(acquired) => acquired,
+                    Err(error) => {
+                        for checkout in checkouts.drain(..) {
+                            pool.rollback_checkout(checkout, false);
+                        }
+                        return Err(error);
+                    }
+                };
+                checkouts.push(checkout);
+                additional_owned = additional_owned.saturating_add(created_bytes);
+            }
+
+            let mut mapped = Vec::with_capacity(count);
+            for (index, &granule_offset) in offsets.iter().enumerate() {
+                let checkout = checkouts[index];
+                let handle = checkout.handle;
+                let address = reservation.base + granule_offset as u64;
+                if let Err(error) = Self::check("cuMemMap", unsafe {
+                    cu::cuMemMap(address, granularity, 0, handle, 0)
+                }) {
+                    pool.rollback_checkout(checkout, false);
+                    for &remaining in &checkouts[index + 1..] {
+                        pool.rollback_checkout(remaining, false);
+                    }
+                    rollback_pooled_maps(reservation, pool, &mut mapped);
+                    return Err(error);
+                }
+                pool.note_mapped();
+                mapped.push((granule_offset, granularity, checkout));
+
+                let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+                access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+                access.location.id = self.device_ordinal;
+                access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                if let Err(error) = Self::check("cuMemSetAccess", unsafe {
+                    cu::cuMemSetAccess(address, granularity, &access, 1)
+                }) {
+                    for &remaining in &checkouts[index + 1..] {
+                        pool.rollback_checkout(remaining, false);
+                    }
+                    rollback_pooled_maps(reservation, pool, &mut mapped);
+                    return Err(error);
+                }
+            }
+            reservation.blocks.extend(
+                mapped
+                    .into_iter()
+                    .map(|(offset, len, checkout)| (offset, len, checkout.handle)),
+            );
+            return Ok(additional_owned);
+        }
+
+        let granularity = self.granularity();
+        let required = offsets.len().saturating_mul(granularity) as u64;
+        if required > max_additional_owned_bytes {
+            return Err(VirtualMemoryError::Os {
+                operation: "reserving CUDA physical memory",
+                reason: format!(
+                    "candidate requires {required} incremental committed bytes but only \
+                     {max_additional_owned_bytes} bytes of physical headroom are available"
+                ),
+                code: 0,
+            });
+        }
+        let mut committed = Vec::new();
+        for &offset in offsets {
+            if let Err(error) =
+                <Self as VirtualBacking>::commit(self, reservation, offset, granularity)
+            {
+                for offset in committed.into_iter().rev() {
+                    let _ =
+                        <Self as VirtualBacking>::release(self, reservation, offset, granularity);
+                }
+                return Err(error);
+            }
+            committed.push(offset);
+        }
+        Ok(required)
+    }
+
+    pub(crate) fn incremental_owned_bytes_for_handles(&self, handles: usize) -> u64 {
+        self.pool.as_ref().map_or_else(
+            || handles.saturating_mul(self.granularity()) as u64,
+            |pool| pool.incremental_owned_bytes_for_handles(handles),
+        )
+    }
+
     /// Reserve and map in `context`.
     ///
     /// Takes a context rather than the execution provider's full runtime
@@ -213,6 +329,12 @@ struct PoolState {
     available: Vec<cu::CUmemGenericAllocationHandle>,
     lease: Option<MemoryLease>,
     pending_lease_shrink: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CheckedOutHandle {
+    handle: cu::CUmemGenericAllocationHandle,
+    created: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -394,7 +516,17 @@ impl PhysicalHandlePool {
             })
     }
 
-    fn acquire(&self) -> Result<cu::CUmemGenericAllocationHandle, VirtualMemoryError> {
+    pub(crate) fn incremental_owned_bytes_for_handles(&self, handles: usize) -> u64 {
+        let available = self.lock().available.len();
+        handles
+            .saturating_sub(available)
+            .saturating_mul(self.granularity) as u64
+    }
+
+    fn acquire_with_owned_limit(
+        &self,
+        max_additional_owned_bytes: u64,
+    ) -> Result<(CheckedOutHandle, u64), VirtualMemoryError> {
         let operation = self
             .authority_gate
             .read()
@@ -407,7 +539,13 @@ impl PhysicalHandlePool {
                 .pooled_unmapped_bytes
                 .fetch_sub(self.granularity as u64, Ordering::AcqRel);
             self.counters.pool_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(handle);
+            return Ok((
+                CheckedOutHandle {
+                    handle,
+                    created: false,
+                },
+                0,
+            ));
         }
         drop(operation);
 
@@ -415,6 +553,33 @@ impl PhysicalHandlePool {
             .lease_checkout
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = {
+            let mut state = self.lock();
+            state.available.pop()
+        } {
+            self.counters
+                .pooled_unmapped_bytes
+                .fetch_sub(self.granularity as u64, Ordering::AcqRel);
+            self.counters.pool_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok((
+                CheckedOutHandle {
+                    handle,
+                    created: false,
+                },
+                0,
+            ));
+        }
+        if self.granularity as u64 > max_additional_owned_bytes {
+            return Err(VirtualMemoryError::Os {
+                operation: "reserving pooled CUDA physical memory",
+                reason: format!(
+                    "candidate requires {} incremental committed bytes but only \
+                     {max_additional_owned_bytes} bytes of physical headroom are available",
+                    self.granularity
+                ),
+                code: 0,
+            });
+        }
         let mut lease = {
             let mut state = self.lock();
             state.lease.take().ok_or_else(|| VirtualMemoryError::Os {
@@ -458,7 +623,44 @@ impl PhysicalHandlePool {
         self.counters
             .total_owned_bytes
             .fetch_add(self.granularity as u64, Ordering::AcqRel);
-        Ok(handle)
+        Ok((
+            CheckedOutHandle {
+                handle,
+                created: true,
+            },
+            self.granularity as u64,
+        ))
+    }
+
+    fn rollback_checkout(&self, checkout: CheckedOutHandle, was_mapped: bool) {
+        if !checkout.created {
+            let _ = self.return_after_unmap(checkout.handle, was_mapped);
+            return;
+        }
+        if was_mapped {
+            self.counters
+                .mapped_bytes
+                .fetch_sub(self.granularity as u64, Ordering::AcqRel);
+        }
+        if self
+            .bind("releasing rolled-back pooled CUDA physical memory")
+            .is_ok()
+            && CudaVirtualBacking::check("cuMemRelease", unsafe {
+                cu::cuMemRelease(checkout.handle)
+            })
+            .is_ok()
+        {
+            self.counters.releases.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .total_owned_bytes
+                .fetch_sub(self.granularity as u64, Ordering::AcqRel);
+            self.shrink_lease_or_defer(self.granularity as u64);
+        } else {
+            self.lock().available.push(checkout.handle);
+            self.counters
+                .pooled_unmapped_bytes
+                .fetch_add(self.granularity as u64, Ordering::AcqRel);
+        }
     }
 
     fn shrink_lease_or_defer(&self, bytes: u64) {
@@ -603,6 +805,24 @@ pub fn pooled_unmapped_bytes_for_authority(authority: MemoryAuthorityId) -> u64 
         .filter_map(|(_, pool)| pool.upgrade())
         .fold(0_u64, |total, pool| {
             total.saturating_add(pool.counters.pooled_unmapped_bytes.load(Ordering::Acquire))
+        })
+}
+
+/// Process-wide authority-owned bytes across live physical-handle pools.
+///
+/// Each compatible pool appears once in the registry, so this is a sum rather
+/// than a last-writer gauge.
+pub fn total_physical_pool_owned_bytes() -> u64 {
+    let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, pool| pool.strong_count() > 0);
+    registry
+        .values()
+        .filter_map(Weak::upgrade)
+        .fold(0_u64, |total, pool| {
+            total.saturating_add(pool.counters.total_owned_bytes.load(Ordering::Acquire))
         })
 }
 
@@ -821,40 +1041,8 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
         len: usize,
     ) -> Result<(), VirtualMemoryError> {
         self.bind("committing CUDA memory")?;
-        if let Some(pool) = &self.pool {
-            let granularity = pool.granularity;
-            let mut mapped = Vec::new();
-            for granule_offset in (offset..offset + len).step_by(granularity) {
-                let handle = match pool.acquire() {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        rollback_pooled_maps(reservation, pool, &mut mapped);
-                        return Err(error);
-                    }
-                };
-                let address = reservation.base + granule_offset as u64;
-                if let Err(error) = Self::check("cuMemMap", unsafe {
-                    cu::cuMemMap(address, granularity, 0, handle, 0)
-                }) {
-                    let _ = pool.return_after_unmap(handle, false);
-                    rollback_pooled_maps(reservation, pool, &mut mapped);
-                    return Err(error);
-                }
-                pool.note_mapped();
-                mapped.push((granule_offset, granularity, handle));
-
-                let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
-                access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-                access.location.id = self.device_ordinal;
-                access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                if let Err(error) = Self::check("cuMemSetAccess", unsafe {
-                    cu::cuMemSetAccess(address, granularity, &access, 1)
-                }) {
-                    rollback_pooled_maps(reservation, pool, &mut mapped);
-                    return Err(error);
-                }
-            }
-            reservation.blocks.extend(mapped);
+        if self.pool.is_some() {
+            self.commit_with_owned_limit(reservation, offset, len, u64::MAX)?;
             return Ok(());
         }
 
@@ -956,15 +1144,15 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
 fn rollback_pooled_maps(
     reservation: &mut CudaReservation,
     pool: &PhysicalHandlePool,
-    mapped: &mut Vec<(usize, usize, cu::CUmemGenericAllocationHandle)>,
+    mapped: &mut Vec<(usize, usize, CheckedOutHandle)>,
 ) {
-    for (offset, len, handle) in mapped.drain(..).rev() {
+    for (offset, len, checkout) in mapped.drain(..).rev() {
         if unsafe { cu::cuMemUnmap(reservation.base + offset as u64, len) }
             == cu::CUresult::CUDA_SUCCESS
         {
-            let _ = pool.return_after_unmap(handle, true);
+            pool.rollback_checkout(checkout, true);
         } else {
-            reservation.blocks.push((offset, len, handle));
+            reservation.blocks.push((offset, len, checkout.handle));
         }
     }
 }

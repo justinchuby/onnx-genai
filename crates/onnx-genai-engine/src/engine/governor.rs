@@ -170,6 +170,28 @@ impl EngineResourceGovernor {
         )
     }
 
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn new_with_authority_and_reservation(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        model_weights_bytes: u64,
+        reservation_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: Option<&DeviceCompatibilityDomain>,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (model_weights_bytes, reservation_bytes),
+            provider,
+            domain,
+        )
+    }
+
     pub(crate) fn new_for_shared_pipeline_kv(
         limits: ResourceLimits,
         allow_runtime_override: bool,

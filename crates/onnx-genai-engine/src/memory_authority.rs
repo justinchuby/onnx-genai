@@ -2,8 +2,8 @@ use std::{fmt, sync::Arc};
 
 use onnx_genai_scheduler::ResourceLimit;
 use onnx_runtime_memory_governor::{
-    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryAuthorityId, MemoryError,
-    MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MemoryAuthorityId,
+    MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
 };
 
 /// Physical-device compatibility domain for a shared device memory authority.
@@ -160,6 +160,17 @@ impl MemoryGovernor for DeviceMemoryAuthority {
         self.governor.record_committed(tier, bytes, role, holder)
     }
 
+    fn reserve_mapped_allowance(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<MappedAllowance, MemoryError> {
+        self.governor
+            .reserve_mapped_allowance(tier, bytes, role, holder)
+    }
+
     fn available(&self, tier: Tier) -> u64 {
         self.governor.available(tier)
     }
@@ -245,6 +256,17 @@ impl MemoryGovernor for EngineMemoryGovernor {
     ) -> Result<MemoryLease, MemoryError> {
         self.governor(tier)
             .record_committed(tier, bytes, role, holder)
+    }
+
+    fn reserve_mapped_allowance(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<MappedAllowance, MemoryError> {
+        self.governor(tier)
+            .reserve_mapped_allowance(tier, bytes, role, holder)
     }
 
     fn available(&self, tier: Tier) -> u64 {
