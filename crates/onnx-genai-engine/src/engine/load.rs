@@ -346,28 +346,37 @@ impl Engine {
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
         #[cfg(feature = "cuda")]
-        let weight_reservation_bytes =
-            if cuda_offload_resolution.is_some_and(|resolution| resolution.policy.enabled)
-                && onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled()
-            {
-                // The production pool charges each physical handle to this same
-                // authority. A content-sized startup lease would double-charge
-                // weights and prevent the native session from creating even its
-                // initial workspace before the mapped weight allowance is derived.
-                0
-            } else {
-                device_weight_reservation_for(
-                    model_weight_bytes,
-                    cuda_offload_resolution.and_then(|resolution| {
-                        resolution.policy.enabled.then(|| {
-                            resolution.policy.device_budget_bytes.unwrap_or(
-                                onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
-                            )
-                        })
-                    }),
-                    governor_kv_config.page_size_bytes,
-                )
-            };
+        eprintln!(
+            "onnx-genai: CUDA dynamic-lending selection: native_device={native_device:?} \
+             configured_vram_limit={:?} package_bytes={model_weight_bytes} \
+             offload_resolution={cuda_offload_resolution:?}",
+            config.limits.vram_limit
+        );
+        #[cfg(feature = "cuda")]
+        let weight_reservation_bytes = if cuda_offload_resolution.is_some_and(|resolution| {
+            resolution.policy.enabled
+                && (resolution.policy.governed_vmm_pool_bytes.is_some()
+                    || onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled())
+        }) {
+            // The production pool charges each physical handle to this same
+            // authority. A content-sized startup lease would double-charge
+            // weights and prevent the native session from creating even its
+            // initial workspace before the mapped weight allowance is derived.
+            0
+        } else {
+            device_weight_reservation_for(
+                model_weight_bytes,
+                cuda_offload_resolution.and_then(|resolution| {
+                    resolution.policy.enabled.then(|| {
+                        resolution
+                            .policy
+                            .device_budget_bytes
+                            .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+                    })
+                }),
+                governor_kv_config.page_size_bytes,
+            )
+        };
         #[cfg(not(feature = "cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
             model_weight_bytes,
@@ -439,6 +448,7 @@ impl Engine {
                 .and_then(|model| model.max_sequence_length),
             governor.snapshot().resolved_limits.vram_bytes,
             model_weight_bytes,
+            governor_kv_config.page_size_bytes,
             cuda_offload_resolution,
         )?;
         // End the second budget.
@@ -1151,12 +1161,15 @@ fn resolve_cuda_offload_policy_from_env_policy(
     let offload_device_budget_bytes = env_policy
         .device_budget_bytes
         .unwrap_or(resolved_vram_bytes);
+    let governed_vmm_pool_bytes = dynamic_kv_weight_lending_enabled()
+        .then(|| usize::try_from(resolved_vram_bytes).unwrap_or(usize::MAX));
     Some(CudaOffloadResolution {
         policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
             enabled: true,
             device_budget_bytes: Some(offload_device_budget_bytes),
             async_pagein: env_policy.async_pagein,
             scan_resistant_dense: env_policy.scan_resistant_dense,
+            governed_vmm_pool_bytes,
         },
         device_budget_is_override: env_policy.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: true,
@@ -1169,6 +1182,7 @@ fn reconcile_cuda_offload_budget_after_native_load(
     max_context: Option<usize>,
     resolved_vram_bytes: u64,
     model_weight_bytes: u64,
+    runtime_growth_reserve_bytes: Option<u64>,
     resolution: Option<CudaOffloadResolution>,
 ) -> anyhow::Result<Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>> {
     let Some(mut resolution) = resolution else {
@@ -1210,8 +1224,18 @@ fn reconcile_cuda_offload_budget_after_native_load(
         };
         full_kv_device_bytes.saturating_add(recurrent_device_bytes)
     };
-    let available_weight_offload_budget_bytes =
-        dynamic_weight_mapped_allowance(resolved_vram_bytes, required_device_non_weight_bytes);
+    let runtime_growth_reserve_bytes = if dynamic_lending {
+        // Prefill workspaces grow with prompt length and are not part of the
+        // persistent load-time ownership sample. Keep a bounded runway
+        // so lending cannot fill the authority to its final VMM granule.
+        runtime_growth_reserve_bytes.unwrap_or(0)
+    } else {
+        0
+    };
+    let available_weight_offload_budget_bytes = dynamic_weight_mapped_allowance(
+        resolved_vram_bytes,
+        required_device_non_weight_bytes.saturating_add(runtime_growth_reserve_bytes),
+    );
     let minimum_useful_weight_budget_bytes = native_session.max_lazy_weight_working_set_bytes();
     let requested_weight_offload_budget_bytes = resolution
         .policy
@@ -1230,6 +1254,7 @@ fn reconcile_cuda_offload_budget_after_native_load(
              required_device_non_weight_bytes={required_device_non_weight_bytes} \
              native_kv_bytes={native_kv_device_bytes} recurrent_state_bytes={recurrent_device_bytes} \
              measured_fixed_overhead_bytes={measured_fixed_overhead_bytes} \
+             runtime_growth_reserve_bytes={runtime_growth_reserve_bytes} \
              minimum_useful_weight_budget_bytes={minimum_useful_weight_budget_bytes} \
              available_weight_offload_budget_bytes={available_weight_offload_budget_bytes} \
              requested_weight_offload_budget_bytes={requested_weight_offload_budget_bytes}"
@@ -1255,6 +1280,7 @@ fn reconcile_cuda_offload_budget_after_native_load(
             native_kv_bytes = native_kv_device_bytes,
             recurrent_state_bytes = recurrent_device_bytes,
             measured_fixed_overhead_bytes,
+            runtime_growth_reserve_bytes,
             dynamic_lending,
             minimum_useful_weight_budget_bytes,
             offload_device_budget_bytes = adopted,
@@ -1289,6 +1315,17 @@ mod dynamic_lending_tests {
         let allowance = dynamic_weight_mapped_allowance(LIMIT, actual_initial_owned);
         assert_eq!(allowance, LIMIT - actual_initial_owned);
         assert!(allowance > OLD_STATIC_ALLOWANCE);
+    }
+
+    #[test]
+    fn weight_allowance_keeps_runtime_workspace_headroom_unlent() {
+        const LIMIT: u64 = 6_000_000_000;
+        let actual_initial_owned = 864_026_624;
+        let runtime_growth_page = 3_145_728;
+        assert_eq!(
+            dynamic_weight_mapped_allowance(LIMIT, actual_initial_owned + runtime_growth_page),
+            5_132_827_648
+        );
     }
 }
 
@@ -2112,12 +2149,14 @@ mod pool_sizing_tests {
                 device_budget_bytes: None,
                 async_pagein: true,
                 scan_resistant_dense: true,
+                governed_vmm_pool_bytes: None,
             },
         )
         .expect("weights above an explicit CUDA VRAM limit should enable offload");
 
         assert!(policy.policy.enabled);
         assert_eq!(policy.policy.device_budget_bytes, Some(6_000));
+        assert_eq!(policy.policy.governed_vmm_pool_bytes, Some(6_000));
         assert!(policy.policy.async_pagein);
         assert!(policy.auto_enabled_from_vram_limit);
     }
@@ -2137,6 +2176,7 @@ mod pool_sizing_tests {
                 device_budget_bytes: Some(4_000),
                 async_pagein: false,
                 scan_resistant_dense: true,
+                governed_vmm_pool_bytes: None,
             },
         )
         .expect("the explicit limit still triggers offload");

@@ -273,7 +273,7 @@ impl Executor {
         holder: onnx_runtime_memory_governor::HolderId,
         required_owned_bytes: u64,
         required_mapped_bytes: u64,
-    ) -> onnx_runtime_ep_api::Result<onnx_runtime_memory_governor::MappedGrowthReport> {
+    ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
         self.ep
             .request_mapped_growth(holder, required_owned_bytes, required_mapped_bytes)
     }

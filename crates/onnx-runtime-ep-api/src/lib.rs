@@ -51,8 +51,8 @@ pub use kernel::{
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
-    CaptureRegionShapeStatus, DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence,
-    OrtPluginExport, StructuralCaptureDecline,
+    CaptureRegionShapeStatus, DeviceBuffer, DeviceCommitRange, EpConfig, EpId, ExecutionProvider,
+    Fence, OrtPluginExport, StructuralCaptureDecline,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

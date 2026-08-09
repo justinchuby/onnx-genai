@@ -348,6 +348,7 @@ pub(crate) struct DecodeCudaState {
     graph_invalidations: u64,
     kv_growth_events: u64,
     kv_growth_d2d_copy_bytes: u64,
+    kv_mapped_growth: Vec<onnx_runtime_memory_governor::CommittedMappedGrowth>,
     capacity: CudaKvCapacity,
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
@@ -1340,10 +1341,8 @@ impl DecodeCudaState {
         session: &InferenceSession,
         new_capacity: usize,
     ) -> anyhow::Result<()> {
-        let mut committed: Vec<(usize, usize, usize)> = Vec::new();
         let kv_indices = self.kv_binding_range.clone().collect::<Vec<_>>();
-        let mut required_mapped_bytes = 0u64;
-        let mut required_owned_bytes = 0u64;
+        let mut commit_ranges = Vec::with_capacity(kv_indices.len() + 1);
         for &index in &kv_indices {
             let binding = &self.bindings[index];
             let mut new_shape = binding.physical_shape().to_vec();
@@ -1355,25 +1354,23 @@ impl DecodeCudaState {
                     new_shape
                 )
             })?;
-            let (mapped, owned) = binding.incremental_commit_bytes(0, bytes)?;
-            required_mapped_bytes = required_mapped_bytes.saturating_add(mapped);
-            required_owned_bytes = required_owned_bytes.saturating_add(owned);
+            commit_ranges.push((index, 0, bytes));
         }
         let mask_bytes = new_capacity
             .checked_mul(std::mem::size_of::<i64>())
             .with_context(|| {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
-        let (mapped, owned) = self.bindings[0].incremental_commit_bytes(0, mask_bytes)?;
-        required_mapped_bytes = required_mapped_bytes.saturating_add(mapped);
-        required_owned_bytes = required_owned_bytes.saturating_add(owned);
-        session.request_mapped_growth(
+        commit_ranges.push((0, 0, mask_bytes));
+        let (required_mapped_bytes, required_owned_bytes) =
+            DeviceIoBinding::incremental_commit_bytes_batch(&self.bindings, &commit_ranges)?;
+        let growth_grant = session.request_mapped_growth(
             onnx_runtime_memory_governor::HolderId::new(8),
             required_owned_bytes,
             required_mapped_bytes,
         )?;
         for index in kv_indices {
-            let binding = &mut self.bindings[index];
+            let binding = &self.bindings[index];
             let mut new_shape = binding.physical_shape().to_vec();
             if new_shape.len() != 4 {
                 bail!(
@@ -1390,34 +1387,12 @@ impl DecodeCudaState {
                     new_shape
                 )
             })?;
-            let old_bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
-                .with_context(|| {
-                    format!(
-                        "VMM-backed CUDA KV '{}' current size overflows for shape {:?}",
-                        binding.input_name(),
-                        binding.physical_shape()
-                    )
-                })?;
-            if let Err(error) = binding.commit_range(0, bytes) {
-                rollback_vmm_growth_commits(&mut self.bindings, &committed);
-                return Err(error.into());
-            }
-            committed.push((index, old_bytes, bytes.saturating_sub(old_bytes)));
+            let _ = bytes;
         }
-        let old_mask_bytes =
-            checked_shape_bytes(self.bindings[0].physical_shape(), DataType::Int64).with_context(
-                || {
-                    format!(
-                        "VMM-backed CUDA mask current size overflows for shape {:?}",
-                        self.bindings[0].physical_shape()
-                    )
-                },
-            )?;
-        if let Err(error) = self.bindings[0].commit_range(0, mask_bytes) {
-            rollback_vmm_growth_commits(&mut self.bindings, &committed);
-            return Err(error.into());
+        DeviceIoBinding::commit_ranges(&self.bindings, &commit_ranges)?;
+        if let Some(grant) = growth_grant {
+            self.kv_mapped_growth.push(grant.commit());
         }
-        committed.push((0, old_mask_bytes, mask_bytes.saturating_sub(old_mask_bytes)));
         Ok(())
     }
 
@@ -2029,6 +2004,7 @@ impl DecodeCudaState {
             graph_invalidations: 0,
             kv_growth_events: 0,
             kv_growth_d2d_copy_bytes: 0,
+            kv_mapped_growth: Vec::new(),
             capacity,
             kv_commits_on_demand,
             graph_fallback_reason: None,
@@ -2940,18 +2916,6 @@ pub(super) fn in_place_copy_route(
         InPlaceCopyRoute::Scratch
     } else {
         InPlaceCopyRoute::DeviceToDevice
-    }
-}
-
-fn rollback_vmm_growth_commits(
-    bindings: &mut [DeviceIoBinding],
-    committed: &[(usize, usize, usize)],
-) {
-    for &(index, old_bytes, extra_bytes) in committed.iter().rev() {
-        if extra_bytes == 0 {
-            continue;
-        }
-        let _ = bindings[index].decommit_range(old_bytes, extra_bytes);
     }
 }
 

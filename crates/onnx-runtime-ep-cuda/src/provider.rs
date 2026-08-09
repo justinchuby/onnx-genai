@@ -163,7 +163,9 @@ impl CudaExecutionProvider {
             // leaving it unmapped costs nothing.
             vmm: {
                 let cell = std::sync::OnceLock::new();
-                if crate::vmm_allocator::vmm_enabled() {
+                if crate::vmm_allocator::vmm_enabled()
+                    || offload_policy.governed_vmm_pool_bytes.is_some()
+                {
                     const RESERVATION_BYTES: usize = 64 << 30;
                     let synchronization_runtime = Arc::clone(&runtime);
                     let teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer =
@@ -178,7 +180,7 @@ impl CudaExecutionProvider {
                         });
                     let arena = match governor.as_deref() {
                         Some(governor) => {
-                            crate::vmm_allocator::CudaVmmAllocator::new_with_teardown_synchronizer(
+                            crate::vmm_allocator::CudaVmmAllocator::new_with_teardown_synchronizer_and_pool(
                             runtime.cuda_context(),
                             onnx_runtime_memory_governor::DeviceKey::device(ordinal),
                             ordinal as i32,
@@ -188,10 +190,13 @@ impl CudaExecutionProvider {
                             onnx_runtime_memory_governor::MemoryRole::Workspace {
                                 step_scoped: false,
                             },
+                            offload_policy.governed_vmm_pool_bytes.or_else(
+                                crate::vmm_allocator::configured_physical_handle_pool_bytes,
+                            ),
                             Arc::clone(&teardown_synchronizer),
                         )
                         }
-                        None => crate::vmm_allocator::CudaVmmAllocator::standalone_with_teardown_synchronizer(
+                        None => crate::vmm_allocator::CudaVmmAllocator::standalone_with_teardown_synchronizer_and_pool(
                             runtime.cuda_context(),
                             onnx_runtime_memory_governor::DeviceKey::device(ordinal),
                             ordinal as i32,
@@ -200,6 +205,9 @@ impl CudaExecutionProvider {
                             onnx_runtime_memory_governor::MemoryRole::Workspace {
                                 step_scoped: false,
                             },
+                            offload_policy.governed_vmm_pool_bytes.or_else(
+                                crate::vmm_allocator::configured_physical_handle_pool_bytes,
+                            ),
                             teardown_synchronizer,
                         ),
                     };
@@ -209,7 +217,10 @@ impl CudaExecutionProvider {
                                 "cuda_ep: device allocations go through a VMM arena over \
                                  {RESERVATION_BYTES} bytes of reserved address space; physical \
                                  granules are mapped on demand and join the memory ledger when \
-                                 one arrives"
+                                 one arrives; physical_pool_bytes={:?}",
+                                offload_policy.governed_vmm_pool_bytes.or_else(
+                                    crate::vmm_allocator::configured_physical_handle_pool_bytes,
+                                )
                             );
                             let _ = cell.set(Arc::new(arena));
                         }
@@ -790,27 +801,86 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok((mapped, owned))
     }
 
+    fn incremental_commit_bytes_batch(
+        &self,
+        ranges: &[onnx_runtime_ep_api::DeviceCommitRange<'_>],
+    ) -> Result<(u64, u64)> {
+        let Some(arena) = self.vmm.get() else {
+            return Ok((0, 0));
+        };
+        let spans = ranges
+            .iter()
+            .map(|range| {
+                std::ptr::NonNull::new(range.buffer.as_ptr() as *mut u8)
+                    .map(|ptr| (ptr, range.buffer.len(), range.offset, range.bytes))
+                    .ok_or_else(|| {
+                        EpError::KernelFailed("cuda_ep: device buffer has a null pointer".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let estimate = arena
+            .incremental_bytes_for_spans(&spans)
+            .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+        Ok((
+            estimate.additional_mapped_bytes,
+            estimate.additional_owned_bytes,
+        ))
+    }
+
+    fn commit_allocation_ranges(
+        &self,
+        ranges: &[onnx_runtime_ep_api::DeviceCommitRange<'_>],
+    ) -> Result<()> {
+        let Some(arena) = self.vmm.get() else {
+            for range in ranges {
+                self.commit_allocation_range(range.buffer, range.offset, range.bytes)?;
+            }
+            return Ok(());
+        };
+        let spans = ranges
+            .iter()
+            .map(|range| {
+                std::ptr::NonNull::new(range.buffer.as_ptr() as *mut u8)
+                    .map(|ptr| (ptr, range.buffer.len(), range.offset, range.bytes))
+                    .ok_or_else(|| {
+                        EpError::KernelFailed("cuda_ep: device buffer has a null pointer".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        arena
+            .try_commit_spans(&spans, u64::MAX)
+            .map(|_| ())
+            .map_err(|error| EpError::KernelFailed(error.to_string()))
+    }
+
     fn request_mapped_growth(
         &self,
         holder: onnx_runtime_memory_governor::HolderId,
         required_owned_bytes: u64,
         required_mapped_bytes: u64,
-    ) -> Result<onnx_runtime_memory_governor::MappedGrowthReport> {
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
         let Some(governor) = self.governor.as_ref() else {
-            return Ok(onnx_runtime_memory_governor::MappedGrowthReport::default());
+            return Ok(None);
         };
+        let available = governor.available(onnx_runtime_memory_governor::Tier::Device);
         let conservative_required_bytes = required_owned_bytes.max(required_mapped_bytes);
-        let shortage = conservative_required_bytes
-            .saturating_sub(governor.available(onnx_runtime_memory_governor::Tier::Device));
+        let shortage = conservative_required_bytes.saturating_sub(available);
+        eprintln!(
+            "cuda_ep: native CUDA KV growth preflight: \
+             requested_owned_bytes={required_owned_bytes} \
+             requested_mapped_bytes={required_mapped_bytes} \
+             authority_available_bytes={available} reclaim_bytes={shortage}"
+        );
         if shortage == 0 {
-            return Ok(onnx_runtime_memory_governor::MappedGrowthReport::default());
+            return Ok(None);
         }
-        match governor.request_mapped_growth(
+        match governor.prepare_mapped_growth(
             onnx_runtime_memory_governor::Tier::Device,
             holder,
             shortage,
         ) {
-            Ok(report) => {
+            Ok(grant) => {
+                let report = grant.report();
                 let stats =
                     governor.mapped_reclaim_stats(onnx_runtime_memory_governor::Tier::Device);
                 eprintln!(
@@ -825,7 +895,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                     stats.mapped_allowance_bytes,
                     stats.reclaimable_mapped_bytes,
                 );
-                Ok(report)
+                Ok(Some(grant))
             }
             Err(error) => {
                 let stats =

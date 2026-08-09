@@ -97,7 +97,7 @@ pub fn vmm_enabled() -> bool {
     })
 }
 
-fn physical_handle_pool_bytes() -> Option<usize> {
+pub fn configured_physical_handle_pool_bytes() -> Option<usize> {
     std::env::var(CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -106,7 +106,7 @@ fn physical_handle_pool_bytes() -> Option<usize> {
 
 /// Whether VMM allocations use the authority-owned production handle pool.
 pub fn production_physical_pool_enabled() -> bool {
-    vmm_enabled() && physical_handle_pool_bytes().is_some()
+    vmm_enabled() && configured_physical_handle_pool_bytes().is_some()
 }
 /// The device tier name used in errors raised before a governor is consulted.
 const TIER: &str = "device";
@@ -439,6 +439,12 @@ pub struct SpanCommit {
     pub newly_mapped_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchCommitEstimate {
+    pub additional_owned_bytes: u64,
+    pub additional_mapped_bytes: u64,
+}
+
 /// Device memory carved out of one reserved address range, with physical
 /// granules mapped on demand and charged to a [`MemoryGovernor`].
 pub struct CudaVmmAllocator {
@@ -548,7 +554,7 @@ impl CudaVmmAllocator {
                 capacity,
                 holder,
                 role,
-                pool_bytes: physical_handle_pool_bytes(),
+                pool_bytes: configured_physical_handle_pool_bytes(),
                 teardown_synchronizer: None,
             },
             &private,
@@ -564,6 +570,30 @@ impl CudaVmmAllocator {
         role: MemoryRole,
         teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
     ) -> Result<Self, MemoryError> {
+        Self::standalone_with_teardown_synchronizer_and_pool(
+            context,
+            device,
+            device_ordinal,
+            capacity,
+            holder,
+            role,
+            configured_physical_handle_pool_bytes(),
+            teardown_synchronizer,
+        )
+    }
+
+    /// Construct a standalone arena with an explicitly selected physical pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn standalone_with_teardown_synchronizer_and_pool(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        holder: HolderId,
+        role: MemoryRole,
+        pool_bytes: Option<usize>,
+        teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+    ) -> Result<Self, MemoryError> {
         let private = onnx_runtime_memory_governor::LedgerGovernor::new(
             onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
         );
@@ -575,7 +605,7 @@ impl CudaVmmAllocator {
                 capacity,
                 holder,
                 role,
-                pool_bytes: physical_handle_pool_bytes(),
+                pool_bytes,
                 teardown_synchronizer: Some(teardown_synchronizer),
             },
             &private,
@@ -653,7 +683,7 @@ impl CudaVmmAllocator {
                 capacity,
                 holder,
                 role,
-                pool_bytes: physical_handle_pool_bytes(),
+                pool_bytes: configured_physical_handle_pool_bytes(),
                 teardown_synchronizer: None,
             },
             governor,
@@ -671,6 +701,32 @@ impl CudaVmmAllocator {
         role: MemoryRole,
         teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
     ) -> Result<Self, MemoryError> {
+        Self::new_with_teardown_synchronizer_and_pool(
+            context,
+            device,
+            device_ordinal,
+            capacity,
+            governor,
+            holder,
+            role,
+            configured_physical_handle_pool_bytes(),
+            teardown_synchronizer,
+        )
+    }
+
+    /// Construct a governed arena with an explicitly selected physical pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_teardown_synchronizer_and_pool(
+        context: Arc<CudaContext>,
+        device: DeviceKey,
+        device_ordinal: i32,
+        capacity: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+        pool_bytes: Option<usize>,
+        teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+    ) -> Result<Self, MemoryError> {
         Self::build(
             VmmConstruction {
                 context,
@@ -679,7 +735,7 @@ impl CudaVmmAllocator {
                 capacity,
                 holder,
                 role,
-                pool_bytes: physical_handle_pool_bytes(),
+                pool_bytes,
                 teardown_synchronizer: Some(teardown_synchronizer),
             },
             governor,
@@ -957,6 +1013,63 @@ impl CudaVmmAllocator {
             .filter(|&granule| arena.spans.granule_refs[granule] == 0)
             .count()
             .saturating_mul(arena.spans.granularity) as u64)
+    }
+
+    pub fn incremental_bytes_for_spans(
+        &self,
+        spans: &[(NonNull<u8>, usize, usize, usize)],
+    ) -> Result<BatchCommitEstimate, MemoryError> {
+        let arena = self.lock();
+        let mut unique = BTreeSet::new();
+        for &(ptr, allocation_bytes, byte_offset, bytes) in spans {
+            let (_, granules) =
+                self.uncommitted_granules(&arena, ptr, allocation_bytes, byte_offset, bytes)?;
+            unique.extend(granules);
+        }
+        let handles = unique
+            .iter()
+            .filter(|&&granule| arena.spans.granule_refs[granule] == 0)
+            .count();
+        Ok(BatchCommitEstimate {
+            additional_owned_bytes: self.backing.incremental_owned_bytes_for_handles(handles),
+            additional_mapped_bytes: handles.saturating_mul(arena.spans.granularity) as u64,
+        })
+    }
+
+    pub fn try_commit_spans(
+        &self,
+        spans: &[(NonNull<u8>, usize, usize, usize)],
+        max_additional_owned_bytes: u64,
+    ) -> Result<SpanCommit, MemoryError> {
+        let mut arena = self.lock();
+        let mut by_allocation = std::collections::BTreeMap::<usize, BTreeSet<usize>>::new();
+        for &(ptr, allocation_bytes, byte_offset, bytes) in spans {
+            let (offset, granules) =
+                self.uncommitted_granules(&arena, ptr, allocation_bytes, byte_offset, bytes)?;
+            by_allocation.entry(offset).or_default().extend(granules);
+        }
+        let mut occurrences = std::collections::BTreeMap::<usize, usize>::new();
+        for granules in by_allocation.values() {
+            for &granule in granules {
+                *occurrences.entry(granule).or_default() += 1;
+            }
+        }
+        let unique = occurrences.keys().copied().collect::<BTreeSet<_>>();
+        let (claimed, commit) =
+            self.claim_granules_limited(&mut arena, unique, max_additional_owned_bytes)?;
+        for (&granule, &count) in &occurrences {
+            if count > 1 {
+                arena.spans.granule_refs[granule] = arena.spans.granule_refs[granule]
+                    .saturating_add(u32::try_from(count - 1).unwrap_or(u32::MAX));
+            }
+        }
+        for (offset, granules) in by_allocation {
+            if let Some(live) = arena.spans.live.get_mut(&offset) {
+                live.committed.extend(granules);
+            }
+        }
+        debug_assert_eq!(claimed, occurrences.keys().copied().collect());
+        Ok(commit)
     }
 
     /// Atomically check physical headroom and commit a live allocation span.

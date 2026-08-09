@@ -76,6 +76,52 @@ fn reserving_an_arena_charges_nothing() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn batched_preflight_unions_two_allocations_in_one_granule() {
+    let (allocator, _) = allocator(64 << 20, 8 << 30);
+    let first = allocator
+        .allocate_committed(4096, 256, &[])
+        .expect("first reservation");
+    let second = allocator
+        .allocate_committed(4096, 256, &[])
+        .expect("second reservation");
+
+    let first_mapped = allocator
+        .incremental_mapped_bytes_for_span(first, 4096, 0, 4096)
+        .unwrap();
+    let second_mapped = allocator
+        .incremental_mapped_bytes_for_span(second, 4096, 0, 4096)
+        .unwrap();
+    let batch = allocator
+        .incremental_bytes_for_spans(&[(first, 4096, 0, 4096), (second, 4096, 0, 4096)])
+        .unwrap();
+
+    assert_eq!(first_mapped, second_mapped);
+    assert_eq!(batch.additional_mapped_bytes, first_mapped);
+    assert_eq!(
+        first_mapped + second_mapped,
+        batch.additional_mapped_bytes * 2
+    );
+    let commit = allocator
+        .try_commit_spans(&[(first, 4096, 0, 4096), (second, 4096, 0, 4096)], u64::MAX)
+        .unwrap();
+    assert_eq!(commit.newly_mapped_bytes, first_mapped);
+    assert_eq!(allocator.committed_and_reserved().0 as u64, first_mapped);
+
+    // SAFETY: both pointers were allocated above by this allocator with these
+    // exact layouts and have not previously been deallocated.
+    unsafe {
+        allocator.deallocate(first, 4096, 256);
+        assert_eq!(allocator.committed_and_reserved().0 as u64, first_mapped);
+        allocator.deallocate(second, 4096, 256);
+    }
+    assert_eq!(allocator.committed_and_reserved().0, 0);
+}
+
 /// A single allocation commits one granule and the ledger is told about it.
 #[cfg_attr(
     not(feature = "gpu-tests"),
