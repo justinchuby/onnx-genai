@@ -710,6 +710,7 @@ struct ResidencyInner {
     policy: WeightResidencyPolicy,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
     mapped_allowance: Option<onnx_runtime_memory_governor::MappedAllowance>,
+    reclaim_registration: Option<onnx_runtime_memory_governor::ReclaimRegistration>,
     /// The governor grant this budget came from, when it came from one.
     ///
     /// Held for its `Drop`: releasing the lease is how the tier learns these
@@ -922,6 +923,7 @@ impl CudaWeightResidency {
                 lease: None,
                 pages: HashMap::new(),
                 mapped_allowance: None,
+                reclaim_registration: None,
                 admission_no_progress: 0,
             }),
         }
@@ -970,6 +972,7 @@ impl CudaWeightResidency {
                 lease: Some(lease),
                 pages: HashMap::new(),
                 mapped_allowance: None,
+                reclaim_registration: None,
                 admission_no_progress: 0,
             }),
         })
@@ -1050,6 +1053,7 @@ impl CudaWeightResidency {
             }
             return Ok(inner.policy.budget);
         }
+
         let requested = {
             let inner = self.inner.lock().expect("residency lock poisoned");
             if inner.lease.is_some() {
@@ -1070,6 +1074,34 @@ impl CudaWeightResidency {
         inner.lease = Some(lease);
         replace_global_budget(old, granted);
         Ok(granted)
+    }
+
+    pub fn register_reclaimable(
+        self: &Arc<Self>,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+    ) -> Result<(), onnx_runtime_memory_governor::MemoryError> {
+        let allowance = {
+            let inner = self.lock();
+            if inner.reclaim_registration.is_some() {
+                return Ok(());
+            }
+            inner.mapped_allowance.clone().ok_or(
+                onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    tier: onnx_runtime_memory_governor::Tier::Device.name(),
+                    requested: 0,
+                    reason: "weight residency must adopt a mapped allowance before reclaim registration",
+                },
+            )?
+        };
+        let participant: Arc<dyn onnx_runtime_memory_governor::ReclaimableMappedHolder> =
+            self.clone();
+        let registration = governor.register_reclaimable_mapped_holder(participant, allowance)?;
+        self.lock().reclaim_registration = Some(registration);
+        Ok(())
+    }
+
+    pub fn has_mapped_allowance(&self) -> bool {
+        self.lock().mapped_allowance.is_some()
     }
 
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
@@ -1591,6 +1623,76 @@ impl CudaWeightResidency {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl onnx_runtime_memory_governor::ReclaimableMappedHolder for CudaWeightResidency {
+    fn holder_id(&self) -> onnx_runtime_memory_governor::HolderId {
+        self.lock().mapped_allowance.as_ref().map_or(
+            onnx_runtime_memory_governor::HolderId::new(0),
+            |allowance| allowance.holder(),
+        )
+    }
+
+    fn priority(&self) -> onnx_runtime_memory_governor::ReclaimPriority {
+        onnx_runtime_memory_governor::ReclaimPriority(0)
+    }
+
+    fn mapped_bytes(&self) -> u64 {
+        self.lock().mapped_allowance.as_ref().map_or(
+            0,
+            onnx_runtime_memory_governor::MappedAllowance::mapped_bytes,
+        )
+    }
+
+    fn reclaim(
+        &self,
+        target_mapped_bytes: u64,
+    ) -> Result<
+        onnx_runtime_memory_governor::ReleaseReport,
+        onnx_runtime_memory_governor::MemoryError,
+    > {
+        let before = self.mapped_bytes();
+        if before <= target_mapped_bytes {
+            return Ok(onnx_runtime_memory_governor::ReleaseReport {
+                before_bytes: before,
+                target_bytes: target_mapped_bytes,
+                after_bytes: before,
+            });
+        }
+        self.runtime.synchronize().map_err(|error| {
+            onnx_runtime_memory_governor::MemoryError::AllocationFailed {
+                tier: onnx_runtime_memory_governor::Tier::Device.name(),
+                requested: before - target_mapped_bytes,
+                reason: format!("cannot synchronize before weight reclaim: {error}"),
+            }
+        })?;
+        let mut inner = self.lock();
+        let allowance = inner.mapped_allowance.clone().ok_or(
+            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                tier: onnx_runtime_memory_governor::Tier::Device.name(),
+                requested: before - target_mapped_bytes,
+                reason: "weight residency has no mapped allowance to reclaim",
+            },
+        )?;
+        let max_attempts = inner.pages.len();
+        let mut attempts = 0usize;
+        while allowance.mapped_bytes() > target_mapped_bytes && attempts < max_attempts {
+            let Some(key) = inner.next_evictable_key(WeightEvictionPolicy::Lru) else {
+                break;
+            };
+            let prior = allowance.mapped_bytes();
+            inner.remove_page(key);
+            attempts += 1;
+            if allowance.mapped_bytes() >= prior {
+                inner.admission_no_progress = inner.admission_no_progress.saturating_add(1);
+            }
+        }
+        Ok(onnx_runtime_memory_governor::ReleaseReport {
+            before_bytes: before,
+            target_bytes: target_mapped_bytes,
+            after_bytes: allowance.mapped_bytes(),
+        })
     }
 }
 

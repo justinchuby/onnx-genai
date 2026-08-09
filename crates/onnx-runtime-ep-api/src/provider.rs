@@ -515,6 +515,33 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Incremental mapped and authority-owned bytes needed to commit a range.
+    fn incremental_commit_bytes(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(u64, u64)> {
+        let _ = (buffer, offset, bytes);
+        Ok((0, 0))
+    }
+
+    /// Reclaim reloadable mappings before growing non-recomputable device state.
+    fn request_mapped_growth(
+        &self,
+        holder: onnx_runtime_memory_governor::HolderId,
+        required_owned_bytes: u64,
+        required_mapped_bytes: u64,
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthReport> {
+        let _ = (holder, required_owned_bytes, required_mapped_bytes);
+        Ok(onnx_runtime_memory_governor::MappedGrowthReport::default())
+    }
+
+    /// Authority-owned physical bytes currently retained by this provider.
+    fn device_owned_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Release physical backing from a byte range in an existing allocation
     /// while preserving its virtual address. Eager providers keep the default
     /// no-op; lazy providers use this for transactional growth rollback.

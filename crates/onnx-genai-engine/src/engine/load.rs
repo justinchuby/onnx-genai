@@ -1178,17 +1178,9 @@ fn reconcile_cuda_offload_budget_after_native_load(
         return Ok(Some(resolution.policy));
     }
 
-    let (native_kv_bytes, native_kv_tier) = match max_context {
-        Some(max_context) => native_session
-            .kv_reservation(max_context)
-            .context("sizing native CUDA KV before deriving the weight-offload budget")?,
-        None => (0, onnx_runtime_memory_governor::Tier::Device),
-    };
-    let native_kv_device_bytes = if native_kv_tier == onnx_runtime_memory_governor::Tier::Device {
-        native_kv_bytes
-    } else {
-        0
-    };
+    let native_kv_device_bytes = native_session
+        .cuda_kv_debug_stats()
+        .map_or(0, |stats| stats.kv_committed_bytes as u64);
     let (recurrent_state_bytes, recurrent_tier) = native_session
         .recurrent_state_reservation()
         .context("sizing native CUDA recurrent state before deriving the weight-offload budget")?;
@@ -1197,10 +1189,29 @@ fn reconcile_cuda_offload_budget_after_native_load(
     } else {
         0
     };
-    let required_device_non_weight_bytes =
-        native_kv_device_bytes.saturating_add(recurrent_device_bytes);
+    let actual_owned_device_bytes = native_session
+        .device_owned_bytes()
+        .unwrap_or_else(|| native_kv_device_bytes.saturating_add(recurrent_device_bytes));
+    let measured_fixed_overhead_bytes = actual_owned_device_bytes
+        .saturating_sub(native_kv_device_bytes)
+        .saturating_sub(recurrent_device_bytes);
+    let dynamic_lending = dynamic_kv_weight_lending_enabled();
+    let required_device_non_weight_bytes = if dynamic_lending {
+        actual_owned_device_bytes
+    } else {
+        let full_kv_device_bytes = match max_context {
+            Some(max_context) => {
+                native_session
+                    .kv_reservation(max_context)
+                    .context("sizing static maximum-context native CUDA KV")?
+                    .0
+            }
+            None => 0,
+        };
+        full_kv_device_bytes.saturating_add(recurrent_device_bytes)
+    };
     let available_weight_offload_budget_bytes =
-        resolved_vram_bytes.saturating_sub(required_device_non_weight_bytes);
+        dynamic_weight_mapped_allowance(resolved_vram_bytes, required_device_non_weight_bytes);
     let minimum_useful_weight_budget_bytes = native_session.max_lazy_weight_working_set_bytes();
     let requested_weight_offload_budget_bytes = resolution
         .policy
@@ -1218,7 +1229,7 @@ fn reconcile_cuda_offload_budget_after_native_load(
              model_weight_bytes={model_weight_bytes} resolved_vram_bytes={resolved_vram_bytes} \
              required_device_non_weight_bytes={required_device_non_weight_bytes} \
              native_kv_bytes={native_kv_device_bytes} recurrent_state_bytes={recurrent_device_bytes} \
-             activations_bytes=unknown runtime_overhead_bytes=unknown \
+             measured_fixed_overhead_bytes={measured_fixed_overhead_bytes} \
              minimum_useful_weight_budget_bytes={minimum_useful_weight_budget_bytes} \
              available_weight_offload_budget_bytes={available_weight_offload_budget_bytes} \
              requested_weight_offload_budget_bytes={requested_weight_offload_budget_bytes}"
@@ -1243,6 +1254,8 @@ fn reconcile_cuda_offload_budget_after_native_load(
             required_device_non_weight_bytes,
             native_kv_bytes = native_kv_device_bytes,
             recurrent_state_bytes = recurrent_device_bytes,
+            measured_fixed_overhead_bytes,
+            dynamic_lending,
             minimum_useful_weight_budget_bytes,
             offload_device_budget_bytes = adopted,
             "enabled CUDA weight offload because model weights exceed the VRAM limit"
@@ -1250,6 +1263,33 @@ fn reconcile_cuda_offload_budget_after_native_load(
     }
 
     Ok(Some(resolution.policy))
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn dynamic_weight_mapped_allowance(limit_bytes: u64, actual_owned_bytes: u64) -> u64 {
+    limit_bytes.saturating_sub(actual_owned_bytes)
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn dynamic_kv_weight_lending_enabled() -> bool {
+    std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING")
+        .ok()
+        .is_none_or(|value| !matches!(value.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+}
+
+#[cfg(all(test, feature = "cuda", feature = "native-backend"))]
+mod dynamic_lending_tests {
+    use super::dynamic_weight_mapped_allowance;
+
+    #[test]
+    fn weight_allowance_subtracts_actual_initial_ownership_not_max_context_kv() {
+        const LIMIT: u64 = 6_000_000_000;
+        const OLD_STATIC_ALLOWANCE: u64 = 4_389_387_264;
+        let actual_initial_owned = 512 << 20;
+        let allowance = dynamic_weight_mapped_allowance(LIMIT, actual_initial_owned);
+        assert_eq!(allowance, LIMIT - actual_initial_owned);
+        assert!(allowance > OLD_STATIC_ALLOWANCE);
+    }
 }
 
 fn fail_explicit_vram_limit_without_offload(

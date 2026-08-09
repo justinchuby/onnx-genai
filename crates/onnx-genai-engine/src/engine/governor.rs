@@ -493,6 +493,11 @@ impl EngineResourceGovernor {
         let limit = self
             .memory
             .available(onnx_runtime_memory_governor::Tier::Device)
+            .saturating_add(
+                self.memory
+                    .mapped_reclaim_stats(onnx_runtime_memory_governor::Tier::Device)
+                    .reclaimable_mapped_bytes,
+            )
             .saturating_add(kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed));
         onnx_genai_scheduler::ByteBudget::new(limit).with_ceiling(std::sync::Arc::new(
             LedgerAdmissionCeiling {
@@ -546,6 +551,11 @@ impl onnx_genai_scheduler::AdmissionCeiling for LedgerAdmissionCeiling {
         use onnx_runtime_memory_governor::MemoryGovernor as _;
         self.memory
             .available(onnx_runtime_memory_governor::Tier::Device)
+            .saturating_add(
+                self.memory
+                    .mapped_reclaim_stats(onnx_runtime_memory_governor::Tier::Device)
+                    .reclaimable_mapped_bytes,
+            )
             .saturating_add(
                 self.kv_pool_bytes
                     .load(std::sync::atomic::Ordering::Relaxed),

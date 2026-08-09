@@ -2,8 +2,9 @@ use std::{fmt, sync::Arc};
 
 use onnx_genai_scheduler::ResourceLimit;
 use onnx_runtime_memory_governor::{
-    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MemoryAuthorityId,
-    MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthReport,
+    MappedReclaimStats, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
+    ReclaimRegistration, ReclaimableMappedHolder, Tier,
 };
 
 /// Physical-device compatibility domain for a shared device memory authority.
@@ -67,6 +68,10 @@ impl DeviceMemoryAuthority {
 
     pub fn headroom_bytes(&self) -> u64 {
         self.governor.available(Tier::Device)
+    }
+
+    pub fn mapped_reclaim_stats(&self) -> MappedReclaimStats {
+        self.governor.mapped_reclaim_stats(Tier::Device)
     }
 
     pub fn pause_reconfiguration(&self) -> onnx_runtime_memory_governor::LeaseLimitGuard<'_> {
@@ -171,6 +176,28 @@ impl MemoryGovernor for DeviceMemoryAuthority {
             .reserve_mapped_allowance(tier, bytes, role, holder)
     }
 
+    fn register_reclaimable_mapped_holder(
+        &self,
+        participant: Arc<dyn ReclaimableMappedHolder>,
+        allowance: MappedAllowance,
+    ) -> Result<ReclaimRegistration, MemoryError> {
+        self.governor
+            .register_reclaimable_mapped_holder(participant, allowance)
+    }
+
+    fn request_mapped_growth(
+        &self,
+        tier: Tier,
+        requester: HolderId,
+        bytes: u64,
+    ) -> Result<MappedGrowthReport, MemoryError> {
+        self.governor.request_mapped_growth(tier, requester, bytes)
+    }
+
+    fn mapped_reclaim_stats(&self, tier: Tier) -> MappedReclaimStats {
+        self.governor.mapped_reclaim_stats(tier)
+    }
+
     fn available(&self, tier: Tier) -> u64 {
         self.governor.available(tier)
     }
@@ -267,6 +294,31 @@ impl MemoryGovernor for EngineMemoryGovernor {
     ) -> Result<MappedAllowance, MemoryError> {
         self.governor(tier)
             .reserve_mapped_allowance(tier, bytes, role, holder)
+    }
+
+    fn register_reclaimable_mapped_holder(
+        &self,
+        participant: Arc<dyn ReclaimableMappedHolder>,
+        allowance: MappedAllowance,
+    ) -> Result<ReclaimRegistration, MemoryError> {
+        self.device
+            .register_reclaimable_mapped_holder(participant, allowance)
+    }
+
+    fn request_mapped_growth(
+        &self,
+        tier: Tier,
+        requester: HolderId,
+        bytes: u64,
+    ) -> Result<MappedGrowthReport, MemoryError> {
+        match tier {
+            Tier::Device => self.device.request_mapped_growth(tier, requester, bytes),
+            _ => self.local.request_mapped_growth(tier, requester, bytes),
+        }
+    }
+
+    fn mapped_reclaim_stats(&self, tier: Tier) -> MappedReclaimStats {
+        self.governor(tier).mapped_reclaim_stats(tier)
     }
 
     fn available(&self, tier: Tier) -> u64 {

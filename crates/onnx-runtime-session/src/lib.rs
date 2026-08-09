@@ -1440,6 +1440,21 @@ impl InferenceSession {
         Ok(self.exec.set_weight_residency_budget(budget_bytes)?)
     }
 
+    pub fn request_mapped_growth(
+        &self,
+        holder: onnx_runtime_memory_governor::HolderId,
+        required_owned_bytes: u64,
+        required_mapped_bytes: u64,
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthReport> {
+        Ok(self
+            .exec
+            .request_mapped_growth(holder, required_owned_bytes, required_mapped_bytes)?)
+    }
+
+    pub fn device_owned_bytes(&self) -> Option<u64> {
+        self.exec.device_owned_bytes()
+    }
+
     pub fn max_lazy_weight_working_set_bytes(&self) -> u64 {
         self.exec.max_lazy_weight_working_set_bytes()
     }

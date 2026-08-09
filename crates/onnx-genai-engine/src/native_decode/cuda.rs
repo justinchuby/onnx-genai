@@ -1275,11 +1275,12 @@ impl DecodeCudaState {
             let old_capacity = self.max_len;
             let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
             let valid_len = self.logical_len;
-            self.commit_vmm_growth(new_capacity).map_err(|error| {
-                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
-                    .map_err(|error| error.to_string());
-                self.growth_failed_error(old_capacity, new_capacity, error, memory)
-            })?;
+            self.commit_vmm_growth(session, new_capacity)
+                .map_err(|error| {
+                    let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                        .map_err(|error| error.to_string());
+                    self.growth_failed_error(old_capacity, new_capacity, error, memory)
+                })?;
             native_cuda_device_barrier(session)?;
             self.apply_vmm_growth(new_capacity, valid_len)?;
             self.invalidate_graph(session)?;
@@ -1334,9 +1335,43 @@ impl DecodeCudaState {
     /// the old shapes and hold the old layout. Extra committed granules are
     /// only installed after their lease succeeds, so the governor remains the
     /// single source of memory truth.
-    fn commit_vmm_growth(&mut self, new_capacity: usize) -> anyhow::Result<()> {
+    fn commit_vmm_growth(
+        &mut self,
+        session: &InferenceSession,
+        new_capacity: usize,
+    ) -> anyhow::Result<()> {
         let mut committed: Vec<(usize, usize, usize)> = Vec::new();
         let kv_indices = self.kv_binding_range.clone().collect::<Vec<_>>();
+        let mut required_mapped_bytes = 0u64;
+        let mut required_owned_bytes = 0u64;
+        for &index in &kv_indices {
+            let binding = &self.bindings[index];
+            let mut new_shape = binding.physical_shape().to_vec();
+            new_shape[2] = new_capacity;
+            let bytes = checked_shape_bytes(&new_shape, binding.dtype).with_context(|| {
+                format!(
+                    "VMM-backed CUDA KV '{}' growth size overflows for shape {:?}",
+                    binding.input_name(),
+                    new_shape
+                )
+            })?;
+            let (mapped, owned) = binding.incremental_commit_bytes(0, bytes)?;
+            required_mapped_bytes = required_mapped_bytes.saturating_add(mapped);
+            required_owned_bytes = required_owned_bytes.saturating_add(owned);
+        }
+        let mask_bytes = new_capacity
+            .checked_mul(std::mem::size_of::<i64>())
+            .with_context(|| {
+                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
+            })?;
+        let (mapped, owned) = self.bindings[0].incremental_commit_bytes(0, mask_bytes)?;
+        required_mapped_bytes = required_mapped_bytes.saturating_add(mapped);
+        required_owned_bytes = required_owned_bytes.saturating_add(owned);
+        session.request_mapped_growth(
+            onnx_runtime_memory_governor::HolderId::new(8),
+            required_owned_bytes,
+            required_mapped_bytes,
+        )?;
         for index in kv_indices {
             let binding = &mut self.bindings[index];
             let mut new_shape = binding.physical_shape().to_vec();
@@ -1369,11 +1404,6 @@ impl DecodeCudaState {
             }
             committed.push((index, old_bytes, bytes.saturating_sub(old_bytes)));
         }
-        let mask_bytes = new_capacity
-            .checked_mul(std::mem::size_of::<i64>())
-            .with_context(|| {
-                format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
-            })?;
         let old_mask_bytes =
             checked_shape_bytes(self.bindings[0].physical_shape(), DataType::Int64).with_context(
                 || {

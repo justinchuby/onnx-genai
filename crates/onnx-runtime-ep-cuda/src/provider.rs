@@ -85,6 +85,7 @@ pub struct CudaExecutionProvider {
     offload_policy: DeviceOffloadPolicy,
     /// LRU device residency cache. `Some` iff `offload_policy.enabled`.
     residency: Option<Arc<CudaWeightResidency>>,
+    governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -233,6 +234,7 @@ impl CudaExecutionProvider {
             csa_metrics,
             offload_policy,
             residency,
+            governor: governor.clone(),
         };
         if let (Some(residency), Some(arena), Some(governor)) =
             (provider.residency.as_ref(), provider.vmm.get(), governor)
@@ -767,6 +769,90 @@ impl ExecutionProvider for CudaExecutionProvider {
             })
     }
 
+    fn incremental_commit_bytes(
+        &self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(u64, u64)> {
+        let Some(arena) = self.vmm.get() else {
+            return Ok((0, 0));
+        };
+        let ptr = std::ptr::NonNull::new(buffer.as_ptr() as *mut u8).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep: device buffer has a null pointer".into())
+        })?;
+        let mapped = arena
+            .incremental_mapped_bytes_for_span(ptr, buffer.len(), offset, bytes)
+            .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+        let owned = arena
+            .incremental_owned_bytes_for_span(ptr, buffer.len(), offset, bytes)
+            .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+        Ok((mapped, owned))
+    }
+
+    fn request_mapped_growth(
+        &self,
+        holder: onnx_runtime_memory_governor::HolderId,
+        required_owned_bytes: u64,
+        required_mapped_bytes: u64,
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthReport> {
+        let Some(governor) = self.governor.as_ref() else {
+            return Ok(onnx_runtime_memory_governor::MappedGrowthReport::default());
+        };
+        let conservative_required_bytes = required_owned_bytes.max(required_mapped_bytes);
+        let shortage = conservative_required_bytes
+            .saturating_sub(governor.available(onnx_runtime_memory_governor::Tier::Device));
+        if shortage == 0 {
+            return Ok(onnx_runtime_memory_governor::MappedGrowthReport::default());
+        }
+        match governor.request_mapped_growth(
+            onnx_runtime_memory_governor::Tier::Device,
+            holder,
+            shortage,
+        ) {
+            Ok(report) => {
+                let stats =
+                    governor.mapped_reclaim_stats(onnx_runtime_memory_governor::Tier::Device);
+                eprintln!(
+                    "cuda_ep: reclaimed weight mappings before native CUDA KV growth: \
+                     requested_owned_bytes={required_owned_bytes} \
+                     requested_mapped_bytes={required_mapped_bytes} \
+                     reclaimed_bytes={} reclaim_attempts={} reclaim_failures={} \
+                     weight_mapped_allowance_bytes={} weight_mapped_bytes={}",
+                    report.reclaimed_bytes,
+                    stats.reclaim_attempts,
+                    stats.reclaim_failures,
+                    stats.mapped_allowance_bytes,
+                    stats.reclaimable_mapped_bytes,
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                let stats =
+                    governor.mapped_reclaim_stats(onnx_runtime_memory_governor::Tier::Device);
+                eprintln!(
+                    "cuda_ep: native CUDA KV growth could not reclaim enough weight mappings: \
+                     requested_owned_bytes={required_owned_bytes} \
+                     requested_mapped_bytes={required_mapped_bytes} \
+                     reclaim_attempts={} reclaim_failures={} weight_mapped_allowance_bytes={} \
+                     weight_mapped_bytes={} error={error}",
+                    stats.reclaim_attempts,
+                    stats.reclaim_failures,
+                    stats.mapped_allowance_bytes,
+                    stats.reclaimable_mapped_bytes,
+                );
+                Err(EpError::KernelFailed(error.to_string()))
+            }
+        }
+    }
+
+    fn device_owned_bytes(&self) -> Option<u64> {
+        self.vmm
+            .get()
+            .and_then(|arena| arena.physical_pool_stats())
+            .map(|stats| stats.snapshot().total_owned_bytes)
+    }
+
     fn decommit_allocation_range(
         &self,
         buffer: &DeviceBuffer,
@@ -1133,6 +1219,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         };
         residency
             .adopt_governed_budget(governor, tier, holder)
+            .and_then(|bytes| {
+                if !residency.has_mapped_allowance() {
+                    return Ok(bytes);
+                }
+                residency.register_reclaimable(governor)?;
+                Ok(bytes)
+            })
             .map_err(|error| {
                 EpError::KernelFailed(format!(
                     "cuda_ep: the device weight-residency cache holds a budget the governor \

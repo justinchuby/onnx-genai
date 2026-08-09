@@ -268,6 +268,20 @@ impl Executor {
         self.ep.set_weight_residency_budget(budget_bytes)
     }
 
+    pub(crate) fn request_mapped_growth(
+        &self,
+        holder: onnx_runtime_memory_governor::HolderId,
+        required_owned_bytes: u64,
+        required_mapped_bytes: u64,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_memory_governor::MappedGrowthReport> {
+        self.ep
+            .request_mapped_growth(holder, required_owned_bytes, required_mapped_bytes)
+    }
+
+    pub(crate) fn device_owned_bytes(&self) -> Option<u64> {
+        self.ep.device_owned_bytes()
+    }
+
     pub(crate) fn max_lazy_weight_working_set_bytes(&self) -> u64 {
         self.plan
             .iter()

@@ -671,6 +671,10 @@ impl NativeDecodeSession {
         Ok(self.session.set_weight_residency_budget(budget_bytes)?)
     }
 
+    pub fn device_owned_bytes(&self) -> Option<u64> {
+        self.session.device_owned_bytes()
+    }
+
     /// Largest set of lazy weights one native executor node may need resident
     /// at the same time.
     pub fn max_lazy_weight_working_set_bytes(&self) -> u64 {

@@ -572,6 +572,16 @@ impl DeviceIoBinding {
         Ok(())
     }
 
+    pub fn incremental_commit_bytes(&self, byte_offset: usize, bytes: usize) -> Result<(u64, u64)> {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("DeviceIoBinding buffer taken only in Drop");
+        Ok(self
+            .allocator
+            .incremental_commit_bytes(buffer, byte_offset, bytes)?)
+    }
+
     pub fn decommit_range(&mut self, byte_offset: usize, bytes: usize) -> Result<()> {
         let buffer = self
             .buffer
