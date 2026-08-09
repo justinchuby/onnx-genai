@@ -82,6 +82,76 @@ impl std::fmt::Debug for CudaVirtualBacking {
 }
 
 impl CudaVirtualBacking {
+    pub(crate) fn commit_with_owned_limit(
+        &self,
+        reservation: &mut CudaReservation,
+        offset: usize,
+        len: usize,
+        max_additional_owned_bytes: u64,
+    ) -> Result<u64, VirtualMemoryError> {
+        self.bind("committing CUDA memory")?;
+        if let Some(pool) = &self.pool {
+            let granularity = pool.granularity;
+            let mut mapped = Vec::new();
+            let mut additional_owned = 0_u64;
+            for granule_offset in (offset..offset + len).step_by(granularity) {
+                let remaining = max_additional_owned_bytes.saturating_sub(additional_owned);
+                let (handle, created_bytes) = match pool.acquire_with_owned_limit(remaining) {
+                    Ok(acquired) => acquired,
+                    Err(error) => {
+                        rollback_pooled_maps(reservation, pool, &mut mapped);
+                        return Err(error);
+                    }
+                };
+                let address = reservation.base + granule_offset as u64;
+                if let Err(error) = Self::check("cuMemMap", unsafe {
+                    cu::cuMemMap(address, granularity, 0, handle, 0)
+                }) {
+                    let _ = pool.return_after_unmap(handle, false);
+                    rollback_pooled_maps(reservation, pool, &mut mapped);
+                    return Err(error);
+                }
+                pool.note_mapped();
+                mapped.push((granule_offset, granularity, handle));
+                additional_owned = additional_owned.saturating_add(created_bytes);
+
+                let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+                access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+                access.location.id = self.device_ordinal;
+                access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                if let Err(error) = Self::check("cuMemSetAccess", unsafe {
+                    cu::cuMemSetAccess(address, granularity, &access, 1)
+                }) {
+                    rollback_pooled_maps(reservation, pool, &mut mapped);
+                    return Err(error);
+                }
+            }
+            reservation.blocks.extend(mapped);
+            return Ok(additional_owned);
+        }
+
+        let required = len as u64;
+        if required > max_additional_owned_bytes {
+            return Err(VirtualMemoryError::Os {
+                operation: "reserving CUDA physical memory",
+                reason: format!(
+                    "candidate requires {required} incremental committed bytes but only \
+                     {max_additional_owned_bytes} bytes of physical headroom are available"
+                ),
+                code: 0,
+            });
+        }
+        <Self as VirtualBacking>::commit(self, reservation, offset, len)?;
+        Ok(required)
+    }
+
+    pub(crate) fn incremental_owned_bytes_for_handles(&self, handles: usize) -> u64 {
+        self.pool.as_ref().map_or_else(
+            || handles.saturating_mul(self.granularity()) as u64,
+            |pool| pool.incremental_owned_bytes_for_handles(handles),
+        )
+    }
+
     /// Reserve and map in `context`.
     ///
     /// Takes a context rather than the execution provider's full runtime
@@ -394,7 +464,22 @@ impl PhysicalHandlePool {
             })
     }
 
+    pub(crate) fn incremental_owned_bytes_for_handles(&self, handles: usize) -> u64 {
+        let available = self.lock().available.len();
+        handles
+            .saturating_sub(available)
+            .saturating_mul(self.granularity) as u64
+    }
+
     fn acquire(&self) -> Result<cu::CUmemGenericAllocationHandle, VirtualMemoryError> {
+        self.acquire_with_owned_limit(u64::MAX)
+            .map(|(handle, _)| handle)
+    }
+
+    fn acquire_with_owned_limit(
+        &self,
+        max_additional_owned_bytes: u64,
+    ) -> Result<(cu::CUmemGenericAllocationHandle, u64), VirtualMemoryError> {
         let operation = self
             .authority_gate
             .read()
@@ -407,7 +492,7 @@ impl PhysicalHandlePool {
                 .pooled_unmapped_bytes
                 .fetch_sub(self.granularity as u64, Ordering::AcqRel);
             self.counters.pool_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(handle);
+            return Ok((handle, 0));
         }
         drop(operation);
 
@@ -415,6 +500,27 @@ impl PhysicalHandlePool {
             .lease_checkout
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = {
+            let mut state = self.lock();
+            state.available.pop()
+        } {
+            self.counters
+                .pooled_unmapped_bytes
+                .fetch_sub(self.granularity as u64, Ordering::AcqRel);
+            self.counters.pool_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok((handle, 0));
+        }
+        if self.granularity as u64 > max_additional_owned_bytes {
+            return Err(VirtualMemoryError::Os {
+                operation: "reserving pooled CUDA physical memory",
+                reason: format!(
+                    "candidate requires {} incremental committed bytes but only \
+                     {max_additional_owned_bytes} bytes of physical headroom are available",
+                    self.granularity
+                ),
+                code: 0,
+            });
+        }
         let mut lease = {
             let mut state = self.lock();
             state.lease.take().ok_or_else(|| VirtualMemoryError::Os {
@@ -458,7 +564,7 @@ impl PhysicalHandlePool {
         self.counters
             .total_owned_bytes
             .fetch_add(self.granularity as u64, Ordering::AcqRel);
-        Ok(handle)
+        Ok((handle, self.granularity as u64))
     }
 
     fn shrink_lease_or_defer(&self, bytes: u64) {
@@ -603,6 +709,24 @@ pub fn pooled_unmapped_bytes_for_authority(authority: MemoryAuthorityId) -> u64 
         .filter_map(|(_, pool)| pool.upgrade())
         .fold(0_u64, |total, pool| {
             total.saturating_add(pool.counters.pooled_unmapped_bytes.load(Ordering::Acquire))
+        })
+}
+
+/// Process-wide authority-owned bytes across live physical-handle pools.
+///
+/// Each compatible pool appears once in the registry, so this is a sum rather
+/// than a last-writer gauge.
+pub fn total_physical_pool_owned_bytes() -> u64 {
+    let registry = PHYSICAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, pool| pool.strong_count() > 0);
+    registry
+        .values()
+        .filter_map(Weak::upgrade)
+        .fold(0_u64, |total, pool| {
+            total.saturating_add(pool.counters.total_owned_bytes.load(Ordering::Acquire))
         })
 }
 

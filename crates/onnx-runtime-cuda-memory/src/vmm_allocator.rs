@@ -421,6 +421,19 @@ pub struct VmmAdoption {
     pub unaccounted_bytes: u64,
 }
 
+/// Result of atomically admitting physical backing for an existing VMM span.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpanCommit {
+    /// Physical bytes newly owned by the shared backing pool.
+    ///
+    /// Mapping a retained pool handle reports zero because that physical
+    /// memory was already authority-owned. Creating a handle reports one
+    /// allocation granule.
+    pub additional_owned_bytes: u64,
+    /// Bytes newly mapped into this allocation.
+    pub newly_mapped_bytes: u64,
+}
+
 /// Device memory carved out of one reserved address range, with physical
 /// granules mapped on demand and charged to a [`MemoryGovernor`].
 pub struct CudaVmmAllocator {
@@ -771,8 +784,19 @@ impl CudaVmmAllocator {
         arena: &mut Arena,
         granules: impl IntoIterator<Item = usize>,
     ) -> Result<BTreeSet<usize>, MemoryError> {
+        self.claim_granules_limited(arena, granules, u64::MAX)
+            .map(|(claimed, _)| claimed)
+    }
+
+    fn claim_granules_limited(
+        &self,
+        arena: &mut Arena,
+        granules: impl IntoIterator<Item = usize>,
+        max_additional_owned_bytes: u64,
+    ) -> Result<(BTreeSet<usize>, SpanCommit), MemoryError> {
         let granularity = arena.spans.granularity;
         let mut claimed = BTreeSet::new();
+        let mut commit = SpanCommit::default();
         for granule in granules {
             if !claimed.insert(granule) {
                 continue;
@@ -787,20 +811,32 @@ impl CudaVmmAllocator {
                 return Err(error);
             }
             let offset = granule * granularity;
-            if let Err(error) = self
-                .backing
-                .commit(&mut arena.reservation, offset, granularity)
-            {
-                self.give_back_lease(arena, granularity);
-                claimed.remove(&granule);
-                self.release_granules(arena, &claimed);
-                return Err(invalid(granularity, format!("cuMemMap: {error}")));
-            }
+            let remaining =
+                max_additional_owned_bytes.saturating_sub(commit.additional_owned_bytes);
+            let additional_owned = match self.backing.commit_with_owned_limit(
+                &mut arena.reservation,
+                offset,
+                granularity,
+                remaining,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.give_back_lease(arena, granularity);
+                    claimed.remove(&granule);
+                    self.release_granules(arena, &claimed);
+                    return Err(invalid(granularity, format!("cuMemMap: {error}")));
+                }
+            };
             arena.spans.granule_refs[granule] = 1;
             arena.spans.committed += granularity;
             note_commit(granularity);
+            commit.additional_owned_bytes = commit
+                .additional_owned_bytes
+                .saturating_add(additional_owned);
+            commit.newly_mapped_bytes =
+                commit.newly_mapped_bytes.saturating_add(granularity as u64);
         }
-        Ok(claimed)
+        Ok((claimed, commit))
     }
 
     fn take(&self, arena: &mut Arena, bytes: usize) -> Result<(), MemoryError> {
@@ -863,6 +899,125 @@ impl CudaVmmAllocator {
 
     fn release_committed_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
         self.release_granules(arena, granules);
+    }
+
+    /// Estimate new authority-owned physical bytes needed to back a live span.
+    ///
+    /// This is an observation only. Callers making an admission decision must
+    /// use [`Self::try_commit_span`] for the race-safe check-and-commit.
+    pub fn incremental_owned_bytes_for_span(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<u64, MemoryError> {
+        let arena = self.lock();
+        let (offset, granules) =
+            self.uncommitted_granules(&arena, ptr, allocation_bytes, byte_offset, bytes)?;
+        let _ = offset;
+        let handles = granules
+            .into_iter()
+            .filter(|&granule| arena.spans.granule_refs[granule] == 0)
+            .count();
+        Ok(self.backing.incremental_owned_bytes_for_handles(handles))
+    }
+
+    /// Atomically check physical headroom and commit a live allocation span.
+    ///
+    /// The arena lock fixes the span's granule coverage while the pool checkout
+    /// consumes either an already-owned retained handle (zero incremental
+    /// bytes) or creates a new handle under the authority lease. Concurrent
+    /// allocators can make an estimate stale, but cannot make this transaction
+    /// exceed `max_additional_owned_bytes` or the governor's physical limit.
+    pub fn try_commit_span(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+        bytes: usize,
+        max_additional_owned_bytes: u64,
+    ) -> Result<SpanCommit, MemoryError> {
+        let mut arena = self.lock();
+        let (offset, granules) =
+            self.uncommitted_granules(&arena, ptr, allocation_bytes, byte_offset, bytes)?;
+        let handles = granules
+            .iter()
+            .filter(|&&granule| arena.spans.granule_refs[granule] == 0)
+            .count();
+        let required = self.backing.incremental_owned_bytes_for_handles(handles);
+        if required > max_additional_owned_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "candidate requires {required} incremental committed bytes but only \
+                     {max_additional_owned_bytes} bytes of physical headroom are available"
+                ),
+            ));
+        }
+        let (claimed, commit) =
+            self.claim_granules_limited(&mut arena, granules, max_additional_owned_bytes)?;
+        if let Some(live) = arena.spans.live.get_mut(&offset) {
+            live.committed.extend(claimed);
+        }
+        Ok(commit)
+    }
+
+    fn uncommitted_granules(
+        &self,
+        arena: &Arena,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<(usize, Vec<usize>), MemoryError> {
+        let end = byte_offset.checked_add(bytes).ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                format!("commit range offset {byte_offset} plus {bytes} bytes overflows"),
+            )
+        })?;
+        if end > allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "commit range {byte_offset}..{end} exceeds allocation of {allocation_bytes} bytes"
+                ),
+            ));
+        }
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return Err(invalid(
+                allocation_bytes,
+                "commit pointer is below the VMM arena reservation".to_string(),
+            ));
+        };
+        let Some(live) = arena.spans.live.get(&offset) else {
+            return Err(invalid(
+                allocation_bytes,
+                "commit pointer is not a live VMM allocation".to_string(),
+            ));
+        };
+        if live.len != allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "commit allocation size {allocation_bytes} does not match live VMM allocation size {}",
+                    live.len
+                ),
+            ));
+        }
+        if bytes == 0 {
+            return Ok((offset, Vec::new()));
+        }
+        let absolute = offset + byte_offset..offset + end;
+        let granules = arena
+            .spans
+            .granules(absolute.start, absolute.len())
+            .filter(|granule| !live.committed.contains(granule))
+            .collect();
+        Ok((offset, granules))
     }
 }
 

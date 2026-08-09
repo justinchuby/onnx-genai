@@ -145,7 +145,7 @@ impl CudaExecutionProvider {
                     .with_scan_resistant_dense(offload_policy.scan_resistant_dense),
             )
         });
-        Ok(Self {
+        let provider = Self {
             device: DeviceId::cuda(ordinal),
             memory: Arc::new(crate::device_allocator::CudaDeviceAllocator::new(
                 runtime.cuda_context(),
@@ -233,7 +233,20 @@ impl CudaExecutionProvider {
             csa_metrics,
             offload_policy,
             residency,
-        })
+        };
+        if let (Some(residency), Some(arena), Some(governor)) =
+            (provider.residency.as_ref(), provider.vmm.get(), governor)
+            && arena.physical_pool_authority().is_some()
+        {
+            residency
+                .install_vmm_admission(Arc::clone(arena), governor)
+                .map_err(|error| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: cannot install committed-byte weight admission: {error}"
+                    ))
+                })?;
+        }
+        Ok(provider)
     }
 
     /// The allocator in force: the VMM arena once installed, otherwise the one

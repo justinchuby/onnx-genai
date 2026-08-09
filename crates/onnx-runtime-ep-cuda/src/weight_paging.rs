@@ -17,8 +17,9 @@
 //! page, and async prefetch overlap (issues #82/#87).
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -26,6 +27,7 @@ use onnx_runtime_ep_api::{
     LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource, WeightHandleError,
 };
 use onnx_runtime_ir::DataType;
+use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
 use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 
@@ -57,10 +59,35 @@ static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_CONTENT_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn add_duration(counter: &AtomicU64, elapsed: Duration) {
     let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
     counter.fetch_add(nanos, Ordering::Relaxed);
+}
+
+fn replace_global_budget(old: u64, new: u64) {
+    if new >= old {
+        GLOBAL_BUDGET_BYTES.fetch_add(new - old, Ordering::Relaxed);
+    } else {
+        let decrease = old - new;
+        let _ = GLOBAL_BUDGET_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(decrease))
+        });
+    }
+}
+
+fn committed_admission_fits(required: u64, available: u64) -> bool {
+    required <= available
+}
+
+fn eviction_made_committed_progress(
+    before_owned: u64,
+    after_owned: u64,
+    before_required: u64,
+    after_required: u64,
+) -> bool {
+    after_owned < before_owned || after_required < before_required
 }
 
 /// Snapshot of the process-global weight-offload counters.
@@ -81,6 +108,8 @@ pub struct GlobalOffloadStats {
     pub vram_free_ns: u64,
     pub budget_bytes: u64,
     pub peak_resident_bytes: u64,
+    pub content_resident_bytes: u64,
+    pub physical_owned_bytes: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -101,6 +130,8 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         vram_free_ns: GLOBAL_VRAM_FREE_NS.load(Ordering::Relaxed),
         budget_bytes: GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed),
         peak_resident_bytes: GLOBAL_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed),
+        content_resident_bytes: GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
+        physical_owned_bytes: crate::virtual_memory::total_physical_pool_owned_bytes(),
     }
 }
 
@@ -121,6 +152,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
     GLOBAL_BUDGET_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_PEAK_RESIDENT_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_CONTENT_RESIDENT_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -248,7 +280,12 @@ fn parse_budget_bytes(value: &str) -> Option<u64> {
 /// A snapshot of [`CudaWeightResidency`] activity for observability / tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CudaResidencyStats {
-    /// Budget the cache tries to stay within, in bytes.
+    /// Configured budget in bytes.
+    ///
+    /// With production VMM pooling, admission uses incremental physical bytes
+    /// and the shared governor's headroom. Without VMM, the allocator cannot
+    /// truthfully report physical ownership, so this retains content-byte
+    /// semantics.
     pub budget_bytes: u64,
     /// Bytes currently resident across all cached pages.
     pub resident_bytes: u64,
@@ -262,6 +299,14 @@ pub struct CudaResidencyStats {
     pub hits: u64,
     /// LRU evictions that freed a page's VRAM.
     pub evictions: u64,
+    /// Authority-owned physical bytes for the shared VMM pool.
+    ///
+    /// This is distinct from `resident_bytes`: content can share a granule,
+    /// and an unmapped retained handle remains physically owned.
+    pub physical_owned_bytes: u64,
+    /// Admission passes that stopped because eviction made no physical or
+    /// reusable-pool progress.
+    pub admission_no_progress: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -272,10 +317,16 @@ pub struct CudaResidencyStats {
 /// for a consuming kernel's `TensorView`.
 pub struct CudaWeightPage {
     runtime: Arc<CudaRuntime>,
+    allocation: WeightAllocation,
     ptr: CUdeviceptr,
     len: usize,
     dtype: DataType,
     shape: Vec<usize>,
+}
+
+enum WeightAllocation {
+    Runtime,
+    Vmm(Arc<crate::vmm_allocator::CudaVmmAllocator>),
 }
 
 impl CudaWeightPage {
@@ -298,6 +349,7 @@ impl CudaWeightPage {
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len: bytes.len(),
             dtype,
@@ -349,6 +401,7 @@ impl CudaWeightPage {
         // the source alive until the fence completes.
         let page = Self {
             runtime: Arc::clone(runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len: bytes.len(),
             dtype,
@@ -398,6 +451,7 @@ impl CudaWeightPage {
         add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len,
             dtype,
@@ -492,7 +546,32 @@ impl Drop for CudaWeightPage {
         // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
         // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
         let free_start = std::time::Instant::now();
-        let _ = unsafe { self.runtime.free_raw(self.ptr) };
+        match &self.allocation {
+            WeightAllocation::Runtime => {
+                let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            }
+            WeightAllocation::Vmm(allocator) => {
+                // Unlike cuMemFree, unmapping a VMM span does not implicitly
+                // wait for kernels that still reference its virtual address.
+                // Retire the mapping only after both CUDA streams are idle so
+                // a pooled handle cannot be recycled under in-flight work.
+                if self.runtime.synchronize().is_err()
+                    || self.runtime.copy_stream().synchronize().is_err()
+                {
+                    return;
+                }
+                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
+                    unsafe {
+                        onnx_runtime_memory_governor::DeviceAllocator::deallocate(
+                            allocator.as_ref(),
+                            ptr,
+                            self.len,
+                            256,
+                        );
+                    }
+                }
+            }
+        }
         add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 }
@@ -533,6 +612,7 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         let page = CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len: total,
             dtype: weight.dtype,
@@ -574,6 +654,12 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
 /// [`CudaWeightPage`] is reused with no H2D traffic. When admitting a page would
 /// exceed the VRAM budget, least-recently-used pages are evicted first.
 ///
+/// Production VMM pooling changes the admission unit, not the cache-efficiency
+/// unit: the governor admits incremental authority-owned granules while hit
+/// rate and resident-content metrics continue to count canonical weight bytes.
+/// The non-VMM path intentionally retains content-byte admission until its
+/// allocator can report truthful physical ownership.
+///
 /// Eviction is use-safe: a page is only reclaimed while the cache is its sole
 /// owner (`Arc::strong_count == 1`). A page handed out and still referenced by an
 /// in-flight kernel is never freed, so a paged weight can never be pulled out from
@@ -588,7 +674,13 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
     scan_resistant_dense: bool,
+    physical: OnceLock<PhysicalAdmission>,
     inner: Mutex<ResidencyInner>,
+}
+
+struct PhysicalAdmission {
+    allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+    governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
 }
 
 struct ResidencyInner {
@@ -611,6 +703,7 @@ struct ResidencyInner {
     /// independently, so a caller outliving the cache still outlives the lease.
     /// See `residency_holds_its_lease_until_its_pages_are_gone`.
     lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    admission_no_progress: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -716,6 +809,16 @@ impl WeightResidencyPolicy {
         self.record_page_in();
     }
 
+    fn remove_page(&mut self, key: u64) -> Option<u64> {
+        if let Some(position) = self.order.iter().position(|&candidate| candidate == key) {
+            self.order.remove(position);
+        }
+        let bytes = self.bytes_by_key.remove(&key)?;
+        self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        self.evictions = self.evictions.saturating_add(1);
+        Some(bytes)
+    }
+
     fn record_page_in(&mut self) {
         self.page_ins += 1;
     }
@@ -785,14 +888,16 @@ impl CudaWeightResidency {
     /// here is a second claim on the same VRAM the governor is already handing
     /// out, and neither side can see the other's.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
-        GLOBAL_BUDGET_BYTES.store(budget_bytes, Ordering::Relaxed);
+        replace_global_budget(0, budget_bytes);
         Self {
             runtime,
             scan_resistant_dense: false,
+            physical: OnceLock::new(),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
                 pages: HashMap::new(),
+                admission_no_progress: 0,
             }),
         }
     }
@@ -830,14 +935,16 @@ impl CudaWeightResidency {
             onnx_runtime_memory_governor::MemoryRole::Weights,
             holder,
         )?;
-        GLOBAL_BUDGET_BYTES.store(lease.bytes(), Ordering::Relaxed);
+        replace_global_budget(0, lease.bytes());
         Ok(Self {
             runtime,
             scan_resistant_dense: false,
+            physical: OnceLock::new(),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
                 pages: HashMap::new(),
+                admission_no_progress: 0,
             }),
         })
     }
@@ -866,7 +973,9 @@ impl CudaWeightResidency {
         if inner.lease.is_some() {
             return Ok(inner.policy.budget);
         }
+        let old = inner.policy.budget;
         inner.policy.budget = budget_bytes;
+        replace_global_budget(old, budget_bytes);
         Ok(inner.policy.budget)
     }
 
@@ -893,6 +1002,16 @@ impl CudaWeightResidency {
         tier: onnx_runtime_memory_governor::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
+        if let Some(physical) = self.physical.get() {
+            if physical.governor.authority_id() != governor.authority_id() {
+                return Err(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    tier: tier.name(),
+                    requested: 0,
+                    reason: "VMM weight residency was built with a different physical-memory authority",
+                });
+            }
+            return Ok(self.lock().policy.budget);
+        }
         let requested = {
             let inner = self.inner.lock().expect("residency lock poisoned");
             if inner.lease.is_some() {
@@ -908,9 +1027,10 @@ impl CudaWeightResidency {
         )?;
         let granted = lease.bytes();
         let mut inner = self.inner.lock().expect("residency lock poisoned");
+        let old = inner.policy.budget;
         inner.policy.budget = granted;
         inner.lease = Some(lease);
-        GLOBAL_BUDGET_BYTES.store(granted, Ordering::Relaxed);
+        replace_global_budget(old, granted);
         Ok(granted)
     }
 
@@ -926,6 +1046,65 @@ impl CudaWeightResidency {
         self
     }
 
+    /// Use the production VMM arena and its existing physical-memory authority
+    /// for weight pages. The configured cache budget remains an observability
+    /// value; admission is governed by incremental authority-owned bytes, not
+    /// by a second private lease.
+    pub fn with_vmm_admission(
+        self,
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<Self, WeightHandleError> {
+        if self.lock().lease.is_some() {
+            return Err(WeightHandleError::DeviceBinding(
+                "cannot install VMM physical admission on a cache that already holds a \
+                 content-byte governor lease"
+                    .into(),
+            ));
+        }
+        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
+            return Err(WeightHandleError::DeviceBinding(
+                "VMM weight residency and its governor must share one physical-memory authority"
+                    .into(),
+            ));
+        }
+        let _ = self.physical.set(PhysicalAdmission {
+            allocator,
+            governor,
+        });
+        Ok(self)
+    }
+
+    pub(crate) fn install_vmm_admission(
+        &self,
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<(), WeightHandleError> {
+        if self.lock().lease.is_some() {
+            return Err(WeightHandleError::DeviceBinding(
+                "cannot install VMM physical admission on a cache that already holds a \
+                 content-byte governor lease"
+                    .into(),
+            ));
+        }
+        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
+            return Err(WeightHandleError::DeviceBinding(
+                "VMM weight residency and its governor must share one physical-memory authority"
+                    .into(),
+            ));
+        }
+        self.physical
+            .set(PhysicalAdmission {
+                allocator,
+                governor,
+            })
+            .map_err(|_| {
+                WeightHandleError::DeviceBinding(
+                    "VMM weight residency admission was installed more than once".into(),
+                )
+            })
+    }
+
     /// Return the device page for `key`, paging it in from `source` on a miss and
     /// evicting LRU pages to respect the budget. The returned [`Arc`] keeps the
     /// page resident for as long as the caller holds it.
@@ -937,6 +1116,23 @@ impl CudaWeightResidency {
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
+        }
+        if self.physical.get().is_some() {
+            let resident = weight.materialize()?;
+            GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+            let bytes = resident.bytes().to_vec();
+            return self.resident_vmm_with(
+                key,
+                resident.dtype,
+                resident.shape.clone(),
+                bytes.len(),
+                self.eviction_for(weight.boundary),
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
+                    })
+                },
+            );
         }
         // Copy region bytes host→device before re-locking so a failed bind never
         // mutates cache accounting.
@@ -968,6 +1164,25 @@ impl CudaWeightResidency {
         let materialize_start = std::time::Instant::now();
         fill_staging_from_regions(weight, source, &mut staging)?;
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        if self.physical.get().is_some() {
+            return self.resident_vmm_with(
+                key,
+                weight.dtype,
+                weight.shape.clone(),
+                len,
+                self.eviction_for(weight.boundary),
+                move |runtime, ptr| {
+                    let staged = &staging.as_slice()[..len];
+                    let copy_ms =
+                        unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+                            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+                        })?;
+                    GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
+                    GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+        }
         let (page, _, _staging) = CudaWeightPage::upload_staged_async(
             &self.runtime,
             weight.dtype,
@@ -995,6 +1210,21 @@ impl CudaWeightResidency {
         let resident = weight.materialize()?;
         GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        if self.physical.get().is_some() {
+            let bytes = resident.bytes().to_vec();
+            return self.resident_vmm_with(
+                key,
+                resident.dtype,
+                resident.shape.clone(),
+                bytes.len(),
+                self.eviction_for(weight.boundary),
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
+                    })
+                },
+            );
+        }
         let page = Arc::new(CudaWeightPage::upload(
             &self.runtime,
             resident.dtype,
@@ -1002,6 +1232,113 @@ impl CudaWeightResidency {
             resident.bytes(),
         )?);
         self.admit(key, page, self.eviction_for(weight.boundary))
+    }
+
+    fn resident_vmm_with<F>(
+        &self,
+        key: u64,
+        dtype: DataType,
+        shape: Vec<usize>,
+        len: usize,
+        eviction: WeightEvictionPolicy,
+        fill: F,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError>
+    where
+        F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
+    {
+        let physical = self
+            .physical
+            .get()
+            .expect("VMM residency helper requires physical admission");
+        let ptr = physical
+            .allocator
+            .allocate_committed(len, 256, &[])
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+        let page = Arc::new(CudaWeightPage {
+            runtime: Arc::clone(&self.runtime),
+            allocation: WeightAllocation::Vmm(Arc::clone(&physical.allocator)),
+            ptr: ptr.as_ptr() as CUdeviceptr,
+            len,
+            dtype,
+            shape,
+        });
+
+        let mut inner = self.lock();
+        if let Some(existing) = inner.pages.get(&key).cloned() {
+            inner.record_hit(key);
+            return Ok(existing);
+        }
+
+        let mut fill = Some(fill);
+        let max_evictions = inner.pages.len();
+        let mut evictions = 0usize;
+        let mut bypass = false;
+        loop {
+            let required = physical
+                .allocator
+                .incremental_owned_bytes_for_span(ptr, len, 0, len)
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+            let available = physical.governor.available(Tier::Device);
+            if committed_admission_fits(required, available) {
+                match physical
+                    .allocator
+                    .try_commit_span(ptr, len, 0, len, available)
+                {
+                    Ok(_) => {
+                        fill.take().expect("VMM page fill runs once")(&self.runtime, page.ptr)?;
+                        if bypass {
+                            inner.record_bypassed_page_in();
+                        } else {
+                            inner.insert_page(key, Arc::clone(&page), len as u64);
+                        }
+                        return Ok(page);
+                    }
+                    Err(error) => {
+                        if evictions >= max_evictions {
+                            return Err(WeightHandleError::DeviceBinding(error.to_string()));
+                        }
+                    }
+                }
+            } else if eviction == WeightEvictionPolicy::StableResident {
+                bypass = true;
+            }
+
+            if evictions >= max_evictions {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "weight residency requires {required} incremental committed bytes but only \
+                     {available} bytes of physical headroom are available after {evictions} eviction(s)"
+                )));
+            }
+            let before_owned = physical
+                .allocator
+                .physical_pool_stats()
+                .map_or(0, |stats| stats.snapshot().total_owned_bytes);
+            let before_required = required;
+            let Some(evicted_key) = inner.next_evictable_key(eviction) else {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "weight residency requires {required} incremental committed bytes but only \
+                     {available} bytes of physical headroom are available and no page is evictable"
+                )));
+            };
+            inner.remove_page(evicted_key);
+            evictions += 1;
+            let after_owned = physical
+                .allocator
+                .physical_pool_stats()
+                .map_or(0, |stats| stats.snapshot().total_owned_bytes);
+            let after_required = physical
+                .allocator
+                .incremental_owned_bytes_for_span(ptr, len, 0, len)
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+            if !eviction_made_committed_progress(
+                before_owned,
+                after_owned,
+                before_required,
+                after_required,
+            ) {
+                inner.admission_no_progress = inner.admission_no_progress.saturating_add(1);
+            }
+        }
     }
 
     fn eviction_for(&self, boundary: LazyWeightBoundary) -> WeightEvictionPolicy {
@@ -1112,7 +1449,7 @@ impl CudaWeightResidency {
                         ))
                     })?;
                     inner.policy.budget = inner.policy.budget.saturating_add(over);
-                    GLOBAL_BUDGET_BYTES.store(inner.policy.budget, Ordering::Relaxed);
+                    replace_global_budget(inner.policy.budget - over, inner.policy.budget);
                 }
                 // No lease means no governor knows about this cache, so there is
                 // nothing to ask and nothing whose total this would falsify.
@@ -1120,7 +1457,7 @@ impl CudaWeightResidency {
                 // the operator never asked for.
                 None => {
                     inner.policy.budget = inner.policy.budget.saturating_add(over);
-                    GLOBAL_BUDGET_BYTES.store(inner.policy.budget, Ordering::Relaxed);
+                    replace_global_budget(inner.policy.budget - over, inner.policy.budget);
                 }
             }
         }
@@ -1131,8 +1468,13 @@ impl CudaWeightResidency {
     /// Snapshot the cache's activity counters.
     pub fn stats(&self) -> CudaResidencyStats {
         let inner = self.lock();
-        GLOBAL_BUDGET_BYTES.store(inner.policy.budget, Ordering::Relaxed);
-        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(inner.policy.peak_resident_bytes, Ordering::Relaxed);
+        let physical_owned_bytes = self
+            .physical
+            .get()
+            .and_then(|physical| physical.allocator.physical_pool_stats())
+            .map_or(inner.policy.resident_bytes, |stats| {
+                stats.snapshot().total_owned_bytes
+            });
         CudaResidencyStats {
             budget_bytes: inner.policy.budget,
             resident_bytes: inner.policy.resident_bytes,
@@ -1141,6 +1483,8 @@ impl CudaWeightResidency {
             page_ins: inner.policy.page_ins,
             hits: inner.policy.hits,
             evictions: inner.policy.evictions,
+            physical_owned_bytes,
+            admission_no_progress: inner.admission_no_progress,
         }
     }
 
@@ -1160,6 +1504,29 @@ impl std::fmt::Debug for CudaWeightResidency {
     }
 }
 
+impl Drop for CudaWeightResidency {
+    fn drop(&mut self) {
+        let budget = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .policy
+            .budget;
+        let resident = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .policy
+            .resident_bytes;
+        replace_global_budget(budget, 0);
+        let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(resident)),
+        );
+    }
+}
+
 impl ResidencyInner {
     /// Record a cache hit for `key`: mark it most-recently-used and bump the
     /// per-instance and process-global hit counters.
@@ -1173,7 +1540,10 @@ impl ResidencyInner {
     fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64) {
         self.pages.insert(key, page);
         self.policy.insert_page(key, bytes);
-        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(self.policy.peak_resident_bytes, Ordering::Relaxed);
+        let global_resident = GLOBAL_CONTENT_RESIDENT_BYTES
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(global_resident, Ordering::Relaxed);
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1182,6 +1552,29 @@ impl ResidencyInner {
     fn record_bypassed_page_in(&mut self) {
         self.policy.record_page_in();
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn next_evictable_key(&self, eviction: WeightEvictionPolicy) -> Option<u64> {
+        self.policy
+            .next_evictable_index(eviction, &mut |key| {
+                self.pages
+                    .get(&key)
+                    .is_some_and(|page| Arc::strong_count(page) == 1)
+            })
+            .map(|index| self.policy.order[index])
+    }
+
+    fn remove_page(&mut self, key: u64) {
+        if self.pages.remove(&key).is_some()
+            && let Some(bytes) = self.policy.remove_page(key)
+        {
+            let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(bytes)),
+            );
+            GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Evict currently-unreferenced pages until admitting `incoming` bytes fits
@@ -1196,7 +1589,13 @@ impl ResidencyInner {
             })
         };
         for key in evicted {
-            if self.pages.remove(&key).is_some() {
+            if let Some(page) = self.pages.remove(&key) {
+                let bytes = page.len() as u64;
+                let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| Some(current.saturating_sub(bytes)),
+                );
                 GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
                 // The page's Drop frees VRAM here when the cache was sole owner.
             }
@@ -1257,6 +1656,115 @@ mod tests {
         assert_eq!(parse_budget_bytes(""), None);
         assert_eq!(parse_budget_bytes("lots"), None);
         assert_eq!(parse_budget_bytes("-5"), None);
+    }
+
+    #[test]
+    fn vmm_admission_uses_incremental_committed_bytes_not_content_bytes() {
+        let content_bytes = 64 << 20;
+        let nominal_content_budget = 1;
+        assert!(
+            content_bytes > nominal_content_budget,
+            "sabotage predicate must say content does not fit"
+        );
+        assert!(
+            committed_admission_fits(0, 0),
+            "already-owned pooled backing must admit regardless of content length"
+        );
+        assert!(!committed_admission_fits(2 << 20, 742 << 10));
+    }
+
+    #[test]
+    fn zero_committed_byte_eviction_is_observable_no_progress() {
+        assert!(!eviction_made_committed_progress(8, 8, 4, 4));
+        assert!(
+            eviction_made_committed_progress(8, 8, 4, 0),
+            "returning an owned handle to the pool is useful even though owned bytes stay flat"
+        );
+        assert!(eviction_made_committed_progress(8, 4, 4, 4));
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn vmm_weight_admission_reuses_owned_granules_without_runtime_alloc_free() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        unsafe {
+            std::env::set_var(
+                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+                (64usize << 20).to_string(),
+            );
+        }
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!(
+                "SKIPPED (CUDA runtime dependencies unavailable): VMM weight admission GPU test"
+            );
+            return;
+        };
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(granule as u64, 0, 0)));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(736),
+                MemoryRole::Weights,
+            )
+            .expect("VMM allocator"),
+        );
+        let authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            governor.clone();
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        let before = runtime.allocation_counts();
+
+        let first_bytes = vec![0x31u8; granule];
+        let first = residency
+            .resident_vmm_with(
+                1,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&first_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .expect("first physical page");
+        drop(first);
+
+        let second_bytes = vec![0x42u8; granule];
+        let second = residency
+            .resident_vmm_with(
+                2,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&second_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .expect("second page reuses the owned handle");
+        drop(second);
+
+        let stats = residency.stats();
+        assert_eq!(stats.resident_bytes, granule as u64);
+        assert_eq!(stats.physical_owned_bytes, granule as u64);
+        assert_eq!(stats.page_ins, 2);
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(runtime.allocation_counts(), before);
+        assert_eq!(governor.used(Tier::Device), granule as u64);
     }
 
     /// A locally chosen budget becomes a claim the rest of the system can see.

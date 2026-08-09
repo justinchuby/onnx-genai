@@ -346,6 +346,18 @@ fn encode_weight_offload() -> String {
         "Process-wide cumulative CUDA weight residency evictions.",
         stats.evictions,
     );
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_content_resident_bytes",
+        "Canonical weight content bytes currently held by CUDA residency caches.",
+        stats.content_resident_bytes,
+    );
+    gauge(
+        &mut output,
+        "onnx_genai_cuda_weight_offload_physical_owned_bytes",
+        "Authority-owned physical bytes across live CUDA VMM handle pools.",
+        stats.physical_owned_bytes,
+    );
     output.push_str("# HELP onnx_genai_cuda_weight_offload_hit_rate Process-wide CUDA weight residency hit ratio derived from cumulative hits and page-ins.\n");
     output.push_str("# TYPE onnx_genai_cuda_weight_offload_hit_rate gauge\n");
     let lookups = stats.hits + stats.page_ins;

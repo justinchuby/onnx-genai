@@ -8,6 +8,7 @@ use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
     Tier,
 };
+use std::sync::{Arc, Barrier};
 
 const HOLDER: HolderId = HolderId::new(736);
 
@@ -117,4 +118,159 @@ fn production_allocators_share_handles_under_one_authority() {
         "production pool transfer: creates={} releases={} hits={} owned={}",
         torn_down.creates, torn_down.releases, torn_down.pool_hits, torn_down.total_owned_bytes
     );
+
+    let tx_governor = LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0));
+    let tx_allocator = CudaVmmAllocator::new(
+        CudaContext::new(0).expect("transaction CUDA context"),
+        DeviceKey::device(0),
+        0,
+        64 << 20,
+        &tx_governor,
+        HolderId::new(738),
+        MemoryRole::Weights,
+    )
+    .expect("transaction allocator");
+    let transactional = tx_allocator
+        .allocate_committed(granule * 3, 256, &[])
+        .expect("reserve an uncommitted candidate");
+    assert_eq!(
+        tx_allocator
+            .incremental_owned_bytes_for_span(transactional, granule * 3, 0, granule)
+            .expect("estimate one granule"),
+        granule as u64
+    );
+    let one = tx_allocator
+        .try_commit_span(transactional, granule * 3, 0, granule, granule as u64)
+        .expect("commit one granule");
+    assert_eq!(one.additional_owned_bytes, granule as u64);
+    assert_eq!(
+        tx_allocator
+            .incremental_owned_bytes_for_span(transactional, granule * 3, 0, granule)
+            .expect("already-covered estimate"),
+        0
+    );
+    let remaining = tx_allocator
+        .try_commit_span(
+            transactional,
+            granule * 3,
+            0,
+            granule * 3,
+            (granule * 2) as u64,
+        )
+        .expect("commit multiple granules");
+    assert_eq!(remaining.additional_owned_bytes, (granule * 2) as u64);
+    unsafe { tx_allocator.deallocate(transactional, granule * 3, 256) };
+    let reused = tx_allocator
+        .allocate_committed(granule, 256, &[])
+        .expect("reserve pooled candidate");
+    let pooled_commit = tx_allocator
+        .try_commit_span(reused, granule, 0, granule, 0)
+        .expect("an already-owned pooled handle needs no physical headroom");
+    assert_eq!(pooled_commit.additional_owned_bytes, 0);
+    unsafe { tx_allocator.deallocate(reused, granule, 256) };
+    let shared_anchor = tx_allocator.allocate(4096, 256).expect("shared anchor");
+    let shared_candidate = tx_allocator
+        .allocate_committed(4096, 256, &[])
+        .expect("shared-granule candidate");
+    assert_eq!(
+        tx_allocator
+            .incremental_owned_bytes_for_span(shared_candidate, 4096, 0, 4096)
+            .expect("shared granule estimate"),
+        0,
+        "an already-mapped shared granule needs no new physical ownership"
+    );
+    tx_allocator
+        .try_commit_span(shared_candidate, 4096, 0, 4096, 0)
+        .expect("shared granule commits with zero headroom");
+    unsafe {
+        tx_allocator.deallocate(shared_candidate, 4096, 256);
+        tx_allocator.deallocate(shared_anchor, 4096, 256);
+    }
+
+    let arithmetic_governor =
+        LedgerGovernor::new(LeaseLedger::new((granule + 742 * 1024) as u64, 0, 0));
+    let arithmetic_allocator = CudaVmmAllocator::new(
+        CudaContext::new(0).expect("arithmetic CUDA context"),
+        DeviceKey::device(0),
+        0,
+        64 << 20,
+        &arithmetic_governor,
+        HolderId::new(739),
+        MemoryRole::Weights,
+    )
+    .expect("arithmetic allocator");
+    let held = arithmetic_allocator
+        .allocate(granule, 256)
+        .expect("first granule fits");
+    let refused = arithmetic_allocator
+        .allocate_committed(granule, 256, &[])
+        .expect("reserve refused candidate");
+    let error = arithmetic_allocator
+        .try_commit_span(
+            refused,
+            granule,
+            0,
+            granule,
+            arithmetic_governor.available(Tier::Device),
+        )
+        .expect_err("742 KiB cannot admit one 2 MiB granule");
+    let message = error.to_string();
+    assert!(message.contains(&format!("{granule} incremental committed bytes")));
+    assert!(message.contains(&(742 * 1024).to_string()));
+    unsafe {
+        arithmetic_allocator.deallocate(refused, granule, 256);
+        arithmetic_allocator.deallocate(held, granule, 256);
+    }
+
+    let race_governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(granule as u64, 0, 0)));
+    let race_allocator = Arc::new(
+        CudaVmmAllocator::new(
+            CudaContext::new(0).expect("race CUDA context"),
+            DeviceKey::device(0),
+            0,
+            64 << 20,
+            race_governor.as_ref(),
+            HolderId::new(737),
+            MemoryRole::Weights,
+        )
+        .expect("race allocator"),
+    );
+    let barrier = Arc::new(Barrier::new(2));
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let allocator = Arc::clone(&race_allocator);
+        let governor = Arc::clone(&race_governor);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            let ptr = allocator
+                .allocate_committed(granule, 256, &[])
+                .expect("race candidate");
+            barrier.wait();
+            let result = allocator.try_commit_span(
+                ptr,
+                granule,
+                0,
+                granule,
+                governor.available(Tier::Device),
+            );
+            if result.is_err() {
+                unsafe { allocator.deallocate(ptr, granule, 256) };
+                None
+            } else {
+                Some(ptr.as_ptr() as usize)
+            }
+        }));
+    }
+    let winners = threads
+        .into_iter()
+        .filter_map(|thread| thread.join().expect("race thread"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one admission may own the granule"
+    );
+    assert_eq!(race_governor.used(Tier::Device), granule as u64);
+    let winner = std::ptr::NonNull::new(winners[0] as *mut u8).expect("winner pointer");
+    unsafe { race_allocator.deallocate(winner, granule, 256) };
 }
