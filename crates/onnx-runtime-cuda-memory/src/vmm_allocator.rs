@@ -103,6 +103,11 @@ fn physical_handle_pool_bytes() -> Option<usize> {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&bytes| bytes > 0)
 }
+
+/// Whether VMM allocations use the authority-owned production handle pool.
+pub fn production_physical_pool_enabled() -> bool {
+    vmm_enabled() && physical_handle_pool_bytes().is_some()
+}
 /// The device tier name used in errors raised before a governor is consulted.
 const TIER: &str = "device";
 
@@ -795,48 +800,50 @@ impl CudaVmmAllocator {
         max_additional_owned_bytes: u64,
     ) -> Result<(BTreeSet<usize>, SpanCommit), MemoryError> {
         let granularity = arena.spans.granularity;
-        let mut claimed = BTreeSet::new();
-        let mut commit = SpanCommit::default();
-        for granule in granules {
-            if !claimed.insert(granule) {
-                continue;
-            }
+        let claimed = granules.into_iter().collect::<BTreeSet<_>>();
+        let mut shared_claimed = BTreeSet::new();
+        let mut newly_mapped = Vec::new();
+        for &granule in &claimed {
             if arena.spans.granule_refs[granule] > 0 {
                 arena.spans.granule_refs[granule] += 1;
-                continue;
+                shared_claimed.insert(granule);
+            } else {
+                newly_mapped.push(granule);
             }
-            if let Err(error) = self.take(arena, granularity) {
-                claimed.remove(&granule);
-                self.release_granules(arena, &claimed);
-                return Err(error);
+        }
+        let mapped_bytes = newly_mapped.len().saturating_mul(granularity);
+        if let Err(error) = self.take(arena, mapped_bytes) {
+            self.release_granules(arena, &shared_claimed);
+            return Err(error);
+        }
+        let offsets = newly_mapped
+            .iter()
+            .map(|granule| granule * granularity)
+            .collect::<Vec<_>>();
+        let additional_owned = match self.backing.commit_offsets_with_owned_limit(
+            &mut arena.reservation,
+            &offsets,
+            max_additional_owned_bytes,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.give_back_lease(arena, mapped_bytes);
+                self.release_granules(arena, &shared_claimed);
+                return Err(invalid(mapped_bytes, format!("cuMemMap: {error}")));
             }
-            let offset = granule * granularity;
-            let remaining =
-                max_additional_owned_bytes.saturating_sub(commit.additional_owned_bytes);
-            let additional_owned = match self.backing.commit_with_owned_limit(
-                &mut arena.reservation,
-                offset,
-                granularity,
-                remaining,
-            ) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    self.give_back_lease(arena, granularity);
-                    claimed.remove(&granule);
-                    self.release_granules(arena, &claimed);
-                    return Err(invalid(granularity, format!("cuMemMap: {error}")));
-                }
-            };
+        };
+        for granule in newly_mapped {
             arena.spans.granule_refs[granule] = 1;
             arena.spans.committed += granularity;
             note_commit(granularity);
-            commit.additional_owned_bytes = commit
-                .additional_owned_bytes
-                .saturating_add(additional_owned);
-            commit.newly_mapped_bytes =
-                commit.newly_mapped_bytes.saturating_add(granularity as u64);
         }
-        Ok((claimed, commit))
+        Ok((
+            claimed,
+            SpanCommit {
+                additional_owned_bytes: additional_owned,
+                newly_mapped_bytes: mapped_bytes as u64,
+            },
+        ))
     }
 
     fn take(&self, arena: &mut Arena, bytes: usize) -> Result<(), MemoryError> {
@@ -862,18 +869,29 @@ impl CudaVmmAllocator {
     /// Drop this allocation's claims, unmapping whatever it was the last user
     /// of.
     fn release_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
+        let _ = self.release_granules_report(arena, granules);
+    }
+
+    fn release_granules_report(&self, arena: &mut Arena, granules: &BTreeSet<usize>) -> u64 {
         let granularity = arena.spans.granularity;
+        let mut unmapped = 0_u64;
         for &granule in granules.iter().rev() {
             match arena.spans.granule_refs[granule].checked_sub(1) {
                 Some(0) => {
                     arena.spans.granule_refs[granule] = 0;
                     let offset = granule * granularity;
-                    let _ = self
+                    if self
                         .backing
-                        .release(&mut arena.reservation, offset, granularity);
+                        .release(&mut arena.reservation, offset, granularity)
+                        .is_err()
+                    {
+                        arena.spans.granule_refs[granule] = 1;
+                        continue;
+                    }
                     arena.spans.committed -= granularity;
                     note_release(granularity);
                     self.give_back_lease(arena, granularity);
+                    unmapped = unmapped.saturating_add(granularity as u64);
                 }
                 Some(remaining) => arena.spans.granule_refs[granule] = remaining,
                 None => {
@@ -895,6 +913,7 @@ impl CudaVmmAllocator {
                 }
             }
         }
+        unmapped
     }
 
     fn release_committed_granules(&self, arena: &mut Arena, granules: &BTreeSet<usize>) {
@@ -923,6 +942,23 @@ impl CudaVmmAllocator {
         Ok(self.backing.incremental_owned_bytes_for_handles(handles))
     }
 
+    pub fn incremental_mapped_bytes_for_span(
+        &self,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+        bytes: usize,
+    ) -> Result<u64, MemoryError> {
+        let arena = self.lock();
+        let (_, granules) =
+            self.uncommitted_granules(&arena, ptr, allocation_bytes, byte_offset, bytes)?;
+        Ok(granules
+            .into_iter()
+            .filter(|&granule| arena.spans.granule_refs[granule] == 0)
+            .count()
+            .saturating_mul(arena.spans.granularity) as u64)
+    }
+
     /// Atomically check physical headroom and commit a live allocation span.
     ///
     /// The arena lock fixes the span's granule coverage while the pool checkout
@@ -936,6 +972,7 @@ impl CudaVmmAllocator {
         allocation_bytes: usize,
         byte_offset: usize,
         bytes: usize,
+        max_additional_mapped_bytes: u64,
         max_additional_owned_bytes: u64,
     ) -> Result<SpanCommit, MemoryError> {
         let mut arena = self.lock();
@@ -946,6 +983,16 @@ impl CudaVmmAllocator {
             .filter(|&&granule| arena.spans.granule_refs[granule] == 0)
             .count();
         let required = self.backing.incremental_owned_bytes_for_handles(handles);
+        let required_mapped = handles.saturating_mul(arena.spans.granularity) as u64;
+        if required_mapped > max_additional_mapped_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "candidate requires {required_mapped} incremental mapped bytes but only \
+                     {max_additional_mapped_bytes} bytes of weight-zone headroom are available"
+                ),
+            ));
+        }
         if required > max_additional_owned_bytes {
             return Err(invalid(
                 allocation_bytes,
@@ -961,6 +1008,22 @@ impl CudaVmmAllocator {
             live.committed.extend(claimed);
         }
         Ok(commit)
+    }
+
+    /// Release a live allocation and report physical bytes actually unmapped.
+    pub fn deallocate_span(&self, ptr: NonNull<u8>) -> u64 {
+        let mut arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return 0;
+        };
+        let Some(live) = arena.spans.live.remove(&offset) else {
+            return 0;
+        };
+        let unmapped = self.release_granules_report(&mut arena, &live.committed);
+        arena.spans.give_back(offset, live.len);
+        unmapped
     }
 
     fn uncommitted_granules(
@@ -1271,20 +1334,7 @@ impl DeviceAllocator for CudaVmmAllocator {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
-        let mut arena = self.lock();
-        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
-        let address = ptr.as_ptr() as usize;
-        let Some(offset) = address.checked_sub(base) else {
-            return;
-        };
-        // The recorded length wins over the caller's: `allocate` is free to
-        // hand back a span it rounded, and freeing the caller's figure would
-        // leave the difference unreachable.
-        let Some(live) = arena.spans.live.remove(&offset) else {
-            return;
-        };
-        self.release_committed_granules(&mut arena, &live.committed);
-        arena.spans.give_back(offset, live.len);
+        let _ = self.deallocate_span(ptr);
     }
 
     /// True: spans are carved from granules mapped as they are needed, and

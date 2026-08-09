@@ -140,7 +140,14 @@ fn production_allocators_share_handles_under_one_authority() {
         granule as u64
     );
     let one = tx_allocator
-        .try_commit_span(transactional, granule * 3, 0, granule, granule as u64)
+        .try_commit_span(
+            transactional,
+            granule * 3,
+            0,
+            granule,
+            granule as u64,
+            granule as u64,
+        )
         .expect("commit one granule");
     assert_eq!(one.additional_owned_bytes, granule as u64);
     assert_eq!(
@@ -156,6 +163,7 @@ fn production_allocators_share_handles_under_one_authority() {
             0,
             granule * 3,
             (granule * 2) as u64,
+            (granule * 2) as u64,
         )
         .expect("commit multiple granules");
     assert_eq!(remaining.additional_owned_bytes, (granule * 2) as u64);
@@ -164,7 +172,7 @@ fn production_allocators_share_handles_under_one_authority() {
         .allocate_committed(granule, 256, &[])
         .expect("reserve pooled candidate");
     let pooled_commit = tx_allocator
-        .try_commit_span(reused, granule, 0, granule, 0)
+        .try_commit_span(reused, granule, 0, granule, granule as u64, 0)
         .expect("an already-owned pooled handle needs no physical headroom");
     assert_eq!(pooled_commit.additional_owned_bytes, 0);
     unsafe { tx_allocator.deallocate(reused, granule, 256) };
@@ -180,7 +188,7 @@ fn production_allocators_share_handles_under_one_authority() {
         "an already-mapped shared granule needs no new physical ownership"
     );
     tx_allocator
-        .try_commit_span(shared_candidate, 4096, 0, 4096, 0)
+        .try_commit_span(shared_candidate, 4096, 0, 4096, 0, 0)
         .expect("shared granule commits with zero headroom");
     unsafe {
         tx_allocator.deallocate(shared_candidate, 4096, 256);
@@ -211,6 +219,7 @@ fn production_allocators_share_handles_under_one_authority() {
             granule,
             0,
             granule,
+            granule as u64,
             arithmetic_governor.available(Tier::Device),
         )
         .expect_err("742 KiB cannot admit one 2 MiB granule");
@@ -220,6 +229,43 @@ fn production_allocators_share_handles_under_one_authority() {
     unsafe {
         arithmetic_allocator.deallocate(refused, granule, 256);
         arithmetic_allocator.deallocate(held, granule, 256);
+    }
+
+    let rollback_governor = LedgerGovernor::new(LeaseLedger::new(granule as u64, 0, 0));
+    let rollback_allocator = CudaVmmAllocator::new(
+        CudaContext::new(0).expect("rollback CUDA context"),
+        DeviceKey::device(0),
+        0,
+        64 << 20,
+        &rollback_governor,
+        HolderId::new(740),
+        MemoryRole::Weights,
+    )
+    .expect("rollback allocator");
+    let rollback_stats = rollback_allocator
+        .physical_pool_stats()
+        .expect("rollback pool stats");
+    for _ in 0..2 {
+        let candidate = rollback_allocator
+            .allocate_committed(granule * 2, 256, &[])
+            .expect("rollback candidate");
+        rollback_allocator
+            .try_commit_span(
+                candidate,
+                granule * 2,
+                0,
+                granule * 2,
+                (granule * 2) as u64,
+                (granule * 2) as u64,
+            )
+            .expect_err("second handle exceeds the real authority limit");
+        let snapshot = rollback_stats.snapshot();
+        assert_eq!(snapshot.total_owned_bytes, 0);
+        assert_eq!(snapshot.pooled_unmapped_bytes, 0);
+        assert_eq!(snapshot.mapped_bytes, 0);
+        assert_eq!(snapshot.creates, snapshot.releases);
+        assert_eq!(rollback_governor.used(Tier::Device), 0);
+        unsafe { rollback_allocator.deallocate(candidate, granule * 2, 256) };
     }
 
     let race_governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(granule as u64, 0, 0)));
@@ -251,6 +297,7 @@ fn production_allocators_share_handles_under_one_authority() {
                 granule,
                 0,
                 granule,
+                granule as u64,
                 governor.available(Tier::Device),
             );
             if result.is_err() {

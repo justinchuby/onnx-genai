@@ -346,18 +346,28 @@ impl Engine {
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
         #[cfg(feature = "cuda")]
-        let weight_reservation_bytes = device_weight_reservation_for(
-            model_weight_bytes,
-            cuda_offload_resolution.and_then(|resolution| {
-                resolution.policy.enabled.then(|| {
-                    resolution
-                        .policy
-                        .device_budget_bytes
-                        .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
-                })
-            }),
-            governor_kv_config.page_size_bytes,
-        );
+        let weight_reservation_bytes =
+            if cuda_offload_resolution.is_some_and(|resolution| resolution.policy.enabled)
+                && onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled()
+            {
+                // The production pool charges each physical handle to this same
+                // authority. A content-sized startup lease would double-charge
+                // weights and prevent the native session from creating even its
+                // initial workspace before the mapped weight allowance is derived.
+                0
+            } else {
+                device_weight_reservation_for(
+                    model_weight_bytes,
+                    cuda_offload_resolution.and_then(|resolution| {
+                        resolution.policy.enabled.then(|| {
+                            resolution.policy.device_budget_bytes.unwrap_or(
+                                onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
+                            )
+                        })
+                    }),
+                    governor_kv_config.page_size_bytes,
+                )
+            };
         #[cfg(not(feature = "cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
             model_weight_bytes,
@@ -366,10 +376,11 @@ impl Engine {
         );
         let governor = {
             let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
-            EngineResourceGovernor::new_with_authority(
+            EngineResourceGovernor::new_with_authority_and_reservation(
                 config.limits.clone(),
                 config.allow_runtime_override,
                 governor_kv_config,
+                model_weight_bytes,
                 weight_reservation_bytes,
                 authority_provider,
                 Some(authority_domain),

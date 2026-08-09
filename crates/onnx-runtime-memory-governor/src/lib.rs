@@ -275,6 +275,7 @@ pub struct LeaseLedger {
     authority_id: MemoryAuthorityId,
     limits: [AtomicU64; 3],
     used: [AtomicU64; 3],
+    mapped_allowance_reserved: [AtomicU64; 3],
     claim_gates: [Mutex<()>; 3],
 }
 
@@ -302,6 +303,7 @@ impl LeaseLedger {
                 AtomicU64::new(disk_bytes),
             ],
             used: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            mapped_allowance_reserved: std::array::from_fn(|_| AtomicU64::new(0)),
             claim_gates: std::array::from_fn(|_| Mutex::new(())),
         })
     }
@@ -434,6 +436,173 @@ impl LeaseLedger {
                 Err(observed) => used = observed,
             }
         }
+    }
+
+    fn try_reserve_mapped_allowance(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+    ) -> Result<(), MemoryError> {
+        let _gate = self.claim_gate(tier);
+        let index = tier.index();
+        let mut reserved = self.mapped_allowance_reserved[index].load(Ordering::Acquire);
+        loop {
+            let limit = self.limits[index].load(Ordering::Acquire);
+            let Some(next) = reserved.checked_add(bytes) else {
+                return Err(MemoryError::InvalidRequest {
+                    tier: tier.name(),
+                    requested: bytes,
+                    reason: "the mapped-allowance reservation overflows its byte counter",
+                });
+            };
+            if next > limit {
+                return Err(MemoryError::TierExhausted {
+                    tier: tier.name(),
+                    requested: bytes,
+                    used: reserved,
+                    limit,
+                    available: limit.saturating_sub(reserved),
+                    role,
+                });
+            }
+            match self.mapped_allowance_reserved[index].compare_exchange_weak(
+                reserved,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => reserved = observed,
+            }
+        }
+    }
+
+    fn release_mapped_allowance(&self, tier: Tier, bytes: u64) {
+        let _ = self.mapped_allowance_reserved[tier.index()].fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |reserved| Some(reserved.saturating_sub(bytes)),
+        );
+    }
+}
+
+/// Authority-owned capacity reservation for mapped bytes attributed to one holder.
+#[derive(Clone, Debug)]
+pub struct MappedAllowance {
+    inner: Arc<MappedAllowanceInner>,
+}
+
+#[derive(Debug)]
+struct MappedAllowanceInner {
+    authority: MemoryAuthorityId,
+    tier: Tier,
+    limit: u64,
+    mapped: AtomicU64,
+    role: MemoryRole,
+    holder: HolderId,
+    accounting: Arc<dyn MappedAllowanceAccounting>,
+}
+
+/// Releases mapped-capacity reservations created by a governor.
+pub trait MappedAllowanceAccounting: Send + Sync + std::fmt::Debug {
+    fn release(&self, tier: Tier, bytes: u64);
+}
+
+impl MappedAllowance {
+    pub fn new(
+        authority: MemoryAuthorityId,
+        tier: Tier,
+        limit: u64,
+        role: MemoryRole,
+        holder: HolderId,
+        accounting: Arc<dyn MappedAllowanceAccounting>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(MappedAllowanceInner {
+                authority,
+                tier,
+                limit,
+                mapped: AtomicU64::new(0),
+                role,
+                holder,
+                accounting,
+            }),
+        }
+    }
+
+    pub fn authority(&self) -> MemoryAuthorityId {
+        self.inner.authority
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.inner.limit
+    }
+
+    pub fn mapped_bytes(&self) -> u64 {
+        self.inner.mapped.load(Ordering::Acquire)
+    }
+
+    pub fn available(&self) -> u64 {
+        self.limit().saturating_sub(self.mapped_bytes())
+    }
+
+    pub fn try_map(&self, bytes: u64) -> Result<(), MemoryError> {
+        let mut mapped = self.inner.mapped.load(Ordering::Acquire);
+        loop {
+            let Some(next) = mapped.checked_add(bytes) else {
+                return Err(MemoryError::InvalidRequest {
+                    tier: self.inner.tier.name(),
+                    requested: bytes,
+                    reason: "mapped-byte attribution overflows its byte counter",
+                });
+            };
+            if next > self.inner.limit {
+                return Err(MemoryError::TierExhausted {
+                    tier: self.inner.tier.name(),
+                    requested: bytes,
+                    used: mapped,
+                    limit: self.inner.limit,
+                    available: self.inner.limit.saturating_sub(mapped),
+                    role: self.inner.role,
+                });
+            }
+            match self.inner.mapped.compare_exchange_weak(
+                mapped,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => mapped = observed,
+            }
+        }
+    }
+
+    pub fn unmap(&self, bytes: u64) -> u64 {
+        let mut mapped = self.inner.mapped.load(Ordering::Acquire);
+        loop {
+            let returned = bytes.min(mapped);
+            match self.inner.mapped.compare_exchange_weak(
+                mapped,
+                mapped - returned,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return returned,
+                Err(observed) => mapped = observed,
+            }
+        }
+    }
+
+    pub fn holder(&self) -> HolderId {
+        self.inner.holder
+    }
+}
+
+impl Drop for MappedAllowanceInner {
+    fn drop(&mut self) {
+        self.accounting.release(self.tier, self.limit);
     }
 }
 
@@ -667,6 +836,28 @@ pub trait MemoryGovernor {
         holder: HolderId,
     ) -> Result<MemoryLease, MemoryError>;
 
+    /// Reserve mapped-byte attribution capacity without charging physical
+    /// ownership a second time.
+    ///
+    /// Physical handle creation is charged through [`reserve`](Self::reserve).
+    /// This separate allowance answers whether one holder may map/use that
+    /// physical capacity. Implementations that do not provide authority-scoped
+    /// attribution must reject rather than silently creating private books.
+    fn reserve_mapped_allowance(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<MappedAllowance, MemoryError> {
+        let _ = (role, holder);
+        Err(MemoryError::InvalidRequest {
+            tier: tier.name(),
+            requested: bytes,
+            reason: "this governor does not support authority-scoped mapped-byte allowances",
+        })
+    }
+
     /// Record `bytes` on `tier` that are already committed for `role`.
     ///
     /// Unlike [`reserve`](MemoryGovernor::reserve), this is not an admission
@@ -731,6 +922,17 @@ pub struct LedgerGovernor {
     ledger: Arc<LeaseLedger>,
 }
 
+#[derive(Debug)]
+struct LedgerMappedAllowanceAccounting {
+    ledger: Arc<LeaseLedger>,
+}
+
+impl MappedAllowanceAccounting for LedgerMappedAllowanceAccounting {
+    fn release(&self, tier: Tier, bytes: u64) {
+        self.ledger.release_mapped_allowance(tier, bytes);
+    }
+}
+
 impl LedgerGovernor {
     /// A governor over `ledger`.
     ///
@@ -768,6 +970,27 @@ impl MemoryGovernor for LedgerGovernor {
         ))
     }
 
+    fn reserve_mapped_allowance(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: HolderId,
+    ) -> Result<MappedAllowance, MemoryError> {
+        self.ledger
+            .try_reserve_mapped_allowance(tier, bytes, role)?;
+        Ok(MappedAllowance::new(
+            self.authority_id(),
+            tier,
+            bytes,
+            role,
+            holder,
+            Arc::new(LedgerMappedAllowanceAccounting {
+                ledger: Arc::clone(&self.ledger),
+            }),
+        ))
+    }
+
     fn record_committed(
         &self,
         tier: Tier,
@@ -801,6 +1024,40 @@ impl MemoryGovernor for LedgerGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_allowances_coordinate_holders_without_double_charging_physical_bytes() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let first = governor
+            .reserve_mapped_allowance(Tier::Device, 60, MemoryRole::Weights, HolderId::new(1))
+            .expect("first zone");
+        assert_eq!(
+            governor.available(Tier::Device),
+            100,
+            "mapped capacity is not physical ownership"
+        );
+        let error = governor
+            .reserve_mapped_allowance(Tier::Device, 60, MemoryRole::Weights, HolderId::new(2))
+            .expect_err("two holders cannot each reserve most of the device");
+        assert!(matches!(
+            error,
+            MemoryError::TierExhausted { available: 40, .. }
+        ));
+
+        first.try_map(60).expect("map to zone limit");
+        assert!(matches!(
+            first.try_map(1),
+            Err(MemoryError::TierExhausted { available: 0, .. })
+        ));
+        assert_eq!(first.unmap(20), 20);
+        first
+            .try_map(20)
+            .expect("eviction restores mapped allowance");
+        drop(first);
+        governor
+            .reserve_mapped_allowance(Tier::Device, 100, MemoryRole::Weights, HolderId::new(2))
+            .expect("dropping zone returns authority capacity");
+    }
 
     fn governor(device: u64, host: u64, disk: u64) -> LedgerGovernor {
         LedgerGovernor::new(LeaseLedger::new(device, host, disk))

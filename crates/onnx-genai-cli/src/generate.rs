@@ -181,6 +181,9 @@ struct CudaOffloadSnapshot {
     vram_free_ns: u64,
     budget_bytes: u64,
     peak_resident_bytes: u64,
+    content_resident_bytes: u64,
+    mapped_physical_bytes: u64,
+    physical_owned_bytes: u64,
 }
 
 fn cuda_offload_stats() -> CudaOffloadSnapshot {
@@ -203,6 +206,9 @@ fn cuda_offload_stats() -> CudaOffloadSnapshot {
             vram_free_ns: stats.vram_free_ns,
             budget_bytes: stats.budget_bytes,
             peak_resident_bytes: stats.peak_resident_bytes,
+            content_resident_bytes: stats.content_resident_bytes,
+            mapped_physical_bytes: stats.mapped_physical_bytes,
+            physical_owned_bytes: stats.physical_owned_bytes,
         }
     }
     #[cfg(not(feature = "native-cuda"))]
@@ -258,6 +264,9 @@ fn emit_cuda_offload_counters(
     let vram_free_ns = after.vram_free_ns.saturating_sub(before.vram_free_ns);
     let budget_bytes = after.budget_bytes;
     let peak_resident_bytes = after.peak_resident_bytes.max(before.peak_resident_bytes);
+    let content_resident_bytes = after.content_resident_bytes;
+    let mapped_physical_bytes = after.mapped_physical_bytes;
+    let physical_owned_bytes = after.physical_owned_bytes;
     if page_ins > 0
         || hits > 0
         || evictions > 0
@@ -273,6 +282,9 @@ fn emit_cuda_offload_counters(
         || vram_free_ns > 0
         || budget_bytes > 0
         || peak_resident_bytes > 0
+        || content_resident_bytes > 0
+        || mapped_physical_bytes > 0
+        || physical_owned_bytes > 0
     {
         profile.counter("weight offload page-ins", page_ins as f64, "page-ins");
         profile.counter("weight offload cache hits", hits as f64, "hits");
@@ -330,6 +342,21 @@ fn emit_cuda_offload_counters(
         profile.counter(
             "weight offload peak resident",
             peak_resident_bytes as f64,
+            "bytes",
+        );
+        profile.counter(
+            "weight offload content resident",
+            content_resident_bytes as f64,
+            "bytes",
+        );
+        profile.counter(
+            "weight offload mapped physical",
+            mapped_physical_bytes as f64,
+            "bytes",
+        );
+        profile.counter(
+            "weight offload physical owned",
+            physical_owned_bytes as f64,
             "bytes",
         );
         profile.counter(
@@ -575,6 +602,7 @@ mod tests {
                 vram_free_ns: 1,
                 budget_bytes: 1,
                 peak_resident_bytes: 1,
+                ..Default::default()
             },
         );
 
