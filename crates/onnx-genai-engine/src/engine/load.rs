@@ -913,6 +913,7 @@ fn required_bytes_per_token_from_kv_config(
     })
 }
 
+#[cfg(feature = "native-backend")]
 fn populate_scheduler_bytes_per_token(
     scheduler: &mut onnx_genai_scheduler::SchedulerConfig,
     kv_config: ModelKvConfig,
@@ -2254,6 +2255,7 @@ mod pool_sizing_tests {
     }
 
     #[test]
+    #[cfg(feature = "native-backend")]
     fn native_state_only_scheduler_does_not_require_kv_geometry() {
         let mut scheduler = onnx_genai_scheduler::SchedulerConfig::default();
         let kv_config =
