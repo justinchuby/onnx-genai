@@ -138,8 +138,10 @@ unsafe extern "C" fn device_alloc(
         match ep.allocate(size, 16) {
             Ok(buf) => {
                 let ptr = buf.as_ptr() as *mut std::os::raw::c_void;
-                // Leak the DeviceBuffer — caller must free via device_free.
-                std::mem::forget(buf);
+                // DeviceBuffer has no Drop impl — when `buf` goes out of scope,
+                // only the handle metadata is discarded; the underlying
+                // allocation stays alive until `device_free` reconstructs a
+                // DeviceBuffer and calls `ep.deallocate()`.
                 ptr
             }
             Err(_) => ptr::null_mut(),
@@ -834,5 +836,70 @@ mod tests {
             hardware_type_to_memory_device_type(ort::OrtHardwareDeviceType_CPU),
             ort::OrtMemoryInfoDeviceType_CPU
         );
+    }
+
+    // ─── Generalized enumeration tests ──────────────────────────────────────
+
+    #[test]
+    fn cpu_support_enumerates_cpu_device() {
+        let support = DeviceSupport::cpu_only();
+        assert!(
+            support.serves(ort::OrtHardwareDeviceType_CPU),
+            "CPU support must enumerate CPU devices"
+        );
+    }
+
+    #[test]
+    fn cpu_support_does_not_enumerate_gpu_device() {
+        let support = DeviceSupport::cpu_only();
+        assert!(
+            !support.serves(ort::OrtHardwareDeviceType_GPU),
+            "CPU support must not enumerate GPU devices"
+        );
+    }
+
+    #[test]
+    fn gpu_support_enumerates_gpu_device() {
+        let support = DeviceSupport::gpu("Cuda", 0x10DE);
+        assert!(
+            support.serves(ort::OrtHardwareDeviceType_GPU),
+            "GPU support must enumerate GPU devices"
+        );
+    }
+
+    #[test]
+    fn gpu_support_does_not_enumerate_cpu_device() {
+        let support = DeviceSupport::gpu("Cuda", 0x10DE);
+        assert!(
+            !support.serves(ort::OrtHardwareDeviceType_CPU),
+            "GPU support must not enumerate CPU devices — fail closed"
+        );
+    }
+
+    #[test]
+    fn gpu_support_does_not_enumerate_npu_device() {
+        let support = DeviceSupport::gpu("Cuda", 0x10DE);
+        assert!(
+            !support.serves(ort::OrtHardwareDeviceType_NPU),
+            "GPU support must not enumerate NPU devices — fail closed"
+        );
+    }
+
+    #[test]
+    fn device_support_memory_device_type_matches_hardware() {
+        let cpu = DeviceSupport::cpu_only();
+        assert_eq!(cpu.memory_device_type(), ort::OrtMemoryInfoDeviceType_CPU);
+
+        let gpu = DeviceSupport::gpu("Cuda", 0x10DE);
+        assert_eq!(gpu.memory_device_type(), ort::OrtMemoryInfoDeviceType_GPU);
+    }
+
+    #[test]
+    fn device_support_stream_awareness_matches_config() {
+        let cpu = DeviceSupport::cpu_only();
+        assert!(!cpu.stream_aware, "CPU EP must not be stream-aware");
+
+        let gpu = DeviceSupport::gpu("Cuda", 0x10DE);
+        assert!(gpu.stream_aware, "GPU EP must be stream-aware");
     }
 }

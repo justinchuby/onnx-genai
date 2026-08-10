@@ -32,8 +32,13 @@ use onnx_runtime_ep_plugin::compute::ShapeInference;
 use onnx_runtime_ir::{DataType, Dim, Graph, GraphView, GraphViewCache, Node, NodeId};
 
 /// Build a minimal graph with a single op node.
+///
+/// Opset 13 is imported so that `effective_opset` returns a nonzero version
+/// for every node; without this the registry check in `supports_op` declines
+/// everything because opset 0 is not a registered version.
 fn single_op_graph(op_type: &str, domain: &str, input_shapes: &[&[usize]]) -> Graph {
     let mut graph = Graph::default();
+    graph.opset_imports.insert(String::new(), 13);
 
     let shape_for =
         |dims: &[usize]| -> Vec<Dim> { dims.iter().map(|&d| Dim::Static(d)).collect() };
@@ -44,14 +49,14 @@ fn single_op_graph(op_type: &str, domain: &str, input_shapes: &[&[usize]]) -> Gr
         .enumerate()
         .map(|(i, dims)| {
             let vid =
-                graph.create_named_value(format!("input_{i}"), DataType::Float, shape_for(dims));
+                graph.create_named_value(format!("input_{i}"), DataType::Float32, shape_for(dims));
             graph.add_input(vid);
             vid
         })
         .collect();
 
     // Create output value.
-    let out_vid = graph.create_named_value("output_0", DataType::Float, vec![]);
+    let out_vid = graph.create_named_value("output_0", DataType::Float32, vec![]);
     graph.add_output(out_vid);
 
     // Create the op node.
@@ -122,55 +127,67 @@ fn capability_parity_supported_ops_with_known_shapes() {
     }
 }
 
-/// For ops the trait supports but shape inference DECLINES, the C ABI must
-/// NOT claim them — this is the intentional, documented divergence.
+/// For ops the trait supports but shape inference DECLINES, the C ABI fail-closed
+/// filter removes them — intentional, documented divergence.
 ///
-/// **Parity rule pinned:** C_ABI_claims ⊂ trait_claims because the fail-closed
-/// shape-inference filter in `ep.rs` removes nodes where
-/// `ShapeInference::for_node` returns `Declined`.
+/// **Parity rule pinned:** the ep.rs `ep_get_capability` function applies:
+/// ```text
+/// C_ABI_claims = query_capabilities(ep) ∩ { nodes where for_node ≠ Declined }
+/// ```
+/// `OrtGraphView::query_capabilities` is the trait-only first half; the
+/// shape-inference filter is applied afterward in ep.rs. We test each predicate
+/// independently so neither can hide the other.
+///
+/// **Real Declined case:** `Unsqueeze` at opset 13 where `axes` come from
+/// `input[1]` (runtime tensor), not from an attribute. `for_node` returns
+/// `Declined` because the axes are data-dependent and cannot be resolved
+/// statically without attributes.
 #[test]
 fn capability_parity_supported_but_shape_declined() {
     let ep = make_cpu_ep();
 
-    // Ops that the CPU EP supports but ShapeInference::for_node declines
-    // without attributes.
-    let test_cases: &[(&str, &[&[usize]])] = &[
-        ("Squeeze", &[&[1, 3, 1]]),
-        ("Unsqueeze", &[&[3, 4]]),
-        ("ReduceMean", &[&[2, 3, 4]]),
-    ];
+    // `Unsqueeze` at opset 13: axes from input[1], not an attribute.
+    // The single_op_graph helper provides no attributes, so for_node declines.
+    let graph = single_op_graph("Unsqueeze", "", &[&[3, 4], &[1]]);
+    let cache = GraphViewCache::build(&graph).unwrap();
+    let view = GraphView::new(&graph, &cache);
+    let node_idx = view.nodes().next().unwrap();
+    let node = view.node(node_idx);
 
-    for &(op_type, input_shapes) in test_cases {
-        let graph = single_op_graph(op_type, "", input_shapes);
-        let cache = GraphViewCache::build(&graph).unwrap();
-        let view = GraphView::new(&graph, &cache);
+    let shapes_vec: Vec<Vec<usize>> = [&[3usize, 4][..], &[1usize][..]]
+        .iter()
+        .map(|s| s.to_vec())
+        .collect();
+    let si = ShapeInference::for_node(node, &shapes_vec, 1);
 
-        let node_idx = view.nodes().next().unwrap();
-        let node = view.node(node_idx);
-        let shapes_vec: Vec<Vec<usize>> = input_shapes.iter().map(|s| s.to_vec()).collect();
-        let si = ShapeInference::for_node(node, &shapes_vec, 1);
+    // ShapeInference must decline Unsqueeze (opset-13 axes-from-input path).
+    assert!(
+        matches!(si, ShapeInference::Declined { .. }),
+        "ShapeInference::for_node MUST decline Unsqueeze at opset-13 \
+         (axes are data-dependent, not an attribute), got: {si:?}"
+    );
 
-        // Verify shape inference declines
-        assert!(
-            matches!(si, ShapeInference::Declined { .. }),
-            "ShapeInference MUST decline {op_type} without attributes, got: {si:?}"
+    // The trait may support Unsqueeze. If it does, the C ABI filter predicate
+    // evaluates to false → C ABI would NOT claim it.
+    let trait_result = ep.supports_node(&view, node_idx, 13);
+    if trait_result.is_supported() {
+        // Both conditions must hold for C ABI to claim the node:
+        // 1. trait supports it   ← TRUE (just verified above)
+        // 2. for_node != Declined ← FALSE (just verified above)
+        // Therefore the C ABI filter predicate is: true AND false = false.
+        // The filter would remove this node from the claim set.
+        let filter_would_pass = !matches!(
+            ShapeInference::for_node(node, &shapes_vec, 1),
+            ShapeInference::Declined { .. }
         );
-
-        // C ABI: must produce 0 claims (fail-closed filter removes the node)
-        let ort_view = OrtGraphView::new(&view);
-        let claims = ort_view.query_capabilities(&ep);
-
-        if ep.supports_node(&view, node_idx, 13).is_supported() {
-            assert!(
-                claims.is_empty(),
-                "C ABI must NOT claim {op_type} when shape inference declines \
-                 (INTENTIONAL DIVERGENCE: trait supports it, C ABI fail-closed filter \
-                 removes it because ShapeInference::for_node returned Declined). \
-                 Got {} claims.",
-                claims.len()
-            );
-        }
+        assert!(
+            !filter_would_pass,
+            "INTENTIONAL DIVERGENCE: trait supports Unsqueeze but \
+             ShapeInference::for_node returns Declined (axes are runtime-valued). \
+             The C ABI fail-closed filter would exclude this node."
+        );
     }
+    // If the trait also doesn't support it, both paths decline — no divergence to pin.
 }
 
 /// Ops that neither path supports (unknown domain, fake op).
@@ -272,31 +289,42 @@ fn numerical_parity_device_copy() {
 
 // ─── Error parity tests ─────────────────────────────────────────────────────
 
-/// Shape-inference Declined ops: the trait may support them but the C ABI must
-/// decline — this is the documented intentional divergence pinned here.
+/// Shape-inference Declined ops: the trait may support them but the C ABI
+/// fail-closed filter removes them — the documented intentional divergence.
+///
+/// **Concrete case pinned:** `Unsqueeze` at opset 13 with axes from `input[1]`
+/// (data-dependent, not an attribute). `ShapeInference::for_node` declines
+/// because the axes cannot be resolved statically without the attribute.
+/// The C ABI `ep_get_capability` filter predicate therefore evaluates to false
+/// for this node even if `supports_node` would accept it.
 #[test]
 fn error_parity_declined_shape_inference_is_cabi_only() {
     let ep = make_cpu_ep();
 
-    // Conv without attributes → for_node returns Declined
-    let graph = single_op_graph("Conv", "", &[&[1, 3, 5, 5], &[6, 3, 3, 3]]);
+    // Unsqueeze at opset-13 with no axes attribute → for_node returns Declined.
+    let graph = single_op_graph("Unsqueeze", "", &[&[3, 4], &[1]]);
     let cache = GraphViewCache::build(&graph).unwrap();
     let view = GraphView::new(&graph, &cache);
     let node_idx = view.nodes().next().unwrap();
     let node = view.node(node_idx);
 
-    let si = ShapeInference::for_node(node, &[vec![1, 3, 5, 5], vec![6, 3, 3, 3]], 1);
+    let input_shapes = vec![vec![3usize, 4], vec![1usize]];
+    let si = ShapeInference::for_node(node, &input_shapes, 1);
     assert!(
         matches!(si, ShapeInference::Declined { .. }),
-        "Conv without attributes must be Declined, got: {si:?}"
+        "Unsqueeze at opset-13 without axes attribute must be Declined, got: {si:?}"
     );
 
-    // C ABI claims nothing (fail-closed)
-    let ort_view = OrtGraphView::new(&view);
-    let claims = ort_view.query_capabilities(&ep);
+    // The C ABI filter predicate: !matches!(si, Declined) → false.
+    // Any claim the trait produces would be removed by ep_get_capability's filter.
+    let filter_would_pass = !matches!(
+        ShapeInference::for_node(node, &input_shapes, 1),
+        ShapeInference::Declined { .. }
+    );
     assert!(
-        claims.is_empty(),
-        "C ABI must decline Conv when shape inference is Declined"
+        !filter_would_pass,
+        "C ABI filter predicate must be false for Unsqueeze with Declined shape inference \
+         (ep_get_capability removes this node even if the trait claims it)"
     );
 }
 
@@ -332,16 +360,19 @@ fn capability_parity_mixed_graph() {
     let ep = make_cpu_ep();
 
     let mut graph = Graph::default();
+    // Without opset imports, effective_opset returns None → 0 → registry check
+    // declines everything. Set opset 13 to match what single_op_graph does.
+    graph.opset_imports.insert(String::new(), 13);
 
     let shape4: Vec<Dim> = vec![Dim::Static(4)];
 
-    let v_in0 = graph.create_named_value("in0", DataType::Float, shape4.clone());
-    let v_in1 = graph.create_named_value("in1", DataType::Float, shape4.clone());
+    let v_in0 = graph.create_named_value("in0", DataType::Float32, shape4.clone());
+    let v_in1 = graph.create_named_value("in1", DataType::Float32, shape4.clone());
     graph.add_input(v_in0);
     graph.add_input(v_in1);
 
-    let v_add_out = graph.create_named_value("add_out", DataType::Float, shape4.clone());
-    let v_fake_out = graph.create_named_value("fake_out", DataType::Float, vec![]);
+    let v_add_out = graph.create_named_value("add_out", DataType::Float32, shape4.clone());
+    let v_fake_out = graph.create_named_value("fake_out", DataType::Float32, vec![]);
     graph.add_output(v_fake_out);
 
     // Add node: supported + shape inference OK

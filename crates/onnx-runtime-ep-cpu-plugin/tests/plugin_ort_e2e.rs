@@ -794,6 +794,68 @@ unsafe fn make_float_tensor(
     }
 }
 
+/// Create a FLOAT16 ORT tensor from raw u16 words (IEEE 754 binary16).
+unsafe fn make_float16_tensor(
+    api: *const ort::OrtApi,
+    data: &mut [u16],
+    shape: &[i64],
+) -> *mut ort::OrtValue {
+    unsafe {
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        let status = ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        );
+        check_status(api, status, "CreateCpuMemoryInfo(f16)");
+
+        let mut val: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+            mem_info,
+            data.as_mut_ptr().cast(),
+            std::mem::size_of_val(data),
+            shape.as_ptr(),
+            shape.len(),
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+            &mut val,
+        );
+        check_status(api, status, "CreateTensorWithDataAsOrtValue(float16)");
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+        val
+    }
+}
+
+/// Create a BFLOAT16 ORT tensor from raw u16 words (top-16-bits of IEEE 754 binary32).
+unsafe fn make_bfloat16_tensor(
+    api: *const ort::OrtApi,
+    data: &mut [u16],
+    shape: &[i64],
+) -> *mut ort::OrtValue {
+    unsafe {
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        let status = ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        );
+        check_status(api, status, "CreateCpuMemoryInfo(bf16)");
+
+        let mut val: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+            mem_info,
+            data.as_mut_ptr().cast(),
+            std::mem::size_of_val(data),
+            shape.as_ptr(),
+            shape.len(),
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
+            &mut val,
+        );
+        check_status(api, status, "CreateTensorWithDataAsOrtValue(bfloat16)");
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+        val
+    }
+}
+
 unsafe fn make_int32_tensor(
     api: *const ort::OrtApi,
     data: &mut [i32],
@@ -1817,4 +1879,166 @@ fn stress_register_run_unregister_cycles() {
     eprintln!(
         "\n✅ stress_register_run_unregister_cycles: {CYCLES} cycles PASSED — use-after-free regression clear"
     );
+}
+
+// ─── f16/bf16 end-to-end conformance (blocked on Deckard's registry_entries) ─
+
+/// Float16 Add through ORT: `Z = X + Y` with all-f16 inputs and outputs.
+///
+/// The CPU kernels in `crates/onnx-runtime-ep-cpu` accept Float16 for Add.
+/// **Blocked:** ORT routes a node to our EP via `GetCapability`, which queries
+/// `supports_op`. The EP's `supports_op` accepts any dtype that the kernel
+/// handles — but ORT *also* consults `GetKernelRegistry` to learn our
+/// type-constraint metadata before routing. Until Deckard lands
+/// `registry_entries()` on `CpuExecutionProvider` (and the cpu-plugin shim
+/// wires it through in `crates/onnx-runtime-ep-cpu/src/provider.rs` /
+/// `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs`), ORT does not route
+/// f16 nodes to us and this test will fail with "no output" or fall through
+/// to ORT's built-in CPU EP.
+///
+/// Remove the `#[ignore]` when `registry_entries()` lands and
+/// `cargo test -p onnx-runtime-ep-cpu-plugin conformance_add_float16 -- --ignored`
+/// passes with the numerically correct output below.
+#[test]
+#[ignore = "blocked: Deckard has not yet landed registry_entries() on CpuExecutionProvider \
+            (crates/onnx-runtime-ep-cpu/src/provider.rs). Without it ORT does not route \
+            Float16 nodes to our EP via GetKernelRegistry."]
+fn conformance_add_float16() {
+    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_f16", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_add_float16 — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        // Float16 bit-patterns: 1.0=0x3C00, 2.0=0x4000, 3.0=0x4200, 4.0=0x4400
+        let mut x_data: [u16; 4] = [0x3C00, 0x4000, 0x4200, 0x4400];
+        let mut y_data: [u16; 4] = [0x3C00, 0x4000, 0x4200, 0x4400];
+        let shape: [i64; 2] = [1, 4];
+
+        let x_val = make_float16_tensor(api, &mut x_data, &shape);
+        let y_val = make_float16_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(float16)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(float16)");
+
+        // Expected: 2.0=0x4000, 4.0=0x4400, 6.0=0x4600, 8.0=0x4800
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 4);
+        let expected: [u16; 4] = [0x4000, 0x4400, 0x4600, 0x4800];
+        eprintln!("  Got f16:      {result:?}");
+        eprintln!("  Expected f16: {expected:?}");
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got, want,
+                "output[{i}]: got f16 bit-pattern {got:#06x}, want {want:#06x}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_f16");
+        eprintln!("\n✅ conformance_add_float16: PASSED");
+    }
+}
+
+/// BFloat16 Add through ORT: `Z = X + Y` with all-bf16 inputs and outputs.
+///
+/// Same routing dependency as `conformance_add_float16` above — blocked on
+/// `registry_entries()` landing in `crates/onnx-runtime-ep-cpu/src/provider.rs`.
+///
+/// BFloat16 is the top 16 bits of a float32 mantissa: 1.0=0x3F80, 2.0=0x4000,
+/// 3.0=0x4040, 4.0=0x4080.
+#[test]
+#[ignore = "blocked: Deckard has not yet landed registry_entries() on CpuExecutionProvider \
+            (crates/onnx-runtime-ep-cpu/src/provider.rs). Without it ORT does not route \
+            BFloat16 nodes to our EP via GetKernelRegistry."]
+fn conformance_add_bfloat16() {
+    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_bf16", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_add_bfloat16 — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        // BFloat16 bit-patterns (top 16 bits of f32):
+        // 1.0→0x3F80, 2.0→0x4000, 3.0→0x4040, 4.0→0x4080
+        let mut x_data: [u16; 4] = [0x3F80, 0x4000, 0x4040, 0x4080];
+        let mut y_data: [u16; 4] = [0x3F80, 0x4000, 0x4040, 0x4080];
+        let shape: [i64; 2] = [1, 4];
+
+        let x_val = make_bfloat16_tensor(api, &mut x_data, &shape);
+        let y_val = make_bfloat16_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(bfloat16)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(bfloat16)");
+
+        // Expected: 2.0→0x4000, 4.0→0x4080, 6.0→0x40C0, 8.0→0x4100
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 4);
+        let expected: [u16; 4] = [0x4000, 0x4080, 0x40C0, 0x4100];
+        eprintln!("  Got bf16:      {result:?}");
+        eprintln!("  Expected bf16: {expected:?}");
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got, want,
+                "output[{i}]: got bf16 bit-pattern {got:#06x}, want {want:#06x}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_bf16");
+        eprintln!("\n✅ conformance_add_bfloat16: PASSED");
+    }
 }

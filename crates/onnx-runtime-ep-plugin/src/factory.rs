@@ -10,6 +10,7 @@ use std::ptr;
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
 
+use crate::device::{DeviceAllocator, DeviceSupport, DeviceSyncStream};
 use crate::ep::ExportedEp;
 use crate::status::{fail_status, host_api, ok_status, set_host_api};
 
@@ -34,6 +35,8 @@ pub struct ExportedFactory {
     /// When non-empty, `create_ep` builds an ORT kernel registry so that ORT
     /// routes f16/bf16 (and other typed) nodes to this EP.
     pub kernel_registry_entries: Vec<crate::ep::KernelRegistryEntry>,
+    /// Device support configuration for generalized enumeration.
+    pub device_support: DeviceSupport,
 }
 
 /// Implementation of `CreateEpFactories` — called by the macro-generated export.
@@ -148,6 +151,7 @@ where
         version_cstr,
         constructor: Box::new(move || constructor()),
         kernel_registry_entries: Vec::new(),
+        device_support: DeviceSupport::cpu_only(),
     });
 
     let factory_ptr = Box::into_raw(factory);
@@ -195,6 +199,47 @@ where
         if !factory_ptr.is_null() {
             let exported = unsafe { &mut *(factory_ptr.cast::<ExportedFactory>()) };
             exported.kernel_registry_entries = entries;
+        }
+    }
+    ok_status()
+}
+
+/// Like [`create_ep_factories_with_registry`] but also sets the device support
+/// configuration for generalized device enumeration.
+///
+/// # Safety
+///
+/// All pointer arguments must be valid per the ORT plugin-EP C ABI.
+pub unsafe fn create_ep_factories_with_device_support<F>(
+    api_base: *const ort::OrtApiBase,
+    out_factories: *mut *mut ort::OrtEpFactory,
+    max_factories: usize,
+    out_num: *mut usize,
+    constructor: F,
+    entries: Vec<crate::ep::KernelRegistryEntry>,
+    support: DeviceSupport,
+) -> *mut ort::OrtStatus
+where
+    F: Fn() -> Box<dyn ExecutionProvider> + Send + Sync + 'static,
+{
+    let status = unsafe {
+        create_ep_factories_with_registry(
+            api_base,
+            out_factories,
+            max_factories,
+            out_num,
+            constructor,
+            entries,
+        )
+    };
+    if !status.is_null() {
+        return status;
+    }
+    if !out_factories.is_null() {
+        let factory_ptr = unsafe { *out_factories };
+        if !factory_ptr.is_null() {
+            let exported = unsafe { &mut *(factory_ptr.cast::<ExportedFactory>()) };
+            exported.device_support = support;
         }
     }
     ok_status()
@@ -303,8 +348,10 @@ unsafe extern "C" fn factory_get_supported_devices(
             None => return fail_status("GetSupportedDevices: CreateEpDevice not available"),
         };
 
-        // Iterate input hardware devices, filter for CPU type, create an
-        // OrtEpDevice for each one (up to max_out).
+        // Iterate input hardware devices, filter using DeviceSupport config,
+        // create an OrtEpDevice for each matching one (up to max_out).
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        let support = &exported.device_support;
         let mut count: usize = 0;
         for i in 0..num_in {
             if count >= max_out {
@@ -315,7 +362,7 @@ unsafe extern "C" fn factory_get_supported_devices(
                 continue;
             }
             let dev_type = unsafe { hw_type_fn(hw_device) };
-            if dev_type != ort::OrtHardwareDeviceType_CPU {
+            if !support.serves(dev_type) {
                 continue;
             }
 
@@ -352,7 +399,7 @@ unsafe extern "C" fn factory_get_supported_devices(
                 return fail_status("GetSupportedDevices: CreateEpDevice returned null device");
             }
 
-            // Register CPU memory info so ORT knows how to allocate for this device.
+            // Register memory info so ORT knows how to allocate for this device.
             // Required: ORT internally accesses the device's allocator info.
             let add_alloc_info = match unsafe { (*ep_api).EpDevice_AddAllocatorInfo } {
                 Some(f) => f,
@@ -375,17 +422,19 @@ unsafe extern "C" fn factory_get_supported_devices(
                 }
             };
 
-            // CPU device allocator with OrtDeviceMemoryType_DEFAULT.
+            // Create allocator name as a C string from the support config.
+            let alloc_name = std::ffi::CString::new(support.allocator_name)
+                .unwrap_or_else(|_| std::ffi::CString::new("Cpu").unwrap());
             let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
             let status = unsafe {
                 create_mem_info_v2(
-                    c"Cpu".as_ptr(),
-                    ort::OrtMemoryInfoDeviceType_CPU, // device_type
-                    0,                                // vendor_id (generic)
-                    0,                                // device_id
-                    ort::OrtDeviceMemoryType_DEFAULT, // mem_type
-                    0,                                // alignment (default)
-                    ort::OrtDeviceAllocator,          // allocator_type
+                    alloc_name.as_ptr(),
+                    support.memory_device_type(),      // device_type from support
+                    support.vendor_id,                 // vendor_id from support
+                    0,                                 // device_id
+                    ort::OrtDeviceMemoryType_DEFAULT,  // mem_type
+                    0,                                 // alignment (default)
+                    ort::OrtDeviceAllocator,           // allocator_type
                     &mut mem_info,
                 )
             };
@@ -474,42 +523,96 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
     }));
 }
 
-/// CPU EP uses ORT's default CPU allocator.
-///
-/// ORT 1.27 has a bug: after a successful CreateAllocator (null status return),
-/// it dereferences the output allocator without null-checking. We MUST provide
-/// a valid allocator even though the spec says "Set to nullptr for default."
+/// Creates an allocator. For CPU EPs, uses ORT's default CPU allocator.
+/// For device EPs (GPU/NPU), creates a DeviceAllocator backed by the EP.
 unsafe extern "C" fn factory_create_allocator(
-    _factory: *mut ort::OrtEpFactory,
-    _memory_info: *const ort::OrtMemoryInfo,
+    factory: *mut ort::OrtEpFactory,
+    memory_info: *const ort::OrtMemoryInfo,
     _allocator_options: *const ort::OrtKeyValuePairs,
     allocator: *mut *mut ort::OrtAllocator,
 ) -> *mut ort::OrtStatus {
-    // Minimal panic-safe path. Avoid complex closures to reduce chance of panic.
-    if allocator.is_null() {
-        return fail_status("CreateAllocator: allocator output pointer is null");
-    }
-    let api = host_api();
-    if api.is_null() {
-        return fail_status("CreateAllocator: host API not available");
-    }
-    let get_default = unsafe { (*api).GetAllocatorWithDefaultOptions };
-    match get_default {
-        Some(f) => unsafe { f(allocator) },
-        None => fail_status("CreateAllocator: GetAllocatorWithDefaultOptions unavailable"),
-    }
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if allocator.is_null() {
+            return fail_status("CreateAllocator: allocator output pointer is null");
+        }
+        if factory.is_null() {
+            return fail_status("CreateAllocator: factory is null");
+        }
+
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        let support = &exported.device_support;
+
+        if support.host_accessible {
+            // CPU path: use ORT's built-in default allocator.
+            let api = host_api();
+            if api.is_null() {
+                return fail_status("CreateAllocator: host API not available");
+            }
+            let get_default = unsafe { (*api).GetAllocatorWithDefaultOptions };
+            match get_default {
+                Some(f) => return unsafe { f(allocator) },
+                None => {
+                    return fail_status(
+                        "CreateAllocator: GetAllocatorWithDefaultOptions unavailable",
+                    );
+                }
+            }
+        }
+
+        // Device path: create a DeviceAllocator backed by a fresh EP instance.
+        // The EP instance must outlive the allocator. We Box-leak it; ORT calls
+        // ReleaseAllocator which drops the DeviceAllocator (but not the EP —
+        // that lives as a raw pointer). The factory's constructor produces a
+        // fresh EP for the allocator to use.
+        let mut ep = (exported.constructor)();
+        let config = onnx_runtime_ep_api::provider::EpConfig::default();
+        if let Err(e) = ep.initialize(&config) {
+            return fail_status(&format!("CreateAllocator: EP init failed: {e}"));
+        }
+        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+        let dev_alloc = unsafe { DeviceAllocator::new(ep_ptr, memory_info) };
+        let alloc_ptr = Box::into_raw(dev_alloc);
+        unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
+        ok_status()
+    }));
+    result.unwrap_or_else(|_| fail_status("CreateAllocator: internal panic"))
 }
 
-/// No-op: we never create allocators, so nothing to release.
+/// Release an allocator. For default ORT allocators (CPU path), this is a no-op.
+/// For DeviceAllocator instances, drops both the allocator and its backing EP.
 unsafe extern "C" fn factory_release_allocator(
-    _factory: *mut ort::OrtEpFactory,
-    _allocator: *mut ort::OrtAllocator,
+    factory: *mut ort::OrtEpFactory,
+    allocator: *mut ort::OrtAllocator,
 ) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if allocator.is_null() || factory.is_null() {
+            return;
+        }
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        if !exported.device_support.host_accessible {
+            // This is a DeviceAllocator we created — drop it and the EP.
+            let dev_alloc = unsafe { Box::from_raw(allocator.cast::<DeviceAllocator>()) };
+            // Drop the leaked EP behind the allocator.
+            if !dev_alloc.ep.is_null() {
+                unsafe {
+                    drop(Box::from_raw(dev_alloc.ep as *mut dyn ExecutionProvider));
+                }
+            }
+        }
+        // CPU path: allocator is ORT's default — we don't own it.
+    }));
 }
 
-/// CPU EP is not stream-aware.
-unsafe extern "C" fn factory_is_stream_aware(_factory: *const ort::OrtEpFactory) -> bool {
-    false
+/// Stream-awareness derived from the factory's DeviceSupport config.
+unsafe extern "C" fn factory_is_stream_aware(factory: *const ort::OrtEpFactory) -> bool {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if factory.is_null() {
+            return false;
+        }
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        exported.device_support.stream_aware
+    }));
+    result.unwrap_or(false)
 }
 
 /// No data transfer needed for CPU EP — set output to null.
@@ -523,17 +626,49 @@ unsafe extern "C" fn factory_create_data_transfer(
     ok_status()
 }
 
-/// CPU EP does not create sync streams.
+/// Creates a sync stream. For non-stream-aware EPs (CPU), returns null (no-op).
+/// For stream-aware EPs (GPU/NPU), creates a DeviceSyncStream backed by a
+/// fresh EP instance.
 unsafe extern "C" fn factory_create_sync_stream(
-    _factory: *mut ort::OrtEpFactory,
+    factory: *mut ort::OrtEpFactory,
     _memory_device: *const ort::OrtMemoryDevice,
     _stream_options: *const ort::OrtKeyValuePairs,
     stream: *mut *mut ort::OrtSyncStreamImpl,
 ) -> *mut ort::OrtStatus {
-    if !stream.is_null() {
-        unsafe { *stream = ptr::null_mut() };
-    }
-    ok_status()
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() {
+            return fail_status("CreateSyncStream: stream output pointer is null");
+        }
+        if factory.is_null() {
+            unsafe { *stream = ptr::null_mut() };
+            return fail_status("CreateSyncStream: factory is null");
+        }
+
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        let support = &exported.device_support;
+
+        if !support.stream_aware {
+            // Non-stream-aware EP: fail closed.
+            unsafe { *stream = ptr::null_mut() };
+            return fail_status(
+                "CreateSyncStream: EP is not stream-aware; cannot create sync stream",
+            );
+        }
+
+        // Stream-aware path: create a DeviceSyncStream backed by a fresh EP.
+        let mut ep = (exported.constructor)();
+        let config = onnx_runtime_ep_api::provider::EpConfig::default();
+        if let Err(e) = ep.initialize(&config) {
+            unsafe { *stream = ptr::null_mut() };
+            return fail_status(&format!("CreateSyncStream: EP init failed: {e}"));
+        }
+        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+        let sync_stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        let stream_ptr = Box::into_raw(sync_stream);
+        unsafe { *stream = stream_ptr.cast::<ort::OrtSyncStreamImpl>() };
+        ok_status()
+    }));
+    result.unwrap_or_else(|_| fail_status("CreateSyncStream: internal panic"))
 }
 
 /// Always compatible — no compiled model validation.

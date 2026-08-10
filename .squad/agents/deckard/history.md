@@ -36,3 +36,12 @@ Pre-2026-08-10 entries moved to `history-archive.md`. Covers: kernel pre-binding
 - **GetKernelRegistry infrastructure**: Implemented full ORT 1.24+ kernel-registry-based type-constraint machinery. `ExportedEp` now optionally holds an `OrtKernelRegistry*` built from `KernelRegistryEntry` slices. GetKernelRegistry callback wired. Coexists with Compile path (not mutually exclusive per header line 1522).
 - **Blocker for f16/bf16**: `ExecutionProvider` trait lacks `op_entries()` iterator; CPU EP plugin must pass entries to `create_ep_factories_with_registry`. Pris: once entries are wired, re-test f16/bf16 routing.
 - 120 lib tests pass (4 new: cleanup, dtype mapping, entry construction, no-host-api guard). 15 conformance tests pass. No regression.
+
+## 2026-08-10 — f16/bf16 kernel-registry entries wired end-to-end
+
+- **Blocker resolved**: CPU EP plugin now passes `KernelRegistryEntry` slices to `create_ep_factories_with_registry`, derived from the real `OpRegistry` via `RecordingOpRegistry`.
+- **Design choice**: Inherent function in ep-cpu (`build_cpu_registry_with_descriptors`) rather than trait method — avoids circular dep between ep-api and ep-plugin. CUDA EP adopts same pattern independently. Consistent with §524.
+- **Dtype derivation**: `supported_dtypes_for_op()` classifies ops by actual dispatch macro used. Fail-closed: unknown ops → f32-only.
+- **f16/bf16 advertised** for: Add, Sub, Mul, Div, MatMul, Gemm, Softmax, LayerNorm, Attention, Identity, Reshape, etc. NOT for pkg.nxrt ops or MatMulNBits.
+- **Tests**: 6 new unit tests (descriptor derivation, f16/bf16 presence, fail-closed). 127 ep-plugin tests, 21 cpu-plugin tests all pass. Workspace check clean.
+- **f16/bf16 routing status**: Infrastructure complete. Whether ORT actually routes depends on compile-EP semantics — Pris's e2e test is the ground truth.

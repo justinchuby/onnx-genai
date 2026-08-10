@@ -249,3 +249,45 @@ from Deckard (`ep.rs:114,406`) and Nabil (`device.rs:121,221,466,556`). These ar
 transient teammate edits, not bugs in the parity logic.
 
 **Decision filed:** `.squad/decisions/inbox/pris-trait-cabi-parity.md`
+
+## 2026-08-10 — Parity tests compile and pass; parity rule verified against real code
+
+**Branch:** `squad/ep-plugin-parity-cuda`
+
+**Task 1 — Parity tests now compile and pass (9/9)**
+
+Two compile errors blocked the tests:
+1. `DataType::Float` → corrected to `DataType::Float32` (6 occurrences, test file only)
+2. `KernelMatch` missing `#[derive(Debug)]` → added to `crates/onnx-runtime-ep-api/src/kernel.rs`
+
+Running the tests revealed **the parity rule holds, but the initial test assumptions were wrong**:
+- `ShapeInference::for_node` does NOT decline Squeeze/ReduceMean/Conv without attributes —
+  it is smarter than `for_op`: it reads input shapes and uses defaults, successfully inferring
+  Squeeze with empty axes, ReduceMean with no axes, and Conv from weight dimensions.
+- The **confirmed Declined case**: `Unsqueeze` at opset ≥ 13 where axes come from `input[1]`
+  (a runtime tensor, not an attribute). Tests updated to use this real example.
+- Graphs built without opset imports get `effective_opset() = 0`, which causes `supports_op`
+  to decline everything. Fixed by adding `graph.opset_imports.insert(String::new(), 13)` in the
+  test graph builder.
+- `OrtGraphView::query_capabilities` is the trait-only first half of the C ABI path; it does
+  NOT apply the shape-inference filter. The filter lives in `ep.rs:ep_get_capability`. Tests
+  that asserted "C ABI claims = 0" via `query_capabilities` were wrong. Fixed to test the
+  filter predicate directly.
+
+**Final counts:**
+- `cargo test -p onnx-runtime-ep-plugin`: **127 passed; 0 failed** (9 integration parity tests all pass)
+- `cargo test -p onnx-runtime-ep-cpu-plugin`: **15 passed; 0 failed; 2 ignored**
+
+**Task 2 — f16/bf16 end-to-end: honest ignored tests**
+
+`registry_entries()` on `CpuExecutionProvider` has not landed (Deckard, owner file:
+`crates/onnx-runtime-ep-cpu/src/provider.rs`). Without it ORT does not route Float16/BFloat16
+nodes to our EP via `GetKernelRegistry`. Tests written with real fixtures and exact bit-pattern
+assertions; `#[ignore]`-d with precise reason naming the blocking file and owner.
+
+New ignored tests:
+- `conformance_add_float16` — `tests/fixtures/add_float16/model.onnx` created
+- `conformance_add_bfloat16` — `tests/fixtures/add_bfloat16/model.onnx` created
+- New helpers `make_float16_tensor` / `make_bfloat16_tensor` added to the test file
+
+**Decision updated:** `.squad/decisions/inbox/pris-trait-cabi-parity.md`

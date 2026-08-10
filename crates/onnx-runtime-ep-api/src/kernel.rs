@@ -82,6 +82,7 @@ impl Cost {
 /// A decline reason travels with the decision that produced it. EPs must not
 /// maintain a separate reason table: colocating the reason with `Unsupported`
 /// keeps diagnostics from drifting away from the actual claim predicate.
+#[derive(Debug)]
 pub enum KernelMatch {
     Supported {
         cost: Cost,
