@@ -3,7 +3,7 @@
 **Date:** 2026-08-10
 **Branch:** `squad/ep-plugin-parity-cuda`
 **Author:** Pris (Tester)
-**Updated:** 2026-08-10 — tests now compile and pass
+**Updated:** 2026-08-10 (lint fix + f16/bf16 verdict)
 
 ## Capability-parity rule (proven in code)
 
@@ -41,27 +41,38 @@ The rule **holds**, but the set of "Declined" ops is **smaller than the initial 
 | com.microsoft unknown ops → both decline | `capability_parity_com_microsoft_domain` | ✅ PASS |
 | Memory roundtrip bit-exact | `numerical_parity_memory_roundtrip` | ✅ PASS |
 | Device-to-device copy bit-exact | `numerical_parity_device_copy` | ✅ PASS |
-| Unsqueeze (opset-13, no axes attr) → C ABI filter predicate = false | `error_parity_declined_shape_inference_is_cabi_only` | ✅ PASS |
+| Unsqueeze (opset-13, no axes attr): trait claims it AND C ABI filter removes it (divergence proven) | `error_parity_declined_shape_inference_is_cabi_only` | ✅ PASS |
 | Unknown op → both decline | `error_parity_unknown_op_declined_by_both` | ✅ PASS |
 
-## Final test counts
+## Final test counts (2026-08-10, commit 577047a74)
 
-- `cargo test -p onnx-runtime-ep-plugin`: **127 passed; 0 failed; 9 integration tests (all pass)**
-- `cargo test -p onnx-runtime-ep-cpu-plugin`: **15 passed; 0 failed; 2 ignored (f16/bf16, blocked)**
+- `cargo test -p onnx-runtime-ep-plugin`: **132 passed; 0 failed; 9 integration tests (all pass)**
+- `cargo test -p onnx-runtime-ep-cpu-plugin -- --include-ignored`: **23 passed; 0 failed; 0 ignored**
 
-## f16/bf16 status
+## f16/bf16 status — **OUTCOME 1: PASSES. #[ignore] removed.**
 
-**Blocked.** Deckard has not landed `registry_entries()` on `CpuExecutionProvider`
-(`crates/onnx-runtime-ep-cpu/src/provider.rs`). Without this, ORT does not route
-Float16/BFloat16 nodes to our EP via `GetKernelRegistry`.
+**Verdict (2026-08-10, commit 577047a74):**
 
-Tests written and `#[ignore]`-d with precise reason:
-- `conformance_add_float16` — uses `tests/fixtures/add_float16/model.onnx`
-- `conformance_add_bfloat16` — uses `tests/fixtures/add_bfloat16/model.onnx`
+Both `conformance_add_float16` and `conformance_add_bfloat16` pass with **numerically
+correct, exact bit-pattern output**. The `#[ignore]` has been removed from both tests.
 
-Both tests assert **exact bit-pattern equality** on f16/bf16 outputs (independently
-computed expected values, not derived from the implementation). Remove `#[ignore]` when
-`registry_entries()` lands and test under `-- --ignored`.
+**Evidence:**
+```
+test conformance_add_float16  ... ok   (f16: [0x4000, 0x4400, 0x4600, 0x4800] ✓)
+test conformance_add_bfloat16 ... ok   (bf16: [0x4000, 0x4080, 0x40C0, 0x4100] ✓)
+```
+
+**Why they now pass:**
+- Deckard landed `build_cpu_registry_with_descriptors()` in `crates/onnx-runtime-ep-cpu`.
+- The cpu-plugin shim wires it through `GetKernelRegistry` in
+  `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs` via `build_kernel_registry_entries()`.
+- `Float16` and `BFloat16` are included in the kernel descriptor supported-dtype lists,
+  so ORT's type-constraint metadata matches and routes f16/bf16 nodes to our EP.
+- The kernel produces correct output (1.0+1.0=2.0, 2.0+2.0=4.0, 3.0+3.0=6.0, 4.0+4.0=8.0
+  for both Float16 and BFloat16 exactly).
+
+**This is outcome 1** (our EP accelerates f16/bf16), not outcome 2 (ORT fallback).
+The kernel registry wiring confirms our EP claims and executes the nodes.
 
 ## What remains unproven
 

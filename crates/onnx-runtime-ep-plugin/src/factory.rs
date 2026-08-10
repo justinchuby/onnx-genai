@@ -494,12 +494,13 @@ unsafe extern "C" fn factory_create_ep(
             return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
         }
 
-        let exported_ep = Box::new(ExportedEp::new_with_registry(
+        let exported_ep = Box::new(ExportedEp::new_with_registry_and_entries(
             ep,
             crate::ep::build_ort_kernel_registry(
                 &exported.kernel_registry_entries,
                 exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
             ),
+            exported.kernel_registry_entries.clone(),
         ));
         let ep_ptr = Box::into_raw(exported_ep);
         // SAFETY: ExportedEp's first field is OrtEp vtable.

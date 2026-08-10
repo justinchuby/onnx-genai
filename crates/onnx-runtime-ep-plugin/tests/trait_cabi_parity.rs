@@ -232,7 +232,7 @@ fn capability_parity_unsupported_ops() {
 fn numerical_parity_memory_roundtrip() {
     let ep = make_cpu_ep();
 
-    let data: Vec<f32> = vec![1.0, 2.0, 3.14, -42.5, 0.0, f32::INFINITY];
+    let data: Vec<f32> = vec![1.0, 2.0, 3.5, -42.5, 0.0, f32::INFINITY];
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             data.as_ptr().cast(),
@@ -308,23 +308,44 @@ fn error_parity_declined_shape_inference_is_cabi_only() {
     let node_idx = view.nodes().next().unwrap();
     let node = view.node(node_idx);
 
+    // Step 1 — Trait path claims Unsqueeze (it is in the kernel registry).
+    // This is the "first half" that OrtGraphView::query_capabilities covers.
+    let ort_view = OrtGraphView::new(&view);
+    let trait_claims = ort_view.query_capabilities(&ep);
+    assert!(
+        !trait_claims.is_empty(),
+        "Trait (query_capabilities) must claim Unsqueeze — it is a registered kernel"
+    );
+
+    // Step 2 — Shape inference is Declined for this node (axes are data-dependent).
     let input_shapes = vec![vec![3usize, 4], vec![1usize]];
     let si = ShapeInference::for_node(node, &input_shapes, 1);
     assert!(
         matches!(si, ShapeInference::Declined { .. }),
-        "Unsqueeze at opset-13 without axes attribute must be Declined, got: {si:?}"
+        "Unsqueeze at opset-13 without axes attribute must be Declined by shape inference, got: {si:?}"
     );
 
-    // The C ABI filter predicate: !matches!(si, Declined) → false.
-    // Any claim the trait produces would be removed by ep_get_capability's filter.
-    let filter_would_pass = !matches!(
-        ShapeInference::for_node(node, &input_shapes, 1),
-        ShapeInference::Declined { .. }
-    );
+    // Step 3 — The C ABI filter in ep_get_capability applies:
+    //   C_ABI_claims = query_capabilities(ep) ∩ { nodes where for_node ≠ Declined }
+    // Since shape inference returns Declined, the filter removes all claims.
+    // Simulate the filter inline:
+    let cabi_claims: Vec<_> = trait_claims
+        .into_iter()
+        .filter(|claim| {
+            claim.node_ids.iter().all(|&nid| {
+                let Some(idx) = view.node_index(nid) else {
+                    return false;
+                };
+                let n = view.node(idx);
+                let si_check = ShapeInference::for_node(n, &input_shapes, 1);
+                !matches!(si_check, ShapeInference::Declined { .. })
+            })
+        })
+        .collect();
     assert!(
-        !filter_would_pass,
-        "C ABI filter predicate must be false for Unsqueeze with Declined shape inference \
-         (ep_get_capability removes this node even if the trait claims it)"
+        cabi_claims.is_empty(),
+        "C ABI filter must produce no claims for Unsqueeze with Declined shape inference \
+         (ep_get_capability removes this node even though the trait claimed it)"
     );
 }
 

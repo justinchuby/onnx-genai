@@ -45,3 +45,11 @@ Pre-2026-08-10 entries moved to `history-archive.md`. Covers: kernel pre-binding
 - **f16/bf16 advertised** for: Add, Sub, Mul, Div, MatMul, Gemm, Softmax, LayerNorm, Attention, Identity, Reshape, etc. NOT for pkg.nxrt ops or MatMulNBits.
 - **Tests**: 6 new unit tests (descriptor derivation, f16/bf16 presence, fail-closed). 127 ep-plugin tests, 21 cpu-plugin tests all pass. Workspace check clean.
 - **f16/bf16 routing status**: Infrastructure complete. Whether ORT actually routes depends on compile-EP semantics — Pris's e2e test is the ground truth.
+
+## 2026-08-10 — Dtype-aware GetCapability claim predicate
+
+- **What**: `ep_get_capability_inner` now applies `node_passes_dtype_filter()` to every claimed node. The filter checks input/output dtypes against `KernelRegistryEntry::supported_dtypes` sourced from the same descriptors used for `GetKernelRegistry`. Single source of truth — no drift by construction.
+- **Fail-closed**: Node rejected if op has no registry entry, if any dtype is Undefined, or if dtype not in supported set.
+- **Wiring**: `ExportedEp` gains `registry_entries: Vec<KernelRegistryEntry>`, populated via `new_with_registry_and_entries()` from factory's `CreateEp`. Backward-compatible: `new_with_registry()` passes empty entries (filter bypassed).
+- **Tests**: 5 new unit tests (f32 claimed, unsupported rejected, Undefined rejected, unknown op rejected, empty entries bypassed). 132 ep-plugin tests, 23 cpu-plugin tests pass. Clippy clean. Workspace check succeeds.
+- **f16/bf16 routing verdict**: The claim predicate is now dtype-aware and will claim f16/bf16 nodes for ops that list Float16/BFloat16. Cannot empirically prove e2e on this host (no f16 model in conformance suite). Instruction to Pris: **un-ignore the f16/bf16 conformance tests.**

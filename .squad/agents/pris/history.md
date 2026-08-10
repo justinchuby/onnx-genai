@@ -250,11 +250,60 @@ transient teammate edits, not bugs in the parity logic.
 
 **Decision filed:** `.squad/decisions/inbox/pris-trait-cabi-parity.md`
 
-## 2026-08-10 — Parity tests compile and pass; parity rule verified against real code
+## 2026-08-10 — Lint fix, parity test strengthened, f16/bf16 verdict (branch: squad/ep-plugin-parity-cuda)
 
-**Branch:** `squad/ep-plugin-parity-cuda`
+**Task 1 — Two lints cleared in `trait_cabi_parity.rs`**
 
-**Task 1 — Parity tests now compile and pass (9/9)**
+1. **PI approximation (`3.14`)** at line 235: replaced with `3.5` — this test exercises
+   memory roundtrip, not PI. The literal was incidentally close to π and triggered
+   clippy's `approx_constant` lint.
+
+2. **Unused `ep` variable** at line ~302 in `error_parity_declined_shape_inference_is_cabi_only`:
+   The `ep` was unused — a real weakness, not just a lint. The test only checked
+   shape inference twice but never verified the actual trait/C-ABI divergence. Fixed by
+   rewriting the test to exercise all three steps of the parity rule:
+   - Step 1: `OrtGraphView::query_capabilities(&ep)` returns a claim (trait says yes).
+   - Step 2: `ShapeInference::for_node` returns Declined for the same node.
+   - Step 3: Simulating the C ABI filter (the `∩` from `ep_get_capability`) produces
+     empty — divergence confirmed end-to-end. The `ep` is now genuinely used.
+
+`cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`: **clean**.
+
+**Task 2 — f16/bf16 verdict: OUTCOME 1 (our EP accelerates f16/bf16)**
+
+Ran both previously-ignored tests against commit `577047a74`:
+```
+test conformance_add_float16  ... ok
+test conformance_add_bfloat16 ... ok
+```
+
+Bit-exact output confirmed:
+- Float16: `[0x4000, 0x4400, 0x4600, 0x4800]` (2.0, 4.0, 6.0, 8.0)
+- BFloat16: `[0x4000, 0x4080, 0x40C0, 0x4100]` (2.0, 4.0, 6.0, 8.0)
+
+**Why this is outcome 1 and not outcome 2:**
+`build_cpu_registry_with_descriptors()` (Deckard's landing) derives Float16/BFloat16
+type-constraint metadata; `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs` wires it
+through `GetKernelRegistry` via `build_kernel_registry_entries()`. ORT uses this
+metadata to route f16/bf16 nodes to our EP rather than falling back to its built-in CPU EP.
+
+`#[ignore]` removed from both `conformance_add_float16` and `conformance_add_bfloat16`.
+Doc comments updated to remove the "blocked" framing.
+
+**Final test counts:**
+```
+cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings: clean
+cargo test -p onnx-runtime-ep-plugin:
+  unittests: 132 passed; 0 failed
+  trait_cabi_parity: 9 passed; 0 failed; 0 ignored
+cargo test -p onnx-runtime-ep-cpu-plugin -- --include-ignored:
+  plugin_export_abi: 6 passed; 0 failed; 0 ignored
+  plugin_ort_e2e:   17 passed; 0 failed; 0 ignored
+  TOTAL:            23 passed; 0 failed; 0 ignored
+```
+
+**Decision updated:** `.squad/decisions/inbox/pris-trait-cabi-parity.md`
+
 
 Two compile errors blocked the tests:
 1. `DataType::Float` → corrected to `DataType::Float32` (6 occurrences, test file only)

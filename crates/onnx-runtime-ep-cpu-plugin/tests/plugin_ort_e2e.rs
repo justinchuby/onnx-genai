@@ -20,13 +20,11 @@
 //!
 //! # f16/bf16 coverage
 //!
-//! The underlying CPU kernels (`crates/onnx-runtime-ep-cpu`) support Float16 and BFloat16
-//! for Add and MatMul. However, the ORT plugin interface routes nodes to our EP only when
-//! GetCapability claims them, and our EP does not currently register explicit half-dtype
-//! type-constraint metadata with ORT's node-capability API. Consequently ORT may not route
-//! f16/bf16 nodes to our EP and an end-to-end ONNX-model test with half inputs is not
-//! provable without kernel-registry support. This is recorded as a coverage gap; see
-//! `.squad/decisions/inbox/pris-ep-conformance-final.md`.
+//! `build_cpu_registry_with_descriptors()` (landed by Deckard) derives Float16 and BFloat16
+//! type-constraint metadata from the kernel registry and wires it through the cpu-plugin shim
+//! into `GetKernelRegistry`. ORT consults this registry to route half-precision nodes to our
+//! EP. `conformance_add_float16` and `conformance_add_bfloat16` verify end-to-end routing
+//! with exact bit-pattern assertions — both pass as of commit `577047a74`.
 //!
 //! # Environment
 //!
@@ -1881,28 +1879,16 @@ fn stress_register_run_unregister_cycles() {
     );
 }
 
-// ─── f16/bf16 end-to-end conformance (blocked on Deckard's registry_entries) ─
+// ─── f16/bf16 end-to-end conformance ─────────────────────────────────────────
 
 /// Float16 Add through ORT: `Z = X + Y` with all-f16 inputs and outputs.
 ///
 /// The CPU kernels in `crates/onnx-runtime-ep-cpu` accept Float16 for Add.
-/// **Blocked:** ORT routes a node to our EP via `GetCapability`, which queries
-/// `supports_op`. The EP's `supports_op` accepts any dtype that the kernel
-/// handles — but ORT *also* consults `GetKernelRegistry` to learn our
-/// type-constraint metadata before routing. Until Deckard lands
-/// `registry_entries()` on `CpuExecutionProvider` (and the cpu-plugin shim
-/// wires it through in `crates/onnx-runtime-ep-cpu/src/provider.rs` /
-/// `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs`), ORT does not route
-/// f16 nodes to us and this test will fail with "no output" or fall through
-/// to ORT's built-in CPU EP.
-///
-/// Remove the `#[ignore]` when `registry_entries()` lands and
-/// `cargo test -p onnx-runtime-ep-cpu-plugin conformance_add_float16 -- --ignored`
-/// passes with the numerically correct output below.
+/// `build_cpu_registry_with_descriptors()` derives Float16 type-constraint
+/// metadata and the cpu-plugin shim wires it through `GetKernelRegistry`.
+/// ORT consults the kernel registry to route f16 nodes to our EP, and our
+/// kernel produces numerically correct output (exact f16 bit-pattern check).
 #[test]
-#[ignore = "blocked: Deckard has not yet landed registry_entries() on CpuExecutionProvider \
-            (crates/onnx-runtime-ep-cpu/src/provider.rs). Without it ORT does not route \
-            Float16 nodes to our EP via GetKernelRegistry."]
 fn conformance_add_float16() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1969,15 +1955,14 @@ fn conformance_add_float16() {
 
 /// BFloat16 Add through ORT: `Z = X + Y` with all-bf16 inputs and outputs.
 ///
-/// Same routing dependency as `conformance_add_float16` above — blocked on
-/// `registry_entries()` landing in `crates/onnx-runtime-ep-cpu/src/provider.rs`.
+/// Same routing as `conformance_add_float16`: `build_cpu_registry_with_descriptors()`
+/// includes BFloat16 type-constraint metadata and the cpu-plugin shim wires it
+/// through `GetKernelRegistry`. Exact bf16 bit-pattern check confirms our kernel
+/// executes correctly.
 ///
 /// BFloat16 is the top 16 bits of a float32 mantissa: 1.0=0x3F80, 2.0=0x4000,
 /// 3.0=0x4040, 4.0=0x4080.
 #[test]
-#[ignore = "blocked: Deckard has not yet landed registry_entries() on CpuExecutionProvider \
-            (crates/onnx-runtime-ep-cpu/src/provider.rs). Without it ORT does not route \
-            BFloat16 nodes to our EP via GetKernelRegistry."]
 fn conformance_add_bfloat16() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

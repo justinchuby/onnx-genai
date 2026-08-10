@@ -462,7 +462,9 @@ mod tests {
         ) -> EpResult<()> {
             let ptr = buffer.as_ptr();
             let size = buffer.len();
-            std::mem::forget(buffer);
+            // DeviceBuffer has no Drop impl: binding to `_` discards the handle
+            // metadata without invoking any destructor (there is none).
+            let _ = buffer;
             if !ptr.is_null() && size > 0 {
                 let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
                 unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
@@ -566,7 +568,9 @@ mod tests {
         ) -> EpResult<()> {
             let ptr = buffer.as_ptr();
             let size = buffer.len();
-            std::mem::forget(buffer);
+            // DeviceBuffer has no Drop impl: binding to `_` discards the handle
+            // metadata without invoking any destructor (there is none).
+            let _ = buffer;
             if !ptr.is_null() && size > 0 {
                 let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
                 unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };

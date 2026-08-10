@@ -32,3 +32,18 @@ Full pre-compaction history in `history-archive.md`.
 - Integrated `DeviceSupport` into `factory.rs`: generalized device enumeration, allocator creation, stream creation, and stream-awareness reporting. CPU path unchanged; GPU/NPU paths now functional via `create_ep_factories_with_device_support`.
 - Added 7 generalized enumeration unit tests. Total: 127 lib tests pass, 15 conformance tests pass (including 25-cycle stress test).
 - `cargo check --workspace` clean without CUDA.
+
+## 2026-08-10 — Test-module mem::forget no-ops resolved
+
+Clippy `--all-targets` flagged two more `forget_non_drop` errors (device.rs:465 and device.rs:569) in `#[cfg(test)]` mocks (`MockGpuEp::deallocate` and `MockCpuEp::deallocate`).
+
+**Site analysis:**
+- Both are `deallocate` implementations in test doubles. The pattern was: extract `ptr`/`size` from the `DeviceBuffer`, call `mem::forget(buffer)`, then manually `dealloc` the raw pointer. Intent: prevent double-free. Verdict: **dead code / no-op** — `DeviceBuffer` has no `Drop` impl, so there is no destructor to suppress. No ownership mistake; the pointer extraction + manual `dealloc` is already correct. The `forget` added no protection.
+- Resolution: replaced `std::mem::forget(buffer)` with `let _ = buffer;` (idiomatic discard binding). Clippy accepts `let _ =` on non-`Drop` types because it is not a spurious lifecycle claim — it just moves the value into `_`. Neither `drop(buffer)` nor `mem::forget(buffer)` is accepted by clippy on a non-`Drop` type.
+- No ownership defect, no decision record needed.
+
+**Validation:**
+- `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → only Pris's 2 errors in `tests/trait_cabi_parity.rs`; zero errors from `device.rs`/`factory.rs`/`lib.rs`.
+- `cargo test -p onnx-runtime-ep-plugin --lib` → **127 passed; 0 failed**.
+- `cargo test -p onnx-runtime-ep-cpu-plugin` → **23 passed; 0 failed** (6 ABI + 17 conformance).
+- `cargo check --workspace` → **Finished** without CUDA.

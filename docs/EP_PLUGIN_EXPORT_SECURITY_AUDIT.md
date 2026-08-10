@@ -4,9 +4,228 @@
 **Initial audit date:** 2026-08-10T20:12:35.793+00:00
 **Re-audit date (RED):** 2026-08-10T21:30:26Z
 **Final re-audit date (SHIP VERDICT):** 2026-08-10T22:42:21Z
-**Branch audited:** `squad/ep-plugin-export`
-**Commits reviewed:** `526a883c4` (Nabil's partial remediation), `c92838dba` (Deckard's UAF fix), Leon's N1/N2 fix, Isidore's N3 fix
-**Scope:** `crates/onnx-runtime-ep-plugin/src/{factory,ep,graph_reader,compute,kernel_ctx,status,lib}.rs` + `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs`
+**Milestone 2 audit date:** 2026-08-10T23:09:23Z
+**Branch audited:** `squad/ep-plugin-export` (M1), `squad/ep-plugin-parity-cuda` (M2)
+**Commits reviewed:** `526a883c4` (Nabil's partial remediation), `c92838dba` (Deckard's UAF fix), Leon's N1/N2 fix, Isidore's N3 fix; M2: `2da0c4e7f`, `577047a74`
+**Scope:** `crates/onnx-runtime-ep-plugin/src/{factory,ep,graph_reader,compute,kernel_ctx,status,lib,device}.rs` + `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs` + `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs` + `crates/onnx-runtime-ep-cuda-plugin/`
+
+---
+
+## ═══ MILESTONE 2 AUDIT — 2026-08-10T23:09:23Z ═══
+
+### 🟡 YELLOW — May ship. One MEDIUM finding (resource leak); no memory-safety or corruption issues.
+
+Milestone 2 adds substantial new FFI surface: `DeviceAllocator`, `DeviceSyncStream`, `DeviceSupport`, `GetKernelRegistry`, and generalized device enumeration. The new code is architecturally sound and follows the established patterns (panic guards, fail-closed validation, correct `#[repr(C)]` layout). One resource leak in the stream release path must be fixed post-merge.
+
+| Finding | Severity | File:Line | Status |
+|---------|----------|-----------|--------|
+| M2-1 — EP instance leaked in `stream_release` | MEDIUM | `factory.rs:~385` / `device.rs:229` | **OPEN** |
+| M2-2 — Misleading doc on `DeviceAllocator::memory_info` ownership | LOW (doc) | `device.rs:96` | Advisory |
+| NEW-1 (from M1) — `compute_release_state` no guard | — | `compute.rs:1567` | **RESOLVED** |
+| NEW-2 (from M1) — partial info leak in `ep_compile_inner` | — | `ep.rs` `cleanup_partial_infos` | **RESOLVED** |
+
+---
+
+### M2-1 (MEDIUM): EP instance leaked on stream release
+
+**File:** `factory.rs` `factory_create_sync_stream` / `device.rs` `stream_release`
+
+**Evidence:**
+
+`factory_create_sync_stream` (factory.rs ~line 375):
+```rust
+let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+let sync_stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+```
+
+`stream_release` (device.rs:229):
+```rust
+unsafe { drop(Box::from_raw(this.cast::<DeviceSyncStream>())); }
+```
+
+Dropping `DeviceSyncStream` drops the struct, but `ep: *const dyn ExecutionProvider` is a raw pointer — no destructor runs. The EP allocated in `factory_create_sync_stream` via `Box::into_raw` is **never freed**.
+
+Compare with `factory_release_allocator` which correctly does:
+```rust
+if !dev_alloc.ep.is_null() {
+    drop(Box::from_raw(dev_alloc.ep as *mut dyn ExecutionProvider));
+}
+```
+
+**Exploit scenario:** Not a memory-safety issue (no corruption, no UAF). It is a bounded resource leak: one EP instance per stream creation. In long-lived ORT processes that repeatedly create/destroy sessions, this will accumulate heap waste proportional to EP state size. Not exploitable for code execution but violates resource hygiene.
+
+**Fix:** Add equivalent `Box::from_raw` of the EP in `stream_release`, or implement `Drop for DeviceSyncStream` that frees the EP. Assign to **Leon** (not Nabil, the author).
+
+---
+
+### M2-2 (LOW advisory): Misleading `DeviceAllocator::memory_info` doc comment
+
+**File:** `device.rs:96`
+
+```rust
+/// Memory info pointer. Owned by this allocator; freed on drop.
+pub memory_info: *const ort::OrtMemoryInfo,
+```
+
+There is no `Drop` impl for `DeviceAllocator`, and no code anywhere calls `ReleaseMemoryInfo` on this field. In `factory_create_allocator`, the `memory_info` argument is ORT-owned (passed from the `OrtEpDevice` via `CreateAllocator`). The allocator merely **borrows** it for `Info()` — ORT manages its lifetime.
+
+The actual behavior is **correct** (not freeing is right), but the comment is wrong and could mislead future maintainers into adding a Drop impl that double-frees ORT-owned memory.
+
+**Fix:** Change doc to: `/// Memory info pointer. Borrowed from ORT; NOT owned by this allocator.`
+
+---
+
+### NEW-1 Verification — RESOLVED ✓
+
+`compute.rs:1563–1575`:
+```rust
+unsafe extern "C" fn compute_release_state(...) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !state.is_null() {
+            unsafe { drop(Box::from_raw(state.cast::<ComputeState>())) };
+        }
+    }));
+}
+```
+
+Fully guarded. Leon's fix is correct.
+
+---
+
+### NEW-2 Verification — RESOLVED ✓
+
+`ep.rs` `cleanup_partial_infos`:
+```rust
+fn cleanup_partial_infos(out_infos: *mut *mut ort::OrtNodeComputeInfo, written: usize) {
+    for j in 0..written {
+        let ptr = unsafe { *out_infos.add(j) };
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr.cast::<ExportedComputeInfo>())) };
+            unsafe { *out_infos.add(j) = ptr::null_mut() };
+        }
+    }
+}
+```
+
+Called at every error path in `ep_compile_inner`. Free-and-null strategy is safe under both ORT contract readings:
+- If ORT calls `ReleaseNodeComputeInfos` after failed `Compile`: all slots are null → no-op (release callback skips nulls).
+- If ORT does NOT call it: we freed → no leak.
+- No double-free: `from_raw` + null prevents re-read.
+
+Unit test `cleanup_partial_infos_nulls_freed_slots` confirms.
+
+---
+
+### `#[repr(C)]` Layout Correctness — VERIFIED
+
+**`DeviceAllocator`** (device.rs:88):
+- First field: `vtable: ort::OrtAllocator` — ORT's expected struct.
+- Cast `*mut DeviceAllocator` → `*mut OrtAllocator` is valid because `#[repr(C)]` guarantees first field is at offset 0.
+- ORT dereferences only the `OrtAllocator` fields; our extension fields follow.
+
+**`DeviceSyncStream`** (device.rs:191):
+- First field: `vtable: ort::OrtSyncStreamImpl`.
+- Same offset-0 guarantee. ORT's `Release`/`Flush`/`GetHandle` callbacks receive `*mut OrtSyncStreamImpl` which we cast back to `*mut DeviceSyncStream`.
+
+**`ExportedFactory`** / **`ExportedEp`** — unchanged from M1, previously verified.
+
+All layouts are correct. No silent corruption risk.
+
+---
+
+### Panic Safety — All New Callbacks Guarded ✓
+
+New `extern "C"` callbacks in milestone 2, verified wrapped in `catch_unwind`:
+
+| Callback | File:Line | Guard |
+|----------|-----------|-------|
+| `device_alloc` | device.rs:121 | ✓ `catch_unwind` → `null_mut()` |
+| `device_free` | device.rs:145 | ✓ `catch_unwind` (void-returning, swallowed) |
+| `device_info` | device.rs:175 | No catch_unwind but body is trivial null-check + field read — **cannot panic** |
+| `device_reserve` | device.rs:183 | Delegates to `device_alloc` (guarded) |
+| `stream_release` | device.rs:228 | ✓ `catch_unwind` (void-returning) |
+| `stream_get_handle` | device.rs:240 | Trivial return `null_mut()` — cannot panic |
+| `stream_flush` | device.rs:246 | ✓ `catch_unwind` → `fail_status(...)` |
+| `stream_on_session_run_end` | device.rs:261 | Delegates to `stream_flush` (guarded) |
+| `ep_get_kernel_registry` | ep.rs | ✓ `catch_unwind` → `fail_status(...)` |
+| `factory_create_allocator` | factory.rs | ✓ `catch_unwind` → `fail_status(...)` |
+| `factory_release_allocator` | factory.rs | ✓ `catch_unwind` (void-returning) |
+| `factory_is_stream_aware` | factory.rs | ✓ `catch_unwind` → `false` |
+| `factory_create_sync_stream` | factory.rs | ✓ `catch_unwind` → `fail_status(...)` |
+| `noop_kernel_create` | ep.rs | Trivial null-write + fail_status — cannot panic |
+
+No unguarded callbacks. **No CRITICAL reinstated.**
+
+---
+
+### Allocator Arithmetic — Size/Alignment
+
+`device_alloc` (device.rs:121): receives `size: usize` from ORT. Passes directly to `ep.allocate(size, 16)`. The EP is responsible for rejecting zero/overflow. The mock EP uses `size.max(1)` which avoids zero-sized allocation UB. A real CUDA EP must similarly guard.
+
+`DeviceBuffer::from_raw_parts` requires non-null pointer (panics via `expect` — caught by outer `catch_unwind`). Alignment fixed at 16; `debug_assert!(align.is_power_of_two())` validates.
+
+No integer overflow in the adapter layer; size is passed through without arithmetic.
+
+---
+
+### `mem::forget` Sites — Independent Assessment
+
+**device.rs:465** (in `MockGpuEp::deallocate` test helper):
+```rust
+std::mem::forget(buffer);
+```
+
+**device.rs:569** (in `MockCpuEp::deallocate` test helper):
+```rust
+std::mem::forget(buffer);
+```
+
+**Assessment:** `DeviceBuffer` (from `onnx_runtime_ep_api/src/provider.rs:63`) has **no `Drop` impl** — confirmed by grep. The struct contains only `DeviceId`, `usize`, `usize`, `NonNull<c_void>`, and `BufferOwner` (an enum). Dropping it discards metadata only; it does NOT free the underlying allocation.
+
+The `mem::forget` calls are therefore **no-ops** — they suppress a drop that would do nothing. Nabil's assessment ("dead code because `DeviceBuffer` has no `Drop`") is **independently verified correct**.
+
+These are in `#[cfg(test)]` mock code only — not production. The real deallocation pattern (`device_free`) extracts the pointer from `DeviceBuffer` and passes it to `ep.deallocate()` which performs the actual free. The buffer going out of scope after pointer extraction is safe because no Drop runs.
+
+---
+
+### `RecordingOpRegistry` Divergence Risk — LOW
+
+`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs`:
+
+The `RecordingOpRegistry` wraps `OpRegistry` and captures `(op_type, domain, since_version)` from the **exact same `register()` calls** that populate the live registry. The wrapper is structurally incapable of divergence from the live registry's key set.
+
+The dtype mapping (`supported_dtypes_for_op`) is a separate function that maps op names to static dtype arrays. It **could** diverge from actual kernel dispatch if a new op is registered without updating the match table. However:
+- The function defaults to `F32_ONLY` for unknown ops → **under-advertises**, never over-advertises.
+- Under-advertising means ORT won't route those nodes to us → **correctness preserved** (we just decline capability).
+- Over-advertising (the dangerous direction) requires explicitly adding a match arm — there's no silent default that claims more than the kernel can handle.
+- A test (`build_cpu_registry_with_descriptors_returns_nonempty`) validates the pipeline works end-to-end.
+
+**Verdict:** Fail-closed by construction. No silent wrong-results risk.
+
+---
+
+### Vtable Lifetime & Ownership Summary
+
+| Object | Created by | Freed by | EP lifetime | Verified |
+|--------|-----------|----------|-------------|----------|
+| `DeviceAllocator` | `factory_create_allocator` (`Box::into_raw`) | `factory_release_allocator` (`Box::from_raw`) | Separate EP created & leaked; freed in release | ✓ EP freed |
+| `DeviceSyncStream` | `factory_create_sync_stream` (`Box::into_raw`) | ORT calls `stream_release` vtable | Separate EP created & leaked; **NOT freed** | ⚠️ M2-1 |
+| `OrtKernelRegistry` | `build_ort_kernel_registry` (ORT API) | `OrtKernelRegistryHolder::drop` (via `ReleaseKernelRegistry`) | Owned by `ExportedEp`; lives until `factory_release_ep` | ✓ |
+| `OrtMemoryInfo` (EpDevice) | `CreateMemoryInfo_V2` in `factory_get_supported_devices` | ORT via `ReleaseEpDevice` | Passed to `AddAllocatorInfo`; ORT owns | ✓ |
+| `OrtMemoryInfo` (Allocator) | Passed by ORT to `CreateAllocator` | ORT-owned (never freed by us) | Borrowed; `Info()` returns it | ✓ (doc wrong, behavior correct) |
+
+---
+
+### Fail-Closed Compliance
+
+All new validation functions return error statuses on mismatch:
+- `validate_device_support` → rejects EP/hardware type mismatch
+- `validate_allocator_request` → rejects device-memory request from CPU-only EP
+- `validate_stream_request` → rejects stream creation for non-stream-aware EP
+- `factory_create_sync_stream` → fails closed if EP not stream-aware
+- `factory_is_stream_aware` → returns `false` on null/panic
+
+No silent success. No guessed dtype/shape. No clamped value. **Compliant.**
 
 ---
 

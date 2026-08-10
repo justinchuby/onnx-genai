@@ -45,3 +45,15 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - New HIGH (N2): negative dims wrap to `usize::MAX` in `kernel_ctx.rs:154`; compounds N1. Owner: Deckard.
 - New MEDIUM (N3): macro-generated `CreateEpFactories`/`ReleaseEpFactory` lack `catch_unwind`. Owner: Nabil.
 - Verdict: 🔴 RED. Decision record: `.squad/decisions/inbox/holden-ep-plugin-reaudit.md`.
+
+## 2026-08-10T23:09:23+0000 — EP plugin milestone 2 audit (squad/ep-plugin-parity-cuda)
+- Audited new device-side FFI surface: `device.rs` (~600 lines), `factory.rs` generalized device/allocator/stream, `ep.rs` kernel registry, `kernels/mod.rs` RecordingOpRegistry.
+- M2-1 (MEDIUM): EP leaked in `stream_release` — `Box::into_raw`'d EP never freed. Assign Leon.
+- M2-2 (LOW): Misleading doc comment on `DeviceAllocator::memory_info` ownership. Advisory.
+- Verified NEW-1 (RESOLVED): `compute_release_state` now wrapped in `catch_unwind`.
+- Verified NEW-2 (RESOLVED): `cleanup_partial_infos` frees and nulls partial `out_infos`.
+- `#[repr(C)]` layout verified correct for `DeviceAllocator` and `DeviceSyncStream`.
+- All 14 new `extern "C"` callbacks: panic-guarded or trivially non-panicking.
+- `mem::forget` sites independently verified safe (DeviceBuffer has no Drop impl).
+- RecordingOpRegistry fail-closed by construction (under-advertises, never over-advertises).
+- Verdict: 🟡 YELLOW — may ship. No memory-safety or corruption issues. Decision: `.squad/decisions/inbox/holden-ep-milestone2-audit.md`.

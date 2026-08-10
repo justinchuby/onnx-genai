@@ -48,6 +48,10 @@ pub struct ExportedEp {
     /// Remains valid for the lifetime of this EP (ORT requirement).
     /// `None` means the EP uses compile-only mode (no type-constraint metadata).
     pub kernel_registry: Option<OrtKernelRegistryHolder>,
+    /// The same registry entries used to build `kernel_registry`, kept here so
+    /// that `GetCapability` can dtype-filter claims against the same source of
+    /// truth. Empty when no registry entries were provided.
+    pub registry_entries: Vec<KernelRegistryEntry>,
 }
 
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
@@ -100,6 +104,20 @@ impl ExportedEp {
         ep: Box<dyn ExecutionProvider>,
         registry: Option<OrtKernelRegistryHolder>,
     ) -> Self {
+        Self::new_with_registry_and_entries(ep, registry, Vec::new())
+    }
+
+    /// Construct with an optional pre-built kernel registry AND the source
+    /// entries for dtype-aware claim filtering in `GetCapability`.
+    ///
+    /// `entries` are the same descriptors used to build `registry`. Keeping
+    /// them here ensures the claim predicate and the advertised type constraints
+    /// agree **by construction** — no independently maintained list to drift.
+    pub fn new_with_registry_and_entries(
+        ep: Box<dyn ExecutionProvider>,
+        registry: Option<OrtKernelRegistryHolder>,
+        entries: Vec<KernelRegistryEntry>,
+    ) -> Self {
         let name_cstr = std::ffi::CString::new(ep.name())
             .unwrap_or_else(|_| std::ffi::CString::new("nxrt_ep").unwrap());
         let has_registry = registry.is_some();
@@ -128,6 +146,7 @@ impl ExportedEp {
             ep,
             name_cstr,
             kernel_registry: registry,
+            registry_entries: entries,
         }
     }
 }
@@ -230,6 +249,27 @@ fn ep_get_capability_inner(
         return ok_status();
     }
 
+    // Fail-closed dtype filter: remove any claim containing a node whose
+    // input/output element types are not in the registry's supported_dtypes
+    // for that op. This ensures the claim predicate and the advertised type
+    // constraints agree by construction — both are sourced from the same
+    // `KernelRegistryEntry` data.
+    let claims: Vec<_> = claims
+        .into_iter()
+        .filter(|claim| {
+            claim.node_ids.iter().all(|&nid| {
+                let Some(node) = ir_graph.nodes.get(nid) else {
+                    return false;
+                };
+                node_passes_dtype_filter(node, ir_graph, &exported.registry_entries)
+            })
+        })
+        .collect();
+
+    if claims.is_empty() {
+        return ok_status();
+    }
+
     // Report claims to ORT via EpGraphSupportInfo_AddNodesToFuse.
     let api = crate::status::host_api();
     if api.is_null() {
@@ -286,6 +326,54 @@ fn ep_get_capability_inner(
     }
 
     ok_status()
+}
+
+/// Check whether a node's input/output element types are all supported by the
+/// corresponding registry entry. Returns `true` if the node should be claimed.
+///
+/// Fail-closed: returns `false` if the op has no registry entry, or if any
+/// value has `DataType::Undefined`.
+pub(crate) fn node_passes_dtype_filter(
+    node: &onnx_runtime_ir::Node,
+    ir_graph: &onnx_runtime_ir::Graph,
+    entries: &[KernelRegistryEntry],
+) -> bool {
+    if entries.is_empty() {
+        return true;
+    }
+    let domain = if node.domain.is_empty() {
+        ""
+    } else {
+        node.domain.as_str()
+    };
+    let entry = entries.iter().find(|e| e.op_type == node.op_type && e.domain == domain);
+    let Some(entry) = entry else {
+        return false;
+    };
+    for input in &node.inputs {
+        let Some(vid) = input else { continue };
+        let Some(value) = ir_graph.values.get(*vid) else {
+            continue;
+        };
+        if value.dtype == DataType::Undefined {
+            return false;
+        }
+        if !entry.supported_dtypes.contains(&value.dtype) {
+            return false;
+        }
+    }
+    for &vid in &node.outputs {
+        let Some(value) = ir_graph.values.get(vid) else {
+            continue;
+        };
+        if value.dtype == DataType::Undefined {
+            return false;
+        }
+        if !entry.supported_dtypes.contains(&value.dtype) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Compile: for each claimed subgraph, create kernels and wrap them as
@@ -934,5 +1022,102 @@ mod tests {
         }];
         let result = build_ort_kernel_registry(&entries, "test_ep");
         assert!(result.is_none(), "must return None without host API");
+    }
+
+    // ─── dtype filter tests ─────────────────────────────────────────────────
+
+    /// Helper to build a minimal Graph with a single node and typed values.
+    fn graph_with_node(
+        op_type: &str,
+        domain: &str,
+        input_dtypes: &[DataType],
+        output_dtypes: &[DataType],
+    ) -> (onnx_runtime_ir::Graph, onnx_runtime_ir::NodeId) {
+        use onnx_runtime_ir::{Graph, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let inputs: Vec<Option<onnx_runtime_ir::ValueId>> = input_dtypes
+            .iter()
+            .map(|&dt| {
+                let vid = g.create_named_value(&format!("in_{dt:?}"), dt, Shape::default());
+                Some(vid)
+            })
+            .collect();
+        let outputs: Vec<onnx_runtime_ir::ValueId> = output_dtypes
+            .iter()
+            .map(|&dt| g.create_named_value(&format!("out_{dt:?}"), dt, Shape::default()))
+            .collect();
+        let mut node = Node::new(NodeId(0), op_type, inputs, outputs);
+        node.domain = domain.to_string();
+        let nid = g.insert_node(node);
+        (g, nid)
+    }
+
+    /// f32 node with matching registry entry is claimed.
+    #[test]
+    fn dtype_filter_claims_f32_node() {
+        let entries = vec![KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: &[DataType::Float32, DataType::Float16],
+        }];
+        let (g, nid) = graph_with_node("Add", "", &[DataType::Float32, DataType::Float32], &[DataType::Float32]);
+        let node = g.nodes.get(nid).unwrap();
+        assert!(super::node_passes_dtype_filter(node, &g, &entries));
+    }
+
+    /// Node with unsupported dtype (Int64 for Add that only supports f32/f16)
+    /// is NOT claimed.
+    #[test]
+    fn dtype_filter_rejects_unsupported_dtype() {
+        let entries = vec![KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: &[DataType::Float32, DataType::Float16],
+        }];
+        let (g, nid) = graph_with_node("Add", "", &[DataType::Int64, DataType::Int64], &[DataType::Int64]);
+        let node = g.nodes.get(nid).unwrap();
+        assert!(!super::node_passes_dtype_filter(node, &g, &entries));
+    }
+
+    /// Node with Undefined dtype is NOT claimed (fail closed).
+    #[test]
+    fn dtype_filter_rejects_undefined_dtype() {
+        let entries = vec![KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: &[DataType::Float32],
+        }];
+        let (g, nid) = graph_with_node("Add", "", &[DataType::Undefined], &[DataType::Float32]);
+        let node = g.nodes.get(nid).unwrap();
+        assert!(!super::node_passes_dtype_filter(node, &g, &entries));
+    }
+
+    /// Node with no matching registry entry is NOT claimed (fail closed).
+    #[test]
+    fn dtype_filter_rejects_unknown_op() {
+        let entries = vec![KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: &[DataType::Float32],
+        }];
+        let (g, nid) = graph_with_node("UnknownOp", "", &[DataType::Float32], &[DataType::Float32]);
+        let node = g.nodes.get(nid).unwrap();
+        assert!(!super::node_passes_dtype_filter(node, &g, &entries));
+    }
+
+    /// Empty registry entries → filter is bypassed (legacy compile-only mode).
+    #[test]
+    fn dtype_filter_bypassed_when_no_entries() {
+        let (g, nid) = graph_with_node("Add", "", &[DataType::Int64], &[DataType::Int64]);
+        let node = g.nodes.get(nid).unwrap();
+        assert!(super::node_passes_dtype_filter(node, &g, &[]));
     }
 }
