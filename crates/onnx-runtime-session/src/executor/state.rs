@@ -284,7 +284,6 @@ pub(super) struct PreparedWorkspace {
     pub(super) _lease: Option<onnx_runtime_memory_governor::MemoryLease>,
     pub(super) bytes: usize,
     pub(super) alignment: usize,
-    pub(super) role: onnx_runtime_memory_governor::MemoryRole,
 }
 
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2

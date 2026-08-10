@@ -1471,8 +1471,7 @@ impl KernelDispatchContext<'_> {
                     // before acquiring the replacement to avoid charging both.
                     self.ep.sync()?;
                     if let Some(old) = prepared.take() {
-                        let unmapped = self.ep.deallocate_with_unmapped(old.buffer)?;
-                        self.ep.release_mapped_growth(unmapped, old.role);
+                        self.ep.deallocate(old.buffer)?;
                     }
                     let target_mapped = self
                         .ep
@@ -1490,32 +1489,19 @@ impl KernelDispatchContext<'_> {
                             return Err(error.into());
                         }
                     };
-                    let (buffer, actual_mapped_bytes) = match grant.as_mut() {
-                        Some(grant) => {
-                            let allocation = self.ep.allocate_with_mapped_growth(
-                                required,
-                                requirement.alignment,
-                                grant,
-                            )?;
-                            (allocation.allocation, allocation.newly_mapped_bytes)
-                        }
-                        None => (self.ep.allocate(required, requirement.alignment)?, 0),
+                    let buffer = match grant.take() {
+                        Some(grant) => self.ep.allocate_with_mapped_growth(
+                            required,
+                            requirement.alignment,
+                            grant,
+                        )?,
+                        None => self.ep.allocate(required, requirement.alignment)?,
                     };
-                    if let Some(grant) = grant
-                        && let Err(error) = grant.commit_bytes(actual_mapped_bytes)
-                    {
-                        let _ = self.ep.deallocate(buffer);
-                        return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                            "workspace mapped-growth commit failed: {error}"
-                        ))
-                        .into());
-                    }
                     *prepared = Some(PreparedWorkspace {
                         buffer,
                         _lease: lease,
                         bytes: required,
                         alignment: requirement.alignment,
-                        role: requirement.role,
                     });
                 }
                 let prepared = prepared.as_mut().ok_or_else(|| {

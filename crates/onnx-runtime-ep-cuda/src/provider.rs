@@ -783,6 +783,27 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        if dynamic_lending_enabled()
+            && self.memory().commits_on_demand()
+            && let Some(governor) = self.governor.as_deref()
+            && let Some(requester) = self
+                .mapped_requesters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&mapped_attribution_role(
+                    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                ))
+                .cloned()
+        {
+            let bytes = self
+                .memory()
+                .mapped_bytes_for_allocation(size, alignment)
+                .map_err(EpError::Memory)?;
+            let grant = governor
+                .prepare_mapped_growth(&requester, bytes)
+                .map_err(EpError::Memory)?;
+            return self.allocate_with_mapped_growth(size, alignment, grant);
+        }
         let full = 0..size;
         self.allocate_committed(size, alignment, std::slice::from_ref(&full))
     }
@@ -791,8 +812,8 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         size: usize,
         alignment: usize,
-        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
-    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<DeviceBuffer>> {
+        mut grant: onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<DeviceBuffer> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
@@ -807,17 +828,24 @@ impl ExecutionProvider for CudaExecutionProvider {
             )
             .map_err(EpError::Memory)?;
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(onnx_runtime_memory_governor::MappedAllocation {
-            allocation: unsafe {
-                DeviceBuffer::from_raw_parts(
-                    allocation.allocation.as_ptr().cast(),
-                    self.device,
-                    size,
-                    alignment,
-                )
-            },
-            newly_mapped_bytes: allocation.newly_mapped_bytes,
-        })
+        let buffer = unsafe {
+            DeviceBuffer::from_raw_parts(
+                allocation.allocation.as_ptr().cast(),
+                self.device,
+                size,
+                alignment,
+            )
+        };
+        if let Err(error) = grant.commit_bytes(allocation.newly_mapped_bytes) {
+            let ptr = buffer.into_raw();
+            if let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) {
+                // Attribution never committed, so roll back the physical map
+                // without running the provider's canonical refund.
+                unsafe { self.memory().deallocate(ptr, size, alignment) };
+            }
+            return Err(EpError::Memory(error));
+        }
+        Ok(buffer)
     }
 
     fn allocate_committed(
@@ -1037,6 +1065,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         // from `self.memory` in `allocate`; `into_raw` consumed the owning
         // handle so no alias remains, and this is its single free.
         let unmapped = unsafe { self.memory().deallocate_with_unmapped(ptr, size, align) };
+        if unmapped > 0
+            && let Some(requester) = self
+                .mapped_requesters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&mapped_attribution_role(
+                    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                ))
+        {
+            requester.unmap(unmapped);
+        }
         self.ep_frees.fetch_add(1, Ordering::Relaxed);
         Ok(unmapped)
     }
@@ -1344,15 +1383,10 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
-        let role = mapped_attribution_role(role);
-        if let Some(requester) = self
-            .mapped_requesters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&role)
-        {
-            requester.unmap(bytes);
-        }
+        // VMM deallocation performs the canonical arena-zone refund. Keeping
+        // this hook as a no-op preserves compatibility for callers/providers
+        // that do not use the CUDA arena without permitting double release.
+        let _ = (bytes, role);
     }
 
     /// True when the VMM arena is in use: it maps 2 MiB granules as spans are
@@ -1609,6 +1643,101 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         unsafe { runtime.dtoh(&mut value, cuptr(second.as_ptr())) }.expect("read reused mapping");
         assert_eq!(u32::from_ne_bytes(value), 0x736);
         provider.deallocate(second).expect("final deallocation");
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn general_deallocation_refunds_the_canonical_arena_zone() {
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
+        };
+
+        let governor_impl = Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
+        let zone_role =
+            mapped_attribution_role(onnx_runtime_memory_governor::MemoryRole::Workspace {
+                step_scoped: true,
+            });
+        let zone_allowance = governor_impl
+            .reserve_mapped_allowance(Tier::Device, 4 << 20, zone_role, HolderId::new(736))
+            .expect("canonical arena allowance");
+        let governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            governor_impl;
+        let provider = CudaExecutionProvider::new_with_offload_policy_and_governor(
+            0,
+            DeviceOffloadPolicy {
+                managed_no_spill: true,
+                managed_limit_bytes: Some(8 << 30),
+                ..DeviceOffloadPolicy::default()
+            },
+            governor,
+        )
+        .expect("governed VMM provider");
+        provider
+            .mapped_requesters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(zone_role, zone_allowance);
+
+        let allocate_pair = || {
+            let bytes = provider
+                .mapped_bytes_for_allocation(4096, 256)
+                .expect("workspace mapped size");
+            let grant = provider
+                .prepare_mapped_growth(
+                    bytes,
+                    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: true },
+                )
+                .expect("prepare workspace growth")
+                .expect("governed grant");
+            let governed = provider
+                .allocate_with_mapped_growth(4096, 256, grant)
+                .expect("governed workspace");
+            let ordinary = provider.allocate(4096, 256).expect("ordinary neighbor");
+            let requester = provider
+                .mapped_requesters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&zone_role)
+                .expect("canonical arena allowance")
+                .clone();
+            assert!(requester.mapped_bytes() > 0);
+            (governed, ordinary, requester)
+        };
+
+        let (governed, ordinary, requester) = allocate_pair();
+        let mapped = requester.mapped_bytes();
+        assert_eq!(provider.deallocate_with_unmapped(governed).unwrap(), 0);
+        assert_eq!(requester.mapped_bytes(), mapped);
+        assert_eq!(provider.deallocate_with_unmapped(ordinary).unwrap(), mapped);
+        assert_eq!(requester.mapped_bytes(), 0);
+        provider.release_mapped_growth(
+            mapped,
+            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: true },
+        );
+        assert_eq!(
+            requester.mapped_bytes(),
+            0,
+            "specialized cleanup cannot double-refund the provider-owned zone"
+        );
+
+        let (governed, ordinary, requester) = allocate_pair();
+        let mapped = requester.mapped_bytes();
+        assert_eq!(provider.deallocate_with_unmapped(ordinary).unwrap(), 0);
+        assert_eq!(requester.mapped_bytes(), mapped);
+        assert_eq!(provider.deallocate_with_unmapped(governed).unwrap(), mapped);
+        assert_eq!(requester.mapped_bytes(), 0);
+
+        // Once the arena zone exists, ordinary-only allocation is admitted,
+        // charged, and refunded by the same provider-owned path.
+        for _ in 0..3 {
+            let ordinary = provider.allocate(4096, 256).expect("ordinary allocation");
+            assert!(requester.mapped_bytes() > 0);
+            provider.deallocate(ordinary).expect("ordinary cleanup");
+            assert_eq!(requester.mapped_bytes(), 0);
+        }
     }
 
     #[cfg_attr(

@@ -301,6 +301,15 @@ from that arena, so KV and workspace content metrics remain distinct while
 their physical mapped attribution uses the same arena-zone allowance. Weight
 paging has separate storage and mapped attribution.
 
+Mapped-zone refund is an allocator/provider responsibility, not a workspace
+caller responsibility. Every VMM deallocation observes the arena's actual
+global granule transition `1→0` and refunds the canonical arena allowance
+itself. This includes ordinary executor buffers that happen to be the final
+reference to a granule first mapped by governed workspace; specialized
+workspace cleanup must not issue a second refund. Retained physical-pool
+handles remain authority-owned—the refund concerns virtual mapped-zone
+attribution only.
+
 ### 1.1 The lease contract, and who may replace it
 
 Memory management in onnx-genai is organized as a five-layer hierarchy. Each layer

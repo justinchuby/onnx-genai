@@ -149,10 +149,9 @@ impl Executor {
             .is_some_and(|prepared| prepared.bytes >= bytes && prepared.alignment >= peak.alignment)
         {
             return Ok(peak);
-        }
+        };
         if let Some(old) = slot.take() {
-            let unmapped = self.ep.deallocate_with_unmapped(old.buffer)?;
-            self.ep.release_mapped_growth(unmapped, old.role);
+            self.ep.deallocate(old.buffer)?;
         }
         let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
         let mut grant = self.ep.prepare_mapped_growth(target_mapped, peak.role)?;
@@ -163,30 +162,17 @@ impl Executor {
                 return Err(error.into());
             }
         };
-        let (fresh, actual_mapped_bytes) = match grant.as_mut() {
-            Some(grant) => {
-                let allocation =
-                    self.ep
-                        .allocate_with_mapped_growth(bytes, peak.alignment, grant)?;
-                (allocation.allocation, allocation.newly_mapped_bytes)
-            }
-            None => (self.ep.allocate(bytes, peak.alignment)?, 0),
+        let fresh = match grant.take() {
+            Some(grant) => self
+                .ep
+                .allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
+            None => self.ep.allocate(bytes, peak.alignment)?,
         };
-        if let Some(grant) = grant
-            && let Err(error) = grant.commit_bytes(actual_mapped_bytes)
-        {
-            let _ = self.ep.deallocate(fresh);
-            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                "workspace mapped-growth commit failed: {error}"
-            ))
-            .into());
-        }
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
             _lease: lease,
             bytes,
             alignment: peak.alignment,
-            role: peak.role,
         });
         Ok(peak)
     }
@@ -266,9 +252,7 @@ impl Executor {
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
         if let Some(workspace) = self.step_workspace.take() {
-            let role = workspace.role;
-            let unmapped = self.ep.deallocate_with_unmapped(workspace.buffer)?;
-            self.ep.release_mapped_growth(unmapped, role);
+            self.ep.deallocate(workspace.buffer)?;
         }
         Ok(())
     }

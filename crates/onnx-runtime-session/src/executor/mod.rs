@@ -608,15 +608,11 @@ impl Drop for Executor {
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
         }
-        if let Some(workspace) = self.persistent_workspace.take()
-            && let Ok(unmapped) = self.ep.deallocate_with_unmapped(workspace.buffer)
-        {
-            self.ep.release_mapped_growth(unmapped, workspace.role);
+        if let Some(workspace) = self.persistent_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
         }
-        if let Some(workspace) = self.step_workspace.take()
-            && let Ok(unmapped) = self.ep.deallocate_with_unmapped(workspace.buffer)
-        {
-            self.ep.release_mapped_growth(unmapped, workspace.role);
+        if let Some(workspace) = self.step_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
         }
         self.shared_buffers.clear();
     }

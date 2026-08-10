@@ -490,14 +490,15 @@ pub trait ExecutionProvider: Send + Sync {
         &self,
         size: usize,
         alignment: usize,
-        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
-    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<DeviceBuffer>> {
-        let _ = grant;
+        grant: onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<DeviceBuffer> {
         let newly_mapped_bytes = self.mapped_bytes_for_allocation(size, alignment)?;
-        Ok(onnx_runtime_memory_governor::MappedAllocation {
-            allocation: self.allocate(size, alignment)?,
-            newly_mapped_bytes,
-        })
+        let allocation = self.allocate(size, alignment)?;
+        if let Err(error) = grant.commit_bytes(newly_mapped_bytes) {
+            let _ = self.deallocate(allocation);
+            return Err(EpError::Memory(error));
+        }
+        Ok(allocation)
     }
 
     /// Allocate device address space while committing only selected byte ranges.
