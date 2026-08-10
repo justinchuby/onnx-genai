@@ -114,7 +114,7 @@ fn native_cuda_routed_qmoe_pipeline_admits_after_workspace() -> anyhow::Result<(
         eprintln!("skipping: no CUDA GPU visible (set CUDA_VISIBLE_DEVICES)");
         return Ok(());
     };
-    let result = (|| {
+    (|| {
         let mut engine = PipelineEngine::from_dir_with_config(
             &fixture_dir(),
             EngineConfig {
@@ -151,8 +151,7 @@ fn native_cuda_routed_qmoe_pipeline_admits_after_workspace() -> anyhow::Result<(
         assert_eq!(events.first(), Some(&"admission"));
         assert!(events[1..].contains(&"token"), "{events:?}");
         Ok::<_, anyhow::Error>(())
-    })();
-    result
+    })()
 }
 
 #[test]
@@ -161,7 +160,7 @@ fn native_cuda_routed_qmoe_exhaustion_precedes_admission_and_recovers() -> anyho
         eprintln!("skipping: no CUDA GPU visible (set CUDA_VISIBLE_DEVICES)");
         return Ok(());
     };
-    let result = (|| {
+    (|| {
         let mut engine = PipelineEngine::from_dir_with_config(
             &fixture_dir(),
             EngineConfig {
@@ -225,6 +224,5 @@ fn native_cuda_routed_qmoe_exhaustion_precedes_admission_and_recovers() -> anyho
         assert!(admitted.load(Ordering::Relaxed));
         assert_eq!(engine.resource_snapshot().vram.used, baseline);
         Ok::<_, anyhow::Error>(())
-    })();
-    result
+    })()
 }
