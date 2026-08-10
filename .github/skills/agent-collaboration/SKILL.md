@@ -32,6 +32,19 @@ Remove-Item <finished-worktree>\target -Recurse -Force -ErrorAction SilentlyCont
 
 Never sweep a worktree belonging to a running agent.
 
+### CI Is Asynchronous
+**Do not wait for CI unless the user explicitly asks you to.** Run the exact
+local tests, Clippy checks, builds, and hardware probes needed to validate the
+changed behavior, then report or merge based on that evidence.
+
+CI is asynchronous feedback, not a blocking gate. If CI later exposes a
+platform-specific or matrix-only problem, fix it forward in a follow-up commit
+or PR. Do not spend an agent turn polling jobs, and do not keep a completed
+worktree alive solely to wait for CI.
+Local validation remains mandatory. "Do not wait for CI" never means "do not
+test."
+test."
+
 ### Decision Recording
 After making a decision that affects other team members, write it to:
 `.squad/decisions/inbox/{your-name}-{brief-slug}.md`
