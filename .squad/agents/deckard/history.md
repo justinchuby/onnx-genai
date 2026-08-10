@@ -113,3 +113,23 @@ Full pre-compaction history in `history-archive.md`.
    `ExportedComputeInfo::new(entries)`.
 3. For opset-13 Unsqueeze with axes-as-input: read `input[1]` as a static initialiser
    and pass the values as `axes` to `for_node` (or the op stays `Declined`).
+
+## 2026-08-10 — EP Device Lifetime Fix (BUG 1 + BUG 2)
+
+**Context:** Reviewer rejection protocol — Nabil locked out; Deckard took ownership.
+
+**Root cause:** Two-factor single bug in `factory.rs:GetSupportedDevices`:
+1. Use-after-free: `OrtMemoryInfo` released immediately after `EpDevice_AddAllocatorInfo`,
+   but ORT stores the pointer (doesn't copy). Dangling pointer → garbage after memory reuse.
+2. Wrong API: `CreateCpuMemoryInfo` (legacy) doesn't populate `OrtMemoryInfoDeviceType` /
+   `OrtDeviceMemoryType` fields needed by the EP device system → garbage DeviceType:64.
+
+**Fix:** `crates/onnx-runtime-ep-plugin/src/factory.rs` — replaced `CreateCpuMemoryInfo` +
+immediate release with `CreateMemoryInfo_V2(CPU, DEFAULT, OrtDeviceAllocator)` and no
+release on success (ORT owns via EpDevice). Release only on `AddAllocatorInfo` failure.
+
+**Result:** `conformance_multiple_run_calls` and `ort_loads_our_ep_and_runs_model` now pass.
+`conformance_two_sessions` has a test bug (searches for registration name "cpu_ep_2sess"
+instead of factory name "cpu_ep") — Pris needs to fix.
+
+**Remaining:** `kernel_ctx.rs:23` has dead_code warning (Leon's file, not mine).

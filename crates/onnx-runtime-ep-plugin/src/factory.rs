@@ -333,36 +333,58 @@ unsafe extern "C" fn factory_get_supported_devices(
                     );
                 }
             };
-            let create_cpu_mem_info = match unsafe { (*api).CreateCpuMemoryInfo } {
+
+            // Use CreateMemoryInfo_V2 to produce a properly-typed OrtMemoryInfo
+            // with OrtMemoryInfoDeviceType and OrtDeviceMemoryType fields that the
+            // EP device system requires. The legacy CreateCpuMemoryInfo creates
+            // old-format memory info whose device-type/memory-type fields are
+            // uninitialized in the new EP ABI, producing garbage values.
+            let create_mem_info_v2 = match unsafe { (*api).CreateMemoryInfo_V2 } {
                 Some(f) => f,
                 None => {
                     return fail_status(
-                        "GetSupportedDevices: CreateCpuMemoryInfo not available",
+                        "GetSupportedDevices: CreateMemoryInfo_V2 not available",
                     );
                 }
             };
-            let release_mem_info = unsafe { (*api).ReleaseMemoryInfo };
 
-            // Default device allocator (OrtDeviceAllocator + OrtMemTypeDefault).
+            // CPU device allocator with OrtDeviceMemoryType_DEFAULT.
             let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
             let status = unsafe {
-                create_cpu_mem_info(
-                    ort::OrtDeviceAllocator,
-                    ort::OrtMemTypeDefault,
+                create_mem_info_v2(
+                    c"Cpu".as_ptr(),
+                    ort::OrtMemoryInfoDeviceType_CPU,   // device_type
+                    0,                                   // vendor_id (generic)
+                    0,                                   // device_id
+                    ort::OrtDeviceMemoryType_DEFAULT,    // mem_type
+                    0,                                   // alignment (default)
+                    ort::OrtDeviceAllocator,             // allocator_type
                     &mut mem_info,
                 )
             };
             if !status.is_null() {
                 return status;
             }
-            if !mem_info.is_null() {
-                let status = unsafe { add_alloc_info(ep_device, mem_info) };
-                if let Some(release) = release_mem_info {
+            if mem_info.is_null() {
+                return fail_status(
+                    "GetSupportedDevices: CreateMemoryInfo_V2 returned null",
+                );
+            }
+
+            // EpDevice_AddAllocatorInfo stores the OrtMemoryInfo pointer inside
+            // the OrtEpDevice. ORT accesses it later (e.g. CreateAllocator,
+            // EpDevice_MemoryInfo). We must NOT release the OrtMemoryInfo here —
+            // ORT will release it when the OrtEpDevice is released via
+            // ReleaseEpDevice. Releasing here causes a use-after-free that
+            // manifests as garbage DeviceType/MemoryType after repeated
+            // register/unregister cycles.
+            let status = unsafe { add_alloc_info(ep_device, mem_info) };
+            if !status.is_null() {
+                // Release mem_info only on failure since it was not consumed.
+                if let Some(release) = unsafe { (*api).ReleaseMemoryInfo } {
                     unsafe { release(mem_info) };
                 }
-                if !status.is_null() {
-                    return status;
-                }
+                return status;
             }
 
             unsafe { *out_devices.add(count) = ep_device };
