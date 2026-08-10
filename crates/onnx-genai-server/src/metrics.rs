@@ -510,6 +510,72 @@ pub(crate) fn encode_kv_telemetry(
     output
 }
 
+pub(crate) fn encode_mapped_growth(metrics: &onnx_genai_engine::MappedGrowthMetrics) -> String {
+    let values = [
+        (
+            "onnx_genai_mapped_growth_attempts_total",
+            "Mapped growth grant attempts.",
+            metrics.attempts,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_growth_bytes_transferred_total",
+            "Allowance bytes transferred by committed mapped growth grants.",
+            metrics.bytes_transferred,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_growth_failures_total",
+            "Mapped growth grant preparation failures.",
+            metrics.failures,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_growth_rollbacks_total",
+            "Mapped growth grants rolled back before commit.",
+            metrics.rollbacks,
+            "counter",
+        ),
+        (
+            "onnx_genai_mapped_weight_bytes",
+            "Currently mapped reloadable weight bytes.",
+            metrics.weight_mapped,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_kv_bytes",
+            "Currently mapped native KV bytes.",
+            metrics.kv_mapped,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_workspace_bytes",
+            "Currently mapped governed workspace bytes.",
+            metrics.workspace_mapped,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_total_owned_bytes",
+            "Total physical bytes owned by mapped-growth authorities.",
+            metrics.total_owned,
+            "gauge",
+        ),
+        (
+            "onnx_genai_mapped_growth_registered_holders",
+            "Live reclaimable mapped holders.",
+            metrics.live_holders,
+            "gauge",
+        ),
+    ];
+    let mut output = String::new();
+    for (name, help, value, metric_type) in values {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} {metric_type}");
+        let _ = writeln!(output, "{name} {value}");
+    }
+    output
+}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn encode_resource_governor(snapshot: &GovernorSnapshot) -> String {
     let mut output = String::new();

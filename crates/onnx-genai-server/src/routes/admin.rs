@@ -429,6 +429,9 @@ pub(crate) async fn prometheus_metrics(
         Some(snapshot) => output.push_str(&crate::metrics::encode_resource_governor(&snapshot)),
         None => output.push_str(&crate::metrics::encode_resource_governor_unavailable()),
     }
+    if let Ok(Some(metrics)) = state.registry.aggregate_growth_metrics() {
+        output.push_str(&crate::metrics::encode_mapped_growth(&metrics));
+    }
     Ok((
         [(
             header::CONTENT_TYPE,

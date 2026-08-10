@@ -39,6 +39,15 @@ use std::ptr::NonNull;
 
 use crate::{MemoryError, Tier};
 
+#[derive(Clone, Copy, Debug)]
+pub struct AllocationCommitRange {
+    pub ptr: NonNull<u8>,
+    pub allocation_bytes: usize,
+    pub align: usize,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
 /// Which physical device memory comes from.
 ///
 /// A `Tier` says *how far away* memory is; this says *which one*. Two CUDA
@@ -149,6 +158,42 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     ) -> Result<(), MemoryError> {
         let _ = (ptr, allocation_bytes, align, offset, bytes);
         Ok(())
+    }
+
+    /// Commit several allocation ranges as one allocator transaction.
+    ///
+    /// Lazy allocators override this to union shared physical granules under a
+    /// single lock. The eager/default implementation preserves compatibility.
+    fn commit_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<(), MemoryError> {
+        for range in ranges {
+            self.commit_allocation_range(
+                range.ptr,
+                range.allocation_bytes,
+                range.align,
+                range.offset,
+                range.bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Mapped attribution bytes represented by a batched set of ranges.
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<u64, MemoryError> {
+        Ok(ranges.iter().fold(0_u64, |total, range| {
+            total.saturating_add(range.bytes as u64)
+        }))
+    }
+
+    /// Mapped bytes required to fully back a new allocation.
+    fn mapped_bytes_for_allocation(&self, bytes: usize, align: usize) -> Result<u64, MemoryError> {
+        let _ = align;
+        Ok(bytes as u64)
     }
 
     /// Release physical backing from a byte range in an existing allocation

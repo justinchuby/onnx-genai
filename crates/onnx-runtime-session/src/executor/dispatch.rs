@@ -1470,18 +1470,54 @@ impl KernelDispatchContext<'_> {
                     // before retiring the old disposable workspace. Release it
                     // before acquiring the replacement to avoid charging both.
                     self.ep.sync()?;
+                    let old_mapped = prepared.as_ref().map_or(0, |old| old.mapped_bytes);
+                    let target_mapped = self
+                        .ep
+                        .mapped_bytes_for_allocation(required, requirement.alignment)?;
+                    let growth = target_mapped.saturating_sub(old_mapped);
+                    let grant = self.ep.prepare_mapped_growth(growth, requirement.role)?;
                     if let Some(old) = prepared.take() {
                         self.ep.deallocate(old.buffer)?;
                     }
-                    let lease = self
+                    let lease = match self
                         .ep
-                        .reserve_workspace(requirement.bytes, requirement.role)?;
-                    let buffer = self.ep.allocate(required, requirement.alignment)?;
+                        .reserve_workspace(requirement.bytes, requirement.role)
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            drop(grant);
+                            self.ep.release_mapped_growth(old_mapped, requirement.role);
+                            return Err(error.into());
+                        }
+                    };
+                    let buffer = match self.ep.allocate(required, requirement.alignment) {
+                        Ok(buffer) => buffer,
+                        Err(error) => {
+                            drop(grant);
+                            self.ep.release_mapped_growth(old_mapped, requirement.role);
+                            return Err(error.into());
+                        }
+                    };
+                    let mapped_bytes = if let Some(grant) = grant {
+                        if let Err(error) = grant.commit() {
+                            let _ = self.ep.deallocate(buffer);
+                            self.ep.release_mapped_growth(old_mapped, requirement.role);
+                            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                                "workspace mapped-growth commit failed: {error}"
+                            ))
+                            .into());
+                        }
+                        target_mapped
+                    } else {
+                        old_mapped
+                    };
                     *prepared = Some(PreparedWorkspace {
                         buffer,
                         _lease: lease,
                         bytes: required,
                         alignment: requirement.alignment,
+                        mapped_bytes,
+                        role: requirement.role,
                     });
                 }
                 let prepared = prepared.as_mut().ok_or_else(|| {

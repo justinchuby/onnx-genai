@@ -55,8 +55,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
-    Tier,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MemoryError, MemoryGovernor,
+    MemoryLease, MemoryRole, Tier,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
@@ -670,6 +670,7 @@ impl CudaVmmAllocator {
         holder: HolderId,
         role: MemoryRole,
         teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+        default_pool_bytes: Option<usize>,
     ) -> Result<Self, MemoryError> {
         Self::build(
             VmmConstruction {
@@ -679,7 +680,7 @@ impl CudaVmmAllocator {
                 capacity,
                 holder,
                 role,
-                pool_bytes: physical_handle_pool_bytes(),
+                pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
                 teardown_synchronizer: Some(teardown_synchronizer),
             },
             governor,
@@ -1093,6 +1094,18 @@ fn aligned_fits(start: usize, span: usize, len: usize, align: usize) -> bool {
         .is_some_and(|end| end <= start + span)
 }
 
+fn batch_granule_references(
+    by_allocation: &BTreeMap<usize, BTreeSet<usize>>,
+) -> BTreeMap<usize, u32> {
+    let mut references = BTreeMap::<usize, u32>::new();
+    for granules in by_allocation.values() {
+        for &granule in granules {
+            *references.entry(granule).or_default() += 1;
+        }
+    }
+    references
+}
+
 // SAFETY: every pointer handed out lies inside this allocator's reservation,
 // in a span removed from the free list and recorded in `live`, so no two live
 // allocations overlap. The granules under a span stay mapped while its
@@ -1243,6 +1256,64 @@ impl DeviceAllocator for CudaVmmAllocator {
         Ok(())
     }
 
+    fn commit_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<(), MemoryError> {
+        let mut arena = self.lock();
+        let mut by_allocation = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for range in ranges {
+            let (offset, granules) = self.uncommitted_granules(
+                &arena,
+                range.ptr,
+                range.allocation_bytes,
+                range.offset,
+                range.bytes,
+            )?;
+            by_allocation.entry(offset).or_default().extend(granules);
+        }
+        let references = batch_granule_references(&by_allocation);
+        let union = references.keys().copied().collect::<Vec<_>>();
+        let claimed = self.claim_granules(&mut arena, union)?;
+        for (&granule, &count) in &references {
+            if count > 1 {
+                arena.spans.granule_refs[granule] =
+                    arena.spans.granule_refs[granule].saturating_add(count - 1);
+            }
+        }
+        debug_assert_eq!(claimed.len(), references.len());
+        for (offset, granules) in by_allocation {
+            if let Some(live) = arena.spans.live.get_mut(&offset) {
+                live.committed.extend(granules);
+            }
+        }
+        Ok(())
+    }
+
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<u64, MemoryError> {
+        let arena = self.lock();
+        let mut identities = BTreeSet::new();
+        for range in ranges {
+            let (_, granules) = self.uncommitted_granules(
+                &arena,
+                range.ptr,
+                range.allocation_bytes,
+                range.offset,
+                range.bytes,
+            )?;
+            identities.extend(granules);
+        }
+        Ok(identities.len().saturating_mul(arena.spans.granularity) as u64)
+    }
+
+    fn mapped_bytes_for_allocation(&self, bytes: usize, _align: usize) -> Result<u64, MemoryError> {
+        let granularity = self.lock().spans.granularity;
+        Ok(round_up(granularity, bytes) as u64)
+    }
+
     fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -1391,6 +1462,24 @@ impl Drop for CudaVmmAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_ranges_union_shared_granule_identity_once() {
+        let by_allocation =
+            BTreeMap::from([(0, BTreeSet::from([7, 8])), (4096, BTreeSet::from([8, 9]))]);
+        let references = batch_granule_references(&by_allocation);
+
+        assert_eq!(
+            references.keys().copied().collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert_eq!(references[&8], 2, "both allocations retain a reference");
+        assert_eq!(
+            references.len(),
+            3,
+            "shared granule 8 is one physical admission identity"
+        );
+    }
 
     /// Alignment padding at the front of a span stays free rather than being
     /// swallowed.

@@ -1,6 +1,22 @@
 use super::*;
 
 impl Executor {
+    pub(crate) fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        Ok(self.ep.prepare_mapped_growth(bytes, role)?)
+    }
+
+    pub(crate) fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.ep.release_mapped_growth(bytes, role);
+    }
+
     pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
         fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
             for (node_id, node) in graph.nodes.iter() {
@@ -134,16 +150,49 @@ impl Executor {
         {
             return Ok(peak);
         }
+        let old_mapped = slot.as_ref().map_or(0, |old| old.mapped_bytes);
+        let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
+        let growth = target_mapped.saturating_sub(old_mapped);
+        let grant = self.ep.prepare_mapped_growth(growth, peak.role)?;
         if let Some(old) = slot.take() {
             self.ep.deallocate(old.buffer)?;
         }
-        let lease = self.ep.reserve_workspace(peak.bytes, peak.role)?;
-        let fresh = self.ep.allocate(bytes, peak.alignment)?;
+        let lease = match self.ep.reserve_workspace(peak.bytes, peak.role) {
+            Ok(lease) => lease,
+            Err(error) => {
+                drop(grant);
+                self.ep.release_mapped_growth(old_mapped, peak.role);
+                return Err(error.into());
+            }
+        };
+        let fresh = match self.ep.allocate(bytes, peak.alignment) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                drop(grant);
+                self.ep.release_mapped_growth(old_mapped, peak.role);
+                return Err(error.into());
+            }
+        };
+        let mapped_bytes = if let Some(grant) = grant {
+            if let Err(error) = grant.commit() {
+                let _ = self.ep.deallocate(fresh);
+                self.ep.release_mapped_growth(old_mapped, peak.role);
+                return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                    "workspace mapped-growth commit failed: {error}"
+                ))
+                .into());
+            }
+            target_mapped
+        } else {
+            old_mapped
+        };
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
             _lease: lease,
             bytes,
             alignment: peak.alignment,
+            mapped_bytes,
+            role: peak.role,
         });
         Ok(peak)
     }
@@ -223,7 +272,10 @@ impl Executor {
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
         if let Some(workspace) = self.step_workspace.take() {
+            let mapped_bytes = workspace.mapped_bytes;
+            let role = workspace.role;
             self.ep.deallocate(workspace.buffer)?;
+            self.ep.release_mapped_growth(mapped_bytes, role);
         }
         Ok(())
     }

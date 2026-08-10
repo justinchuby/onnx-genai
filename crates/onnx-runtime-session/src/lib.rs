@@ -1145,6 +1145,22 @@ impl InferenceSession {
         self.exec.prepare_with_device_bindings(inputs, bindings)
     }
 
+    pub fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        self.exec.prepare_mapped_growth(bytes, role)
+    }
+
+    pub fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.exec.release_mapped_growth(bytes, role);
+    }
+
     /// Locations of graph nodes that declare owned kernel workspace.
     pub fn workspace_node_locations(&self) -> Vec<String> {
         self.exec.workspace_node_locations()

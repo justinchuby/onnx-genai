@@ -9,8 +9,8 @@ use onnx_genai::{Engine, EngineConfig};
 #[cfg(feature = "native-backend")]
 use onnx_genai_engine::NativeDecodeDevice;
 use onnx_genai_engine::{
-    DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MemoryAuthorityProvider,
-    ResourceLimit,
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MappedGrowthMetrics,
+    MemoryAuthorityProvider, ResourceLimit,
 };
 use onnx_genai_ort::{ChatTemplate, ModelDirectory, PipelineModelDirectory, Tokenizer};
 
@@ -66,6 +66,38 @@ impl ServerMemoryAuthorities {
             total.saturating_add(authority.limit_bytes())
         });
         Ok(Some((used, limit, limit.saturating_sub(used))))
+    }
+
+    pub(crate) fn aggregate_growth_metrics(&self) -> anyhow::Result<Option<MappedGrowthMetrics>> {
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
+        if authorities.is_empty() {
+            return Ok(None);
+        }
+        let mut total = MappedGrowthMetrics::default();
+        for authority in authorities.values() {
+            let metrics = authority.growth_metrics();
+            total.attempts = total.attempts.saturating_add(metrics.attempts);
+            total.bytes_transferred = total
+                .bytes_transferred
+                .saturating_add(metrics.bytes_transferred);
+            total.failures = total.failures.saturating_add(metrics.failures);
+            total.rollbacks = total.rollbacks.saturating_add(metrics.rollbacks);
+            total.weight_mapped = total.weight_mapped.saturating_add(metrics.weight_mapped);
+            total.kv_mapped = total.kv_mapped.saturating_add(metrics.kv_mapped);
+            total.workspace_mapped = total
+                .workspace_mapped
+                .saturating_add(metrics.workspace_mapped);
+            total.total_owned = total.total_owned.saturating_add(metrics.total_owned);
+            total.live_holders = total.live_holders.saturating_add(metrics.live_holders);
+            total.mapped_bytes = total.mapped_bytes.saturating_add(metrics.mapped_bytes);
+            total.total_allowance_bytes = total
+                .total_allowance_bytes
+                .saturating_add(metrics.total_allowance_bytes);
+        }
+        Ok(Some(total))
     }
 
     /// Atomically apply one operator policy to every device authority.

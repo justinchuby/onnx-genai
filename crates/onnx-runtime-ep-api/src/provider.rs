@@ -515,6 +515,23 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Commit all listed ranges as one allocator transaction.
+    fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
+        for &(buffer, offset, bytes) in ranges {
+            self.commit_allocation_range(buffer, offset, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+    ) -> Result<u64> {
+        Ok(ranges.iter().fold(0_u64, |total, (_, _, bytes)| {
+            total.saturating_add(*bytes as u64)
+        }))
+    }
+
     /// Release physical backing from a byte range in an existing allocation
     /// while preserving its virtual address. Eager providers keep the default
     /// no-op; lazy providers use this for transactional growth rollback.
@@ -704,6 +721,24 @@ pub trait ExecutionProvider: Send + Sync {
         _role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
         Ok(None)
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        let _ = (bytes, role);
+        Ok(None)
+    }
+
+    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
+        let _ = alignment;
+        Ok(bytes as u64)
+    }
+
+    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+        let _ = (bytes, role);
     }
 
     /// Place any long-lived device memory this provider holds under `governor`.

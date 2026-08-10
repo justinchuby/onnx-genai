@@ -610,9 +610,13 @@ impl Drop for Executor {
         }
         if let Some(workspace) = self.persistent_workspace.take() {
             let _ = self.ep.deallocate(workspace.buffer);
+            self.ep
+                .release_mapped_growth(workspace.mapped_bytes, workspace.role);
         }
         if let Some(workspace) = self.step_workspace.take() {
             let _ = self.ep.deallocate(workspace.buffer);
+            self.ep
+                .release_mapped_growth(workspace.mapped_bytes, workspace.role);
         }
         self.shared_buffers.clear();
     }

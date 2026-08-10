@@ -1368,11 +1368,23 @@ impl DecodeCudaState {
             let old_capacity = self.max_len;
             let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
             let valid_len = self.logical_len;
+            let mapped_growth_bytes = self.vmm_growth_mapped_bytes(new_capacity)?;
+            let grant = session
+                .prepare_mapped_growth(
+                    mapped_growth_bytes,
+                    onnx_runtime_memory_governor::MemoryRole::KvCache,
+                )
+                .context("prepare transactional native CUDA KV growth")?;
             self.commit_vmm_growth(new_capacity).map_err(|error| {
                 let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
                     .map_err(|error| error.to_string());
                 self.growth_failed_error(old_capacity, new_capacity, error, memory)
             })?;
+            if let Some(grant) = grant {
+                grant
+                    .commit_bytes(mapped_growth_bytes)
+                    .context("commit native CUDA KV mapped-growth attribution")?;
+            }
             native_cuda_device_barrier(session)?;
             self.apply_vmm_growth(new_capacity, valid_len)?;
             self.invalidate_graph(session)?;
@@ -1428,10 +1440,34 @@ impl DecodeCudaState {
     /// only installed after their lease succeeds, so the governor remains the
     /// single source of memory truth.
     fn commit_vmm_growth(&mut self, new_capacity: usize) -> anyhow::Result<()> {
-        let mut committed: Vec<(usize, usize, usize)> = Vec::new();
-        let kv_indices = self.kv_binding_range.clone().collect::<Vec<_>>();
-        for index in kv_indices {
-            let binding = &mut self.bindings[index];
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .commit_binding_ranges(&ranges)
+            .context("commit native CUDA KV binding ranges atomically")
+    }
+
+    fn vmm_growth_mapped_bytes(&self, new_capacity: usize) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size native CUDA KV mapped-growth transaction")
+    }
+
+    fn vmm_growth_requests(
+        &self,
+        new_capacity: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
             let mut new_shape = binding.physical_shape().to_vec();
             if new_shape.len() != 4 {
                 bail!(
@@ -1448,40 +1484,15 @@ impl DecodeCudaState {
                     new_shape
                 )
             })?;
-            let old_bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
-                .with_context(|| {
-                    format!(
-                        "VMM-backed CUDA KV '{}' current size overflows for shape {:?}",
-                        binding.input_name(),
-                        binding.physical_shape()
-                    )
-                })?;
-            if let Err(error) = binding.commit_range(0, bytes) {
-                rollback_vmm_growth_commits(&mut self.bindings, &committed);
-                return Err(error.into());
-            }
-            committed.push((index, old_bytes, bytes.saturating_sub(old_bytes)));
+            requested.push((index, 0, bytes));
         }
         let mask_bytes = new_capacity
             .checked_mul(std::mem::size_of::<i64>())
             .with_context(|| {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
-        let old_mask_bytes =
-            checked_shape_bytes(self.bindings[0].physical_shape(), DataType::Int64).with_context(
-                || {
-                    format!(
-                        "VMM-backed CUDA mask current size overflows for shape {:?}",
-                        self.bindings[0].physical_shape()
-                    )
-                },
-            )?;
-        if let Err(error) = self.bindings[0].commit_range(0, mask_bytes) {
-            rollback_vmm_growth_commits(&mut self.bindings, &committed);
-            return Err(error.into());
-        }
-        committed.push((0, old_mask_bytes, mask_bytes.saturating_sub(old_mask_bytes)));
-        Ok(())
+        requested.push((0, 0, mask_bytes));
+        Ok(requested)
     }
 
     /// Grow VMM-backed KV in place, keeping the reserved address range stable.
@@ -3003,18 +3014,6 @@ pub(super) fn in_place_copy_route(
         InPlaceCopyRoute::Scratch
     } else {
         InPlaceCopyRoute::DeviceToDevice
-    }
-}
-
-fn rollback_vmm_growth_commits(
-    bindings: &mut [DeviceIoBinding],
-    committed: &[(usize, usize, usize)],
-) {
-    for &(index, old_bytes, extra_bytes) in committed.iter().rev() {
-        if extra_bytes == 0 {
-            continue;
-        }
-        let _ = bindings[index].decommit_range(old_bytes, extra_bytes);
     }
 }
 

@@ -20,8 +20,9 @@
 //!    dereferenceable; it only travels between `allocate`, `copy`, and kernels,
 //!    exactly as [`onnx_runtime_ep_api::DeviceBuffer`] documents for CUDA.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
@@ -39,6 +40,23 @@ use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 /// `ONNX_GENAI_WEIGHT_OFFLOAD` is enabled without an explicit
 /// `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` override (4 GiB).
 pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
+
+fn dynamic_lending_enabled() -> bool {
+    dynamic_lending_enabled_for(
+        std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn dynamic_lending_enabled_for(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
@@ -86,6 +104,14 @@ pub struct CudaExecutionProvider {
     offload_policy: DeviceOffloadPolicy,
     /// LRU device residency cache. `Some` iff `offload_policy.enabled`.
     residency: Option<Arc<CudaWeightResidency>>,
+    mapped_reclaim_registration:
+        std::sync::OnceLock<onnx_runtime_memory_governor::MappedHolderRegistration>,
+    mapped_requesters: Mutex<
+        HashMap<
+            onnx_runtime_memory_governor::MemoryRole,
+            onnx_runtime_memory_governor::MappedAllowance,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -136,6 +162,8 @@ impl CudaExecutionProvider {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
+        let auto_dynamic_lending =
+            governor.is_some() && offload_policy.enabled && dynamic_lending_enabled();
         let residency = offload_policy.enabled.then(|| {
             let budget = offload_policy
                 .device_budget_bytes
@@ -164,7 +192,7 @@ impl CudaExecutionProvider {
             // leaving it unmapped costs nothing.
             vmm: {
                 let cell = std::sync::OnceLock::new();
-                if crate::vmm_allocator::vmm_enabled() {
+                if crate::vmm_allocator::vmm_enabled() || auto_dynamic_lending {
                     const RESERVATION_BYTES: usize = 64 << 30;
                     let synchronization_runtime = Arc::clone(&runtime);
                     let teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer =
@@ -190,6 +218,7 @@ impl CudaExecutionProvider {
                                 step_scoped: false,
                             },
                             Arc::clone(&teardown_synchronizer),
+                            auto_dynamic_lending.then_some(256usize << 20),
                         )
                         }
                         None => crate::vmm_allocator::CudaVmmAllocator::standalone_with_teardown_synchronizer(
@@ -209,8 +238,17 @@ impl CudaExecutionProvider {
                             eprintln!(
                                 "cuda_ep: device allocations go through a VMM arena over \
                                  {RESERVATION_BYTES} bytes of reserved address space; physical \
-                                 granules are mapped on demand and join the memory ledger when \
-                                 one arrives"
+                                 granules are mapped on demand; strategy={}{}",
+                                if auto_dynamic_lending {
+                                    "vram-limit dynamic KV/weight lending"
+                                } else {
+                                    "explicit CUDA VMM"
+                                },
+                                if auto_dynamic_lending {
+                                    " with a retained physical-handle pool"
+                                } else {
+                                    ""
+                                }
                             );
                             let _ = cell.set(Arc::new(arena));
                         }
@@ -235,6 +273,8 @@ impl CudaExecutionProvider {
             csa_metrics,
             offload_policy,
             residency,
+            mapped_reclaim_registration: std::sync::OnceLock::new(),
+            mapped_requesters: Mutex::new(HashMap::new()),
         };
         if let (Some(residency), Some(arena), Some(governor)) =
             (provider.residency.as_ref(), provider.vmm.get(), governor)
@@ -760,6 +800,69 @@ impl ExecutionProvider for CudaExecutionProvider {
             })
     }
 
+    fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
+        let raw = ranges
+            .iter()
+            .map(|&(buffer, offset, bytes)| {
+                assert_eq!(
+                    buffer.device(),
+                    self.device,
+                    "cuda_ep: refusing to commit a buffer from device {:?}",
+                    buffer.device()
+                );
+                let ptr = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8)
+                    .ok_or_else(|| EpError::KernelFailed("cuda_ep: null commit buffer".into()))?;
+                Ok(onnx_runtime_memory_governor::AllocationCommitRange {
+                    ptr,
+                    allocation_bytes: buffer.len(),
+                    align: buffer.alignment(),
+                    offset,
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.memory()
+            .commit_allocation_ranges(&raw)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not commit {} binding range(s) atomically on CUDA device {}: {error}",
+                    raw.len(),
+                    self.device.index
+                ))
+            })
+    }
+
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+    ) -> Result<u64> {
+        let raw = ranges
+            .iter()
+            .map(|&(buffer, offset, bytes)| {
+                let ptr = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8)
+                    .ok_or_else(|| {
+                        EpError::KernelFailed("cuda_ep: null mapped range buffer".into())
+                    })?;
+                Ok(onnx_runtime_memory_governor::AllocationCommitRange {
+                    ptr,
+                    allocation_bytes: buffer.len(),
+                    align: buffer.alignment(),
+                    offset,
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.memory()
+            .mapped_bytes_for_allocation_ranges(&raw)
+            .map_err(EpError::Memory)
+    }
+
+    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
+        self.memory()
+            .mapped_bytes_for_allocation(bytes, alignment)
+            .map_err(EpError::Memory)
+    }
+
     fn decommit_allocation_range(
         &self,
         buffer: &DeviceBuffer,
@@ -1077,6 +1180,63 @@ impl ExecutionProvider for CudaExecutionProvider {
             .map_err(Into::into)
     }
 
+    fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        if bytes == 0 || !dynamic_lending_enabled() || !self.memory().commits_on_demand() {
+            return Ok(None);
+        }
+        let Some(governor) = self.governor.as_deref() else {
+            eprintln!(
+                "cuda_ep: WARNING: dynamic mapped growth requested without an authority \
+                 participant; continuing with ordinary allocator admission"
+            );
+            return Ok(None);
+        };
+        let mut requesters = self
+            .mapped_requesters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let requester = match requesters.entry(role) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let holder = match role {
+                    onnx_runtime_memory_governor::MemoryRole::KvCache => {
+                        onnx_runtime_memory_governor::HolderId::new(65)
+                    }
+                    _ => onnx_runtime_memory_governor::HolderId::new(66),
+                };
+                entry.insert(
+                    governor
+                        .reserve_mapped_allowance(
+                            onnx_runtime_memory_governor::Tier::Device,
+                            0,
+                            role,
+                            holder,
+                        )
+                        .map_err(EpError::Memory)?,
+                )
+            }
+        };
+        governor
+            .prepare_mapped_growth(requester, bytes)
+            .map(Some)
+            .map_err(EpError::Memory)
+    }
+
+    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+        if let Some(requester) = self
+            .mapped_requesters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&role)
+        {
+            requester.unmap(bytes);
+        }
+    }
+
     /// True when the VMM arena is in use: it maps 2 MiB granules as spans are
     /// handed out and leases each one before mapping it, so committed memory
     /// tracks real use rather than the largest request anyone might make.
@@ -1108,9 +1268,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         tier: onnx_runtime_memory_governor::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
-        if crate::vmm_allocator::vmm_enabled()
-            && let Some(arena) = self.vmm.get()
-        {
+        if let Some(arena) = self.vmm.get() {
             if let Some(authority) = arena.physical_pool_authority()
                 && authority != governor.authority_id()
             {
@@ -1146,14 +1304,33 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(residency) = self.residency.as_ref() else {
             return Ok(0);
         };
-        residency
+        let governed = residency
             .adopt_governed_budget(governor, tier, holder)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
                     "cuda_ep: the device weight-residency cache holds a budget the governor \
                      cannot grant on {tier:?}: {error}"
                 ))
-            })
+            })?;
+        if dynamic_lending_enabled() && self.mapped_reclaim_registration.get().is_none() {
+            let reclaimable: Arc<dyn onnx_runtime_memory_governor::ReclaimableMappedHolder> =
+                Arc::clone(residency)
+                    as Arc<dyn onnx_runtime_memory_governor::ReclaimableMappedHolder>;
+            match governor.register_reclaimable_mapped_holder(&reclaimable) {
+                Ok(registration) => {
+                    let _ = self.mapped_reclaim_registration.set(registration);
+                    eprintln!(
+                        "cuda_ep: registered CUDA weight residency holder {holder:?} with \
+                         {governed} allowance byte(s) for transactional mapped growth"
+                    );
+                }
+                Err(error) => eprintln!(
+                    "cuda_ep: WARNING: dynamic KV/weight lending is unavailable because the \
+                     memory authority does not provide mapped-growth registration: {error}"
+                ),
+            }
+        }
+        Ok(governed)
     }
 
     fn sync(&self) -> Result<()> {
@@ -1164,6 +1341,16 @@ impl ExecutionProvider for CudaExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_lending_is_on_by_default_with_behavior_safe_opt_outs() {
+        assert!(dynamic_lending_enabled_for(None));
+        assert!(dynamic_lending_enabled_for(Some("1")));
+        assert!(dynamic_lending_enabled_for(Some("true")));
+        for disabled in ["0", " false ", "NO", "Off"] {
+            assert!(!dynamic_lending_enabled_for(Some(disabled)));
+        }
+    }
 
     #[cfg_attr(
         not(feature = "gpu-tests"),
@@ -1283,6 +1470,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 .launch(LaunchConfig::for_num_elems(1))
                 .expect("enqueue delayed write")
         };
+        #[allow(clippy::drop_non_drop)]
         drop(allocation);
         drop(first);
         let after_teardown = stats.snapshot();
