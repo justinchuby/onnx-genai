@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-07T00:30:00Z (Scribe C1 diagnosis batch; inbox merged; no size compaction needed)
+Last consolidated: 2026-08-10T21:09:11Z (Scribe EP plugin export wave; 35 inbox drops merged; full narrative appended to decisions-archive/2026-08.md)
 
 Standing governance rules and active directives. Full narrative is archived in `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and older `.squad/decisions/archive/` files.
 
@@ -118,3 +118,60 @@ Fetch large external models only when needed, measure, and delete immediately. D
 ## Active historical pointers
 
 For detailed per-PR narrative, use archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md` for pre-August ledger, CUDA parity waves, Mac CPU EP/perf methodology, and July CLI/runtime records; `.squad/decisions-archive/2026-08.md` for fused LinearAttention, hetero legalization, 35B-A3B QMoE, #695/#700 hybrid cache fix, and August Scribe batches; older material remains under `.squad/decisions/archive/`.
+
+## Current active wave — 2026-08-10 (EP plugin export)
+
+### ORT plugin EP export — CPU EP end-to-end milestone
+
+**By:** Roy, Nabil, Deckard, Pris, Holden, Leon, Isidore (branch `squad/ep-plugin-export`)
+
+**What:** Upstream ORT 1.27.0 now genuinely loads, registers, and executes our Rust CPU execution provider (`onnx-runtime-ep-cpu-plugin`) as a real plugin EP via `RegisterExecutionProviderLibrary` → `GetEpDevices` → `SessionOptionsAppendExecutionProvider_V2` → `CreateSession` → `Run`. 82 adapter unit tests + 21 real-ORT conformance tests pass, 0 ignored. Branch has 7 commits; push blocked (no GitHub credentials on host).
+
+**Ship status:** 🟡 YELLOW — may ship. All CRITICAL/HIGH blockers cleared (Holden final audit). Two LOW advisories post-merge: `compute_release_state` missing `catch_unwind` (assign Leon), `ep_compile_inner` partial-output cleanup on mid-loop failure (assign Deckard).
+
+**Correct ORT 1.27 export symbols:** `CreateEpFactories` and `ReleaseEpFactory` (both required). Source: `onnxruntime_c_api.h:5579`, `onnxruntime_ep_c_api.h:2637,2661`. The full call sequence is `dlopen` → `CreateEpFactories` → `GetSupportedDevices` → `SessionOptionsAppendExecutionProvider_V2` → `CreateSession` → `Run`.
+
+**CUDA EP:** Hard-blocked (no CUDA toolkit/GPU on host, plus device-memory/stream/allocator ownership unresolved). Not in scope this wave.
+
+Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: challenger-ort-plugin-abi-truth, nabil-ep-plugin-adapter, nabil-ep-device-enumeration, deckard-ep-compute-path, deckard-ep-shape-inference, deckard-ep-device-lifetime, holden-ep-plugin-ffi-audit, holden-ep-plugin-reaudit, holden-ep-plugin-final-verdict, isidore-ep-export-guards, leon-ep-compute-hardening, nabil-ep-plugin-hardening, nabil-ep-capability-integration, pris-ep-plugin-conformance, pris-ep-conformance-suite, pris-ep-conformance-final, roy-ep-plugin-export, roy-ep-export-milestone, roy-ep-provider-readiness).
+
+### PR #728 — growing-symbol classifier round 4–8
+
+**By:** Batty, Leon, Deckard, Roy, Gaff, Sapper, Sebastian
+
+**What:** Multi-round reviewer rejections for the growing-symbol classifier in the executor. Key fix: the growing-set closure must cover ALL broadcasting handlers (not just elementwise). Path-B authoritative record closes the set. Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: batty/deckard/gaff/leon/roy/sapper/sebastian-728-revision).
+
+## ORT plugin-EP ABI standing directives
+
+### OrtMemoryInfo lifetime (USE-AFTER-FREE — caused real bugs)
+
+`EpDevice_AddAllocatorInfo(_In_ OrtEpDevice*, _In_ const OrtMemoryInfo*)` stores the raw pointer; ORT does NOT copy it. **Do NOT call `ReleaseMemoryInfo` after a successful `AddAllocatorInfo`.** ORT releases it when `ReleaseEpDevice` is called. Release only on failure. Use `CreateMemoryInfo_V2` with explicit `OrtMemoryInfoDeviceType_CPU` / `OrtDeviceMemoryType_DEFAULT`; the legacy `CreateCpuMemoryInfo` leaves those fields uninitialized, producing garbage DeviceType:64 / MemoryType:28 after repeated register/unregister cycles.
+
+### OrtGraph*/OrtNode* scope (CACHING BUG — caused real bugs)
+
+`OrtGraph*` and `OrtNode*` handles passed to `GetCapability` / `Compile` callbacks must NOT be stored or cached beyond the callback return. ORT may free them immediately after. Copy all needed attributes and initializers into owned Rust data structures during the callback.
+
+### Shape-inference fail-closed policy
+
+`ShapeInference::for_op` / `for_node` return `Declined { op_type, domain }` for any op with no modelled rule. `infer_shapes` turns `Declined` into an error status — ORT receives a proper failure, not silently-wrong output tensors. Do not reintroduce a silent `SameAsInput(0)` fallback.
+
+### Evidence discipline for implementation claims
+
+A previous session reported the adapter crate as "Implemented (v1)" when it did not compile. **Implementation claims require quoted command output as evidence** (`cargo check` / `cargo test` output). "Passes locally" is not evidence; command transcript is.
+
+## CI and workflow standing directives
+
+**CI is asynchronous.** Do not wait for CI before continuing, reporting, or merging. Required local targeted tests, Clippy, builds, and hardware probes remain blocking. Fix CI failures found later in follow-up commits.
+
+**Design autonomy.** The coordinator may make architecture and design decisions when evidence supports them. Direction-changing decisions must update durable design documentation (measurement, falsifier, limitations, rollback path). When work is separable without shared mutable state, prefer parallel agents in separate worktrees.
+
+## Memory governance standing directives (2026-08-06/08/09)
+
+- `MemoryGovernor` exposes a stable `MemoryAuthorityId`; each backing authority is named at construction; `VirtualBuffer` rejects a different governor before reserving or committing.
+- CUDA weight residency admission uses two constraints: mapped granules vs. weight allowance, newly created handles vs. global physical headroom. Failed transactions release newly created handles.
+- Multi-model server owns one concurrency-safe device authority per backend/device domain; engine host/disk ledgers remain private.
+- QMoE workspace: kernels declare typed workspace requirements; native CUDA prefill resolves QMoE shapes and reserves one reusable session-persistent workspace peak before the admission callback.
+- Explicit byte `--vram-limit` enforced at engine load: native CUDA derives offload budget; non-offload backends fail at load if weights exceed limit. Derived budget = VRAM limit minus device KV/recurrent state, and must meet the largest lazy-weight node working set.
+- CUDA weight offload defaults to async mmap-backed page-in with fence-ordered copy into reusable pinned staging. Synchronous demand-copy path available via `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0`.
+
+Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-memory-authority-contract, copilot-committed-granule-admission, copilot-shared-device-authority, copilot-qmoe-workspace-stage0, copilot-vram-limit-load-enforcement, copilot-705-weight-offload-prefetch, copilot-mapped-growth-grant, copilot-ci-is-asynchronous, copilot-design-autonomy-and-parallel-work).

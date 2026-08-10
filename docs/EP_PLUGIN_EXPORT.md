@@ -30,15 +30,16 @@ These facts were verified personally by running the commands below on the branch
 | `GetEpDevices` finds `cpu_ep` | `ort_register_ep_library` passes |
 | Unsupported ops decline, not crash | `ort_unsupported_op_declines_not_crashes` passes |
 
-## PLANNED (not yet true)
+## CURRENT STATUS (as of 2026-08-10, commit `bad3682`)
 
 | Item | Status |
 |------|--------|
-| `conformance_two_sessions` (8th register/run cycle) | `#[ignore]` — dangling OrtEpDevice after ≥6 cycles (factory.rs bug, Nabil) |
-| CUDA EP | Blocked — no CUDA toolkit/GPU on this host; design is speculative |
-| nxrt-native Rust trait ABI for EP | Partially wired; not independently tested as a Rust trait surface |
+| `conformance_two_sessions` | ✅ **Passing** — was `#[ignore]`d due to test-assertion bug (fixed by Pris); `EpDevice_EpName` returns factory name `"cpu_ep"`, not registration key |
+| `stress_register_run_unregister_cycles` (25 cycles) | ✅ **Passing** — UAF fix verified; `DeviceType:-112` regression gone |
+| CUDA EP | ⛔ Blocked — no CUDA toolkit/GPU; design work (allocator/stream callbacks) also remains |
+| nxrt-native Rust trait ABI for EP | 🟡 Partially wired; not independently tested as a Rust trait surface |
 | `OrtCompiledModelCompatibilityInfo` | Returns `None`; deferred |
-| Holden security sign-off | Pending — 3 open findings from re-audit |
+| Holden security sign-off | ✅ **🟡 YELLOW — May ship** (2026-08-10T22:42Z) — all ship-blockers resolved; 2 LOW advisories recorded for post-merge |
 
 ---
 
@@ -314,11 +315,11 @@ resolved.
 
 | Gap | Impact | Owner | Status |
 |-----|--------|-------|--------|
-| `conformance_two_sessions` — OrtEpDevice corruption after ≥6 register/run cycles | Test `#[ignore]`d | Nabil (factory.rs) | Open bug |
+| `conformance_two_sessions` — previously `#[ignore]`d | ✅ **Fixed** — was test-assertion bug (Pris); UAF root-cause fixed by Deckard (`c92838d`); `stress_register_run_unregister_cycles` (25 cycles) passes | Closed |
 | Ops requiring non-trivial shape inference (Reshape, Gather, Concat) | `SameAsInput(0)` fallback may produce wrong shape | Nabil/Deckard | Incremental |
 | Multi-output ops (Split, TopK) | Only first output shaped correctly | Nabil/Deckard | Deferred |
 | Device (GPU) tensors | Requires allocator callback design | CUDA wave | Blocked — no GPU on this host |
-| Holden security re-audit — 3 open findings | Not ship-cleared | Deckard (N1), Nabil (M1) | Open |
+| Holden security re-audit | ✅ **🟡 YELLOW — May ship** (2026-08-10T22:42Z) | All resolved; 2 LOW post-merge advisories | Closed |
 
 ## 7. Milestone Plan
 

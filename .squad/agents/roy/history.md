@@ -92,3 +92,32 @@ Produced `docs/EP_PLUGIN_EXPORT.md`: architecture for exporting nxrt EPs as ORT 
 Large-model recon documented 27B runtime and GPU-capacity blockers; Granite unfused MoE does not engage offload.
 
 Full pre-compaction history in `history-archive.md`.
+### 2026-08-10T22:56Z — EP plugin PR doc accuracy sweep
+
+**Task:** Correct stale claims in `docs/EP_PLUGIN_EXPORT_PR.md` and related docs after all agents finished.
+
+**Validation I personally ran (commit `bad3682`, 2026-08-10T22:56Z):**
+
+- `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → `Finished dev profile in 1.59s` — zero errors, zero warnings.
+- `cargo test -p onnx-runtime-ep-plugin --lib` → `82 passed; 0 failed; 0 ignored` in 0.00s.
+- `cargo test -p onnx-runtime-ep-cpu-plugin` → `6 passed` (lib) + `15 passed` (integration) = **21 total, 0 failed, 0 ignored** in 0.73s. Full parallel run.
+- `cargo check --workspace` → `Finished dev profile in 0.26s` — clean.
+
+**Stale claims corrected in `docs/EP_PLUGIN_EXPORT_PR.md`:**
+
+1. Removed the "mutex poison cascade / 4-test parallel failure" section entirely — full suite now passes in parallel, zero ignored.
+2. `conformance_two_sessions` is no longer `#[ignore]`d and no longer fails — was a test-assertion bug (Pris fixed); stated plainly with root-cause.
+3. `stress_register_run_unregister_cycles` (25 cycles) now cited as the regression test for the UAF fix (Deckard, `c92838d`).
+4. Holden's verdict updated from 🔴 RED (pending) to 🟡 YELLOW — May ship (2026-08-10T22:42Z) with all N1/N2/N3/UAF findings resolved.
+5. Security table rewritten: all findings marked RESOLVED; two LOW post-merge advisories (NEW-1/NEW-2) recorded honestly.
+6. `validate_dims` safety fix called out as genuine safety fix (not cleanup) — was never called before Leon's commit `2fb7150`.
+7. f16/bf16 coverage gap (Pris) documented: `GetKernelRegistry` not wired, no fake test written.
+8. CUDA EP limitation: stated both halves — hardware blocked AND design work remaining.
+9. Process section updated: Leon (N1, N2), Isidore (N3), Deckard (UAF), Pris (two_sessions) all credited.
+10. Follow-ups list stripped of already-done items; only genuine open items remain (NEW-1/NEW-2 LOW, f16/bf16, CUDA design, §524 trait).
+
+**Also swept `docs/EP_PLUGIN_EXPORT.md`:**
+- "PLANNED (not yet true)" section replaced with "CURRENT STATUS" reflecting passing tests and YELLOW verdict.
+- Known-gaps table: `conformance_two_sessions` marked Closed; Holden sign-off marked Closed.
+
+**Durable lesson:** Pre-final docs written mid-work will always be stale. Always re-run validation commands at head and quote actual output — do not copy numbers from coordinator memo on faith.
