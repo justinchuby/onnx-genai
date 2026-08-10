@@ -1490,24 +1490,31 @@ impl KernelDispatchContext<'_> {
                             return Err(error.into());
                         }
                     };
-                    let allocation = match grant.as_mut() {
-                        Some(grant) => self.ep.allocate_with_mapped_growth(
+                    let (buffer, actual_mapped_bytes) = match grant.as_mut() {
+                        Some(grant) => match self.ep.allocate_with_mapped_growth(
                             required,
                             requirement.alignment,
                             grant,
-                        ),
-                        None => self.ep.allocate(required, requirement.alignment),
-                    };
-                    let buffer = match allocation {
-                        Ok(buffer) => buffer,
-                        Err(error) => {
-                            drop(grant);
-                            self.ep.release_mapped_growth(old_mapped, requirement.role);
-                            return Err(error.into());
-                        }
+                        ) {
+                            Ok(allocation) => {
+                                (allocation.allocation, allocation.newly_mapped_bytes)
+                            }
+                            Err(error) => {
+                                self.ep.release_mapped_growth(old_mapped, requirement.role);
+                                return Err(error.into());
+                            }
+                        },
+                        None => match self.ep.allocate(required, requirement.alignment) {
+                            Ok(allocation) => (allocation, old_mapped),
+                            Err(error) => {
+                                self.ep.release_mapped_growth(old_mapped, requirement.role);
+                                return Err(error.into());
+                            }
+                        },
                     };
                     let mapped_bytes = if let Some(grant) = grant {
-                        if let Err(error) = grant.commit() {
+                        let added_mapped = actual_mapped_bytes.saturating_sub(old_mapped);
+                        if let Err(error) = grant.commit_bytes(added_mapped) {
                             let _ = self.ep.deallocate(buffer);
                             self.ep.release_mapped_growth(old_mapped, requirement.role);
                             return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
@@ -1515,7 +1522,11 @@ impl KernelDispatchContext<'_> {
                             ))
                             .into());
                         }
-                        target_mapped
+                        self.ep.release_mapped_growth(
+                            old_mapped.saturating_sub(actual_mapped_bytes),
+                            requirement.role,
+                        );
+                        actual_mapped_bytes
                     } else {
                         old_mapped
                     };

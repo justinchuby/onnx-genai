@@ -48,6 +48,12 @@ pub struct AllocationCommitRange {
     pub bytes: usize,
 }
 
+#[derive(Debug)]
+pub struct MappedAllocation<T> {
+    pub allocation: T,
+    pub newly_mapped_bytes: u64,
+}
+
 /// Which physical device memory comes from.
 ///
 /// A `Tier` says *how far away* memory is; this says *which one*. Two CUDA
@@ -147,9 +153,16 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         align: usize,
         committed_ranges: &[std::ops::Range<usize>],
         capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<NonNull<u8>, MemoryError> {
+    ) -> Result<MappedAllocation<NonNull<u8>>, MemoryError> {
         let _ = capacity;
-        self.allocate_committed(bytes, align, committed_ranges)
+        let allocation = self.allocate_committed(bytes, align, committed_ranges)?;
+        let newly_mapped_bytes = committed_ranges.iter().fold(0_u64, |total, range| {
+            total.saturating_add(range.len() as u64)
+        });
+        Ok(MappedAllocation {
+            allocation,
+            newly_mapped_bytes,
+        })
     }
 
     /// Ensure `offset..offset + bytes` in an existing allocation is physically

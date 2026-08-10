@@ -72,7 +72,9 @@
 
 pub mod allocator;
 
-pub use allocator::{AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator};
+pub use allocator::{
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
+};
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

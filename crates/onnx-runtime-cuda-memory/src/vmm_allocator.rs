@@ -1266,7 +1266,7 @@ impl DeviceAllocator for CudaVmmAllocator {
         align: usize,
         committed_ranges: &[std::ops::Range<usize>],
         capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<NonNull<u8>, MemoryError> {
+    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
         let ptr = self.allocate_committed(bytes, align, &[])?;
         let ranges = committed_ranges
             .iter()
@@ -1278,13 +1278,19 @@ impl DeviceAllocator for CudaVmmAllocator {
                 bytes: range.len(),
             })
             .collect::<Vec<_>>();
-        if let Err(error) = self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
-            // SAFETY: this is the exact live allocation returned above and it
-            // has not escaped to the caller.
-            unsafe { self.deallocate(ptr, bytes, align) };
-            return Err(error);
-        }
-        Ok(ptr)
+        let commit = match self.commit_allocation_ranges_inner(&ranges, Some(capacity)) {
+            Ok(commit) => commit,
+            Err(error) => {
+                // SAFETY: this is the exact live allocation returned above and
+                // it has not escaped to the caller.
+                unsafe { self.deallocate(ptr, bytes, align) };
+                return Err(error);
+            }
+        };
+        Ok(onnx_runtime_memory_governor::MappedAllocation {
+            allocation: ptr,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+        })
     }
 
     fn commit_allocation_range(

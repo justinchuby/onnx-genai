@@ -783,12 +783,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         size: usize,
         alignment: usize,
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
-    ) -> Result<DeviceBuffer> {
+    ) -> Result<onnx_runtime_memory_governor::MappedAllocation<DeviceBuffer>> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
         let full = 0..size;
-        let ptr = self
+        let allocation = self
             .memory()
             .allocate_committed_with_capacity(
                 size,
@@ -798,8 +798,16 @@ impl ExecutionProvider for CudaExecutionProvider {
             )
             .map_err(EpError::Memory)?;
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(unsafe {
-            DeviceBuffer::from_raw_parts(ptr.as_ptr().cast(), self.device, size, alignment)
+        Ok(onnx_runtime_memory_governor::MappedAllocation {
+            allocation: unsafe {
+                DeviceBuffer::from_raw_parts(
+                    allocation.allocation.as_ptr().cast(),
+                    self.device,
+                    size,
+                    alignment,
+                )
+            },
+            newly_mapped_bytes: allocation.newly_mapped_bytes,
         })
     }
 

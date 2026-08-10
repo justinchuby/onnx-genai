@@ -165,22 +165,28 @@ impl Executor {
                 return Err(error.into());
             }
         };
-        let allocation = match grant.as_mut() {
-            Some(grant) => self
+        let (fresh, actual_mapped_bytes) = match grant.as_mut() {
+            Some(grant) => match self
                 .ep
-                .allocate_with_mapped_growth(bytes, peak.alignment, grant),
-            None => self.ep.allocate(bytes, peak.alignment),
-        };
-        let fresh = match allocation {
-            Ok(fresh) => fresh,
-            Err(error) => {
-                drop(grant);
-                self.ep.release_mapped_growth(old_mapped, peak.role);
-                return Err(error.into());
-            }
+                .allocate_with_mapped_growth(bytes, peak.alignment, grant)
+            {
+                Ok(allocation) => (allocation.allocation, allocation.newly_mapped_bytes),
+                Err(error) => {
+                    self.ep.release_mapped_growth(old_mapped, peak.role);
+                    return Err(error.into());
+                }
+            },
+            None => match self.ep.allocate(bytes, peak.alignment) {
+                Ok(allocation) => (allocation, old_mapped),
+                Err(error) => {
+                    self.ep.release_mapped_growth(old_mapped, peak.role);
+                    return Err(error.into());
+                }
+            },
         };
         let mapped_bytes = if let Some(grant) = grant {
-            if let Err(error) = grant.commit() {
+            let added_mapped = actual_mapped_bytes.saturating_sub(old_mapped);
+            if let Err(error) = grant.commit_bytes(added_mapped) {
                 let _ = self.ep.deallocate(fresh);
                 self.ep.release_mapped_growth(old_mapped, peak.role);
                 return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
@@ -188,7 +194,9 @@ impl Executor {
                 ))
                 .into());
             }
-            target_mapped
+            self.ep
+                .release_mapped_growth(old_mapped.saturating_sub(actual_mapped_bytes), peak.role);
+            actual_mapped_bytes
         } else {
             old_mapped
         };
