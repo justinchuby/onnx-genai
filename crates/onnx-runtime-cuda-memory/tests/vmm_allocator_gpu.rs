@@ -111,6 +111,47 @@ fn an_allocation_commits_a_granule_and_the_ledger_sees_it() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
+    let granule = 2_u64 << 20;
+    let (allocator, governor) = allocator(64 << 20, granule);
+    let requester = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::KvCache,
+            HolderId::new(22),
+        )
+        .expect("requester allowance");
+    let mut grant = governor
+        .prepare_mapped_growth(&requester, granule)
+        .expect("reserve exact physical headroom");
+    assert!(
+        governor
+            .reserve(Tier::Device, 1, MemoryRole::Activation, HolderId::new(23))
+            .is_err(),
+        "ordinary claims remain blocked by the live grant"
+    );
+    let full = 0..4096;
+    let pointer = allocator
+        .allocate_committed_with_capacity(
+            4096,
+            256,
+            std::slice::from_ref(&full),
+            grant.physical_capacity(),
+        )
+        .expect("allocator consumes grant-bound capacity");
+    assert_eq!(grant.physical_capacity().remaining_bytes(), 0);
+    grant.commit_bytes(granule).expect("mapped attribution");
+    assert_eq!(governor.used(Tier::Device), granule);
+    unsafe { allocator.deallocate(pointer, 4096, 256) };
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
 /// A partial commit is a real allocation claim, not just a map operation.
 ///
 /// KV reserves a large span and commits pieces later. If those late commits do

@@ -121,6 +121,10 @@ impl ServerMemoryAuthorities {
             .map_err(anyhow::Error::new)?;
         let mut ordered = authorities.values().cloned().collect::<Vec<_>>();
         ordered.sort_by_key(|authority| authority.domain().to_string());
+        let _mapped_growth = ordered
+            .iter()
+            .map(DeviceMemoryAuthority::pause_mapped_growth)
+            .collect::<Result<Vec<_>, _>>()?;
         let guards = ordered
             .iter()
             .map(DeviceMemoryAuthority::pause_reconfiguration)

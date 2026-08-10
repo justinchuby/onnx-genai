@@ -153,7 +153,7 @@ impl Executor {
         let old_mapped = slot.as_ref().map_or(0, |old| old.mapped_bytes);
         let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
         let growth = target_mapped.saturating_sub(old_mapped);
-        let grant = self.ep.prepare_mapped_growth(growth, peak.role)?;
+        let mut grant = self.ep.prepare_mapped_growth(growth, peak.role)?;
         if let Some(old) = slot.take() {
             self.ep.deallocate(old.buffer)?;
         }
@@ -165,7 +165,13 @@ impl Executor {
                 return Err(error.into());
             }
         };
-        let fresh = match self.ep.allocate(bytes, peak.alignment) {
+        let allocation = match grant.as_mut() {
+            Some(grant) => self
+                .ep
+                .allocate_with_mapped_growth(bytes, peak.alignment, grant),
+            None => self.ep.allocate(bytes, peak.alignment),
+        };
+        let fresh = match allocation {
             Ok(fresh) => fresh,
             Err(error) => {
                 drop(grant);

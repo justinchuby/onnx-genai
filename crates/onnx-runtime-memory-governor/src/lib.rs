@@ -74,9 +74,9 @@ pub mod allocator;
 
 pub use allocator::{AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator};
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 /// Stable identity of one physical-memory accounting authority.
 ///
@@ -497,28 +497,20 @@ impl LeaseLedger {
         &self,
         tier: Tier,
         bytes: u64,
-        role: MemoryRole,
+        _role: MemoryRole,
     ) -> Result<u64, MemoryError> {
         let _gate = self.claim_gate(tier);
         let index = tier.index();
-        let used = self.used[index].load(Ordering::Acquire);
-        let limit = self.limits[index].load(Ordering::Acquire);
         let current = self.mapped_growth_reserved[index].load(Ordering::Acquire);
-        let available = limit.saturating_sub(used.saturating_add(current));
-        let reserved = bytes.min(available);
-        self.mapped_growth_reserved[index]
-            .store(current.saturating_add(reserved), Ordering::Release);
-        if bytes > 0 && reserved == 0 && used < limit {
-            return Err(MemoryError::TierExhausted {
+        let reserved = current
+            .checked_add(bytes)
+            .ok_or(MemoryError::InvalidRequest {
                 tier: tier.name(),
                 requested: bytes,
-                used,
-                limit,
-                available,
-                role,
-            });
-        }
-        Ok(reserved)
+                reason: "mapped-growth reservation overflows its byte counter",
+            })?;
+        self.mapped_growth_reserved[index].store(reserved, Ordering::Release);
+        Ok(bytes)
     }
 
     fn release_mapped_growth(&self, tier: Tier, bytes: u64) {
@@ -528,6 +520,145 @@ impl LeaseLedger {
             Ordering::Acquire,
             |reserved| Some(reserved.saturating_sub(bytes)),
         );
+    }
+
+    fn consume_mapped_growth(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+    ) -> Result<(), MemoryError> {
+        let _gate = self.claim_gate(tier);
+        let index = tier.index();
+        let reserved = self.mapped_growth_reserved[index].load(Ordering::Acquire);
+        if bytes > reserved {
+            return Err(MemoryError::InvalidRequest {
+                tier: tier.name(),
+                requested: bytes,
+                reason: "mapped-growth capacity token overconsumed its authority reservation",
+            });
+        }
+        let used = self.used[index].load(Ordering::Acquire);
+        let next = used.checked_add(bytes).ok_or(MemoryError::InvalidRequest {
+            tier: tier.name(),
+            requested: bytes,
+            reason: "mapped-growth capacity conversion overflows tier usage",
+        })?;
+        let limit = self.limits[index].load(Ordering::Acquire);
+        if next.saturating_add(reserved - bytes) > limit {
+            return Err(MemoryError::TierExhausted {
+                tier: tier.name(),
+                requested: bytes,
+                used,
+                limit,
+                available: limit.saturating_sub(used.saturating_add(reserved)),
+                role,
+            });
+        }
+        self.mapped_growth_reserved[index].store(reserved - bytes, Ordering::Release);
+        self.used[index].store(next, Ordering::Release);
+        Ok(())
+    }
+
+    fn refund_mapped_growth(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+    ) -> Result<(), MemoryError> {
+        let _gate = self.claim_gate(tier);
+        let index = tier.index();
+        let used = self.used[index].load(Ordering::Acquire);
+        if bytes > used {
+            return Err(MemoryError::InvalidRequest {
+                tier: tier.name(),
+                requested: bytes,
+                reason: "mapped-growth capacity refund exceeds owned tier bytes",
+            });
+        }
+        let reserved = self.mapped_growth_reserved[index].load(Ordering::Acquire);
+        let next_reserved = reserved
+            .checked_add(bytes)
+            .ok_or(MemoryError::InvalidRequest {
+                tier: tier.name(),
+                requested: bytes,
+                reason: "mapped-growth capacity refund overflows the authority reservation",
+            })?;
+        let limit = self.limits[index].load(Ordering::Acquire);
+        if used - bytes + next_reserved > limit {
+            return Err(MemoryError::TierExhausted {
+                tier: tier.name(),
+                requested: bytes,
+                used,
+                limit,
+                available: limit.saturating_sub(used.saturating_add(reserved)),
+                role,
+            });
+        }
+        self.used[index].store(used - bytes, Ordering::Release);
+        self.mapped_growth_reserved[index].store(next_reserved, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Non-forgeable authority reservation consumed only by the allocator commit
+/// owned by a live [`MappedGrowthGrant`].
+#[derive(Debug)]
+pub struct MappedPhysicalCapacityToken {
+    ledger: Arc<LeaseLedger>,
+    tier: Tier,
+    role: MemoryRole,
+    remaining: u64,
+}
+
+impl MappedPhysicalCapacityToken {
+    pub fn remaining_bytes(&self) -> u64 {
+        self.remaining
+    }
+
+    fn consume(&mut self, bytes: u64) -> Result<(), MemoryError> {
+        if bytes > self.remaining {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: bytes,
+                reason: "mapped-growth capacity token cannot be consumed beyond its reservation",
+            });
+        }
+        self.ledger
+            .consume_mapped_growth(self.tier, bytes, self.role)?;
+        self.remaining -= bytes;
+        Ok(())
+    }
+
+    fn refund(&mut self, bytes: u64) -> Result<(), MemoryError> {
+        self.ledger
+            .refund_mapped_growth(self.tier, bytes, self.role)?;
+        self.remaining = self
+            .remaining
+            .checked_add(bytes)
+            .ok_or(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: bytes,
+                reason: "mapped-growth capacity token refund overflows remaining bytes",
+            })?;
+        Ok(())
+    }
+
+    fn authority(&self) -> MemoryAuthorityId {
+        self.ledger.authority_id
+    }
+
+    fn release_remaining(&mut self) {
+        if self.remaining > 0 {
+            self.ledger.release_mapped_growth(self.tier, self.remaining);
+            self.remaining = 0;
+        }
+    }
+}
+
+impl Drop for MappedPhysicalCapacityToken {
+    fn drop(&mut self) {
+        self.release_remaining();
     }
 }
 
@@ -541,12 +672,17 @@ pub struct MappedAllowance {
 struct MappedAllowanceInner {
     authority: MemoryAuthorityId,
     tier: Tier,
-    limit: AtomicU64,
-    mapped: AtomicU64,
-    growth_reserved: AtomicU64,
+    state: Mutex<MappedAllowanceState>,
     role: MemoryRole,
     holder: HolderId,
     accounting: Arc<dyn MappedAllowanceAccounting>,
+}
+
+#[derive(Debug)]
+struct MappedAllowanceState {
+    limit: u64,
+    mapped: u64,
+    growth_reserved: u64,
 }
 
 /// Releases mapped-capacity reservations created by a governor.
@@ -567,9 +703,11 @@ impl MappedAllowance {
             inner: Arc::new(MappedAllowanceInner {
                 authority,
                 tier,
-                limit: AtomicU64::new(limit),
-                mapped: AtomicU64::new(0),
-                growth_reserved: AtomicU64::new(0),
+                state: Mutex::new(MappedAllowanceState {
+                    limit,
+                    mapped: 0,
+                    growth_reserved: 0,
+                }),
                 role,
                 holder,
                 accounting,
@@ -582,68 +720,70 @@ impl MappedAllowance {
     }
 
     pub fn limit(&self) -> u64 {
-        self.inner.limit.load(Ordering::Acquire)
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .limit
     }
 
     pub fn mapped_bytes(&self) -> u64 {
-        self.inner.mapped.load(Ordering::Acquire)
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mapped
     }
 
     pub fn available(&self) -> u64 {
-        self.limit().saturating_sub(
-            self.mapped_bytes()
-                .saturating_add(self.inner.growth_reserved.load(Ordering::Acquire)),
-        )
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .limit
+            .saturating_sub(state.mapped.saturating_add(state.growth_reserved))
     }
 
     pub fn try_map(&self, bytes: u64) -> Result<(), MemoryError> {
-        let mut mapped = self.inner.mapped.load(Ordering::Acquire);
-        loop {
-            let Some(next) = mapped.checked_add(bytes) else {
-                return Err(MemoryError::InvalidRequest {
-                    tier: self.inner.tier.name(),
-                    requested: bytes,
-                    reason: "mapped-byte attribution overflows its byte counter",
-                });
-            };
-            let limit = self.limit();
-            let reserved = self.inner.growth_reserved.load(Ordering::Acquire);
-            if next.saturating_add(reserved) > limit {
-                return Err(MemoryError::TierExhausted {
-                    tier: self.inner.tier.name(),
-                    requested: bytes,
-                    used: mapped,
-                    limit,
-                    available: limit.saturating_sub(mapped.saturating_add(reserved)),
-                    role: self.inner.role,
-                });
-            }
-            match self.inner.mapped.compare_exchange_weak(
-                mapped,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => mapped = observed,
-            }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(next) = state.mapped.checked_add(bytes) else {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                reason: "mapped-byte attribution overflows its byte counter",
+            });
+        };
+        if next.saturating_add(state.growth_reserved) > state.limit {
+            return Err(MemoryError::TierExhausted {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                used: state.mapped,
+                limit: state.limit,
+                available: state
+                    .limit
+                    .saturating_sub(state.mapped.saturating_add(state.growth_reserved)),
+                role: self.inner.role,
+            });
         }
+        state.mapped = next;
+        Ok(())
     }
 
     pub fn unmap(&self, bytes: u64) -> u64 {
-        let mut mapped = self.inner.mapped.load(Ordering::Acquire);
-        loop {
-            let returned = bytes.min(mapped);
-            match self.inner.mapped.compare_exchange_weak(
-                mapped,
-                mapped - returned,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return returned,
-                Err(observed) => mapped = observed,
-            }
-        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let returned = bytes.min(state.mapped);
+        state.mapped -= returned;
+        returned
     }
 
     pub fn holder(&self) -> HolderId {
@@ -655,97 +795,112 @@ impl MappedAllowance {
     }
 
     fn reserve_growth(&self, bytes: u64) -> Result<(), MemoryError> {
-        let mut reserved = self.inner.growth_reserved.load(Ordering::Acquire);
-        loop {
-            let mapped = self.mapped_bytes();
-            let limit = self.limit();
-            let Some(next) = reserved.checked_add(bytes) else {
-                return Err(MemoryError::InvalidRequest {
-                    tier: self.inner.tier.name(),
-                    requested: bytes,
-                    reason: "mapped growth reservation overflows its byte counter",
-                });
-            };
-            if mapped.saturating_add(next) > limit {
-                return Err(MemoryError::TierExhausted {
-                    tier: self.inner.tier.name(),
-                    requested: bytes,
-                    used: mapped.saturating_add(reserved),
-                    limit,
-                    available: limit.saturating_sub(mapped.saturating_add(reserved)),
-                    role: self.inner.role,
-                });
-            }
-            match self.inner.growth_reserved.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => reserved = observed,
-            }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(next) = state.growth_reserved.checked_add(bytes) else {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                reason: "mapped growth reservation overflows its byte counter",
+            });
+        };
+        if state.mapped.saturating_add(next) > state.limit {
+            return Err(MemoryError::TierExhausted {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                used: state.mapped.saturating_add(state.growth_reserved),
+                limit: state.limit,
+                available: state
+                    .limit
+                    .saturating_sub(state.mapped.saturating_add(state.growth_reserved)),
+                role: self.inner.role,
+            });
         }
+        state.growth_reserved = next;
+        Ok(())
     }
 
     fn release_growth(&self, bytes: u64) {
-        let _ = self.inner.growth_reserved.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |reserved| Some(reserved.saturating_sub(bytes)),
-        );
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.growth_reserved = state.growth_reserved.saturating_sub(bytes);
     }
 
     fn add_limit_transferred(&self, bytes: u64) -> Result<(), MemoryError> {
-        self.inner
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.limit = state
             .limit
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |limit| {
-                limit.checked_add(bytes)
-            })
-            .map(|_| ())
-            .map_err(|_| MemoryError::InvalidRequest {
+            .checked_add(bytes)
+            .ok_or(MemoryError::InvalidRequest {
                 tier: self.inner.tier.name(),
                 requested: bytes,
                 reason: "mapped allowance transfer overflows the requester limit",
-            })
+            })?;
+        Ok(())
     }
 
     fn subtract_limit_transferred(&self, bytes: u64) -> Result<(), MemoryError> {
-        self.inner
-            .limit
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |limit| {
-                (bytes <= limit).then_some(limit - bytes)
-            })
-            .map(|_| ())
-            .map_err(|_| MemoryError::InvalidRequest {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if bytes > state.limit {
+            return Err(MemoryError::InvalidRequest {
                 tier: self.inner.tier.name(),
                 requested: bytes,
                 reason: "mapped allowance transfer exceeds the victim limit",
-            })
+            });
+        }
+        state.limit -= bytes;
+        Ok(())
     }
 
     fn map_reserved(&self, bytes: u64) -> Result<(), MemoryError> {
-        let reserved = self.inner.growth_reserved.load(Ordering::Acquire);
-        if bytes > reserved {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if bytes > state.growth_reserved {
             return Err(MemoryError::InvalidRequest {
                 tier: self.inner.tier.name(),
                 requested: bytes,
                 reason: "mapped growth commit exceeds its live reservation",
             });
         }
-        self.release_growth(bytes);
-        if let Err(error) = self.try_map(bytes) {
-            let _ = self.reserve_growth(bytes);
-            return Err(error);
-        }
+        state.growth_reserved -= bytes;
+        state.mapped = state
+            .mapped
+            .checked_add(bytes)
+            .ok_or(MemoryError::InvalidRequest {
+                tier: self.inner.tier.name(),
+                requested: bytes,
+                reason: "mapped growth commit overflows mapped attribution",
+            })?;
         Ok(())
     }
 }
 
 impl Drop for MappedAllowanceInner {
     fn drop(&mut self) {
-        self.accounting
-            .release(self.tier, self.limit.load(Ordering::Acquire));
+        self.accounting.release(
+            self.tier,
+            self.state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .limit,
+        );
     }
 }
 
@@ -796,11 +951,19 @@ struct RegisteredMappedHolder {
 
 struct MappedGrowthAuthorityInner {
     ledger: Arc<LeaseLedger>,
-    active: AtomicBool,
+    operations: Mutex<MappedOperationQueue>,
+    operation_ready: Condvar,
+    next_operation: AtomicU64,
     next_registration: AtomicU64,
     holders: Mutex<BTreeMap<u64, RegisteredMappedHolder>>,
     allowances: Mutex<Vec<Weak<MappedAllowanceInner>>>,
     counters: MappedGrowthCounters,
+}
+
+#[derive(Default)]
+struct MappedOperationQueue {
+    active: bool,
+    waiters: VecDeque<u64>,
 }
 
 /// Authority-owned mapped-growth transaction coordinator.
@@ -824,7 +987,9 @@ impl MappedGrowthAuthority {
         Self {
             inner: Arc::new(MappedGrowthAuthorityInner {
                 ledger,
-                active: AtomicBool::new(false),
+                operations: Mutex::new(MappedOperationQueue::default()),
+                operation_ready: Condvar::new(),
+                next_operation: AtomicU64::new(1),
                 next_registration: AtomicU64::new(1),
                 holders: Mutex::new(BTreeMap::new()),
                 allowances: Mutex::new(Vec::new()),
@@ -870,6 +1035,36 @@ impl MappedGrowthAuthority {
             .push(Arc::downgrade(&allowance.inner));
     }
 
+    fn acquire_operation(&self) -> MappedGrowthOperationGuard {
+        let ticket = self.inner.next_operation.fetch_add(1, Ordering::Relaxed);
+        let mut waiter = MappedOperationWaiter {
+            authority: Arc::clone(&self.inner),
+            ticket,
+            acquired: false,
+        };
+        let mut queue = self
+            .inner
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.waiters.push_back(ticket);
+        loop {
+            if !queue.active && queue.waiters.front() == Some(&ticket) {
+                queue.waiters.pop_front();
+                queue.active = true;
+                waiter.acquired = true;
+                return MappedGrowthOperationGuard {
+                    authority: Arc::clone(&self.inner),
+                };
+            }
+            queue = self
+                .inner
+                .operation_ready
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
     pub fn prepare_mapped_growth(
         &self,
         requester: &MappedAllowance,
@@ -884,19 +1079,7 @@ impl MappedGrowthAuthority {
                 reason: "mapped growth requester belongs to a different memory authority",
             });
         }
-        if self
-            .inner
-            .active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.inner.counters.failures.fetch_add(1, Ordering::Relaxed);
-            return Err(MemoryError::InvalidRequest {
-                tier: Tier::Device.name(),
-                requested: bytes,
-                reason: "another mapped-growth transaction or authority reconfiguration is active",
-            });
-        }
+        let operation = self.acquire_operation();
 
         let physical_reserved =
             match self
@@ -906,7 +1089,6 @@ impl MappedGrowthAuthority {
             {
                 Ok(reserved) => reserved,
                 Err(error) => {
-                    self.inner.active.store(false, Ordering::Release);
                     self.inner.counters.failures.fetch_add(1, Ordering::Relaxed);
                     return Err(error);
                 }
@@ -916,9 +1098,15 @@ impl MappedGrowthAuthority {
             authority: Arc::clone(&self.inner),
             requester: requester.clone(),
             requested_bytes: bytes,
-            physical_reserved,
+            physical_capacity: MappedPhysicalCapacityToken {
+                ledger: Arc::clone(&self.inner.ledger),
+                tier: Tier::Device,
+                role: requester.role(),
+                remaining: physical_reserved,
+            },
             transferred_bytes: 0,
             victims: Vec::new(),
+            operation: Some(operation),
             active: true,
         };
 
@@ -1045,8 +1233,16 @@ impl MappedGrowthAuthority {
         let mut weight_mapped = 0_u64;
         let mut kv_mapped = 0_u64;
         let mut workspace_mapped = 0_u64;
+        let mut mapped_bytes = 0_u64;
+        let mut total_allowance_bytes = 0_u64;
         for allowance in &live_allowances {
-            let mapped = allowance.mapped.load(Ordering::Acquire);
+            let state = allowance
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mapped = state.mapped;
+            mapped_bytes = mapped_bytes.saturating_add(mapped);
+            total_allowance_bytes = total_allowance_bytes.saturating_add(state.limit);
             match allowance.role {
                 MemoryRole::Weights => weight_mapped = weight_mapped.saturating_add(mapped),
                 MemoryRole::KvCache => kv_mapped = kv_mapped.saturating_add(mapped),
@@ -1066,14 +1262,8 @@ impl MappedGrowthAuthority {
             failures: self.inner.counters.failures.load(Ordering::Relaxed),
             rollbacks: self.inner.counters.rollbacks.load(Ordering::Relaxed),
             live_holders: live.len() as u64,
-            mapped_bytes: live_allowances
-                .iter()
-                .map(|allowance| allowance.mapped.load(Ordering::Acquire))
-                .sum(),
-            total_allowance_bytes: live_allowances
-                .iter()
-                .map(|allowance| allowance.limit.load(Ordering::Acquire))
-                .sum(),
+            mapped_bytes,
+            total_allowance_bytes,
             weight_mapped,
             kv_mapped,
             workspace_mapped,
@@ -1082,17 +1272,34 @@ impl MappedGrowthAuthority {
     }
 
     pub fn pause_transactions(&self) -> Result<MappedGrowthOperationGuard, MemoryError> {
-        self.inner
-            .active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| MemoryError::InvalidRequest {
-                tier: Tier::Device.name(),
-                requested: 0,
-                reason: "a mapped-growth transaction or authority reconfiguration is active",
-            })?;
-        Ok(MappedGrowthOperationGuard {
-            authority: Arc::clone(&self.inner),
-        })
+        Ok(self.acquire_operation())
+    }
+}
+
+struct MappedOperationWaiter {
+    authority: Arc<MappedGrowthAuthorityInner>,
+    ticket: u64,
+    acquired: bool,
+}
+
+impl Drop for MappedOperationWaiter {
+    fn drop(&mut self) {
+        if self.acquired {
+            return;
+        }
+        let mut queue = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = queue
+            .waiters
+            .iter()
+            .position(|ticket| *ticket == self.ticket)
+        {
+            queue.waiters.remove(index);
+            self.authority.operation_ready.notify_all();
+        }
     }
 }
 
@@ -1102,7 +1309,13 @@ pub struct MappedGrowthOperationGuard {
 
 impl Drop for MappedGrowthOperationGuard {
     fn drop(&mut self) {
-        self.authority.active.store(false, Ordering::Release);
+        let mut queue = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.active = false;
+        self.authority.operation_ready.notify_all();
     }
 }
 
@@ -1128,9 +1341,10 @@ pub struct MappedGrowthGrant {
     authority: Arc<MappedGrowthAuthorityInner>,
     requester: MappedAllowance,
     requested_bytes: u64,
-    physical_reserved: u64,
+    physical_capacity: MappedPhysicalCapacityToken,
     transferred_bytes: u64,
     victims: Vec<(MappedAllowance, u64)>,
+    operation: Option<MappedGrowthOperationGuard>,
     active: bool,
 }
 
@@ -1143,6 +1357,10 @@ impl MappedGrowthGrant {
         self.transferred_bytes
     }
 
+    pub fn physical_capacity(&mut self) -> &mut MappedPhysicalCapacityToken {
+        &mut self.physical_capacity
+    }
+
     /// Commit the grant into the requester's mapped attribution.
     pub fn commit(self) -> Result<(), MemoryError> {
         let requested = self.requested_bytes;
@@ -1152,10 +1370,7 @@ impl MappedGrowthGrant {
     pub fn commit_bytes(mut self, actual_mapped_bytes: u64) -> Result<(), MemoryError> {
         self.reduce_to_actual(actual_mapped_bytes)?;
         self.requester.map_reserved(actual_mapped_bytes)?;
-        self.authority
-            .ledger
-            .release_mapped_growth(Tier::Device, self.physical_reserved);
-        self.physical_reserved = 0;
+        self.physical_capacity.release_remaining();
         self.authority
             .counters
             .bytes_transferred
@@ -1181,10 +1396,7 @@ impl MappedGrowthGrant {
         let actual = commit()?;
         self.reduce_to_actual(actual)?;
         self.requester.map_reserved(actual)?;
-        self.authority
-            .ledger
-            .release_mapped_growth(Tier::Device, self.physical_reserved);
-        self.physical_reserved = 0;
+        self.physical_capacity.release_remaining();
         self.authority
             .counters
             .bytes_transferred
@@ -1234,10 +1446,7 @@ impl MappedGrowthGrant {
         for (victim, bytes) in self.victims.drain(..).rev() {
             let _ = victim.add_limit_transferred(bytes);
         }
-        self.authority
-            .ledger
-            .release_mapped_growth(Tier::Device, self.physical_reserved);
-        self.physical_reserved = 0;
+        self.physical_capacity.release_remaining();
         self.authority
             .counters
             .rollbacks
@@ -1252,7 +1461,7 @@ impl MappedGrowthGrant {
     fn finish(&mut self) {
         if self.active {
             self.active = false;
-            self.authority.active.store(false, Ordering::Release);
+            self.operation.take();
         }
     }
 }
@@ -1303,6 +1512,10 @@ impl LeaseLimitGuard<'_> {
 /// it: growing in place is what lets a lease expand at a tier that is merely
 /// full rather than over-subscribed.
 pub trait LeaseAccounting: Send + Sync + std::fmt::Debug {
+    fn authority_id(&self) -> Option<MemoryAuthorityId> {
+        None
+    }
+
     /// Charge `bytes` on `tier` for `role`, or fail without changing anything.
     fn try_claim(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError>;
 
@@ -1311,6 +1524,9 @@ pub trait LeaseAccounting: Send + Sync + std::fmt::Debug {
 }
 
 impl LeaseAccounting for LeaseLedger {
+    fn authority_id(&self) -> Option<MemoryAuthorityId> {
+        Some(self.authority_id)
+    }
     fn try_claim(&self, tier: Tier, bytes: u64, role: MemoryRole) -> Result<(), MemoryError> {
         LeaseLedger::try_claim(self, tier, bytes, role)
     }
@@ -1436,6 +1652,49 @@ impl MemoryLease {
         self.accounting.try_claim(self.tier, extra, self.role)?;
         self.bytes = self.bytes.saturating_add(extra);
         Ok(())
+    }
+
+    pub fn grow_from_mapped_capacity(
+        &mut self,
+        token: &mut MappedPhysicalCapacityToken,
+        extra: u64,
+    ) -> Result<(), MemoryError> {
+        if self.tier != token.tier || self.accounting.authority_id() != Some(token.authority()) {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: extra,
+                reason: "mapped-growth capacity token belongs to a different lease authority",
+            });
+        }
+        let next = self
+            .bytes
+            .checked_add(extra)
+            .ok_or(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: extra,
+                reason: "mapped-growth lease conversion overflows lease bytes",
+            })?;
+        token.consume(extra)?;
+        self.bytes = next;
+        Ok(())
+    }
+
+    pub fn shrink_to_mapped_capacity(
+        &mut self,
+        token: &mut MappedPhysicalCapacityToken,
+        bytes: u64,
+    ) -> Result<u64, MemoryError> {
+        if self.tier != token.tier || self.accounting.authority_id() != Some(token.authority()) {
+            return Err(MemoryError::InvalidRequest {
+                tier: self.tier.name(),
+                requested: bytes,
+                reason: "mapped-growth capacity token belongs to a different lease authority",
+            });
+        }
+        let returned = bytes.min(self.bytes);
+        token.refund(returned)?;
+        self.bytes -= returned;
+        Ok(returned)
     }
 
     /// Give back `bytes`, keeping the rest of the lease.
@@ -1912,6 +2171,172 @@ mod tests {
         drop(grant);
         assert_eq!(governor.available(Tier::Device), 60);
         requester.try_map(1).expect("rollback restores page-in");
+    }
+
+    #[test]
+    fn grant_capacity_converts_exact_headroom_without_rechecking_it() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let _standing = governor
+            .reserve(Tier::Device, 80, MemoryRole::Weights, HolderId::new(1))
+            .expect("standing bytes");
+        let requester = mapped_allowance(&governor, 20, MemoryRole::KvCache, 2);
+        let mut grant = governor
+            .prepare_mapped_growth(&requester, 20)
+            .expect("reserve exact free headroom");
+        assert!(
+            governor
+                .reserve(Tier::Device, 1, MemoryRole::Activation, HolderId::new(3))
+                .is_err(),
+            "ordinary claims cannot consume grant capacity"
+        );
+        let mut allocator_lease = governor
+            .reserve(
+                Tier::Device,
+                0,
+                MemoryRole::Workspace { step_scoped: false },
+                HolderId::new(4),
+            )
+            .expect("allocator lease");
+        allocator_lease
+            .grow_from_mapped_capacity(grant.physical_capacity(), 20)
+            .expect("grant-bound claim bypasses its own reservation exactly once");
+        assert_eq!(allocator_lease.bytes(), 20);
+        assert_eq!(grant.physical_capacity().remaining_bytes(), 0);
+        assert!(
+            allocator_lease
+                .grow_from_mapped_capacity(grant.physical_capacity(), 1)
+                .is_err(),
+            "capacity token cannot overconsume"
+        );
+        allocator_lease
+            .shrink_to_mapped_capacity(grant.physical_capacity(), 20)
+            .expect("failed allocator creation restores the grant reservation");
+        assert_eq!(grant.physical_capacity().remaining_bytes(), 20);
+        assert!(
+            governor
+                .reserve(Tier::Device, 1, MemoryRole::Activation, HolderId::new(3))
+                .is_err(),
+            "refunded token capacity remains unavailable to ordinary claims"
+        );
+        allocator_lease
+            .grow_from_mapped_capacity(grant.physical_capacity(), 20)
+            .expect("refunded capacity remains consumable by its grant");
+        grant.commit().expect("mapped attribution");
+        assert_eq!(governor.used(Tier::Device), 100);
+    }
+
+    #[test]
+    fn grant_reserves_future_reclaimed_capacity_before_it_is_free() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let mut standing = governor
+            .reserve(Tier::Device, 100, MemoryRole::Weights, HolderId::new(1))
+            .expect("full standing ownership");
+        let victim = Arc::new(TestMappedHolder::new(
+            mapped_allowance(&governor, 80, MemoryRole::Weights, 1),
+            0,
+            0,
+            0,
+        ));
+        let requester = mapped_allowance(&governor, 20, MemoryRole::KvCache, 2);
+        requester.try_map(20).expect("requester allowance full");
+        let holder: Arc<dyn ReclaimableMappedHolder> = victim;
+        let _registration = governor
+            .register_reclaimable_mapped_holder(&holder)
+            .expect("register victim");
+        let mut grant = governor
+            .prepare_mapped_growth(&requester, 20)
+            .expect("reserve capacity that the victim will make available");
+
+        assert!(
+            governor
+                .reserve(Tier::Device, 1, MemoryRole::Activation, HolderId::new(3))
+                .is_err(),
+            "ordinary claims cannot steal capacity promised by a live grant"
+        );
+        standing.shrink(20);
+        let mut allocator_lease = governor
+            .reserve(
+                Tier::Device,
+                0,
+                MemoryRole::Workspace { step_scoped: false },
+                HolderId::new(4),
+            )
+            .expect("allocator lease");
+        allocator_lease
+            .grow_from_mapped_capacity(grant.physical_capacity(), 20)
+            .expect("the grant consumes capacity after reclaim makes it physical");
+        grant.commit().expect("commit mapped attribution");
+        assert_eq!(governor.used(Tier::Device), 100);
+    }
+
+    #[test]
+    fn concurrent_mapped_growth_waits_in_fifo_order() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let first_requester = mapped_allowance(&governor, 20, MemoryRole::KvCache, 1);
+        let second_requester = mapped_allowance(
+            &governor,
+            20,
+            MemoryRole::Workspace { step_scoped: false },
+            2,
+        );
+        let first = governor
+            .prepare_mapped_growth(&first_requester, 20)
+            .expect("first grant");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let second_governor = governor.clone();
+        let second_thread = thread::spawn(move || {
+            let grant = second_governor
+                .prepare_mapped_growth(&second_requester, 20)
+                .expect("queued grant");
+            acquired_tx.send(2).expect("report acquisition");
+            grant.commit().expect("second commit");
+        });
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "overlapping grant must wait rather than fail or bypass the first"
+        );
+        first.commit().expect("first commit");
+        assert_eq!(
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second grant eventually acquires"),
+            2
+        );
+        second_thread.join().expect("second thread");
+    }
+
+    #[test]
+    fn reserved_to_mapped_transition_never_exposes_capacity() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        for _ in 0..256 {
+            let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+            let requester = mapped_allowance(&governor, 100, MemoryRole::KvCache, 1);
+            requester.try_map(80).expect("initial mapping");
+            let grant = governor
+                .prepare_mapped_growth(&requester, 20)
+                .expect("growth reservation");
+            let barrier = Arc::new(Barrier::new(2));
+            let competitor = requester.clone();
+            let competitor_barrier = Arc::clone(&barrier);
+            let thread = thread::spawn(move || {
+                competitor_barrier.wait();
+                competitor.try_map(1)
+            });
+            barrier.wait();
+            grant
+                .commit()
+                .expect("atomic reserved-to-mapped transition");
+            assert!(
+                thread.join().expect("competitor").is_err(),
+                "try_map must observe either the reservation or committed mapping"
+            );
+        }
     }
 
     #[test]

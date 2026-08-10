@@ -232,6 +232,9 @@ pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceOffloadPolicy {
     pub enabled: bool,
+    /// An explicit device byte limit selected authority-managed VMM allocation
+    /// instead of the WDDM-spill-compatible allocator.
+    pub managed_no_spill: bool,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
     pub device_budget_bytes: Option<u64>,
     /// Use the asynchronous, fence-ordered page-in (default `true` / opt-out).
@@ -250,6 +253,7 @@ impl Default for DeviceOffloadPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
+            managed_no_spill: false,
             device_budget_bytes: None,
             async_pagein: false,
             scan_resistant_dense: true,
@@ -278,6 +282,7 @@ impl DeviceOffloadPolicy {
         );
         Self {
             enabled,
+            managed_no_spill: false,
             device_budget_bytes,
             async_pagein,
             scan_resistant_dense,

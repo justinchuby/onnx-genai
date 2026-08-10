@@ -46,7 +46,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use cudarc::driver::sys as cu;
 use onnx_runtime_memory_governor::{
-    HolderId, MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    HolderId, MappedPhysicalCapacityToken, MemoryAuthorityId, MemoryError, MemoryGovernor,
+    MemoryLease, MemoryRole, Tier,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking, VirtualMemoryError};
 
@@ -102,6 +103,21 @@ impl CudaVirtualBacking {
         offsets: &[usize],
         max_additional_owned_bytes: u64,
     ) -> Result<u64, VirtualMemoryError> {
+        self.commit_offsets_with_owned_limit_and_capacity(
+            reservation,
+            offsets,
+            max_additional_owned_bytes,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_offsets_with_owned_limit_and_capacity(
+        &self,
+        reservation: &mut CudaReservation,
+        offsets: &[usize],
+        max_additional_owned_bytes: u64,
+        mut capacity: Option<&mut MappedPhysicalCapacityToken>,
+    ) -> Result<u64, VirtualMemoryError> {
         self.bind("committing CUDA memory")?;
         if let Some(pool) = &self.pool {
             let granularity = pool.granularity;
@@ -110,15 +126,16 @@ impl CudaVirtualBacking {
             let mut additional_owned = 0_u64;
             for _ in 0..count {
                 let remaining = max_additional_owned_bytes.saturating_sub(additional_owned);
-                let (checkout, created_bytes) = match pool.acquire_with_owned_limit(remaining) {
-                    Ok(acquired) => acquired,
-                    Err(error) => {
-                        for checkout in checkouts.drain(..) {
-                            pool.rollback_checkout(checkout, false);
+                let (checkout, created_bytes) =
+                    match pool.acquire_with_owned_limit(remaining, capacity.as_deref_mut()) {
+                        Ok(acquired) => acquired,
+                        Err(error) => {
+                            for checkout in checkouts.drain(..) {
+                                pool.rollback_checkout(checkout, false);
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
-                    }
-                };
+                    };
                 checkouts.push(checkout);
                 additional_owned = additional_owned.saturating_add(created_bytes);
             }
@@ -526,6 +543,7 @@ impl PhysicalHandlePool {
     fn acquire_with_owned_limit(
         &self,
         max_additional_owned_bytes: u64,
+        mut capacity: Option<&mut MappedPhysicalCapacityToken>,
     ) -> Result<(CheckedOutHandle, u64), VirtualMemoryError> {
         let operation = self
             .authority_gate
@@ -588,13 +606,15 @@ impl PhysicalHandlePool {
                 code: 0,
             })?
         };
-        let growth = lease
-            .grow(self.granularity as u64)
-            .map_err(|error| VirtualMemoryError::Os {
-                operation: "growing physical handle pool lease",
-                reason: error.to_string(),
-                code: 0,
-            });
+        let growth = match capacity.as_deref_mut() {
+            Some(capacity) => lease.grow_from_mapped_capacity(capacity, self.granularity as u64),
+            None => lease.grow(self.granularity as u64),
+        }
+        .map_err(|error| VirtualMemoryError::Os {
+            operation: "growing physical handle pool lease",
+            reason: error.to_string(),
+            code: 0,
+        });
         {
             let mut state = self.lock();
             let pending = std::mem::take(&mut state.pending_lease_shrink);
@@ -609,14 +629,14 @@ impl PhysicalHandlePool {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Err(error) = self.bind("creating pooled CUDA physical memory") {
-            self.shrink_lease_or_defer(self.granularity as u64);
+            self.refund_lease_growth(capacity, self.granularity as u64);
             return Err(error);
         }
         let prop = allocation_prop(self.device_ordinal);
         let mut handle: cu::CUmemGenericAllocationHandle = 0;
         let result = unsafe { cu::cuMemCreate(&mut handle, self.granularity, &prop, 0) };
         if let Err(error) = CudaVirtualBacking::check("cuMemCreate", result) {
-            self.shrink_lease_or_defer(self.granularity as u64);
+            self.refund_lease_growth(capacity, self.granularity as u64);
             return Err(error);
         }
         self.counters.creates.fetch_add(1, Ordering::Relaxed);
@@ -666,6 +686,24 @@ impl PhysicalHandlePool {
     fn shrink_lease_or_defer(&self, bytes: u64) {
         let mut state = self.lock();
         if let Some(lease) = state.lease.as_mut() {
+            lease.shrink(bytes);
+        } else {
+            state.pending_lease_shrink = state.pending_lease_shrink.saturating_add(bytes);
+        }
+    }
+
+    fn refund_lease_growth(
+        &self,
+        capacity: Option<&mut onnx_runtime_memory_governor::MappedPhysicalCapacityToken>,
+        bytes: u64,
+    ) {
+        let mut state = self.lock();
+        if let Some(lease) = state.lease.as_mut() {
+            if let Some(capacity) = capacity
+                && lease.shrink_to_mapped_capacity(capacity, bytes).is_ok()
+            {
+                return;
+            }
             lease.shrink(bytes);
         } else {
             state.pending_lease_shrink = state.pending_lease_shrink.saturating_add(bytes);

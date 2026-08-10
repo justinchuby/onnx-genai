@@ -486,6 +486,16 @@ pub trait ExecutionProvider: Send + Sync {
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;
 
+    fn allocate_with_mapped_growth(
+        &self,
+        size: usize,
+        alignment: usize,
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<DeviceBuffer> {
+        let _ = grant;
+        self.allocate(size, alignment)
+    }
+
     /// Allocate device address space while committing only selected byte ranges.
     ///
     /// Providers whose allocator cannot reserve without committing should use
@@ -521,6 +531,15 @@ pub trait ExecutionProvider: Send + Sync {
             self.commit_allocation_range(buffer, offset, bytes)?;
         }
         Ok(())
+    }
+
+    fn commit_allocation_ranges_with_mapped_growth(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<()> {
+        let _ = grant;
+        self.commit_allocation_ranges(ranges)
     }
 
     fn mapped_bytes_for_allocation_ranges(

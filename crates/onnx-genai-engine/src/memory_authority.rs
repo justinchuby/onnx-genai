@@ -78,6 +78,12 @@ impl DeviceMemoryAuthority {
         self.governor.ledger().pause_claims(Tier::Device)
     }
 
+    pub fn pause_mapped_growth(
+        &self,
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthOperationGuard, MemoryError> {
+        self.governor.pause_mapped_growth()
+    }
+
     pub fn trim_unmapped_bytes(&self, bytes: u64) -> anyhow::Result<u64> {
         #[cfg(feature = "cuda")]
         {

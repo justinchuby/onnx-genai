@@ -37,7 +37,7 @@
 use std::fmt::Debug;
 use std::ptr::NonNull;
 
-use crate::{MemoryError, Tier};
+use crate::{MappedPhysicalCapacityToken, MemoryError, Tier};
 
 #[derive(Clone, Copy, Debug)]
 pub struct AllocationCommitRange {
@@ -141,6 +141,17 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         self.allocate(bytes, align)
     }
 
+    fn allocate_committed_with_capacity(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<NonNull<u8>, MemoryError> {
+        let _ = capacity;
+        self.allocate_committed(bytes, align, committed_ranges)
+    }
+
     /// Ensure `offset..offset + bytes` in an existing allocation is physically
     /// backed.
     ///
@@ -178,6 +189,15 @@ pub trait DeviceAllocator: Send + Sync + Debug {
             )?;
         }
         Ok(())
+    }
+
+    fn commit_allocation_ranges_with_capacity(
+        &self,
+        ranges: &[AllocationCommitRange],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<(), MemoryError> {
+        let _ = capacity;
+        self.commit_allocation_ranges(ranges)
     }
 
     /// Mapped attribution bytes represented by a batched set of ranges.

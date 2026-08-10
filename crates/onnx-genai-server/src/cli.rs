@@ -121,6 +121,12 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         kv_cache_dtype: args.kv_cache_dtype,
         #[cfg(feature = "native-backend")]
         native_device: args.native_device.clone(),
+        #[cfg(feature = "native-backend")]
+        decode_backend: if args.native_device.is_some() {
+            onnx_genai_engine::EngineDecodeBackend::Native
+        } else {
+            onnx_genai_engine::EngineDecodeBackend::default()
+        },
         ..Default::default()
     };
     if let Some(vram_limit) = args.vram_limit {
@@ -215,6 +221,19 @@ mod tests {
                 .limits
                 .vram_limit,
             ResourceLimit::Auto
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn explicit_native_device_selects_native_decode() {
+        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--native-device", "cpu"]);
+
+        assert_eq!(
+            server_config_from_args(&cli.serve)
+                .engine_config
+                .decode_backend,
+            onnx_genai_engine::EngineDecodeBackend::Native
         );
     }
 }

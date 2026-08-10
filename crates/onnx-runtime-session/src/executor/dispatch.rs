@@ -1475,7 +1475,7 @@ impl KernelDispatchContext<'_> {
                         .ep
                         .mapped_bytes_for_allocation(required, requirement.alignment)?;
                     let growth = target_mapped.saturating_sub(old_mapped);
-                    let grant = self.ep.prepare_mapped_growth(growth, requirement.role)?;
+                    let mut grant = self.ep.prepare_mapped_growth(growth, requirement.role)?;
                     if let Some(old) = prepared.take() {
                         self.ep.deallocate(old.buffer)?;
                     }
@@ -1490,7 +1490,15 @@ impl KernelDispatchContext<'_> {
                             return Err(error.into());
                         }
                     };
-                    let buffer = match self.ep.allocate(required, requirement.alignment) {
+                    let allocation = match grant.as_mut() {
+                        Some(grant) => self.ep.allocate_with_mapped_growth(
+                            required,
+                            requirement.alignment,
+                            grant,
+                        ),
+                        None => self.ep.allocate(required, requirement.alignment),
+                    };
+                    let buffer = match allocation {
                         Ok(buffer) => buffer,
                         Err(error) => {
                             drop(grant);

@@ -1369,17 +1369,18 @@ impl DecodeCudaState {
             let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
             let valid_len = self.logical_len;
             let mapped_growth_bytes = self.vmm_growth_mapped_bytes(new_capacity)?;
-            let grant = session
+            let mut grant = session
                 .prepare_mapped_growth(
                     mapped_growth_bytes,
                     onnx_runtime_memory_governor::MemoryRole::KvCache,
                 )
                 .context("prepare transactional native CUDA KV growth")?;
-            self.commit_vmm_growth(new_capacity).map_err(|error| {
-                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
-                    .map_err(|error| error.to_string());
-                self.growth_failed_error(old_capacity, new_capacity, error, memory)
-            })?;
+            self.commit_vmm_growth(new_capacity, grant.as_mut())
+                .map_err(|error| {
+                    let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                        .map_err(|error| error.to_string());
+                    self.growth_failed_error(old_capacity, new_capacity, error, memory)
+                })?;
             if let Some(grant) = grant {
                 grant
                     .commit_bytes(mapped_growth_bytes)
@@ -1439,15 +1440,23 @@ impl DecodeCudaState {
     /// the old shapes and hold the old layout. Extra committed granules are
     /// only installed after their lease succeeds, so the governor remains the
     /// single source of memory truth.
-    fn commit_vmm_growth(&mut self, new_capacity: usize) -> anyhow::Result<()> {
+    fn commit_vmm_growth(
+        &mut self,
+        new_capacity: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<()> {
         let requested = self.vmm_growth_requests(new_capacity)?;
         let ranges = requested
             .iter()
             .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
             .collect::<Vec<_>>();
-        self.bindings[0]
-            .commit_binding_ranges(&ranges)
-            .context("commit native CUDA KV binding ranges atomically")
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => self.bindings[0].commit_binding_ranges(&ranges),
+        }
+        .context("commit native CUDA KV binding ranges atomically")
     }
 
     fn vmm_growth_mapped_bytes(&self, new_capacity: usize) -> anyhow::Result<u64> {

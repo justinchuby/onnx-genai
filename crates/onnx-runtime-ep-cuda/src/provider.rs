@@ -58,6 +58,14 @@ fn dynamic_lending_enabled_for(value: Option<&str>) -> bool {
     })
 }
 
+fn auto_dynamic_lending_for(
+    governor_present: bool,
+    policy: &DeviceOffloadPolicy,
+    lending_enabled: bool,
+) -> bool {
+    governor_present && policy.managed_no_spill && lending_enabled
+}
+
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
@@ -162,8 +170,11 @@ impl CudaExecutionProvider {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
-        let auto_dynamic_lending =
-            governor.is_some() && offload_policy.enabled && dynamic_lending_enabled();
+        let auto_dynamic_lending = auto_dynamic_lending_for(
+            governor.is_some(),
+            &offload_policy,
+            dynamic_lending_enabled(),
+        );
         let residency = offload_policy.enabled.then(|| {
             let budget = offload_policy
                 .device_budget_bytes
@@ -742,6 +753,31 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.allocate_committed(size, alignment, std::slice::from_ref(&full))
     }
 
+    fn allocate_with_mapped_growth(
+        &self,
+        size: usize,
+        alignment: usize,
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<DeviceBuffer> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(EpError::AlignmentError);
+        }
+        let full = 0..size;
+        let ptr = self
+            .memory()
+            .allocate_committed_with_capacity(
+                size,
+                alignment,
+                std::slice::from_ref(&full),
+                grant.physical_capacity(),
+            )
+            .map_err(EpError::Memory)?;
+        self.ep_allocations.fetch_add(1, Ordering::Relaxed);
+        Ok(unsafe {
+            DeviceBuffer::from_raw_parts(ptr.as_ptr().cast(), self.device, size, alignment)
+        })
+    }
+
     fn allocate_committed(
         &self,
         size: usize,
@@ -823,6 +859,38 @@ impl ExecutionProvider for CudaExecutionProvider {
             .collect::<Result<Vec<_>>>()?;
         self.memory()
             .commit_allocation_ranges(&raw)
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: could not commit {} binding range(s) atomically on CUDA device {}: {error}",
+                    raw.len(),
+                    self.device.index
+                ))
+            })
+    }
+
+    fn commit_allocation_ranges_with_mapped_growth(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<()> {
+        let raw = ranges
+            .iter()
+            .map(|&(buffer, offset, bytes)| {
+                let ptr = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8)
+                    .ok_or_else(|| {
+                        EpError::KernelFailed("cuda_ep: null mapped range buffer".into())
+                    })?;
+                Ok(onnx_runtime_memory_governor::AllocationCommitRange {
+                    ptr,
+                    allocation_bytes: buffer.len(),
+                    align: buffer.alignment(),
+                    offset,
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.memory()
+            .commit_allocation_ranges_with_capacity(&raw, grant.physical_capacity())
             .map_err(|error| {
                 EpError::KernelFailed(format!(
                     "cuda_ep: could not commit {} binding range(s) atomically on CUDA device {}: {error}",
@@ -1312,7 +1380,10 @@ impl ExecutionProvider for CudaExecutionProvider {
                      cannot grant on {tier:?}: {error}"
                 ))
             })?;
-        if dynamic_lending_enabled() && self.mapped_reclaim_registration.get().is_none() {
+        if self.offload_policy.managed_no_spill
+            && dynamic_lending_enabled()
+            && self.mapped_reclaim_registration.get().is_none()
+        {
             let reclaimable: Arc<dyn onnx_runtime_memory_governor::ReclaimableMappedHolder> =
                 Arc::clone(residency)
                     as Arc<dyn onnx_runtime_memory_governor::ReclaimableMappedHolder>;
@@ -1350,6 +1421,22 @@ mod tests {
         for disabled in ["0", " false ", "NO", "Off"] {
             assert!(!dynamic_lending_enabled_for(Some(disabled)));
         }
+    }
+
+    #[test]
+    fn only_explicit_managed_policy_auto_enables_vmm_and_opt_out_restores_compatibility() {
+        let compatibility = DeviceOffloadPolicy {
+            enabled: true,
+            ..DeviceOffloadPolicy::default()
+        };
+        assert!(!auto_dynamic_lending_for(true, &compatibility, true));
+        let managed = DeviceOffloadPolicy {
+            managed_no_spill: true,
+            ..compatibility
+        };
+        assert!(auto_dynamic_lending_for(true, &managed, true));
+        assert!(!auto_dynamic_lending_for(true, &managed, false));
+        assert!(!auto_dynamic_lending_for(false, &managed, true));
     }
 
     #[cfg_attr(

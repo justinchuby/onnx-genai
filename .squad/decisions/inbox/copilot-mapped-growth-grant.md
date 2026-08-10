@@ -6,5 +6,6 @@
   `mapped_bytes - new_limit` is physically reclaimed.
 - Native CUDA KV commits all binding ranges as one granule-union transaction.
 - Governed CUDA workspace and native KV use the same requester/grant contract.
-- `serve --vram-limit` with weight offload enables the VMM/pool path unless
-  `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`.
+- An explicit byte `serve --vram-limit` selects managed no-spill VMM/pool mode;
+  `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` restores the non-VMM compatibility
+  path. A 6 GiB qwen2.5-14b int4 live run loaded and generated correctly.
