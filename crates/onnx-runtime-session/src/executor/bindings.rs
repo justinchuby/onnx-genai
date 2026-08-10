@@ -1,5 +1,25 @@
 use super::*;
 
+/// Ops whose owned scratch is reserved by prepare-only planning (§736) so that
+/// capacity refusal surfaces before request admission rather than as a late
+/// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
+/// workspace; `com.microsoft::Attention` reserves a step-scoped Phase-2a
+/// scratch. Both report their exact bytes via [`Kernel::workspace_requirement`].
+pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
+    (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN && node.op_type == "BlockQuantizedMoE")
+        || (node.domain == "com.microsoft" && node.op_type == "Attention")
+}
+
+/// Merge a per-node workspace requirement into the running peak for its
+/// lifetime class, keeping the largest byte count and the strictest alignment.
+fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceRequirement) {
+    if requirement.bytes > peak.bytes {
+        *peak = requirement;
+    } else if requirement.bytes == peak.bytes {
+        peak.alignment = peak.alignment.max(requirement.alignment);
+    }
+}
+
 impl Executor {
     pub(crate) fn prepare_mapped_growth(
         &self,
@@ -20,9 +40,7 @@ impl Executor {
     pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
         fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
             for (node_id, node) in graph.nodes.iter() {
-                if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
-                    && node.op_type == "BlockQuantizedMoE"
-                {
+                if is_planned_workspace_node(node) {
                     out.push(format!(
                         "{scope}node#{} '{}::{}'",
                         node_id.0, node.domain, node.op_type
@@ -53,13 +71,16 @@ impl Executor {
         let external = self.prepare_external_bindings(bindings)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let resolved = self.resolve_soft(&symbols);
-        let mut peak = WorkspaceRequirement::NONE;
+        // Track one peak per lifetime class: session-persistent and step-scoped
+        // scratch live in separate executor slots, so a single peak cannot stand
+        // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
+        let mut peak_persistent = WorkspaceRequirement::NONE;
+        let mut peak_step = WorkspaceRequirement::NONE;
 
         for pi in 0..self.plan.len() {
             let node_id = self.plan[pi].node_id;
             let node = self.graph.node(node_id);
-            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN || node.op_type != "BlockQuantizedMoE"
-            {
+            if !is_planned_workspace_node(node) {
                 continue;
             }
             let input_shapes = self.plan[pi]
@@ -109,6 +130,9 @@ impl Executor {
                 .map(|((shape, dtype), input)| TensorMetadata::new(*dtype, shape, input.is_some()))
                 .collect::<Vec<_>>();
             let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes == 0 {
+                continue;
+            }
             match requirement.role {
                 onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
                     if step_scoped
@@ -120,19 +144,48 @@ impl Executor {
                     )));
                 }
             }
-            if requirement.bytes > peak.bytes {
-                peak = requirement;
-            } else if requirement.bytes == peak.bytes {
-                peak.alignment = peak.alignment.max(requirement.alignment);
-            }
+            let peak = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut peak_persistent,
+                WorkspaceLifetime::StepScoped => &mut peak_step,
+            };
+            merge_workspace_peak(peak, requirement);
         }
         let child_graphs = self.graph.subgraphs.values().collect::<Vec<_>>();
         for child in child_graphs {
-            self.collect_nested_workspace_requirement(child, &symbols, "control-flow/", &mut peak)?;
+            self.collect_nested_workspace_requirement(
+                child,
+                &symbols,
+                "control-flow/",
+                &mut peak_persistent,
+                &mut peak_step,
+            )?;
         }
 
+        Self::reserve_prepared_workspace(
+            self.ep.as_ref(),
+            &mut self.persistent_workspace,
+            peak_persistent,
+        )?;
+        Self::reserve_prepared_workspace(self.ep.as_ref(), &mut self.step_workspace, peak_step)?;
+
+        // Return the dominant requirement for callers that assert on a single
+        // reserved workspace; the two slots are prepared independently above.
+        Ok(if peak_persistent.bytes >= peak_step.bytes {
+            peak_persistent
+        } else {
+            peak_step
+        })
+    }
+
+    /// Reserve `peak` into `slot` against the device authority, reusing a
+    /// large-enough existing preparation. A zero requirement is a no-op.
+    fn reserve_prepared_workspace(
+        ep: &dyn ExecutionProvider,
+        slot: &mut Option<PreparedWorkspace>,
+        peak: WorkspaceRequirement,
+    ) -> Result<()> {
         if peak.bytes == 0 {
-            return Ok(peak);
+            return Ok(());
         }
         let bytes = usize::try_from(peak.bytes).map_err(|_| {
             SessionError::Internal(format!(
@@ -140,22 +193,18 @@ impl Executor {
                 peak.bytes
             ))
         })?;
-        let slot = match peak.lifetime {
-            WorkspaceLifetime::SessionPersistent => &mut self.persistent_workspace,
-            WorkspaceLifetime::StepScoped => &mut self.step_workspace,
-        };
         if slot
             .as_ref()
             .is_some_and(|prepared| prepared.bytes >= bytes && prepared.alignment >= peak.alignment)
         {
-            return Ok(peak);
+            return Ok(());
         };
         if let Some(old) = slot.take() {
-            self.ep.deallocate(old.buffer)?;
+            ep.deallocate(old.buffer)?;
         }
-        let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
-        let mut grant = self.ep.prepare_mapped_growth(target_mapped, peak.role)?;
-        let lease = match self.ep.reserve_workspace(peak.bytes, peak.role) {
+        let target_mapped = ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
+        let mut grant = ep.prepare_mapped_growth(target_mapped, peak.role)?;
+        let lease = match ep.reserve_workspace(peak.bytes, peak.role) {
             Ok(lease) => lease,
             Err(error) => {
                 drop(grant);
@@ -163,10 +212,8 @@ impl Executor {
             }
         };
         let fresh = match grant.take() {
-            Some(grant) => self
-                .ep
-                .allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
-            None => self.ep.allocate(bytes, peak.alignment)?,
+            Some(grant) => ep.allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
+            None => ep.allocate(bytes, peak.alignment)?,
         };
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
@@ -174,7 +221,7 @@ impl Executor {
             bytes,
             alignment: peak.alignment,
         });
-        Ok(peak)
+        Ok(())
     }
 
     fn collect_nested_workspace_requirement(
@@ -182,11 +229,11 @@ impl Executor {
         graph: &Graph,
         symbols: &HashMap<SymbolId, usize>,
         scope: &str,
-        peak: &mut WorkspaceRequirement,
+        peak_persistent: &mut WorkspaceRequirement,
+        peak_step: &mut WorkspaceRequirement,
     ) -> Result<()> {
         for (node_id, node) in graph.nodes.iter() {
-            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN || node.op_type != "BlockQuantizedMoE"
-            {
+            if !is_planned_workspace_node(node) {
                 continue;
             }
             let input_shapes = node
@@ -233,18 +280,33 @@ impl Executor {
                 })
                 .collect::<Vec<_>>();
             let requirement = kernel.workspace_requirement(&metadata)?;
-            if requirement.bytes > peak.bytes {
-                *peak = requirement;
-            } else if requirement.bytes == peak.bytes {
-                peak.alignment = peak.alignment.max(requirement.alignment);
+            if requirement.bytes == 0 {
+                continue;
             }
+            match requirement.role {
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                    if step_scoped
+                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
+                _ => {
+                    return Err(SessionError::Internal(format!(
+                        "{scope}node#{} ('{}::{}') returned an inconsistent workspace role/lifetime",
+                        node_id.0, node.domain, node.op_type
+                    )));
+                }
+            }
+            let peak = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut *peak_persistent,
+                WorkspaceLifetime::StepScoped => &mut *peak_step,
+            };
+            merge_workspace_peak(peak, requirement);
         }
         for ((node_id, attribute), child) in &graph.subgraphs {
             self.collect_nested_workspace_requirement(
                 child,
                 symbols,
                 &format!("{scope}node#{}/{attribute}/", node_id.0),
-                peak,
+                peak_persistent,
+                peak_step,
             )?;
         }
         Ok(())
