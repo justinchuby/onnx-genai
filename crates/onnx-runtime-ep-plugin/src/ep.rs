@@ -121,6 +121,48 @@ fn ep_get_capability_inner(
         return ok_status();
     }
 
+    // Fail-closed filter: remove any claim containing a node whose shape
+    // inference returns `Declined`. This prevents over-claiming ops we cannot
+    // correctly execute (e.g. NonZero with data-dependent output shape).
+    let claims: Vec<_> = claims
+        .into_iter()
+        .filter(|claim| {
+            claim.node_ids.iter().all(|&nid| {
+                let node = ir_graph.nodes.get(nid);
+                if node.is_none() {
+                    return false;
+                }
+                let node = node.unwrap();
+                let input_shapes: Vec<Vec<usize>> = node
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        input
+                            .and_then(|vid| ir_graph.values.get(vid))
+                            .map(|v| {
+                                v.shape
+                                    .iter()
+                                    .filter_map(|d| d.as_static())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let num_outputs = node.outputs.len();
+                let si = crate::compute::ShapeInference::for_node(
+                    node,
+                    &input_shapes,
+                    num_outputs,
+                );
+                !matches!(si, crate::compute::ShapeInference::Declined { .. })
+            })
+        })
+        .collect();
+
+    if claims.is_empty() {
+        return ok_status();
+    }
+
     // Report claims to ORT via EpGraphSupportInfo_AddNodesToFuse.
     let api = crate::status::host_api();
     if api.is_null() {
@@ -276,9 +318,10 @@ fn ep_compile_inner(
                         .find_map(|v| v.map(|val| view.value(val).dtype))
                         .unwrap_or(onnx_runtime_ir::DataType::Float32);
 
-                    // Determine shape inference strategy from op_type.
+                    // Determine shape inference strategy using full node
+                    // attributes (wired to Deckard's 22 rules).
                     let shape_inference =
-                        crate::compute::ShapeInference::for_op(&node.op_type);
+                        crate::compute::ShapeInference::for_node(node, &shapes, num_outputs);
 
                     entries.push(crate::compute::CompiledKernelEntry {
                         kernel,
@@ -304,12 +347,105 @@ fn ep_compile_inner(
         }
 
         // Wrap kernels in OrtNodeComputeInfo.
-        let info = ExportedComputeInfo::new(entries);
+        let mut info = ExportedComputeInfo::new(entries);
+
+        // For multi-node fused subgraphs, construct the SubgraphRouting so
+        // intermediates are threaded correctly in topological order.
+        if info.entries.len() > 1
+            && let Some(routing) = build_subgraph_routing(&view, ir_graph)
+        {
+            info.set_routing(routing);
+        }
+
         let info_ptr = Box::into_raw(Box::new(info));
         unsafe { *out_infos.add(i) = info_ptr.cast::<ort::OrtNodeComputeInfo>() };
     }
 
     ok_status()
+}
+
+/// Build a `SubgraphRouting` table for a multi-node fused subgraph.
+///
+/// Determines which node inputs come from ORT kernel-context inputs (graph inputs)
+/// vs. intermediate buffers, and which outputs go to ORT outputs vs. buffers.
+fn build_subgraph_routing(
+    view: &onnx_runtime_ir::GraphView<'_>,
+    graph: &onnx_runtime_ir::Graph,
+) -> Option<crate::compute::SubgraphRouting> {
+    use crate::compute::{NodeInputSource, NodeOutputSink};
+    use std::collections::HashMap;
+
+    // Build maps: ValueId → ORT input/output index.
+    let input_index: HashMap<onnx_runtime_ir::ValueId, usize> = graph
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, &vid)| (vid, i))
+        .collect();
+
+    let output_index: HashMap<onnx_runtime_ir::ValueId, usize> = graph
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, &vid)| (vid, i))
+        .collect();
+
+    // Map ValueId → buffer index for intermediate values.
+    let mut value_to_buffer: HashMap<onnx_runtime_ir::ValueId, usize> = HashMap::new();
+    let mut next_buffer = 0usize;
+
+    let nodes: Vec<_> = view.nodes().collect();
+
+    let mut input_sources: Vec<Vec<NodeInputSource>> = Vec::with_capacity(nodes.len());
+    let mut output_sinks: Vec<Vec<NodeOutputSink>> = Vec::with_capacity(nodes.len());
+
+    for &node_idx in &nodes {
+        // Build input sources.
+        let node_inputs = view.node_inputs(node_idx);
+        let mut sources = Vec::with_capacity(node_inputs.len());
+        for input_slot in node_inputs {
+            match input_slot {
+                Some(val_idx) => {
+                    let vid = view.value_id(*val_idx);
+                    if let Some(&ort_idx) = input_index.get(&vid) {
+                        sources.push(NodeInputSource::Ort(ort_idx));
+                    } else if let Some(&buf_idx) = value_to_buffer.get(&vid) {
+                        sources.push(NodeInputSource::Buffer(buf_idx));
+                    } else {
+                        // Value not from graph input or prior node output — decline.
+                        return None;
+                    }
+                }
+                None => {
+                    sources.push(NodeInputSource::Ort(0));
+                }
+            }
+        }
+        input_sources.push(sources);
+
+        // Build output sinks.
+        let node_outputs = view.node_outputs(node_idx);
+        let mut sinks = Vec::with_capacity(node_outputs.len());
+        for &val_idx in node_outputs {
+            let vid = view.value_id(val_idx);
+            if let Some(&ort_idx) = output_index.get(&vid) {
+                sinks.push(NodeOutputSink::Ort(ort_idx));
+            } else {
+                // Intermediate — assign a buffer.
+                let buf_idx = next_buffer;
+                next_buffer += 1;
+                value_to_buffer.insert(vid, buf_idx);
+                sinks.push(NodeOutputSink::Buffer(buf_idx));
+            }
+        }
+        output_sinks.push(sinks);
+    }
+
+    Some(crate::compute::SubgraphRouting {
+        input_sources,
+        output_sinks,
+        num_intermediate_buffers: next_buffer,
+    })
 }
 
 /// Release compiled kernel infos.
@@ -381,5 +517,66 @@ mod tests {
             r.unwrap_or_else(|_| crate::status::fail_status("internal panic"))
         }));
         assert!(result.is_ok(), "panic must be contained by catch_unwind");
+    }
+
+    /// ShapeInference::for_node returns Declined for NonZero (data-dependent
+    /// output shape), ensuring the capability filter rejects it.
+    #[test]
+    fn shape_inference_declines_nonzero() {
+        use onnx_runtime_ir::{Node, NodeId};
+        let node = Node::new(NodeId(0), "NonZero", vec![None], vec![]);
+        let si = crate::compute::ShapeInference::for_node(&node, &[vec![2, 3]], 1);
+        assert!(
+            matches!(si, crate::compute::ShapeInference::Declined { .. }),
+            "NonZero must be Declined; got {si:?}"
+        );
+    }
+
+    /// ShapeInference::for_node accepts Add (elementwise broadcast) without
+    /// attributes.
+    #[test]
+    fn shape_inference_accepts_add() {
+        use onnx_runtime_ir::{Node, NodeId};
+        let node = Node::new(NodeId(0), "Add", vec![None, None], vec![]);
+        let si = crate::compute::ShapeInference::for_node(&node, &[vec![2, 3], vec![2, 3]], 1);
+        assert!(
+            matches!(si, crate::compute::ShapeInference::ElementwiseBroadcast),
+            "Add must be ElementwiseBroadcast; got {si:?}"
+        );
+    }
+
+    /// ShapeInference::for_node reads the axis attribute for Concat.
+    #[test]
+    fn shape_inference_reads_concat_axis_attribute() {
+        use onnx_runtime_ir::{Attribute, Node, NodeId};
+        let mut node = Node::new(NodeId(0), "Concat", vec![None, None], vec![]);
+        node.attributes
+            .insert("axis".to_string(), Attribute::Int(1));
+        let si = crate::compute::ShapeInference::for_node(&node, &[vec![2, 3], vec![2, 5]], 1);
+        match si {
+            crate::compute::ShapeInference::Concat { axis } => {
+                assert_eq!(axis, 1, "axis attribute must be read as 1");
+            }
+            other => panic!("Expected Concat; got {other:?}"),
+        }
+    }
+
+    /// ShapeInference::for_node handles opset-13 Unsqueeze when axes are
+    /// injected from initializer data.
+    #[test]
+    fn shape_inference_unsqueeze_with_injected_axes() {
+        use onnx_runtime_ir::{Attribute, Node, NodeId};
+        let mut node = Node::new(NodeId(0), "Unsqueeze", vec![None, None], vec![]);
+        node.version = Some(13);
+        // Simulate axes injected from initializer.
+        node.attributes
+            .insert("axes".to_string(), Attribute::Ints(vec![0, 2]));
+        let si = crate::compute::ShapeInference::for_node(&node, &[vec![3, 4]], 1);
+        match si {
+            crate::compute::ShapeInference::Unsqueeze { axes } => {
+                assert_eq!(axes, vec![0, 2]);
+            }
+            other => panic!("Expected Unsqueeze; got {other:?}"),
+        }
     }
 }

@@ -16,6 +16,44 @@ use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId};
 
+/// Validate raw ORT dimensions for a single tensor, converting to `usize` shape.
+///
+/// Rejects negative dims (fail closed) and detects element-count overflow.
+/// Returns `(shape, element_count, expected_byte_length)`.
+pub(crate) fn validate_dims(
+    dims: &[i64],
+    dtype: DataType,
+    context: &str,
+) -> Result<(Vec<usize>, usize, usize), String> {
+    let mut shape: Vec<usize> = Vec::with_capacity(dims.len());
+    for (dim_idx, &d) in dims.iter().enumerate() {
+        if d < 0 {
+            return Err(format!(
+                "{context} dim[{dim_idx}] is {d} — negative dimensions are \
+                 invalid at Compute time (symbolic/dynamic dims must be \
+                 resolved before execution)"
+            ));
+        }
+        shape.push(d as usize);
+    }
+
+    let element_count: usize = shape.iter().try_fold(1usize, |acc, &d| {
+        acc.checked_mul(d)
+    }).ok_or_else(|| {
+        format!("{context} shape {shape:?} overflows usize in element count")
+    })?;
+
+    let byte_size = dtype.byte_size();
+    let expected_bytes = element_count.checked_mul(byte_size).ok_or_else(|| {
+        format!(
+            "{context} byte length overflows: {element_count} elements × \
+             {byte_size} bytes/element"
+        )
+    })?;
+
+    Ok((shape, element_count, expected_bytes))
+}
+
 /// Owned input tensor data extracted from an `OrtKernelContext`.
 ///
 /// Holds the shape/strides vectors so that `TensorView` references remain valid.
@@ -294,5 +332,78 @@ mod tests {
         assert!(DataType::from_onnx(0).is_none());
         // Extremely large value should also be None.
         assert!(DataType::from_onnx(9999).is_none());
+    }
+
+    // ── Dimension validation tests ────────────────────────────────────────
+
+    #[test]
+    fn validate_dims_rejects_negative() {
+        let dims = [4, -1, 8];
+        let err = super::validate_dims(&dims, DataType::Float32, "test").unwrap_err();
+        assert!(err.contains("dim[1] is -1"), "error: {err}");
+        assert!(err.contains("negative"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_dims_rejects_large_negative() {
+        // ORT's dynamic-dim sentinel -1 as i64
+        let dims = [2, -1i64];
+        let err = super::validate_dims(&dims, DataType::Float32, "x").unwrap_err();
+        assert!(err.contains("-1"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_dims_overflow_element_count() {
+        // Two huge dims that overflow usize on multiply
+        let dims = [i64::MAX / 2, 4];
+        let err = super::validate_dims(&dims, DataType::Float32, "big").unwrap_err();
+        assert!(err.contains("overflows"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_dims_overflow_byte_length() {
+        // Two large dims whose product fits in usize but * byte_size overflows
+        // On 64-bit: i64::MAX/4 is fine as element count for Float32 (4 bytes)
+        // but i64::MAX/4 * 4 = i64::MAX - 3 which doesn't overflow usize,
+        // so use i64::MAX/2 * 2 bytes (Float16).
+        // Actually: find dims that make element_count * byte_size overflow.
+        // i64::MAX as usize = 2^63-1. For Float64 (8 bytes):
+        // (2^63-1) * 8 overflows usize on 64-bit.
+        let dims = [i64::MAX]; // huge but positive
+        let result = super::validate_dims(&dims, DataType::Float64, "bytes");
+        // byte_size = 8, element_count = 2^63-1, product overflows
+        assert!(result.is_err(), "should fail: {result:?}");
+    }
+
+    #[test]
+    fn validate_dims_zero_dim_accepted() {
+        // Zero-dim tensors are legal in ONNX (e.g. empty batch)
+        let dims = [0i64, 3, 224, 224];
+        let (shape, elem_count, byte_len) =
+            super::validate_dims(&dims, DataType::Float32, "zero").unwrap();
+        assert_eq!(shape, vec![0, 3, 224, 224]);
+        assert_eq!(elem_count, 0);
+        assert_eq!(byte_len, 0);
+    }
+
+    #[test]
+    fn validate_dims_scalar_tensor() {
+        // Scalar: zero-rank tensor with 1 element
+        let dims: [i64; 0] = [];
+        let (shape, elem_count, byte_len) =
+            super::validate_dims(&dims, DataType::Float32, "scalar").unwrap();
+        assert_eq!(shape, Vec::<usize>::new());
+        assert_eq!(elem_count, 1); // product of empty = 1
+        assert_eq!(byte_len, 4);
+    }
+
+    #[test]
+    fn validate_dims_normal_shape() {
+        let dims = [2i64, 3, 4];
+        let (shape, elem_count, byte_len) =
+            super::validate_dims(&dims, DataType::Float32, "ok").unwrap();
+        assert_eq!(shape, vec![2, 3, 4]);
+        assert_eq!(elem_count, 24);
+        assert_eq!(byte_len, 96);
     }
 }

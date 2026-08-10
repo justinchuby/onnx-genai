@@ -145,3 +145,61 @@ plugin_export_abi: 6 passed, 0 failed, 0 ignored
 plugin_ort_e2e:    2 passed, 0 failed, 3 ignored
 ```
 Zero crashes, zero false passes. All failures are genuine, precisely documented.
+
+---
+
+## 2026-08-10 — EP Conformance Suite (squad/ep-plugin-export)
+
+**Objective:** Convert the single "Add 1×4" proof point into a real conformance suite.
+
+### Summary
+
+Nabil fixed `GetSupportedDevices` (factory.rs) so ORT no longer segfaults on
+registration. The original `ort_loads_our_ep_and_runs_model` test previously
+verified a full end-to-end pass (Run returned [6,8,10,12]).
+
+This session broadened coverage by adding 6 new ONNX fixtures and 8 new L3
+conformance tests, serialising all EP tests via `ORT_EP_LOCK: Mutex<()>` to
+prevent non-deterministic parallel ORT state corruption.
+
+### Tests un-ignored
+
+| Test | Status |
+|------|--------|
+| `ort_register_ep_library` | ✅ Un-ignored (passes) |
+| `ort_unsupported_op_declines_not_crashes` | ✅ Un-ignored (passes — NonZero declined, ORT default CPU EP handles Run correctly) |
+| `conformance_add_broadcast` | ✅ Un-ignored (got [[11,22,33],[14,25,36]]) |
+| `conformance_add_dynamic_dim` | ✅ Un-ignored (got [6,8,10,12] with batch=1 at runtime) |
+| `conformance_add_int32` | ✅ Un-ignored (got [11,22,33,44]) |
+| `conformance_chain_add_mul` | ✅ Un-ignored (got [4,6,8,10] — topological intermediates proven) |
+| `conformance_matmul_2d` | ✅ Un-ignored (got [[4,2],[10,5]]) |
+| `conformance_mixed_partition` | ✅ Un-ignored (ORT partitions Add→our EP, NonZero→default EP; final output correct) |
+
+### Bugs found
+
+**BUG 1 (factory.rs / Nabil):** `OrtEpDevice` descriptor becomes corrupt after
+≥6 `RegisterExecutionProviderLibrary`+Run+Unregister cycles in the same process.
+Values observed: `DeviceType:-112 MemoryType:-85 VendorId:31163 DeviceId:3139`
+(uninitialized/dangling pointer). Root cause: likely stack allocation or
+incorrect lifetime in `GetSupportedDevices`. Blocks `conformance_multiple_run_calls`,
+`conformance_two_sessions`, and `ort_loads_our_ep_and_runs_model` (when run as 7th+
+cycle). Not observed until cycle 7; default suite uses ≤6 cycles.
+
+### Final test counts
+
+```
+Default run (cargo test -p onnx-runtime-ep-cpu-plugin):
+  unittests:         0 passed, 0 failed, 0 ignored
+  plugin_export_abi: 6 passed, 0 failed, 0 ignored
+  plugin_ort_e2e:   10 passed, 0 failed, 3 ignored
+  TOTAL:            16 passed, 0 failed, 3 ignored
+
+With --include-ignored:
+  plugin_ort_e2e:    8 passed, 5 failed (BUG 1 manifests at cycle 7+)
+```
+
+### Fixtures added
+
+`add_broadcast`, `chain_add_mul`, `matmul_2d`, `mixed_partition`,
+`add_int32`, `add_dynamic_dim` — all committed under `tests/fixtures/`.
+Generator: `tests/fixtures/generate_fixtures.py`.

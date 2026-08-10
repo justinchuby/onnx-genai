@@ -9,7 +9,7 @@ use std::ffi::CStr;
 use std::ptr;
 
 use onnx_genai_ort_sys as ort;
-use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, ValueId};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, Shape, ValueId};
 
 /// A reader that extracts nxrt IR from an ORT `OrtGraph*`.
 pub struct OutboundGraphReader {
@@ -19,6 +19,9 @@ pub struct OutboundGraphReader {
     /// The original ORT node pointers, kept for passing back to
     /// `EpGraphSupportInfo_AddNodesToFuse`.
     ort_node_ptrs: Vec<*const ort::OrtNode>,
+    /// Owned copies of small int64 initializer tensors, keyed by value name.
+    /// Used to resolve opset-13 Unsqueeze/Squeeze axes from constant inputs.
+    initializer_int64: HashMap<String, Vec<i64>>,
 }
 
 // OutboundGraphReader intentionally does NOT implement Send or Sync.
@@ -145,7 +148,12 @@ impl OutboundGraphReader {
             node_input_names.push(in_names);
         }
 
-        // Second pass: create nodes with proper edges.
+        // Read initializers and copy small int64 tensors into owned data.
+        let initializer_int64 = unsafe {
+            Self::read_initializers_int64(api, graph_ptr).unwrap_or_default()
+        };
+
+        // Second pass: create nodes with proper edges and attributes.
         for (i, ort_node) in ort_nodes.iter().enumerate() {
             if ort_node.is_null() {
                 continue;
@@ -180,9 +188,29 @@ impl OutboundGraphReader {
 
             let mut node = Node::new(NodeId(0), &op_type, inputs, outputs);
             node.name = name;
-            node.domain = domain;
+            node.domain = domain.clone();
             if since_version > 0 {
                 node.version = Some(since_version as i64);
+            }
+
+            // Read node attributes from ORT and populate IR node.
+            if let Ok(attrs) = unsafe { Self::read_node_attributes(api, *ort_node) } {
+                node.attributes = attrs;
+            }
+
+            // For opset-13+ Unsqueeze/Squeeze: if axes attribute is missing but
+            // input[1] is a constant initializer, inject it as an attribute so
+            // ShapeInference::for_node can use it.
+            if (op_type == "Unsqueeze" || op_type == "Squeeze")
+                && since_version >= 13
+                && !node.attributes.contains_key("axes")
+                && let Some(axes_input_name) = node_input_names[i].get(1)
+                && let Some(axes_data) = initializer_int64.get(axes_input_name)
+            {
+                node.attributes.insert(
+                    "axes".to_string(),
+                    Attribute::Ints(axes_data.clone()),
+                );
             }
 
             let nid = ir_graph.insert_node(node);
@@ -209,12 +237,18 @@ impl OutboundGraphReader {
             graph: ir_graph,
             ort_index_to_node_id,
             ort_node_ptrs: ort_nodes,
+            initializer_int64,
         })
     }
 
     /// Get the IR graph for capability discovery.
     pub fn to_ir_graph(&self) -> &Graph {
         &self.graph
+    }
+
+    /// Access the owned int64 initializer data (copied from ORT during construction).
+    pub fn initializer_int64(&self) -> &HashMap<String, Vec<i64>> {
+        &self.initializer_int64
     }
 
     /// Map our internal `NodeId` back to the ORT node's index in the original
@@ -490,6 +524,352 @@ impl OutboundGraphReader {
         };
 
         Ok((name, dtype, shape))
+    }
+
+    // ─── Attribute reading ─────────────────────────────────────────────
+
+    /// Read all attributes from an ORT node and return them as owned IR
+    /// `Attribute` values. Copies all data during the Compile call frame.
+    unsafe fn read_node_attributes(
+        api: *const ort::OrtApi,
+        node: *const ort::OrtNode,
+    ) -> Result<HashMap<String, Attribute>, String> {
+        let get_num = unsafe { (*api).Node_GetNumAttributes }
+            .ok_or("OrtApi.Node_GetNumAttributes is null")?;
+        let mut num_attrs = 0usize;
+        let status = unsafe { get_num(node, &mut num_attrs) };
+        Self::check(status)?;
+
+        if num_attrs == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let get_attrs = unsafe { (*api).Node_GetAttributes }
+            .ok_or("OrtApi.Node_GetAttributes is null")?;
+        let mut attr_ptrs: Vec<*const ort::OrtOpAttr> = vec![ptr::null(); num_attrs];
+        let status = unsafe { get_attrs(node, attr_ptrs.as_mut_ptr(), num_attrs) };
+        Self::check(status)?;
+
+        let get_name = unsafe { (*api).OpAttr_GetName }
+            .ok_or("OrtApi.OpAttr_GetName is null")?;
+        let get_type = unsafe { (*api).OpAttr_GetType }
+            .ok_or("OrtApi.OpAttr_GetType is null")?;
+        let read_attr = unsafe { (*api).ReadOpAttr }
+            .ok_or("OrtApi.ReadOpAttr is null")?;
+
+        let mut result = HashMap::with_capacity(num_attrs);
+
+        for &attr_ptr in &attr_ptrs {
+            if attr_ptr.is_null() {
+                continue;
+            }
+
+            // Get name.
+            let mut name_ptr: *const std::ffi::c_char = ptr::null();
+            let status = unsafe { get_name(attr_ptr, &mut name_ptr) };
+            Self::check(status)?;
+            if name_ptr.is_null() {
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+
+            // Get type.
+            let mut attr_type: ort::OrtOpAttrType = 0;
+            let status = unsafe { get_type(attr_ptr, &mut attr_type) };
+            Self::check(status)?;
+
+            let attr_value = unsafe {
+                Self::read_attr_value(read_attr, attr_ptr, attr_type)
+            };
+
+            if let Some(value) = attr_value {
+                result.insert(name, value);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read a single attribute value from its OrtOpAttr pointer.
+    unsafe fn read_attr_value(
+        read_attr: unsafe extern "C" fn(
+            *const ort::OrtOpAttr,
+            ort::OrtOpAttrType,
+            *mut std::ffi::c_void,
+            usize,
+            *mut usize,
+        ) -> *mut ort::OrtStatus,
+        attr_ptr: *const ort::OrtOpAttr,
+        attr_type: ort::OrtOpAttrType,
+    ) -> Option<Attribute> {
+        match attr_type {
+            ort::ORT_OP_ATTR_INT => {
+                let mut val: i64 = 0;
+                let mut out_size = 0usize;
+                let status = unsafe {
+                    read_attr(
+                        attr_ptr,
+                        ort::ORT_OP_ATTR_INT,
+                        (&raw mut val).cast(),
+                        std::mem::size_of::<i64>(),
+                        &mut out_size,
+                    )
+                };
+                if status.is_null() {
+                    Some(Attribute::Int(val))
+                } else {
+                    Self::check(status).ok();
+                    None
+                }
+            }
+            ort::ORT_OP_ATTR_INTS => {
+                // First call with zero len to get required size.
+                let mut required = 0usize;
+                let status = unsafe {
+                    read_attr(
+                        attr_ptr,
+                        ort::ORT_OP_ATTR_INTS,
+                        ptr::null_mut(),
+                        0,
+                        &mut required,
+                    )
+                };
+                // Status is non-null (buffer too small) but `required` has the count.
+                if !status.is_null() {
+                    Self::check(status).ok();
+                }
+                if required == 0 {
+                    return Some(Attribute::Ints(Vec::new()));
+                }
+                let count = required / std::mem::size_of::<i64>();
+                let mut buf: Vec<i64> = vec![0; count];
+                let mut out_size = 0usize;
+                let status = unsafe {
+                    read_attr(
+                        attr_ptr,
+                        ort::ORT_OP_ATTR_INTS,
+                        buf.as_mut_ptr().cast(),
+                        required,
+                        &mut out_size,
+                    )
+                };
+                if status.is_null() {
+                    Some(Attribute::Ints(buf))
+                } else {
+                    Self::check(status).ok();
+                    None
+                }
+            }
+            ort::ORT_OP_ATTR_FLOAT => {
+                let mut val: f32 = 0.0;
+                let mut out_size = 0usize;
+                let status = unsafe {
+                    read_attr(
+                        attr_ptr,
+                        ort::ORT_OP_ATTR_FLOAT,
+                        (&raw mut val).cast(),
+                        std::mem::size_of::<f32>(),
+                        &mut out_size,
+                    )
+                };
+                if status.is_null() {
+                    Some(Attribute::Float(val))
+                } else {
+                    Self::check(status).ok();
+                    None
+                }
+            }
+            ort::ORT_OP_ATTR_STRING => {
+                // First call to get required size.
+                let mut required = 0usize;
+                let status = unsafe {
+                    read_attr(
+                        attr_ptr,
+                        ort::ORT_OP_ATTR_STRING,
+                        ptr::null_mut(),
+                        0,
+                        &mut required,
+                    )
+                };
+                if !status.is_null() {
+                    Self::check(status).ok();
+                }
+                if required == 0 {
+                    return Some(Attribute::String(Vec::new()));
+                }
+                let mut buf: Vec<u8> = vec![0; required];
+                let mut out_size = 0usize;
+                let status = unsafe {
+                    read_attr(
+                        attr_ptr,
+                        ort::ORT_OP_ATTR_STRING,
+                        buf.as_mut_ptr().cast(),
+                        required,
+                        &mut out_size,
+                    )
+                };
+                if status.is_null() {
+                    // Trim trailing null if present.
+                    if buf.last() == Some(&0) {
+                        buf.pop();
+                    }
+                    Some(Attribute::String(buf))
+                } else {
+                    Self::check(status).ok();
+                    None
+                }
+            }
+            // FLOATS, STRINGS, GRAPH, TENSOR — not needed for shape inference;
+            // skip gracefully.
+            _ => None,
+        }
+    }
+
+    // ─── Initializer reading ────────────────────────────────────────────
+
+    /// Read graph initializers and extract small int64 tensors as owned data.
+    /// This copies the data during the callback frame; no ORT pointers are cached.
+    unsafe fn read_initializers_int64(
+        api: *const ort::OrtApi,
+        graph: *const ort::OrtGraph,
+    ) -> Result<HashMap<String, Vec<i64>>, String> {
+        let get_num = unsafe { (*api).Graph_GetNumInitializers }
+            .ok_or("OrtApi.Graph_GetNumInitializers is null")?;
+        let mut num_init = 0usize;
+        let status = unsafe { get_num(graph, &mut num_init) };
+        Self::check(status)?;
+
+        if num_init == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let get_inits = unsafe { (*api).Graph_GetInitializers }
+            .ok_or("OrtApi.Graph_GetInitializers is null")?;
+        let mut init_infos: Vec<*const ort::OrtValueInfo> = vec![ptr::null(); num_init];
+        let status = unsafe { get_inits(graph, init_infos.as_mut_ptr(), num_init) };
+        Self::check(status)?;
+
+        let get_init_val = unsafe { (*api).ValueInfo_GetInitializerValue }
+            .ok_or("OrtApi.ValueInfo_GetInitializerValue is null")?;
+        let get_name = unsafe { (*api).GetValueInfoName }
+            .ok_or("OrtApi.GetValueInfoName is null")?;
+
+        let get_type_info = unsafe { (*api).GetValueInfoTypeInfo }
+            .ok_or("OrtApi.GetValueInfoTypeInfo is null")?;
+        let cast_tensor = unsafe { (*api).CastTypeInfoToTensorInfo }
+            .ok_or("OrtApi.CastTypeInfoToTensorInfo is null")?;
+        let get_elem_type = unsafe { (*api).GetTensorElementType }
+            .ok_or("OrtApi.GetTensorElementType is null")?;
+        let get_dims_count = unsafe { (*api).GetDimensionsCount }
+            .ok_or("OrtApi.GetDimensionsCount is null")?;
+        let get_data = unsafe { (*api).GetTensorData }
+            .ok_or("OrtApi.GetTensorData is null")?;
+        let get_tensor_shape = unsafe { (*api).GetTensorTypeAndShape }
+            .ok_or("OrtApi.GetTensorTypeAndShape is null")?;
+        let get_shape_elem_count = unsafe { (*api).GetTensorShapeElementCount }
+            .ok_or("OrtApi.GetTensorShapeElementCount is null")?;
+
+        let mut result = HashMap::new();
+
+        for &info in &init_infos {
+            if info.is_null() {
+                continue;
+            }
+
+            // Get name.
+            let mut name_ptr: *const std::ffi::c_char = ptr::null();
+            let status = unsafe { get_name(info, &mut name_ptr) };
+            if !status.is_null() || name_ptr.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if name.is_empty() {
+                continue;
+            }
+
+            // Check if this is an int64 tensor and small enough to copy.
+            let mut type_info: *const ort::OrtTypeInfo = ptr::null();
+            let status = unsafe { get_type_info(info, &mut type_info) };
+            if !status.is_null() || type_info.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            let mut tensor_info: *const ort::OrtTensorTypeAndShapeInfo = ptr::null();
+            let status = unsafe { cast_tensor(type_info, &mut tensor_info) };
+            if !status.is_null() || tensor_info.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            let mut elem_type: ort::ONNXTensorElementDataType = 0;
+            let status = unsafe { get_elem_type(tensor_info, &mut elem_type) };
+            if !status.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            // Only copy int64 tensors (used for axes, shapes, etc.)
+            if elem_type != ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 {
+                continue;
+            }
+            let mut dims_count = 0usize;
+            let status = unsafe { get_dims_count(tensor_info, &mut dims_count) };
+            if !status.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            // Only copy 1-D tensors with ≤ 64 elements (shape/axes metadata).
+            if dims_count > 1 {
+                continue;
+            }
+
+            // Get the initializer OrtValue.
+            let mut ort_value: *const ort::OrtValue = ptr::null();
+            let status = unsafe { get_init_val(info, &mut ort_value) };
+            if !status.is_null() || ort_value.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+
+            // Get element count from the value's shape info.
+            let mut val_shape: *mut ort::OrtTensorTypeAndShapeInfo = ptr::null_mut();
+            let status = unsafe {
+                get_tensor_shape(ort_value.cast_mut(), &mut val_shape)
+            };
+            if !status.is_null() || val_shape.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+            let mut elem_count = 0usize;
+            let status = unsafe { get_shape_elem_count(val_shape, &mut elem_count) };
+            // Release shape info.
+            if let Some(rel) = unsafe { (*api).ReleaseTensorTypeAndShapeInfo } {
+                unsafe { rel(val_shape) };
+            }
+            if !status.is_null() || elem_count == 0 || elem_count > 64 {
+                Self::check(status).ok();
+                continue;
+            }
+
+            // Read raw data.
+            let mut data_ptr: *const std::ffi::c_void = ptr::null();
+            let status = unsafe { get_data(ort_value, &mut data_ptr) };
+            if !status.is_null() || data_ptr.is_null() {
+                Self::check(status).ok();
+                continue;
+            }
+
+            // Copy into owned Vec<i64>.
+            let slice = unsafe {
+                std::slice::from_raw_parts(data_ptr.cast::<i64>(), elem_count)
+            };
+            result.insert(name, slice.to_vec());
+        }
+
+        Ok(result)
     }
 
     /// Check an OrtStatus and convert to Result, extracting the error message.

@@ -57,4 +57,23 @@ Durable rules:
 (`.squad/decisions.md`, reconstructed rules section, 2026-07-29)
 
 Inbox drop `leon-reasoning-fixture-round3.md` was lost when the worktree was deleted
+
+## 2026-08-10 — EP Plugin Compute Hardening (reviewer rejection fix)
+
+**Context:** Holden's security re-audit flagged two findings (N1, N2) in `compute.rs`/`kernel_ctx.rs`. Deckard locked out; reassigned to Leon.
+
+**N1 (CRITICAL — `compute_execute` panic guard):** Already present in current code — `catch_unwind` wraps the entire `compute_execute` body (confirmed at `compute.rs:~551`). Added test verifying the pattern.
+
+**N2 (HIGH — negative dims wrap to usize::MAX):** Fixed in `kernel_ctx.rs`. Added `validate_dims()` helper that rejects any negative dimension with an actionable error message naming the dim index and value. Zero dims are accepted (legal ONNX).
+
+**Additional hardening:**
+- Element-count overflow: all `shape.iter().product()` replaced with `checked_mul` fold in `kernel_ctx.rs:validate_dims`, `compute.rs` intermediate buffer allocation, and `read_i64_tensor`.
+- Byte-length overflow: `element_count * byte_size` uses `checked_mul`.
+- Zero-dim null-ptr: zero-element tensors are allowed to have null data pointers; only non-zero-element tensors fail on null.
+- 7 new unit tests: negative dim rejected, large negative rejected, element-count overflow, byte-length overflow, zero-dim accepted, scalar tensor, normal shape.
+- 2 new compute tests: panic-guard pattern, contiguous_strides edge cases.
+
+**Build status:** `cargo build -p onnx-runtime-ep-plugin` fails due to `graph_reader.rs` (Isidore's concurrent edits — missing fields/methods). All errors are confined to that file; `compute.rs` and `kernel_ctx.rs` have zero compile errors and pass clippy when graph_reader is stubbed. Noted for coordinator.
+
+**No public API signatures changed.** `validate_dims` is `pub(crate)` only.
 before Scribe ran; content reconstructed into `.squad/decisions.md`.

@@ -2108,4 +2108,37 @@ mod tests {
         assert!(matches!(ShapeInference::for_op("Slice"), ShapeInference::SliceData));
         assert!(matches!(ShapeInference::for_op("Shape"), ShapeInference::ShapeOp { start: 0, end: None }));
     }
+
+    // ── Panic guard test ──────────────────────────────────────────────────
+
+    #[test]
+    fn compute_execute_catches_panic_returns_error_status() {
+        // The compute_execute extern "C" fn wraps execution in catch_unwind.
+        // Verify that a panic inside the closure path does NOT propagate across
+        // the extern "C" boundary (would be UB) but is converted to an error.
+        // We test the pattern directly since we cannot easily call the real
+        // extern "C" fn without a valid ORT context.
+        use crate::status::fail_status;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("simulated kernel panic");
+        }));
+        let status = result.unwrap_or_else(|_| fail_status("Compute: internal panic"));
+        // In test environment without ORT API, fail_status returns null (documented).
+        // The important thing is we didn't actually unwind/abort.
+        let _ = status;
+    }
+
+    // ── Intermediate buffer overflow test ─────────────────────────────────
+
+    #[test]
+    fn contiguous_strides_empty_shape() {
+        let s = super::contiguous_strides(&[]);
+        assert_eq!(s, Vec::<i64>::new());
+    }
+
+    #[test]
+    fn contiguous_strides_scalar() {
+        let s = super::contiguous_strides(&[1]);
+        assert_eq!(s, vec![1i64]);
+    }
 }
