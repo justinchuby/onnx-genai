@@ -57,9 +57,7 @@ impl ExportedEp {
 // ─── OrtEp callbacks ────────────────────────────────────────────────────────
 
 /// GetName: return the EP name as a C string.
-unsafe extern "C" fn ep_get_name(
-    ep: *const ort::OrtEp,
-) -> *const std::ffi::c_char {
+unsafe extern "C" fn ep_get_name(ep: *const ort::OrtEp) -> *const std::ffi::c_char {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if ep.is_null() {
             return c"unknown".as_ptr();
@@ -139,21 +137,12 @@ fn ep_get_capability_inner(
                     .map(|input| {
                         input
                             .and_then(|vid| ir_graph.values.get(vid))
-                            .map(|v| {
-                                v.shape
-                                    .iter()
-                                    .filter_map(|d| d.as_static())
-                                    .collect()
-                            })
+                            .map(|v| v.shape.iter().filter_map(|d| d.as_static()).collect())
                             .unwrap_or_default()
                     })
                     .collect();
                 let num_outputs = node.outputs.len();
-                let si = crate::compute::ShapeInference::for_node(
-                    node,
-                    &input_shapes,
-                    num_outputs,
-                );
+                let si = crate::compute::ShapeInference::for_node(node, &input_shapes, num_outputs);
                 !matches!(si, crate::compute::ShapeInference::Declined { .. })
             })
         })
@@ -185,7 +174,7 @@ fn ep_get_capability_inner(
             None => {
                 return fail_status(
                     "GetCapability: OrtEpApi.EpGraphSupportInfo_AddNodesToFuse is null",
-                )
+                );
             }
         }
     };
@@ -264,9 +253,7 @@ fn ep_compile_inner(
         let reader = match unsafe { OutboundGraphReader::from_ort_graph(graph_ptr) } {
             Ok(r) => r,
             Err(msg) => {
-                return fail_status(&format!(
-                    "Compile: failed to read subgraph {i}: {msg}"
-                ));
+                return fail_status(&format!("Compile: failed to read subgraph {i}: {msg}"));
             }
         };
 
@@ -301,9 +288,7 @@ fn ep_compile_inner(
                 })
                 .collect();
 
-            let opset = ir_graph
-                .effective_opset(node)
-                .unwrap_or(0);
+            let opset = ir_graph.effective_opset(node).unwrap_or(0);
 
             match exported.ep.get_kernel(node, &shapes, opset) {
                 Ok(kernel) => {
@@ -478,11 +463,7 @@ mod tests {
     fn get_capability_null_ep_returns_status() {
         // Reset host API so invalid_arg_status returns null safely.
         unsafe { crate::status::set_host_api(ptr::null()) };
-        let status = ep_get_capability_inner(
-            ptr::null_mut(),
-            ptr::null(),
-            ptr::null_mut(),
-        );
+        let status = ep_get_capability_inner(ptr::null_mut(), ptr::null(), ptr::null_mut());
         // With no ORT API loaded, invalid_arg_status returns null.
         // The important invariant: no panic, no segfault.
         let _ = status;
@@ -496,8 +477,8 @@ mod tests {
         // graphs null check, which should return before dereferencing either.
         let mut dummy_out: *mut ort::OrtNodeComputeInfo = ptr::null_mut();
         let status = ep_compile_inner(
-            1usize as *mut ort::OrtEp, // non-null; reached only after null check
-            ptr::null_mut(),            // null graphs → returns invalid_arg_status
+            std::ptr::dangling_mut::<ort::OrtEp>(), // non-null sentinel; never dereferenced
+            ptr::null_mut(),                        // null graphs → returns invalid_arg_status
             1,
             &raw mut dummy_out,
         );

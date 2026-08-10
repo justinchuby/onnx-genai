@@ -133,3 +133,26 @@ release on success (ORT owns via EpDevice). Release only on `AddAllocatorInfo` f
 instead of factory name "cpu_ep") — Pris needs to fix.
 
 **Remaining:** `kernel_ctx.rs:23` has dead_code warning (Leon's file, not mine).
+
+## 2026-08-10 — Clippy lint ep.rs:499 (manual_dangling_ptr)
+
+**Clippy error:** `error: manual creation of a dangling pointer` at `ep.rs:499` in the
+`compile_null_graphs_returns_status` unit test. The offending expression was
+`1usize as *mut ort::OrtEp` — an integer cast used as a non-null sentinel.
+
+**Assessment: COSMETIC lint, not a real defect.** The pointer:
+- Lives entirely inside a test function
+- Is passed to `ep_compile_inner` only to satisfy a "is the ep pointer non-null?" check
+  that precedes the actual null-graphs check under test
+- Is **never dereferenced** and never crosses the ABI to ORT
+- Is a test fixture, not production code
+
+**Fix:** Replaced `1usize as *mut ort::OrtEp` with `std::ptr::dangling_mut::<ort::OrtEp>()`,
+the clippy-suggested idiomatic form for an intentional non-null, never-dereferenced pointer.
+No `#[allow]` suppression used.
+
+**Validation:**
+- `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`: ep.rs error gone;
+  only 2 lib.rs errors remain (Isidore's: `lib.rs:184`, `lib.rs:189`)
+- `cargo test -p onnx-runtime-ep-plugin --lib`: **82 passed, 0 failed**
+- `cargo test -p onnx-runtime-ep-cpu-plugin --all-targets`: **21 passed (6+15), 0 failed, 0 ignored**

@@ -91,12 +91,10 @@ fn dlopen_and_create_factory() {
     type ReleaseEpFactory = unsafe extern "C" fn(*mut ort::OrtEpFactory) -> *mut ort::OrtStatus;
 
     let create: libloading::Symbol<'_, CreateEpFactories> =
-        unsafe { lib.get(b"CreateEpFactories") }
-            .expect("CreateEpFactories symbol not found");
+        unsafe { lib.get(b"CreateEpFactories") }.expect("CreateEpFactories symbol not found");
 
     let release: libloading::Symbol<'_, ReleaseEpFactory> =
-        unsafe { lib.get(b"ReleaseEpFactory") }
-            .expect("ReleaseEpFactory symbol not found");
+        unsafe { lib.get(b"ReleaseEpFactory") }.expect("ReleaseEpFactory symbol not found");
 
     let api_base = test_api_base();
 
@@ -289,8 +287,9 @@ mod mock_kernel_ctx {
         out: *mut *mut ort::OrtValue,
     ) -> ort::OrtStatusPtr {
         // Allocate the output in our mock state.
-        let shape: Vec<i64> =
-            (0..dim_count).map(|i| unsafe { *dim_values.add(i) }).collect();
+        let shape: Vec<i64> = (0..dim_count)
+            .map(|i| unsafe { *dim_values.add(i) })
+            .collect();
         let numel: usize = shape.iter().map(|&d| d as usize).product();
 
         STATE.with(|s| {
@@ -352,7 +351,9 @@ mod mock_kernel_ctx {
 fn compute_add_end_to_end() {
     use mock_kernel_ctx::*;
     use onnx_runtime_ep_cpu::kernels::add::AddKernel;
-    use onnx_runtime_ep_plugin::compute::{CompiledKernelEntry, ExportedComputeInfo, ShapeInference};
+    use onnx_runtime_ep_plugin::compute::{
+        CompiledKernelEntry, ExportedComputeInfo, ShapeInference,
+    };
     use onnx_runtime_ir::DataType;
 
     // Set up mock API as the host.
@@ -407,7 +408,11 @@ fn compute_add_end_to_end() {
         assert_eq!(state.outputs.len(), 1, "expected 1 output");
         let out = &state.outputs[0];
         assert_eq!(out.shape, vec![4i64], "output shape mismatch");
-        assert_eq!(out.data, vec![11.0, 22.0, 33.0, 44.0], "output values wrong");
+        assert_eq!(
+            out.data,
+            vec![11.0, 22.0, 33.0, 44.0],
+            "output values wrong"
+        );
     });
 }
 
@@ -416,7 +421,9 @@ fn compute_add_end_to_end() {
 fn compute_add_broadcast() {
     use mock_kernel_ctx::*;
     use onnx_runtime_ep_cpu::kernels::add::AddKernel;
-    use onnx_runtime_ep_plugin::compute::{CompiledKernelEntry, ExportedComputeInfo, ShapeInference};
+    use onnx_runtime_ep_plugin::compute::{
+        CompiledKernelEntry, ExportedComputeInfo, ShapeInference,
+    };
     use onnx_runtime_ir::DataType;
 
     let api = mock_ort_api();
@@ -484,7 +491,12 @@ fn l1_nm_exported_symbols() {
 
     // Run `nm --dynamic --defined-only --extern-only`
     let output = std::process::Command::new("nm")
-        .args(["--dynamic", "--defined-only", "--extern-only", "--format=posix"])
+        .args([
+            "--dynamic",
+            "--defined-only",
+            "--extern-only",
+            "--format=posix",
+        ])
         .arg(&path)
         .output()
         .expect("`nm` not found — install binutils");
@@ -628,8 +640,7 @@ fn l2_fail_closed_unsupported_api_version() {
     }
 
     let path = find_cdylib();
-    let lib = unsafe { Library::new(&path) }
-        .unwrap_or_else(|e| panic!("dlopen failed: {e}"));
+    let lib = unsafe { Library::new(&path) }.unwrap_or_else(|e| panic!("dlopen failed: {e}"));
 
     type CreateFn = unsafe extern "C" fn(
         *const std::ffi::c_char,

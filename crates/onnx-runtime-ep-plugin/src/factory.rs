@@ -78,8 +78,9 @@ where
         // Try to create an error status using an older API version for error
         // reporting. If that also fails, return null + 0 factories.
         let fallback_api = unsafe { (get_api.unwrap())(1) }; // v1 always has CreateStatus
-        if let Some(create_status) =
-            (!fallback_api.is_null()).then(|| unsafe { (*fallback_api).CreateStatus }).flatten()
+        if let Some(create_status) = (!fallback_api.is_null())
+            .then(|| unsafe { (*fallback_api).CreateStatus })
+            .flatten()
         {
             let msg = c"EP plugin requires ORT API version 27 but host does not support it. \
                        Plugin will not load (fail-closed).";
@@ -102,9 +103,7 @@ where
     unsafe { set_host_api(api) };
 
     if max_factories == 0 || out_factories.is_null() || out_num.is_null() {
-        return fail_status(
-            "CreateEpFactories: out_factories is null or max_factories is 0",
-        );
+        return fail_status("CreateEpFactories: out_factories is null or max_factories is 0");
     }
 
     // Create a temporary EP to get the name.
@@ -112,7 +111,8 @@ where
     let name = ep.name().to_string();
     drop(ep);
 
-    let name_cstr = CString::new(name.as_str()).unwrap_or_else(|_| CString::new("nxrt_ep").unwrap());
+    let name_cstr =
+        CString::new(name.as_str()).unwrap_or_else(|_| CString::new("nxrt_ep").unwrap());
     let vendor_cstr = CString::new("nxrt").unwrap();
     let version_cstr = CString::new("0.1.0").unwrap();
 
@@ -164,9 +164,7 @@ where
 /// # Safety
 ///
 /// `factory` must be a pointer returned by `create_ep_factories`.
-pub unsafe fn release_ep_factory(
-    factory: *mut ort::OrtEpFactory,
-) -> *mut ort::OrtStatus {
+pub unsafe fn release_ep_factory(factory: *mut ort::OrtEpFactory) -> *mut ort::OrtStatus {
     if factory.is_null() {
         return ok_status();
     }
@@ -179,9 +177,7 @@ pub unsafe fn release_ep_factory(
 
 // ─── OrtEpFactory callbacks ─────────────────────────────────────────────────
 
-unsafe extern "C" fn factory_get_name(
-    factory: *const ort::OrtEpFactory,
-) -> *const c_char {
+unsafe extern "C" fn factory_get_name(factory: *const ort::OrtEpFactory) -> *const c_char {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if factory.is_null() {
             return c"unknown".as_ptr();
@@ -192,9 +188,7 @@ unsafe extern "C" fn factory_get_name(
     result.unwrap_or(c"unknown".as_ptr())
 }
 
-unsafe extern "C" fn factory_get_vendor(
-    factory: *const ort::OrtEpFactory,
-) -> *const c_char {
+unsafe extern "C" fn factory_get_vendor(factory: *const ort::OrtEpFactory) -> *const c_char {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if factory.is_null() {
             return c"unknown".as_ptr();
@@ -205,16 +199,12 @@ unsafe extern "C" fn factory_get_vendor(
     result.unwrap_or(c"unknown".as_ptr())
 }
 
-unsafe extern "C" fn factory_get_vendor_id(
-    _factory: *const ort::OrtEpFactory,
-) -> u32 {
+unsafe extern "C" fn factory_get_vendor_id(_factory: *const ort::OrtEpFactory) -> u32 {
     // No PCI vendor ID for CPU EP; return 0.
     0
 }
 
-unsafe extern "C" fn factory_get_version(
-    factory: *const ort::OrtEpFactory,
-) -> *const c_char {
+unsafe extern "C" fn factory_get_version(factory: *const ort::OrtEpFactory) -> *const c_char {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if factory.is_null() {
             return c"0.0.0".as_ptr();
@@ -301,19 +291,17 @@ unsafe extern "C" fn factory_get_supported_devices(
 
             let mut ep_device: *mut ort::OrtEpDevice = ptr::null_mut();
             let status = unsafe {
-                create_ep_device(
-                    factory,
-                    hw_device,
-                    ep_metadata,
-                    ep_options,
-                    &mut ep_device,
-                )
+                create_ep_device(factory, hw_device, ep_metadata, ep_options, &mut ep_device)
             };
 
             // Release KVPs (CreateEpDevice copies them per the doc).
             if let Some(release) = release_kvp {
-                if !ep_metadata.is_null() { unsafe { release(ep_metadata) }; }
-                if !ep_options.is_null() { unsafe { release(ep_options) }; }
+                if !ep_metadata.is_null() {
+                    unsafe { release(ep_metadata) };
+                }
+                if !ep_options.is_null() {
+                    unsafe { release(ep_options) };
+                }
             }
 
             if !status.is_null() {
@@ -342,9 +330,7 @@ unsafe extern "C" fn factory_get_supported_devices(
             let create_mem_info_v2 = match unsafe { (*api).CreateMemoryInfo_V2 } {
                 Some(f) => f,
                 None => {
-                    return fail_status(
-                        "GetSupportedDevices: CreateMemoryInfo_V2 not available",
-                    );
+                    return fail_status("GetSupportedDevices: CreateMemoryInfo_V2 not available");
                 }
             };
 
@@ -353,12 +339,12 @@ unsafe extern "C" fn factory_get_supported_devices(
             let status = unsafe {
                 create_mem_info_v2(
                     c"Cpu".as_ptr(),
-                    ort::OrtMemoryInfoDeviceType_CPU,   // device_type
-                    0,                                   // vendor_id (generic)
-                    0,                                   // device_id
-                    ort::OrtDeviceMemoryType_DEFAULT,    // mem_type
-                    0,                                   // alignment (default)
-                    ort::OrtDeviceAllocator,             // allocator_type
+                    ort::OrtMemoryInfoDeviceType_CPU, // device_type
+                    0,                                // vendor_id (generic)
+                    0,                                // device_id
+                    ort::OrtDeviceMemoryType_DEFAULT, // mem_type
+                    0,                                // alignment (default)
+                    ort::OrtDeviceAllocator,          // allocator_type
                     &mut mem_info,
                 )
             };
@@ -366,9 +352,7 @@ unsafe extern "C" fn factory_get_supported_devices(
                 return status;
             }
             if mem_info.is_null() {
-                return fail_status(
-                    "GetSupportedDevices: CreateMemoryInfo_V2 returned null",
-                );
+                return fail_status("GetSupportedDevices: CreateMemoryInfo_V2 returned null");
             }
 
             // EpDevice_AddAllocatorInfo stores the OrtMemoryInfo pointer inside
@@ -429,10 +413,7 @@ unsafe extern "C" fn factory_create_ep(
     result.unwrap_or_else(|_| fail_status("CreateEp: internal panic"))
 }
 
-unsafe extern "C" fn factory_release_ep(
-    _factory: *mut ort::OrtEpFactory,
-    ep: *mut ort::OrtEp,
-) {
+unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *mut ort::OrtEp) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if ep.is_null() {
             return;
@@ -480,9 +461,7 @@ unsafe extern "C" fn factory_release_allocator(
 }
 
 /// CPU EP is not stream-aware.
-unsafe extern "C" fn factory_is_stream_aware(
-    _factory: *const ort::OrtEpFactory,
-) -> bool {
+unsafe extern "C" fn factory_is_stream_aware(_factory: *const ort::OrtEpFactory) -> bool {
     false
 }
 

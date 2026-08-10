@@ -37,9 +37,7 @@ impl OutboundGraphReader {
     ///
     /// `graph_ptr` must be a valid `OrtGraph*` from ORT, and the host ORT API
     /// must have been initialized via [`crate::status::set_host_api`].
-    pub unsafe fn from_ort_graph(
-        graph_ptr: *const ort::OrtGraph,
-    ) -> Result<Self, String> {
+    pub unsafe fn from_ort_graph(graph_ptr: *const ort::OrtGraph) -> Result<Self, String> {
         let api = crate::status::host_api();
         if api.is_null() {
             return Err("host ORT API not initialized".into());
@@ -149,9 +147,8 @@ impl OutboundGraphReader {
         }
 
         // Read initializers and copy small int64 tensors into owned data.
-        let initializer_int64 = unsafe {
-            Self::read_initializers_int64(api, graph_ptr).unwrap_or_default()
-        };
+        let initializer_int64 =
+            unsafe { Self::read_initializers_int64(api, graph_ptr).unwrap_or_default() };
 
         // Second pass: create nodes with proper edges and attributes.
         for (i, ort_node) in ort_nodes.iter().enumerate() {
@@ -207,10 +204,8 @@ impl OutboundGraphReader {
                 && let Some(axes_input_name) = node_input_names[i].get(1)
                 && let Some(axes_data) = initializer_int64.get(axes_input_name)
             {
-                node.attributes.insert(
-                    "axes".to_string(),
-                    Attribute::Ints(axes_data.clone()),
-                );
+                node.attributes
+                    .insert("axes".to_string(), Attribute::Ints(axes_data.clone()));
             }
 
             let nid = ir_graph.insert_node(node);
@@ -272,8 +267,7 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         graph: *const ort::OrtGraph,
     ) -> Result<usize, String> {
-        let f = unsafe { (*api).Graph_GetNumNodes }
-            .ok_or("OrtApi.Graph_GetNumNodes is null")?;
+        let f = unsafe { (*api).Graph_GetNumNodes }.ok_or("OrtApi.Graph_GetNumNodes is null")?;
         let mut count = 0usize;
         let status = unsafe { f(graph, &mut count) };
         Self::check(status)?;
@@ -286,8 +280,7 @@ impl OutboundGraphReader {
         out: *mut *const ort::OrtNode,
         count: usize,
     ) -> Result<(), String> {
-        let f = unsafe { (*api).Graph_GetNodes }
-            .ok_or("OrtApi.Graph_GetNodes is null")?;
+        let f = unsafe { (*api).Graph_GetNodes }.ok_or("OrtApi.Graph_GetNodes is null")?;
         let status = unsafe { f(graph, out, count) };
         Self::check(status)
     }
@@ -296,8 +289,7 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         graph: *const ort::OrtGraph,
     ) -> Result<usize, String> {
-        let f = unsafe { (*api).Graph_GetNumInputs }
-            .ok_or("OrtApi.Graph_GetNumInputs is null")?;
+        let f = unsafe { (*api).Graph_GetNumInputs }.ok_or("OrtApi.Graph_GetNumInputs is null")?;
         let mut count = 0usize;
         let status = unsafe { f(graph, &mut count) };
         Self::check(status)?;
@@ -310,8 +302,7 @@ impl OutboundGraphReader {
         out: *mut *const ort::OrtValueInfo,
         count: usize,
     ) -> Result<(), String> {
-        let f = unsafe { (*api).Graph_GetInputs }
-            .ok_or("OrtApi.Graph_GetInputs is null")?;
+        let f = unsafe { (*api).Graph_GetInputs }.ok_or("OrtApi.Graph_GetInputs is null")?;
         let status = unsafe { f(graph, out, count) };
         Self::check(status)
     }
@@ -320,8 +311,8 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         graph: *const ort::OrtGraph,
     ) -> Result<usize, String> {
-        let f = unsafe { (*api).Graph_GetNumOutputs }
-            .ok_or("OrtApi.Graph_GetNumOutputs is null")?;
+        let f =
+            unsafe { (*api).Graph_GetNumOutputs }.ok_or("OrtApi.Graph_GetNumOutputs is null")?;
         let mut count = 0usize;
         let status = unsafe { f(graph, &mut count) };
         Self::check(status)?;
@@ -334,8 +325,7 @@ impl OutboundGraphReader {
         out: *mut *const ort::OrtValueInfo,
         count: usize,
     ) -> Result<(), String> {
-        let f = unsafe { (*api).Graph_GetOutputs }
-            .ok_or("OrtApi.Graph_GetOutputs is null")?;
+        let f = unsafe { (*api).Graph_GetOutputs }.ok_or("OrtApi.Graph_GetOutputs is null")?;
         let status = unsafe { f(graph, out, count) };
         Self::check(status)
     }
@@ -344,8 +334,7 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         node: *const ort::OrtNode,
     ) -> Result<usize, String> {
-        let f = unsafe { (*api).Node_GetNumInputs }
-            .ok_or("OrtApi.Node_GetNumInputs is null")?;
+        let f = unsafe { (*api).Node_GetNumInputs }.ok_or("OrtApi.Node_GetNumInputs is null")?;
         let mut count = 0usize;
         let status = unsafe { f(node, &mut count) };
         Self::check(status)?;
@@ -358,8 +347,7 @@ impl OutboundGraphReader {
         out: *mut *const ort::OrtValueInfo,
         count: usize,
     ) -> Result<(), String> {
-        let f = unsafe { (*api).Node_GetInputs }
-            .ok_or("OrtApi.Node_GetInputs is null")?;
+        let f = unsafe { (*api).Node_GetInputs }.ok_or("OrtApi.Node_GetInputs is null")?;
         let status = unsafe { f(node, out, count) };
         Self::check(status)
     }
@@ -368,8 +356,7 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         node: *const ort::OrtNode,
     ) -> Result<usize, String> {
-        let f = unsafe { (*api).Node_GetNumOutputs }
-            .ok_or("OrtApi.Node_GetNumOutputs is null")?;
+        let f = unsafe { (*api).Node_GetNumOutputs }.ok_or("OrtApi.Node_GetNumOutputs is null")?;
         let mut count = 0usize;
         let status = unsafe { f(node, &mut count) };
         Self::check(status)?;
@@ -382,8 +369,7 @@ impl OutboundGraphReader {
         out: *mut *const ort::OrtValueInfo,
         count: usize,
     ) -> Result<(), String> {
-        let f = unsafe { (*api).Node_GetOutputs }
-            .ok_or("OrtApi.Node_GetOutputs is null")?;
+        let f = unsafe { (*api).Node_GetOutputs }.ok_or("OrtApi.Node_GetOutputs is null")?;
         let status = unsafe { f(node, out, count) };
         Self::check(status)
     }
@@ -392,38 +378,41 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         node: *const ort::OrtNode,
     ) -> Result<String, String> {
-        let f = unsafe { (*api).Node_GetOperatorType }
-            .ok_or("OrtApi.Node_GetOperatorType is null")?;
+        let f =
+            unsafe { (*api).Node_GetOperatorType }.ok_or("OrtApi.Node_GetOperatorType is null")?;
         let mut ptr: *const std::ffi::c_char = std::ptr::null();
         let status = unsafe { f(node, &mut ptr) };
         Self::check(status)?;
         if ptr.is_null() {
             return Err("Node_GetOperatorType returned null".into());
         }
-        Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        Ok(unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     unsafe fn node_domain(
         api: *const ort::OrtApi,
         node: *const ort::OrtNode,
     ) -> Result<String, String> {
-        let f = unsafe { (*api).Node_GetDomain }
-            .ok_or("OrtApi.Node_GetDomain is null")?;
+        let f = unsafe { (*api).Node_GetDomain }.ok_or("OrtApi.Node_GetDomain is null")?;
         let mut ptr: *const std::ffi::c_char = std::ptr::null();
         let status = unsafe { f(node, &mut ptr) };
         Self::check(status)?;
         if ptr.is_null() {
             return Ok(String::new());
         }
-        Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        Ok(unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     unsafe fn node_since_version(
         api: *const ort::OrtApi,
         node: *const ort::OrtNode,
     ) -> Result<i32, String> {
-        let f = unsafe { (*api).Node_GetSinceVersion }
-            .ok_or("OrtApi.Node_GetSinceVersion is null")?;
+        let f =
+            unsafe { (*api).Node_GetSinceVersion }.ok_or("OrtApi.Node_GetSinceVersion is null")?;
         let mut version: i32 = 0;
         let status = unsafe { f(node, &mut version) };
         Self::check(status)?;
@@ -434,15 +423,16 @@ impl OutboundGraphReader {
         api: *const ort::OrtApi,
         node: *const ort::OrtNode,
     ) -> Result<String, String> {
-        let f = unsafe { (*api).Node_GetName }
-            .ok_or("OrtApi.Node_GetName is null")?;
+        let f = unsafe { (*api).Node_GetName }.ok_or("OrtApi.Node_GetName is null")?;
         let mut ptr: *const std::ffi::c_char = std::ptr::null();
         let status = unsafe { f(node, &mut ptr) };
         Self::check(status)?;
         if ptr.is_null() {
             return Ok(String::new());
         }
-        Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        Ok(unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     /// Read dtype and shape from an `OrtValueInfo*`.
@@ -451,8 +441,8 @@ impl OutboundGraphReader {
         info: *const ort::OrtValueInfo,
     ) -> Result<(String, DataType, Shape), String> {
         // Get name.
-        let get_name = unsafe { (*api).GetValueInfoName }
-            .ok_or("OrtApi.GetValueInfoName is null")?;
+        let get_name =
+            unsafe { (*api).GetValueInfoName }.ok_or("OrtApi.GetValueInfoName is null")?;
         let mut name_ptr: *const std::ffi::c_char = ptr::null();
         let status = unsafe { get_name(info, &mut name_ptr) };
         Self::check(status)?;
@@ -465,8 +455,8 @@ impl OutboundGraphReader {
         };
 
         // Get type info.
-        let get_type_info = unsafe { (*api).GetValueInfoTypeInfo }
-            .ok_or("OrtApi.GetValueInfoTypeInfo is null")?;
+        let get_type_info =
+            unsafe { (*api).GetValueInfoTypeInfo }.ok_or("OrtApi.GetValueInfoTypeInfo is null")?;
         let mut type_info: *const ort::OrtTypeInfo = ptr::null();
         let status = unsafe { get_type_info(info, &mut type_info) };
         Self::check(status)?;
@@ -487,23 +477,22 @@ impl OutboundGraphReader {
         }
 
         // Get element type.
-        let get_elem_type = unsafe { (*api).GetTensorElementType }
-            .ok_or("OrtApi.GetTensorElementType is null")?;
+        let get_elem_type =
+            unsafe { (*api).GetTensorElementType }.ok_or("OrtApi.GetTensorElementType is null")?;
         let mut elem_type: ort::ONNXTensorElementDataType = 0;
         let status = unsafe { get_elem_type(tensor_info, &mut elem_type) };
         Self::check(status)?;
         let dtype = DataType::from_onnx(elem_type as i32).unwrap_or(DataType::Undefined);
 
         // Get dimensions.
-        let get_dims_count = unsafe { (*api).GetDimensionsCount }
-            .ok_or("OrtApi.GetDimensionsCount is null")?;
+        let get_dims_count =
+            unsafe { (*api).GetDimensionsCount }.ok_or("OrtApi.GetDimensionsCount is null")?;
         let mut dims_count = 0usize;
         let status = unsafe { get_dims_count(tensor_info, &mut dims_count) };
         Self::check(status)?;
 
         let shape = if dims_count > 0 {
-            let get_dims = unsafe { (*api).GetDimensions }
-                .ok_or("OrtApi.GetDimensions is null")?;
+            let get_dims = unsafe { (*api).GetDimensions }.ok_or("OrtApi.GetDimensions is null")?;
             let mut dims: Vec<i64> = vec![0; dims_count];
             let status = unsafe { get_dims(tensor_info, dims.as_mut_ptr(), dims_count) };
             Self::check(status)?;
@@ -544,18 +533,15 @@ impl OutboundGraphReader {
             return Ok(HashMap::new());
         }
 
-        let get_attrs = unsafe { (*api).Node_GetAttributes }
-            .ok_or("OrtApi.Node_GetAttributes is null")?;
+        let get_attrs =
+            unsafe { (*api).Node_GetAttributes }.ok_or("OrtApi.Node_GetAttributes is null")?;
         let mut attr_ptrs: Vec<*const ort::OrtOpAttr> = vec![ptr::null(); num_attrs];
         let status = unsafe { get_attrs(node, attr_ptrs.as_mut_ptr(), num_attrs) };
         Self::check(status)?;
 
-        let get_name = unsafe { (*api).OpAttr_GetName }
-            .ok_or("OrtApi.OpAttr_GetName is null")?;
-        let get_type = unsafe { (*api).OpAttr_GetType }
-            .ok_or("OrtApi.OpAttr_GetType is null")?;
-        let read_attr = unsafe { (*api).ReadOpAttr }
-            .ok_or("OrtApi.ReadOpAttr is null")?;
+        let get_name = unsafe { (*api).OpAttr_GetName }.ok_or("OrtApi.OpAttr_GetName is null")?;
+        let get_type = unsafe { (*api).OpAttr_GetType }.ok_or("OrtApi.OpAttr_GetType is null")?;
+        let read_attr = unsafe { (*api).ReadOpAttr }.ok_or("OrtApi.ReadOpAttr is null")?;
 
         let mut result = HashMap::with_capacity(num_attrs);
 
@@ -580,9 +566,7 @@ impl OutboundGraphReader {
             let status = unsafe { get_type(attr_ptr, &mut attr_type) };
             Self::check(status)?;
 
-            let attr_value = unsafe {
-                Self::read_attr_value(read_attr, attr_ptr, attr_type)
-            };
+            let attr_value = unsafe { Self::read_attr_value(read_attr, attr_ptr, attr_type) };
 
             if let Some(value) = attr_value {
                 result.insert(name, value);
@@ -753,19 +737,18 @@ impl OutboundGraphReader {
 
         let get_init_val = unsafe { (*api).ValueInfo_GetInitializerValue }
             .ok_or("OrtApi.ValueInfo_GetInitializerValue is null")?;
-        let get_name = unsafe { (*api).GetValueInfoName }
-            .ok_or("OrtApi.GetValueInfoName is null")?;
+        let get_name =
+            unsafe { (*api).GetValueInfoName }.ok_or("OrtApi.GetValueInfoName is null")?;
 
-        let get_type_info = unsafe { (*api).GetValueInfoTypeInfo }
-            .ok_or("OrtApi.GetValueInfoTypeInfo is null")?;
+        let get_type_info =
+            unsafe { (*api).GetValueInfoTypeInfo }.ok_or("OrtApi.GetValueInfoTypeInfo is null")?;
         let cast_tensor = unsafe { (*api).CastTypeInfoToTensorInfo }
             .ok_or("OrtApi.CastTypeInfoToTensorInfo is null")?;
-        let get_elem_type = unsafe { (*api).GetTensorElementType }
-            .ok_or("OrtApi.GetTensorElementType is null")?;
-        let get_dims_count = unsafe { (*api).GetDimensionsCount }
-            .ok_or("OrtApi.GetDimensionsCount is null")?;
-        let get_data = unsafe { (*api).GetTensorData }
-            .ok_or("OrtApi.GetTensorData is null")?;
+        let get_elem_type =
+            unsafe { (*api).GetTensorElementType }.ok_or("OrtApi.GetTensorElementType is null")?;
+        let get_dims_count =
+            unsafe { (*api).GetDimensionsCount }.ok_or("OrtApi.GetDimensionsCount is null")?;
+        let get_data = unsafe { (*api).GetTensorData }.ok_or("OrtApi.GetTensorData is null")?;
         let get_tensor_shape = unsafe { (*api).GetTensorTypeAndShape }
             .ok_or("OrtApi.GetTensorTypeAndShape is null")?;
         let get_shape_elem_count = unsafe { (*api).GetTensorShapeElementCount }
@@ -836,9 +819,7 @@ impl OutboundGraphReader {
 
             // Get element count from the value's shape info.
             let mut val_shape: *mut ort::OrtTensorTypeAndShapeInfo = ptr::null_mut();
-            let status = unsafe {
-                get_tensor_shape(ort_value.cast_mut(), &mut val_shape)
-            };
+            let status = unsafe { get_tensor_shape(ort_value.cast_mut(), &mut val_shape) };
             if !status.is_null() || val_shape.is_null() {
                 Self::check(status).ok();
                 continue;
@@ -863,9 +844,7 @@ impl OutboundGraphReader {
             }
 
             // Copy into owned Vec<i64>.
-            let slice = unsafe {
-                std::slice::from_raw_parts(data_ptr.cast::<i64>(), elem_count)
-            };
+            let slice = unsafe { std::slice::from_raw_parts(data_ptr.cast::<i64>(), elem_count) };
             result.insert(name, slice.to_vec());
         }
 
@@ -881,9 +860,7 @@ impl OutboundGraphReader {
         let api = crate::status::host_api();
         let message = if !api.is_null() {
             // SAFETY: api is valid (set during CreateEpFactories).
-            let msg_ptr = unsafe {
-                (*api).GetErrorMessage.map(|f| f(status))
-            };
+            let msg_ptr = unsafe { (*api).GetErrorMessage.map(|f| f(status)) };
             let msg = msg_ptr
                 .filter(|&p| !p.is_null())
                 .map(|p| {

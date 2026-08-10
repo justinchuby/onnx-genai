@@ -102,10 +102,7 @@ macro_rules! skip_if_missing {
         match $resource {
             Some(v) => v,
             None => {
-                eprintln!(
-                    "\n*** SKIPPED: {} ***\n",
-                    $msg
-                );
+                eprintln!("\n*** SKIPPED: {} ***\n", $msg);
                 return;
             }
         }
@@ -138,13 +135,14 @@ unsafe fn get_ort_api(lib: &libloading::Library) -> *const ort::OrtApi {
 /// `api` and `status` must be valid (or null for status).
 unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &str) {
     if !status.is_null() {
-        let get_msg = unsafe { (*api).GetErrorMessage }
-            .expect("GetErrorMessage not in OrtApi");
+        let get_msg = unsafe { (*api).GetErrorMessage }.expect("GetErrorMessage not in OrtApi");
         let msg_ptr = unsafe { get_msg(status) };
         let msg = if msg_ptr.is_null() {
             "(no message)".to_owned()
         } else {
-            unsafe { CStr::from_ptr(msg_ptr) }.to_string_lossy().into_owned()
+            unsafe { CStr::from_ptr(msg_ptr) }
+                .to_string_lossy()
+                .into_owned()
         };
         if let Some(release) = unsafe { (*api).ReleaseStatus } {
             unsafe { release(status) };
@@ -213,10 +211,8 @@ fn ort_api_sanity() {
 #[test]
 fn ort_register_ep_library() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
-    let ort_lib_dir = skip_if_missing!(
-        find_ort_lib_dir(),
-        "ort_register_ep_library: ORT not found"
-    );
+    let ort_lib_dir =
+        skip_if_missing!(find_ort_lib_dir(), "ort_register_ep_library: ORT not found");
     let ep_lib_path = skip_if_missing!(
         find_ep_cdylib(),
         "ort_register_ep_library: EP cdylib not found; run cargo build -p onnx-runtime-ep-cpu-plugin"
@@ -229,11 +225,8 @@ fn ort_register_ep_library() {
     unsafe {
         let mut env: *mut ort::OrtEnv = ptr::null_mut();
         let logid = CString::new("nxrt_reg_test").unwrap();
-        let status = ((*api).CreateEnv.unwrap())(
-            ort::ORT_LOGGING_LEVEL_WARNING,
-            logid.as_ptr(),
-            &mut env,
-        );
+        let status =
+            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
         check_status(api, status, "CreateEnv");
 
         let reg_name = CString::new("cpu_ep").unwrap();
@@ -284,11 +277,8 @@ fn ort_loads_our_ep_and_runs_model() {
         // Stage 1: Env
         let mut env: *mut ort::OrtEnv = ptr::null_mut();
         let logid = CString::new("nxrt_e2e").unwrap();
-        let status = ((*api).CreateEnv.unwrap())(
-            ort::ORT_LOGGING_LEVEL_WARNING,
-            logid.as_ptr(),
-            &mut env,
-        );
+        let status =
+            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
         check_status(api, status, "CreateEnv");
         eprintln!("✓ Stage 1: CreateEnv");
 
@@ -323,7 +313,10 @@ fn ort_loads_our_ep_and_runs_model() {
                 }
             }
         }
-        assert!(!our_device.is_null(), "EP 'cpu_ep' not in GetEpDevices result");
+        assert!(
+            !our_device.is_null(),
+            "EP 'cpu_ep' not in GetEpDevices result"
+        );
         eprintln!("✓ Stage 3b: Found 'cpu_ep' in device list");
 
         // Stage 4: SessionOptions + AppendEP
@@ -347,7 +340,8 @@ fn ort_loads_our_ep_and_runs_model() {
         // Stage 5: CreateSession
         let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
         let mut session: *mut ort::OrtSession = ptr::null_mut();
-        let status = ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
+        let status =
+            ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
         check_status(api, status, "CreateSession");
         eprintln!("✓ Stage 5: CreateSession");
 
@@ -369,7 +363,8 @@ fn ort_loads_our_ep_and_runs_model() {
             mem_info,
             x_data.as_mut_ptr().cast(),
             4 * std::mem::size_of::<f32>(),
-            shape.as_ptr(), 2,
+            shape.as_ptr(),
+            2,
             ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             &mut x_val,
         );
@@ -380,7 +375,8 @@ fn ort_loads_our_ep_and_runs_model() {
             mem_info,
             y_data.as_mut_ptr().cast(),
             4 * std::mem::size_of::<f32>(),
-            shape.as_ptr(), 2,
+            shape.as_ptr(),
+            2,
             ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             &mut y_val,
         );
@@ -414,7 +410,10 @@ fn ort_loads_our_ep_and_runs_model() {
         eprintln!("  Got:      {result:?}");
         eprintln!("  Expected: {expected:?}");
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "output[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "output[{i}] = {got}, want {want}"
+            );
         }
         eprintln!("✓ Stage 7: Output values correct");
 
@@ -469,17 +468,16 @@ fn ort_unsupported_op_declines_not_crashes() {
     unsafe {
         let mut env: *mut ort::OrtEnv = ptr::null_mut();
         let logid = CString::new("nxrt_neg_test").unwrap();
-        let status = ((*api).CreateEnv.unwrap())(
-            ort::ORT_LOGGING_LEVEL_WARNING,
-            logid.as_ptr(),
-            &mut env,
-        );
+        let status =
+            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
         check_status(api, status, "CreateEnv");
 
         let reg_name = CString::new("cpu_ep_neg").unwrap();
         let ep_path_c = CString::new(ep_lib_path.to_str().unwrap()).unwrap();
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
-            env, reg_name.as_ptr(), ep_path_c.as_ptr(),
+            env,
+            reg_name.as_ptr(),
+            ep_path_c.as_ptr(),
         );
         check_status(api, status, "RegisterExecutionProviderLibrary");
 
@@ -498,7 +496,10 @@ fn ort_unsupported_op_declines_not_crashes() {
                 our_device = dev;
             }
         }
-        assert!(!our_device.is_null(), "EP 'cpu_ep' not found in device list");
+        assert!(
+            !our_device.is_null(),
+            "EP 'cpu_ep' not found in device list"
+        );
 
         let mut session_options: *mut ort::OrtSessionOptions = ptr::null_mut();
         let status = ((*api).CreateSessionOptions.unwrap())(&mut session_options);
@@ -506,33 +507,50 @@ fn ort_unsupported_op_declines_not_crashes() {
 
         let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
         let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
-            session_options, env, devices_arr.as_ptr(), 1,
-            ptr::null(), ptr::null(), 0,
+            session_options,
+            env,
+            devices_arr.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+            0,
         );
         check_status(api, status, "SessionOptionsAppendExecutionProvider_V2");
 
         // CreateSession with unsupported-op model: should succeed (ORT falls back to default EP)
         let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
         let mut session: *mut ort::OrtSession = ptr::null_mut();
-        let status = ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
+        let status =
+            ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
         check_status(api, status, "CreateSession(unsupported-op model)");
-        assert!(!session.is_null(), "Session is null for unsupported-op model");
-        eprintln!("✓ CreateSession succeeded for unsupported-op model (EP declined, ORT fell back)");
+        assert!(
+            !session.is_null(),
+            "Session is null for unsupported-op model"
+        );
+        eprintln!(
+            "✓ CreateSession succeeded for unsupported-op model (EP declined, ORT fell back)"
+        );
 
         // Run must also succeed (ORT's default EP handles NonZero)
         let mut input_data: [f32; 4] = [0.0, 1.0, 0.0, 2.0];
         let shape: [i64; 2] = [1, 4];
         let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
         let status = ((*api).CreateCpuMemoryInfo.unwrap())(
-            ort::OrtDeviceAllocator, ort::OrtMemTypeDefault, &mut mem_info,
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
         );
         check_status(api, status, "CreateCpuMemoryInfo");
 
         let mut input_val: *mut ort::OrtValue = ptr::null_mut();
         let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
-            mem_info, input_data.as_mut_ptr().cast(),
-            4 * std::mem::size_of::<f32>(), shape.as_ptr(), 2,
-            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &mut input_val,
+            mem_info,
+            input_data.as_mut_ptr().cast(),
+            4 * std::mem::size_of::<f32>(),
+            shape.as_ptr(),
+            2,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            &mut input_val,
         );
         check_status(api, status, "CreateTensor(input)");
 
@@ -541,9 +559,14 @@ fn ort_unsupported_op_declines_not_crashes() {
         let inputs: [*const ort::OrtValue; 1] = [input_val];
         let mut output: *mut ort::OrtValue = ptr::null_mut();
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 1,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run(unsupported-op model)");
         eprintln!("✓ Run succeeded for unsupported-op model (no crash, correct fallback)");
@@ -574,9 +597,16 @@ fn diag_ort_ep_api_nullcheck() {
     let api = unsafe { get_ort_api(&lib) };
     macro_rules! check_fn {
         ($field:ident) => {
-            eprintln!("  {:60}: {}", stringify!($field),
-                if unsafe { (*api).$field }.is_some() { "PRESENT" } else { "NULL" });
-        }
+            eprintln!(
+                "  {:60}: {}",
+                stringify!($field),
+                if unsafe { (*api).$field }.is_some() {
+                    "PRESENT"
+                } else {
+                    "NULL"
+                }
+            );
+        };
     }
     eprintln!("ORT 1.27 API function pointer audit:");
     check_fn!(CreateEnv);
@@ -644,13 +674,21 @@ unsafe fn conformance_setup(
     // Env
     let mut env: *mut ort::OrtEnv = ptr::null_mut();
     let logid = std::ffi::CString::new(format!("nxrt_{reg_name}")).unwrap();
-    let status = unsafe { ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env) };
+    let status = unsafe {
+        ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env)
+    };
     unsafe { check_status(api, status, "CreateEnv") };
 
     // Register EP library
     let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
     let ep_path_c = std::ffi::CString::new(ep_lib_path.to_str().unwrap()).unwrap();
-    let status = unsafe { ((*api).RegisterExecutionProviderLibrary.unwrap())(env, reg_name_c.as_ptr(), ep_path_c.as_ptr()) };
+    let status = unsafe {
+        ((*api).RegisterExecutionProviderLibrary.unwrap())(
+            env,
+            reg_name_c.as_ptr(),
+            ep_path_c.as_ptr(),
+        )
+    };
     unsafe { check_status(api, status, "RegisterExecutionProviderLibrary") };
 
     // Find our device
@@ -666,13 +704,15 @@ unsafe fn conformance_setup(
         let name_ptr = unsafe { ep_name_fn(dev) };
         // EpDevice_EpName returns the name the EP declares internally ("cpu_ep"),
         // which is independent of the registration key used in RegisterExecutionProviderLibrary.
-        if !name_ptr.is_null()
-            && unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy() == "cpu_ep"
+        if !name_ptr.is_null() && unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy() == "cpu_ep"
         {
             our_device = dev;
         }
     }
-    assert!(!our_device.is_null(), "EP 'cpu_ep' not found in GetEpDevices result (reg_name={reg_name})");
+    assert!(
+        !our_device.is_null(),
+        "EP 'cpu_ep' not found in GetEpDevices result (reg_name={reg_name})"
+    );
 
     // SessionOptions + append EP
     let mut session_options: *mut ort::OrtSessionOptions = ptr::null_mut();
@@ -680,16 +720,25 @@ unsafe fn conformance_setup(
     unsafe { check_status(api, status, "CreateSessionOptions") };
 
     let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
-    let status = unsafe { ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
-        session_options, env, devices_arr.as_ptr(), 1,
-        ptr::null(), ptr::null(), 0,
-    ) };
+    let status = unsafe {
+        ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
+            session_options,
+            env,
+            devices_arr.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
     unsafe { check_status(api, status, "SessionOptionsAppendExecutionProvider_V2") };
 
     // CreateSession
     let model_c = std::ffi::CString::new(model_path.to_str().unwrap()).unwrap();
     let mut session: *mut ort::OrtSession = ptr::null_mut();
-    let status = unsafe { ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session) };
+    let status = unsafe {
+        ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session)
+    };
     unsafe { check_status(api, status, "CreateSession") };
 
     Some((lib, api, env, session_options, session))
@@ -723,7 +772,9 @@ unsafe fn make_float_tensor(
     unsafe {
         let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
         let status = ((*api).CreateCpuMemoryInfo.unwrap())(
-            ort::OrtDeviceAllocator, ort::OrtMemTypeDefault, &mut mem_info,
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
         );
         check_status(api, status, "CreateCpuMemoryInfo");
 
@@ -732,7 +783,8 @@ unsafe fn make_float_tensor(
             mem_info,
             data.as_mut_ptr().cast(),
             std::mem::size_of_val(data),
-            shape.as_ptr(), shape.len(),
+            shape.as_ptr(),
+            shape.len(),
             ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             &mut val,
         );
@@ -750,7 +802,9 @@ unsafe fn make_int32_tensor(
     unsafe {
         let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
         let status = ((*api).CreateCpuMemoryInfo.unwrap())(
-            ort::OrtDeviceAllocator, ort::OrtMemTypeDefault, &mut mem_info,
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
         );
         check_status(api, status, "CreateCpuMemoryInfo");
 
@@ -759,7 +813,8 @@ unsafe fn make_int32_tensor(
             mem_info,
             data.as_mut_ptr().cast(),
             std::mem::size_of_val(data),
-            shape.as_ptr(), shape.len(),
+            shape.as_ptr(),
+            shape.len(),
             ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
             &mut val,
         );
@@ -781,15 +836,12 @@ unsafe fn make_int32_tensor(
 fn conformance_add_broadcast() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_bc", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_add_broadcast — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_add_broadcast — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -808,9 +860,14 @@ fn conformance_add_broadcast() {
         let mut output: *mut ort::OrtValue = ptr::null_mut();
 
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run");
         assert!(!output.is_null());
@@ -823,7 +880,10 @@ fn conformance_add_broadcast() {
         eprintln!("  Got:      {result:?}");
         eprintln!("  Expected: {expected:?}");
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "output[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "output[{i}] = {got}, want {want}"
+            );
         }
 
         ((*api).ReleaseValue.unwrap())(output);
@@ -849,15 +909,12 @@ fn conformance_add_broadcast() {
 fn conformance_chain_add_mul() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_chain", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_chain_add_mul — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_chain_add_mul — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -879,9 +936,14 @@ fn conformance_chain_add_mul() {
         let mut output: *mut ort::OrtValue = ptr::null_mut();
 
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 4,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            4,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run");
         assert!(!output.is_null());
@@ -895,7 +957,10 @@ fn conformance_chain_add_mul() {
         eprintln!("  Got:      {result:?}");
         eprintln!("  Expected: {expected:?}");
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "output[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "output[{i}] = {got}, want {want}"
+            );
         }
 
         ((*api).ReleaseValue.unwrap())(output);
@@ -925,9 +990,7 @@ fn conformance_matmul_2d() {
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_mm", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_matmul_2d — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_matmul_2d — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -946,9 +1009,14 @@ fn conformance_matmul_2d() {
         let mut output: *mut ort::OrtValue = ptr::null_mut();
 
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run");
         assert!(!output.is_null());
@@ -961,7 +1029,10 @@ fn conformance_matmul_2d() {
         eprintln!("  Got:      {result:?}");
         eprintln!("  Expected: {expected:?}");
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "output[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "output[{i}] = {got}, want {want}"
+            );
         }
 
         ((*api).ReleaseValue.unwrap())(output);
@@ -986,15 +1057,12 @@ fn conformance_matmul_2d() {
 fn conformance_mixed_partition() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/mixed_partition/model.onnx");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/mixed_partition/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_mix", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_mixed_partition — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_mixed_partition — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -1012,9 +1080,14 @@ fn conformance_mixed_partition() {
         let mut output: *mut ort::OrtValue = ptr::null_mut();
 
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run");
         assert!(!output.is_null(), "output is null");
@@ -1057,9 +1130,7 @@ fn conformance_add_int32() {
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_i32", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_add_int32 — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_add_int32 — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -1077,9 +1148,14 @@ fn conformance_add_int32() {
         let mut output: *mut ort::OrtValue = ptr::null_mut();
 
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run");
         assert!(!output.is_null());
@@ -1119,15 +1195,12 @@ fn conformance_add_int32() {
 fn conformance_add_dynamic_dim() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/add_dynamic_dim/model.onnx");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_dynamic_dim/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_dyn", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_add_dynamic_dim — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_add_dynamic_dim — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -1146,25 +1219,32 @@ fn conformance_add_dynamic_dim() {
         let mut output: *mut ort::OrtValue = ptr::null_mut();
 
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         // Accept either success (check values) or a clean ORT error.
         // A crash or incorrect output is the actual failure we guard against.
         if !status.is_null() {
             let get_msg = (*api).GetErrorMessage.expect("GetErrorMessage");
-            let msg = CStr::from_ptr(get_msg(status)).to_string_lossy().into_owned();
+            let msg = CStr::from_ptr(get_msg(status))
+                .to_string_lossy()
+                .into_owned();
             ((*api).ReleaseStatus.unwrap())(status);
-            eprintln!(
-                "  Run returned ORT error (acceptable for dynamic-dim path): {msg}"
-            );
+            eprintln!("  Run returned ORT error (acceptable for dynamic-dim path): {msg}");
             // Must be a real ORT error, not a crash-followed-by-null.
             assert!(
                 !msg.is_empty(),
                 "status non-null but error message is empty — likely memory corruption"
             );
-            eprintln!("✓ conformance_add_dynamic_dim: dynamic dim handled with clean error (no crash)");
+            eprintln!(
+                "✓ conformance_add_dynamic_dim: dynamic dim handled with clean error (no crash)"
+            );
         } else {
             assert!(!output.is_null());
             let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
@@ -1175,10 +1255,15 @@ fn conformance_add_dynamic_dim() {
             eprintln!("  Got:      {result:?}");
             eprintln!("  Expected: {expected:?}");
             for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
-                assert!((got - want).abs() < 1e-6, "output[{i}] = {got}, want {want}");
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "output[{i}] = {got}, want {want}"
+                );
             }
             ((*api).ReleaseValue.unwrap())(output);
-            eprintln!("✓ conformance_add_dynamic_dim: dynamic dim handled correctly with correct output");
+            eprintln!(
+                "✓ conformance_add_dynamic_dim: dynamic dim handled correctly with correct output"
+            );
         }
 
         ((*api).ReleaseValue.unwrap())(x_val);
@@ -1204,9 +1289,7 @@ fn conformance_multiple_run_calls() {
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_runs", &model_path) })
     else {
-        eprintln!(
-            "*** SKIPPED: conformance_multiple_run_calls — ORT or EP cdylib not found ***"
-        );
+        eprintln!("*** SKIPPED: conformance_multiple_run_calls — ORT or EP cdylib not found ***");
         return;
     };
 
@@ -1223,9 +1306,14 @@ fn conformance_multiple_run_calls() {
         let inputs1: [*const ort::OrtValue; 2] = [xv1, yv1];
         let mut out1: *mut ort::OrtValue = ptr::null_mut();
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs1.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut out1,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs1.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut out1,
         );
         check_status(api, status, "Run(1)");
         assert!(!out1.is_null());
@@ -1235,7 +1323,10 @@ fn conformance_multiple_run_calls() {
         let r1 = std::slice::from_raw_parts(dp as *const f32, 4);
         let e1: [f32; 4] = [6.0, 8.0, 10.0, 12.0];
         for (i, (got, want)) in r1.iter().zip(e1.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "Run1 output[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "Run1 output[{i}] = {got}, want {want}"
+            );
         }
         eprintln!("  Run 1 ok: {r1:?}");
 
@@ -1247,9 +1338,14 @@ fn conformance_multiple_run_calls() {
         let inputs2: [*const ort::OrtValue; 2] = [xv2, yv2];
         let mut out2: *mut ort::OrtValue = ptr::null_mut();
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs2.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut out2,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs2.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut out2,
         );
         check_status(api, status, "Run(2)");
         assert!(!out2.is_null());
@@ -1259,7 +1355,10 @@ fn conformance_multiple_run_calls() {
         let r2 = std::slice::from_raw_parts(dp2 as *const f32, 4);
         let e2: [f32; 4] = [10.0, 10.0, 10.0, 10.0];
         for (i, (got, want)) in r2.iter().zip(e2.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-6, "Run2 output[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "Run2 output[{i}] = {got}, want {want}"
+            );
         }
         eprintln!("  Run 2 ok: {r2:?}");
 
@@ -1314,12 +1413,17 @@ fn conformance_two_sessions() {
 
         let mut env: *mut ort::OrtEnv = ptr::null_mut();
         let logid = std::ffi::CString::new("nxrt_two_sess").unwrap();
-        let status = ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
+        let status =
+            ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
         check_status(api, status, "CreateEnv");
 
         let reg_name = std::ffi::CString::new("cpu_ep_2sess").unwrap();
         let ep_path_c = std::ffi::CString::new(ep_lib_path.to_str().unwrap()).unwrap();
-        let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr(), ep_path_c.as_ptr());
+        let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
+            env,
+            reg_name.as_ptr(),
+            ep_path_c.as_ptr(),
+        );
         check_status(api, status, "RegisterExecutionProviderLibrary");
 
         let mut ep_devices: *const *const ort::OrtEpDevice = ptr::null();
@@ -1332,13 +1436,14 @@ fn conformance_two_sessions() {
         for i in 0..num_devices {
             let dev = *ep_devices.add(i);
             let name_ptr = ep_name_fn(dev);
-            if !name_ptr.is_null()
-                && CStr::from_ptr(name_ptr).to_string_lossy() == "cpu_ep"
-            {
+            if !name_ptr.is_null() && CStr::from_ptr(name_ptr).to_string_lossy() == "cpu_ep" {
                 our_device = dev;
             }
         }
-        assert!(!our_device.is_null(), "EP 'cpu_ep' not found in GetEpDevices (reg_name=cpu_ep_2sess; EpDevice_EpName returns factory GetName, not registration key)");
+        assert!(
+            !our_device.is_null(),
+            "EP 'cpu_ep' not found in GetEpDevices (reg_name=cpu_ep_2sess; EpDevice_EpName returns factory GetName, not registration key)"
+        );
 
         // Build session A
         let mut opts_a: *mut ort::OrtSessionOptions = ptr::null_mut();
@@ -1346,7 +1451,13 @@ fn conformance_two_sessions() {
         check_status(api, status, "CreateSessionOptions(A)");
         let devs: [*const ort::OrtEpDevice; 1] = [our_device];
         let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
-            opts_a, env, devs.as_ptr(), 1, ptr::null(), ptr::null(), 0,
+            opts_a,
+            env,
+            devs.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+            0,
         );
         check_status(api, status, "AppendEP(A)");
         let model_a_c = std::ffi::CString::new(model_a.to_str().unwrap()).unwrap();
@@ -1360,7 +1471,13 @@ fn conformance_two_sessions() {
         let status = ((*api).CreateSessionOptions.unwrap())(&mut opts_b);
         check_status(api, status, "CreateSessionOptions(B)");
         let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
-            opts_b, env, devs.as_ptr(), 1, ptr::null(), ptr::null(), 0,
+            opts_b,
+            env,
+            devs.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+            0,
         );
         check_status(api, status, "AppendEP(B)");
         let model_b_c = std::ffi::CString::new(model_b.to_str().unwrap()).unwrap();
@@ -1382,8 +1499,16 @@ fn conformance_two_sessions() {
         let yva = make_float_tensor(api, &mut ya, &shape14);
         let ins_a: [*const ort::OrtValue; 2] = [xva, yva];
         let mut out_a: *mut ort::OrtValue = ptr::null_mut();
-        let status = ((*api).Run.unwrap())(sess_a, ptr::null(), in_names.as_ptr(), ins_a.as_ptr(), 2,
-            out_names.as_ptr(), 1, &mut out_a);
+        let status = ((*api).Run.unwrap())(
+            sess_a,
+            ptr::null(),
+            in_names.as_ptr(),
+            ins_a.as_ptr(),
+            2,
+            out_names.as_ptr(),
+            1,
+            &mut out_a,
+        );
         check_status(api, status, "Run(A)");
         assert!(!out_a.is_null());
         let mut dpa: *mut std::ffi::c_void = ptr::null_mut();
@@ -1403,8 +1528,16 @@ fn conformance_two_sessions() {
         let yvb = make_float_tensor(api, &mut yb, &shape3);
         let ins_b: [*const ort::OrtValue; 2] = [xvb, yvb];
         let mut out_b: *mut ort::OrtValue = ptr::null_mut();
-        let status = ((*api).Run.unwrap())(sess_b, ptr::null(), in_names.as_ptr(), ins_b.as_ptr(), 2,
-            out_names.as_ptr(), 1, &mut out_b);
+        let status = ((*api).Run.unwrap())(
+            sess_b,
+            ptr::null(),
+            in_names.as_ptr(),
+            ins_b.as_ptr(),
+            2,
+            out_names.as_ptr(),
+            1,
+            &mut out_b,
+        );
         check_status(api, status, "Run(B)");
         assert!(!out_b.is_null());
         let mut dpb: *mut std::ffi::c_void = ptr::null_mut();
@@ -1454,7 +1587,8 @@ fn conformance_two_sessions() {
 fn conformance_matmul_batched_nd() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_mm3d", &model_path) })
@@ -1466,13 +1600,12 @@ fn conformance_matmul_batched_nd() {
     unsafe {
         // A [2,3,4]
         let mut a_data: [f32; 24] = [
-            1.0, 2.0, 3.0, 4.0,   5.0, 6.0, 7.0, 8.0,   9.0, 10.0, 11.0, 12.0,
-            0.0, 1.0, 0.0, 1.0,   2.0, 0.0, 2.0, 0.0,   1.0, 1.0,  1.0,  1.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 0.0, 1.0, 0.0, 1.0, 2.0,
+            0.0, 2.0, 0.0, 1.0, 1.0, 1.0, 1.0,
         ];
         // B [2,4,2]
         let mut b_data: [f32; 16] = [
-            1.0, 0.0,  0.0, 1.0,  1.0, 0.0,  0.0, 1.0,
-            2.0, 0.0,  0.0, 2.0,  2.0, 0.0,  0.0, 2.0,
+            1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0, 2.0,
         ];
         let a_shape: [i64; 3] = [2, 3, 4];
         let b_shape: [i64; 3] = [2, 4, 2];
@@ -1485,9 +1618,14 @@ fn conformance_matmul_batched_nd() {
         let inputs: [*const ort::OrtValue; 2] = [a_val, b_val];
         let mut output: *mut ort::OrtValue = ptr::null_mut();
         let status = ((*api).Run.unwrap())(
-            session, ptr::null(),
-            input_names.as_ptr(), inputs.as_ptr(), 2,
-            output_names.as_ptr(), 1, &mut output,
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
         );
         check_status(api, status, "Run");
         assert!(!output.is_null());
@@ -1497,7 +1635,9 @@ fn conformance_matmul_batched_nd() {
         check_status(api, status, "GetTensorMutableData");
         let result = std::slice::from_raw_parts(data_ptr as *const f32, 12);
         // C[0] = [[4,6],[12,14],[20,22]]  C[1] = [[0,4],[8,0],[4,4]]
-        let expected: [f32; 12] = [4.0, 6.0, 12.0, 14.0, 20.0, 22.0, 0.0, 4.0, 8.0, 0.0, 4.0, 4.0];
+        let expected: [f32; 12] = [
+            4.0, 6.0, 12.0, 14.0, 20.0, 22.0, 0.0, 4.0, 8.0, 0.0, 4.0, 4.0,
+        ];
         eprintln!("  Got:      {result:?}");
         eprintln!("  Expected: {expected:?}");
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
@@ -1539,7 +1679,9 @@ fn stress_register_run_unregister_cycles() {
     let ep_lib_path = {
         let p = find_ep_cdylib();
         if p.is_none() {
-            eprintln!("*** SKIPPED: stress_register_run_unregister_cycles — EP cdylib not found ***");
+            eprintln!(
+                "*** SKIPPED: stress_register_run_unregister_cycles — EP cdylib not found ***"
+            );
             return;
         }
         p.unwrap()
@@ -1547,7 +1689,9 @@ fn stress_register_run_unregister_cycles() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
     if !model_path.exists() {
-        eprintln!("*** SKIPPED: stress_register_run_unregister_cycles — add_1x4 fixture missing ***");
+        eprintln!(
+            "*** SKIPPED: stress_register_run_unregister_cycles — add_1x4 fixture missing ***"
+        );
         return;
     }
 
@@ -1566,11 +1710,19 @@ fn stress_register_run_unregister_cycles() {
             // Env
             let logid = CString::new(format!("stress_{cycle}")).unwrap();
             let mut env: *mut ort::OrtEnv = ptr::null_mut();
-            let status = ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
+            let status = ((*api).CreateEnv.unwrap())(
+                ort::ORT_LOGGING_LEVEL_WARNING,
+                logid.as_ptr(),
+                &mut env,
+            );
             check_status(api, status, &format!("CreateEnv[{cycle}]"));
 
             // Register
-            let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(env, reg_c.as_ptr(), ep_path_c.as_ptr());
+            let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
+                env,
+                reg_c.as_ptr(),
+                ep_path_c.as_ptr(),
+            );
             check_status(api, status, &format!("Register[{cycle}]"));
 
             // GetEpDevices — device must have correct DeviceType every cycle.
@@ -1599,12 +1751,19 @@ fn stress_register_run_unregister_cycles() {
             check_status(api, status, &format!("CreateSessionOptions[{cycle}]"));
             let devs: [*const ort::OrtEpDevice; 1] = [our_device];
             let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
-                sess_opts, env, devs.as_ptr(), 1, ptr::null(), ptr::null(), 0,
+                sess_opts,
+                env,
+                devs.as_ptr(),
+                1,
+                ptr::null(),
+                ptr::null(),
+                0,
             );
             check_status(api, status, &format!("AppendEP[{cycle}]"));
             let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
             let mut session: *mut ort::OrtSession = ptr::null_mut();
-            let status = ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), sess_opts, &mut session);
+            let status =
+                ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), sess_opts, &mut session);
             check_status(api, status, &format!("CreateSession[{cycle}]"));
 
             // Run: [1,2,3,4] + [5,6,7,8] = [6,8,10,12]
@@ -1618,9 +1777,14 @@ fn stress_register_run_unregister_cycles() {
             let inputs: [*const ort::OrtValue; 2] = [xv, yv];
             let mut output: *mut ort::OrtValue = ptr::null_mut();
             let status = ((*api).Run.unwrap())(
-                session, ptr::null(),
-                in_names.as_ptr(), inputs.as_ptr(), 2,
-                out_names.as_ptr(), 1, &mut output,
+                session,
+                ptr::null(),
+                in_names.as_ptr(),
+                inputs.as_ptr(),
+                2,
+                out_names.as_ptr(),
+                1,
+                &mut output,
             );
             check_status(api, status, &format!("Run[{cycle}]"));
             assert!(!output.is_null(), "cycle {cycle}: output is null");
@@ -1650,6 +1814,7 @@ fn stress_register_run_unregister_cycles() {
         eprintln!("  ✓ cycle {}/{CYCLES}", cycle + 1);
     }
 
-    eprintln!("\n✅ stress_register_run_unregister_cycles: {CYCLES} cycles PASSED — use-after-free regression clear");
+    eprintln!(
+        "\n✅ stress_register_run_unregister_cycles: {CYCLES} cycles PASSED — use-after-free regression clear"
+    );
 }
-

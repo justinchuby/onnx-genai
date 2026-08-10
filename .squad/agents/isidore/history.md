@@ -45,3 +45,37 @@ behaviour.
   are resolved.
 - Decision doc written to `.squad/decisions/inbox/isidore-ep-export-guards.md`.
 
+
+## 2026-08-10 — Clippy lint cleanup (lib.rs test body)
+
+Two clippy errors remained in the `export_ep_factories!` macro test block after
+the N3 panic-guard fix landed:
+
+**Error 1** `unused-mut` at `lib.rs:184`
+- `let mut out_num: usize = 0;` — `out_num` is never mutated in the test (it
+  is read via `assert_eq!` but never assigned after construction).
+- Fix: removed `mut`.
+
+**Error 2** `diverging_sub_expression` at `lib.rs:189`
+- The original code used `let _: Box<dyn ExecutionProvider> = panic!(...)` to
+  produce a typed diverging expression inside `catch_unwind`. Clippy flags a
+  `panic!` (which diverges) used as the RHS of a `let`-binding as a
+  "sub-expression diverges". The type ascription was unnecessary — the closure
+  body only needs to panic, not return a value.
+- Fix: replaced with a bare `panic!(...)` statement. No safety check weakened;
+  `catch_unwind` still absorbs the panic and the `result.is_err()` assertion
+  still validates the guard behaviour.
+- The macro body itself (`CreateEpFactories`, `ReleaseEpFactory`) was NOT
+  touched; both panic guards, null checks, and the ORT API version check are
+  intact.
+
+**Clippy result** (post-fix):
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.78s
+```
+No errors from `lib.rs`. `ep.rs:499` (Deckard's `manual_dangling_ptr`) was
+already resolved concurrently and does not appear.
+
+**Test results**:
+- `cargo test -p onnx-runtime-ep-plugin --lib` → 82 passed, 0 failed
+- `cargo test -p onnx-runtime-ep-cpu-plugin` → 21 passed (6+15), 0 failed

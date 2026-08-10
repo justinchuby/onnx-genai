@@ -27,15 +27,15 @@
 
 use onnx_genai_ort_sys as ort;
 
-pub mod factory;
-pub mod ep;
 pub mod compute;
+pub mod ep;
+pub mod factory;
 pub mod graph_reader;
 pub mod kernel_ctx;
 pub mod status;
 
-pub use factory::ExportedFactory;
 pub use ep::ExportedEp;
+pub use factory::ExportedFactory;
 
 /// Re-export of `onnx_genai_ort_sys` for use by the `export_ep_factories!` macro.
 #[doc(hidden)]
@@ -117,20 +117,18 @@ macro_rules! export_ep_factories {
             // AssertUnwindSafe closure without borrowing `self`.
             let out_factories_raw = out_factories;
             let out_num_raw = out_num;
-            let result = ::std::panic::catch_unwind(
-                ::std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: caller guarantees pointer validity per ORT ABI.
-                    unsafe {
-                        $crate::factory::create_ep_factories(
-                            api_base,
-                            out_factories_raw,
-                            max_factories,
-                            out_num_raw,
-                            $constructor,
-                        )
-                    }
-                }),
-            );
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: caller guarantees pointer validity per ORT ABI.
+                unsafe {
+                    $crate::factory::create_ep_factories(
+                        api_base,
+                        out_factories_raw,
+                        max_factories,
+                        out_num_raw,
+                        $constructor,
+                    )
+                }
+            }));
             match result {
                 ::std::result::Result::Ok(status) => status,
                 ::std::result::Result::Err(_panic_payload) => {
@@ -181,14 +179,19 @@ mod tests {
     /// produced. This is the N3 regression test.
     #[test]
     fn panicking_constructor_caught_and_zero_factories_returned() {
-        let mut out_num: usize = 0; // will be verified to stay 0 after panic guard
+        let out_num: usize = 0; // will be verified to stay 0 after panic guard
 
         // Step 1: confirm catch_unwind absorbs the panic (as the macro guard does).
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _: Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider> =
-                panic!("simulated constructor panic for N3 guard test");
+            // Directly panic — no type ascription needed; the diverging value is
+            // not assigned to anything, so clippy's diverging_sub_expression is
+            // not triggered.
+            panic!("simulated constructor panic for N3 guard test");
         }));
-        assert!(result.is_err(), "catch_unwind must capture the constructor panic");
+        assert!(
+            result.is_err(),
+            "catch_unwind must capture the constructor panic"
+        );
 
         // Simulate the macro's Err branch — out_num stays at 0 and we produce a status.
         // (out_num was already 0; this simulates the guard leaving it at 0.)
@@ -213,4 +216,3 @@ mod tests {
         assert!(result.is_ok(), "panic_to_fail_status must not itself panic");
     }
 }
-

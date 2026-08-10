@@ -82,13 +82,25 @@ pub enum ShapeInference {
         noop_with_empty_axes: bool,
     },
     /// Opset-18+ reduction where axes come from input[1].
-    ReductionFromInput { keepdims: bool, noop_with_empty_axes: bool },
+    ReductionFromInput {
+        keepdims: bool,
+        noop_with_empty_axes: bool,
+    },
     /// Conv with explicit spatial axis rules.
-    Conv { out_channels: usize, per_axis: Vec<ConvSpatialAxis> },
+    Conv {
+        out_channels: usize,
+        per_axis: Vec<ConvSpatialAxis>,
+    },
     /// MultiHeadAttention: [B,S,hidden], optional present_key/value.
-    MultiHeadAttention { num_heads: usize, num_outputs: usize },
+    MultiHeadAttention {
+        num_heads: usize,
+        num_outputs: usize,
+    },
     /// GroupQueryAttention.
-    GroupQueryAttention { num_heads: usize, kv_num_heads: usize },
+    GroupQueryAttention {
+        num_heads: usize,
+        kv_num_heads: usize,
+    },
     /// RotaryEmbedding — output same shape as input[0].
     RotaryEmbedding,
     /// Softmax, LayerNormalization, etc.: shape-preserving single output.
@@ -110,26 +122,58 @@ impl ShapeInference {
     fn for_op_domain(op_type: &str, domain: &str) -> Self {
         match op_type {
             // ── Elementwise broadcast ops ─────────────────────────────────
-            "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor"
-            | "Equal" | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual"
-            | "BitShift" | "BitwiseAnd" | "BitwiseOr" | "BitwiseXor"
-            | "Max" | "Min" | "Mean" | "Sum" | "Where" => Self::ElementwiseBroadcast,
+            "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
+            | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
+            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where" => {
+                Self::ElementwiseBroadcast
+            }
 
             // ── Unary / shape-preserving ──────────────────────────────────
-            "Relu" | "Sigmoid" | "Tanh" | "Exp" | "Log" | "Sqrt" | "Abs" | "Neg"
-            | "Ceil" | "Floor" | "Round" | "Reciprocal" | "Not" | "Sign" | "Erf"
-            | "Gelu" | "HardSigmoid" | "HardSwish" | "LeakyRelu" | "Elu" | "Selu"
-            | "Softplus" | "Softsign" | "Cast" | "Identity" | "Dropout"
-            | "IsNaN" | "IsInf" | "BitCount" | "Bernoulli"
+            "Relu"
+            | "Sigmoid"
+            | "Tanh"
+            | "Exp"
+            | "Log"
+            | "Sqrt"
+            | "Abs"
+            | "Neg"
+            | "Ceil"
+            | "Floor"
+            | "Round"
+            | "Reciprocal"
+            | "Not"
+            | "Sign"
+            | "Erf"
+            | "Gelu"
+            | "HardSigmoid"
+            | "HardSwish"
+            | "LeakyRelu"
+            | "Elu"
+            | "Selu"
+            | "Softplus"
+            | "Softsign"
+            | "Cast"
+            | "Identity"
+            | "Dropout"
+            | "IsNaN"
+            | "IsInf"
+            | "BitCount"
+            | "Bernoulli"
             | "NegativeLogLikelihoodLoss" => Self::SameAsInput(0),
 
             // ── Shape-preserving normalisation ops ───────────────────────
-            "Softmax" | "LogSoftmax" | "Hardmax" | "BatchNormalization"
-            | "InstanceNormalization" | "LpNormalization" => Self::SameAsInput(0),
+            "Softmax"
+            | "LogSoftmax"
+            | "Hardmax"
+            | "BatchNormalization"
+            | "InstanceNormalization"
+            | "LpNormalization" => Self::SameAsInput(0),
 
             // ── LayerNorm family: 1–3 outputs, shape of input[0] ─────────
-            "LayerNormalization" | "RMSNormalization"
-            | "SkipLayerNormalization" | "SkipSimplifiedLayerNormalization"
+            "LayerNormalization"
+            | "RMSNormalization"
+            | "SkipLayerNormalization"
+            | "SkipSimplifiedLayerNormalization"
             | "SimplifiedLayerNormalization" => Self::SameAsInput(0),
 
             // ── Matrix multiply ───────────────────────────────────────────
@@ -141,19 +185,33 @@ impl ShapeInference {
             "Gather" => Self::Gather { axis: 0 },
             "GatherND" => Self::GatherND { batch_dims: 0 },
             "GatherBlockQuantized" => Self::GatherBlockQuantized,
-            "Shape" => Self::ShapeOp { start: 0, end: None },
+            "Shape" => Self::ShapeOp {
+                start: 0,
+                end: None,
+            },
             "Reshape" => Self::ReshapeData { allowzero: false },
             "Slice" => Self::SliceData,
             "RotaryEmbedding" => Self::RotaryEmbedding,
 
             // ── Ops that require attributes — Declined ────────────────────
-            "Squeeze" | "Unsqueeze"
-            | "ReduceMean" | "ReduceSum" | "ReduceProd" | "ReduceMax"
-            | "ReduceMin" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
-            | "ReduceLogSumExp" | "ReduceSumSquare"
-            | "Conv" | "ConvTranspose" | "ConvInteger"
+            "Squeeze"
+            | "Unsqueeze"
+            | "ReduceMean"
+            | "ReduceSum"
+            | "ReduceProd"
+            | "ReduceMax"
+            | "ReduceMin"
+            | "ReduceL1"
+            | "ReduceL2"
+            | "ReduceLogSum"
+            | "ReduceLogSumExp"
+            | "ReduceSumSquare"
+            | "Conv"
+            | "ConvTranspose"
+            | "ConvInteger"
             | "Gemm"
-            | "MultiHeadAttention" | "GroupQueryAttention" => Self::Declined {
+            | "MultiHeadAttention"
+            | "GroupQueryAttention" => Self::Declined {
                 op_type: op_type.to_string(),
                 domain: domain.to_string(),
             },
@@ -169,39 +227,60 @@ impl ShapeInference {
     /// of its inputs (may be empty slices for absent optional inputs).
     ///
     /// `num_outputs` is how many output slots the node has in the graph.
-    pub fn for_node(
-        node: &Node,
-        input_shapes: &[Vec<usize>],
-        num_outputs: usize,
-    ) -> Self {
+    pub fn for_node(node: &Node, input_shapes: &[Vec<usize>], num_outputs: usize) -> Self {
         let op = node.op_type.as_str();
         let domain = node.domain.as_str();
         let opset = node.version.unwrap_or(0);
 
-        let int_attr = |name: &str| -> Option<i64> {
-            node.attr(name)?.as_int()
-        };
-        let ints_attr = |name: &str| -> Option<Vec<i64>> {
-            Some(node.attr(name)?.as_ints()?.to_vec())
-        };
+        let int_attr = |name: &str| -> Option<i64> { node.attr(name)?.as_int() };
+        let ints_attr =
+            |name: &str| -> Option<Vec<i64>> { Some(node.attr(name)?.as_ints()?.to_vec()) };
 
         match op {
             // ── Elementwise ───────────────────────────────────────────────
-            "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor"
-            | "Equal" | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual"
-            | "BitShift" | "BitwiseAnd" | "BitwiseOr" | "BitwiseXor"
-            | "Max" | "Min" | "Mean" | "Sum" | "Where" => Self::ElementwiseBroadcast,
+            "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
+            | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
+            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where" => {
+                Self::ElementwiseBroadcast
+            }
 
             // ── Unary / shape-preserving ──────────────────────────────────
-            "Relu" | "Sigmoid" | "Tanh" | "Exp" | "Log" | "Sqrt" | "Abs" | "Neg"
-            | "Ceil" | "Floor" | "Round" | "Reciprocal" | "Not" | "Sign" | "Erf"
-            | "Gelu" | "HardSigmoid" | "HardSwish" | "LeakyRelu" | "Elu" | "Selu"
-            | "Softplus" | "Softsign" | "Cast" | "Identity" | "Dropout"
-            | "IsNaN" | "IsInf" | "BitCount" | "Bernoulli"
-            | "Softmax" | "LogSoftmax" | "Hardmax"
-            | "BatchNormalization" | "InstanceNormalization" | "LpNormalization" => {
-                Self::SameAsInput(0)
-            }
+            "Relu"
+            | "Sigmoid"
+            | "Tanh"
+            | "Exp"
+            | "Log"
+            | "Sqrt"
+            | "Abs"
+            | "Neg"
+            | "Ceil"
+            | "Floor"
+            | "Round"
+            | "Reciprocal"
+            | "Not"
+            | "Sign"
+            | "Erf"
+            | "Gelu"
+            | "HardSigmoid"
+            | "HardSwish"
+            | "LeakyRelu"
+            | "Elu"
+            | "Selu"
+            | "Softplus"
+            | "Softsign"
+            | "Cast"
+            | "Identity"
+            | "Dropout"
+            | "IsNaN"
+            | "IsInf"
+            | "BitCount"
+            | "Bernoulli"
+            | "Softmax"
+            | "LogSoftmax"
+            | "Hardmax"
+            | "BatchNormalization"
+            | "InstanceNormalization"
+            | "LpNormalization" => Self::SameAsInput(0),
 
             // ── LayerNorm / SkipLayerNorm family ──────────────────────────
             "LayerNormalization" | "RMSNormalization" | "SimplifiedLayerNormalization" => {
@@ -293,10 +372,17 @@ impl ShapeInference {
                 let keepdims = int_attr("keepdims").unwrap_or(1) != 0;
                 let noop_with_empty_axes = int_attr("noop_with_empty_axes").unwrap_or(0) != 0;
                 if opset >= 18 {
-                    Self::ReductionFromInput { keepdims, noop_with_empty_axes }
+                    Self::ReductionFromInput {
+                        keepdims,
+                        noop_with_empty_axes,
+                    }
                 } else {
                     let axes = ints_attr("axes");
-                    Self::Reduction { keepdims, axes, noop_with_empty_axes }
+                    Self::Reduction {
+                        keepdims,
+                        axes,
+                        noop_with_empty_axes,
+                    }
                 }
             }
 
@@ -315,12 +401,18 @@ impl ShapeInference {
             // ── Attention family (com.microsoft) ──────────────────────────
             "MultiHeadAttention" => {
                 let num_heads = int_attr("num_heads").unwrap_or(0) as usize;
-                Self::MultiHeadAttention { num_heads, num_outputs }
+                Self::MultiHeadAttention {
+                    num_heads,
+                    num_outputs,
+                }
             }
             "GroupQueryAttention" => {
                 let num_heads = int_attr("num_heads").unwrap_or(0) as usize;
                 let kv_num_heads = int_attr("kv_num_heads").unwrap_or(num_heads as i64) as usize;
-                Self::GroupQueryAttention { num_heads, kv_num_heads }
+                Self::GroupQueryAttention {
+                    num_heads,
+                    kv_num_heads,
+                }
             }
             "RotaryEmbedding" => Self::RotaryEmbedding,
 
@@ -335,14 +427,22 @@ impl ShapeInference {
 fn is_reduction(op: &str) -> bool {
     matches!(
         op,
-        "ReduceMean" | "ReduceSum" | "ReduceProd" | "ReduceMax" | "ReduceMin"
-        | "ReduceL1" | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp"
-        | "ReduceSumSquare"
+        "ReduceMean"
+            | "ReduceSum"
+            | "ReduceProd"
+            | "ReduceMax"
+            | "ReduceMin"
+            | "ReduceL1"
+            | "ReduceL2"
+            | "ReduceLogSum"
+            | "ReduceLogSumExp"
+            | "ReduceSumSquare"
     )
 }
 
 fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference> {
-    let auto_pad = node.attr("auto_pad")
+    let auto_pad = node
+        .attr("auto_pad")
         .and_then(|a| a.as_str())
         .unwrap_or("NOTSET");
     if auto_pad != "NOTSET" {
@@ -359,7 +459,8 @@ fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference
     // weight[0] first dim is out_channels.
     let out_channels = input_shapes.get(1).and_then(|w| w.first()).copied()?;
 
-    let kernel_shape: Vec<usize> = node.attr("kernel_shape")
+    let kernel_shape: Vec<usize> = node
+        .attr("kernel_shape")
         .and_then(|a| a.as_ints())
         .map(|v| v.iter().map(|&x| x as usize).collect())
         .or_else(|| {
@@ -372,17 +473,20 @@ fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference
             }
         })?;
 
-    let strides: Vec<usize> = node.attr("strides")
+    let strides: Vec<usize> = node
+        .attr("strides")
         .and_then(|a| a.as_ints())
         .map(|v| v.iter().map(|&x| x as usize).collect())
         .unwrap_or_else(|| vec![1; spatial_dims]);
 
-    let dilations: Vec<usize> = node.attr("dilations")
+    let dilations: Vec<usize> = node
+        .attr("dilations")
         .and_then(|a| a.as_ints())
         .map(|v| v.iter().map(|&x| x as usize).collect())
         .unwrap_or_else(|| vec![1; spatial_dims]);
 
-    let pads: Vec<usize> = node.attr("pads")
+    let pads: Vec<usize> = node
+        .attr("pads")
         .and_then(|a| a.as_ints())
         .map(|v| v.iter().map(|&x| x as usize).collect())
         .unwrap_or_else(|| vec![0; 2 * spatial_dims]);
@@ -405,7 +509,10 @@ fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference
         })
         .collect();
 
-    Some(ShapeInference::Conv { out_channels, per_axis })
+    Some(ShapeInference::Conv {
+        out_channels,
+        per_axis,
+    })
 }
 
 /// A compiled kernel bundled with the metadata needed to drive execution
@@ -576,22 +683,21 @@ unsafe extern "C" fn compute_execute(
             if routing.input_sources.len() != exported.entries.len()
                 || routing.output_sinks.len() != exported.entries.len()
             {
-                return fail_status(
-                    "Compute: routing table length mismatch with entries",
-                );
+                return fail_status("Compute: routing table length mismatch with entries");
             }
 
             // Allocate intermediate buffer slots (uninitialized until written).
-            let mut intermediates: Vec<Option<IntermediateBuf>> =
-                (0..routing.num_intermediate_buffers).map(|_| None).collect();
+            let mut intermediates: Vec<Option<IntermediateBuf>> = (0..routing
+                .num_intermediate_buffers)
+                .map(|_| None)
+                .collect();
 
             for (node_idx, entry) in exported.entries.iter().enumerate() {
                 let sources = &routing.input_sources[node_idx];
                 let sinks = &routing.output_sinks[node_idx];
 
                 // Gather input views for this node.
-                let mut kernel_inputs: Vec<TensorView<'_>> =
-                    Vec::with_capacity(sources.len());
+                let mut kernel_inputs: Vec<TensorView<'_>> = Vec::with_capacity(sources.len());
                 for src in sources {
                     match src {
                         NodeInputSource::Ort(i) => {
@@ -618,23 +724,19 @@ unsafe extern "C" fn compute_execute(
                             let view = buf.view();
                             // Transmute lifetime to 'static so we can store in the
                             // Vec; we ensure the buf outlives this scope.
-                            let view: TensorView<'static> =
-                                unsafe { std::mem::transmute(view) };
+                            let view: TensorView<'static> = unsafe { std::mem::transmute(view) };
                             kernel_inputs.push(view);
                         }
                     }
                 }
 
                 // Infer output shapes.
-                let output_shapes =
-                    match infer_shapes(&entry.shape_inference, &kernel_inputs) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return fail_status(&format!(
-                                "Compute: shape inference failed: {e}"
-                            ));
-                        }
-                    };
+                let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return fail_status(&format!("Compute: shape inference failed: {e}"));
+                    }
+                };
 
                 // Execute — dispatch based on sinks.
                 // For outputs going to ORT we allocate via ORT API;
@@ -643,9 +745,7 @@ unsafe extern "C" fn compute_execute(
                 let mut buf_writes: Vec<(usize, Vec<usize>, DataType)> = Vec::new();
 
                 // We need to know which output slot → which sink.
-                for (out_slot, (shape, sink)) in
-                    output_shapes.iter().zip(sinks).enumerate()
-                {
+                for (out_slot, (shape, sink)) in output_shapes.iter().zip(sinks).enumerate() {
                     match sink {
                         NodeOutputSink::Ort(ort_idx) => {
                             match unsafe {
@@ -684,7 +784,12 @@ unsafe extern "C" fn compute_execute(
                     let strides = contiguous_strides(shape);
                     new_bufs.push((
                         *buf_idx,
-                        IntermediateBuf { data, shape: shape.clone(), strides, dtype: *dtype },
+                        IntermediateBuf {
+                            data,
+                            shape: shape.clone(),
+                            strides,
+                            dtype: *dtype,
+                        },
                     ));
                 }
 
@@ -706,12 +811,8 @@ unsafe extern "C" fn compute_execute(
                         .collect()
                 };
 
-                if let Err(e) =
-                    entry.kernel.execute(&kernel_inputs, &mut all_output_views)
-                {
-                    return fail_status(&format!(
-                        "Compute: kernel execution failed: {e}"
-                    ));
+                if let Err(e) = entry.kernel.execute(&kernel_inputs, &mut all_output_views) {
+                    return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
 
                 // Store new intermediate buffers.
@@ -731,9 +832,7 @@ unsafe extern "C" fn compute_execute(
             let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                 Ok(s) => s,
                 Err(e) => {
-                    return fail_status(&format!(
-                        "Compute: shape inference failed: {e}"
-                    ));
+                    return fail_status(&format!("Compute: shape inference failed: {e}"));
                 }
             };
             let mut owned_outputs = Vec::with_capacity(entry.num_outputs);
@@ -745,8 +844,7 @@ unsafe extern "C" fn compute_execute(
                     Err(e) => return fail_status(&format!("Compute: {e}")),
                 }
             }
-            let mut output_views: Vec<_> =
-                owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
+            let mut output_views: Vec<_> = owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
             if let Err(e) = entry.kernel.execute(&kernel_inputs, &mut output_views) {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }
@@ -773,9 +871,7 @@ fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
 
 /// Build a mutable TensorView from an IntermediateBuf (unsafe: caller ensures
 /// exclusive access and lifetime correctness).
-fn buf_view_mut(
-    buf: &mut IntermediateBuf,
-) -> onnx_runtime_ep_api::tensor::TensorMut<'_> {
+fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::TensorMut<'_> {
     use onnx_runtime_ep_api::tensor::{DevicePtrMut, TensorMut};
     TensorMut::new(
         DevicePtrMut(buf.data.as_mut_ptr().cast()),
@@ -841,10 +937,7 @@ fn infer_shapes(
 
         ShapeInference::MatMul => {
             if inputs.len() < 2 {
-                return Err(format!(
-                    "MatMul: expected ≥2 inputs, got {}",
-                    inputs.len()
-                ));
+                return Err(format!("MatMul: expected ≥2 inputs, got {}", inputs.len()));
             }
             let a = inputs[0].shape;
             let b = inputs[1].shape;
@@ -859,9 +952,7 @@ fn infer_shapes(
             let a = inputs[0].shape;
             let b = inputs[1].shape;
             if a.len() != 2 || b.len() != 2 {
-                return Err(format!(
-                    "Gemm: inputs must be 2-D, got {a:?} and {b:?}"
-                ));
+                return Err(format!("Gemm: inputs must be 2-D, got {a:?} and {b:?}"));
             }
             let m = if *trans_a { a[1] } else { a[0] };
             let n = if *trans_b { b[0] } else { b[1] };
@@ -917,7 +1008,10 @@ fn infer_shapes(
 
         ShapeInference::GatherND { batch_dims } => {
             if inputs.len() < 2 {
-                return Err(format!("GatherND: expected ≥2 inputs, got {}", inputs.len()));
+                return Err(format!(
+                    "GatherND: expected ≥2 inputs, got {}",
+                    inputs.len()
+                ));
             }
             let data = inputs[0].shape;
             let indices = inputs[1].shape;
@@ -970,8 +1064,7 @@ fn infer_shapes(
                 return Err("Shape: no inputs".into());
             }
             let rank = inputs[0].shape.len() as i64;
-            let s = normalise_axis(*start, inputs[0].shape.len())
-                .unwrap_or(0);
+            let s = normalise_axis(*start, inputs[0].shape.len()).unwrap_or(0);
             let e = if let Some(end_val) = end {
                 if *end_val < 0 {
                     (rank + end_val).max(0) as usize
@@ -1024,7 +1117,9 @@ fn infer_shapes(
                         a as usize
                     };
                     if ax >= out_rank {
-                        Err(format!("Unsqueeze: axis {a} out of range for output rank {out_rank}"))
+                        Err(format!(
+                            "Unsqueeze: axis {a} out of range for output rank {out_rank}"
+                        ))
                     } else {
                         Ok(ax)
                     }
@@ -1065,7 +1160,10 @@ fn infer_shapes(
                     0 if !allowzero => {
                         // Copy from input shape at same index.
                         let d = data_shape.get(i).copied().ok_or_else(|| {
-                            format!("Reshape: dim 0 at index {i} but input rank is {}", data_shape.len())
+                            format!(
+                                "Reshape: dim 0 at index {i} but input rank is {}",
+                                data_shape.len()
+                            )
                         })?;
                         out.push(d);
                         known_prod *= d;
@@ -1124,15 +1222,27 @@ fn infer_shapes(
             Ok(vec![out_shape])
         }
 
-        ShapeInference::Reduction { keepdims, axes, noop_with_empty_axes } => {
+        ShapeInference::Reduction {
+            keepdims,
+            axes,
+            noop_with_empty_axes,
+        } => {
             if inputs.is_empty() {
                 return Err("Reduction: no inputs".into());
             }
             let shape = inputs[0].shape;
-            Ok(vec![reduce_shape(shape, axes.as_deref(), *keepdims, *noop_with_empty_axes)?])
+            Ok(vec![reduce_shape(
+                shape,
+                axes.as_deref(),
+                *keepdims,
+                *noop_with_empty_axes,
+            )?])
         }
 
-        ShapeInference::ReductionFromInput { keepdims, noop_with_empty_axes } => {
+        ShapeInference::ReductionFromInput {
+            keepdims,
+            noop_with_empty_axes,
+        } => {
             if inputs.is_empty() {
                 return Err("ReductionFromInput: no inputs".into());
             }
@@ -1142,10 +1252,18 @@ fn infer_shapes(
             } else {
                 None
             };
-            Ok(vec![reduce_shape(shape, axes_opt.as_deref(), *keepdims, *noop_with_empty_axes)?])
+            Ok(vec![reduce_shape(
+                shape,
+                axes_opt.as_deref(),
+                *keepdims,
+                *noop_with_empty_axes,
+            )?])
         }
 
-        ShapeInference::Conv { out_channels, per_axis } => {
+        ShapeInference::Conv {
+            out_channels,
+            per_axis,
+        } => {
             if inputs.is_empty() {
                 return Err("Conv: no inputs".into());
             }
@@ -1172,7 +1290,10 @@ fn infer_shapes(
             Ok(vec![out])
         }
 
-        ShapeInference::MultiHeadAttention { num_heads, num_outputs } => {
+        ShapeInference::MultiHeadAttention {
+            num_heads,
+            num_outputs,
+        } => {
             // query: [B, S, hidden]
             // output[0]: same as query
             // output[1] present_key:   [B, num_heads, P+S, head_size]  (if present)
@@ -1191,11 +1312,16 @@ fn infer_shapes(
                 let b = q[0];
                 let s = q[1];
                 let hidden = if q.len() > 2 { q[2] } else { 0 };
-                let head_size = if *num_heads > 0 { hidden / num_heads } else { 0 };
+                let head_size = if *num_heads > 0 {
+                    hidden / num_heads
+                } else {
+                    0
+                };
                 // past_key is input[6] when present.
-                let past_seq = inputs.get(6).map(|v| {
-                    if v.shape.len() >= 3 { v.shape[2] } else { 0 }
-                }).unwrap_or(0);
+                let past_seq = inputs
+                    .get(6)
+                    .map(|v| if v.shape.len() >= 3 { v.shape[2] } else { 0 })
+                    .unwrap_or(0);
                 let present_shape = vec![b, *num_heads, past_seq + s, head_size];
                 for _ in 1..*num_outputs {
                     outputs.push(present_shape.clone());
@@ -1204,7 +1330,10 @@ fn infer_shapes(
             Ok(outputs)
         }
 
-        ShapeInference::GroupQueryAttention { num_heads, kv_num_heads } => {
+        ShapeInference::GroupQueryAttention {
+            num_heads,
+            kv_num_heads,
+        } => {
             if inputs.is_empty() {
                 return Err("GroupQueryAttention: no inputs".into());
             }
@@ -1215,11 +1344,16 @@ fn infer_shapes(
             let b = q[0];
             let s = q[1];
             let hidden = if q.len() > 2 { q[2] } else { 0 };
-            let head_size = if *num_heads > 0 { hidden / num_heads } else { 0 };
+            let head_size = if *num_heads > 0 {
+                hidden / num_heads
+            } else {
+                0
+            };
             let attn_out = q.to_vec();
-            let past_seq = inputs.get(3).map(|v| {
-                if v.shape.len() >= 3 { v.shape[2] } else { 0 }
-            }).unwrap_or(0);
+            let past_seq = inputs
+                .get(3)
+                .map(|v| if v.shape.len() >= 3 { v.shape[2] } else { 0 })
+                .unwrap_or(0);
             let present_shape = vec![b, *kv_num_heads, past_seq + s, head_size];
             Ok(vec![attn_out, present_shape.clone(), present_shape])
         }
@@ -1286,9 +1420,7 @@ fn matmul_output_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
             let mut batch_out: Vec<usize> = Vec::with_capacity(max_batch);
             for (x, y) in a_padded.zip(b_padded) {
                 if x != y && x != 1 && y != 1 {
-                    return Err(format!(
-                        "MatMul: incompatible batch dims: {a:?} vs {b:?}"
-                    ));
+                    return Err(format!("MatMul: incompatible batch dims: {a:?} vs {b:?}"));
                 }
                 batch_out.push(x.max(y));
             }
@@ -1348,10 +1480,7 @@ fn reduce_shape(
 /// `i64` elements.
 unsafe fn read_i64_tensor(view: &TensorView<'_>) -> Result<Vec<i64>, String> {
     if view.dtype != DataType::Int64 {
-        return Err(format!(
-            "expected Int64 tensor, got {:?}",
-            view.dtype
-        ));
+        return Err(format!("expected Int64 tensor, got {:?}", view.dtype));
     }
     if view.data.is_null() {
         return Err("tensor data pointer is null".into());
@@ -1394,8 +1523,12 @@ fn slice_output_shape(
         let mut end = ends.get(i).copied().unwrap_or(dim);
 
         // Negative indices.
-        if start < 0 { start += dim; }
-        if end < 0 { end += dim; }
+        if start < 0 {
+            start += dim;
+        }
+        if end < 0 {
+            end += dim;
+        }
 
         // Clamp.
         start = start.clamp(clamp_lo, clamp_hi);
@@ -1403,9 +1536,17 @@ fn slice_output_shape(
 
         let span = end - start;
         let count = if step > 0 {
-            if span <= 0 { 0 } else { (span + step - 1) / step }
+            if span <= 0 {
+                0
+            } else {
+                (span + step - 1) / step
+            }
         } else {
-            if span >= 0 { 0 } else { (-span + (-step) - 1) / (-step) }
+            if span >= 0 {
+                0
+            } else {
+                (-span + (-step) - 1) / (-step)
+            }
         };
         out[axis] = count.max(0) as usize;
     }
@@ -1451,9 +1592,10 @@ mod tests {
         )
     }
 
-    fn infer(strategy: &ShapeInference, inputs: &[TensorView<'_>])
-        -> Result<Vec<Vec<usize>>, String>
-    {
+    fn infer(
+        strategy: &ShapeInference,
+        inputs: &[TensorView<'_>],
+    ) -> Result<Vec<Vec<usize>>, String> {
         infer_shapes(strategy, inputs)
     }
 
@@ -1489,7 +1631,10 @@ mod tests {
         };
         let err = infer(&s, &[]).unwrap_err();
         assert!(err.contains("FooBar"), "error should mention op: {err}");
-        assert!(err.contains("some.domain"), "error should mention domain: {err}");
+        assert!(
+            err.contains("some.domain"),
+            "error should mention domain: {err}"
+        );
         assert!(err.contains("for_node"), "error should suggest fix: {err}");
     }
 
@@ -1497,7 +1642,8 @@ mod tests {
 
     #[test]
     fn elementwise_broadcast_same_shape() {
-        let s = [2usize, 3]; let st = [3i64, 1];
+        let s = [2usize, 3];
+        let st = [3i64, 1];
         let v1 = view(&s, &st);
         let v2 = view(&s, &st);
         let res = infer(&ShapeInference::ElementwiseBroadcast, &[v1, v2]).unwrap();
@@ -1507,24 +1653,30 @@ mod tests {
     #[test]
     fn elementwise_broadcast_numpy_rules() {
         // [3,1] × [1,4] → [3,4]
-        let s1 = [3usize, 1]; let st1 = [1i64, 1];
-        let s2 = [1usize, 4]; let st2 = [4i64, 1];
+        let s1 = [3usize, 1];
+        let st1 = [1i64, 1];
+        let s2 = [1usize, 4];
+        let st2 = [4i64, 1];
         let res = infer(
             &ShapeInference::ElementwiseBroadcast,
             &[view(&s1, &st1), view(&s2, &st2)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
     }
 
     #[test]
     fn elementwise_broadcast_scalar_and_vector() {
         // [] × [5] → [5]
-        let s_scalar: [usize; 0] = []; let st_scalar: [i64; 0] = [];
-        let s_vec = [5usize]; let st_vec = [1i64];
+        let s_scalar: [usize; 0] = [];
+        let st_scalar: [i64; 0] = [];
+        let s_vec = [5usize];
+        let st_vec = [1i64];
         let res = infer(
             &ShapeInference::ElementwiseBroadcast,
             &[view(&s_scalar, &st_scalar), view(&s_vec, &st_vec)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![5]]);
     }
 
@@ -1538,14 +1690,16 @@ mod tests {
 
     #[test]
     fn same_as_input_roundtrip() {
-        let s = [2usize, 3]; let st = [3i64, 1];
+        let s = [2usize, 3];
+        let st = [3i64, 1];
         let res = infer(&ShapeInference::SameAsInput(0), &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![2, 3]]);
     }
 
     #[test]
     fn same_as_input_oob_is_error() {
-        let s = [4usize]; let st = [1i64];
+        let s = [4usize];
+        let st = [1i64];
         let res = infer(&ShapeInference::SameAsInput(5), &[view(&s, &st)]);
         assert!(res.is_err());
         let msg = res.unwrap_err();
@@ -1554,11 +1708,13 @@ mod tests {
 
     #[test]
     fn same_as_input_multi_output() {
-        let s = [2usize, 3]; let st = [3i64, 1];
+        let s = [2usize, 3];
+        let st = [3i64, 1];
         let res = infer(
             &ShapeInference::SameAsInputMultiOutput { idx: 0, count: 3 },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res.len(), 3);
         assert!(res.iter().all(|r| r == &vec![2, 3]));
     }
@@ -1567,16 +1723,20 @@ mod tests {
 
     #[test]
     fn matmul_2d() {
-        let a = [3usize, 4]; let b = [4usize, 5];
-        let at = [4i64, 1]; let bt = [5i64, 1];
+        let a = [3usize, 4];
+        let b = [4usize, 5];
+        let at = [4i64, 1];
+        let bt = [5i64, 1];
         let res = infer(&ShapeInference::MatMul, &[view(&a, &at), view(&b, &bt)]).unwrap();
         assert_eq!(res, vec![vec![3, 5]]);
     }
 
     #[test]
     fn matmul_batched() {
-        let a = [2usize, 3, 4]; let b = [2usize, 4, 5];
-        let at = [12i64, 4, 1]; let bt = [20i64, 5, 1];
+        let a = [2usize, 3, 4];
+        let b = [2usize, 4, 5];
+        let at = [12i64, 4, 1];
+        let bt = [20i64, 5, 1];
         let res = infer(&ShapeInference::MatMul, &[view(&a, &at), view(&b, &bt)]).unwrap();
         assert_eq!(res, vec![vec![2, 3, 5]]);
     }
@@ -1584,25 +1744,31 @@ mod tests {
     #[test]
     fn matmul_batch_broadcast() {
         // [1, 3, 4] × [2, 4, 5] → [2, 3, 5]
-        let a = [1usize, 3, 4]; let b = [2usize, 4, 5];
-        let at = [12i64, 4, 1]; let bt = [20i64, 5, 1];
+        let a = [1usize, 3, 4];
+        let b = [2usize, 4, 5];
+        let at = [12i64, 4, 1];
+        let bt = [20i64, 5, 1];
         let res = infer(&ShapeInference::MatMul, &[view(&a, &at), view(&b, &bt)]).unwrap();
         assert_eq!(res, vec![vec![2, 3, 5]]);
     }
 
     #[test]
     fn matmul_1d_vector_dot() {
-        let a = [4usize]; let b = [4usize];
-        let at = [1i64]; let bt = [1i64];
+        let a = [4usize];
+        let b = [4usize];
+        let at = [1i64];
+        let bt = [1i64];
         let res = infer(&ShapeInference::MatMul, &[view(&a, &at), view(&b, &bt)]).unwrap();
-        assert_eq!(res, vec![vec![] as Vec<usize>]);  // scalar output
+        assert_eq!(res, vec![vec![] as Vec<usize>]); // scalar output
     }
 
     #[test]
     fn matmul_matvec() {
         // [M, K] × [K] → [M]
-        let a = [3usize, 4]; let b = [4usize];
-        let at = [4i64, 1]; let bt = [1i64];
+        let a = [3usize, 4];
+        let b = [4usize];
+        let at = [4i64, 1];
+        let bt = [1i64];
         let res = infer(&ShapeInference::MatMul, &[view(&a, &at), view(&b, &bt)]).unwrap();
         assert_eq!(res, vec![vec![3]]);
     }
@@ -1611,24 +1777,36 @@ mod tests {
 
     #[test]
     fn gemm_no_transpose() {
-        let a = [3usize, 4]; let b = [4usize, 5];
-        let at = [4i64, 1]; let bt = [5i64, 1];
+        let a = [3usize, 4];
+        let b = [4usize, 5];
+        let at = [4i64, 1];
+        let bt = [5i64, 1];
         let res = infer(
-            &ShapeInference::Gemm { trans_a: false, trans_b: false },
+            &ShapeInference::Gemm {
+                trans_a: false,
+                trans_b: false,
+            },
             &[view(&a, &at), view(&b, &bt)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![3, 5]]);
     }
 
     #[test]
     fn gemm_trans_b() {
         // A=[3,4], B=[5,4], transB → output [3,5]
-        let a = [3usize, 4]; let b = [5usize, 4];
-        let at = [4i64, 1]; let bt = [4i64, 1];
+        let a = [3usize, 4];
+        let b = [5usize, 4];
+        let at = [4i64, 1];
+        let bt = [4i64, 1];
         let res = infer(
-            &ShapeInference::Gemm { trans_a: false, trans_b: true },
+            &ShapeInference::Gemm {
+                trans_a: false,
+                trans_b: true,
+            },
             &[view(&a, &at), view(&b, &bt)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![3, 5]]);
     }
 
@@ -1636,35 +1814,44 @@ mod tests {
 
     #[test]
     fn concat_axis0() {
-        let s1 = [2usize, 3]; let st1 = [3i64, 1];
-        let s2 = [4usize, 3]; let st2 = [3i64, 1];
+        let s1 = [2usize, 3];
+        let st1 = [3i64, 1];
+        let s2 = [4usize, 3];
+        let st2 = [3i64, 1];
         let res = infer(
             &ShapeInference::Concat { axis: 0 },
             &[view(&s1, &st1), view(&s2, &st2)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![6, 3]]);
     }
 
     #[test]
     fn concat_axis1() {
-        let s1 = [2usize, 3]; let st1 = [3i64, 1];
-        let s2 = [2usize, 5]; let st2 = [5i64, 1];
+        let s1 = [2usize, 3];
+        let st1 = [3i64, 1];
+        let s2 = [2usize, 5];
+        let st2 = [5i64, 1];
         let res = infer(
             &ShapeInference::Concat { axis: 1 },
             &[view(&s1, &st1), view(&s2, &st2)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 8]]);
     }
 
     #[test]
     fn concat_negative_axis() {
         // axis=-1 for rank-2 = axis=1
-        let s1 = [2usize, 3]; let st1 = [3i64, 1];
-        let s2 = [2usize, 4]; let st2 = [4i64, 1];
+        let s1 = [2usize, 3];
+        let st1 = [3i64, 1];
+        let s2 = [2usize, 4];
+        let st2 = [4i64, 1];
         let res = infer(
             &ShapeInference::Concat { axis: -1 },
             &[view(&s1, &st1), view(&s2, &st2)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 7]]);
     }
 
@@ -1672,29 +1859,34 @@ mod tests {
 
     #[test]
     fn transpose_default_reverses() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
-        let res = infer(
-            &ShapeInference::Transpose { perm: None },
-            &[view(&s, &st)],
-        ).unwrap();
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
+        let res = infer(&ShapeInference::Transpose { perm: None }, &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![4, 3, 2]]);
     }
 
     #[test]
     fn transpose_explicit_perm() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
-            &ShapeInference::Transpose { perm: Some(vec![0, 2, 1]) },
+            &ShapeInference::Transpose {
+                perm: Some(vec![0, 2, 1]),
+            },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 4, 3]]);
     }
 
     #[test]
     fn transpose_perm_wrong_length_is_error() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
-            &ShapeInference::Transpose { perm: Some(vec![0, 1]) },
+            &ShapeInference::Transpose {
+                perm: Some(vec![0, 1]),
+            },
             &[view(&s, &st)],
         );
         assert!(res.is_err());
@@ -1705,24 +1897,30 @@ mod tests {
     #[test]
     fn gather_axis0() {
         // data=[5,4], indices=[3] → output=[3,4]
-        let data = [5usize, 4]; let dst = [4i64, 1];
-        let idx = [3usize]; let ist = [1i64];
+        let data = [5usize, 4];
+        let dst = [4i64, 1];
+        let idx = [3usize];
+        let ist = [1i64];
         let res = infer(
             &ShapeInference::Gather { axis: 0 },
             &[view(&data, &dst), view(&idx, &ist)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
     }
 
     #[test]
     fn gather_axis1_matrix_index() {
         // data=[2,10,4], indices=[3,5], axis=1 → output=[2,3,5,4]
-        let data = [2usize, 10, 4]; let dst = [40i64, 4, 1];
-        let idx = [3usize, 5]; let ist = [5i64, 1];
+        let data = [2usize, 10, 4];
+        let dst = [40i64, 4, 1];
+        let idx = [3usize, 5];
+        let ist = [5i64, 1];
         let res = infer(
             &ShapeInference::Gather { axis: 1 },
             &[view(&data, &dst), view(&idx, &ist)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 3, 5, 4]]);
     }
 
@@ -1732,12 +1930,15 @@ mod tests {
     fn gather_nd_basic() {
         // data=[2,3,4], indices=[5,2] (k=2, batch_dims=0)
         // → output=[5,4]
-        let data = [2usize, 3, 4]; let dst = [12i64, 4, 1];
-        let idx = [5usize, 2]; let ist = [2i64, 1];
+        let data = [2usize, 3, 4];
+        let dst = [12i64, 4, 1];
+        let idx = [5usize, 2];
+        let ist = [2i64, 1];
         let res = infer(
             &ShapeInference::GatherND { batch_dims: 0 },
             &[view(&data, &dst), view(&idx, &ist)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![5, 4]]);
     }
 
@@ -1745,73 +1946,88 @@ mod tests {
 
     #[test]
     fn shape_op_full() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
-            &ShapeInference::ShapeOp { start: 0, end: None },
+            &ShapeInference::ShapeOp {
+                start: 0,
+                end: None,
+            },
             &[view(&s, &st)],
-        ).unwrap();
-        assert_eq!(res, vec![vec![3]]);  // 3-dim shape → output len 3
+        )
+        .unwrap();
+        assert_eq!(res, vec![vec![3]]); // 3-dim shape → output len 3
     }
 
     #[test]
     fn shape_op_slice() {
-        let s = [2usize, 3, 4, 5]; let st = [60i64, 20, 5, 1];
+        let s = [2usize, 3, 4, 5];
+        let st = [60i64, 20, 5, 1];
         let res = infer(
-            &ShapeInference::ShapeOp { start: 1, end: Some(3) },
+            &ShapeInference::ShapeOp {
+                start: 1,
+                end: Some(3),
+            },
             &[view(&s, &st)],
-        ).unwrap();
-        assert_eq!(res, vec![vec![2]]);  // dims 1..3 → 2 dims
+        )
+        .unwrap();
+        assert_eq!(res, vec![vec![2]]); // dims 1..3 → 2 dims
     }
 
     #[test]
     fn shape_op_negative_indices() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
-            &ShapeInference::ShapeOp { start: -2, end: None },
+            &ShapeInference::ShapeOp {
+                start: -2,
+                end: None,
+            },
             &[view(&s, &st)],
-        ).unwrap();
-        assert_eq!(res, vec![vec![2]]);  // dims [-2:] = [3,4] → 2 dims
+        )
+        .unwrap();
+        assert_eq!(res, vec![vec![2]]); // dims [-2:] = [3,4] → 2 dims
     }
 
     // ── Squeeze / Unsqueeze ───────────────────────────────────────────────────
 
     #[test]
     fn squeeze_removes_ones() {
-        let s = [1usize, 3, 1, 4]; let st = [12i64, 4, 4, 1];
-        let res = infer(
-            &ShapeInference::Squeeze { axes: vec![] },
-            &[view(&s, &st)],
-        ).unwrap();
+        let s = [1usize, 3, 1, 4];
+        let st = [12i64, 4, 4, 1];
+        let res = infer(&ShapeInference::Squeeze { axes: vec![] }, &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
     }
 
     #[test]
     fn squeeze_specific_axis() {
-        let s = [1usize, 3, 4]; let st = [12i64, 4, 1];
-        let res = infer(
-            &ShapeInference::Squeeze { axes: vec![0] },
-            &[view(&s, &st)],
-        ).unwrap();
+        let s = [1usize, 3, 4];
+        let st = [12i64, 4, 1];
+        let res = infer(&ShapeInference::Squeeze { axes: vec![0] }, &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
     }
 
     #[test]
     fn unsqueeze_insert_at_front() {
-        let s = [3usize, 4]; let st = [4i64, 1];
+        let s = [3usize, 4];
+        let st = [4i64, 1];
         let res = infer(
             &ShapeInference::Unsqueeze { axes: vec![0] },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![1, 3, 4]]);
     }
 
     #[test]
     fn unsqueeze_multiple_axes() {
-        let s = [3usize]; let st = [1i64];
+        let s = [3usize];
+        let st = [1i64];
         let res = infer(
             &ShapeInference::Unsqueeze { axes: vec![0, 2] },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![1, 3, 1]]);
     }
 
@@ -1819,30 +2035,36 @@ mod tests {
 
     #[test]
     fn reshape_static_shape() {
-        let d = [2usize, 6]; let dst = [6i64, 1];
+        let d = [2usize, 6];
+        let dst = [6i64, 1];
         let data_view = view(&d, &dst);
         let shape_data: [i64; 3] = [2, 2, 3];
-        let sshape = [3usize]; let sst = [1i64];
+        let sshape = [3usize];
+        let sst = [1i64];
         let shape_view = i64_view(&shape_data, &sshape, &sst);
         let res = infer(
             &ShapeInference::ReshapeData { allowzero: false },
             &[data_view, shape_view],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 2, 3]]);
     }
 
     #[test]
     fn reshape_infer_minus_one() {
         // data=[2,6]=12, shape=[3,-1] → [3,4]
-        let d = [2usize, 6]; let dst = [6i64, 1];
+        let d = [2usize, 6];
+        let dst = [6i64, 1];
         let data_view = view(&d, &dst);
         let shape_data: [i64; 2] = [3, -1];
-        let sshape = [2usize]; let sst = [1i64];
+        let sshape = [2usize];
+        let sst = [1i64];
         let shape_view = i64_view(&shape_data, &sshape, &sst);
         let res = infer(
             &ShapeInference::ReshapeData { allowzero: false },
             &[data_view, shape_view],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
     }
 
@@ -1851,15 +2073,18 @@ mod tests {
         // data=[2,3,4], shape=[0,12,0] allowzero=false
         // dim 0 → copy from data[0]=2, dim 2 → copy from data[2]=4 → [2,12,4]? No:
         // "0" means copy the corresponding dim from input. so shape=[0,12,1]→[2,12,1]
-        let d = [2usize, 3, 4]; let dst = [12i64, 4, 1];
+        let d = [2usize, 3, 4];
+        let dst = [12i64, 4, 1];
         let data_view = view(&d, &dst);
         let shape_data: [i64; 3] = [0, 12, 1];
-        let sshape = [3usize]; let sst = [1i64];
+        let sshape = [3usize];
+        let sst = [1i64];
         let shape_view = i64_view(&shape_data, &sshape, &sst);
         let res = infer(
             &ShapeInference::ReshapeData { allowzero: false },
             &[data_view, shape_view],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 12, 1]]);
     }
 
@@ -1868,38 +2093,48 @@ mod tests {
     #[test]
     fn slice_basic() {
         // data=[5,4], starts=[1], ends=[3], axes=[0], steps=[1] → [2,4]
-        let d = [5usize, 4]; let dst = [4i64, 1];
+        let d = [5usize, 4];
+        let dst = [4i64, 1];
         let data_v = view(&d, &dst);
-        let starts_d: [i64; 1] = [1]; let ends_d: [i64; 1] = [3];
-        let ax_d: [i64; 1] = [0]; let steps_d: [i64; 1] = [1];
-        let s1 = [1usize]; let st1 = [1i64];
+        let starts_d: [i64; 1] = [1];
+        let ends_d: [i64; 1] = [3];
+        let ax_d: [i64; 1] = [0];
+        let steps_d: [i64; 1] = [1];
+        let s1 = [1usize];
+        let st1 = [1i64];
         let starts_v = i64_view(&starts_d, &s1, &st1);
-        let ends_v   = i64_view(&ends_d,   &s1, &st1);
-        let ax_v     = i64_view(&ax_d,     &s1, &st1);
-        let steps_v  = i64_view(&steps_d,  &s1, &st1);
+        let ends_v = i64_view(&ends_d, &s1, &st1);
+        let ax_v = i64_view(&ax_d, &s1, &st1);
+        let steps_v = i64_view(&steps_d, &s1, &st1);
         let res = infer(
             &ShapeInference::SliceData,
             &[data_v, starts_v, ends_v, ax_v, steps_v],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 4]]);
     }
 
     #[test]
     fn slice_negative_step_reverse() {
         // data=[5], starts=[4], ends=[-6], axes=[0], steps=[-1] → [5] (all elements reversed)
-        let d = [5usize]; let dst = [1i64];
+        let d = [5usize];
+        let dst = [1i64];
         let data_v = view(&d, &dst);
-        let starts_d: [i64; 1] = [4]; let ends_d: [i64; 1] = [-6];
-        let ax_d: [i64; 1] = [0]; let steps_d: [i64; 1] = [-1];
-        let s1 = [1usize]; let st1 = [1i64];
+        let starts_d: [i64; 1] = [4];
+        let ends_d: [i64; 1] = [-6];
+        let ax_d: [i64; 1] = [0];
+        let steps_d: [i64; 1] = [-1];
+        let s1 = [1usize];
+        let st1 = [1i64];
         let starts_v = i64_view(&starts_d, &s1, &st1);
-        let ends_v   = i64_view(&ends_d,   &s1, &st1);
-        let ax_v     = i64_view(&ax_d,     &s1, &st1);
-        let steps_v  = i64_view(&steps_d,  &s1, &st1);
+        let ends_v = i64_view(&ends_d, &s1, &st1);
+        let ax_v = i64_view(&ax_d, &s1, &st1);
+        let steps_v = i64_view(&steps_d, &s1, &st1);
         let res = infer(
             &ShapeInference::SliceData,
             &[data_v, starts_v, ends_v, ax_v, steps_v],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![5]]);
     }
 
@@ -1907,7 +2142,8 @@ mod tests {
 
     #[test]
     fn reduction_keepdims_single_axis() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
             &ShapeInference::Reduction {
                 keepdims: true,
@@ -1915,13 +2151,15 @@ mod tests {
                 noop_with_empty_axes: false,
             },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 1, 4]]);
     }
 
     #[test]
     fn reduction_no_keepdims() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
             &ShapeInference::Reduction {
                 keepdims: false,
@@ -1929,13 +2167,15 @@ mod tests {
                 noop_with_empty_axes: false,
             },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![2, 4]]);
     }
 
     #[test]
     fn reduction_all_axes_keepdims() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
             &ShapeInference::Reduction {
                 keepdims: true,
@@ -1943,13 +2183,15 @@ mod tests {
                 noop_with_empty_axes: false,
             },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![1, 1, 1]]);
     }
 
     #[test]
     fn reduction_noop_empty_axes() {
-        let s = [2usize, 3, 4]; let st = [12i64, 4, 1];
+        let s = [2usize, 3, 4];
+        let st = [12i64, 4, 1];
         let res = infer(
             &ShapeInference::Reduction {
                 keepdims: true,
@@ -1957,8 +2199,9 @@ mod tests {
                 noop_with_empty_axes: true,
             },
             &[view(&s, &st)],
-        ).unwrap();
-        assert_eq!(res, vec![vec![2, 3, 4]]);  // identity
+        )
+        .unwrap();
+        assert_eq!(res, vec![vec![2, 3, 4]]); // identity
     }
 
     // ── Conv ─────────────────────────────────────────────────────────────────
@@ -1966,31 +2209,45 @@ mod tests {
     #[test]
     fn conv_1d_no_padding() {
         // in=[1,3,7], kernel=3, stride=1, dilation=1, pad=0 → out=[1,16,5]
-        let s = [1usize, 3, 7]; let st = [21i64, 7, 1];
+        let s = [1usize, 3, 7];
+        let st = [21i64, 7, 1];
         let res = infer(
             &ShapeInference::Conv {
                 out_channels: 16,
                 per_axis: vec![ConvSpatialAxis {
-                    kernel: 3, pad_before: 0, pad_after: 0, stride: 1, dilation: 1
+                    kernel: 3,
+                    pad_before: 0,
+                    pad_after: 0,
+                    stride: 1,
+                    dilation: 1,
                 }],
             },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![1, 16, 5]]);
     }
 
     #[test]
     fn conv_2d_with_padding() {
         // in=[1,3,5,5], kernel=3, stride=1, dilation=1, pad=1 all → out=[1,16,5,5]
-        let s = [1usize, 3, 5, 5]; let st = [75i64, 25, 5, 1];
-        let rule = ConvSpatialAxis { kernel: 3, pad_before: 1, pad_after: 1, stride: 1, dilation: 1 };
+        let s = [1usize, 3, 5, 5];
+        let st = [75i64, 25, 5, 1];
+        let rule = ConvSpatialAxis {
+            kernel: 3,
+            pad_before: 1,
+            pad_after: 1,
+            stride: 1,
+            dilation: 1,
+        };
         let res = infer(
             &ShapeInference::Conv {
                 out_channels: 16,
                 per_axis: vec![rule.clone(), rule],
             },
             &[view(&s, &st)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(res, vec![vec![1, 16, 5, 5]]);
     }
 
@@ -2008,10 +2265,15 @@ mod tests {
 
     #[test]
     fn intermediate_buf_view_roundtrip() {
-        let data = vec![0u8; 12 * 4];   // 12 f32 elements
+        let data = vec![0u8; 12 * 4]; // 12 f32 elements
         let shape = vec![3usize, 4];
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
-        let buf = IntermediateBuf { data, shape: shape.clone(), strides, dtype: DataType::Float32 };
+        let buf = IntermediateBuf {
+            data,
+            shape: shape.clone(),
+            strides,
+            dtype: DataType::Float32,
+        };
         let v = buf.view();
         assert_eq!(v.shape, &shape[..]);
         assert_eq!(v.dtype, DataType::Float32);
@@ -2035,10 +2297,19 @@ mod tests {
         assert_eq!(routing.input_sources.len(), 2);
         assert_eq!(routing.output_sinks.len(), 2);
         // Verify the chain: ORT→Buffer→ORT.
-        assert!(matches!(routing.input_sources[0][0], NodeInputSource::Ort(0)));
-        assert!(matches!(routing.output_sinks[0][0],  NodeOutputSink::Buffer(0)));
-        assert!(matches!(routing.input_sources[1][0], NodeInputSource::Buffer(0)));
-        assert!(matches!(routing.output_sinks[1][0],  NodeOutputSink::Ort(0)));
+        assert!(matches!(
+            routing.input_sources[0][0],
+            NodeInputSource::Ort(0)
+        ));
+        assert!(matches!(
+            routing.output_sinks[0][0],
+            NodeOutputSink::Buffer(0)
+        ));
+        assert!(matches!(
+            routing.input_sources[1][0],
+            NodeInputSource::Buffer(0)
+        ));
+        assert!(matches!(routing.output_sinks[1][0], NodeOutputSink::Ort(0)));
     }
 
     // ── CreateState / ReleaseState lifecycle ──────────────────────────────────
@@ -2047,15 +2318,13 @@ mod tests {
     fn create_and_release_state_lifecycle() {
         let mut state_ptr: *mut c_void = std::ptr::null_mut();
         let status = unsafe {
-            compute_create_state(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut state_ptr,
-            )
+            compute_create_state(std::ptr::null_mut(), std::ptr::null_mut(), &mut state_ptr)
         };
         assert!(status.is_null(), "ok_status returns null");
         assert!(!state_ptr.is_null());
-        unsafe { compute_release_state(std::ptr::null_mut(), state_ptr); }
+        unsafe {
+            compute_release_state(std::ptr::null_mut(), state_ptr);
+        }
     }
 
     #[test]
@@ -2067,7 +2336,7 @@ mod tests {
                 std::ptr::null_mut(),
             )
         };
-        let _ = status;  // may be null in test env (no ORT API)
+        let _ = status; // may be null in test env (no ORT API)
     }
 
     // ── for_op coverage ───────────────────────────────────────────────────────
@@ -2076,7 +2345,10 @@ mod tests {
     fn for_op_elementwise_coverage() {
         for op in ["Add", "Sub", "Mul", "Div", "Pow", "Where", "Max", "Min"] {
             assert!(
-                matches!(ShapeInference::for_op(op), ShapeInference::ElementwiseBroadcast),
+                matches!(
+                    ShapeInference::for_op(op),
+                    ShapeInference::ElementwiseBroadcast
+                ),
                 "{op} should be ElementwiseBroadcast"
             );
         }
@@ -2084,7 +2356,14 @@ mod tests {
 
     #[test]
     fn for_op_unary_coverage() {
-        for op in ["Relu", "Sigmoid", "Cast", "Identity", "Softmax", "LayerNormalization"] {
+        for op in [
+            "Relu",
+            "Sigmoid",
+            "Cast",
+            "Identity",
+            "Softmax",
+            "LayerNormalization",
+        ] {
             assert!(
                 matches!(ShapeInference::for_op(op), ShapeInference::SameAsInput(0)),
                 "{op} should be SameAsInput(0)"
@@ -2094,19 +2373,43 @@ mod tests {
 
     #[test]
     fn for_op_matmul_is_matmul() {
-        assert!(matches!(ShapeInference::for_op("MatMul"), ShapeInference::MatMul));
+        assert!(matches!(
+            ShapeInference::for_op("MatMul"),
+            ShapeInference::MatMul
+        ));
     }
 
     #[test]
     fn for_op_safe_defaults_exist() {
         // These ops have reasonable attribute defaults, so for_op can give a
         // useful (if not always perfect) result.
-        assert!(matches!(ShapeInference::for_op("Concat"), ShapeInference::Concat { axis: 0 }));
-        assert!(matches!(ShapeInference::for_op("Transpose"), ShapeInference::Transpose { perm: None }));
-        assert!(matches!(ShapeInference::for_op("Gather"), ShapeInference::Gather { axis: 0 }));
-        assert!(matches!(ShapeInference::for_op("Reshape"), ShapeInference::ReshapeData { allowzero: false }));
-        assert!(matches!(ShapeInference::for_op("Slice"), ShapeInference::SliceData));
-        assert!(matches!(ShapeInference::for_op("Shape"), ShapeInference::ShapeOp { start: 0, end: None }));
+        assert!(matches!(
+            ShapeInference::for_op("Concat"),
+            ShapeInference::Concat { axis: 0 }
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Transpose"),
+            ShapeInference::Transpose { perm: None }
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Gather"),
+            ShapeInference::Gather { axis: 0 }
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Reshape"),
+            ShapeInference::ReshapeData { allowzero: false }
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Slice"),
+            ShapeInference::SliceData
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Shape"),
+            ShapeInference::ShapeOp {
+                start: 0,
+                end: None
+            }
+        ));
     }
 
     // ── Panic guard test ──────────────────────────────────────────────────

@@ -37,11 +37,10 @@ pub(crate) fn validate_dims(
         shape.push(d as usize);
     }
 
-    let element_count: usize = shape.iter().try_fold(1usize, |acc, &d| {
-        acc.checked_mul(d)
-    }).ok_or_else(|| {
-        format!("{context} shape {shape:?} overflows usize in element count")
-    })?;
+    let element_count: usize = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| format!("{context} shape {shape:?} overflows usize in element count"))?;
 
     let byte_size = dtype.byte_size();
     let expected_bytes = element_count.checked_mul(byte_size).ok_or_else(|| {
@@ -122,15 +121,11 @@ pub(crate) unsafe fn read_inputs(
     let get_dims_count = api
         .GetDimensionsCount
         .ok_or("OrtApi.GetDimensionsCount is null")?;
-    let get_dims = api
-        .GetDimensions
-        .ok_or("OrtApi.GetDimensions is null")?;
+    let get_dims = api.GetDimensions.ok_or("OrtApi.GetDimensions is null")?;
     let release_type_shape = api
         .ReleaseTensorTypeAndShapeInfo
         .ok_or("OrtApi.ReleaseTensorTypeAndShapeInfo is null")?;
-    let get_tensor_data = api
-        .GetTensorData
-        .ok_or("OrtApi.GetTensorData is null")?;
+    let get_tensor_data = api.GetTensorData.ok_or("OrtApi.GetTensorData is null")?;
 
     let mut input_count: usize = 0;
     let status = unsafe { get_input_count(ctx, &mut input_count) };
@@ -170,9 +165,8 @@ pub(crate) unsafe fn read_inputs(
             unsafe { release_type_shape(type_shape) };
             return Err(format!("GetTensorElementType failed for input {i}"));
         }
-        let dtype = DataType::from_onnx(elem_type as i32).ok_or_else(|| {
-            format!("unsupported element type {elem_type} for input {i}")
-        })?;
+        let dtype = DataType::from_onnx(elem_type as i32)
+            .ok_or_else(|| format!("unsupported element type {elem_type} for input {i}"))?;
 
         // Dimensions.
         let mut ndim: usize = 0;
@@ -190,11 +184,7 @@ pub(crate) unsafe fn read_inputs(
         unsafe { release_type_shape(type_shape) };
 
         // Validate ORT-supplied dims: reject negatives and detect overflow.
-        let (shape, _, _) = validate_dims(
-            &dims,
-            dtype,
-            &format!("input {i}"),
-        )?;
+        let (shape, _, _) = validate_dims(&dims, dtype, &format!("input {i}"))?;
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
 
         // Data pointer.
@@ -241,8 +231,7 @@ pub(crate) unsafe fn allocate_output(
 
     let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
     let mut value: *mut ort::OrtValue = std::ptr::null_mut();
-    let status =
-        unsafe { get_output(ctx, index, dims.as_ptr(), dims.len(), &mut value) };
+    let status = unsafe { get_output(ctx, index, dims.as_ptr(), dims.len(), &mut value) };
     if !status.is_null() {
         return Err(format!("KernelContext_GetOutput({index}) failed"));
     }
@@ -327,7 +316,11 @@ mod tests {
         for (onnx_val, expected) in cases {
             let dt = DataType::from_onnx(onnx_val).unwrap();
             assert_eq!(dt, expected, "from_onnx({onnx_val}) mismatch");
-            assert_eq!(dt.to_onnx(), onnx_val, "to_onnx round-trip for {expected:?}");
+            assert_eq!(
+                dt.to_onnx(),
+                onnx_val,
+                "to_onnx round-trip for {expected:?}"
+            );
         }
     }
 
