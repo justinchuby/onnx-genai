@@ -783,6 +783,9 @@ mod tests {
                 kv_telemetry: Default::default(),
                 resource_snapshot: Default::default(),
                 device_authority: None,
+                // A stub drives no engine, so it advertises the honest "no
+                // batching" report used by every non-batching backend.
+                batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
             },
             tokenizer,
             chat_template: None,

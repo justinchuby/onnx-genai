@@ -1,7 +1,8 @@
 //! Batched static-cache generation path.
 
 use crate::config::{
-    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult,
 };
 use crate::decode::ModelDecodePath;
 use crate::decode_loop::{
@@ -99,6 +100,67 @@ impl ContinuousBatchRow {
             generated_tokens: self.state.generated_tokens.clone(),
             generated_text: self.state.generated_text.clone(),
             step: self.state.step,
+        }
+    }
+}
+
+/// Operator-facing description of how many sequences the engine's decode path
+/// can advance in a single shared forward pass.
+///
+/// This is sourced from the decode path itself — the resolved
+/// [`EngineDecodeBackend`](crate::EngineDecodeBackend) plus the model-I/O
+/// [`ModelDecodePath`] selection — **not** from whether an ORT decoder session
+/// happens to be present. Before this type existed, the only signal an operator
+/// had was [`Engine::continuous_batch_manager`] returning `Err`, which the
+/// server swallowed into a debug/info-level "using per-request engine path" log
+/// line. On the native backend that `Err` is structural and permanent (batch and
+/// query-seq are pinned to 1 in `native_decode/cuda.rs`), so reporting it as a
+/// first-class capability lets `--max-batch` and `/v1/resources` tell the truth
+/// instead of accepting a batch width that silently has no effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchingCapability {
+    /// Maximum number of sequences that can be decoded concurrently in one
+    /// shared forward pass. `None` means "not structurally capped": batching is
+    /// supported and bounded only by memory and the operator's `--max-batch`.
+    /// `Some(1)` means the decode path can only ever advance one sequence, so
+    /// continuous batching is unavailable regardless of the requested width.
+    max_concurrent_sequences: Option<usize>,
+    /// Operator-facing explanation naming the backend / decode path and the
+    /// reason for the limit. Safe to log and to surface over `/v1/resources`.
+    reason: String,
+}
+
+impl BatchingCapability {
+    /// Whether more than one sequence can share a decode step.
+    pub fn supports_batching(&self) -> bool {
+        !matches!(self.max_concurrent_sequences, Some(cap) if cap <= 1)
+    }
+
+    /// The structural cap on concurrently-decoded sequences, if any. `None`
+    /// means "bounded only by memory / configuration".
+    pub fn max_concurrent_sequences(&self) -> Option<usize> {
+        self.max_concurrent_sequences
+    }
+
+    /// Operator-facing reason string describing the backend / decode path.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Whether a requested batch width can be honored by this decode path.
+    pub fn allows(&self, requested: usize) -> bool {
+        match self.max_concurrent_sequences {
+            None => true,
+            Some(cap) => requested <= cap,
+        }
+    }
+
+    /// The batch width that will actually take effect for `requested`: the
+    /// request clamped to `[1, cap]` (or just floored at 1 when uncapped).
+    pub fn effective_max_batch(&self, requested: usize) -> usize {
+        match self.max_concurrent_sequences {
+            None => requested.max(1),
+            Some(cap) => requested.clamp(1, cap),
         }
     }
 }
@@ -643,6 +705,68 @@ impl Engine {
         }
 
         collect_batch_results(results)
+    }
+
+    /// Report how many sequences this engine's decode path can advance in a
+    /// single shared forward pass, and why.
+    ///
+    /// The answer is derived from the resolved decode backend and the model-I/O
+    /// [`ModelDecodePath`], **not** from whether an ORT decoder session happens
+    /// to be present. That distinction is the whole point: on the native backend
+    /// [`Self::continuous_batch_manager`] always fails because there is no ORT
+    /// decoder session, but the honest reason is that native decode pins batch
+    /// and query-seq to 1 as a structural invariant (`native_decode/cuda.rs`),
+    /// not that a session is momentarily missing.
+    pub fn batching_capability(&self) -> BatchingCapability {
+        // The native decode path advances exactly one sequence per step
+        // regardless of the model's KV I/O shape, so it is answered first and
+        // unconditionally. `native_decode/cuda.rs` pins both the batch dimension
+        // and the query-sequence dimension to 1 as a structural decode
+        // invariant, which is not a tunable.
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return BatchingCapability {
+                max_concurrent_sequences: Some(1),
+                reason: "the native decode backend advances exactly one sequence \
+                         per step: batch and query-seq are pinned to 1 as a \
+                         structural decode invariant (native_decode/cuda.rs), so \
+                         continuous batching is unavailable"
+                    .to_string(),
+            };
+        }
+        match self.decode_path {
+            ModelDecodePath::StaticCache { .. } => BatchingCapability {
+                max_concurrent_sequences: None,
+                reason: "ONNX Runtime static-cache decode advances a shared batch \
+                         of sequences per step; concurrency is bounded only by \
+                         memory and the configured maximum batch size"
+                    .to_string(),
+            },
+            ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                ..
+            } => BatchingCapability {
+                max_concurrent_sequences: None,
+                reason: "shared-KV-buffer past/present decode advances a shared \
+                         batch of sequences per step; concurrency is bounded only \
+                         by memory and the configured maximum batch size"
+                    .to_string(),
+            },
+            ModelDecodePath::PastPresent { .. } => BatchingCapability {
+                max_concurrent_sequences: Some(1),
+                reason: "this past/present model is not using a shared KV buffer: \
+                         the execution provider did not report fixed-capacity \
+                         present binding, or it was not opted into at launch, so \
+                         only one sequence can be decoded at a time"
+                    .to_string(),
+            },
+            ModelDecodePath::Legacy => BatchingCapability {
+                max_concurrent_sequences: Some(1),
+                reason: "this legacy past/present model has no shared KV buffer \
+                         and cannot batch: continuous batching requires a \
+                         static-cache or shared-buffer past/present model"
+                    .to_string(),
+            },
+        }
     }
 
     /// Create a lower-level continuous-batch manager for incremental serving.

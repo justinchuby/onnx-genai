@@ -332,6 +332,12 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
     pub max_queue_depth: usize,
+    /// Operator-requested maximum continuous-batch width (`--max-batch`). `None`
+    /// leaves the server default in place and clamps silently to what the decode
+    /// path can honor. `Some(n)` with `n > 1` on a backend that cannot batch is a
+    /// hard startup refusal rather than a silent no-op — see
+    /// [`enforce_requested_max_batch`].
+    pub max_batch: Option<usize>,
     /// Enable the /v1/debug/* introspection endpoints. Off by default; enable with
     /// `--enable-debug-endpoints` or `ONNX_GENAI_DEBUG_ENDPOINTS=1`. These endpoints
     /// expose server internals and should only be used on loopback-bound instances or
@@ -359,6 +365,7 @@ impl Default for ServerConfig {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+            max_batch: None,
             enable_debug_endpoints: false,
             enable_admin_endpoints: false,
             max_loaded_models: None,
@@ -381,6 +388,9 @@ impl ServerConfig {
         }
         if self.max_queue_depth == 0 {
             anyhow::bail!("max_queue_depth must be greater than zero");
+        }
+        if self.max_batch == Some(0) {
+            anyhow::bail!("max_batch must be greater than zero when set");
         }
         if self.max_loaded_models == Some(0) {
             anyhow::bail!("max_loaded_models must be greater than zero when set");
@@ -468,7 +478,11 @@ impl AppState {
     ) -> Self {
         let config = config.validate().expect("validated server config");
         let fim_config = engine.fim_config().cloned();
-        let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+        let engine_driver = EngineDriver::start(
+            engine,
+            config.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
+            config.max_queue_depth,
+        );
         let handle = ModelHandle::new(ModelHandleParts {
             id: model_id,
             // Test-only constructor: the model was handed in already loaded, so
@@ -552,6 +566,35 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
     Ok(metadata.model.and_then(|model| model.max_sequence_length))
 }
 
+/// Refuse an explicit `--max-batch > 1` that the engine's decode path cannot
+/// honor. This is the startup-time enforcement for issue #750: the native
+/// backend (and legacy / non-shared-buffer past/present ORT models) can only
+/// decode one sequence at a time, so accepting `--max-batch 8` and silently
+/// serving one-at-a-time is dishonest. A `None` request (operator did not set
+/// the flag) is never refused — the default width is clamped silently instead.
+pub(crate) fn enforce_requested_max_batch(
+    engine: &Engine,
+    requested: Option<usize>,
+) -> anyhow::Result<()> {
+    let Some(asked) = requested else {
+        return Ok(());
+    };
+    if asked <= 1 {
+        return Ok(());
+    }
+    let capability = engine.batching_capability();
+    if !capability.allows(asked) {
+        anyhow::bail!(
+            "--max-batch {asked} cannot be honored: {reason}. This backend decodes \
+             at most {cap} sequence(s) concurrently; re-launch with --max-batch 1 \
+             (or omit the flag) to run single-sequence decoding.",
+            reason = capability.reason(),
+            cap = capability.effective_max_batch(asked),
+        );
+    }
+    Ok(())
+}
+
 /// Build one model handle (plain or pipeline) from a `ModelSpec`.
 ///
 /// `config` must already be validated.  This is the single shared construction
@@ -605,7 +648,13 @@ pub(crate) fn build_handle_with_authorities(
     // is moved into the driver, so every request built for this handle can honor
     // a model that ships `do_sample: true` instead of forcing greedy.
     let generation_defaults = engine.metadata().generation.clone();
-    let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+    // Refuse an explicit `--max-batch > 1` the decode path cannot honor, rather
+    // than accepting it and silently falling back to per-request decoding. The
+    // check is sourced from the engine's decode path, not from whether an ORT
+    // session exists (issue #750).
+    enforce_requested_max_batch(&engine, config.max_batch)?;
+    let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
+    let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),

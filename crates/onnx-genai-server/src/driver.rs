@@ -13,10 +13,10 @@ use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
 use onnx_genai_engine::{
-    ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
-    DeviceMemoryAuthority, EmbeddingOptions, EngineGovernorError, FimConfig, GovernorSnapshot,
-    KvNotApplicable, KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
-    SchedulerAdmissionError,
+    BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
+    ContinuousBatchManager, DeviceMemoryAuthority, EmbeddingOptions, EngineGovernorError,
+    FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry, PipelineEngine,
+    PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -40,6 +40,63 @@ pub(crate) struct EngineDriver {
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
     pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
     pub(crate) device_authority: Option<DeviceMemoryAuthority>,
+    /// Honest, decode-path-sourced batching report for this engine, resolved at
+    /// startup. Surfaced over `/v1/resources` and `/v1/debug/kv` so an operator
+    /// sees `batch_supported=false` / effective max batch = 1 directly instead of
+    /// inferring it from a debug-level "using per-request engine path" log line.
+    pub(crate) batching: Arc<BatchingReport>,
+}
+
+/// Server-facing summary of an engine's batching capability, combining the
+/// engine's structural [`BatchingCapability`] with the operator's requested
+/// `--max-batch` and the width that actually took effect.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchingReport {
+    /// Whether the decode path can advance more than one sequence per step.
+    pub(crate) supported: bool,
+    /// The `--max-batch` width the operator asked for (or the default).
+    pub(crate) requested_max_batch: usize,
+    /// The width that actually takes effect after clamping to what the decode
+    /// path can honor.
+    pub(crate) effective_max_batch: usize,
+    /// Operator-facing reason string naming the backend / decode path.
+    pub(crate) reason: String,
+}
+
+impl BatchingReport {
+    fn from_capability(capability: &BatchingCapability, requested: usize) -> Self {
+        Self {
+            supported: capability.supports_batching(),
+            requested_max_batch: requested,
+            effective_max_batch: capability.effective_max_batch(requested),
+            reason: capability.reason().to_string(),
+        }
+    }
+
+    /// The report for a pipeline engine, which always serves one request at a
+    /// time (its components own their own caches rather than one batched pass).
+    fn pipeline() -> Self {
+        Self {
+            supported: false,
+            requested_max_batch: 1,
+            effective_max_batch: 1,
+            reason: "pipeline engines serve one request at a time; their \
+                     components own separate caches rather than a shared batched \
+                     forward pass"
+                .to_string(),
+        }
+    }
+
+    /// A placeholder report for registry test doubles that drive no engine.
+    #[cfg(test)]
+    pub(crate) fn single_sequence_stub() -> Self {
+        Self {
+            supported: false,
+            requested_max_batch: 1,
+            effective_max_batch: 1,
+            reason: "test stub handle: no engine, single-sequence".to_string(),
+        }
+    }
 }
 
 pub(crate) enum DriverCommand {
@@ -209,6 +266,21 @@ impl EngineDriver {
         // last point at which it is reachable from here, and the mirror must
         // outlive that move because reading it is the whole reason it exists.
         let mut engine = engine;
+        // Resolve the honest batching capability from the decode path (not from
+        // whether an ORT session exists) while the engine is still borrowable,
+        // then clamp the requested width to what the path can actually honor.
+        let batching = Arc::new(BatchingReport::from_capability(
+            &engine.batching_capability(),
+            max_batch,
+        ));
+        let effective_max_batch = batching.effective_max_batch;
+        tracing::info!(
+            batch_supported = batching.supported,
+            requested_max_batch = batching.requested_max_batch,
+            effective_max_batch = batching.effective_max_batch,
+            reason = %batching.reason,
+            "resolved batching capability",
+        );
         let device_authority = Some(engine.governor().device_authority());
         let kv_telemetry = Arc::new(KvTelemetry::default());
         if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
@@ -228,7 +300,7 @@ impl EngineDriver {
                 run_engine_driver(
                     owner,
                     rx,
-                    max_batch,
+                    effective_max_batch,
                     max_queue_depth,
                     driver_capacity,
                     driver_snapshot,
@@ -242,6 +314,7 @@ impl EngineDriver {
             kv_telemetry,
             resource_snapshot,
             device_authority,
+            batching,
         }
     }
 
@@ -282,6 +355,7 @@ impl EngineDriver {
             kv_telemetry,
             resource_snapshot,
             device_authority,
+            batching: Arc::new(BatchingReport::pipeline()),
         }
     }
 
@@ -293,6 +367,11 @@ impl EngineDriver {
     /// is precisely when the pool is worth reading.
     pub(crate) fn kv_telemetry(&self) -> &Arc<KvTelemetry> {
         &self.kv_telemetry
+    }
+
+    /// The resolved, decode-path-sourced batching report for this engine.
+    pub(crate) fn batching(&self) -> &BatchingReport {
+        &self.batching
     }
 
     pub(crate) async fn create_session(&self) -> anyhow::Result<SessionId> {
@@ -618,7 +697,11 @@ fn run_engine_driver(
             &resource_snapshot,
         );
     } else {
-        tracing::info!("continuous batch driver disabled; using per-request engine path");
+        tracing::info!(
+            batch_supported = false,
+            effective_max_batch = 1,
+            "continuous batch driver disabled; using per-request engine path (single-sequence decode)"
+        );
         run_fallback_engine_driver(&mut engine, rx, &resource_snapshot);
     }
 }
@@ -1645,6 +1728,10 @@ mod admission_tests {
             kv_telemetry: Arc::new(KvTelemetry::default()),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
             device_authority: None,
+            batching: Arc::new(BatchingReport::from_capability(
+                &engine.batching_capability(),
+                1,
+            )),
         };
 
         assert_eq!(driver.resource_snapshot().await.unwrap(), snapshot);
