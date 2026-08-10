@@ -236,6 +236,13 @@ pub(crate) struct DebugProfileResponse {
     collecting: bool,
     note: &'static str,
     stages: Vec<ProfileStage>,
+    memory_strategies: Vec<ProfileMemoryStrategy>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileMemoryStrategy {
+    model_id: String,
+    plan: onnx_genai_engine::MemoryStrategyPlan,
 }
 
 #[derive(Debug, Serialize)]

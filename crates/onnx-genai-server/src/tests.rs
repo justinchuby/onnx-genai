@@ -3847,6 +3847,16 @@ async fn debug_profile_reports_stage_totals() {
 
     assert!(body["stages"].is_array(), "body: {body}");
     assert!(
+        body["memory_strategies"]
+            .as_array()
+            .is_some_and(|plans| !plans.is_empty()),
+        "the profile must report the load-time memory plan, including Unknown: {body}"
+    );
+    assert!(
+        body["memory_strategies"][0]["plan"]["strategy"]["value"].is_string(),
+        "the effective strategy must be machine-readable: {body}"
+    );
+    assert!(
         body["collecting"].is_boolean(),
         "whether anything is being collected must be stated, not inferred from \
          an empty list: {body}"

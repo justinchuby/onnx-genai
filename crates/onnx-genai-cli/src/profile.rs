@@ -577,6 +577,8 @@ pub(crate) struct MemoryUsage {
     /// user asks for `gpu_layers:N`, `--profile` must show the translated byte
     /// plan instead of silently accepting a knob that nothing reached.
     pub(crate) weight_placement: Option<WeightPlacementMemory>,
+    /// Graph/metadata-derived memory residency choice and all inference evidence.
+    pub(crate) memory_strategy: Option<onnx_genai::engine::MemoryStrategyPlan>,
     /// What the virtual-memory arena did to physical memory, when this build
     /// can have one. See [`VmmArena`].
     pub(crate) vmm_arena: Option<VmmArena>,
@@ -669,6 +671,7 @@ impl MemoryUsage {
             && self.composition.is_none()
             && self.activation_plan.is_none()
             && self.weight_placement.is_none()
+            && self.memory_strategy.is_none()
             && self.vmm_arena.is_none()
     }
 }
@@ -982,6 +985,25 @@ impl RunProfile {
                 );
                 let _ = writeln!(out, "{:<24} {}", "  explanation", plan.explanation);
             }
+            if let Some(plan) = &self.memory.memory_strategy {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:?} ({:?})",
+                    "memory strategy", plan.strategy.value, plan.strategy.source
+                );
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:?}; weights {} / limit {}",
+                    "  evidence",
+                    plan.weight_access_pattern.value,
+                    format_bytes(plan.total_weight_bytes.value),
+                    plan.resolved_device_limit_bytes
+                        .value
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                let _ = writeln!(out, "{:<24} {}", "  reason", plan.strategy.reason);
+            }
             if let Some(arena) = self.memory.vmm_arena {
                 if arena.reserved_bytes == 0 && arena.commits == 0 {
                     let _ = writeln!(
@@ -1269,6 +1291,12 @@ impl RunProfile {
                 plan.device_bytes,
                 plan.host_bytes,
                 json_string(&plan.explanation)
+            ));
+        }
+        if let Some(plan) = &self.memory.memory_strategy {
+            fields.push(format!(
+                "\"memory_strategy\":{}",
+                serde_json::to_string(plan).expect("memory strategy plan is serializable")
             ));
         }
         if let Some(arena) = self.memory.vmm_arena {
@@ -1667,6 +1695,24 @@ mod tests {
         assert_eq!(
             value["weight_placement"]["explanation"],
             "VRAM placement: source=gpu_layers:1"
+        );
+    }
+
+    #[test]
+    fn unknown_memory_strategy_is_visible_in_profile_text_and_json() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.memory_strategy = Some(onnx_genai::engine::MemoryStrategyPlan::default());
+
+        let text = profile.to_text();
+        assert!(text.contains("memory strategy"), "{text}");
+        assert!(text.contains("Unknown"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["memory_strategy"]["strategy"]["value"], "unknown");
+        assert_eq!(
+            value["memory_strategy"]["weight_access_pattern"]["value"],
+            "unknown"
         );
     }
 

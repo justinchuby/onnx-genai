@@ -425,6 +425,11 @@ impl Engine {
         }
     }
 
+    /// Graph/metadata-derived load-time memory strategy and its evidence.
+    pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
+        &self.memory_strategy_plan
+    }
+
     /// Change the live VRAM ceiling when runtime overrides are enabled.
     pub fn set_vram_limit(
         &self,
@@ -2369,6 +2374,7 @@ mod tests {
             session: None,
             native_session: None,
             weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::default(),
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,

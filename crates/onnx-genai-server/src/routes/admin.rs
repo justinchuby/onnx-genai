@@ -190,7 +190,9 @@ pub(crate) async fn admin_set_vram_limit(
 /// follows the backend without this endpoint knowing which one is in use.
 /// Empty until `ONNX_GENAI_PROFILE` is set, and empty is reported as empty
 /// rather than fabricated.
-pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
+pub(crate) async fn debug_profile(
+    State(state): State<AppState>,
+) -> Result<Json<DebugProfileResponse>, ApiError> {
     let stages = onnx_genai_ort::profile::snapshot()
         .into_iter()
         .map(|stage| ProfileStage {
@@ -204,11 +206,19 @@ pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
             },
         })
         .collect::<Vec<_>>();
-    Json(DebugProfileResponse {
+    let memory_strategies = state
+        .registry
+        .memory_strategy_plans()
+        .map_err(map_registry_error)?
+        .into_iter()
+        .map(|(model_id, plan)| ProfileMemoryStrategy { model_id, plan })
+        .collect();
+    Ok(Json(DebugProfileResponse {
         collecting: onnx_genai_ort::profile::enabled(),
         note: "Stage totals accumulate across every request this process has served. Run with ONNX_GENAI_PROFILE=1 to collect them.",
         stages,
-    })
+        memory_strategies,
+    }))
 }
 
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {

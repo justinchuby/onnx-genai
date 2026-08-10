@@ -49,6 +49,9 @@ impl Engine {
             ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
+        let graph_memory =
+            crate::engine::memory_strategy::analyze_model_memory(&model_directory.model_path);
+        let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
         let operator_vram_limit = config.limits.vram_limit;
         let metadata_hints = load_model_metadata_hints(&model_directory.model_path)?;
         report_metadata_hint_warnings(&metadata_hints);
@@ -173,7 +176,7 @@ impl Engine {
         };
 
         // Stage: resource governor and batch scheduler.
-        let (governor, scheduler) = build_governor_and_scheduler(
+        let (governor, scheduler, governor_kv_config) = build_governor_and_scheduler(
             &config,
             &model_directory,
             kv_model.as_ref(),
@@ -181,6 +184,28 @@ impl Engine {
             authority_provider.as_ref(),
             &domain,
         )?;
+        let memory_strategy_plan = crate::engine::memory_strategy::build_memory_strategy_plan(
+            crate::engine::memory_strategy::MemoryStrategyPlanInput {
+                graph: graph_memory,
+                total_weight_bytes: model_weight_bytes,
+                exact_kv_bytes_per_token: governor_kv_config.bytes_per_token(),
+                resolved_device_limit_bytes: Some(governor.snapshot().resolved_limits.vram_bytes),
+                limit_is_override: !matches!(config.limits.vram_limit, ResourceLimit::Auto),
+                automatic_offload_allowed: matches!(
+                    config.limits.vram_limit,
+                    ResourceLimit::Bytes(_)
+                ),
+                compatibility_offload_enabled: false,
+                overrides: crate::engine::memory_strategy::MemoryStrategyOverrides::from_config(
+                    &config,
+                ),
+                advisory_only: true,
+            },
+        );
+        crate::engine::memory_strategy::log_memory_strategy_plan(
+            &memory_strategy_plan,
+            "single_model_ort",
+        );
 
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
@@ -238,6 +263,7 @@ impl Engine {
             native_session: None,
             #[cfg(feature = "native-backend")]
             weight_placement: None,
+            memory_strategy_plan,
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
@@ -340,9 +366,17 @@ impl Engine {
             None => governor_kv_config(None, &config)?,
         };
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
+        let graph_memory =
+            crate::engine::memory_strategy::analyze_model_memory(&model_directory.model_path);
         #[cfg(feature = "cuda")]
-        let cuda_offload_resolution =
-            resolve_cuda_offload_policy(&native_device, &config.limits, model_weight_bytes);
+        let cuda_env_policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
+        #[cfg(feature = "cuda")]
+        let cuda_offload_resolution = resolve_cuda_offload_policy_from_env_policy(
+            &native_device,
+            &config.limits,
+            model_weight_bytes,
+            cuda_env_policy,
+        );
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
         #[cfg(feature = "cuda")]
@@ -386,6 +420,46 @@ impl Engine {
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
+        let memory_strategy_overrides =
+            crate::engine::memory_strategy::MemoryStrategyOverrides::from_config(&config);
+        #[cfg(feature = "cuda")]
+        let memory_strategy_overrides = {
+            let mut overrides = memory_strategy_overrides;
+            populate_cuda_memory_strategy_overrides(&mut overrides, cuda_env_policy);
+            overrides
+        };
+        let memory_strategy_plan = crate::engine::memory_strategy::build_memory_strategy_plan(
+            crate::engine::memory_strategy::MemoryStrategyPlanInput {
+                graph: graph_memory,
+                total_weight_bytes: model_weight_bytes,
+                exact_kv_bytes_per_token: governor_kv_config.bytes_per_token(),
+                resolved_device_limit_bytes: Some(governor.snapshot().resolved_limits.vram_bytes),
+                limit_is_override: !matches!(config.limits.vram_limit, ResourceLimit::Auto),
+                automatic_offload_allowed: matches!(
+                    config.limits.vram_limit,
+                    ResourceLimit::Bytes(_)
+                ),
+                compatibility_offload_enabled: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        cuda_offload_resolution.is_some_and(|resolution| resolution.policy.enabled)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        false
+                    }
+                },
+                overrides: memory_strategy_overrides,
+                advisory_only: !matches!(
+                    native_device,
+                    crate::native_decode::NativeDecodeDevice::Cuda { .. }
+                ),
+            },
+        );
+        crate::engine::memory_strategy::log_memory_strategy_plan(
+            &memory_strategy_plan,
+            "single_model_native",
+        );
         let mut scheduler_config = config.scheduler.clone();
         // The native pool carries no per-layer geometry, so it holds only
         // bookkeeping. Its size is a fixed bound rather than a budget
@@ -666,6 +740,7 @@ impl Engine {
             session: None,
             native_session: Some(native_session),
             weight_placement,
+            memory_strategy_plan,
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,
@@ -810,7 +885,7 @@ fn build_governor_and_scheduler(
     decode_path: &ModelDecodePath,
     authority_provider: Option<&SharedMemoryAuthorityProvider>,
     authority_domain: &DeviceCompatibilityDomain,
-) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
+) -> anyhow::Result<(EngineResourceGovernor, Scheduler, ModelKvConfig)> {
     let governor_kv_config = match (kv_model, decode_path) {
         (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Legacy) => {
             governor_no_paged_kv_config(config)?
@@ -841,7 +916,7 @@ fn build_governor_and_scheduler(
     }
 
     let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
-    Ok((governor, scheduler))
+    Ok((governor, scheduler, governor_kv_config))
 }
 
 pub(crate) fn validate_shared_authority_limit(
@@ -1168,20 +1243,6 @@ fn cuda_weight_startup_reservation(
 }
 
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
-fn resolve_cuda_offload_policy(
-    native_device: &crate::native_decode::NativeDecodeDevice,
-    limits: &ResourceLimits,
-    package_bytes: u64,
-) -> Option<CudaOffloadResolution> {
-    resolve_cuda_offload_policy_from_env_policy(
-        native_device,
-        limits,
-        package_bytes,
-        onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
-    )
-}
-
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn resolve_cuda_offload_policy_from_env_policy(
     native_device: &crate::native_decode::NativeDecodeDevice,
     limits: &ResourceLimits,
@@ -1240,6 +1301,25 @@ fn resolve_cuda_offload_policy_from_env_policy(
         device_budget_is_override: env_policy.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: true,
     })
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn populate_cuda_memory_strategy_overrides(
+    overrides: &mut crate::engine::memory_strategy::MemoryStrategyOverrides,
+    policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+) {
+    if std::env::var_os(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ENV).is_some() {
+        overrides.weight_offload = Some(policy.enabled);
+    }
+    if std::env::var_os(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_DEVICE_BYTES_ENV).is_some() {
+        overrides.weight_device_budget_bytes = policy.device_budget_bytes;
+    }
+    if std::env::var_os(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV).is_some() {
+        overrides.scan_resistant_dense = Some(policy.scan_resistant_dense);
+    }
+    if std::env::var_os(onnx_runtime_ep_cuda::WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV).is_some() {
+        overrides.async_pagein = Some(policy.async_pagein);
+    }
 }
 
 #[cfg(all(feature = "cuda", feature = "native-backend"))]

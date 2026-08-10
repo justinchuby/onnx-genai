@@ -40,6 +40,7 @@ pub(crate) struct EngineDriver {
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
     pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
     pub(crate) device_authority: Option<DeviceMemoryAuthority>,
+    pub(crate) memory_strategy_plan: Arc<onnx_genai_engine::MemoryStrategyPlan>,
 }
 
 pub(crate) enum DriverCommand {
@@ -209,6 +210,7 @@ impl EngineDriver {
         // last point at which it is reachable from here, and the mirror must
         // outlive that move because reading it is the whole reason it exists.
         let mut engine = engine;
+        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let device_authority = Some(engine.governor().device_authority());
         let kv_telemetry = Arc::new(KvTelemetry::default());
         if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
@@ -242,6 +244,7 @@ impl EngineDriver {
             kv_telemetry,
             resource_snapshot,
             device_authority,
+            memory_strategy_plan,
         }
     }
 
@@ -250,6 +253,7 @@ impl EngineDriver {
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
         let device_authority = Some(engine.device_authority());
+        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
         let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
             EngineBackend::Pipeline(engine) => engine.resource_snapshot(),
@@ -282,6 +286,7 @@ impl EngineDriver {
             kv_telemetry,
             resource_snapshot,
             device_authority,
+            memory_strategy_plan,
         }
     }
 
@@ -1645,6 +1650,7 @@ mod admission_tests {
             kv_telemetry: Arc::new(KvTelemetry::default()),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
             device_authority: None,
+            memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::default()),
         };
 
         assert_eq!(driver.resource_snapshot().await.unwrap(), snapshot);

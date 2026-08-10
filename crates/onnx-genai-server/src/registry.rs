@@ -339,6 +339,24 @@ impl ModelRegistry {
         Ok(self.read()?.models.values().next().cloned())
     }
 
+    pub(crate) fn memory_strategy_plans(
+        &self,
+    ) -> Result<Vec<(String, onnx_genai_engine::MemoryStrategyPlan)>, RegistryError> {
+        let inner = self.read()?;
+        let mut plans = inner
+            .models
+            .iter()
+            .map(|(id, handle)| {
+                (
+                    id.clone(),
+                    handle.engine.memory_strategy_plan.as_ref().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        plans.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(plans)
+    }
+
     /// Build a registry from a list of specs, loading the eager ones immediately.
     ///
     /// All specs (eager or not) are recorded in `available`.  Eager specs are also
@@ -783,6 +801,7 @@ mod tests {
                 kv_telemetry: Default::default(),
                 resource_snapshot: Default::default(),
                 device_authority: None,
+                memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::default()),
             },
             tokenizer,
             chat_template: None,

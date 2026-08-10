@@ -221,6 +221,8 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 /// Engine for metadata-declared multi-model pipelines.
 pub struct PipelineEngine {
     models: PipelineModels,
+    /// Combined graph/metadata memory strategy for all pipeline components.
+    memory_strategy_plan: crate::engine::MemoryStrategyPlan,
     /// Owns the pipeline's component-weight reservation. It is created before
     /// any component session, so a failed load rolls the reservation back.
     resource_governor: EngineResourceGovernor,
@@ -793,6 +795,41 @@ impl PipelineEngine {
             authority_provider.as_ref(),
             &authority_domain,
         )?;
+        let component_memory = directory.model_paths.iter().map(|(name, path)| {
+            let mut evidence = crate::engine::memory_strategy::analyze_model_memory(path);
+            for layer in &mut evidence.per_layer_weight_bytes {
+                layer.node = format!("{name}:{}", layer.node);
+            }
+            evidence
+        });
+        let graph_memory = crate::engine::memory_strategy::combine_graph_memory(
+            component_memory,
+            matches!(
+                directory.spec.strategy.kind,
+                PipelineStrategyKind::Iterative
+            ),
+        );
+        let mut memory_strategy_plan = crate::engine::memory_strategy::build_memory_strategy_plan(
+            crate::engine::memory_strategy::MemoryStrategyPlanInput {
+                graph: graph_memory,
+                total_weight_bytes: model_weights_bytes,
+                exact_kv_bytes_per_token: None,
+                resolved_device_limit_bytes: Some(
+                    resource_governor.snapshot().resolved_limits.vram_bytes,
+                ),
+                limit_is_override: !matches!(config.limits.vram_limit, crate::ResourceLimit::Auto),
+                automatic_offload_allowed: false,
+                compatibility_offload_enabled: false,
+                overrides: crate::engine::memory_strategy::MemoryStrategyOverrides::from_config(
+                    &config,
+                ),
+                advisory_only: true,
+            },
+        );
+        crate::engine::memory_strategy::log_memory_strategy_plan(
+            &memory_strategy_plan,
+            "pipeline_before_components",
+        );
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let native_cuda_authority = if backend == PipelineBackend::Native {
             match native_decoder_device(config.native_device.as_ref()) {
@@ -883,6 +920,16 @@ impl PipelineEngine {
                 let kv_config = match kv_model.as_ref() {
                     Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
                     None => crate::engine::governor_no_paged_kv_config(&config)?,
+                };
+                memory_strategy_plan.exact_kv_bytes_per_token = crate::engine::MemoryPlanDecision {
+                    value: kv_config.bytes_per_token(),
+                    source: crate::engine::MemoryDecisionSource::Inference,
+                    inferred_value: None,
+                    reason: if kv_config.bytes_per_token().is_some() {
+                        "computed from exact per-tensor pipeline decoder KV geometry".to_string()
+                    } else {
+                        "pipeline decoder KV geometry is absent or unsupported".to_string()
+                    },
                 };
                 let component_governor = EngineResourceGovernor::new_for_shared_pipeline_kv(
                     config.limits.clone(),
@@ -976,6 +1023,7 @@ impl PipelineEngine {
         };
         Ok(Self {
             models,
+            memory_strategy_plan,
             resource_governor,
             _kv_governor: kv_governor,
             plan,
@@ -1008,12 +1056,18 @@ impl PipelineEngine {
                 snapshot.vram.headroom = authority.headroom_bytes();
                 snapshot.resolved_limits.vram_bytes = authority.limit_bytes();
             }
+
             snapshot
         }
         #[cfg(not(feature = "cuda"))]
         {
             self.resource_governor.snapshot()
         }
+    }
+
+    /// Combined graph/metadata-derived memory strategy for this pipeline.
+    pub fn memory_strategy_plan(&self) -> &crate::engine::MemoryStrategyPlan {
+        &self.memory_strategy_plan
     }
 
     pub fn models(&self) -> &PipelineModels {

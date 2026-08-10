@@ -65,6 +65,7 @@ mod decode_backend;
 mod governor;
 mod load;
 pub(crate) mod memory_plan;
+pub(crate) mod memory_strategy;
 mod metadata;
 mod model;
 #[cfg(feature = "native-backend")]
@@ -80,6 +81,10 @@ pub(crate) use load::{
 };
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
+pub use memory_strategy::{
+    LayerWeightSize, MemoryDecisionSource, MemoryEvictionPolicy, MemoryPlanDecision,
+    MemoryStrategy, MemoryStrategyOverrides, MemoryStrategyPlan, WeightAccessPattern,
+};
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
@@ -213,6 +218,7 @@ mod tests {
             native_session: None,
             #[cfg(feature = "native-backend")]
             weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::default(),
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
@@ -1267,6 +1273,11 @@ mod tests {
         assert!(
             report.host_bytes > 0,
             "CPU load has no governed device residency budget, so the plan should visibly keep bytes on host: {report:?}"
+        );
+        assert_eq!(
+            engine.memory_strategy_plan().weight_access_pattern.value,
+            WeightAccessPattern::MoeRouted,
+            "the live QMoE fixture must be classified from its graph"
         );
     }
 
