@@ -189,7 +189,12 @@ pub(crate) unsafe fn read_inputs(
         }
         unsafe { release_type_shape(type_shape) };
 
-        let shape: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+        // Validate ORT-supplied dims: reject negatives and detect overflow.
+        let (shape, _, _) = validate_dims(
+            &dims,
+            dtype,
+            &format!("input {i}"),
+        )?;
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
 
         // Data pointer.

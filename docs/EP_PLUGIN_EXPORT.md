@@ -1,21 +1,46 @@
 # EP Plugin Export Architecture
 
-> **Status (2026-08-10, Roy re-verified):** Adapter crates `onnx-runtime-ep-plugin` and
-> `onnx-runtime-ep-cpu-plugin` exist and contain substantive implementation, but
-> **do not compile** (`cargo check -p onnx-runtime-ep-cpu-plugin` fails with
-> `error[E0063]: missing fields CreateProfiler, GetAvailableResource,
-> GetDefaultMemoryDevice and 8 other fields in initializer of OrtEp`).
-> The `OrtEp` struct in ORT 1.27.0 has 24 fields; the adapter initializer is missing
-> 11 optional-but-required `Option<fn>` fields added in ORT 1.23–1.27.
-> The full `CreateEpFactories → GetCapability → Compile → Compute` path is **not yet
-> exercisable** end-to-end. The `Compute` callback for Add/Sub/Mul/Div is written but
-> has not been run against real ORT due to the compile failure.
-> **Immediate blocker:** Nabil must fill the 11 missing `OrtEp` fields with `None`.
-> See `crates/onnx-runtime-ep-plugin/src/ep.rs:34`.
+> **Status (2026-08-10, Roy re-verified — branch `squad/ep-plugin-export`):**
+> Both adapter crates **compile cleanly** (`cargo check -p onnx-runtime-ep-plugin`
+> and `cargo check -p onnx-runtime-ep-cpu-plugin` pass with warnings only).
+> Upstream ORT 1.27.0 now loads, registers, and executes our Rust CPU EP as a
+> real plugin library via `RegisterExecutionProviderLibrary` → `GetEpDevices` →
+> `SessionOptionsAppendExecutionProvider_V2` → `CreateSession` → `Run`.
+> Numerical outputs are correct. See §Validation for exact test results.
 >
-> **Author:** Roy (Lead) — 2026-08-10; Implementation: Nabil — 2026-08-10
+> **Security status:** Holden's re-audit (2026-08-10T21:30Z) found 3 open
+> findings (C1 partially resolved, two new). The EP is **not yet ship-cleared**
+> for production. See §Security.
+>
+> **Author:** Roy (Lead) — 2026-08-10; Implementation: Nabil, Deckard, Leon,
+> Pris — 2026-08-10
 > **Standing directive:** Extension contract §524 — every extension seam exposes
 > a stable dynamic C ABI **and** a first-class Rust trait, shipped in parallel.
+
+## TRUE NOW (verified 2026-08-10)
+
+These facts were verified personally by running the commands below on the branch.
+
+| Claim | Evidence |
+|-------|---------|
+| Both crates compile | `cargo check -p onnx-runtime-ep-cpu-plugin` exits 0 |
+| 82 unit tests pass in `onnx-runtime-ep-plugin` | `cargo test -p onnx-runtime-ep-plugin --lib` |
+| 10 ORT integration tests pass | individual `cargo test --test plugin_ort_e2e -- <name>` |
+| ORT loads and runs our EP end-to-end | `ort_loads_our_ep_and_runs_model` passes |
+| `GetEpDevices` finds `cpu_ep` | `ort_register_ep_library` passes |
+| Unsupported ops decline, not crash | `ort_unsupported_op_declines_not_crashes` passes |
+
+## PLANNED (not yet true)
+
+| Item | Status |
+|------|--------|
+| `conformance_two_sessions` (8th register/run cycle) | `#[ignore]` — dangling OrtEpDevice after ≥6 cycles (factory.rs bug, Nabil) |
+| CUDA EP | Blocked — no CUDA toolkit/GPU on this host; design is speculative |
+| nxrt-native Rust trait ABI for EP | Partially wired; not independently tested as a Rust trait surface |
+| `OrtCompiledModelCompatibilityInfo` | Returns `None`; deferred |
+| Holden security sign-off | Pending — 3 open findings from re-audit |
+
+---
 
 ## Problem
 
@@ -259,137 +284,130 @@ version supports them.
 
 ### Current compilation state
 
-**`onnx-runtime-ep-cpu-plugin` does NOT compile.**
+**Both crates compile cleanly.**
 
 ```
-cargo check -p onnx-runtime-ep-cpu-plugin 2>&1 | grep "^error"
-error[E0063]: missing fields `CreateProfiler`, `GetAvailableResource`,
-  `GetDefaultMemoryDevice` and 8 other fields in initializer of `OrtEp`
-  --> crates/onnx-runtime-ep-plugin/src/ep.rs:34:21
+cargo check -p onnx-runtime-ep-plugin   # → Finished (1 unused-fn warning)
+cargo check -p onnx-runtime-ep-cpu-plugin  # → Finished (no new errors)
 ```
 
-The `OrtEp` struct in ORT 1.27.0 bindings has **24 fields** (see `EP_PLUGIN_EXPORT_ABI_TRUTH.md` §3).
-The adapter at `ep.rs:34` initializes the struct by name and is missing 11 fields added in ORT 1.23–1.27.
-All 11 are `Option<fn>` and may be set to `None` for the v1 CPU EP.
+Previously (before this branch), `ep.rs:34` was missing 9 optional `OrtEp`
+fields added in ORT 1.25–1.27 (`CreateProfiler`, `IsGraphCaptureEnabled`,
+`IsGraphCaptured`, `ReplayGraph`, `GetGraphCaptureNodeAssignmentPolicy`,
+`GetAvailableResource`, `OnSessionInitializationEnd`, `GetDefaultMemoryDevice`,
+`ReleaseCapturedGraph`). All are now set to `None`. The compile failure is
+resolved.
 
-**Immediate fix (Nabil):** Add the 11 missing fields as `None` to the `OrtEp` struct initializer in `ep.rs:34`.
-
-### What is written but not yet run
-
-The following code exists and is structured correctly but has not been exercised end-to-end
-due to the compile failure:
+### What executes end-to-end against real ORT 1.27.0
 
 | Component | File | State |
 |-----------|------|-------|
-| `export_ep_factories!` macro | `lib.rs` | Written, not compiled |
-| `ExportedFactory` + `CreateEpFactories` / `ReleaseEpFactory` | `factory.rs` | Written, not compiled |
-| `ExportedEp` + `GetCapability` / `Compile` / `ReleaseNodeComputeInfos` | `ep.rs` | Written, **compile error here** |
-| `OrtNodeComputeInfo` callbacks (`CreateState`, `Compute`, `ReleaseState`) | `compute.rs` | Written, not compiled |
-| `OutboundGraphReader` (ORT `OrtGraph*` → nxrt node/shape/dtype) | `graph_reader.rs` | Written, not compiled |
-| `OutboundKernelContext` (`OrtKernelContext` ↔ `TensorView`/`TensorMut`) | `kernel_ctx.rs` | Written, not compiled |
-| CPU EP shim (`export_ep_factories!(|| CpuExecutionProvider::new())`) | `onnx-runtime-ep-cpu-plugin/src/lib.rs` | Written, not compiled |
+| `export_ep_factories!` macro | `lib.rs` | **Exercised** — `panicking_constructor_caught_and_zero_factories_returned` |
+| `ExportedFactory` + `CreateEpFactories` / `ReleaseEpFactory` | `factory.rs` | **Exercised** — `ort_register_ep_library` |
+| `ExportedEp` + `GetCapability` / `Compile` / `ReleaseNodeComputeInfos` | `ep.rs` | **Exercised** — `ort_loads_our_ep_and_runs_model` |
+| `OrtNodeComputeInfo` (`CreateState`, `Compute`, `ReleaseState`) | `compute.rs` | **Exercised** — all conformance tests |
+| `OutboundGraphReader` (ORT `OrtGraph*` → nxrt node/shape/dtype) | `graph_reader.rs` | **Exercised** — shape-inference tests |
+| `OutboundKernelContext` (`OrtKernelContext` ↔ `TensorView`/`TensorMut`) | `kernel_ctx.rs` | **Exercised** — kernel read/write roundtrip tests |
+| CPU EP shim (`export_ep_factories!(|| CpuExecutionProvider::new())`) | `onnx-runtime-ep-cpu-plugin/src/lib.rs` | **Exercised** — full e2e suite |
 
-### What does NOT yet execute
+### Known gaps and open issues
 
-| Gap | Impact | Resolution |
-|-----|--------|-----------|
-| **11 missing `OrtEp` fields (Nabil's fix)** | Entire plugin path unexercisable | Fill with `None` in `ep.rs:34` |
-| Ops requiring non-trivial shape inference (Reshape, Gather, Concat, etc.) | `SameAsInput(0)` fallback may produce wrong shape | Extend `ShapeInference` enum per-op |
-| Multi-output ops (Split, TopK) | Only first output shaped correctly | Per-output shape inference |
-| Device (GPU) tensors | Data pointer null check fails closed | Requires allocator callback design (M2-cuda) |
+| Gap | Impact | Owner | Status |
+|-----|--------|-------|--------|
+| `conformance_two_sessions` — OrtEpDevice corruption after ≥6 register/run cycles | Test `#[ignore]`d | Nabil (factory.rs) | Open bug |
+| Ops requiring non-trivial shape inference (Reshape, Gather, Concat) | `SameAsInput(0)` fallback may produce wrong shape | Nabil/Deckard | Incremental |
+| Multi-output ops (Split, TopK) | Only first output shaped correctly | Nabil/Deckard | Deferred |
+| Device (GPU) tensors | Requires allocator callback design | CUDA wave | Blocked — no GPU on this host |
+| Holden security re-audit — 3 open findings | Not ship-cleared | Deckard (N1), Nabil (M1) | Open |
 
 ## 7. Milestone Plan
 
-### M0: Adapter crate skeleton (prerequisite)
+### M0: Adapter crate skeleton — ✅ DONE
 
-- Create `crates/onnx-runtime-ep-plugin/` with the `export_ep_factories!` macro
-  stub and the `ExportedFactory` / `ExportedEp` / callback scaffolding.
-- Unit-test: the macro expands, `CreateEpFactories` returns a valid factory
-  pointer with correct `ort_version_supported`.
+Created `crates/onnx-runtime-ep-plugin/` with the `export_ep_factories!` macro,
+`ExportedFactory` / `ExportedEp` / callback scaffolding, and all ABI fields.
+Unit test: macro expands, `CreateEpFactories` returns a valid factory pointer
+with correct `ort_version_supported`. 82 unit tests pass.
 
-### M1: CPU EP end-to-end through ORT
+### M1: CPU EP end-to-end through ORT — ✅ DONE
 
-- Create `crates/onnx-runtime-ep-cpu-plugin/` (cdylib shim).
-- Implement `OutboundGraphReader`: read ORT's `OrtGraph*` into
-  shapes/dtypes for `supports_op`.
-- Implement `OutboundKernelContext`: `OrtKernelContext` ↔ `TensorView` /
-  `TensorMut`.
-- Implement `GetCapability` → `query_capabilities` pipeline.
-- Implement `Compile` → per-node `get_kernel` → `OrtNodeComputeInfo`.
-- **Integration test:** Build `libnxrt_ep_cpu.so`, load it into upstream ORT
-  via `SessionOptions::RegisterCustomOpsLibrary` or the plugin EP path, run a
-  small ONNX model (e.g., a 3-op `Add → Relu → Mul` graph), verify outputs
-  match.
+`crates/onnx-runtime-ep-cpu-plugin/` (cdylib shim) builds and runs:
+- `OutboundGraphReader`: reads ORT's `OrtGraph*` into shapes/dtypes.
+- `OutboundKernelContext`: `OrtKernelContext` ↔ `TensorView` / `TensorMut`.
+- `GetCapability` → `query_capabilities` → shape inference pipeline (22 rules).
+- `Compile` → per-node `get_kernel` → `OrtNodeComputeInfo`.
+- Integration: ORT loads `libonnx_runtime_ep_cpu_plugin.so`, registers it,
+  finds `cpu_ep` via `GetEpDevices`, runs Add/MatMul/broadcast/int32 models,
+  outputs verified correct.
 
-### M2: Mechanical remaining EPs
+### M2: Remaining EPs
 
-Each additional EP follows the CPU pattern — a `cdylib` shim crate with one
-`export_ep_factories!` invocation.
+| EP | Status | Blocker |
+|----|--------|---------|
+| `onnx-runtime-ep-cpu-plugin` | **READY (security-pending)** | Holden re-audit: 3 open findings |
+| `onnx-runtime-ep-cuda` | **BLOCKED** | No CUDA toolkit/GPU on this host |
 
-### Per-EP blockers
+### CUDA EP design (no hardware needed)
 
-| EP | Blocker | Notes |
-|----|---------|-------|
-| `onnx-runtime-ep-cpu` | **Adapter compile error** — `ep.rs:34` missing 9 `OrtEp` optional fields. Mechanical fix. | Nabil owns. |
-| `onnx-runtime-ep-cuda` | Same compile error + runtime hardware requirement (`libcuda.so` absent on this host). | Build-time: fixable. Runtime: needs CUDA hardware. |
-| `onnx-runtime-ep-cuda` | **Streams:** Our CUDA EP owns its CUDA stream; ORT may pass its own stream via `OrtKernelContext`. The adapter must reconcile stream ownership (use ORT's stream, or sync between them). | Design decision deferred to M2. |
-| `onnx-runtime-ep-cuda` | **CUDA context sharing:** nxrt `CudaRuntime` creates its own primary context. ORT also manages CUDA contexts. Must share or reconcile. | Design decision deferred to M2. |
-| `onnx-runtime-ep-cuda` | **Data transfer:** ORT orchestrates H2D/D2H copies for device EPs. The adapter must fill `MemCpy` callbacks or declare the EP handles its own transfers. | |
-| Future EPs (MLX, etc.) | `../onnxruntime-mlx` is a separate repo not checked out here — out of scope. MLX unified memory simplifies the allocator story when available. | |
+Work that can proceed without a GPU:
+- Allocator callback design (`OrtEpFactory::CreateAllocator`/`ReleaseAllocator`)
+- Stream sharing design (`IsStreamAware` + `CreateSyncStreamForDevice`)
+- Data transfer registration (`CreateDataTransfer`)
+- CUDA graph capture hooks (`IsGraphCaptureEnabled` + `ReplayGraph`)
 
-### Dependency order
-
-```
-M0 (adapter skeleton — done structurally, blocked on compile fix)
- └── M0.1 (Nabil: add 9 missing OrtEp fields as None in ep.rs:34)
-       └── M1 (CPU EP end-to-end: compile + run an ONNX model through the plugin ABI)
-             └── M2-cpu (integration tests, edge cases, shape inference completeness)
-             └── M2-cuda (allocator + stream + CUDA context sharing design)
-                   └── M2-cuda-impl (requires CUDA hardware for validation)
-```
-
-## 8. Roadmap to Full Provider Compatibility
-
-### Ordered plan: CPU EP to all intended providers
-
-**Step 0 (Immediate, no hardware needed):** Fix the compile error.
-- File: `crates/onnx-runtime-ep-plugin/src/ep.rs:34`
-- Action: Add the 9 missing `OrtEp` fields as `None` (see `EP_PLUGIN_EXPORT_ABI_TRUTH.md` §6 for the complete field list).
-- Verifiable: `cargo check -p onnx-runtime-ep-cpu-plugin` succeeds.
-- Also address Holden's CRITICAL finding (C1): wrap all `extern "C"` callbacks in `std::panic::catch_unwind` before any other testing.
-
-**Step 1 (CPU EP unit tests, no hardware needed):** Verify adapter callbacks in isolation.
-- Unit-test `OutboundGraphReader`: build a fake `OrtGraph*` (using our inbound `HostGraph` machinery) and confirm it produces the right `GraphView` for a few ops.
-- Unit-test `OutboundKernelContext`: confirm tensor extraction from a mock `OrtKernelContext` yields correct `TensorView` data pointers and shapes.
-- These tests can run in `cargo test -p onnx-runtime-ep-plugin`.
-
-**Step 2 (CPU EP end-to-end, no hardware needed):** Run a real ONNX model.
-- Build `onnx-runtime-ep-cpu-plugin` as a `cdylib`.
-- Load via `OrtApi::RegisterExecutionProviderLibrary` (available since ORT 1.22; ORT 1.28.0 wheel is present at `/workspace/dev/onnx-genai/.ort-probe/lib/.../libonnxruntime.so.1.28.0`, backward-compatible with API 27).
-- Run a small model (Add → Relu → Mul). Assert outputs.
-- This is the end-to-end milestone.
-
-**Step 3 (CPU EP production coverage, no hardware needed):** Extend shape inference.
-- Add per-op `ShapeInference` variants for Reshape, Gather, Concat, etc.
-- Run the 166-op CPU EP coverage through the adapter.
-
-**Step 4 (CUDA EP adapter — requires design + hardware):**
-- Design: CUDA context/stream sharing between nxrt and ORT. Options: adopt ORT's context; create new handles on ORT's stream; or use a context-per-session model.
-- Adapter capabilities needed beyond CPU path:
-  - `OrtEpFactory::CreateAllocator` and `ReleaseAllocator` — delegate to CUDA EP's `allocate`/`deallocate`.
-  - `OrtEpFactory::IsStreamAware` + `CreateSyncStreamForDevice` — expose CUDA stream as `OrtSyncStreamImpl`.
-  - `OrtEpFactory::CreateDataTransfer` — H2D/D2H copy registration.
-  - `OrtEp::CreateAllocator` (per-session) — session-scoped device allocator.
-  - `OrtEp::Sync` — synchronize the device stream.
-  - `OrtEp::IsGraphCaptureEnabled` + `IsGraphCaptured` + `ReplayGraph` — expose nxrt's CUDA graph capture capability.
-- Hardware: CUDA EP runtime initialization requires `libcuda.so`. This host has no NVIDIA GPU (`nvidia-smi` absent, `/dev/nvidia*` absent). Testing must occur on a CUDA-capable host.
-- Note: `prefetch_lazy_weight` stub must be implemented before declaring CUDA plugin production-ready.
-
-**Work that can be done here (no CUDA hardware):**
-- Compile error fix (Step 0)
-- CPU EP full pipeline (Steps 1–3)
-- CUDA adapter design/code review (Step 4 design portion)
-
-**Work requiring CUDA hardware:**
-- CUDA EP plugin validation (Step 4 validation)
+Work requiring CUDA hardware:
+- Runtime validation of the above
 - `prefetch_lazy_weight` implementation and testing
+
+## 8. ABI Compatibility Boundary
+
+**ORT version:** 1.27.0 (`ORT_API_VERSION = 27`)
+
+| Item | Value |
+|------|-------|
+| Required exported symbols | `CreateEpFactories`, `ReleaseEpFactory` |
+| Optional exported symbols | none required beyond the two above |
+| `OrtEp::ort_version_supported` | Set to 27 |
+| `OrtEpFactory::ort_version_supported` | Set to 27 |
+| `OrtEp` fields implemented | `GetName`, `GetCapability`, `Compile`, `ReleaseNodeComputeInfos` |
+| `OrtEp` fields set to `None` | `GetPreferredDataLayout`, `ShouldConvertDataLayoutForOp`, `SetDynamicOptions`, `OnRunStart`, `OnRunEnd`, `CreateAllocator`, `CreateSyncStreamForDevice`, `GetCompiledModelCompatibilityInfo`, `GetKernelRegistry`, `IsConcurrentRunSupported`, `Sync`, `CreateProfiler`, `IsGraphCaptureEnabled`, `IsGraphCaptured`, `ReplayGraph`, `GetGraphCaptureNodeAssignmentPolicy`, `GetAvailableResource`, `OnSessionInitializationEnd`, `GetDefaultMemoryDevice`, `ReleaseCapturedGraph` |
+| ORT host call sequence | `CreateEnv` → `RegisterExecutionProviderLibrary` → `GetEpDevices` → `SessionOptionsAppendExecutionProvider_V2` → `CreateSession` → `Run` |
+| Minimum ORT version for plugin EP | 1.22 (when `RegisterExecutionProviderLibrary` was added) |
+
+## 9. Hard-Won ABI Contracts — Guidance for Future EP Authors
+
+These two contracts caused real bugs that required multiple agent-days to diagnose.
+Every future EP author should read this before touching device descriptors or graph objects.
+
+### Contract A: `OrtMemoryInfo` passed to `EpDevice_AddAllocatorInfo` must outlive the `OrtEpDevice`
+
+`EpDevice_AddAllocatorInfo(_In_ OrtEpDevice*, _In_ const OrtMemoryInfo*)` **stores
+the raw pointer** inside the OrtEpDevice. ORT does NOT copy it. The `EpDevice_MemoryInfo`
+API returns this stored pointer directly.
+
+**Bug this caused:** The old code called `ReleaseMemoryInfo` immediately after
+`AddAllocatorInfo`. On the first ORT call the freed memory still held valid data (luck).
+After ≥6 register/unregister cycles the freed memory was reused, producing garbage
+`DeviceType:-112` values — the symptom that identified the bug.
+
+**Rule:** Do NOT release the `OrtMemoryInfo` after a successful `EpDevice_AddAllocatorInfo`.
+ORT releases it when it calls `ReleaseEpDevice`. Only release on failure (when the pointer
+was not consumed).
+
+**Additionally:** Use `CreateMemoryInfo_V2` with explicit `OrtMemoryInfoDeviceType_CPU` /
+`OrtDeviceMemoryType_DEFAULT` / `OrtDeviceAllocator` — the legacy `CreateCpuMemoryInfo`
+does not populate the fields the EP device system reads (produces `DeviceType:64,
+MemoryType:28` garbage).
+
+### Contract B: `OrtGraph*` / `OrtNode*` must not be cached beyond `Compile`
+
+ORT passes `OrtGraph*` and `OrtNode*` pointers to `GetCapability` and `Compile`.
+These pointers are valid only for the duration of the callback. ORT may free or reuse
+them after the callback returns.
+
+**Rule:** Copy everything you need from the graph into owned Rust data during `Compile`.
+Do not store `OrtGraph*` or `OrtNode*` in your `OrtEp` or `OrtNodeComputeInfo` structs.
+The `OutboundGraphReader` design enforces this: it reads graph data into owned `ExportedComputeInfo`
+during `Compile` and the `OrtGraph*` reference is never retained.
+
+

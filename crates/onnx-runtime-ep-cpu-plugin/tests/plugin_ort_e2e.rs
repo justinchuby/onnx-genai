@@ -6,22 +6,32 @@
 //! - `ort_register_ep_library` — real `RegisterExecutionProviderLibrary` call.
 //! - `ort_loads_our_ep_and_runs_model` — full end-to-end: Env → Register → Devices → Session → Run.
 //! - `ort_unsupported_op_declines_not_crashes` — negative: model with unsupported op must not crash.
-//! - `conformance_*` — real-ORT conformance suite covering broadcast, multi-node, MatMul, mixed
-//!   partition, INT32, dynamic dims, multiple runs, two sessions.
+//! - `conformance_*` — real-ORT conformance suite covering broadcast, multi-node, MatMul, batched-ND
+//!   MatMul, mixed partition, INT32, dynamic dims, multiple runs, two sessions.
+//! - `stress_register_run_unregister_cycles` — 25 complete register→Run→unregister cycles to lock
+//!   in the use-after-free fix in factory.rs (bug only appeared at cycle ≥6).
+//!
+//! # `EpDevice_EpName` vs registration name
+//!
+//! `EpDevice_EpName` returns the factory's declared name (e.g. "cpu_ep"), which is the
+//! string returned by `OrtEpFactory::GetName`. It is **not** the registration key passed
+//! to `RegisterExecutionProviderLibrary`. Tests that search the device list must compare
+//! against the factory name "cpu_ep", not the registration key.
+//!
+//! # f16/bf16 coverage
+//!
+//! The underlying CPU kernels (`crates/onnx-runtime-ep-cpu`) support Float16 and BFloat16
+//! for Add and MatMul. However, the ORT plugin interface routes nodes to our EP only when
+//! GetCapability claims them, and our EP does not currently register explicit half-dtype
+//! type-constraint metadata with ORT's node-capability API. Consequently ORT may not route
+//! f16/bf16 nodes to our EP and an end-to-end ONNX-model test with half inputs is not
+//! provable without kernel-registry support. This is recorded as a coverage gap; see
+//! `.squad/decisions/inbox/pris-ep-conformance-final.md`.
 //!
 //! # Environment
 //!
 //! No env vars required — the test resolves ORT from the ort-sys build output.
 //! Skips loudly if ORT or the EP cdylib is absent.
-//!
-//! # Serialisation note
-//!
-//! ORT's EP library registry is **global process state**.  After ~6 complete
-//! register+Run+unregister cycles the device descriptor becomes corrupt (a
-//! dangling-pointer / uninitialized-memory bug in factory.rs — Nabil).  All
-//! tests that register our EP therefore acquire `ORT_EP_LOCK` so they run
-//! serially, keeping the cycle count below the corruption threshold for the
-//! default suite.
 
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
@@ -247,13 +257,6 @@ fn ort_register_ep_library() {
 ///
 /// Same blocking condition as `ort_register_ep_library`.
 #[test]
-#[ignore = "BUG (Nabil/ep.rs or factory.rs): ORT Run fails with 'allocator != nullptr was false. \
-            Failed to find allocator for device Device:[DeviceType:64 MemoryType:28 ...]'. \
-            The EP device is found and session creation succeeds, but at Run-time ORT cannot locate \
-            the allocator for our custom device. The EP must register its allocator during \
-            Compile/CreateExecutionProvider so ORT can route tensor copies. \
-            Likely fix: call OrtEpApi::CreateEpDevice with correct DeviceType/MemoryType and \
-            register a GetAllocator callback in crates/onnx-runtime-ep-plugin/src/ep.rs or factory.rs."]
 fn ort_loads_our_ep_and_runs_model() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let ort_lib_dir = skip_if_missing!(
@@ -1192,13 +1195,7 @@ fn conformance_add_dynamic_dim() {
 ///
 /// Call 1: [1,2,3,4] + [5,6,7,8] = [6,8,10,12]
 /// Call 2: [10,0,10,0] + [0,10,0,10] = [10,10,10,10]
-///
-/// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
 #[test]
-#[ignore = "BUG (Nabil/factory.rs): OrtEpDevice corrupted after ≥6 register+Run+unregister cycles \
-            in the same process (DeviceType:-112, garbage values — dangling pointer or uninitialized \
-            memory in GetSupportedDevices / factory.rs).  This test is the 7th cycle in the full \
-            suite; fix in crates/onnx-runtime-ep-plugin/src/factory.rs (Nabil)."]
 fn conformance_multiple_run_calls() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1285,11 +1282,11 @@ fn conformance_multiple_run_calls() {
 /// Session A: add_1x4 model.  Session B: add_broadcast model.
 /// Both run and must produce correct, independent outputs.
 ///
-/// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
+/// Registration name: "cpu_ep_2sess" (the key passed to RegisterExecutionProviderLibrary).
+/// EP name: "cpu_ep" (the string returned by the factory's GetName / EpDevice_EpName).
+/// These are distinct: EpDevice_EpName returns the factory's declared name, not the
+/// registration key. The device search must use the factory name "cpu_ep".
 #[test]
-#[ignore = "BUG (Nabil/factory.rs): OrtEpDevice corrupted after ≥6 register+Run+unregister cycles \
-            (DeviceType:-112 garbage — dangling pointer or uninit in factory.rs GetSupportedDevices). \
-            This test is the 8th cycle in the full suite; fix in factory.rs (Nabil)."]
 fn conformance_two_sessions() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1336,12 +1333,12 @@ fn conformance_two_sessions() {
             let dev = *ep_devices.add(i);
             let name_ptr = ep_name_fn(dev);
             if !name_ptr.is_null()
-                && CStr::from_ptr(name_ptr).to_string_lossy() == "cpu_ep_2sess"
+                && CStr::from_ptr(name_ptr).to_string_lossy() == "cpu_ep"
             {
                 our_device = dev;
             }
         }
-        assert!(!our_device.is_null(), "EP cpu_ep_2sess not found");
+        assert!(!our_device.is_null(), "EP 'cpu_ep' not found in GetEpDevices (reg_name=cpu_ep_2sess; EpDevice_EpName returns factory GetName, not registration key)");
 
         // Build session A
         let mut opts_a: *mut ort::OrtSessionOptions = ptr::null_mut();
@@ -1437,3 +1434,222 @@ fn conformance_two_sessions() {
         eprintln!("\n✅ conformance_two_sessions: PASSED — both sessions independent and correct");
     }
 }
+
+// ─── Conformance: batched ND MatMul ──────────────────────────────────────────
+
+/// Batched 3-D MatMul: A [2,3,4] × B [2,4,2] → C [2,3,2].
+///
+/// Tests the batched-ND broadcast inference in our MatMul kernel under real ORT dispatch.
+///
+/// Hand-computed expected values:
+///   batch 0: A0 = [[1,2,3,4],[5,6,7,8],[9,10,11,12]]  B0 = [[1,0],[0,1],[1,0],[0,1]]
+///     C0[0] = [1*1+2*0+3*1+4*0, 1*0+2*1+3*0+4*1] = [4, 6]
+///     C0[1] = [5+7, 6+8] = [12, 14]
+///     C0[2] = [9+11, 10+12] = [20, 22]
+///   batch 1: A1 = [[0,1,0,1],[2,0,2,0],[1,1,1,1]]  B1 = [[2,0],[0,2],[2,0],[0,2]]
+///     C1[0] = [0*2+1*0+0*2+1*0, 0*0+1*2+0*0+1*2] = [0, 4]
+///     C1[1] = [2*2+0*0+2*2+0*0, 2*0+0*2+2*0+0*2] = [8, 0]
+///     C1[2] = [1*2+1*0+1*2+1*0, 1*0+1*2+1*0+1*2] = [4, 4]
+#[test]
+fn conformance_matmul_batched_nd() {
+    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_mm3d", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_matmul_batched_nd — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        // A [2,3,4]
+        let mut a_data: [f32; 24] = [
+            1.0, 2.0, 3.0, 4.0,   5.0, 6.0, 7.0, 8.0,   9.0, 10.0, 11.0, 12.0,
+            0.0, 1.0, 0.0, 1.0,   2.0, 0.0, 2.0, 0.0,   1.0, 1.0,  1.0,  1.0,
+        ];
+        // B [2,4,2]
+        let mut b_data: [f32; 16] = [
+            1.0, 0.0,  0.0, 1.0,  1.0, 0.0,  0.0, 1.0,
+            2.0, 0.0,  0.0, 2.0,  2.0, 0.0,  0.0, 2.0,
+        ];
+        let a_shape: [i64; 3] = [2, 3, 4];
+        let b_shape: [i64; 3] = [2, 4, 2];
+
+        let a_val = make_float_tensor(api, &mut a_data, &a_shape);
+        let b_val = make_float_tensor(api, &mut b_data, &b_shape);
+
+        let input_names = [c"A".as_ptr(), c"B".as_ptr()];
+        let output_names = [c"C".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [a_val, b_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session, ptr::null(),
+            input_names.as_ptr(), inputs.as_ptr(), 2,
+            output_names.as_ptr(), 1, &mut output,
+        );
+        check_status(api, status, "Run");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 12);
+        // C[0] = [[4,6],[12,14],[20,22]]  C[1] = [[0,4],[8,0],[4,4]]
+        let expected: [f32; 12] = [4.0, 6.0, 12.0, 14.0, 20.0, 22.0, 0.0, 4.0, 8.0, 0.0, 4.0, 4.0];
+        eprintln!("  Got:      {result:?}");
+        eprintln!("  Expected: {expected:?}");
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-5, "C[{i}] = {got}, want {want}");
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(a_val);
+        ((*api).ReleaseValue.unwrap())(b_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_mm3d");
+        eprintln!("\n✅ conformance_matmul_batched_nd: PASSED");
+    }
+}
+
+// ─── Stress: use-after-free regression ───────────────────────────────────────
+
+/// 25 complete register → GetEpDevices → CreateSession → Run → Unregister cycles.
+///
+/// The use-after-free bug (fixed in commit c92838dba) corrupted `OrtEpDevice`
+/// after ≥6 cycles when `OrtMemoryInfo` was released while ORT held the raw
+/// pointer. This stress test exceeds that threshold by 4× so any regression
+/// will be caught before it reaches production.
+///
+/// Each cycle uses a fresh Env, fresh session, fresh registration key, and
+/// verifies the Run output independently. Corrupt memory typically manifests
+/// as a DeviceType=-112 panic or a segfault on the device-lookup assertion.
+#[test]
+fn stress_register_run_unregister_cycles() {
+    let _lock = ORT_EP_LOCK.lock().unwrap();
+
+    let ort_lib_dir = {
+        let d = find_ort_lib_dir();
+        if d.is_none() {
+            eprintln!("*** SKIPPED: stress_register_run_unregister_cycles — ORT not found ***");
+            return;
+        }
+        d.unwrap()
+    };
+    let ep_lib_path = {
+        let p = find_ep_cdylib();
+        if p.is_none() {
+            eprintln!("*** SKIPPED: stress_register_run_unregister_cycles — EP cdylib not found ***");
+            return;
+        }
+        p.unwrap()
+    };
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
+    if !model_path.exists() {
+        eprintln!("*** SKIPPED: stress_register_run_unregister_cycles — add_1x4 fixture missing ***");
+        return;
+    }
+
+    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    // Keep the library loaded for the whole test — dlopen reference-counts.
+    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
+    let api = unsafe { get_ort_api(&lib) };
+    let ep_path_c = CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+
+    const CYCLES: usize = 25;
+    for cycle in 0..CYCLES {
+        let reg_key = format!("stress_ep_{cycle}");
+        let reg_c = CString::new(reg_key.as_str()).unwrap();
+
+        unsafe {
+            // Env
+            let logid = CString::new(format!("stress_{cycle}")).unwrap();
+            let mut env: *mut ort::OrtEnv = ptr::null_mut();
+            let status = ((*api).CreateEnv.unwrap())(ort::ORT_LOGGING_LEVEL_WARNING, logid.as_ptr(), &mut env);
+            check_status(api, status, &format!("CreateEnv[{cycle}]"));
+
+            // Register
+            let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(env, reg_c.as_ptr(), ep_path_c.as_ptr());
+            check_status(api, status, &format!("Register[{cycle}]"));
+
+            // GetEpDevices — device must have correct DeviceType every cycle.
+            let mut ep_devices: *const *const ort::OrtEpDevice = ptr::null();
+            let mut num_devices: usize = 0;
+            let status = ((*api).GetEpDevices.unwrap())(env, &mut ep_devices, &mut num_devices);
+            check_status(api, status, &format!("GetEpDevices[{cycle}]"));
+
+            let ep_name_fn = (*api).EpDevice_EpName.expect("EpDevice_EpName");
+            let mut our_device: *const ort::OrtEpDevice = ptr::null();
+            for i in 0..num_devices {
+                let dev = *ep_devices.add(i);
+                let name_ptr = ep_name_fn(dev);
+                if !name_ptr.is_null() && CStr::from_ptr(name_ptr).to_string_lossy() == "cpu_ep" {
+                    our_device = dev;
+                }
+            }
+            assert!(
+                !our_device.is_null(),
+                "stress cycle {cycle}: EP 'cpu_ep' not found — possible DeviceType corruption (use-after-free regression)"
+            );
+
+            // Session
+            let mut sess_opts: *mut ort::OrtSessionOptions = ptr::null_mut();
+            let status = ((*api).CreateSessionOptions.unwrap())(&mut sess_opts);
+            check_status(api, status, &format!("CreateSessionOptions[{cycle}]"));
+            let devs: [*const ort::OrtEpDevice; 1] = [our_device];
+            let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
+                sess_opts, env, devs.as_ptr(), 1, ptr::null(), ptr::null(), 0,
+            );
+            check_status(api, status, &format!("AppendEP[{cycle}]"));
+            let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
+            let mut session: *mut ort::OrtSession = ptr::null_mut();
+            let status = ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), sess_opts, &mut session);
+            check_status(api, status, &format!("CreateSession[{cycle}]"));
+
+            // Run: [1,2,3,4] + [5,6,7,8] = [6,8,10,12]
+            let mut x_data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+            let mut y_data: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
+            let shape: [i64; 2] = [1, 4];
+            let xv = make_float_tensor(api, &mut x_data, &shape);
+            let yv = make_float_tensor(api, &mut y_data, &shape);
+            let in_names = [c"X".as_ptr(), c"Y".as_ptr()];
+            let out_names = [c"Z".as_ptr()];
+            let inputs: [*const ort::OrtValue; 2] = [xv, yv];
+            let mut output: *mut ort::OrtValue = ptr::null_mut();
+            let status = ((*api).Run.unwrap())(
+                session, ptr::null(),
+                in_names.as_ptr(), inputs.as_ptr(), 2,
+                out_names.as_ptr(), 1, &mut output,
+            );
+            check_status(api, status, &format!("Run[{cycle}]"));
+            assert!(!output.is_null(), "cycle {cycle}: output is null");
+            let mut dp: *mut std::ffi::c_void = ptr::null_mut();
+            let status = ((*api).GetTensorMutableData.unwrap())(output, &mut dp);
+            check_status(api, status, &format!("GetTensorMutableData[{cycle}]"));
+            let result = std::slice::from_raw_parts(dp as *const f32, 4);
+            let expected: [f32; 4] = [6.0, 8.0, 10.0, 12.0];
+            for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "cycle {cycle}: output[{i}]={got}, want {want}"
+                );
+            }
+
+            // Teardown
+            ((*api).ReleaseValue.unwrap())(output);
+            ((*api).ReleaseValue.unwrap())(xv);
+            ((*api).ReleaseValue.unwrap())(yv);
+            ((*api).ReleaseSession.unwrap())(session);
+            ((*api).ReleaseSessionOptions.unwrap())(sess_opts);
+            let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_c.as_ptr());
+            check_status(api, status, &format!("Unregister[{cycle}]"));
+            ((*api).ReleaseEnv.unwrap())(env);
+        }
+
+        eprintln!("  ✓ cycle {}/{CYCLES}", cycle + 1);
+    }
+
+    eprintln!("\n✅ stress_register_run_unregister_cycles: {CYCLES} cycles PASSED — use-after-free regression clear");
+}
+

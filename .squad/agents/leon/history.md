@@ -77,3 +77,30 @@ Inbox drop `leon-reasoning-fixture-round3.md` was lost when the worktree was del
 
 **No public API signatures changed.** `validate_dims` is `pub(crate)` only.
 before Scribe ran; content reconstructed into `.squad/decisions.md`.
+---
+
+## 2026-08-10 — Clippy dead_code cleanup: validate_dims wired into read_inputs
+
+**Branch:** squad/ep-plugin-export
+**Triggered by:** Deckard validation gate failure; Reviewer Rejection Protocol prevented him from editing.
+
+**Finding:** `validate_dims` in `kernel_ctx.rs:23` was reported as dead code by
+`cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`.
+
+**Root cause — real gap, not cosmetic:** `validate_dims` was defined but never
+called from `read_inputs`. The production path was silently casting ORT dims via
+`.map(|&d| d as usize)` — a bare cast that passes negative dims as huge positive
+values, bypassing the negative-dim rejection and overflow checks entirely.
+This is exactly the "validation path never connected" scenario flagged in the mission.
+
+**Fix:** Replaced the bare cast in `read_inputs` with a call to `validate_dims`,
+so every set of ORT-supplied dims crossing the FFI boundary now goes through the
+validated path. No `#[allow(dead_code)]` was used.
+
+**Remaining clippy errors (not my files):**
+- `lib.rs:184` — `unused-mut` (`let mut out_num`)
+- `lib.rs:189` — `clippy::diverging-sub-expression` (panic! in test guard)
+- `ep.rs:499` — `clippy::manual-dangling-ptr` (`1usize as *mut OrtEp`)
+These are in Isidore's (`lib.rs`) and Deckard's (`ep.rs`) files; not touched.
+
+**Test result:** `cargo test -p onnx-runtime-ep-plugin --lib` — 82 passed, 0 failed.

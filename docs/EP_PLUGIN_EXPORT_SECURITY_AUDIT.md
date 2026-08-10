@@ -2,9 +2,167 @@
 
 **Auditor:** Holden (Security Engineer)
 **Initial audit date:** 2026-08-10T20:12:35.793+00:00
-**Re-audit date:** 2026-08-10T21:30:26Z
-**Branch audited:** `squad/ep-plugin-export` @ commit `526a883c4`
+**Re-audit date (RED):** 2026-08-10T21:30:26Z
+**Final re-audit date (SHIP VERDICT):** 2026-08-10T22:42:21Z
+**Branch audited:** `squad/ep-plugin-export`
+**Commits reviewed:** `526a883c4` (Nabil's partial remediation), `c92838dba` (Deckard's UAF fix), Leon's N1/N2 fix, Isidore's N3 fix
 **Scope:** `crates/onnx-runtime-ep-plugin/src/{factory,ep,graph_reader,compute,kernel_ctx,status,lib}.rs` + `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs`
+
+---
+
+## ═══ FINAL SHIP VERDICT — 2026-08-10T22:42:21Z ═══
+
+### 🟡 YELLOW — May ship. Advisory items recorded below; no blockers remain.
+
+All three original ship-blocking findings (N1 CRITICAL, N2 HIGH, N3 MEDIUM) have been independently verified as resolved in the current branch head. The Deckard-authored use-after-free fix in `factory.rs` (commit `c92838dba`) is structurally correct. Two new LOW advisory items are filed for post-merge follow-up.
+
+| Finding | Severity | Fixer | Status |
+|---------|----------|-------|--------|
+| N1 — `compute_execute` no `catch_unwind` | CRITICAL | Leon | **RESOLVED** — `compute.rs:552` guarded |
+| N2 — negative dims wrap to `usize::MAX` | HIGH | Leon | **RESOLVED** — `kernel_ctx.rs:193` calls `validate_dims()` |
+| N3 — macro entry points unguarded | MEDIUM | Isidore | **RESOLVED** — `lib.rs` both symbols guarded |
+| UAF `factory.rs` `OrtMemoryInfo` | CRITICAL (new) | Deckard | **RESOLVED** — ownership transfer correct |
+| NEW-1 — `compute_release_state` no guard | LOW (advisory) | Leon (post-merge) | Advisory |
+| NEW-2 — partial info leak in `ep_compile_inner` | LOW (advisory) | Deckard (post-merge) | Advisory |
+
+---
+
+### N1 Verification — RESOLVED
+
+`compute.rs:547–762`:
+```rust
+unsafe extern "C" fn compute_execute(...) -> *mut ort::OrtStatus {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ...
+    }));
+    result.unwrap_or_else(|_| fail_status("Compute: internal panic"))
+}
+```
+`catch_unwind` wraps the entire execution body. `compute_create_state` (line 519) is also guarded. Regression test `compute_execute_catches_panic_returns_error_status` in `compute.rs` tests` at line 2115 confirmed present. All `OrtNodeComputeInfo` callbacks (`CreateState`, `Compute`, `ReleaseState`) checked — see NEW-1 for minor note on `ReleaseState`.
+
+### N2 Verification — RESOLVED
+
+`kernel_ctx.rs:23–58`: `validate_dims()` rejects negative dims by index and value, uses `checked_mul` for element-count and byte-length overflow, accepts zero dims as legal (ONNX-compatible). Called from `read_inputs()` at line 193:
+```rust
+let (shape, _, _) = validate_dims(&dims, dtype, &format!("input {i}"))?;
+```
+Eight test cases present: negative, large-negative, element-count overflow, byte-length overflow, zero-dim, scalar, normal. The old unchecked `dims.iter().map(|&d| d as usize)` is confirmed replaced.
+
+### N3 Verification — RESOLVED
+
+`lib.rs`: `CreateEpFactories` is wrapped in `catch_unwind(AssertUnwindSafe(...))` that zero-clears `*out_num` and returns `fail_status(...)` on panic. `ReleaseEpFactory` return type is `void` (correct per ORT ABI — prior version incorrectly returned `*mut OrtStatus`). `panic_to_fail_status` helper is `pub` and documented. Two regression tests: `panicking_constructor_caught_and_zero_factories_returned` and `panic_to_fail_status_never_panics`.
+
+### factory.rs UAF Fix Verification — CORRECT
+
+`factory.rs` (Deckard, commit `c92838dba`):
+
+The fix is in `factory_get_supported_devices`, the `EpDevice_AddAllocatorInfo` call site:
+
+**Before (buggy):** `mem_info` was released immediately after `add_alloc_info`, but ORT stores the raw pointer inside `OrtEpDevice` without copying it — the device then held a dangling pointer.
+
+**After (fixed):**
+```rust
+let status = unsafe { add_alloc_info(ep_device, mem_info) };
+if !status.is_null() {
+    // Release mem_info only on failure since it was not consumed.
+    if let Some(release) = unsafe { (*api).ReleaseMemoryInfo } {
+        unsafe { release(mem_info) };
+    }
+    return status;
+}
+// Success: ORT owns mem_info via OrtEpDevice; do not release here.
+```
+
+Ownership analysis:
+- **Success path:** `add_alloc_info` transfers ownership of `mem_info` to ORT's `OrtEpDevice`. ORT releases it when the device is released. We never call `ReleaseMemoryInfo`. No leak.
+- **Failure path:** `add_alloc_info` returns a non-null status (failure); ownership was not transferred. We call `ReleaseMemoryInfo` exactly once. No leak.
+- **Double-free impossibility:** The two release paths are mutually exclusive (branched on `status.is_null()`). There is no path that calls `ReleaseMemoryInfo` twice on the same pointer.
+- **`CreateMemoryInfo_V2`:** Correct replacement for the deprecated `CreateCpuMemoryInfo`. Supplies `OrtMemoryInfoDeviceType_CPU` and `OrtDeviceMemoryType_DEFAULT`, which the new EP device ABI requires; the old API left those fields uninitialized, producing the garbage `DeviceType:-112 MemoryType:-85` reported in production.
+
+This fix is structurally sound and matches the ownership-transfer contract described in the ORT plugin-EP header.
+
+---
+
+### NEW-1 (LOW Advisory) — `compute_release_state` missing `catch_unwind`
+
+**File:** `compute.rs:1416`
+
+```rust
+unsafe extern "C" fn compute_release_state(
+    _info: *mut ort::OrtNodeComputeInfo,
+    state: *mut c_void,
+) {
+    if !state.is_null() {
+        unsafe { drop(Box::from_raw(state.cast::<ComputeState>())) };
+    }
+}
+```
+
+`ComputeState` is `struct ComputeState { _placeholder: u8 }` — no heap fields, no custom `Drop`. Dropping a `Box<ComputeState>` is a trivial heap deallocation that cannot panic in Rust's standard allocator. The exploit surface is **zero in current code**.
+
+However, every other `extern "C"` callback with a non-trivial body is wrapped in `catch_unwind`. If `ComputeState` is later extended with a field that has a custom `Drop` (e.g., a file handle, a lock guard, a connection pool), the missing guard will silently become a latent UB vector. This should be patched before `ComputeState` grows.
+
+**Recommended fix (one-liner, assign to Leon post-merge):**
+```rust
+unsafe extern "C" fn compute_release_state(...) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !state.is_null() {
+            unsafe { drop(Box::from_raw(state.cast::<ComputeState>())) };
+        }
+    }));
+}
+```
+
+**Severity: LOW. Non-blocking. File follow-up issue.**
+
+---
+
+### NEW-2 (LOW Advisory) — Partial `OrtNodeComputeInfo` leak on `Compile` error
+
+**File:** `ep.rs`, `ep_compile_inner`
+
+If `Compile` is called with `count = N` subgraphs and compilation fails at index `i` (e.g., `get_kernel` returns `Err`), the function returns `fail_status(...)` immediately. `out_infos[0..i]` contain valid `Box<ExportedComputeInfo>` raw pointers that were already written; `out_infos[i..N]` are uninitialised (or null per caller contract).
+
+The ORT header is silent on whether `ReleaseNodeComputeInfos` is called after a non-null `Compile` return. If ORT skips it, `out_infos[0..i]` leak; if ORT calls it, the caller tries to free pointers it did not place and we double-free. Neither is correct.
+
+This is a carry-forward of M2 from the previous audit. Not a memory-safety issue with a known ORT 1.27 behavior, but should be hardened: on the failure path, free the already-written infos before returning.
+
+**Severity: LOW. Non-blocking. Assign to Deckard post-merge.**
+
+---
+
+### Broader Scope Audit (new code since last pass)
+
+**`graph_reader.rs` — node attribute and initializer reading:**
+
+| Concern | Verdict |
+|---------|---------|
+| `OrtGraph*`/`OrtNode*` cached beyond `Compile` | **SAFE** — `OutboundGraphReader` is `!Send + !Sync` (doc comment at line 28); `ExportedComputeInfo` stores only owned `Box<dyn Kernel>`, never raw ORT pointers. `to_ir_graph()` returns a reference to a stack-local-owned `Graph`; no ORT pointers escape the callback. |
+| Bounds/overflow on attribute arrays | **SAFE** — `read_attr_value` uses a two-call pattern (zero-length probe for required size, then allocate exact). Buffer size comes from ORT, not from attacker-controlled model data directly. |
+| Overflow on initializer tensor copy | **SAFE** — `read_initializers_int64` restricts copies to 1-D tensors with ≤ 64 elements (`if dims_count > 1 { continue; }` / `if elem_count > 64 { continue; }`). |
+| `CStr` conversions on ORT strings | **SAFE** — All use `.to_string_lossy().into_owned()`. Non-UTF-8 bytes replaced with `U+FFFD`; no panic. ORT strings are null-checked before `CStr::from_ptr`. |
+| String attribute type mismatches | **SAFE** — `read_attr_value` matches on `attr_type` from ORT and falls through to `None` for unrecognised types. No type confusion. |
+| `OrtValue` from initializers released | **SAFE** — `ValueInfo_GetInitializerValue` follows the ORT `Get*` borrow pattern (pointer into graph-owned storage, not a caller allocation). Consistent with `KernelContext_GetInput` which also returns a borrowed `OrtValue*` without needing `ReleaseValue`. |
+
+**`factory.rs` — allocator/memory-info registration:**
+
+See UAF fix verification above. EP name, vendor, and version `CString` fields are owned by `ExportedFactory` for its lifetime. ORT reads them via `GetName`/`GetVendor`/`GetVersion` callbacks while the factory is alive. Lifetimes are correct.
+
+**`ep.rs` — capability filtering:**
+
+When `GetCapability` declines a node via the `ShapeInference::Declined` filter:
+- `claims` is filtered to an empty `Vec`.
+- The function returns `ok_status()` with zero claimed nodes.
+- `ir_graph`, `cache`, and `view` are stack-local and dropped.
+- No partially-built state escapes. The reader's `ort_node_ptrs` are also stack-local and freed with the reader.
+
+Fail-closed behavior per `.squad/decisions.md`: declining a node never claims it; no shape is guessed; no dimension is clamped. **Verified.**
+
+---
+
+## Prior Re-audit Record (2026-08-10T21:30:26Z)
+
+Nabil's remediation commit (`526a883c4`) resolved H1/H2/H3 but left `compute_execute` unguarded (reinstating CRITICAL as N1). Leon, Deckard, and Isidore were assigned N1/N2/N3 respectively under Reviewer Rejection Protocol lockout. Details below.
 
 ---
 

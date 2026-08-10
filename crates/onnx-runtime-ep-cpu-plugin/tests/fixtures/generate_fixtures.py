@@ -82,6 +82,25 @@ def gen_matmul_2d():
     save(model, "matmul_2d")
 
 
+# ── matmul_batched_nd ─────────────────────────────────────────────────────────
+# Batched 3-D MatMul: A [2,3,4] × B [2,4,2] → C [2,3,2]
+# Tests batched-ND broadcast inference in our MatMul kernel.
+#
+# batch 0: A0=[[1,2,3,4],[5,6,7,8],[9,10,11,12]]  B0=[[1,0],[0,1],[1,0],[0,1]]
+#   C0 = [[4,6],[12,14],[20,22]]
+# batch 1: A1=[[0,1,0,1],[2,0,2,0],[1,1,1,1]]  B1=[[2,0],[0,2],[2,0],[0,2]]
+#   C1 = [[0,4],[8,0],[4,4]]
+def gen_matmul_batched_nd():
+    A = helper.make_tensor_value_info("A", TensorProto.FLOAT, [2, 3, 4])
+    B = helper.make_tensor_value_info("B", TensorProto.FLOAT, [2, 4, 2])
+    C = helper.make_tensor_value_info("C", TensorProto.FLOAT, [2, 3, 2])
+    node = helper.make_node("MatMul", inputs=["A", "B"], outputs=["C"])
+    graph = helper.make_graph([node], "matmul_batched_nd", [A, B], [C])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "matmul_batched_nd")
+
+
 # ── mixed_partition ──────────────────────────────────────────────────────────
 # Graph with Add (claimed by our EP) and NonZero (not claimed by our EP).
 # ORT must partition: our EP handles Add, ORT's default handles NonZero.
@@ -136,6 +155,7 @@ if __name__ == "__main__":
     gen_add_broadcast()
     gen_chain_add_mul()
     gen_matmul_2d()
+    gen_matmul_batched_nd()
     gen_mixed_partition()
     gen_add_int32()
     gen_add_dynamic_dim()

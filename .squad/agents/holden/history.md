@@ -27,6 +27,16 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - Full report: `docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
 - `compute.rs` and `kernel_ctx.rs` flagged for re-audit when Phase 2 Compute lands.
 
+## 2026-08-10T22:42:21+0000 — EP plugin final ship verdict (squad/ep-plugin-export)
+- Verified N1 (CRITICAL): `compute_execute` at `compute.rs:552` is wrapped in `catch_unwind`; regression test at line 2115 confirmed. RESOLVED.
+- Verified N2 (HIGH): `validate_dims()` called from `read_inputs()` at `kernel_ctx.rs:193`; rejects negative dims, `checked_mul` for overflow, eight tests. RESOLVED.
+- Verified N3 (MEDIUM): both `CreateEpFactories` and `ReleaseEpFactory` wrapped in `catch_unwind` in `lib.rs`; `ReleaseEpFactory` return type corrected to `void`; tests present. RESOLVED.
+- Verified Deckard's `factory.rs` UAF fix (commit `c92838dba`): `EpDevice_AddAllocatorInfo` ownership transfer correct; success path does not release `mem_info`; failure path releases exactly once; `CreateMemoryInfo_V2` used. CORRECT.
+- New LOW advisory: `compute_release_state` (`compute.rs:1416`) missing `catch_unwind` — trivially safe now but pattern violation. Filed for Leon post-merge.
+- New LOW advisory: `ep_compile_inner` partial info leak on error path — carry-forward M2. Filed for Deckard post-merge.
+- Broader new-code audit: graph_reader.rs attribute/initializer reading, ep.rs capability filter, factory.rs lifetime — all sound.
+- Verdict: 🟡 YELLOW — may ship. No blockers. Decision record: `.squad/decisions/inbox/holden-ep-plugin-final-verdict.md`.
+
 ## 2026-08-10T21:30:26+0000 — EP plugin re-audit (commit 526a883c4)
 - Re-audited Nabil's remediation commit on `squad/ep-plugin-export`.
 - H1 (AtomicPtr), H2 (null graphs guard), H3 (Send/Sync removed): all RESOLVED.

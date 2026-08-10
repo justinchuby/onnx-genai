@@ -203,3 +203,30 @@ With --include-ignored:
 `add_broadcast`, `chain_add_mul`, `matmul_2d`, `mixed_partition`,
 `add_int32`, `add_dynamic_dim` — all committed under `tests/fixtures/`.
 Generator: `tests/fixtures/generate_fixtures.py`.
+
+---
+
+## 2026-08-10 — EP plugin conformance final pass (branch: squad/ep-plugin-export)
+
+**Context:** Deckard fixed the use-after-free in commit c92838dba (`OrtMemoryInfo` released while ORT held the raw pointer; `CreateCpuMemoryInfo` replaced with correct pre-1.22 API `CreateMemoryInfo_V2`).
+
+**Actions taken:**
+
+1. **Un-ignored `ort_loads_our_ep_and_runs_model`** — allocator bug confirmed fixed. Test passes.
+
+2. **Un-ignored `conformance_multiple_run_calls`** — use-after-free fix confirmed. Test passes (7th+ cycle in suite, clean).
+
+3. **Fixed and un-ignored `conformance_two_sessions`** — test bug: `EpDevice_EpName` returns factory's `GetName` ("cpu_ep"), not the registration key ("cpu_ep_2sess"). Corrected the device-search comparison and assertion message. Test passes.
+
+4. **Added `conformance_matmul_batched_nd`** — new fixture `tests/fixtures/matmul_batched_nd/model.onnx` (MatMul [2,3,4]×[2,4,2]→[2,3,2]). Proves batched-ND MatMul dispatch through ORT. All 12 output values independently verified.
+
+5. **Added `stress_register_run_unregister_cycles`** — 25 complete cycles (≥4× the failure threshold of the fixed bug). Every cycle verifies Run output. Regression gate for use-after-free.
+
+6. **f16/bf16** — CPU kernels support both dtypes; ORT plugin cannot route f16/bf16 nodes without `GetKernelRegistry` type-constraint metadata. Documented as coverage gap, no fake test written.
+
+**Results (two runs):**
+- Run 1: `test result: ok. 15 passed; 0 failed; 0 ignored`
+- Run 2: `test result: ok. 15 passed; 0 failed; 0 ignored`
+- Suite is order-independent (stress test alone exceeds the former corruption threshold).
+
+**Decision filed:** `.squad/decisions/inbox/pris-ep-conformance-final.md`

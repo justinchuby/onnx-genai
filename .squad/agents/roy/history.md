@@ -46,7 +46,34 @@
 
 **Decision record:** `.squad/decisions/inbox/roy-ep-provider-readiness.md`
 
-**Durable lesson:** Prior session reported adapter "implemented and tested" but the adapter crate does not compile. Build artifacts and `cargo check` are the only trustworthy status signals — not doc status fields or session summaries.
+### 2026-08-10T22:42:00Z — EP plugin export: final docs + PR
+
+Verified end-to-end state of `squad/ep-plugin-export` branch. Both adapter crates
+compile cleanly. `cargo test -p onnx-runtime-ep-plugin --lib`: 82 passed / 0 failed.
+10 ORT integration tests individually confirmed passing (ORT 1.27.0 loads, registers,
+and runs the Rust CPU EP; numerically correct outputs). `conformance_two_sessions`
+carries `#[ignore]` — known OrtEpDevice corruption bug (Nabil, factory.rs).
+
+Updated `docs/EP_PLUGIN_EXPORT.md`: removed stale "does not compile" status block,
+rewrote §6 (What Executes Now) to reflect actual state, replaced stale milestone plan
+with accurate done/planned table, added §8 ABI compatibility boundary and §9 hard-won
+ABI contracts.
+
+Written `docs/EP_PLUGIN_EXPORT_PR.md`: PR description with verified validation numbers,
+security finding dispositions, process note, known limitations, and §524 compliance statement.
+
+Written `.squad/decisions/inbox/roy-ep-export-milestone.md`: milestone record and
+ORT compatibility boundary.
+
+Security: Holden's re-audit (2026-08-10T21:30Z) recorded 3 findings. N2/M1 resolved on
+this branch. N1 (`compute_execute` unguarded) remains open — Deckard's responsibility.
+Final verdict pending.
+
+**Durable lesson:** Test harness mutex poisoning from `#[ignore]`d tests can cascade
+failures across unrelated tests when running with `--include-ignored`. Always confirm
+by running failing tests individually before reporting them as broken.
+
+
 
 ### 2026-08-10T20:12:35+0000 — EP plugin export architecture
 
