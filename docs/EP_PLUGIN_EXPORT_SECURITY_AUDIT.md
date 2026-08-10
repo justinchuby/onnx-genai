@@ -1,134 +1,183 @@
 # EP Plugin Export — Security Audit
 
 **Auditor:** Holden (Security Engineer)
-**Date:** 2026-08-10T20:12:35.793+00:00
-**Scope:** `crates/onnx-runtime-ep-plugin/src/{factory,ep,graph_reader,compute,kernel_ctx,status,lib}.rs`
-**Status:** `compute.rs` and `kernel_ctx.rs` are in-flux (Nabil actively editing); findings on those are preliminary and must be re-checked at merge.
-
-> **Roy note (2026-08-10):** All findings in this audit are being actively remediated
-> on branch `squad/ep-plugin-export` by Nabil (FFI hardening), Deckard (compute path),
-> and Pris (conformance tests). **Do not mark any finding resolved here** — Holden re-audits
-> at merge. Status: **being remediated on squad/ep-plugin-export**.
+**Initial audit date:** 2026-08-10T20:12:35.793+00:00
+**Re-audit date:** 2026-08-10T21:30:26Z
+**Branch audited:** `squad/ep-plugin-export` @ commit `526a883c4`
+**Scope:** `crates/onnx-runtime-ep-plugin/src/{factory,ep,graph_reader,compute,kernel_ctx,status,lib}.rs` + `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs`
 
 ---
 
-## Summary
+## Re-audit Summary (2026-08-10)
 
-| Severity | Count |
-|----------|-------|
-| CRITICAL | 1 |
-| HIGH     | 3 |
-| MEDIUM   | 2 |
-| LOW      | 1 |
+Nabil's remediation commit (`526a883c4`) resolves three of the four original findings. One finding (C1, panic safety) is **partially fixed** — most callbacks are now guarded, but `compute_execute` is not. That single gap reinstates the CRITICAL verdict.
 
----
+| ID | Original finding | Status | Evidence |
+|----|-----------------|--------|----------|
+| C1 | No `catch_unwind` on extern "C" callbacks | **OPEN (partial)** — `compute_execute` unguarded | `compute.rs:119` |
+| H1 | `static mut HOST_ORT_API` data race | **RESOLVED** | `status.rs:10–30`, AtomicPtr + Acquire/Release |
+| H2 | `graphs` null-deref in `ep_compile` | **RESOLVED** | `ep.rs:209` null guard |
+| H3 | Unsound `unsafe impl Send+Sync` on `OutboundGraphReader` | **RESOLVED** | `graph_reader.rs:28–30`, impl removed + comment |
 
-## CRITICAL
+**New findings introduced in this session:**
 
-### C1. No `catch_unwind` on any `extern "C"` callback — unwinding across FFI is instant UB
+| ID | Severity | Description |
+|----|----------|-------------|
+| N1 | CRITICAL | `compute_execute` has no `catch_unwind` — reinstates C1 |
+| N2 | HIGH | Negative/dynamic dims wrapped to `usize::MAX` in `kernel_ctx.rs:154` |
+| N3 | MEDIUM | `CreateEpFactories` / `ReleaseEpFactory` (macro-generated `extern "C"`) call into `create_ep_factories` / `release_ep_factory` without a `catch_unwind` |
 
-**Files:** All 9 exported callbacks: `factory.rs:119` (`factory_get_name`), `factory.rs:127` (`factory_get_supported_devices`), `factory.rs:147` (`factory_create_ep`), `factory.rs:175` (`factory_release_ep`), `ep.rs:53` (`ep_get_capability`), `ep.rs:128` (`ep_compile`), `ep.rs:199` (`ep_release_node_compute_infos`), `compute.rs:58` (`compute_create_state`), `compute.rs:82` (`compute_execute`), `compute.rs:106` (`compute_release_state`).
-
-**Scenario:** Any Rust panic (failed allocation, `Vec` index OOB in `claims[i].node_ids`, `unwrap()` on `CString::new`, `GraphViewCache::build` panicking, etc.) will unwind through the `extern "C"` boundary into ORT's C/C++ runtime. Per Rust reference this is **undefined behavior** — in practice it corrupts ORT's stack and crashes the host process silently.
-
-**Specific panic sources observed:**
-- `factory.rs:97`: `constructor()` — user-supplied closure may panic.
-- `ep.rs:170-176`: `exported.ep.get_kernel(...)` — trait method on user-provided EP may panic.
-- `ep.rs:73`: `reader.to_ir_graph()` and `GraphViewCache::build()` — complex code, can panic on OOM or internal assertion.
-- `compute.rs:82-95`: `exported.kernels` index/iteration if any `Kernel::execute` panics (future Phase 2).
-
-**Fix:** Wrap every `extern "C" fn` body in `std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { ... }))`. On `Err(_)`, return `fail_status("internal panic")` (or for `-> ()` callbacks, just swallow). This is non-negotiable before shipping.
+**Overall verdict: 🔴 RED — ship-blocking.**
 
 ---
 
-## HIGH
+## Original Findings — Detailed Re-audit
 
-### H1. `static mut HOST_ORT_API` is a data race — unsound under concurrent `CreateEpFactories` calls
+### C1. `catch_unwind` on `extern "C"` callbacks — **OPEN (partial fix)**
 
-**File:** `status.rs:11-28`
+**Original finding:** No `catch_unwind` on any extern "C" callback.
 
-**Scenario:** If ORT (or a host with multiple providers) calls `CreateEpFactories` for two plugin libs from different threads — or calls any callback while `set_host_api` is running — the `static mut` read/write is a data race (UB even if the value written is the same both times). Rust 2024 edition's stricter `unsafe` lint will flag this soon.
+**Remediation by Nabil:** Applied to 12 of 13 live callbacks. Verified present on:
+`factory_get_name` (factory.rs:181), `factory_get_vendor` (factory.rs:194), `factory_get_version` (factory.rs:214), `factory_get_supported_devices` (factory.rs:232), `factory_create_ep` (factory.rs:254), `factory_release_ep` (factory.rs:281), `ep_get_name` (ep.rs:63), `ep_get_capability` (ep.rs:82), `ep_compile` (ep.rs:192), `ep_release_node_compute_infos` (ep.rs:321), `compute_create_state` (compute.rs:97).
 
-**Fix:** Replace with `static HOST_ORT_API: AtomicPtr<ort::OrtApi> = AtomicPtr::new(ptr::null_mut())` and use `store(Relaxed)` / `load(Acquire)`.
+`factory_get_vendor_id` (factory.rs:204) has no `catch_unwind` but the body is the literal `0` — no panic is possible. Sound.
 
-### H2. `graphs` pointer not null-checked before indexing in `ep_compile`
+**`compute_execute` (compute.rs:119) has NO `catch_unwind`.** This is the OrtNodeComputeInfo `Compute` callback — ORT calls it at every inference. The body calls:
+- `read_inputs(api_ref, kernel_context)` — complex logic including Vec allocations, ORT API calls (which panic internally if malformed), `DataType::from_onnx().ok_or_else(...)` mapped to `?`-via-Err return, but also `vec![0i64; ndim]` which panics on OOM.
+- `inputs[input_offset..input_offset + entry.num_inputs]` (compute.rs:154) — slice range panics if `input_offset + num_inputs > inputs.len()`. No bounds guard.
+- `entry.kernel.execute(&kernel_inputs, &mut output_views)` (compute.rs:198) — trait dispatch; user-provided kernels can panic.
+- `infer_shapes` calls `broadcast_shapes` from `onnx_runtime_ir`; an internal assertion there could panic.
 
-**File:** `ep.rs:143`
+**Any of these panics unwind across `extern "C"` into ORT's process — immediate UB.**
 
-**Scenario:** If ORT passes `graphs == null` with `count > 0`, `*graphs.add(i)` dereferences a null pointer → segfault in ORT's process.
-
-**Fix:** Add `if graphs.is_null() { return fail_status(...); }` alongside the existing `out_infos` null check.
-
-### H3. `unsafe impl Send + Sync` for `OutboundGraphReader` is unsound if instance escapes callback scope
-
-**File:** `graph_reader.rs:32-33`
-
-**Scenario:** `OutboundGraphReader` stores raw `*const OrtNode` pointers whose validity is scoped to the current ORT callback invocation. The `Send + Sync` impls allow it to be moved to another thread or stored in a `Mutex` that outlives the callback. If any future code (or a user EP impl) captures the reader in a closure, spawn, or `Arc`, those pointers become dangling.
-
-**Current risk:** Low today because usage is stack-local in `ep_get_capability` / `ep_compile`. But the blanket impls are a landmine.
-
-**Fix:** Remove `unsafe impl Send for OutboundGraphReader` and `unsafe impl Sync for OutboundGraphReader`. The struct is only used within a single callback frame; it never needs to be `Send`/`Sync`. If the compiler later requires it for some composition, audit that specific path rather than granting blanket impls.
+**Status: OPEN — ship-blocking. Assign to Deckard (owns compute.rs).**
 
 ---
 
-## MEDIUM
+### H1. `static mut HOST_ORT_API` data race — **RESOLVED**
 
-### M1. `check()` in `graph_reader.rs:465` releases the OrtStatus but discards the message
-
-**File:** `graph_reader.rs:459-470`
-
-**Scenario:** When an ORT API call fails, `check()` releases the status immediately and returns a generic `"ORT API call failed"` string. This loses the actual error message from ORT, making debugging impossible. More critically, the function calls `ReleaseStatus` — if ORT's `ReleaseStatus` expects the caller to have NOT already read the message (unlikely but possible ABI-dependent), this could misbehave.
-
-**Fix:** Before `ReleaseStatus`, call `GetErrorMessage(status)` to extract the real message and include it in the `Err(...)`. This is a correctness/debuggability issue, not a memory-safety issue, so MEDIUM.
-
-### M2. `ep_compile` does not clean up already-allocated `ExportedComputeInfo` on mid-loop error
-
-**File:** `ep.rs:128-197`
-
-**Scenario:** If `get_kernel` fails at subgraph index `i=3` (of 5), the function returns an error status immediately. Subgraphs 0..2 already have `ExportedComputeInfo` written into `out_infos`. ORT's contract for error returns from `Compile` is unclear — if ORT does NOT call `ReleaseNodeComputeInfos` on error, those allocations leak. If ORT DOES call it, this is fine.
-
-**Fix:** Either (a) document that ORT always calls `ReleaseNodeComputeInfos` even on `Compile` error and cite the header, or (b) on error, iterate back over `out_infos[0..i]` and free any non-null entries before returning.
+`status.rs:10–30`: replaced with `static HOST_ORT_API: AtomicPtr<ort::OrtApi>`. Stored with `Ordering::Release`, loaded with `Ordering::Acquire`. Correct; no TOCTOU risk because the pointer is process-lifetime (set once at `CreateEpFactories`, never reset). Verified sound.
 
 ---
 
-## LOW
+### H2. `graphs` null-deref in `ep_compile` — **RESOLVED**
 
-### L1. `node_id_to_ort_index` returns 0 on miss — could silently report wrong node
-
-**File:** `graph_reader.rs:186`
-
-**Scenario:** If `node_id_to_ort_index` is called with a `NodeId` that doesn't exist in `ort_index_to_node_id` (bug elsewhere), it returns index 0 — silently reporting the first ORT node as a claim. This is a logic bug rather than memory-safety.
-
-**Fix:** Return `Option<usize>` and propagate the error, or at least `debug_assert!` the lookup succeeds.
+`ep.rs:209`: `if graphs.is_null() { return invalid_arg_status("Compile: graphs pointer is null"); }` is present before any indexing. Verified.
 
 ---
 
-## Areas Verified Sound
+### H3. Unsound `unsafe impl Send+Sync` on `OutboundGraphReader` — **RESOLVED**
 
-- **Pointer ownership model** (factory.rs, ep.rs): `Box::into_raw` / `Box::from_raw` pairs are correctly matched between `create_ep_factories` ↔ `release_ep_factory`, `factory_create_ep` ↔ `factory_release_ep`, `ep_compile` ↔ `ep_release_node_compute_infos`, `compute_create_state` ↔ `compute_release_state`. No double-free or type mismatch.
-- **`#[repr(C)]` vtable layout**: `ExportedFactory`, `ExportedEp`, `ExportedComputeInfo` all place the vtable as their first field. The cast from `*mut ExportedFoo` to `*mut OrtFoo` is sound because `#[repr(C)]` guarantees the first field is at offset 0.
-- **String handling** (`factory_get_name`): Returns `exported.name_cstr.as_ptr()` which points into the still-live `ExportedFactory`. The pointer is valid for as long as the factory exists (until `ReleaseEpFactory`). No use-after-free.
-- **Buffer overflow on `out_factories`**: `create_ep_factories` writes exactly 1 factory and checks `max_factories == 0` beforehand. Sound.
-- **`kernel_ctx.rs`**: Empty (placeholder for Phase 2). No findings.
-- **`compute.rs`**: Returns `NOT_IMPLEMENTED` — fail-closed. The only live paths are `CreateState`/`ReleaseState` which are simple Box round-trips. Sound for v1.
+`graph_reader.rs:28–30`: both impls removed. A comment explains the rationale (raw `OrtNode*` valid only within the callback frame, no cross-thread use). Verified. No `ort_node_ptrs` escape `ExportedComputeInfo` — `CompiledKernelEntry` stores only `Box<dyn Kernel>`, not OrtGraph/OrtNode pointers. The ORT header's prohibition on caching `OrtGraph` beyond `Compile` is not violated.
 
 ---
 
-## In-Flux Files (re-check required)
+## New Findings
 
-`compute.rs` and `kernel_ctx.rs` are actively being edited by Nabil for Phase 2. When the `Compute` path becomes live, the following must be audited:
+### N1. CRITICAL — `compute_execute` missing `catch_unwind` (see C1 above)
 
-1. **Tensor size overflow**: `dims.iter().product::<usize>()` can overflow for attacker-controlled shapes.
-2. **dtype validation**: Constructing a typed `TensorView<f32>` over a buffer that's actually `int8` is instant UB.
-3. **Bounds on `KernelContext_GetOutput` shape**: The shape passed to allocate the output tensor must be validated; an EP that requests a 16-exabyte output from ORT would be a DoS.
-4. **Panic safety in `Kernel::execute`**: Same C1 issue — `catch_unwind` is mandatory.
+See C1 re-audit above. This is the ship blocker.
+
+**Fix:** Wrap the entire body of `compute_execute` in `std::panic::catch_unwind(AssertUnwindSafe(|| { ... }))` returning `fail_status("Compute: internal panic")` on `Err`. `AssertUnwindSafe` is justified here for the same reason as other callbacks: on panic the state is poisoned, the callback frame unwinds, and ORT will release the EP; we are not hiding broken invariants we intend to reuse.
+
+**Owner: Deckard** (owns `compute.rs`/`kernel_ctx.rs`; Nabil is locked out from re-fixing a finding he missed).
+
+---
+
+### N2. HIGH — Negative (dynamic) dims silently wrap to `usize::MAX` in `kernel_ctx.rs:154`
+
+```rust
+// kernel_ctx.rs:154
+let shape: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+```
+
+ORT's `KernelContext_GetInput` returns runtime tensor shapes. For models with dynamic batch size the dim value is `-1` (symbolic). Casting `-1i64` to `usize` produces `18_446_744_073_709_551_615` (`usize::MAX`) on 64-bit. This value is then:
+
+1. Passed as a shape element to `infer_shapes` → `broadcast_shapes` from `onnx_runtime_ir`. If that function does `shape.iter().product::<usize>()` to compute element count, it overflows to 0 or wraps; if it panics on internal assertion that is instant UB inside unguarded `compute_execute`.
+2. Passed to `allocate_output` → cast back to `i64` (`usize::MAX as i64 == -1`) → forwarded to `KernelContext_GetOutput`. ORT would reject this with an error status and we return `fail_status(...)`. Survivable if C1 is fixed, but incorrect.
+
+**Scenario with attacker-controlled ONNX model:** Any model with a symbolic batch dim causes `read_inputs` to produce a shape containing `usize::MAX`. Subsequent arithmetic on that shape can panic inside the unguarded `compute_execute`, corrupting ORT's process.
+
+**Fix (Deckard):** Replace the cast with a checked conversion:
+```rust
+let shape: Vec<usize> = dims.iter().map(|&d| {
+    if d < 0 { return Err(format!("dynamic dim {d} not supported at compute time")); }
+    Ok(d as usize)
+}).collect::<Result<Vec<_>, _>>()
+.map_err(|e| format!("input {i}: {e}"))?;
+```
+Return `Err(...)` to propagate as a `fail_status` result from `read_inputs`.
+
+---
+
+### N3. MEDIUM — Macro-generated `CreateEpFactories` / `ReleaseEpFactory` lack `catch_unwind`
+
+`lib.rs:64–88` (macro expansion): The two top-level `extern "C"` symbols call directly into `factory::create_ep_factories` and `factory::release_ep_factory` without a `catch_unwind` guard. Panic sources in `create_ep_factories`:
+
+- `constructor()` call (factory.rs:97) — user closure, can panic.
+- `ep.name()` — trait method on user EP.
+- `Box::new(ExportedFactory { ... })` — OOM panic.
+
+`release_ep_factory` drops `ExportedFactory` which owns a `Box<dyn Fn()>` constructor closure; drop of that closure theoretically can panic.
+
+These are load-time / session-close paths rather than per-inference. Lower risk than N1, but a panic at `CreateEpFactories` time will crash ORT before the session initializes. With `panic=abort` this is moot, but the plugin cannot mandate that for the host process.
+
+**Fix (Nabil):** Add `catch_unwind` wrappers in the macro expansion around the `create_ep_factories` and `release_ep_factory` calls, matching the pattern already used for all other callbacks.
+
+---
+
+## Original Medium / Low Findings (carry-forward)
+
+### M1. `check()` discards ORT error message — **RESOLVED**
+
+`graph_reader.rs` now calls `GetErrorMessage` before `ReleaseStatus` and includes the real message in the `Err` string. Verified at `graph_reader.rs:459–490`.
+
+### M2. `ep_compile` does not clean up partial `CompiledKernelEntry` allocations on mid-loop error — **STILL OPEN (advisory)**
+
+`ep.rs:200–304`: If `get_kernel` or `ExportedComputeInfo::new` fails at subgraph index `i`, previously-written `out_infos[0..i]` entries are not freed before returning. ORT's contract for `Compile` error returns is unspecified in the header excerpts available. If ORT does not call `ReleaseNodeComputeInfos` on error, these leak; if it does, they are double-freed.
+
+This is a hardening item, not currently exploitable without a specific ORT version that leaks on Compile error. Carry forward as MEDIUM.
+
+### L1. `node_id_to_ort_index` returns 0 on miss — **STILL OPEN (advisory)**
+
+`graph_reader.rs:186`: returns `0` for unknown `NodeId`. No change. Still a logic correctness landmine but not a memory safety issue. Carry forward as LOW.
+
+---
+
+## Cross-Check: Contract Compliance
+
+Per `.squad/decisions.md` extension contract: **fail closed on unsupported capabilities.** Verified:
+- Version mismatch on `CreateEpFactories` returns an error status, writes 0 factories (factory.rs:76–95). ✅
+- `GetSupportedDevices` returns 0 devices for CPU EP (factory.rs:232–243). ✅
+- `ep_get_capability_inner` returns `ok_status()` (not silence-on-unsupported-graph) when claiming zero nodes. ✅
+- `ShapeInference::for_op` falls through to `SameAsInput(0)` for unknown ops, which fails loudly on mismatch rather than silently producing wrong output. ✅
+
+---
+
+## Verified Sound (unchanged from initial audit)
+
+- `#[repr(C)]` vtable layout for `ExportedFactory`, `ExportedEp`, `ExportedComputeInfo` — first-field-at-offset-0 cast is sound.
+- `Box::into_raw` / `Box::from_raw` pairing: factory ↔ release, EP ↔ release, compute info ↔ release, state ↔ release_state. All matched; no type mismatch or double-free.
+- `host_api()` AtomicPtr ordering: Acquire load after Release store. Process-lifetime pointer; TOCTOU impossible.
+- `OutboundGraphReader` does not cache `OrtGraph*` or `OrtNode*` past the callback frame; `ExportedComputeInfo.entries` contains only owned Rust objects.
+- CStr / string safety in `graph_reader.rs`: all ORT string pointers are null-checked before `CStr::from_ptr`; `to_string_lossy` handles non-UTF-8 safely.
+- `GetSupportedDevices` `max_out` bound: CPU EP writes 0 devices, so no bounds concern.
 
 ---
 
 ## Verdict
 
-**CRITICAL C1 (panic safety) must be fixed before this code can ship.** A single panic in any code path reachable from these callbacks — including OOM, assertion failures deep in `onnx_runtime_ir`, or user-EP trait panics — is undefined behavior that corrupts ORT's process.
+**🔴 RED — ship-blocking.**
 
-**HIGH H1–H3 should be fixed in the same PR.** H1 is a latent data race; H2 is a null-deref crash; H3 is a soundness hole that will bite when the code evolves.
+**N1** (`compute_execute` missing `catch_unwind`, compute.rs:119) reinstates CRITICAL C1. `Kernel::execute` is a trait method callable by user-supplied EP implementations; any panic there unwinds across the C ABI into ORT's process. This is unconditional UB and must be fixed before merge.
 
-MEDIUM/LOW items are hardening and can land in a follow-up.
+**N2** (negative dim wrap to `usize::MAX`, kernel_ctx.rs:154) is HIGH and compounds N1 — a dynamic-dim model triggers the unchecked path. Must also be fixed.
+
+**N3** (macro-generated entry points unguarded, lib.rs:64–88) is MEDIUM and should be fixed in the same PR.
+
+**Required fixes:**
+1. **Deckard** — wrap `compute_execute` body in `catch_unwind` (N1, CRITICAL).
+2. **Deckard** — validate dims ≥ 0 in `read_inputs`, return error for dynamic dims (N2, HIGH).
+3. **Nabil** — add `catch_unwind` to macro-generated `CreateEpFactories` / `ReleaseEpFactory` (N3, MEDIUM).
+
+Per Reviewer Rejection Protocol: Nabil is locked out from revising N1/N2 (Deckard's files). Deckard is locked out from revising N3 (Nabil's macro). These are different files; no cross-lock conflict.

@@ -11,7 +11,7 @@ use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
 
 use crate::ep::ExportedEp;
-use crate::status::{fail_status, ok_status, set_host_api};
+use crate::status::{fail_status, host_api, ok_status, set_host_api};
 
 /// A heap-allocated factory whose raw pointer is returned as `OrtEpFactory*`.
 ///
@@ -126,18 +126,18 @@ where
             ReleaseEp: Some(factory_release_ep),
             GetVendorId: Some(factory_get_vendor_id),
             GetVersion: Some(factory_get_version),
-            ValidateCompiledModelCompatibilityInfo: None,
-            CreateAllocator: None,
-            ReleaseAllocator: None,
-            CreateDataTransfer: None,
-            IsStreamAware: None,
-            CreateSyncStreamForDevice: None,
-            GetHardwareDeviceIncompatibilityDetails: None,
-            CreateExternalResourceImporterForDevice: None,
-            GetNumCustomOpDomains: None,
-            GetCustomOpDomains: None,
-            InitGraphicsInterop: None,
-            DeinitGraphicsInterop: None,
+            ValidateCompiledModelCompatibilityInfo: Some(factory_validate_compiled_model),
+            CreateAllocator: Some(factory_create_allocator),
+            ReleaseAllocator: Some(factory_release_allocator),
+            CreateDataTransfer: Some(factory_create_data_transfer),
+            IsStreamAware: Some(factory_is_stream_aware),
+            CreateSyncStreamForDevice: Some(factory_create_sync_stream),
+            GetHardwareDeviceIncompatibilityDetails: Some(factory_get_hw_incompatibility),
+            CreateExternalResourceImporterForDevice: Some(factory_create_resource_importer),
+            GetNumCustomOpDomains: Some(factory_get_num_custom_op_domains),
+            GetCustomOpDomains: Some(factory_get_custom_op_domains),
+            InitGraphicsInterop: Some(factory_init_graphics_interop),
+            DeinitGraphicsInterop: Some(factory_deinit_graphics_interop),
         },
         name_cstr,
         vendor_cstr,
@@ -149,6 +149,10 @@ where
     // SAFETY: factory_ptr points to an ExportedFactory whose first field is
     // OrtEpFactory, so the cast is valid.
     unsafe {
+        // Zero the entire output array so ORT doesn't read stale pointers.
+        for i in 0..max_factories {
+            *out_factories.add(i) = ptr::null_mut();
+        }
         *out_factories = factory_ptr.cast::<ort::OrtEpFactory>();
         *out_num = 1;
     }
@@ -223,20 +227,149 @@ unsafe extern "C" fn factory_get_version(
 
 unsafe extern "C" fn factory_get_supported_devices(
     factory: *mut ort::OrtEpFactory,
-    _in_devices: *const *const ort::OrtHardwareDevice,
-    _num_in: usize,
+    in_devices: *const *const ort::OrtHardwareDevice,
+    num_in: usize,
     out_devices: *mut *mut ort::OrtEpDevice,
     max_out: usize,
     out_num: *mut usize,
 ) -> *mut ort::OrtStatus {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if factory.is_null() || out_devices.is_null() || out_num.is_null() || max_out == 0 {
+        // Null/bounds checks.
+        if out_num.is_null() {
+            return fail_status("GetSupportedDevices: out_num is null");
+        }
+        // Default to zero so early returns are safe.
+        unsafe { *out_num = 0 };
+
+        if factory.is_null() || out_devices.is_null() || max_out == 0 {
             return fail_status("GetSupportedDevices: invalid arguments");
         }
+        if in_devices.is_null() || num_in == 0 {
+            // No hardware devices from ORT — nothing to match. Clean return.
+            return ok_status();
+        }
 
-        // For CPU EP we return zero EP devices — the EP does not own hardware that
-        // ORT needs to enumerate.
-        unsafe { *out_num = 0 };
+        // Get the ORT API and EP API.
+        let api = host_api();
+        if api.is_null() {
+            return fail_status("GetSupportedDevices: host ORT API not initialized");
+        }
+        let hw_type_fn = unsafe { (*api).HardwareDevice_Type };
+        let hw_type_fn = match hw_type_fn {
+            Some(f) => f,
+            None => return fail_status("GetSupportedDevices: HardwareDevice_Type not available"),
+        };
+        let get_ep_api = match unsafe { (*api).GetEpApi } {
+            Some(f) => f,
+            None => return fail_status("GetSupportedDevices: GetEpApi not available"),
+        };
+        let ep_api = unsafe { get_ep_api() };
+        if ep_api.is_null() {
+            return fail_status("GetSupportedDevices: GetEpApi returned null");
+        }
+        let create_ep_device = match unsafe { (*ep_api).CreateEpDevice } {
+            Some(f) => f,
+            None => return fail_status("GetSupportedDevices: CreateEpDevice not available"),
+        };
+
+        // Iterate input hardware devices, filter for CPU type, create an
+        // OrtEpDevice for each one (up to max_out).
+        let mut count: usize = 0;
+        for i in 0..num_in {
+            if count >= max_out {
+                break;
+            }
+            let hw_device = unsafe { *in_devices.add(i) };
+            if hw_device.is_null() {
+                continue;
+            }
+            let dev_type = unsafe { hw_type_fn(hw_device) };
+            if dev_type != ort::OrtHardwareDeviceType_CPU {
+                continue;
+            }
+
+            // Create an OrtEpDevice. ORT takes ownership of the returned pointer.
+            // Create empty metadata and options KVPs — ORT may dereference these internally.
+            let create_kvp = unsafe { (*api).CreateKeyValuePairs };
+            let release_kvp = unsafe { (*api).ReleaseKeyValuePairs };
+            let mut ep_metadata: *mut ort::OrtKeyValuePairs = ptr::null_mut();
+            let mut ep_options: *mut ort::OrtKeyValuePairs = ptr::null_mut();
+            if let Some(create_kvp) = create_kvp {
+                unsafe { create_kvp(&mut ep_metadata) };
+                unsafe { create_kvp(&mut ep_options) };
+            }
+
+            let mut ep_device: *mut ort::OrtEpDevice = ptr::null_mut();
+            let status = unsafe {
+                create_ep_device(
+                    factory,
+                    hw_device,
+                    ep_metadata,
+                    ep_options,
+                    &mut ep_device,
+                )
+            };
+
+            // Release KVPs (CreateEpDevice copies them per the doc).
+            if let Some(release) = release_kvp {
+                if !ep_metadata.is_null() { unsafe { release(ep_metadata) }; }
+                if !ep_options.is_null() { unsafe { release(ep_options) }; }
+            }
+
+            if !status.is_null() {
+                return status;
+            }
+            if ep_device.is_null() {
+                return fail_status("GetSupportedDevices: CreateEpDevice returned null device");
+            }
+
+            // Register CPU memory info so ORT knows how to allocate for this device.
+            // Required: ORT internally accesses the device's allocator info.
+            let add_alloc_info = match unsafe { (*ep_api).EpDevice_AddAllocatorInfo } {
+                Some(f) => f,
+                None => {
+                    return fail_status(
+                        "GetSupportedDevices: EpDevice_AddAllocatorInfo not available",
+                    );
+                }
+            };
+            let create_cpu_mem_info = match unsafe { (*api).CreateCpuMemoryInfo } {
+                Some(f) => f,
+                None => {
+                    return fail_status(
+                        "GetSupportedDevices: CreateCpuMemoryInfo not available",
+                    );
+                }
+            };
+            let release_mem_info = unsafe { (*api).ReleaseMemoryInfo };
+
+            // Default device allocator (OrtDeviceAllocator + OrtMemTypeDefault).
+            let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+            let status = unsafe {
+                create_cpu_mem_info(
+                    ort::OrtDeviceAllocator,
+                    ort::OrtMemTypeDefault,
+                    &mut mem_info,
+                )
+            };
+            if !status.is_null() {
+                return status;
+            }
+            if !mem_info.is_null() {
+                let status = unsafe { add_alloc_info(ep_device, mem_info) };
+                if let Some(release) = release_mem_info {
+                    unsafe { release(mem_info) };
+                }
+                if !status.is_null() {
+                    return status;
+                }
+            }
+
+            unsafe { *out_devices.add(count) = ep_device };
+            count += 1;
+        }
+
+        unsafe { *out_num = count };
         ok_status()
     }));
     result.unwrap_or_else(|_| fail_status("GetSupportedDevices: internal panic"))
@@ -289,4 +422,140 @@ unsafe extern "C" fn factory_release_ep(
             let _ = exported_ep.ep.shutdown();
         }
     }));
+}
+
+/// CPU EP uses ORT's default CPU allocator.
+///
+/// ORT 1.27 has a bug: after a successful CreateAllocator (null status return),
+/// it dereferences the output allocator without null-checking. We MUST provide
+/// a valid allocator even though the spec says "Set to nullptr for default."
+unsafe extern "C" fn factory_create_allocator(
+    _factory: *mut ort::OrtEpFactory,
+    _memory_info: *const ort::OrtMemoryInfo,
+    _allocator_options: *const ort::OrtKeyValuePairs,
+    allocator: *mut *mut ort::OrtAllocator,
+) -> *mut ort::OrtStatus {
+    // Minimal panic-safe path. Avoid complex closures to reduce chance of panic.
+    if allocator.is_null() {
+        return fail_status("CreateAllocator: allocator output pointer is null");
+    }
+    let api = host_api();
+    if api.is_null() {
+        return fail_status("CreateAllocator: host API not available");
+    }
+    let get_default = unsafe { (*api).GetAllocatorWithDefaultOptions };
+    match get_default {
+        Some(f) => unsafe { f(allocator) },
+        None => fail_status("CreateAllocator: GetAllocatorWithDefaultOptions unavailable"),
+    }
+}
+
+/// No-op: we never create allocators, so nothing to release.
+unsafe extern "C" fn factory_release_allocator(
+    _factory: *mut ort::OrtEpFactory,
+    _allocator: *mut ort::OrtAllocator,
+) {
+}
+
+/// CPU EP is not stream-aware.
+unsafe extern "C" fn factory_is_stream_aware(
+    _factory: *const ort::OrtEpFactory,
+) -> bool {
+    false
+}
+
+/// No data transfer needed for CPU EP — set output to null.
+unsafe extern "C" fn factory_create_data_transfer(
+    _factory: *mut ort::OrtEpFactory,
+    data_transfer: *mut *mut ort::OrtDataTransferImpl,
+) -> *mut ort::OrtStatus {
+    if !data_transfer.is_null() {
+        unsafe { *data_transfer = ptr::null_mut() };
+    }
+    ok_status()
+}
+
+/// CPU EP does not create sync streams.
+unsafe extern "C" fn factory_create_sync_stream(
+    _factory: *mut ort::OrtEpFactory,
+    _memory_device: *const ort::OrtMemoryDevice,
+    _stream_options: *const ort::OrtKeyValuePairs,
+    stream: *mut *mut ort::OrtSyncStreamImpl,
+) -> *mut ort::OrtStatus {
+    if !stream.is_null() {
+        unsafe { *stream = ptr::null_mut() };
+    }
+    ok_status()
+}
+
+/// Always compatible — no compiled model validation.
+unsafe extern "C" fn factory_validate_compiled_model(
+    _factory: *mut ort::OrtEpFactory,
+    _devices: *const *const ort::OrtHardwareDevice,
+    _num_devices: usize,
+    _compatibility_info: *const c_char,
+    model_compatibility: *mut ort::OrtCompiledModelCompatibility,
+) -> *mut ort::OrtStatus {
+    if !model_compatibility.is_null() {
+        unsafe { *model_compatibility = 0 }; // Compatible
+    }
+    ok_status()
+}
+
+/// No hardware incompatibility details to report.
+unsafe extern "C" fn factory_get_hw_incompatibility(
+    _factory: *mut ort::OrtEpFactory,
+    _hw: *const ort::OrtHardwareDevice,
+    _details: *mut ort::OrtDeviceEpIncompatibilityDetails,
+) -> *mut ort::OrtStatus {
+    ok_status()
+}
+
+/// No external resource importer for CPU EP.
+unsafe extern "C" fn factory_create_resource_importer(
+    _factory: *mut ort::OrtEpFactory,
+    _ep_device: *const ort::OrtEpDevice,
+    out_importer: *mut *mut ort::OrtExternalResourceImporterImpl,
+) -> *mut ort::OrtStatus {
+    if !out_importer.is_null() {
+        unsafe { *out_importer = ptr::null_mut() };
+    }
+    ok_status()
+}
+
+/// No custom op domains.
+unsafe extern "C" fn factory_get_num_custom_op_domains(
+    _factory: *mut ort::OrtEpFactory,
+    num_domains: *mut usize,
+) -> *mut ort::OrtStatus {
+    if !num_domains.is_null() {
+        unsafe { *num_domains = 0 };
+    }
+    ok_status()
+}
+
+/// No custom op domains — nothing to fill.
+unsafe extern "C" fn factory_get_custom_op_domains(
+    _factory: *mut ort::OrtEpFactory,
+    _domains: *mut *mut ort::OrtCustomOpDomain,
+    _num_domains: usize,
+) -> *mut ort::OrtStatus {
+    ok_status()
+}
+
+/// Graphics interop not supported for CPU EP.
+unsafe extern "C" fn factory_init_graphics_interop(
+    _factory: *mut ort::OrtEpFactory,
+    _ep_device: *const ort::OrtEpDevice,
+    _config: *const ort::OrtGraphicsInteropConfig,
+) -> *mut ort::OrtStatus {
+    ok_status()
+}
+
+/// Graphics interop not supported for CPU EP.
+unsafe extern "C" fn factory_deinit_graphics_interop(
+    _factory: *mut ort::OrtEpFactory,
+    _ep_device: *const ort::OrtEpDevice,
+) -> *mut ort::OrtStatus {
+    ok_status()
 }

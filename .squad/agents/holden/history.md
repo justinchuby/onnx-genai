@@ -26,3 +26,12 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - Decision record filed: `.squad/decisions/inbox/holden-ep-plugin-ffi-audit.md`.
 - Full report: `docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
 - `compute.rs` and `kernel_ctx.rs` flagged for re-audit when Phase 2 Compute lands.
+
+## 2026-08-10T21:30:26+0000 — EP plugin re-audit (commit 526a883c4)
+- Re-audited Nabil's remediation commit on `squad/ep-plugin-export`.
+- H1 (AtomicPtr), H2 (null graphs guard), H3 (Send/Sync removed): all RESOLVED.
+- C1 (catch_unwind): PARTIAL — 12 of 13 callbacks guarded; `compute_execute` (compute.rs:119) left unguarded. Reinstates CRITICAL.
+- New CRITICAL (N1): `compute_execute` has no `catch_unwind`; `kernel.execute()` and slice indexing can panic across C ABI. Owner: Deckard.
+- New HIGH (N2): negative dims wrap to `usize::MAX` in `kernel_ctx.rs:154`; compounds N1. Owner: Deckard.
+- New MEDIUM (N3): macro-generated `CreateEpFactories`/`ReleaseEpFactory` lack `catch_unwind`. Owner: Nabil.
+- Verdict: 🔴 RED. Decision record: `.squad/decisions/inbox/holden-ep-plugin-reaudit.md`.

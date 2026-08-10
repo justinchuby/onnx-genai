@@ -75,3 +75,41 @@ Full pre-compaction history in `history-archive.md`.
 - Added 14 unit tests across both files (shape inference, dtype mapping, state lifecycle, view roundtrips). All pass.
 - `cargo check` clean for my files; clippy clean for my files (crate-level clippy blocked by graph_reader.rs warnings in Nabil's files).
 - No `todo!()`, no placeholders, no `ORT_NOT_IMPLEMENTED` — Compute is real.
+
+## 2026-08-10 — EP Plugin: Real Shape Inference + Fail-Closed Policy
+
+**Branch:** squad/ep-plugin-export
+
+**Work done:**
+- Replaced 2-variant `ShapeInference` enum with **22 variants** covering all high-value
+  CPU EP ops: elementwise broadcast, MatMul (1-D/2-D/batched-ND), Gemm, Concat, Transpose,
+  Gather, GatherND, GatherBlockQuantized, Shape, Squeeze, Unsqueeze, Reshape (data-dependent),
+  Slice (data-dependent), Reduction (opset < 18 and ≥ 18), Conv, MultiHeadAttention,
+  GroupQueryAttention, RotaryEmbedding, LayerNorm family, and `Declined` (fail-closed).
+- Added `for_op` (conservative, `Declined` for attribute-dependent ops) and
+  `for_node(node, input_shapes, num_outputs)` (full attribute extraction from IR `Node`).
+- Replaced silent `SameAsInput(0)` fallback with `Declined { op_type, domain }` —
+  `infer_shapes` returns an actionable error naming op, domain, and suggested fix.
+- Added `SubgraphRouting`, `NodeInputSource`, `NodeOutputSink`, `IntermediateBuf` for
+  correct multi-node fused subgraph execution: intermediates allocated on heap, threaded
+  in topological order, freed on return.
+- `ExportedComputeInfo` gained `routing: Option<SubgraphRouting>` and `set_routing()`.
+- Multi-kernel subgraph without routing → explicit error (no silent misbehaviour).
+- `compute_execute` wrapped in `catch_unwind` for panic safety across the C ABI.
+- Data-dependent ops: `ReshapeData` reads `input[1]` shape tensor at runtime; `SliceData`
+  reads starts/ends/axes/steps; both fail closed if pointer is null or dtype is wrong.
+- **66 tests pass** (up from 8): broadcast edge cases, MatMul rank/batch, Concat axis,
+  Transpose perm, Reshape with -1 and 0-copy, Slice step semantics, reduction keepdims,
+  Conv 1-D/2-D, Gather/GatherND, Squeeze/Unsqueeze, ShapeOp, SubgraphRouting chain,
+  Declined error message, CreateState/ReleaseState lifecycle.
+- `cargo check` clean; `cargo clippy -p onnx-runtime-ep-plugin -- -D warnings` clean.
+
+**Decisions filed:** `.squad/decisions/inbox/deckard-ep-shape-inference.md`
+
+**Required Nabil changes:**
+1. `ep.rs` ~line 281: change `ShapeInference::for_op(&node.op_type)` →
+   `ShapeInference::for_node(node, &input_shapes, num_outputs)`.
+2. `ep.rs`: for multi-node fused subgraphs, call `info.set_routing(routing)` after
+   `ExportedComputeInfo::new(entries)`.
+3. For opset-13 Unsqueeze with axes-as-input: read `input[1]` as a static initialiser
+   and pass the values as `axes` to `for_node` (or the op stays `Declined`).
