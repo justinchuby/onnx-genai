@@ -1,17 +1,37 @@
 //! `ExportedEp` — the heap object behind an opaque `OrtEp*`.
 //!
-//! Implements `GetCapability`, `Compile`, and `ReleaseNodeComputeInfos` by
-//! delegating to the Rust `ExecutionProvider` trait.
+//! Implements `GetCapability`, `Compile`, `ReleaseNodeComputeInfos`, and
+//! `GetKernelRegistry` by delegating to the Rust `ExecutionProvider` trait.
 
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
+use onnx_runtime_ir::DataType;
 
 use crate::compute::ExportedComputeInfo;
 use crate::graph_reader::OutboundGraphReader;
 use crate::status::{fail_status, invalid_arg_status, ok_status};
+
+// ─── Kernel registry entry type ─────────────────────────────────────────────
+
+/// Describes a single operator kernel for ORT's `GetKernelRegistry` type-constraint
+/// advertisement. Sourced from the Rust EP's real registry — do not hand-maintain.
+#[derive(Clone, Debug)]
+pub struct KernelRegistryEntry {
+    /// ONNX operator type (e.g. `"Add"`, `"MatMul"`).
+    pub op_type: &'static str,
+    /// ONNX domain (empty string = default `ai.onnx`; or `"com.microsoft"` etc.).
+    pub domain: &'static str,
+    /// Starting opset version that is supported.
+    pub since_version: i32,
+    /// Ending opset version (inclusive). Set equal to `since_version` for single version.
+    pub end_version: i32,
+    /// Supported element types for the `"T"` type-constraint parameter.
+    /// Import from `kernel_ctx::CPU_EP_SUPPORTED_DTYPES` to keep in sync.
+    pub supported_dtypes: &'static [DataType],
+}
 
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
 ///
@@ -24,12 +44,65 @@ pub struct ExportedEp {
     pub ep: Box<dyn ExecutionProvider>,
     /// EP name kept alive for `GetName` callback.
     pub name_cstr: std::ffi::CString,
+    /// ORT kernel registry built from [`KernelRegistryEntry`] slices.
+    /// Remains valid for the lifetime of this EP (ORT requirement).
+    /// `None` means the EP uses compile-only mode (no type-constraint metadata).
+    pub kernel_registry: Option<OrtKernelRegistryHolder>,
+}
+
+/// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
+///
+/// Releases it on drop via `ReleaseKernelRegistry`.
+pub struct OrtKernelRegistryHolder {
+    ptr: *mut ort::OrtKernelRegistry,
+}
+
+// SAFETY: The kernel registry is read-only after construction.
+unsafe impl Send for OrtKernelRegistryHolder {}
+unsafe impl Sync for OrtKernelRegistryHolder {}
+
+impl Drop for OrtKernelRegistryHolder {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        let api = crate::status::host_api();
+        if api.is_null() {
+            return;
+        }
+        let ep_api = unsafe {
+            let Some(get_ep_api) = (*api).GetEpApi else {
+                return;
+            };
+            get_ep_api()
+        };
+        if ep_api.is_null() {
+            return;
+        }
+        if let Some(release) = unsafe { (*ep_api).ReleaseKernelRegistry } {
+            unsafe { release(self.ptr) };
+        }
+    }
 }
 
 impl ExportedEp {
     pub fn new(ep: Box<dyn ExecutionProvider>) -> Self {
+        Self::new_with_registry(ep, None)
+    }
+
+    /// Construct with an optional pre-built kernel registry.
+    ///
+    /// When `registry` is `Some`, ORT uses its type constraints to validate
+    /// node→EP routing (enables f16/bf16). When `None`, the EP is compile-only
+    /// and ORT assumes all types are handled (per header: "If set to NULL, ORT
+    /// assumes the EP compiles nodes").
+    pub fn new_with_registry(
+        ep: Box<dyn ExecutionProvider>,
+        registry: Option<OrtKernelRegistryHolder>,
+    ) -> Self {
         let name_cstr = std::ffi::CString::new(ep.name())
             .unwrap_or_else(|_| std::ffi::CString::new("nxrt_ep").unwrap());
+        let has_registry = registry.is_some();
         Self {
             vtable: ort::OrtEp {
                 ort_version_supported: ort::ORT_API_VERSION,
@@ -37,6 +110,11 @@ impl ExportedEp {
                 GetCapability: Some(ep_get_capability),
                 Compile: Some(ep_compile),
                 ReleaseNodeComputeInfos: Some(ep_release_node_compute_infos),
+                GetKernelRegistry: if has_registry {
+                    Some(ep_get_kernel_registry)
+                } else {
+                    None
+                },
                 GetPreferredDataLayout: None,
                 ShouldConvertDataLayoutForOp: None,
                 SetDynamicOptions: None,
@@ -45,11 +123,11 @@ impl ExportedEp {
                 CreateAllocator: None,
                 CreateSyncStreamForDevice: None,
                 GetCompiledModelCompatibilityInfo: None,
-                GetKernelRegistry: None,
                 ..Default::default()
             },
             ep,
             name_cstr,
+            kernel_registry: registry,
         }
     }
 }
@@ -253,6 +331,13 @@ fn ep_compile_inner(
         let reader = match unsafe { OutboundGraphReader::from_ort_graph(graph_ptr) } {
             Ok(r) => r,
             Err(msg) => {
+                // NEW-2 fix: free already-written out_infos[0..i] and null them
+                // so that a subsequent ReleaseNodeComputeInfos (if ORT calls it)
+                // is a safe no-op. This is safe under both "ORT frees on failure"
+                // (all slots are null → no double-free) and "ORT does not free"
+                // (we freed → no leak). Header lines 2179/2203–2207 do not
+                // specify the failure-path contract.
+                cleanup_partial_infos(out_infos, i);
                 return fail_status(&format!("Compile: failed to read subgraph {i}: {msg}"));
             }
         };
@@ -261,6 +346,7 @@ fn ep_compile_inner(
         let cache = match onnx_runtime_ir::GraphViewCache::build(ir_graph) {
             Ok(c) => c,
             Err(e) => {
+                cleanup_partial_infos(out_infos, i);
                 return fail_status(&format!(
                     "Compile: failed to build graph cache for subgraph {i}: {e}"
                 ));
@@ -317,6 +403,7 @@ fn ep_compile_inner(
                     });
                 }
                 Err(e) => {
+                    cleanup_partial_infos(out_infos, i);
                     return fail_status(&format!(
                         "Compile: get_kernel failed for node '{}' ({}): {e}",
                         node.name.as_str(),
@@ -452,6 +539,231 @@ unsafe extern "C" fn ep_release_node_compute_infos(
     }));
 }
 
+/// Free already-written `out_infos[0..written]` and null them out on compile
+/// failure. This is safe under both possible ORT behaviors on a failed Compile:
+///
+/// 1. ORT calls `ReleaseNodeComputeInfos` on the partial array → all slots are
+///    null → no double-free (our release callback skips nulls).
+/// 2. ORT does NOT call `ReleaseNodeComputeInfos` → no leak because we freed.
+///
+/// Evidence: ORT header lines 2179 ("ORT calls ReleaseNodeComputeInfos() to
+/// release multiple instances in a batch") and 2203–2207 do NOT specify whether
+/// this applies on Compile failure. This cleanup-and-null strategy is safe under
+/// both interpretations.
+fn cleanup_partial_infos(out_infos: *mut *mut ort::OrtNodeComputeInfo, written: usize) {
+    for j in 0..written {
+        let ptr = unsafe { *out_infos.add(j) };
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr.cast::<ExportedComputeInfo>())) };
+            unsafe { *out_infos.add(j) = ptr::null_mut() };
+        }
+    }
+}
+
+// ─── GetKernelRegistry ──────────────────────────────────────────────────────
+
+/// `GetKernelRegistry` callback: returns the EP's pre-built kernel registry.
+///
+/// ORT uses this for type-constraint metadata so f16/bf16 nodes are correctly
+/// routed to our EP during `GetCapability`. The kernel registry coexists with
+/// the compile-based path: ORT header line 1522 documents
+/// `EpGraphSupportInfo_LookUpKernel` as "Used within OrtEp::GetCapability()".
+unsafe extern "C" fn ep_get_kernel_registry(
+    ep: *mut ort::OrtEp,
+    out_registry: *mut *const ort::OrtKernelRegistry,
+) -> *mut ort::OrtStatus {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if ep.is_null() || out_registry.is_null() {
+            return invalid_arg_status("GetKernelRegistry: null argument");
+        }
+        let exported = unsafe { &*(ep.cast::<ExportedEp>()) };
+        match &exported.kernel_registry {
+            Some(holder) => {
+                unsafe { *out_registry = holder.ptr.cast_const() };
+            }
+            None => {
+                unsafe { *out_registry = ptr::null() };
+            }
+        }
+        ok_status()
+    }));
+    result.unwrap_or_else(|_| fail_status("GetKernelRegistry: internal panic"))
+}
+
+/// Build an ORT `OrtKernelRegistry` from a slice of [`KernelRegistryEntry`].
+///
+/// Requires the ORT host API to be set (called after `set_host_api`).
+/// Returns `None` if the entries slice is empty or ORT API is unavailable.
+///
+/// The returned registry is valid for the EP's lifetime. ORT never frees it;
+/// we free it in [`OrtKernelRegistryHolder::drop`].
+pub fn build_ort_kernel_registry(
+    entries: &[KernelRegistryEntry],
+    ep_name: &str,
+) -> Option<OrtKernelRegistryHolder> {
+    if entries.is_empty() {
+        return None;
+    }
+    let api = crate::status::host_api();
+    if api.is_null() {
+        return None;
+    }
+    let ep_api = unsafe {
+        let get_ep_api = (*api).GetEpApi?;
+        get_ep_api()
+    };
+    if ep_api.is_null() {
+        return None;
+    }
+
+    // Create the kernel registry.
+    let create_registry = unsafe { (*ep_api).CreateKernelRegistry }?;
+    let mut registry_ptr: *mut ort::OrtKernelRegistry = ptr::null_mut();
+    let status = unsafe { create_registry(&mut registry_ptr) };
+    if !status.is_null() || registry_ptr.is_null() {
+        return None;
+    }
+
+    let create_builder = unsafe { (*ep_api).CreateKernelDefBuilder }?;
+    let set_op_type = unsafe { (*ep_api).KernelDefBuilder_SetOperatorType }?;
+    let set_domain = unsafe { (*ep_api).KernelDefBuilder_SetDomain }?;
+    let set_since_version = unsafe { (*ep_api).KernelDefBuilder_SetSinceVersion }?;
+    let set_ep = unsafe { (*ep_api).KernelDefBuilder_SetExecutionProvider }?;
+    let add_type_constraint = unsafe { (*ep_api).KernelDefBuilder_AddTypeConstraint }?;
+    let build_def = unsafe { (*ep_api).KernelDefBuilder_Build }?;
+    let release_builder = unsafe { (*ep_api).ReleaseKernelDefBuilder }?;
+    let add_kernel = unsafe { (*ep_api).KernelRegistry_AddKernel }?;
+    let release_def = unsafe { (*ep_api).ReleaseKernelDef }?;
+    let get_tensor_data_type = unsafe { (*ep_api).GetTensorDataType }?;
+
+    let ep_name_c = std::ffi::CString::new(ep_name).ok()?;
+
+    for entry in entries {
+        let op_c = std::ffi::CString::new(entry.op_type).ok()?;
+        let domain_c = std::ffi::CString::new(entry.domain).ok()?;
+
+        let mut builder: *mut ort::OrtKernelDefBuilder = ptr::null_mut();
+        let s = unsafe { create_builder(&mut builder) };
+        if !s.is_null() || builder.is_null() {
+            continue;
+        }
+
+        let s = unsafe { set_op_type(builder, op_c.as_ptr()) };
+        if !s.is_null() {
+            unsafe { release_builder(builder) };
+            continue;
+        }
+        let s = unsafe { set_domain(builder, domain_c.as_ptr()) };
+        if !s.is_null() {
+            unsafe { release_builder(builder) };
+            continue;
+        }
+        let s = unsafe {
+            set_since_version(
+                builder,
+                entry.since_version,
+                entry.end_version,
+            )
+        };
+        if !s.is_null() {
+            unsafe { release_builder(builder) };
+            continue;
+        }
+        let s = unsafe { set_ep(builder, ep_name_c.as_ptr()) };
+        if !s.is_null() {
+            unsafe { release_builder(builder) };
+            continue;
+        }
+
+        // Build OrtDataType* array for the type constraint "T".
+        let mut ort_dtypes: Vec<*const ort::OrtDataType> = Vec::new();
+        for &dtype in entry.supported_dtypes {
+            let onnx_elem = dtype_to_onnx_tensor_elem(dtype);
+            let mut dt_ptr: *const ort::OrtDataType = ptr::null();
+            let s = unsafe { get_tensor_data_type(onnx_elem, &mut dt_ptr) };
+            if s.is_null() && !dt_ptr.is_null() {
+                ort_dtypes.push(dt_ptr);
+            }
+        }
+
+        if !ort_dtypes.is_empty() {
+            let constraint_name = c"T";
+            let s = unsafe {
+                add_type_constraint(
+                    builder,
+                    constraint_name.as_ptr(),
+                    ort_dtypes.as_ptr(),
+                    ort_dtypes.len(),
+                )
+            };
+            if !s.is_null() {
+                unsafe { release_builder(builder) };
+                continue;
+            }
+        }
+
+        let mut kernel_def: *mut ort::OrtKernelDef = ptr::null_mut();
+        let s = unsafe { build_def(builder, &mut kernel_def) };
+        unsafe { release_builder(builder) };
+        if !s.is_null() || kernel_def.is_null() {
+            continue;
+        }
+
+        // Register with a no-op kernel create function. For compile-based EPs,
+        // ORT should never call it (nodes go through Compile). If it IS called,
+        // returning null kernel signals unsupported, which is safe.
+        let s = unsafe {
+            add_kernel(
+                registry_ptr,
+                kernel_def,
+                Some(noop_kernel_create),
+                ptr::null_mut(),
+            )
+        };
+        unsafe { release_def(kernel_def) };
+        if !s.is_null() {
+            // Non-fatal: skip this entry.
+            continue;
+        }
+    }
+
+    Some(OrtKernelRegistryHolder { ptr: registry_ptr })
+}
+
+/// No-op kernel create function. For compile-based EPs using a kernel registry
+/// purely for type-constraint advertisement, ORT should never invoke this.
+/// If it does (unexpected), return null kernel → ORT falls back.
+unsafe extern "C" fn noop_kernel_create(
+    _state: *mut std::ffi::c_void,
+    _info: *const ort::OrtKernelInfo,
+    kernel_out: *mut *mut ort::OrtKernelImpl,
+) -> *mut ort::OrtStatus {
+    if !kernel_out.is_null() {
+        unsafe { *kernel_out = ptr::null_mut() };
+    }
+    fail_status("kernel_create called on compile-based EP — unexpected; returning null kernel")
+}
+
+/// Map `DataType` to `ONNXTensorElementDataType` enum value.
+fn dtype_to_onnx_tensor_elem(dtype: DataType) -> ort::ONNXTensorElementDataType {
+    match dtype {
+        DataType::Float32 => 1,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+        DataType::Uint8 => 2,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
+        DataType::Int8 => 3,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
+        DataType::Uint16 => 4,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
+        DataType::Int16 => 5,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
+        DataType::Int32 => 6,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+        DataType::Int64 => 7,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+        DataType::Bool => 9,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
+        DataType::Float16 => 10, // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
+        DataType::Float64 => 11, // ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
+        DataType::Uint32 => 12,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
+        DataType::Uint64 => 13,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
+        DataType::BFloat16 => 16, // ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+        _ => 0,                  // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +871,68 @@ mod tests {
             }
             other => panic!("Expected Unsqueeze; got {other:?}"),
         }
+    }
+
+    /// cleanup_partial_infos frees written entries and nulls them out.
+    #[test]
+    fn cleanup_partial_infos_nulls_freed_slots() {
+        unsafe { crate::status::set_host_api(ptr::null()) };
+        // Allocate an array of 3 pointers, writing non-null "sentinels" for 2.
+        let mut infos: [*mut ort::OrtNodeComputeInfo; 3] = [ptr::null_mut(); 3];
+        // Create real ExportedComputeInfo that cleanup_partial_infos will drop.
+        let info0 = Box::into_raw(Box::new(ExportedComputeInfo::new(Vec::new())));
+        let info1 = Box::into_raw(Box::new(ExportedComputeInfo::new(Vec::new())));
+        infos[0] = info0.cast();
+        infos[1] = info1.cast();
+        // Simulate failure at index 2 — cleanup [0..2].
+        cleanup_partial_infos(infos.as_mut_ptr(), 2);
+        assert!(infos[0].is_null(), "slot 0 must be nulled after cleanup");
+        assert!(infos[1].is_null(), "slot 1 must be nulled after cleanup");
+    }
+
+    /// dtype_to_onnx_tensor_elem maps all CPU_EP_SUPPORTED_DTYPES correctly.
+    #[test]
+    fn dtype_mapping_matches_ort_constants() {
+        use crate::kernel_ctx::CPU_EP_SUPPORTED_DTYPES;
+        for &dtype in CPU_EP_SUPPORTED_DTYPES {
+            let elem = dtype_to_onnx_tensor_elem(dtype);
+            assert_ne!(elem, 0, "dtype {dtype:?} mapped to UNDEFINED");
+        }
+        // Spot-check specific values.
+        assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float16), 10);
+        assert_eq!(dtype_to_onnx_tensor_elem(DataType::BFloat16), 16);
+        assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float32), 1);
+    }
+
+    /// KernelRegistryEntry can be constructed with static data.
+    #[test]
+    fn kernel_registry_entry_construction() {
+        use crate::kernel_ctx::CPU_EP_SUPPORTED_DTYPES;
+        let entry = KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
+        };
+        assert_eq!(entry.op_type, "Add");
+        assert!(entry.supported_dtypes.contains(&DataType::Float16));
+        assert!(entry.supported_dtypes.contains(&DataType::BFloat16));
+    }
+
+    /// build_ort_kernel_registry returns None when host API is not set.
+    #[test]
+    fn build_registry_without_host_api_returns_none() {
+        unsafe { crate::status::set_host_api(ptr::null()) };
+        use crate::kernel_ctx::CPU_EP_SUPPORTED_DTYPES;
+        let entries = vec![KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
+        }];
+        let result = build_ort_kernel_registry(&entries, "test_ep");
+        assert!(result.is_none(), "must return None without host API");
     }
 }

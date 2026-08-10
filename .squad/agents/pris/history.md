@@ -230,3 +230,22 @@ Generator: `tests/fixtures/generate_fixtures.py`.
 - Suite is order-independent (stress test alone exceeds the former corruption threshold).
 
 **Decision filed:** `.squad/decisions/inbox/pris-ep-conformance-final.md`
+
+## 2026-08-10 — Trait ↔ C-ABI parity integration tests
+
+**Branch:** `squad/ep-plugin-parity-cuda`
+**File:** `crates/onnx-runtime-ep-plugin/tests/trait_cabi_parity.rs`
+
+Added 9 integration tests proving the capability-parity rule between the Rust
+`ExecutionProvider` trait path and the ORT plugin C ABI path:
+- Capability parity: supported ops claimed by both, Declined ops excluded by C ABI only
+- Numerical parity: memory roundtrip and device copy are bit-exact
+- Error parity: unsupported ops declined by both, shape-Declined is C-ABI-only filter
+
+**Encoded parity rule:** `C_ABI_claims = trait_claims ∩ { nodes where ShapeInference::for_node ≠ Declined }`
+
+**Status:** Tests written and formatted; lib does not compile due to in-flight changes
+from Deckard (`ep.rs:114,406`) and Nabil (`device.rs:121,221,466,556`). These are
+transient teammate edits, not bugs in the parity logic.
+
+**Decision filed:** `.squad/decisions/inbox/pris-trait-cabi-parity.md`

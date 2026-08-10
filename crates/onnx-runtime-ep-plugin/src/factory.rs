@@ -30,6 +30,10 @@ pub struct ExportedFactory {
     pub version_cstr: CString,
     /// Constructor that produces a fresh EP instance.
     pub constructor: Box<dyn Fn() -> Box<dyn ExecutionProvider> + Send + Sync>,
+    /// Optional kernel registry entries for type-constraint advertisement.
+    /// When non-empty, `create_ep` builds an ORT kernel registry so that ORT
+    /// routes f16/bf16 (and other typed) nodes to this EP.
+    pub kernel_registry_entries: Vec<crate::ep::KernelRegistryEntry>,
 }
 
 /// Implementation of `CreateEpFactories` — called by the macro-generated export.
@@ -143,6 +147,7 @@ where
         vendor_cstr,
         version_cstr,
         constructor: Box::new(move || constructor()),
+        kernel_registry_entries: Vec::new(),
     });
 
     let factory_ptr = Box::into_raw(factory);
@@ -155,6 +160,42 @@ where
         }
         *out_factories = factory_ptr.cast::<ort::OrtEpFactory>();
         *out_num = 1;
+    }
+    ok_status()
+}
+
+/// Like [`create_ep_factories`] but also registers kernel-registry entries for
+/// type-constraint metadata. This enables ORT to route typed nodes (e.g.
+/// f16/bf16) to the EP.
+///
+/// # Safety
+///
+/// All pointer arguments must be valid per the ORT plugin-EP C ABI.
+pub unsafe fn create_ep_factories_with_registry<F>(
+    api_base: *const ort::OrtApiBase,
+    out_factories: *mut *mut ort::OrtEpFactory,
+    max_factories: usize,
+    out_num: *mut usize,
+    constructor: F,
+    entries: Vec<crate::ep::KernelRegistryEntry>,
+) -> *mut ort::OrtStatus
+where
+    F: Fn() -> Box<dyn ExecutionProvider> + Send + Sync + 'static,
+{
+    // Delegate to the standard path — it builds the factory.
+    let status = unsafe {
+        create_ep_factories(api_base, out_factories, max_factories, out_num, constructor)
+    };
+    if !status.is_null() {
+        return status;
+    }
+    // Patch the factory's kernel_registry_entries field.
+    if !out_factories.is_null() {
+        let factory_ptr = unsafe { *out_factories };
+        if !factory_ptr.is_null() {
+            let exported = unsafe { &mut *(factory_ptr.cast::<ExportedFactory>()) };
+            exported.kernel_registry_entries = entries;
+        }
     }
     ok_status()
 }
@@ -404,7 +445,13 @@ unsafe extern "C" fn factory_create_ep(
             return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
         }
 
-        let exported_ep = Box::new(ExportedEp::new(ep));
+        let exported_ep = Box::new(ExportedEp::new_with_registry(
+            ep,
+            crate::ep::build_ort_kernel_registry(
+                &exported.kernel_registry_entries,
+                exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
+            ),
+        ));
         let ep_ptr = Box::into_raw(exported_ep);
         // SAFETY: ExportedEp's first field is OrtEp vtable.
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };

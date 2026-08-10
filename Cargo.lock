@@ -2428,12 +2428,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-ep-cuda-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-cuda",
+ "onnx-runtime-ep-plugin",
+]
+
+[[package]]
 name = "onnx-runtime-ep-plugin"
 version = "0.1.0-dev.5"
 dependencies = [
  "libloading 0.8.9",
  "onnx-genai-ort-sys",
  "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
 ]
 

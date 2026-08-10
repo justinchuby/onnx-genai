@@ -121,3 +121,34 @@ Full pre-compaction history in `history-archive.md`.
 - Known-gaps table: `conformance_two_sessions` marked Closed; Holden sign-off marked Closed.
 
 **Durable lesson:** Pre-final docs written mid-work will always be stale. Always re-run validation commands at head and quote actual output — do not copy numbers from coordinator memo on faith.
+
+---
+
+## 2026-08-10T23:30Z — EP inventory, M2 state, §524 update (branch `squad/ep-plugin-parity-cuda`)
+
+**Task:** Complete EP inventory, update PR doc for both milestones, state §524 compliance honestly.
+
+**EP inventory result (re-run at HEAD `5fa8cb2a8`):**
+- Production EPs: exactly 2 — `CpuExecutionProvider` and `CudaExecutionProvider`.
+- Excluded non-EPs confirmed: `LegacyOrtEp` (inbound adapter), `PluginExecutionProvider` (inbound bridge), `onnx-runtime-eager` (orchestrator), `mlas-sys` (BLAS lib), all test/mock impls.
+- Metal EP (`../onnxruntime-mlx`): **OUT OF SCOPE** — `ls /workspace/dev/` confirms only `onnx-genai` present. Sibling repo must be cloned separately.
+- QNN NPU EP: **ASPIRATIONAL** — no crate, no stub, no design. Luba's domain; not in scope this wave.
+
+**M2 state at HEAD `5fa8cb2a8`:** `squad/ep-plugin-parity-cuda` = `squad/ep-plugin-export` (zero new M2 commits).
+- Leon NEW-1 (`catch_unwind` on `compute_release_state`): **DONE** — code at `compute.rs:1563` confirms it landed before M1 hand-off, not post-merge.
+- Pris trait↔C-ABI parity tests: **NOT YET COMMITTED** — §524 trait-half proof pending.
+- Deckard NEW-2 + `GetKernelRegistry`: **NOT YET COMMITTED**.
+- Nabil CUDA shim (`onnx-runtime-ep-cuda-plugin`): **NOT YET COMMITTED** — crate does not exist.
+
+**Validation observed (`cargo test -p onnx-runtime-ep-plugin --lib` + `cargo test -p onnx-runtime-ep-cpu-plugin`):**
+- 82 lib unit tests, ok.
+- 6 lib integration tests + 15 ORT e2e tests = 21 total, all ok, 0 ignored.
+
+**§524:** C ABI half complete. Rust trait half structurally wired but §524 proof (Pris's parity tests) not yet committed. Native nxrt dynamic ABI unimplemented in both milestones.
+
+**Recommendation:** Two stacked PRs (not one). M1 is independently mergeable; M2 is not.
+
+**Deliverables written:**
+- `.squad/decisions/inbox/roy-ep-inventory-complete.md`
+- `docs/EP_PLUGIN_EXPORT_PR.md` updated (both milestones, branch structure, M2 state, §524 table, corrected NEW-1 status, Follow-Ups updated).
+- `.squad/agents/roy/history.md` (this entry).

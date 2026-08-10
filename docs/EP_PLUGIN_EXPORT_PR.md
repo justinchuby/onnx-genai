@@ -1,7 +1,20 @@
-# PR: ORT Plugin EP Export — Rust CPU EP now loads and runs via upstream ORT 1.27.0
+# PR: ORT Plugin EP Export — Rust CPU EP via upstream ORT 1.27.0 (Milestone 1) + Parity & CUDA Prep (Milestone 2 in progress)
 
-**Branch:** `squad/ep-plugin-export`
-**Commits:** `526a883`, `f81d98d`, `09635cd`, `c92838d`, `2fb7150`, `bad3682`
+## Branch structure
+
+| Branch | Milestone | Status |
+|---|---|---|
+| `squad/ep-plugin-export` | M1 — CPU EP fully exported as ORT plugin | 🟡 YELLOW — may ship (all CRITICAL/HIGH cleared) |
+| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity, CUDA shim, f16/bf16 type constraints | 🔴 IN PROGRESS — no M2 commits landed yet (stacked; not independently mergeable) |
+
+**Recommendation: two stacked PRs, not one.**
+M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it now unblocks downstream tooling without waiting for M2. M2 (`squad/ep-plugin-parity-cuda`) adds parity tests and CUDA scaffolding that are genuinely additive; they depend on M1's adapter but don't affect M1 correctness. Squashing them into one PR would make the review surface larger with no benefit, and would stall M1 behind M2's hardware-gated CUDA work. Stack PR2 on PR1 with a base-branch dependency in the PR description.
+
+**Push is blocked:** No `GH_TOKEN`/`GITHUB_TOKEN`, no SSH private key, and GCM cache is empty on this host. `git ls-remote origin refs/heads/squad/ep-plugin-export` returned empty — neither branch exists remotely. A user or CI runner with write credentials must push and open the PRs.
+
+---
+
+**M1 commits:** `526a883`, `f81d98d`, `09635cd`, `c92838d`, `2fb7150`, `bad3682`, `415289bc`, `5fa8cb2a`
 
 ---
 
@@ -119,8 +132,9 @@ Integration tests covering:
 
 ## Validation
 
-All commands run by Roy on `squad/ep-plugin-export` at commit `bad3682`,
-2026-08-10T22:56Z. Output is quoted verbatim.
+All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `5fa8cb2a8`,
+2026-08-10T23:30Z. Output is quoted verbatim. (The branch is currently at the same
+commit as `squad/ep-plugin-export`; no M2 commits have landed yet.)
 
 ### `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`
 
@@ -141,11 +155,10 @@ test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
 ```
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
 ```
 
-21 tests total (6 lib + 15 integration), zero failures, zero ignored. Full parallel
-run, no `--test-threads=1` workaround needed.
+21 tests total (6 lib + 15 integration), zero failures, zero ignored.
 
 ### `cargo check --workspace`
 
@@ -183,12 +196,12 @@ follow-up — they do not block merge.
 | N3 | Macro entry points `CreateEpFactories`/`ReleaseEpFactory` unguarded (MEDIUM) | Isidore | **RESOLVED** — both wrapped; `ReleaseEpFactory` return type corrected to `void` |
 | UAF | `OrtMemoryInfo` released while ORT holds pointer (CRITICAL) | Deckard | **RESOLVED** — `c92838d`; Holden confirmed correct, no double-free possible |
 
-### Post-merge advisory items (LOW, not blocking)
+### Post-merge advisory items status (re-verified at `5fa8cb2a8`)
 
-| ID | Item | Owner |
-|----|------|-------|
-| NEW-1 | `compute_release_state` lacks `catch_unwind` — pattern violation; `ComputeState` is trivially droppable now but guard should be added before extending it | Leon |
-| NEW-2 | `ep_compile_inner` does not clean up `out_infos[0..i]` on mid-loop failure; ORT contract for Compile errors is unspecified | Deckard |
+| ID | Item | Actual status |
+|----|------|---------------|
+| NEW-1 | `compute_release_state` lacks `catch_unwind` | **RESOLVED** — `catch_unwind` is present at `compute.rs:1563`; comment explicitly says "This fixes NEW-1 from the EP plugin security audit." Leon's work landed before the M1 hand-off, not post-merge. The PR doc listed it as post-merge advisory in error. |
+| NEW-2 | `ep_compile_inner` does not clean up `out_infos[0..i]` on mid-loop failure | **OPEN** — no cleanup logic found in `ep_compile_inner` (`ep.rs:229`). LOW risk; ORT contract on `Compile` errors is still unspecified. Owner: Deckard. |
 
 ---
 
@@ -207,6 +220,21 @@ The Reviewer Rejection Protocol was enforced throughout this branch:
   capability-claiming code was rejected.
 - **`conformance_two_sessions` assertion bug** — reassigned to Pris (tester);
   fixed and now passing.
+
+---
+
+## Milestone 2 — In-progress work (branch `squad/ep-plugin-parity-cuda`)
+
+As of HEAD `5fa8cb2a8`, the M2 branch has zero new commits beyond M1. The four
+engineers are working concurrently but nothing has been committed to this branch yet.
+Status per engineer based on code inspection:
+
+| Engineer | Task | Status |
+|---|---|---|
+| Leon | `catch_unwind` on `compute_release_state` (NEW-1) | ✅ **DONE** — landed before M1 hand-off; code at `compute.rs:1563` with explicit comment. Formerly listed as "post-merge advisory" in error. |
+| Pris | Trait ↔ C-ABI capability/numeric/error parity tests | 🔴 **NOT YET COMMITTED** — no such tests in `crates/onnx-runtime-ep-api/tests/`. §524 trait-half proof depends on this work. |
+| Deckard | NEW-2 `ep_compile_inner` partial cleanup + `GetKernelRegistry` f16/bf16 | 🔴 **NOT YET COMMITTED** — `GetKernelRegistry: None` at `ep.rs:48`; no cleanup in `ep_compile_inner`. |
+| Nabil | Device/allocator/stream adapter surfaces + `onnx-runtime-ep-cuda-plugin` shim | 🔴 **NOT YET COMMITTED** — crate `onnx-runtime-ep-cuda-plugin` does not exist. |
 
 ---
 
@@ -233,39 +261,30 @@ The Reviewer Rejection Protocol was enforced throughout this branch:
 
 ---
 
-## Architecture-Contract Compliance (Standing Directive §524)
+## Architecture-Contract Compliance (Standing Directive §524) — Updated for M1+M2
 
 The standing directive requires: every extension seam exposes a stable C ABI with
 dynamic loading support **and** a first-class Rust trait; the two surfaces stay in
 sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 
-| Requirement | This PR |
-|-------------|---------|
-| Stable C ABI with dynamic loading | ✅ `CreateEpFactories`/`ReleaseEpFactory` exports; ORT `dlopen`s the cdylib |
-| First-class Rust trait | 🟡 `ExecutionProvider` trait exists and is implemented by `CpuExecutionProvider`; the plugin adapter bridges it, but the Rust trait surface is not independently tested as a plugin surface |
-| ORT ABI evolves toward nxrt | ✅ Plugin adapter is thin shim; core logic lives in the Rust trait impl |
-| Fail closed on unsupported capabilities | ✅ `Declined` path in shape inference; `GetCapability` refuses ops whose shapes cannot be resolved; 22 explicit rules, no wildcard accept |
+| Requirement | M1 status | M2 status |
+|-------------|-----------|-----------|
+| Stable C ABI with dynamic loading | ✅ Complete — `CreateEpFactories`/`ReleaseEpFactory` exports; ORT `dlopen`s the cdylib | ✅ Unchanged |
+| First-class Rust trait | 🟡 `ExecutionProvider` trait exists and is implemented; plugin adapter bridges it | 🔴 Trait↔C-ABI parity tests (Pris's work) have NOT landed yet on `squad/ep-plugin-parity-cuda`. §524 requires both seams proven; only the C ABI side is verified by the 21 ORT conformance tests. |
+| ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim; core logic lives in the Rust trait impl | ✅ Unchanged |
+| Fail closed on unsupported capabilities | ✅ `Declined` path in shape inference; 22 explicit rules, no wildcard accept | ✅ Unchanged |
+| Native nxrt dynamic ABI | 🔴 Not implemented — no `extern "C"` nxrt-native ABI exists; the only dynamic-loading surface is the ORT plugin ABI | 🔴 Not started in M2 either |
 
-**Honest status:** The C ABI half is complete and verified. The nxrt-native Rust
-trait half is wired but not independently validated as a plugin surface. Full §524
-compliance requires a follow-up that tests the Rust trait side without going through
-the C ABI bridge.
+**Honest M2 §524 status:** The C ABI half is complete and verified by 21 ORT conformance tests. The Rust trait half is structurally wired — `CpuExecutionProvider` implements the trait and the adapter bridges it — but the trait surface has NOT been independently tested as a first-class plugin seam. Pris's trait↔C-ABI parity tests are the intended evidence for the trait half; they are in scope for M2 but have not been committed yet. The native nxrt dynamic ABI remains entirely undesigned and unimplemented in both milestones.
 
 ---
 
 ## Follow-Ups
 
-1. **Leon:** Add `catch_unwind` to `compute_release_state` (NEW-1 LOW advisory —
-   pattern violation; safe now but must guard before `ComputeState` is extended).
-2. **Deckard:** Handle `out_infos[0..i]` cleanup on mid-loop `ep_compile_inner`
-   failure once ORT contract is clarified (NEW-2 LOW advisory).
-3. **Nabil / `ep.rs`:** Wire `GetKernelRegistry` so f16/bf16 type constraints are
-   registered with ORT; enables end-to-end f16/bf16 conformance testing.
-4. **CUDA EP:** Design allocator (`CreateAllocator`), stream/sync
-   (`CreateSyncStreamForDevice`), and device-pointer crossing ABI; validate on a
-   CUDA-capable host.
-5. **Shape inference:** Add per-op rules for Reshape (computed dims), Split,
-   TopK, Slice (negative axis) to expand what the CPU EP can claim.
-6. **§524 Rust trait surface:** Add an integration test that exercises
-   `CpuExecutionProvider` directly via the `ExecutionProvider` Rust trait without
-   the C ABI bridge, to verify the two surfaces stay in sync.
+1. ~~**Leon:** Add `catch_unwind` to `compute_release_state` (NEW-1)~~ — **DONE** (already in code at `compute.rs:1563`).
+2. **Deckard:** Handle `out_infos[0..i]` cleanup on mid-loop `ep_compile_inner` failure once ORT contract is clarified (NEW-2 LOW advisory).
+3. **Deckard/Nabil:** Wire `GetKernelRegistry` so f16/bf16 type constraints are registered with ORT; enables end-to-end f16/bf16 conformance testing.
+4. **Pris:** Add trait↔C-ABI parity tests (capability round-trip, numeric precision, error propagation) in `crates/onnx-runtime-ep-api/tests/`. These are the §524 evidence for the Rust trait half.
+5. **Nabil:** Design and implement `onnx-runtime-ep-cuda-plugin` shim with allocator ABI (`CreateAllocator`), stream/sync ABI (`CreateSyncStreamForDevice`), and device-pointer crossing. Validate on a CUDA-capable host.
+6. **Shape inference:** Add per-op rules for Reshape (computed dims), Split, TopK, Slice (negative axis) to expand what the CPU EP can claim.
+7. **Native nxrt dynamic ABI:** Design and implement a first-class native nxrt `extern "C"` ABI (separate from the ORT plugin ABI) to complete §524 compliance.

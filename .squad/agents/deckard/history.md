@@ -29,3 +29,10 @@ Pre-2026-08-10 entries moved to `history-archive.md`. Covers: kernel pre-binding
 - 22-variant `ShapeInference` + `SubgraphRouting` for multi-node subgraphs; 66 tests.
 - Device lifetime UAF fix in `factory.rs` (`CreateMemoryInfo_V2` + no release on success). Clippy `manual_dangling_ptr` lint fixed.
 - Post-merge advisory: `ep_compile_inner` partial-output cleanup on mid-loop failure (not yet resolved).
+
+## 2026-08-10 — GetKernelRegistry + NEW-2 Compile cleanup
+
+- **NEW-2 resolved**: `ep_compile_inner` now frees and nulls `out_infos[0..i]` on mid-loop failure. Safe under both "ORT frees on failure" (null → no-op) and "ORT doesn't free" (we freed → no leak). Header lines 2179/2203–2207 do not specify failure-path ownership.
+- **GetKernelRegistry infrastructure**: Implemented full ORT 1.24+ kernel-registry-based type-constraint machinery. `ExportedEp` now optionally holds an `OrtKernelRegistry*` built from `KernelRegistryEntry` slices. GetKernelRegistry callback wired. Coexists with Compile path (not mutually exclusive per header line 1522).
+- **Blocker for f16/bf16**: `ExecutionProvider` trait lacks `op_entries()` iterator; CPU EP plugin must pass entries to `create_ep_factories_with_registry`. Pris: once entries are wired, re-test f16/bf16 routing.
+- 120 lib tests pass (4 new: cleanup, dtype mapping, entry construction, no-host-api guard). 15 conformance tests pass. No regression.

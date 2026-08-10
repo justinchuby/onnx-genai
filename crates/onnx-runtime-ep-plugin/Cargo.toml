@@ -15,6 +15,13 @@ onnx-genai-ort-sys = { workspace = true }
 
 [dev-dependencies]
 libloading = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+
+[[test]]
+name = "trait_cabi_parity"
+path = "tests/trait_cabi_parity.rs"
 
 [lints]
 workspace = true

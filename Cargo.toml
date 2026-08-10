@@ -58,6 +58,7 @@ members = [
     # ── Outbound ORT plugin-EP export (not in default-members — requires ort-sys) ──
     "crates/onnx-runtime-ep-plugin",
     "crates/onnx-runtime-ep-cpu-plugin",
+    "crates/onnx-runtime-ep-cuda-plugin",
 
     # ── Vendored ONNX Runtime MLAS bindings ──
     # Registered as a member so `cargo build -p mlas-sys` resolves. Crates that
@@ -175,6 +176,7 @@ onnx-std = { path = "crates/onnx-std", version = "=0.1.0-dev.5" }
 
 onnx-runtime-ep-plugin = { path = "crates/onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cpu-plugin = { path = "crates/onnx-runtime-ep-cpu-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-cuda-plugin = { path = "crates/onnx-runtime-ep-cuda-plugin", version = "=0.1.0-dev.5" }
 
 # External
 # `default` pulls `onig` (a vendored C regex engine), `esaxx_fast` (a C++ suffix

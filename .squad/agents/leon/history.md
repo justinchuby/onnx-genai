@@ -104,3 +104,37 @@ validated path. No `#[allow(dead_code)]` was used.
 These are in Isidore's (`lib.rs`) and Deckard's (`ep.rs`) files; not touched.
 
 **Test result:** `cargo test -p onnx-runtime-ep-plugin --lib` — 82 passed, 0 failed.
+
+---
+
+## 2026-08-10 — EP plugin parity wave: NEW-1 fix + f16/bf16 marshaling
+
+**Branch:** squad/ep-plugin-parity-cuda
+
+### TASK 1 — NEW-1: compute_release_state catch_unwind (compute.rs)
+
+`compute_release_state` was the only `extern "C"` callback in the two owned
+files lacking a `catch_unwind` guard. Wrapped the body in
+`catch_unwind(AssertUnwindSafe(…))` with `let _ = result` to swallow any panic
+(void return — no status channel). The other two callbacks (`compute_create_state`,
+`compute_execute`) were already guarded; none were missed.
+
+Added test `release_state_swallows_panic_safely` verifying the guard pattern.
+
+### TASK 2 — f16/bf16 marshaling (kernel_ctx.rs)
+
+Verified against `bindings.rs`:
+- `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 = 10` → `DataType::Float16 = 10` ✅
+- `ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 = 16` → `DataType::BFloat16 = 16` ✅
+- Both have `byte_size() = 2` — existing `checked_mul` overflow guards cover them.
+
+Exposed `CPU_EP_SUPPORTED_DTYPES: &[DataType]` as a public constant so Deckard
+can import it (do not copy) for `GetKernelRegistry` type constraints.
+
+Added 7 new tests covering f16/bf16 round-trip, byte-length, overflow guard,
+unsupported-dtype fail-closed, and the supported-dtypes constant.
+
+**Test results:**
+- `cargo test -p onnx-runtime-ep-plugin --lib` → 90 passed (was 82)
+- `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → clean
+- `cargo test -p onnx-runtime-ep-cpu-plugin` → 15 passed

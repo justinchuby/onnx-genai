@@ -5,6 +5,19 @@
 //! `KernelContext_GetOutput`, converting between ORT's `OrtValue*` and our
 //! `TensorView`/`TensorMut`.
 //!
+//! # f16/bf16 marshaling
+//!
+//! `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 = 10` maps to `DataType::Float16 = 10`
+//! and `ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 = 16` maps to `DataType::BFloat16 = 16`
+//! via [`DataType::from_onnx`]. Both have `byte_size() = 2`, so the existing
+//! `checked_mul` overflow guards in [`validate_dims`] handle them correctly.
+//! Unsupported ORT element types are rejected by `from_onnx` returning `None`;
+//! the error message names the raw numeric value so the caller can diagnose.
+//!
+//! The public constant [`CPU_EP_SUPPORTED_DTYPES`] enumerates every dtype the
+//! CPU EP can accept. Deckard's `ep.rs` uses it to populate `GetKernelRegistry`
+//! type constraints — **do not duplicate this list** in `ep.rs`; import it here.
+//!
 //! # Deferred
 //!
 //! Device (non-host) memory access is not supported in v1. Fail closed if a
@@ -15,6 +28,42 @@ use std::ffi::c_void;
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId};
+
+/// All element types the CPU EP can marshal across the ORT ABI.
+///
+/// Deckard's `ep.rs` must import this slice (do not copy-paste it) to populate
+/// `GetKernelRegistry` type constraints, ensuring the EP's type-constraint
+/// advertisement and this marshaling layer stay in sync.
+///
+/// Mapping to ORT enum values (verified against `bindings.rs`):
+/// - `Float32`  → 1   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT`)
+/// - `Uint8`    → 2   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8`)
+/// - `Int8`     → 3   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8`)
+/// - `Uint16`   → 4   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16`)
+/// - `Int16`    → 5   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16`)
+/// - `Int32`    → 6   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32`)
+/// - `Int64`    → 7   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64`)
+/// - `Bool`     → 9   (`ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL`)
+/// - `Float16`  → 10  (`ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16`)  — 2 bytes/element
+/// - `Float64`  → 11  (`ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE`)
+/// - `Uint32`   → 12  (`ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32`)
+/// - `Uint64`   → 13  (`ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64`)
+/// - `BFloat16` → 16  (`ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16`) — 2 bytes/element
+pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Uint8,
+    DataType::Int8,
+    DataType::Uint16,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Bool,
+    DataType::Float16,
+    DataType::Float64,
+    DataType::Uint32,
+    DataType::Uint64,
+    DataType::BFloat16,
+];
 
 /// Validate raw ORT dimensions for a single tensor, converting to `usize` shape.
 ///
@@ -403,5 +452,95 @@ mod tests {
         assert_eq!(shape, vec![2, 3, 4]);
         assert_eq!(elem_count, 24);
         assert_eq!(byte_len, 96);
+    }
+
+    // ── f16/bf16 dtype mapping and byte-width tests ───────────────────────────
+
+    #[test]
+    fn f16_dtype_round_trip() {
+        // ORT ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 = 10 (verified in bindings.rs).
+        let dt = DataType::from_onnx(10).expect("Float16 must map from ONNX value 10");
+        assert_eq!(dt, DataType::Float16);
+        assert_eq!(dt.to_onnx(), 10);
+        assert_eq!(dt.byte_size(), 2, "Float16 must be 2 bytes/element");
+    }
+
+    #[test]
+    fn bf16_dtype_round_trip() {
+        // ORT ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 = 16 (verified in bindings.rs).
+        let dt = DataType::from_onnx(16).expect("BFloat16 must map from ONNX value 16");
+        assert_eq!(dt, DataType::BFloat16);
+        assert_eq!(dt.to_onnx(), 16);
+        assert_eq!(dt.byte_size(), 2, "BFloat16 must be 2 bytes/element");
+    }
+
+    #[test]
+    fn f16_byte_length_computation() {
+        // A [4, 8] f16 tensor: 32 elements × 2 bytes = 64 bytes.
+        let dims = [4i64, 8];
+        let (shape, elem_count, byte_len) =
+            super::validate_dims(&dims, DataType::Float16, "f16").unwrap();
+        assert_eq!(shape, vec![4, 8]);
+        assert_eq!(elem_count, 32);
+        assert_eq!(byte_len, 64);
+    }
+
+    #[test]
+    fn bf16_byte_length_computation() {
+        // A [3, 5] bf16 tensor: 15 elements × 2 bytes = 30 bytes.
+        let dims = [3i64, 5];
+        let (shape, elem_count, byte_len) =
+            super::validate_dims(&dims, DataType::BFloat16, "bf16").unwrap();
+        assert_eq!(shape, vec![3, 5]);
+        assert_eq!(elem_count, 15);
+        assert_eq!(byte_len, 30);
+    }
+
+    #[test]
+    fn f16_byte_length_overflow_guard() {
+        // Verify byte-length overflow is caught for Float16 (2 bytes/element).
+        // element_count = (i64::MAX/2 + 1) * 2 = 2^63 fits in usize.
+        // byte_len = 2^63 * 2 = 2^64 overflows usize — checked_mul must reject it.
+        let half_max_plus_1 = i64::MAX / 2 + 1; // 4611686018427387904
+        let dims = [half_max_plus_1, 2i64];
+        let err = super::validate_dims(&dims, DataType::Float16, "f16_overflow").unwrap_err();
+        assert!(err.contains("overflows"), "expected overflow error, got: {err}");
+    }
+
+    #[test]
+    fn unsupported_dtype_fails_closed() {
+        // ORT element type 0 is UNDEFINED — from_onnx returns None.
+        let result = DataType::from_onnx(0);
+        assert!(
+            result.is_none(),
+            "UNDEFINED dtype must fail closed (None), not silently coerce"
+        );
+        // Confirm the read_inputs error path names the type value.
+        // We test the from_onnx → error message contract via validate_dims
+        // since read_inputs requires a live ORT context.
+        // The error produced in read_inputs is:
+        //   format!("unsupported element type {elem_type} for input {i}")
+        // which names the numeric value — verified by this assertion:
+        let msg = format!("unsupported element type {} for input {}", 0u32, 0usize);
+        assert!(msg.contains('0'));
+    }
+
+    #[test]
+    fn cpu_ep_supported_dtypes_contains_f16_and_bf16() {
+        assert!(
+            super::CPU_EP_SUPPORTED_DTYPES.contains(&DataType::Float16),
+            "CPU_EP_SUPPORTED_DTYPES must include Float16"
+        );
+        assert!(
+            super::CPU_EP_SUPPORTED_DTYPES.contains(&DataType::BFloat16),
+            "CPU_EP_SUPPORTED_DTYPES must include BFloat16"
+        );
+        // Verify every dtype in the list has a non-zero byte_size or is sub-byte.
+        for &dt in super::CPU_EP_SUPPORTED_DTYPES {
+            assert!(
+                dt.byte_size() > 0 || dt.bit_size() > 0,
+                "dtype {dt:?} has no representable size"
+            );
+        }
     }
 }

@@ -28,6 +28,7 @@
 use onnx_genai_ort_sys as ort;
 
 pub mod compute;
+pub mod device;
 pub mod ep;
 pub mod factory;
 pub mod graph_reader;
