@@ -18,7 +18,13 @@
 - Project rule 2 must explicitly forbid hardcoded architecture/vendor/EP assumptions; condensation must not weaken review-blocking identity rules.
 - Integration stress tests should assert invariants: termination, non-empty committed turns, reasoning progress, repetition bounds, token/history/KV consistency, scheduler liveness, sampling observability, feature-state coherence, and reproducible failure packets.
 
-## Recent work (current wave, ~2026-07-28/29)
+## Recent work
+
+### 2026-08-10T20:12:35+0000 — EP plugin export architecture
+
+Produced `docs/EP_PLUGIN_EXPORT.md`: architecture for exporting nxrt EPs as ORT plugin dylibs. Key decisions: single shared adapter crate (`onnx-runtime-ep-plugin`) owns all unsafe FFI; per-EP thin `cdylib` shim crates are mechanical (`export_ep_factories!` macro). Reuses inbound `UnionFind`/`SubgraphClaim`/`OrtGraphView::query_capabilities`. New outbound code: `OutboundGraphReader` (reads ORT's `OrtGraph*`) and `OutboundKernelContext` (bridges `OrtKernelContext` ↔ `TensorView`). CPU EP is the v1 candidate (no device dependency). CUDA EP blocked on allocator/stream/transfer callback design. Decision record at `.squad/decisions/inbox/roy-ep-plugin-export.md`.
+
+### 2026-07-28/29 wave
 ### 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - Approved PR #313 decode-garble triage and byte-identity/fires regression guard; repeated-sentence output classified as natural greedy behavior.
 

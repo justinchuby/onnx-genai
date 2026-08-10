@@ -17,3 +17,12 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 ## 2026-07-28T11:20:06+0000 — #75 strict-lockout review cycle
 - Requested changes on PR #346 for incorrect default-domain registration and LabelEncoder-1 dtype selection.
 - Re-approved after Rachael, not the locked-out original author Bryant, independently corrected both defects in `c20ec211`.
+
+## 2026-08-10T20:12:35+0000 — Outbound EP plugin FFI audit
+- Full security audit of `crates/onnx-runtime-ep-plugin/` (~1,300 LOC of raw FFI).
+- 1 CRITICAL: no `catch_unwind` on any `extern "C"` callback — panic across FFI is UB.
+- 3 HIGH: `static mut` data race on HOST_ORT_API, missing null-check on `graphs` in `ep_compile`, unsound blanket `Send+Sync` on `OutboundGraphReader`.
+- 2 MEDIUM, 1 LOW (hardening, non-blocking).
+- Decision record filed: `.squad/decisions/inbox/holden-ep-plugin-ffi-audit.md`.
+- Full report: `docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
+- `compute.rs` and `kernel_ctx.rs` flagged for re-audit when Phase 2 Compute lands.

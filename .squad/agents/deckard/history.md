@@ -52,6 +52,16 @@ Full pre-compaction history in `history-archive.md`.
 - Authored and merged #604, a test-only fix for the pre-existing #595 `phase_profile_gating_and_accumulation` parallel-runner flake seen after #602.
 - Replaced racing global `all_stats().is_empty()` reset assertions with phase-scoped `snapshot(enabled_phase).is_some()` / `.is_none()` checks on the test's unique phase name; validated 30/30 full-parallel lib runs plus fmt/clippy clean.
 
+## 2026-08-10T20:16:00+0000 — EP plugin-export inventory
+
+- Produced `docs/EP_PLUGIN_EXPORT_INVENTORY.md` for @justinchuby: definitive inventory of every in-repo EP intended for ORT plugin-EP ABI export.
+- Confirmed 2 production EPs: `CpuExecutionProvider` (provider.rs:118, 166 op registrations, no stubs, pure-Rust, NEAR) and `CudaExecutionProvider` (provider.rs:513, 109 op registrations, `prefetch_lazy_weight` stub, CUDA toolkit required, BLOCKED).
+- Confirmed non-EPs: `onnx-runtime-eager` (orchestrator), `mlas-sys` (BLAS lib), `LegacyOrtEp`/`PluginExecutionProvider` (inbound adapters only). No MLX/Metal sibling repo.
+- `as_ort_plugin()` returns `None` on both real EPs; `OrtPluginExport` struct (provider.rs:311) is a name-only marker — Phase 2 is aspirational, not implemented.
+- `prefetch_lazy_weight` on CUDA EP (provider.rs:564–573) is `let _ = (…); Ok(false)` — real functional stub.
+- Recommended CPU EP as first export candidate: 166 ops, no stubs, pure-Rust, host pointers trivially C ABI–safe.
+- Named 6 trait/ABI gaps: `OrtPluginExport` insufficient, no `GetSupportedDevices` hook, no outbound capability-claim method, `KernelMatch`/`EpError`/`Kernel`/`DeviceBuffer` cannot cross FFI without projection.
+
 ## 2026-08-03T03:10:00+0000 — mobius PR #449 PackedMHA bias slot
 
 - Authored mobius PR #449, adding `bias` as the 4th formal to the `PackedMultiHeadAttention` fallback while keeping it inert in the body.

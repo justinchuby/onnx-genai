@@ -16,3 +16,68 @@
 ## 2026-07-29T12:30:00Z — tiny-reasoning-fixture round 1 (PR #410)
 
 Reviewed round 1 of the tiny reasoning fixture. Locked out after round 1; rounds 2 and 3 proceeded under Gaff (PR #410 REJECT) and Luv (PR #411 rounds 2 and 3). Inbox drop `pris-tiny-reasoning-fixture.md` was lost when the worktree was deleted before Scribe ran; content reconstructed into `.squad/decisions.md` (reconstructed rules section, 2026-07-29).
+
+---
+
+## 2026-08-10 — EP Plugin Export: Validation Strategy + Environment Feasibility
+
+**Requested by:** @justinchuby  
+**Task:** Recon/plan pass for outbound EP plugin export (our EPs as ORT-loadable dylibs).
+
+### Environment findings
+
+- Installed ORT 1.28.0 via pip to `.ort-probe/` venv; confirmed `libonnxruntime.so.1.28.0`
+  is present at `.ort-probe/lib/.../onnxruntime/capi/`.
+- ORT 1.28 dynamic symbol table has **exactly 2 exports**: `OrtGetApiBase` and
+  `OrtSessionOptionsAppendExecutionProvider_CPU`. All internal symbols are stripped.
+- ORT 1.28 is backward-compatible with API v27 (our ort-sys target version).
+- ORT 1.28's public C API **does not expose a function to load a plugin EP from a file path**.
+  `RegisterCustomOpsLibrary_V2` exists only for custom ops. `add_provider(name, config)`
+  requires the EP to already be registered by name in the OrtEnv. L3 is blocked.
+
+### Output
+
+- Created `docs/EP_PLUGIN_EXPORT_TEST_PLAN.md` with:
+  - Full environment feasibility report (ORT 1.28 symbol evidence, API version compatibility)
+  - Three-level test ladder: L1 (symbol export assertion), L2 (in-process dlopen ABI driver),
+    L3 (real ORT e2e, marked not achievable with current wheel + rationale)
+  - Existing test surface mapped to reuse paths
+  - Fixture inventory (existing .onnx models and how to synthesize a new one)
+  - CI integration plan
+
+### Decisions
+
+None recorded (plan pass; no source changes).
+
+---
+
+## 2026-08-10 — L3 Test Built and Executed
+
+### Context
+Challenger proved that ORT's `RegisterExecutionProviderLibrary` EXISTS in the vtable
+(available since ORT 1.22). My prior recon using `nm -D` was the wrong instrument —
+the ORT C API is entirely a vtable behind `OrtGetApiBase`.
+
+### What was done
+1. Built L3 end-to-end test: `crates/onnx-runtime-ep-cpu-plugin/tests/plugin_ort_e2e.rs`
+2. Created fixture: `crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/add_1x4/model.onnx`
+   (float32 Add, opset 17, shape [1,4])
+3. Test drives full ORT 1.27.0 registration path against our cdylib
+4. Added pre-flight vtable check to catch missing entries without segfaulting
+
+### Real result (ORT 1.27.0)
+- ✅ CreateEpFactories succeeds (factory pointer returned)
+- ✅ Pre-flight confirms: GetName, GetSupportedDevices, CreateEp, ReleaseEp populated
+- ❌ **GetVendor, GetVendorId, GetVersion are None** in the factory vtable
+- ❌ ORT segfaults at `RegisterExecutionProviderLibrary` calling `GetVendor` (offset 16)
+- Stages NOT reached: registration, device enumeration, session creation, Run
+
+### What blocks full green
+Fix required in `crates/onnx-runtime-ep-plugin/src/factory.rs`:
+Add `GetVendor: Some(...)`, `GetVendorId: Some(...)`, `GetVersion: Some(...)` to the
+`OrtEpFactory` vtable initialization (currently `..Default::default()` leaves them None).
+
+### Corrections to test plan
+- §2.4: "ORT cannot load plugins" → WRONG; corrected to YES via vtable API
+- §L3: "Not achievable" → NOW achievable; test written and running
+- Symbol name: `CreateEpFactories` (not `CreateEpApiFactories`)

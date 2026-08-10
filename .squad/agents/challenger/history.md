@@ -24,3 +24,31 @@ someone happened to ask a second question:
 
 The common shape: a result was accepted without asking what *else* could produce
 it. Challenger's remit is that question.
+
+## 2026-08-10 — ORT Plugin EP Export ABI: Three Claims Challenged
+
+**Claims under review:**
+- Claim A (Nabil): export symbol is `CreateEpFactories` — **SOUND**
+- Claim B (Pris): export symbol is `CreateEpApiFactories` — **CONTRADICTED**
+- Claim C (Pris): e2e test impossible, `nm -D` shows only 2 symbols — **CONTRADICTED**
+
+**Method:** Downloaded ORT 1.27.0 release (SHA-256 verified against `ort-sys/build.rs`),
+read `onnxruntime_c_api.h` and `onnxruntime_ep_c_api.h` directly.
+
+**Findings:**
+1. The required export symbols are `CreateEpFactories` and `ReleaseEpFactory` (both
+   required). The typedef names are `CreateEpApiFactoriesFn` / `ReleaseEpApiFactoryFn`
+   but the `dlsym` lookup name is `CreateEpFactories`. Nabil was right; Pris confused
+   the typedef name with the export name.
+2. `RegisterExecutionProviderLibrary`, `GetEpDevices`, and
+   `SessionOptionsAppendExecutionProvider_V2` are all members of the `OrtApi` struct
+   (since v1.22). They are invisible to `nm -D` because the entire ORT C API is
+   accessed through the `OrtApi` function-pointer struct returned by
+   `OrtGetApiBase()->GetApi(version)`. Pris used `nm -D` — the wrong instrument
+   entirely. The conclusion that "e2e test is impossible" was invalid.
+3. `ort_version_supported` provides forward-compat (ORT skips calling newer members),
+   not fail-closed rejection. Justin's fail-closed requirement needs an explicit check.
+
+**What changed:** Full authoritative vtable dump and call sequence written to
+`docs/EP_PLUGIN_EXPORT_ABI_TRUTH.md`. Decision record filed. Implementation
+unblocked for e2e testing.
