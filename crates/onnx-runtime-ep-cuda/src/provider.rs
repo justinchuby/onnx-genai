@@ -49,6 +49,15 @@ fn dynamic_lending_enabled() -> bool {
     )
 }
 
+fn mapped_attribution_role(
+    _role: onnx_runtime_memory_governor::MemoryRole,
+) -> onnx_runtime_memory_governor::MemoryRole {
+    // This provider has one suballocating VMM arena. KV and both workspace
+    // lifetimes can touch the same physical granule, so mapped attribution is
+    // one arena zone even though their content leases/metrics remain distinct.
+    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false }
+}
+
 fn dynamic_lending_enabled_for(value: Option<&str>) -> bool {
     !value.is_some_and(|value| {
         matches!(
@@ -1304,6 +1313,9 @@ impl ExecutionProvider for CudaExecutionProvider {
             .mapped_requesters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Content roles remain distinct in their leases and metrics, but every
+        // allocation in this suballocating arena shares one mapped allowance.
+        let role = mapped_attribution_role(role);
         let requester = match requesters.entry(role) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1332,6 +1344,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+        let role = mapped_attribution_role(role);
         if let Some(requester) = self
             .mapped_requesters
             .lock()
@@ -1458,6 +1471,26 @@ mod tests {
         for disabled in ["0", " false ", "NO", "Off"] {
             assert!(!dynamic_lending_enabled_for(Some(disabled)));
         }
+    }
+
+    #[test]
+    fn workspace_lifetimes_share_one_physical_mapping_zone() {
+        let step_content =
+            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: true };
+        let persistent_content =
+            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false };
+        assert_ne!(
+            step_content, persistent_content,
+            "content accounting keeps lifetime categories distinct"
+        );
+        let step = mapped_attribution_role(step_content);
+        let persistent = mapped_attribution_role(persistent_content);
+        assert_eq!(step, persistent);
+        assert_eq!(
+            step,
+            mapped_attribution_role(onnx_runtime_memory_governor::MemoryRole::KvCache),
+            "the current provider's KV and workspace suballocate one arena"
+        );
     }
 
     #[test]

@@ -415,6 +415,8 @@ struct Arena {
     /// owned, a `&dyn` borrow is not, and the execution-provider contract
     /// hands over the latter.
     lease: MemoryLease,
+    /// One mapped-attribution allowance owns every granule in this arena.
+    mapped_owner: Option<usize>,
 }
 
 /// Result of moving an arena's committed-byte claim to a real governor.
@@ -734,6 +736,7 @@ impl CudaVmmAllocator {
             reservation,
             spans: Spans::new(granularity, capacity),
             lease: governor.reserve(Tier::Device, 0, role, holder)?,
+            mapped_owner: None,
         };
         // After the last fallible step: an arena that failed to build has no
         // `Drop` to take these back off the books.
@@ -1134,9 +1137,19 @@ impl CudaVmmAllocator {
     fn commit_allocation_ranges_inner(
         &self,
         ranges: &[AllocationCommitRange],
-        capacity: Option<&mut MappedPhysicalCapacityToken>,
+        mut capacity: Option<&mut MappedPhysicalCapacityToken>,
     ) -> Result<SpanCommit, MemoryError> {
         let mut arena = self.lock();
+        if let Some(capacity) = capacity.as_deref()
+            && let Some(owner) = arena.mapped_owner
+            && owner != capacity.owner_id()
+        {
+            return Err(invalid(
+                ranges.iter().map(|range| range.bytes).sum(),
+                "mapped capacity token belongs to a different allowance than this arena"
+                    .to_string(),
+            ));
+        }
         let mut by_allocation = BTreeMap::<usize, BTreeSet<usize>>::new();
         for range in ranges {
             let (offset, granules) = self.uncommitted_granules(
@@ -1150,7 +1163,7 @@ impl CudaVmmAllocator {
         }
         let references = batch_granule_references(&by_allocation);
         let union = references.keys().copied().collect::<Vec<_>>();
-        let (claimed, commit) = match capacity {
+        let (claimed, commit) = match capacity.as_deref_mut() {
             Some(capacity) => {
                 self.claim_granules_limited(&mut arena, union, u64::MAX, Some(capacity))?
             }
@@ -1167,6 +1180,9 @@ impl CudaVmmAllocator {
             if let Some(live) = arena.spans.live.get_mut(&offset) {
                 live.committed.extend(granules);
             }
+        }
+        if let Some(capacity) = capacity {
+            arena.mapped_owner.get_or_insert(capacity.owner_id());
         }
         Ok(commit)
     }
@@ -1267,6 +1283,16 @@ impl DeviceAllocator for CudaVmmAllocator {
         committed_ranges: &[std::ops::Range<usize>],
         capacity: &mut MappedPhysicalCapacityToken,
     ) -> Result<onnx_runtime_memory_governor::MappedAllocation<NonNull<u8>>, MemoryError> {
+        if capacity.role() != self.role {
+            return Err(invalid(
+                bytes,
+                format!(
+                    "mapped allocation role {:?} does not match arena zone {:?}",
+                    capacity.role(),
+                    self.role
+                ),
+            ));
+        }
         let ptr = self.allocate_committed(bytes, align, &[])?;
         let ranges = committed_ranges
             .iter()

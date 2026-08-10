@@ -623,12 +623,21 @@ pub struct MappedPhysicalCapacityToken {
     ledger: Arc<LeaseLedger>,
     tier: Tier,
     role: MemoryRole,
+    owner_id: usize,
     remaining: u64,
 }
 
 impl MappedPhysicalCapacityToken {
     pub fn remaining_bytes(&self) -> u64 {
         self.remaining
+    }
+
+    pub fn role(&self) -> MemoryRole {
+        self.role
+    }
+
+    pub fn owner_id(&self) -> usize {
+        self.owner_id
     }
 
     fn consume(&mut self, bytes: u64) -> Result<(), MemoryError> {
@@ -1117,6 +1126,7 @@ impl MappedGrowthAuthority {
                 ledger: Arc::clone(&self.inner.ledger),
                 tier: Tier::Device,
                 role: requester.role(),
+                owner_id: Arc::as_ptr(&requester.inner) as usize,
                 remaining: physical_reserved,
             },
             transferred_bytes: 0,

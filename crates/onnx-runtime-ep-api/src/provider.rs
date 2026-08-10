@@ -761,6 +761,9 @@ pub trait ExecutionProvider: Send + Sync {
         bytes: u64,
         role: onnx_runtime_memory_governor::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        // `role` describes content/lifetime. Providers whose allocator
+        // suballocates shared granules must canonicalize it to the arena's
+        // physical mapped-attribution zone.
         let _ = (bytes, role);
         Ok(None)
     }
@@ -771,6 +774,8 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+        // This must use the same canonical physical zone as
+        // `prepare_mapped_growth`; allocation lifetime is not map ownership.
         let _ = (bytes, role);
     }
 

@@ -290,6 +290,17 @@ weights — so that half of the reservation is released at adoption, and only th
 half nothing else accounts for is kept. Holding both charged the same memory
 twice and made the ledger refuse the arena.
 
+**Workspace lifetime is not physical mapping ownership.** Step-scoped and
+session-persistent workspace remain distinct content/lease categories, but
+allocations packed into one VMM arena use one `WorkspaceZone` mapped allowance.
+The zone charges global granule transitions `0→1` and refunds `1→0`, so the
+last surviving allocation may perform the refund regardless of which lifetime
+first mapped the granule. An arena rejects a grant from another mapped zone
+before physical allocation. The current native provider also suballocates KV
+from that arena, so KV and workspace content metrics remain distinct while
+their physical mapped attribution uses the same arena-zone allowance. Weight
+paging has separate storage and mapped attribution.
+
 ### 1.1 The lease contract, and who may replace it
 
 Memory management in onnx-genai is organized as a five-layer hierarchy. Each layer

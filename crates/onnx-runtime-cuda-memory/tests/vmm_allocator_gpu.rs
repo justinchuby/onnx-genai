@@ -123,7 +123,7 @@ fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
         .reserve_mapped_allowance(
             Tier::Device,
             granule,
-            MemoryRole::KvCache,
+            MemoryRole::Workspace { step_scoped: false },
             HolderId::new(22),
         )
         .expect("requester allowance");
@@ -155,6 +155,63 @@ fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
     assert_eq!(requester.unmap(unmapped), unmapped);
     assert_eq!(requester.mapped_bytes(), 0);
     assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mapped_allocation_rejects_a_different_arena_zone() {
+    let granule = 2_u64 << 20;
+    let (allocator, governor) = allocator(64 << 20, granule * 2);
+    let arena_zone = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::Workspace { step_scoped: false },
+            HolderId::new(26),
+        )
+        .expect("arena-zone allowance");
+    let mut first_grant = governor
+        .prepare_mapped_growth(&arena_zone, granule)
+        .expect("arena-zone grant");
+    let full = 0..4096;
+    let first = allocator
+        .allocate_committed_with_capacity(
+            4096,
+            256,
+            std::slice::from_ref(&full),
+            first_grant.physical_capacity(),
+        )
+        .expect("bind arena mapped owner");
+    first_grant
+        .commit_bytes(first.newly_mapped_bytes)
+        .expect("commit arena-zone mapping");
+
+    let wrong_zone = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::Workspace { step_scoped: false },
+            HolderId::new(27),
+        )
+        .expect("different-zone allowance");
+    let mut grant = governor
+        .prepare_mapped_growth(&wrong_zone, granule)
+        .expect("different-zone grant");
+    let error = allocator
+        .allocate_committed_with_capacity(
+            4096,
+            256,
+            std::slice::from_ref(&full),
+            grant.physical_capacity(),
+        )
+        .expect_err("one arena cannot accept a different mapped owner");
+    assert!(error.to_string().contains("different allowance"), "{error}");
+    assert_eq!(allocator.committed_and_reserved().0, granule as usize);
+    let unmapped = allocator.deallocate_span(first.allocation);
+    arena_zone.unmap(unmapped);
 }
 
 #[cfg_attr(
