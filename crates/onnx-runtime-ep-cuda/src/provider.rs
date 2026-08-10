@@ -66,6 +66,31 @@ fn auto_dynamic_lending_for(
     governor_present && policy.managed_no_spill && lending_enabled
 }
 
+#[derive(Debug)]
+enum VmmInitialization<T> {
+    Installed(T),
+    CompatibilityFallback(String),
+}
+
+fn resolve_vmm_initialization<T, E: std::fmt::Display>(
+    managed_no_spill: bool,
+    requested_limit: Option<u64>,
+    result: std::result::Result<T, E>,
+) -> Result<VmmInitialization<T>> {
+    match result {
+        Ok(arena) => Ok(VmmInitialization::Installed(arena)),
+        Err(error) if managed_no_spill => Err(EpError::KernelFailed(format!(
+            "managed no-spill CUDA initialization failed before model allocation for requested \
+             VRAM limit {}: could not build the required VMM arena and physical-handle pool: \
+             {error}",
+            requested_limit
+                .map(|bytes| format!("{bytes} bytes"))
+                .unwrap_or_else(|| "unknown".to_string())
+        ))),
+        Err(error) => Ok(VmmInitialization::CompatibilityFallback(error.to_string())),
+    }
+}
+
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
@@ -244,8 +269,12 @@ impl CudaExecutionProvider {
                             teardown_synchronizer,
                         ),
                     };
-                    match arena {
-                        Ok(arena) => {
+                    match resolve_vmm_initialization(
+                        auto_dynamic_lending,
+                        offload_policy.managed_limit_bytes,
+                        arena,
+                    )? {
+                        VmmInitialization::Installed(arena) => {
                             eprintln!(
                                 "cuda_ep: device allocations go through a VMM arena over \
                                  {RESERVATION_BYTES} bytes of reserved address space; physical \
@@ -263,11 +292,7 @@ impl CudaExecutionProvider {
                             );
                             let _ = cell.set(Arc::new(arena));
                         }
-                        // Falling back to cuMemAlloc keeps the model running,
-                        // which matters more than the accounting -- but say so,
-                        // because a silent fallback is how a feature reads as
-                        // enabled while doing nothing.
-                        Err(error) => eprintln!(
+                        VmmInitialization::CompatibilityFallback(error) => eprintln!(
                             "cuda_ep: WARNING: could not build the VMM arena, falling back to \
                              cuMemAlloc; device allocations will not be charged to the ledger: \
                              {error}"
@@ -1437,6 +1462,43 @@ mod tests {
         assert!(auto_dynamic_lending_for(true, &managed, true));
         assert!(!auto_dynamic_lending_for(true, &managed, false));
         assert!(!auto_dynamic_lending_for(false, &managed, true));
+    }
+
+    #[test]
+    fn managed_vmm_failure_is_fatal_before_allocator_fallback() {
+        let allocation_attempted = std::sync::atomic::AtomicBool::new(false);
+        let result = resolve_vmm_initialization::<(), _>(
+            true,
+            Some(6 << 30),
+            Err("injected VMM initialization failure"),
+        );
+        if matches!(result, Ok(VmmInitialization::CompatibilityFallback(_))) {
+            allocation_attempted.store(true, Ordering::Relaxed);
+        }
+        let error = result.expect_err("managed mode must not fall back");
+        assert!(!allocation_attempted.load(Ordering::Relaxed));
+        let message = error.to_string();
+        assert!(message.contains("6442450944 bytes"), "{message}");
+        assert!(
+            message.contains("injected VMM initialization failure"),
+            "{message}"
+        );
+        assert!(message.contains("before model allocation"), "{message}");
+    }
+
+    #[test]
+    fn compatibility_vmm_failure_keeps_fallback_available() {
+        let result = resolve_vmm_initialization::<(), _>(
+            false,
+            None,
+            Err("injected VMM initialization failure"),
+        )
+        .expect("compatibility mode permits fallback");
+        assert!(matches!(
+            result,
+            VmmInitialization::CompatibilityFallback(reason)
+                if reason == "injected VMM initialization failure"
+        ));
     }
 
     #[cfg_attr(

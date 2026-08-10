@@ -642,7 +642,9 @@ impl NativeDecodeSession {
             Ok(outputs) => outputs,
             Err(error) => {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA {error_context} forward pass failed{diagnosis}: {error}");
+                return Err(anyhow::Error::new(error).context(format!(
+                    "native CUDA {error_context} forward pass failed{diagnosis}"
+                )));
             }
         };
         let names = self
@@ -771,7 +773,9 @@ impl NativeDecodeSession {
                 let run_start = std::time::Instant::now();
                 if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                    bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                    return Err(error.context(format!(
+                        "native CUDA decode-inline forward pass failed{diagnosis}"
+                    )));
                 }
                 step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
                 let logits_start = std::time::Instant::now();
@@ -810,7 +814,9 @@ impl NativeDecodeSession {
             let run_start = std::time::Instant::now();
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decoder forward pass failed{diagnosis}"
+                )));
             }
             step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
             let logits_start = std::time::Instant::now();
@@ -910,7 +916,9 @@ impl NativeDecodeSession {
         let run_start = std::time::Instant::now();
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
         step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
         let logits_start = std::time::Instant::now();
@@ -1168,7 +1176,9 @@ impl NativeDecodeSession {
             // never round-trip to the host.
             if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decode-inline forward pass failed{diagnosis}"
+                )));
             }
             // Detection-before-consumption (Harry #588 PR-3 rec #1): the greedy
             // device-argmax read already returns the shared capture-error word;
@@ -1187,7 +1197,9 @@ impl NativeDecodeSession {
         }
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
         let (token_id, capture_error) = state.read_greedy_result()?;
         if capture_error != 0 {

@@ -842,7 +842,19 @@ impl CudaVmmAllocator {
             Err(error) => {
                 self.give_back_lease(arena, mapped_bytes);
                 self.release_granules(arena, &shared_claimed);
-                return Err(invalid(mapped_bytes, format!("cuMemMap: {error}")));
+                return Err(match &error {
+                    onnx_runtime_virtual_memory::VirtualMemoryError::Os {
+                        operation: "growing physical handle pool lease",
+                        ..
+                    } => MemoryError::CapacityUnavailable {
+                        tier: "device",
+                        requested: mapped_bytes as u64,
+                        available: 0,
+                        role: self.role,
+                        detail: format!("cuMemMap: {error}"),
+                    },
+                    _ => invalid(mapped_bytes, format!("cuMemMap: {error}")),
+                });
             }
         };
         for granule in newly_mapped {

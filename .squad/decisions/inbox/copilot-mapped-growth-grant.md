@@ -10,3 +10,7 @@
   `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` restores the non-VMM compatibility
   path. A 6 GiB qwen2.5-14b int4 live run loaded and generated correctly; its
   first physical KV growth transferred and attributed 201,326,592 bytes.
+- Managed VMM/pool construction failure is fatal before model allocation;
+  compatibility mode alone may fall back to ungoverned `cuMemAlloc`.
+- Insufficient reclaim is a typed capacity refusal and maps to HTTP 429 with
+  `Retry-After`, never an `InvalidRequest`/500.

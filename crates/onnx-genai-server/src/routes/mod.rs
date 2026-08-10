@@ -589,6 +589,26 @@ mod overload_tests {
         assert!(!body.to_string().contains("scheduler admission failed"));
     }
 
+    #[tokio::test]
+    async fn unreclaimable_mapped_capacity_is_a_pre_header_overload() {
+        let error: anyhow::Error = onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+            tier: "device",
+            requested: 4096,
+            available: 0,
+            role: onnx_runtime_memory_governor::MemoryRole::KvCache,
+            detail: "mapped holder could not reach its tentative reclaim target".into(),
+        }
+        .into();
+        let response = generation_failure(DriverFailure::from_engine_error(&error)).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+    }
+
     #[test]
     fn unrelated_generation_failure_remains_internal() {
         let error = generation_failure(DriverFailure {

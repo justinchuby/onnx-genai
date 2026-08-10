@@ -265,6 +265,19 @@ pub enum MemoryError {
         /// What the backing allocator said.
         reason: String,
     },
+    /// A well-formed capacity transfer or backing claim could not make enough
+    /// governed bytes available.
+    #[error(
+        "cannot make {requested} bytes of {tier} capacity available for {role:?}: only \
+         {available} bytes became available; {detail}"
+    )]
+    CapacityUnavailable {
+        tier: &'static str,
+        requested: u64,
+        available: u64,
+        role: MemoryRole,
+        detail: String,
+    },
 }
 
 /// Per-tier accounting shared by a governor and every lease it has granted.
@@ -1184,10 +1197,12 @@ impl MappedGrowthAuthority {
                 let _ = requester.subtract_limit_transferred(transfer);
                 let _ = victim.add_limit_transferred(transfer);
                 grant.rollback();
-                return Err(MemoryError::InvalidRequest {
+                return Err(MemoryError::CapacityUnavailable {
                     tier: Tier::Device.name(),
                     requested: reclaim_target,
-                    reason: "mapped holder could not reach its tentative reclaim target",
+                    available: report.reclaimed_bytes,
+                    role: requester.role(),
+                    detail: "mapped holder could not reach its tentative reclaim target".into(),
                 });
             }
             grant.transferred_bytes = grant.transferred_bytes.saturating_add(transfer);
@@ -2125,10 +2140,19 @@ mod tests {
             .register_reclaimable_mapped_holder(&holder)
             .expect("register victim");
 
-        assert!(
-            governor.prepare_mapped_growth(&requester, 20).is_err(),
-            "pinned victim must refuse the requester"
-        );
+        let error = match governor.prepare_mapped_growth(&requester, 20) {
+            Ok(_) => panic!("pinned victim must refuse the requester"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MemoryError::CapacityUnavailable {
+                requested: 20,
+                available: 0,
+                role: MemoryRole::KvCache,
+                ..
+            }
+        ));
         assert_eq!(victim.allowance.limit(), 80);
         assert_eq!(requester.limit(), 20);
         assert_eq!(requester.mapped_bytes(), 20);

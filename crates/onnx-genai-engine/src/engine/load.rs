@@ -1172,6 +1172,10 @@ fn resolve_cuda_offload_policy_from_env_policy(
     if env_policy.enabled {
         let mut policy = env_policy;
         policy.managed_no_spill = explicit_byte_limit;
+        policy.managed_limit_bytes = explicit_byte_limit.then_some(match limits.vram_limit {
+            ResourceLimit::Bytes(bytes) => bytes,
+            _ => unreachable!("explicit_byte_limit checked above"),
+        });
         return Some(CudaOffloadResolution {
             policy,
             device_budget_is_override: env_policy.device_budget_bytes.is_some(),
@@ -1186,6 +1190,7 @@ fn resolve_cuda_offload_policy_from_env_policy(
         return Some(CudaOffloadResolution {
             policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 managed_no_spill: true,
+                managed_limit_bytes: Some(resolved_vram_bytes),
                 ..env_policy
             },
             device_budget_is_override: false,
@@ -1200,6 +1205,7 @@ fn resolve_cuda_offload_policy_from_env_policy(
         policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
             enabled: true,
             managed_no_spill: true,
+            managed_limit_bytes: Some(resolved_vram_bytes),
             device_budget_bytes: Some(offload_device_budget_bytes),
             async_pagein: env_policy.async_pagein,
             scan_resistant_dense: env_policy.scan_resistant_dense,
@@ -2116,6 +2122,7 @@ mod pool_sizing_tests {
             onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 enabled: false,
                 managed_no_spill: false,
+                managed_limit_bytes: None,
                 device_budget_bytes: None,
                 async_pagein: true,
                 scan_resistant_dense: true,
@@ -2125,6 +2132,7 @@ mod pool_sizing_tests {
 
         assert!(policy.policy.enabled);
         assert!(policy.policy.managed_no_spill);
+        assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert_eq!(policy.policy.device_budget_bytes, Some(6_000));
         assert!(policy.policy.async_pagein);
         assert!(policy.auto_enabled_from_vram_limit);
@@ -2148,6 +2156,7 @@ mod pool_sizing_tests {
             onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 enabled: false,
                 managed_no_spill: false,
+                managed_limit_bytes: None,
                 device_budget_bytes: Some(4_000),
                 async_pagein: false,
                 scan_resistant_dense: true,
@@ -2156,6 +2165,7 @@ mod pool_sizing_tests {
         .expect("the explicit limit still triggers offload");
 
         assert_eq!(policy.policy.device_budget_bytes, Some(4_000));
+        assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert!(policy.device_budget_is_override);
     }
 
