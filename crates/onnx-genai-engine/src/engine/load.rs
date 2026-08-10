@@ -393,10 +393,7 @@ impl Engine {
         // the count from a memory budget would build hundreds of millions of
         // empty structs for storage that is never allocated.
         let native_kv_pages = BOOKKEEPING_POOL_PAGES;
-        if scheduler_config.bytes_per_token.is_none() {
-            scheduler_config.bytes_per_token =
-                required_bytes_per_token_from_kv_config(governor_kv_config)?;
-        }
+        populate_scheduler_bytes_per_token(&mut scheduler_config, governor_kv_config)?;
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
             build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
@@ -914,6 +911,22 @@ fn required_bytes_per_token_from_kv_config(
             kv_config.tokens_per_page
         )
     })
+}
+
+fn populate_scheduler_bytes_per_token(
+    scheduler: &mut onnx_genai_scheduler::SchedulerConfig,
+    kv_config: ModelKvConfig,
+) -> anyhow::Result<()> {
+    if scheduler.bytes_per_token.is_none() {
+        scheduler.bytes_per_token = match kv_config.bytes_per_token() {
+            Some(bytes_per_token) => Some(bytes_per_token),
+            None if kv_config.page_geometry_required => {
+                required_bytes_per_token_from_kv_config(kv_config)?
+            }
+            None => None,
+        };
+    }
+    Ok(())
 }
 
 fn load_draft_model(
@@ -2238,5 +2251,18 @@ mod pool_sizing_tests {
             cuda_weight_startup_reservation(10_000, Some(resolution), false, Some(256)),
             10_000
         );
+    }
+
+    #[test]
+    fn native_state_only_scheduler_does_not_require_kv_geometry() {
+        let mut scheduler = onnx_genai_scheduler::SchedulerConfig::default();
+        let kv_config =
+            governor_no_paged_kv_config(&EngineConfig::default()).expect("state-only KV config");
+
+        populate_scheduler_bytes_per_token(&mut scheduler, kv_config)
+            .expect("state-only native load keeps absent KV geometry valid");
+
+        assert!(!kv_config.page_geometry_required);
+        assert_eq!(scheduler.bytes_per_token, None);
     }
 }

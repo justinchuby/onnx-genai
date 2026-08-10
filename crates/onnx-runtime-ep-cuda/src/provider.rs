@@ -492,6 +492,22 @@ impl CudaExecutionProvider {
     pub fn offload_policy(&self) -> &DeviceOffloadPolicy {
         &self.offload_policy
     }
+
+    fn refund_canonical_mapped_zone(&self, unmapped: u64) {
+        if unmapped == 0 {
+            return;
+        }
+        if let Some(requester) = self
+            .mapped_requesters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&mapped_attribution_role(
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            ))
+        {
+            requester.unmap(unmapped);
+        }
+    }
 }
 
 impl ExecutionProvider for CudaExecutionProvider {
@@ -1006,7 +1022,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         buffer: &DeviceBuffer,
         offset: usize,
         bytes: usize,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         assert_eq!(
             buffer.device(),
             self.device,
@@ -1014,10 +1030,11 @@ impl ExecutionProvider for CudaExecutionProvider {
             buffer.device()
         );
         let Some(ptr) = std::ptr::NonNull::new(buffer.as_ptr().cast::<u8>() as *mut u8) else {
-            return Ok(());
+            return Ok(0);
         };
         self.synchronize_before_pooled_unmap()?;
-        self.memory()
+        let unmapped = self
+            .memory()
             .decommit_allocation_range(ptr, buffer.len(), buffer.alignment(), offset, bytes)
             .map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -1026,7 +1043,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                     buffer.len(),
                     self.device.index
                 ))
-            })
+            })?;
+        self.refund_canonical_mapped_zone(unmapped);
+        Ok(unmapped)
     }
 
     fn allocation_committed_bytes(&self, buffer: &DeviceBuffer) -> usize {
@@ -1065,17 +1084,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // from `self.memory` in `allocate`; `into_raw` consumed the owning
         // handle so no alias remains, and this is its single free.
         let unmapped = unsafe { self.memory().deallocate_with_unmapped(ptr, size, align) };
-        if unmapped > 0
-            && let Some(requester) = self
-                .mapped_requesters
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&mapped_attribution_role(
-                    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-                ))
-        {
-            requester.unmap(unmapped);
-        }
+        self.refund_canonical_mapped_zone(unmapped);
         self.ep_frees.fetch_add(1, Ordering::Relaxed);
         Ok(unmapped)
     }
@@ -1738,6 +1747,39 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
             provider.deallocate(ordinary).expect("ordinary cleanup");
             assert_eq!(requester.mapped_bytes(), 0);
         }
+
+        let granule = provider
+            .mapped_bytes_for_allocation(4096, 256)
+            .expect("allocation granule");
+        for _ in 0..3 {
+            let buffer = provider
+                .allocate((granule * 2) as usize, 256)
+                .expect("two-granule ordinary allocation");
+            assert_eq!(requester.mapped_bytes(), granule * 2);
+            assert_eq!(
+                provider
+                    .decommit_allocation_range(&buffer, granule as usize, granule as usize,)
+                    .expect("partial decommit"),
+                granule
+            );
+            assert_eq!(requester.mapped_bytes(), granule);
+            assert_eq!(provider.deallocate_with_unmapped(buffer).unwrap(), granule);
+            assert_eq!(requester.mapped_bytes(), 0);
+        }
+
+        let (governed, ordinary, requester) = allocate_pair();
+        let mapped = requester.mapped_bytes();
+        assert_eq!(
+            provider
+                .decommit_allocation_range(&governed, 0, 4096)
+                .expect("shared-range decommit"),
+            0,
+            "the ordinary neighbor retains the shared granule"
+        );
+        assert_eq!(requester.mapped_bytes(), mapped);
+        assert_eq!(provider.deallocate_with_unmapped(ordinary).unwrap(), mapped);
+        assert_eq!(requester.mapped_bytes(), 0);
+        assert_eq!(provider.deallocate_with_unmapped(governed).unwrap(), 0);
     }
 
     #[cfg_attr(

@@ -236,6 +236,7 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// The default is a no-op because eager allocators cannot partially unmap
     /// allocations. Lazy allocators may override this so callers can roll back
     /// a failed multi-buffer growth without leaving committed bytes charged.
+    /// Returns the physical bytes whose global mapping reference reached zero.
     fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -243,9 +244,9 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         align: usize,
         offset: usize,
         bytes: usize,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         let _ = (ptr, allocation_bytes, align, offset, bytes);
-        Ok(())
+        Ok(0)
     }
 
     /// Physical bytes currently claimed by this allocation.

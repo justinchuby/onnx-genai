@@ -1433,7 +1433,7 @@ impl DeviceAllocator for CudaVmmAllocator {
         _align: usize,
         byte_offset: usize,
         bytes: usize,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         let end = byte_offset.checked_add(bytes).ok_or_else(|| {
             invalid(
                 allocation_bytes,
@@ -1449,7 +1449,7 @@ impl DeviceAllocator for CudaVmmAllocator {
             ));
         }
         if bytes == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let mut arena = self.lock();
         let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
@@ -1487,13 +1487,13 @@ impl DeviceAllocator for CudaVmmAllocator {
                 start >= absolute_start && start < absolute_end
             })
             .collect::<BTreeSet<_>>();
-        self.release_committed_granules(&mut arena, &releasable);
+        let unmapped = self.release_granules_report(&mut arena, &releasable);
         if let Some(live) = arena.spans.live.get_mut(&offset) {
             for granule in releasable {
                 live.committed.remove(&granule);
             }
         }
-        Ok(())
+        Ok(unmapped)
     }
 
     fn allocation_committed_bytes(

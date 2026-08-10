@@ -409,9 +409,12 @@ fn decommit_range_rolls_back_late_commits_without_releasing_prefix() {
         .expect("late growth commit");
     assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
 
-    allocator
-        .decommit_allocation_range(pointer, len, 256, granularity, granularity)
-        .expect("rollback late growth commit");
+    assert_eq!(
+        allocator
+            .decommit_allocation_range(pointer, len, 256, granularity, granularity)
+            .expect("rollback late growth commit"),
+        granularity as u64
+    );
     assert_eq!(
         allocator.committed_and_reserved().0,
         granularity,
@@ -452,9 +455,12 @@ fn decommit_misaligned_growth_tail_releases_new_granules_only() {
         .expect("growth claims a second granule");
     assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
 
-    allocator
-        .decommit_allocation_range(pointer, len, 256, old_bytes, granularity)
-        .expect("rollback starts at a non-granule-aligned old bucket");
+    assert_eq!(
+        allocator
+            .decommit_allocation_range(pointer, len, 256, old_bytes, granularity)
+            .expect("rollback starts at a non-granule-aligned old bucket"),
+        granularity as u64
+    );
     assert_eq!(
         allocator.committed_and_reserved().0,
         granularity,

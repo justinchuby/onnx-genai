@@ -560,14 +560,15 @@ pub trait ExecutionProvider: Send + Sync {
     /// Release physical backing from a byte range in an existing allocation
     /// while preserving its virtual address. Eager providers keep the default
     /// no-op; lazy providers use this for transactional growth rollback.
+    /// Returns the bytes actually unmapped after shared references are applied.
     fn decommit_allocation_range(
         &self,
         buffer: &DeviceBuffer,
         offset: usize,
         bytes: usize,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _ = (buffer, offset, bytes);
-        Ok(())
+        Ok(0)
     }
 
     /// Physical bytes currently claimed by `buffer`. Eager providers return
