@@ -352,26 +352,12 @@ impl Engine {
             onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled(),
         );
         #[cfg(feature = "cuda")]
-        let weight_reservation_bytes = if governed_physical_pool {
-            // The production pool charges each physical handle to this same
-            // authority. A content-sized startup lease would double-charge
-            // weights and prevent the native session from creating even its
-            // initial workspace before the mapped weight allowance is derived.
-            0
-        } else {
-            device_weight_reservation_for(
-                model_weight_bytes,
-                cuda_offload_resolution.and_then(|resolution| {
-                    resolution.policy.enabled.then(|| {
-                        resolution
-                            .policy
-                            .device_budget_bytes
-                            .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
-                    })
-                }),
-                governor_kv_config.page_size_bytes,
-            )
-        };
+        let weight_reservation_bytes = cuda_weight_startup_reservation(
+            model_weight_bytes,
+            cuda_offload_resolution,
+            governed_physical_pool,
+            governor_kv_config.page_size_bytes,
+        );
         #[cfg(feature = "cuda")]
         tracing::info!(
             managed_no_spill = cuda_offload_resolution
@@ -1135,9 +1121,36 @@ fn uses_governed_physical_pool(
     configured_pool_enabled: bool,
 ) -> bool {
     resolution.is_some_and(|resolution| {
-        resolution.policy.enabled
-            && (configured_pool_enabled || (resolution.policy.managed_no_spill && lending_enabled))
+        (resolution.policy.enabled && configured_pool_enabled)
+            || (resolution.policy.managed_no_spill && lending_enabled)
     })
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn cuda_weight_startup_reservation(
+    model_weight_bytes: u64,
+    resolution: Option<CudaOffloadResolution>,
+    governed_physical_pool: bool,
+    kv_page_size_bytes: Option<u64>,
+) -> u64 {
+    if governed_physical_pool {
+        // The physical pool charges each handle to this authority, including
+        // resident weights when managed VMM does not need weight offload.
+        // Reserving package bytes here would charge the same weights twice.
+        return 0;
+    }
+    device_weight_reservation_for(
+        model_weight_bytes,
+        resolution.and_then(|resolution| {
+            resolution.policy.enabled.then(|| {
+                resolution
+                    .policy
+                    .device_budget_bytes
+                    .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+            })
+        }),
+        kv_page_size_bytes,
+    )
 }
 
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
@@ -2137,9 +2150,18 @@ mod pool_sizing_tests {
         assert!(policy.policy.async_pagein);
         assert!(policy.auto_enabled_from_vram_limit);
         assert!(uses_governed_physical_pool(Some(policy), true, false));
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), true, None),
+            0
+        );
         assert!(
             !uses_governed_physical_pool(Some(policy), false, false),
             "the lending opt-out must preserve the compatibility reservation path"
+        );
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), false, None),
+            6_000,
+            "the non-pool offload path keeps its existing device-budget reservation"
         );
     }
 
@@ -2184,5 +2206,37 @@ mod pool_sizing_tests {
         .expect("explicit byte limit selects managed allocation");
         assert!(!policy.policy.enabled);
         assert!(policy.policy.managed_no_spill);
+        assert!(
+            uses_governed_physical_pool(Some(policy), true, false),
+            "managed VMM owns physical weight handles even when offload is unnecessary"
+        );
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), true, Some(256)),
+            0,
+            "pool-owned resident weights must not also reserve package bytes"
+        );
+        assert!(
+            !uses_governed_physical_pool(Some(policy), false, false),
+            "lending opt-out keeps the resident package-reservation path"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resident_non_vmm_weights_keep_package_reservation() {
+        let resolution = CudaOffloadResolution {
+            policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                enabled: false,
+                managed_no_spill: false,
+                ..onnx_runtime_ep_cuda::DeviceOffloadPolicy::default()
+            },
+            device_budget_is_override: false,
+            auto_enabled_from_vram_limit: false,
+        };
+
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(resolution), false, Some(256)),
+            10_000
+        );
     }
 }

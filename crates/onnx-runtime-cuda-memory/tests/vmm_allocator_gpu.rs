@@ -20,8 +20,8 @@
 use cudarc::driver::CudaContext;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    Tier,
+    AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor,
+    MemoryGovernor, MemoryRole, Tier,
 };
 
 const HOLDER: HolderId = HolderId::new(21);
@@ -149,6 +149,90 @@ fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
     grant.commit_bytes(granule).expect("mapped attribution");
     assert_eq!(governor.used(Tier::Device), granule);
     unsafe { allocator.deallocate(pointer, 4096, 256) };
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn adjacent_shared_granule_consumes_mapped_growth_once() {
+    let granule = 2_u64 << 20;
+    let (allocator, governor) = allocator(64 << 20, granule);
+    let requester = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::KvCache,
+            HolderId::new(24),
+        )
+        .expect("requester allowance");
+    let first = allocator
+        .allocate_committed(4096, 256, &[])
+        .expect("first adjacent allocation");
+    let second = allocator
+        .allocate_committed(4096, 256, &[])
+        .expect("second adjacent allocation");
+
+    let first_range = AllocationCommitRange {
+        ptr: first,
+        allocation_bytes: 4096,
+        align: 256,
+        offset: 0,
+        bytes: 4096,
+    };
+    let mut first_grant = governor
+        .prepare_mapped_growth(&requester, granule)
+        .expect("first granule grant");
+    let first_mapped = allocator
+        .commit_allocation_ranges_with_capacity(
+            std::slice::from_ref(&first_range),
+            first_grant.physical_capacity(),
+        )
+        .expect("first mapping transaction");
+    assert_eq!(first_mapped, granule);
+    first_grant
+        .commit_bytes(first_mapped)
+        .expect("attribute first granule");
+
+    let second_range = AllocationCommitRange {
+        ptr: second,
+        allocation_bytes: 4096,
+        align: 256,
+        offset: 0,
+        bytes: 4096,
+    };
+    assert_eq!(
+        allocator
+            .mapped_bytes_for_allocation_ranges(std::slice::from_ref(&second_range))
+            .expect("size shared mapping"),
+        0,
+        "a globally mapped shared granule needs no additional allowance"
+    );
+    let mut second_grant = governor
+        .prepare_mapped_growth(&requester, 0)
+        .expect("zero-byte shared-granule grant");
+    let second_mapped = allocator
+        .commit_allocation_ranges_with_capacity(
+            std::slice::from_ref(&second_range),
+            second_grant.physical_capacity(),
+        )
+        .expect("shared mapping transaction");
+    assert_eq!(second_mapped, 0);
+    second_grant
+        .commit_bytes(second_mapped)
+        .expect("attribute no additional bytes");
+    assert_eq!(requester.mapped_bytes(), granule);
+
+    unsafe { allocator.deallocate(first, 4096, 256) };
+    assert_eq!(
+        allocator.committed_and_reserved().0,
+        granule as usize,
+        "the second reference retains the shared granule"
+    );
+    unsafe { allocator.deallocate(second, 4096, 256) };
+    assert_eq!(allocator.committed_and_reserved().0, 0);
     assert_eq!(governor.used(Tier::Device), 0);
 }
 

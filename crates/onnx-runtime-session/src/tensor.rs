@@ -594,7 +594,7 @@ impl DeviceIoBinding {
         &self,
         ranges: &[(&DeviceIoBinding, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let buffers = ranges
             .iter()
             .map(|&(binding, offset, bytes)| {
@@ -608,9 +608,9 @@ impl DeviceIoBinding {
                 )
             })
             .collect::<Vec<_>>();
-        self.allocator
-            .commit_allocation_ranges_with_mapped_growth(&buffers, grant)?;
-        Ok(())
+        Ok(self
+            .allocator
+            .commit_allocation_ranges_with_mapped_growth(&buffers, grant)?)
     }
 
     pub fn mapped_bytes_for_binding_ranges(

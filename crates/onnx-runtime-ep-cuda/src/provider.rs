@@ -897,7 +897,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         ranges: &[(&DeviceBuffer, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {

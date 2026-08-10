@@ -537,9 +537,10 @@ pub trait ExecutionProvider: Send + Sync {
         &self,
         ranges: &[(&DeviceBuffer, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _ = grant;
-        self.commit_allocation_ranges(ranges)
+        self.commit_allocation_ranges(ranges)?;
+        self.mapped_bytes_for_allocation_ranges(ranges)
     }
 
     fn mapped_bytes_for_allocation_ranges(

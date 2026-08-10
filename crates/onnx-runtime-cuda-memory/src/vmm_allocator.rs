@@ -794,16 +794,6 @@ impl CudaVmmAllocator {
             .map(|(claimed, _)| claimed)
     }
 
-    fn claim_granules_with_capacity(
-        &self,
-        arena: &mut Arena,
-        granules: impl IntoIterator<Item = usize>,
-        capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<BTreeSet<usize>, MemoryError> {
-        self.claim_granules_limited(arena, granules, u64::MAX, Some(capacity))
-            .map(|(claimed, _)| claimed)
-    }
-
     fn claim_granules_limited(
         &self,
         arena: &mut Arena,
@@ -1145,7 +1135,7 @@ impl CudaVmmAllocator {
         &self,
         ranges: &[AllocationCommitRange],
         capacity: Option<&mut MappedPhysicalCapacityToken>,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<SpanCommit, MemoryError> {
         let mut arena = self.lock();
         let mut by_allocation = BTreeMap::<usize, BTreeSet<usize>>::new();
         for range in ranges {
@@ -1160,9 +1150,11 @@ impl CudaVmmAllocator {
         }
         let references = batch_granule_references(&by_allocation);
         let union = references.keys().copied().collect::<Vec<_>>();
-        let claimed = match capacity {
-            Some(capacity) => self.claim_granules_with_capacity(&mut arena, union, capacity)?,
-            None => self.claim_granules(&mut arena, union)?,
+        let (claimed, commit) = match capacity {
+            Some(capacity) => {
+                self.claim_granules_limited(&mut arena, union, u64::MAX, Some(capacity))?
+            }
+            None => self.claim_granules_limited(&mut arena, union, u64::MAX, None)?,
         };
         for (&granule, &count) in &references {
             if count > 1 {
@@ -1176,7 +1168,7 @@ impl CudaVmmAllocator {
                 live.committed.extend(granules);
             }
         }
-        Ok(())
+        Ok(commit)
     }
 }
 
@@ -1362,14 +1354,16 @@ impl DeviceAllocator for CudaVmmAllocator {
         ranges: &[AllocationCommitRange],
     ) -> Result<(), MemoryError> {
         self.commit_allocation_ranges_inner(ranges, None)
+            .map(|_| ())
     }
 
     fn commit_allocation_ranges_with_capacity(
         &self,
         ranges: &[AllocationCommitRange],
         capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         self.commit_allocation_ranges_inner(ranges, Some(capacity))
+            .map(|commit| commit.newly_mapped_bytes)
     }
 
     fn mapped_bytes_for_allocation_ranges(
@@ -1386,7 +1380,11 @@ impl DeviceAllocator for CudaVmmAllocator {
                 range.offset,
                 range.bytes,
             )?;
-            identities.extend(granules);
+            identities.extend(
+                granules
+                    .into_iter()
+                    .filter(|&granule| arena.spans.granule_refs[granule] == 0),
+            );
         }
         Ok(identities.len().saturating_mul(arena.spans.granularity) as u64)
     }

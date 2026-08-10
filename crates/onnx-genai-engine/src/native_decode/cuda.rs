@@ -1392,7 +1392,8 @@ impl DecodeCudaState {
                 grant_prepared = grant.is_some(),
                 "prepared native CUDA KV mapped-growth transaction"
             );
-            self.commit_vmm_growth(new_capacity, grant.as_mut())
+            let actual_mapped_bytes = self
+                .commit_vmm_growth(new_capacity, grant.as_mut())
                 .map_err(|error| {
                     let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
                         .map_err(|error| error.to_string());
@@ -1400,7 +1401,7 @@ impl DecodeCudaState {
                 })?;
             if let Some(grant) = grant {
                 grant
-                    .commit_bytes(mapped_growth_bytes)
+                    .commit_bytes(actual_mapped_bytes)
                     .context("commit native CUDA KV mapped-growth attribution")?;
             }
             native_cuda_device_barrier(session)?;
@@ -1461,7 +1462,7 @@ impl DecodeCudaState {
         &mut self,
         new_capacity: usize,
         grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let requested = self.vmm_growth_requests(new_capacity)?;
         let ranges = requested
             .iter()
@@ -1471,7 +1472,10 @@ impl DecodeCudaState {
             Some(grant) => {
                 self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
             }
-            None => self.bindings[0].commit_binding_ranges(&ranges),
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
         }
         .context("commit native CUDA KV binding ranges atomically")
     }

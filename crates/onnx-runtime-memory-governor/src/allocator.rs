@@ -195,9 +195,10 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         &self,
         ranges: &[AllocationCommitRange],
         capacity: &mut MappedPhysicalCapacityToken,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         let _ = capacity;
-        self.commit_allocation_ranges(ranges)
+        self.commit_allocation_ranges(ranges)?;
+        self.mapped_bytes_for_allocation_ranges(ranges)
     }
 
     /// Mapped attribution bytes represented by a batched set of ranges.
