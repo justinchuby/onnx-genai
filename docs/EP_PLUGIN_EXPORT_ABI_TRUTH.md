@@ -247,3 +247,84 @@ For **fail-closed behavior** (Justin's requirement), we would need to add our ow
 2. **Export `ReleaseEpFactory`** (not `ReleaseEpApiFactory`). Required.
 3. **End-to-end tests ARE possible.** Use `OrtApi::RegisterExecutionProviderLibrary` → `GetEpDevices` → `SessionOptionsAppendExecutionProvider_V2`. Available since ORT 1.22.
 4. **`ort_version_supported`** is a forward-compat field, not a fail-closed gate. Add explicit version checking in `CreateEpFactories` if fail-closed is required.
+
+---
+
+## 6. Accurate Field Inventory — Verified from `bindings.rs` (Roy, 2026-08-10)
+
+Source: `target/debug/build/onnx-genai-ort-sys-3b504ed789bb5e57/out/bindings.rs`
+(generated from ORT 1.27.0 headers at build time).
+
+> **Important note:** `ValidateCompiledModelCompatibilityInfo` is a member of
+> `OrtEpFactory`, NOT `OrtEp`. `OrtEp` has `GetCompiledModelCompatibilityInfo`.
+> The bindings confirm this. Any doc that says otherwise is wrong.
+
+### `OrtEp` — 24 fields
+
+| # | Field | Optional? | Since version | v1 CPU EP |
+|---|-------|-----------|---------------|-----------|
+| 1 | `ort_version_supported: u32` | required | 1.22 | Set to `ORT_API_VERSION` (27) |
+| 2 | `GetName` | required | 1.22 | Implement |
+| 3 | `GetCapability` | required | 1.23 | Implement |
+| 4 | `Compile` | optional since 1.24 | 1.23 | Implement (no kernel registry) |
+| 5 | `ReleaseNodeComputeInfos` | optional since 1.24 | 1.23 | Implement |
+| 6 | `GetPreferredDataLayout` | optional | 1.23 | `None` |
+| 7 | `ShouldConvertDataLayoutForOp` | optional | 1.23 | `None` |
+| 8 | `SetDynamicOptions` | optional | 1.23 | `None` |
+| 9 | `OnRunStart` | optional | 1.23 | `None` |
+| 10 | `OnRunEnd` | optional | 1.23 | `None` |
+| 11 | `CreateAllocator` | optional | 1.23 | `None` (host malloc; ORT allocates) |
+| 12 | `CreateSyncStreamForDevice` | optional | 1.23 | `None` (CPU has no stream) |
+| 13 | `GetCompiledModelCompatibilityInfo` | required-if-Compile | 1.23 | `None` for v1 |
+| 14 | `GetKernelRegistry` | optional | 1.24 | `None` |
+| 15 | `IsConcurrentRunSupported` | optional | 1.24 | `None` |
+| 16 | `Sync` | optional | 1.25 | `None` |
+| 17 | `CreateProfiler` | optional | 1.25 | `None` ← **missing in ep.rs:34** |
+| 18 | `IsGraphCaptureEnabled` | optional | 1.26 | `None` ← **missing in ep.rs:34** |
+| 19 | `IsGraphCaptured` | required if #18 | 1.26 | `None` ← **missing in ep.rs:34** |
+| 20 | `ReplayGraph` | required if #18 | 1.26 | `None` ← **missing in ep.rs:34** |
+| 21 | `GetGraphCaptureNodeAssignmentPolicy` | optional | 1.26 | `None` ← **missing in ep.rs:34** |
+| 22 | `GetAvailableResource` | optional | 1.26 | `None` ← **missing in ep.rs:34** |
+| 23 | `OnSessionInitializationEnd` | optional | 1.27 | `None` ← **missing in ep.rs:34** |
+| 24 | `GetDefaultMemoryDevice` | optional | 1.27 | `None` ← **missing in ep.rs:34** |
+| 25 | `ReleaseCapturedGraph` | optional | 1.27 | `None` ← **missing in ep.rs:34** |
+
+> Fields 17–25 (9 fields, not 11 as reported in the compile error; the compile error
+> message rounds at 8 "and 8 other fields") are the ones causing the compile failure.
+> All are `Option<fn>` and must be set to `None`.
+
+### `OrtEpFactory` — 19 fields
+
+| # | Field | Optional? | Since | v1 CPU EP |
+|---|-------|-----------|-------|-----------|
+| 1 | `ort_version_supported: u32` | required | 1.22 | Set to `ORT_API_VERSION` (27) |
+| 2 | `GetName` | required | 1.22 | Implement |
+| 3 | `GetVendor` | required | 1.22 | Implement |
+| 4 | `GetSupportedDevices` | required | 1.22 | Implement |
+| 5 | `CreateEp` | required | 1.22 | Implement |
+| 6 | `ReleaseEp` | required | 1.22 | Implement |
+| 7 | `GetVendorId` | optional | 1.23 | `None` |
+| 8 | `GetVersion` | optional | 1.23 | `None` |
+| 9 | `ValidateCompiledModelCompatibilityInfo` | optional | 1.23 | `None` |
+| 10 | `CreateAllocator` | optional | 1.23 | `None` |
+| 11 | `ReleaseAllocator` | optional | 1.23 | `None` |
+| 12 | `CreateDataTransfer` | optional | 1.23 | `None` |
+| 13 | `IsStreamAware` | optional | 1.23 | `None` |
+| 14 | `CreateSyncStreamForDevice` | optional | 1.23 | `None` |
+| 15 | `GetHardwareDeviceIncompatibilityDetails` | optional | 1.24 | `None` |
+| 16 | `CreateExternalResourceImporterForDevice` | optional | 1.24 | `None` |
+| 17 | `GetNumCustomOpDomains` | optional | 1.24 | `None` |
+| 18 | `GetCustomOpDomains` | optional | 1.24 | `None` |
+| 19 | `InitGraphicsInterop` | optional | 1.25 | `None` |
+| 20 | `DeinitGraphicsInterop` | optional | 1.25 | `None` |
+
+### Current Compiler Blocker
+
+`crates/onnx-runtime-ep-plugin/src/ep.rs:34` initializes `ort::OrtEp { ... }` but
+omits fields 17–25 from the table above. Since Rust struct initialization with named
+fields requires all fields to be present, this is a compile error.
+
+**Fix:** Add each missing field as `fieldname: None` in the initializer, or use
+`ort::OrtEp { ..Default::default() }` if the bindings derive `Default`
+(check with `grep "derive.*Default" bindings.rs | grep OrtEp`). If no `Default`,
+explicitly set all 9 missing fields to `None`.

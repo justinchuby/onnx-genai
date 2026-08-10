@@ -20,6 +20,34 @@
 
 ## Recent work
 
+### 2026-08-10T21:15:32+0000 — EP provider readiness verification and doc consolidation
+
+**Mission:** Verify provider inventory, prove CUDA blocker, define ORT compatibility boundary, consolidate EP_PLUGIN_EXPORT docs, roadmap to full compatibility.
+
+**Findings (all evidence-backed):**
+
+- **Inventory re-verified:** 2 production EPs: `CpuExecutionProvider` (`provider.rs:118`, NEAR) and `CudaExecutionProvider` (`provider.rs:513`, BLOCKED). 2 inbound adapters (not candidates). 7 test/mock impls (excluded). Complete and correct.
+
+- **`../onnxruntime-mlx` contradiction resolved:** `ls /workspace/dev/` → only `onnx-genai` present. The MLX sibling repo does not exist in this workspace. `.squad/team.md` references an external repo not checked out here. No Metal EP in scope.
+
+- **CUDA blocker — dual:**
+  1. *Adapter compile error* (hardware-independent): `onnx-runtime-ep-plugin/src/ep.rs:34` initializes `OrtEp` struct missing 9 optional fields added in ORT 1.23–1.27. Affects both CPU and CUDA plugin. Mechanical fix for Nabil.
+  2. *Runtime hardware requirement* (CUDA-only): `nvidia-smi` absent, `nvcc` absent, `/usr/local/cuda*` absent, `/dev/nvidia*` absent. CUDA EP uses `cudarc` with `dynamic-loading`; builds cleanly (`cargo check -p onnx-runtime-ep-cuda` → `Finished in 10.02s`) but fails at runtime without `libcuda.so`. Additional design work needed: CUDA context/stream sharing, allocator callbacks, data transfer.
+
+- **CPU EP plugin compile error confirmed:** `cargo check -p onnx-runtime-ep-cpu-plugin` → `error[E0063]: missing fields CreateProfiler, GetAvailableResource, GetDefaultMemoryDevice and 8 other fields in initializer of OrtEp`. NOT a clean compile, contrary to the status claim in `EP_PLUGIN_EXPORT.md`.
+
+- **ORT compatibility boundary:** ORT 1.27.0 (`ORT_API_VERSION = 27`). `OrtEp` has 24 fields; `OrtEpFactory` has 19 fields. Required: `CreateEpFactories` + `ReleaseEpFactory`. Fail-closed version check required in `CreateEpFactories`. `ValidateCompiledModelCompatibilityInfo` is on `OrtEpFactory`; `GetCompiledModelCompatibilityInfo` is on `OrtEp` — bindings confirmed.
+
+**Docs changed:**
+- `docs/EP_PLUGIN_EXPORT.md`: Corrected stale "v1 implemented" status; replaced §6 with true compile state; replaced dependency order with accurate roadmap; added §8 roadmap.
+- `docs/EP_PLUGIN_EXPORT_ABI_TRUTH.md`: Added §6 with accurate `OrtEp` (24 fields) and `OrtEpFactory` (19 fields) field inventories from `bindings.rs`; identified 9 missing fields by name; added fix guidance.
+- `docs/EP_PLUGIN_EXPORT_INVENTORY.md`: Updated summary table with correct readiness; added §6 verification note.
+- `docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`: Added remediation status note (do not mark findings resolved; Holden re-audits at merge).
+
+**Decision record:** `.squad/decisions/inbox/roy-ep-provider-readiness.md`
+
+**Durable lesson:** Prior session reported adapter "implemented and tested" but the adapter crate does not compile. Build artifacts and `cargo check` are the only trustworthy status signals — not doc status fields or session summaries.
+
 ### 2026-08-10T20:12:35+0000 — EP plugin export architecture
 
 Produced `docs/EP_PLUGIN_EXPORT.md`: architecture for exporting nxrt EPs as ORT plugin dylibs. Key decisions: single shared adapter crate (`onnx-runtime-ep-plugin`) owns all unsafe FFI; per-EP thin `cdylib` shim crates are mechanical (`export_ep_factories!` macro). Reuses inbound `UnionFind`/`SubgraphClaim`/`OrtGraphView::query_capabilities`. New outbound code: `OutboundGraphReader` (reads ORT's `OrtGraph*`) and `OutboundKernelContext` (bridges `OrtKernelContext` ↔ `TensorView`). CPU EP is the v1 candidate (no device dependency). CUDA EP blocked on allocator/stream/transfer callback design. Decision record at `.squad/decisions/inbox/roy-ep-plugin-export.md`.

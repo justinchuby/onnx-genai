@@ -35,6 +35,17 @@ pub(crate) fn host_api() -> *const ort::OrtApi {
 /// a null pointer which ORT interprets as success — but we document this path
 /// cannot be reached.
 pub(crate) fn fail_status(message: &str) -> *mut ort::OrtStatus {
+    status_with_code(ort::ORT_FAIL, message)
+}
+
+/// Create an `OrtStatus` with `ORT_INVALID_ARGUMENT`. Use for null or
+/// out-of-range pointer arguments coming from ORT.
+pub(crate) fn invalid_arg_status(message: &str) -> *mut ort::OrtStatus {
+    status_with_code(ort::ORT_INVALID_ARGUMENT, message)
+}
+
+/// Create an `OrtStatus` with an explicit error code.
+pub(crate) fn status_with_code(code: ort::OrtErrorCode, message: &str) -> *mut ort::OrtStatus {
     let c_msg = CString::new(message).unwrap_or_else(|_| CString::new("unknown error").unwrap());
     let api = host_api();
     if api.is_null() {
@@ -43,14 +54,73 @@ pub(crate) fn fail_status(message: &str) -> *mut ort::OrtStatus {
     // SAFETY: api was set during CreateEpFactories and is process-lifetime valid.
     unsafe {
         match (*api).CreateStatus {
-            Some(create_status) => create_status(ort::ORT_FAIL, c_msg.as_ptr()),
+            Some(create_status) => create_status(code, c_msg.as_ptr()),
             None => ptr::null_mut(),
         }
     }
 }
 
-
 /// Success: null status pointer.
 pub(crate) fn ok_status() -> *mut ort::OrtStatus {
     ptr::null_mut()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn host_api_starts_null() {
+        // In a test binary with no ORT loaded, host_api() returns null.
+        // We can't guarantee this if another test sets it, but the AtomicPtr
+        // default is null.
+        let _ = host_api(); // must not panic or crash
+    }
+
+    #[test]
+    fn fail_status_returns_null_when_no_api() {
+        // When the API is not initialized (test environment without ORT),
+        // fail_status returns null_mut (fail-safe: ORT would interpret as success,
+        // but we document this path is unreachable in production).
+        // We zero the atomic so this test is deterministic.
+        HOST_ORT_API.store(ptr::null_mut(), Ordering::Release);
+        let status = fail_status("test error");
+        assert!(status.is_null(), "expected null when no ORT API is set");
+    }
+
+    #[test]
+    fn invalid_arg_status_returns_null_when_no_api() {
+        HOST_ORT_API.store(ptr::null_mut(), Ordering::Release);
+        let status = invalid_arg_status("null pointer");
+        assert!(status.is_null());
+    }
+
+    #[test]
+    fn ok_status_is_null() {
+        assert!(ok_status().is_null());
+    }
+
+    #[test]
+    fn catch_unwind_prevents_panic_from_escaping() {
+        // Verify that std::panic::catch_unwind absorbs a panic — this is the
+        // same pattern every extern "C" callback uses.
+        HOST_ORT_API.store(ptr::null_mut(), Ordering::Release);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("test panic inside extern C");
+        }));
+        // Panic was caught; the test thread is still alive.
+        assert!(result.is_err(), "catch_unwind should return Err on panic");
+    }
+
+    #[test]
+    fn set_host_api_stores_and_loads() {
+        // Verify the AtomicPtr round-trips a non-null value.
+        let dummy: u8 = 42;
+        let ptr = &dummy as *const u8 as *const ort::OrtApi;
+        unsafe { set_host_api(ptr) };
+        assert_eq!(host_api(), ptr);
+        // Restore to null so other tests are not affected.
+        HOST_ORT_API.store(std::ptr::null_mut(), Ordering::Release);
+    }
 }

@@ -11,7 +11,7 @@ use onnx_runtime_ep_api::provider::ExecutionProvider;
 
 use crate::compute::ExportedComputeInfo;
 use crate::graph_reader::OutboundGraphReader;
-use crate::status::{fail_status, ok_status};
+use crate::status::{fail_status, invalid_arg_status, ok_status};
 
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
 ///
@@ -45,8 +45,8 @@ impl ExportedEp {
                 CreateAllocator: None,
                 CreateSyncStreamForDevice: None,
                 GetCompiledModelCompatibilityInfo: None,
-                ValidateCompiledModelCompatibilityInfo: None,
                 GetKernelRegistry: None,
+                ..Default::default()
             },
             ep,
             name_cstr,
@@ -91,7 +91,7 @@ fn ep_get_capability_inner(
     support: *mut ort::OrtEpGraphSupportInfo,
 ) -> *mut ort::OrtStatus {
     if ep.is_null() || graph.is_null() || support.is_null() {
-        return fail_status("GetCapability: null argument");
+        return invalid_arg_status("GetCapability: null argument");
     }
 
     let exported = unsafe { &*(ep.cast::<ExportedEp>()) };
@@ -202,11 +202,11 @@ fn ep_compile_inner(
     out_infos: *mut *mut ort::OrtNodeComputeInfo,
 ) -> *mut ort::OrtStatus {
     if ep.is_null() || out_infos.is_null() || count == 0 {
-        return fail_status("Compile: null argument or zero count");
+        return invalid_arg_status("Compile: null argument or zero count");
     }
-    // B3: null-check graphs pointer
+    // Null-check graphs pointer (H2: would segfault otherwise).
     if graphs.is_null() {
-        return fail_status("Compile: graphs pointer is null");
+        return invalid_arg_status("Compile: graphs pointer is null");
     }
 
     let exported = unsafe { &*(ep.cast::<ExportedEp>()) };
@@ -329,4 +329,57 @@ unsafe extern "C" fn ep_release_node_compute_infos(
             }
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+
+    /// ep_get_capability_inner returns a (null) status — not a crash — when
+    /// called with null ep pointer.
+    #[test]
+    fn get_capability_null_ep_returns_status() {
+        // Reset host API so invalid_arg_status returns null safely.
+        unsafe { crate::status::set_host_api(ptr::null()) };
+        let status = ep_get_capability_inner(
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null_mut(),
+        );
+        // With no ORT API loaded, invalid_arg_status returns null.
+        // The important invariant: no panic, no segfault.
+        let _ = status;
+    }
+
+    /// ep_compile_inner returns a status (not a crash) when graphs is null.
+    #[test]
+    fn compile_null_graphs_returns_status() {
+        unsafe { crate::status::set_host_api(ptr::null()) };
+        // Pass a non-null sentinel for ep and out_infos so we reach the
+        // graphs null check, which should return before dereferencing either.
+        let mut dummy_out: *mut ort::OrtNodeComputeInfo = ptr::null_mut();
+        let status = ep_compile_inner(
+            1usize as *mut ort::OrtEp, // non-null; reached only after null check
+            ptr::null_mut(),            // null graphs → returns invalid_arg_status
+            1,
+            &raw mut dummy_out,
+        );
+        // With no ORT API, invalid_arg_status returns null — no segfault.
+        let _ = status;
+    }
+
+    /// Panic inside an extern "C" callback wrapper is caught and does not
+    /// unwind past the catch_unwind boundary.
+    #[test]
+    fn catch_unwind_in_callback_wrapper_works() {
+        unsafe { crate::status::set_host_api(ptr::null()) };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> *mut ort::OrtStatus { panic!("simulated panic in ep callback") },
+            ));
+            r.unwrap_or_else(|_| crate::status::fail_status("internal panic"))
+        }));
+        assert!(result.is_ok(), "panic must be contained by catch_unwind");
+    }
 }

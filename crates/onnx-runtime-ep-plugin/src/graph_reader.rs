@@ -21,11 +21,11 @@ pub struct OutboundGraphReader {
     ort_node_ptrs: Vec<*const ort::OrtNode>,
 }
 
-// SAFETY: OutboundGraphReader is only used within the scope of a single
-// GetCapability/Compile callback. The ORT node pointers are valid for that
-// duration and are not shared across threads.
-unsafe impl Send for OutboundGraphReader {}
-unsafe impl Sync for OutboundGraphReader {}
+// OutboundGraphReader intentionally does NOT implement Send or Sync.
+// The raw OrtNode pointers it holds are only valid within the ORT callback
+// frame in which the reader was constructed. Granting Send/Sync would allow
+// the reader (and its dangling pointers) to escape to other threads.
+// Use it stack-locally inside a single GetCapability/Compile callback only.
 
 impl OutboundGraphReader {
     /// Read an `OrtGraph*` and produce an IR `Graph`.
@@ -37,7 +37,7 @@ impl OutboundGraphReader {
     pub unsafe fn from_ort_graph(
         graph_ptr: *const ort::OrtGraph,
     ) -> Result<Self, String> {
-        let api = unsafe { crate::status::host_api() };
+        let api = crate::status::host_api();
         if api.is_null() {
             return Err("host ORT API not initialized".into());
         }
@@ -492,19 +492,35 @@ impl OutboundGraphReader {
         Ok((name, dtype, shape))
     }
 
-    /// Check an OrtStatus and convert to Result.
+    /// Check an OrtStatus and convert to Result, extracting the error message.
     fn check(status: *mut ort::OrtStatus) -> Result<(), String> {
         if status.is_null() {
             return Ok(());
         }
-        // Try to extract the error message.
-        let api = unsafe { crate::status::host_api() };
-        if !api.is_null() {
-            // Release the status after extracting message.
+        // Extract the real error message before releasing.
+        let api = crate::status::host_api();
+        let message = if !api.is_null() {
+            // SAFETY: api is valid (set during CreateEpFactories).
+            let msg_ptr = unsafe {
+                (*api).GetErrorMessage.map(|f| f(status))
+            };
+            let msg = msg_ptr
+                .filter(|&p| !p.is_null())
+                .map(|p| {
+                    // SAFETY: ORT guarantees a null-terminated string.
+                    unsafe { std::ffi::CStr::from_ptr(p) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| "ORT API call failed".into());
+            // Release the status only after we've copied the message.
             if let Some(release) = unsafe { (*api).ReleaseStatus } {
                 unsafe { release(status) };
             }
-        }
-        Err("ORT API call failed".into())
+            msg
+        } else {
+            "ORT API call failed (host API not available)".into()
+        };
+        Err(message)
     }
 }

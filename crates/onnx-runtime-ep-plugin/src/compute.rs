@@ -132,7 +132,7 @@ unsafe extern "C" fn compute_execute(
     }
 
     // Get the host OrtApi for kernel context operations.
-    let api = unsafe { crate::status::host_api() };
+    let api = crate::status::host_api();
     if api.is_null() {
         return fail_status("Compute: host ORT API not available");
     }
@@ -239,5 +239,133 @@ unsafe extern "C" fn compute_release_state(
 ) {
     if !state.is_null() {
         unsafe { drop(Box::from_raw(state.cast::<ComputeState>())) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
+    use onnx_runtime_ir::DeviceId;
+
+    fn make_view<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(std::ptr::null()),
+            DataType::Float32,
+            shape,
+            strides,
+            DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn shape_inference_for_op_elementwise() {
+        assert!(matches!(
+            ShapeInference::for_op("Add"),
+            ShapeInference::ElementwiseBroadcast
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Mul"),
+            ShapeInference::ElementwiseBroadcast
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Where"),
+            ShapeInference::ElementwiseBroadcast
+        ));
+    }
+
+    #[test]
+    fn shape_inference_for_op_unary() {
+        assert!(matches!(
+            ShapeInference::for_op("Relu"),
+            ShapeInference::SameAsInput(0)
+        ));
+        assert!(matches!(
+            ShapeInference::for_op("Cast"),
+            ShapeInference::SameAsInput(0)
+        ));
+    }
+
+    #[test]
+    fn shape_inference_for_op_unknown_defaults() {
+        assert!(matches!(
+            ShapeInference::for_op("SomeUnknownOp"),
+            ShapeInference::SameAsInput(0)
+        ));
+    }
+
+    #[test]
+    fn infer_shapes_same_as_input() {
+        let shape = vec![2usize, 3];
+        let strides = vec![3i64, 1];
+        let view = make_view(&shape, &strides);
+        let result = infer_shapes(&ShapeInference::SameAsInput(0), &[view]).unwrap();
+        assert_eq!(result, vec![vec![2, 3]]);
+    }
+
+    #[test]
+    fn infer_shapes_same_as_input_out_of_bounds() {
+        let shape = vec![4usize];
+        let strides = vec![1i64];
+        let view = make_view(&shape, &strides);
+        let result = infer_shapes(&ShapeInference::SameAsInput(5), &[view]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn infer_shapes_broadcast() {
+        let s1 = vec![3usize, 1];
+        let st1 = vec![1i64, 1];
+        let s2 = vec![1usize, 4];
+        let st2 = vec![4i64, 1];
+        let v1 = make_view(&s1, &st1);
+        let v2 = make_view(&s2, &st2);
+        let result =
+            infer_shapes(&ShapeInference::ElementwiseBroadcast, &[v1, v2]).unwrap();
+        assert_eq!(result, vec![vec![3, 4]]);
+    }
+
+    #[test]
+    fn infer_shapes_broadcast_empty_inputs() {
+        let result =
+            infer_shapes(&ShapeInference::ElementwiseBroadcast, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_and_release_state_lifecycle() {
+        // Test that state can be created and released without panic/leak.
+        let mut state_ptr: *mut c_void = std::ptr::null_mut();
+        let status = unsafe {
+            compute_create_state(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut state_ptr,
+            )
+        };
+        // ok_status returns null.
+        assert!(status.is_null());
+        assert!(!state_ptr.is_null());
+
+        // Release it.
+        unsafe {
+            compute_release_state(std::ptr::null_mut(), state_ptr);
+        }
+    }
+
+    #[test]
+    fn create_state_null_out_does_not_panic() {
+        // Without a live ORT API, fail_status returns null (no API to create
+        // OrtStatus). We just verify no panic/UB occurs.
+        let status = unsafe {
+            compute_create_state(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        // In test environment (no ORT API), fail_status returns null.
+        // The important thing is no crash/UB.
+        let _ = status;
     }
 }

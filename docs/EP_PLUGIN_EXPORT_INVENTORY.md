@@ -159,9 +159,30 @@ Evidence:
 
 | EP | Crate | `impl EP`? | `todo!`/stubs | Op registrations | Memory model | Build deps | ORT export readiness |
 |---|---|---|---|---|---|---|---|
-| **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | **NEAR** — adapter not yet wired |
-| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6, cuBLAS, cuDNN | **BLOCKED** — hardware dep + stub + buffer ABI complexity |
+| **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | **NEAR** — adapter exists but has compile error (9 missing `OrtEp` fields in `ep.rs:34`) |
+| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | **BLOCKED** — adapter compile error + runtime hardware required + buffer/stream/context ABI complexity |
 | LegacyOrtEp | `onnx-runtime-ep-api` | Yes (inbound only) | — | — | Inbound adapter | — | Not a candidate |
 | PluginExecutionProvider | `onnx-runtime-session` | Yes (inbound bridge) | — | — | Inbound bridge | — | Not a candidate |
 | onnx-runtime-eager | `onnx-runtime-eager` | No (orchestrator) | — | — | — | — | Not a candidate |
 | mlas-sys | `mlas-sys` | No (BLAS lib) | — | — | — | — | Not a candidate |
+
+---
+
+## 6. Roy Verification Note (2026-08-10)
+
+Re-ran `grep -rn "impl ExecutionProvider" crates/` independently. Results match Deckard's
+inventory exactly: 2 production EPs (CPU + CUDA), 2 inbound adapters, 7 test/mock
+implementations (excluded). Inventory is complete and correct.
+
+**`../onnxruntime-mlx`:** `ls /workspace/dev/` confirms only `onnx-genai` exists on this machine.
+The sibling repo described in `.squad/team.md` is **not checked out here**. No Metal/MPS EP
+is in scope for this workspace. Deckard's exclusion is correct.
+
+**Adapter state update:** Since Deckard's inventory was written, `onnx-runtime-ep-plugin` and
+`onnx-runtime-ep-cpu-plugin` crates have been created by Nabil. However, the adapter has a
+compile error (`OrtEp` struct initializer missing 9 optional fields). The `as_ort_plugin()`
+trait-method path described in Q4 is now superseded by the dedicated adapter crate architecture;
+the trait method is no longer the outbound export mechanism.
+
+**CUDA build note:** The CUDA EP builds cleanly via `cargo check` on this no-CUDA host because
+`cudarc` uses `dynamic-loading` feature (dlopen at runtime, not linked at build time).

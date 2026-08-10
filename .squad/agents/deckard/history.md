@@ -66,3 +66,12 @@ Full pre-compaction history in `history-archive.md`.
 
 - Authored mobius PR #449, adding `bias` as the 4th formal to the `PackedMultiHeadAttention` fallback while keeping it inert in the body.
 - Added positional/admissibility tests covering full input order, bias at index 3, and 6-input calls; ruff clean, 3/3 new tests passed, and 30/30 `ep_optimization_test` regression passed. Awaiting Justin merge.
+
+## 2026-08-10T21:09:00+0000 — EP Plugin Compute Path Implementation
+
+- Implemented real `Compute` callback in `compute.rs`: reads inputs from OrtKernelContext, infers output shapes (broadcast or same-as-input), allocates ORT outputs, executes kernels in topological order.
+- Fixed `unused_unsafe` warning at compute.rs:135.
+- `kernel_ctx.rs`: complete OrtKernelContext ↔ TensorView bridge with dtype mapping, shape marshaling, null-pointer guards.
+- Added 14 unit tests across both files (shape inference, dtype mapping, state lifecycle, view roundtrips). All pass.
+- `cargo check` clean for my files; clippy clean for my files (crate-level clippy blocked by graph_reader.rs warnings in Nabil's files).
+- No `todo!()`, no placeholders, no `ORT_NOT_IMPLEMENTED` — Compute is real.

@@ -226,3 +226,73 @@ pub(crate) unsafe fn allocate_output(
         strides,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ir::DataType;
+
+    #[test]
+    fn owned_input_view_roundtrip() {
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let input = OwnedInput {
+            data_ptr: data.as_ptr().cast(),
+            dtype: DataType::Float32,
+            shape: vec![2, 2],
+            strides: vec![2, 1],
+        };
+        let view = input.view();
+        assert_eq!(view.shape, &[2, 2]);
+        assert_eq!(view.dtype, DataType::Float32);
+    }
+
+    #[test]
+    fn owned_output_view_mut_roundtrip() {
+        let mut data: [f32; 6] = [0.0; 6];
+        let mut output = OwnedOutput {
+            data_ptr: data.as_mut_ptr().cast(),
+            dtype: DataType::Float32,
+            shape: vec![2, 3],
+            strides: vec![3, 1],
+        };
+        let view = output.view_mut();
+        assert_eq!(view.shape, &[2, 3]);
+        assert_eq!(view.dtype, DataType::Float32);
+    }
+
+    #[test]
+    fn owned_input_null_data_for_optional() {
+        let input = OwnedInput {
+            data_ptr: std::ptr::null(),
+            dtype: DataType::Float32,
+            shape: vec![],
+            strides: vec![],
+        };
+        let view = input.view();
+        assert_eq!(view.shape, &[] as &[usize]);
+    }
+
+    #[test]
+    fn dtype_mapping_supported_types() {
+        // Verify round-trip for common types used by CPU EP.
+        let cases = [
+            (1, DataType::Float32),
+            (7, DataType::Int64),
+            (11, DataType::Float64),
+            (6, DataType::Int32),
+        ];
+        for (onnx_val, expected) in cases {
+            let dt = DataType::from_onnx(onnx_val).unwrap();
+            assert_eq!(dt, expected, "from_onnx({onnx_val}) mismatch");
+            assert_eq!(dt.to_onnx(), onnx_val, "to_onnx round-trip for {expected:?}");
+        }
+    }
+
+    #[test]
+    fn dtype_mapping_unsupported_returns_none() {
+        // 0 is UNDEFINED in ORT, should return None.
+        assert!(DataType::from_onnx(0).is_none());
+        // Extremely large value should also be None.
+        assert!(DataType::from_onnx(9999).is_none());
+    }
+}

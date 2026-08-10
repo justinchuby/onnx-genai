@@ -5,6 +5,11 @@
 **Scope:** `crates/onnx-runtime-ep-plugin/src/{factory,ep,graph_reader,compute,kernel_ctx,status,lib}.rs`
 **Status:** `compute.rs` and `kernel_ctx.rs` are in-flux (Nabil actively editing); findings on those are preliminary and must be re-checked at merge.
 
+> **Roy note (2026-08-10):** All findings in this audit are being actively remediated
+> on branch `squad/ep-plugin-export` by Nabil (FFI hardening), Deckard (compute path),
+> and Pris (conformance tests). **Do not mark any finding resolved here** — Holden re-audits
+> at merge. Status: **being remediated on squad/ep-plugin-export**.
+
 ---
 
 ## Summary
