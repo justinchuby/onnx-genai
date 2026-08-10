@@ -1875,6 +1875,10 @@ backend, is actively maintained, and covers **CUDA 11.4 → 13.3** (feature-flag
   entry point isn't yet wrapped.
 - **Dynamic linking by default** (no build-time CUDA toolkit required to `cargo build` the crate
   metadata); static linking supported.
+- **Selectable CUDA binding version:** enable exactly one of `cuda-12060`, `cuda-12080`,
+  `cuda-12090`, or `cuda-13000`. Workspace defaults select `cuda-13000`; consumers targeting
+  CUDA 12.x should build with `--no-default-features --features "cuda cuda-12080"` (or the
+  desired 12.x selector) so only one `cudarc` binding set is active.
 
 This replaces any bespoke driver FFI: the EP does **not** hand-roll `cuMemAlloc`/`cuLaunchKernel`
 bindings — it consumes `cudarc` and reserves hand-written FFI strictly for our own `extern "C"`
@@ -2013,7 +2017,7 @@ fused elementwise variants still go to a `.cu`/CuTe kernel.
 ```
 onnx-runtime-ep-cuda/
 ├── build.rs                  # nvcc: native-eps/cuda/*.cu → libcuda_kernels.a
-├── Cargo.toml                # cudarc = { features = ["cuda-12090","cublas","cublaslt","cudnn","nccl"] }
+├── Cargo.toml                # cudarc non-version features + one cuda-* selector (default cuda-13000)
 └── src/
     ├── provider.rs           # CudaExecutionProvider (cudarc::driver device/context)
     ├── allocator.rs          # device allocator (cudarc)
