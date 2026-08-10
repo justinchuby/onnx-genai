@@ -5,8 +5,8 @@ use crate::decode::{
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
-    Engine, EngineConfig, EngineResourceGovernor, component_governor,
-    model_requires_native_backend, requested_decode_backend,
+    Engine, EngineConfig, EngineResourceGovernor, component_governor, infer_memory_strategy_plan,
+    log_memory_strategy_plan, model_requires_native_backend, requested_decode_backend,
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
@@ -14,6 +14,8 @@ use crate::kv_bridge::{
 };
 use crate::logits::TokenId;
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
+use crate::{MemoryStrategyPlan, WeightAccessPattern};
+use onnx_genai_scheduler::ModelKvConfig;
 
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
@@ -228,6 +230,7 @@ pub struct PipelineEngine {
     /// available. Both governors delegate device accounting to the same
     /// authority; this one owns only the KV plan.
     _kv_governor: Option<EngineResourceGovernor>,
+    memory_strategy_plan: MemoryStrategyPlan,
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
@@ -863,6 +866,7 @@ impl PipelineEngine {
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
         let mut paged: Option<PipelinePagedKv> = None;
         let mut kv_governor = None;
+        let mut memory_strategy_kv_config = None;
         let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
@@ -884,6 +888,7 @@ impl PipelineEngine {
                     Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
                     None => crate::engine::governor_no_paged_kv_config(&config)?,
                 };
+                memory_strategy_kv_config = Some(kv_config);
                 let component_governor = EngineResourceGovernor::new_for_shared_pipeline_kv(
                     config.limits.clone(),
                     config.allow_runtime_override,
@@ -974,10 +979,27 @@ impl PipelineEngine {
                 0,
             ),
         };
+        let memory_strategy_plan = infer_memory_strategy_plan(
+            &config,
+            resource_governor.snapshot().resolved_limits.vram_bytes,
+            model_weights_bytes,
+            memory_strategy_kv_config.unwrap_or_else(|| {
+                ModelKvConfig::unknown(u64::try_from(config.page_size).unwrap_or(0))
+            }),
+            match &plan {
+                PipelinePlan::Autoregressive(_) => WeightAccessPattern::SequentialDense,
+                PipelinePlan::Iterative(_) => WeightAccessPattern::Iterative,
+                _ => WeightAccessPattern::Unknown,
+            },
+            Vec::new(),
+            None,
+        );
+        log_memory_strategy_plan(&memory_strategy_plan);
         Ok(Self {
             models,
             resource_governor,
             _kv_governor: kv_governor,
+            memory_strategy_plan,
             plan,
             decode_backend: match backend {
                 PipelineBackend::Ort => EngineDecodeBackend::Ort,
@@ -1014,6 +1036,10 @@ impl PipelineEngine {
         {
             self.resource_governor.snapshot()
         }
+    }
+
+    pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
+        &self.memory_strategy_plan
     }
 
     pub fn models(&self) -> &PipelineModels {

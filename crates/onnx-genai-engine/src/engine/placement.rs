@@ -54,6 +54,24 @@ pub(crate) fn plan_static_weight_placement(
     Ok(Some(plan.into()))
 }
 
+pub(crate) fn qmoe_layer_weight_bytes(
+    session: &InferenceSession,
+) -> anyhow::Result<Vec<LayerWeightBytes>> {
+    qmoe_layers(session.graph()).map(|layers| {
+        layers
+            .into_iter()
+            .map(|layer| LayerWeightBytes {
+                layer_index: layer.layer_index,
+                bytes: layer
+                    .regions
+                    .iter()
+                    .map(|region| region.mapped_bytes() as u64)
+                    .sum(),
+            })
+            .collect()
+    })
+}
+
 #[derive(Debug)]
 struct OwnedLayerWeightRegions {
     layer_index: usize,

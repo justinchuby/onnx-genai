@@ -639,6 +639,102 @@ pub struct WeightPlacementReport {
     pub explanation: String,
 }
 
+/// Load-time memory strategy selected from graph/model evidence and overrides.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryStrategyPlan {
+    pub strategy: MemoryStrategy,
+    pub weight_access_pattern: WeightAccessPattern,
+    pub total_weight_bytes: u64,
+    pub kv_bytes_per_token: Option<u64>,
+    pub per_layer_weight_bytes: Vec<LayerWeightBytes>,
+    pub fits_resolved_device_budget: Option<bool>,
+    pub decisions: Vec<MemoryStrategyDecision>,
+}
+
+impl MemoryStrategyPlan {
+    pub fn unknown(
+        total_weight_bytes: u64,
+        kv_bytes_per_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            strategy: MemoryStrategy::Unknown,
+            weight_access_pattern: WeightAccessPattern::Unknown,
+            total_weight_bytes,
+            kv_bytes_per_token,
+            per_layer_weight_bytes: Vec::new(),
+            fits_resolved_device_budget: None,
+            decisions: vec![MemoryStrategyDecision::new(
+                "strategy",
+                "Unknown",
+                DecisionSource::Inference,
+                reason,
+                format!(
+                    "total_weight_bytes={total_weight_bytes} kv_bytes_per_token={kv_bytes_per_token:?}"
+                ),
+            )],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum MemoryStrategy {
+    Compatibility,
+    FullResident,
+    DynamicWeightResidency,
+    MoeRoutingAware,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum WeightAccessPattern {
+    SequentialDense,
+    MoeRouted,
+    Iterative,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LayerWeightBytes {
+    pub layer_index: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryStrategyDecision {
+    pub field: &'static str,
+    pub value: String,
+    pub source: DecisionSource,
+    pub reason: String,
+    pub evidence: String,
+}
+
+impl MemoryStrategyDecision {
+    pub fn new(
+        field: &'static str,
+        value: impl Into<String>,
+        source: DecisionSource,
+        reason: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            field,
+            value: value.into(),
+            source,
+            reason: reason.into(),
+            evidence: evidence.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DecisionSource {
+    Inference,
+    ExplicitOverride,
+    CompatibilityDefault,
+    Unknown,
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {

@@ -15,8 +15,8 @@ use onnx_genai::{
 use onnx_genai_engine::{
     ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
     DeviceMemoryAuthority, EmbeddingOptions, EngineGovernorError, FimConfig, GovernorSnapshot,
-    KvNotApplicable, KvTelemetry, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
-    SchedulerAdmissionError,
+    KvNotApplicable, KvTelemetry, MemoryStrategyPlan, PipelineEngine, PipelineGenerateRequest,
+    ResourceLimit, SchedulerAdmissionError,
 };
 use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -39,6 +39,7 @@ pub(crate) struct EngineDriver {
     pub(crate) kv_telemetry: Arc<KvTelemetry>,
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
     pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    pub(crate) memory_strategy_plan: Arc<MemoryStrategyPlan>,
     pub(crate) device_authority: Option<DeviceMemoryAuthority>,
 }
 
@@ -216,6 +217,7 @@ impl EngineDriver {
         } else {
             kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
         }
+        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
             EngineBackend::Single(engine) => engine.resource_snapshot(),
@@ -241,6 +243,7 @@ impl EngineDriver {
             generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
             kv_telemetry,
             resource_snapshot,
+            memory_strategy_plan,
             device_authority,
         }
     }
@@ -250,6 +253,7 @@ impl EngineDriver {
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
         let device_authority = Some(engine.device_authority());
+        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
         let resource_snapshot = Arc::new(Mutex::new(Some(match &owner.0 {
             EngineBackend::Pipeline(engine) => engine.resource_snapshot(),
@@ -281,6 +285,7 @@ impl EngineDriver {
             generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
             kv_telemetry,
             resource_snapshot,
+            memory_strategy_plan,
             device_authority,
         }
     }
@@ -575,6 +580,10 @@ impl EngineDriver {
             snapshot.resolved_limits.vram_bytes = limit;
         }
         Ok(snapshot)
+    }
+
+    pub(crate) fn memory_strategy_plan(&self) -> Arc<MemoryStrategyPlan> {
+        Arc::clone(&self.memory_strategy_plan)
     }
 
     pub(crate) async fn set_vram_limit(
@@ -1644,6 +1653,7 @@ mod admission_tests {
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
+            memory_strategy_plan: Arc::new(engine.memory_strategy_plan().clone()),
             device_authority: None,
         };
 

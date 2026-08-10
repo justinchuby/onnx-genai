@@ -181,6 +181,16 @@ impl Engine {
             authority_provider.as_ref(),
             &domain,
         )?;
+        let memory_strategy_plan = infer_memory_strategy_plan(
+            &config,
+            governor.snapshot().resolved_limits.vram_bytes,
+            device_weight_package_bytes(&model_directory.model_path),
+            governor_kv_config(kv_model.as_ref(), &config)?,
+            weight_access_pattern_from_metadata(&metadata, WeightAccessPattern::SequentialDense),
+            Vec::new(),
+            None,
+        );
+        log_memory_strategy_plan(&memory_strategy_plan);
 
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
@@ -238,6 +248,7 @@ impl Engine {
             native_session: None,
             #[cfg(feature = "native-backend")]
             weight_placement: None,
+            memory_strategy_plan,
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
@@ -386,6 +397,30 @@ impl Engine {
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
+        let mut memory_strategy_plan = infer_memory_strategy_plan(
+            &config,
+            governor.snapshot().resolved_limits.vram_bytes,
+            model_weight_bytes,
+            governor_kv_config,
+            weight_access_pattern_from_metadata(&metadata, WeightAccessPattern::SequentialDense),
+            Vec::new(),
+            {
+                #[cfg(feature = "cuda")]
+                {
+                    cuda_offload_resolution.map(|resolution| ExplicitOffloadEvidence {
+                        enabled: resolution.policy.enabled,
+                        device_budget_bytes: resolution.policy.device_budget_bytes,
+                        scan_resistant_dense: resolution.policy.scan_resistant_dense,
+                        managed_no_spill: resolution.policy.managed_no_spill,
+                    })
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    None
+                }
+            },
+        );
+        log_memory_strategy_plan(&memory_strategy_plan);
         let mut scheduler_config = config.scheduler.clone();
         // The native pool carries no per-layer geometry, so it holds only
         // bookkeeping. Its size is a fixed bound rather than a budget
@@ -426,6 +461,30 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
+        let qmoe_layer_bytes = qmoe_layer_weight_bytes(native_session.inference_session())?;
+        if !qmoe_layer_bytes.is_empty() {
+            memory_strategy_plan.weight_access_pattern = WeightAccessPattern::MoeRouted;
+            memory_strategy_plan.per_layer_weight_bytes = qmoe_layer_bytes;
+            if !matches!(memory_strategy_plan.strategy, MemoryStrategy::Unknown) {
+                memory_strategy_plan.strategy = MemoryStrategy::MoeRoutingAware;
+            }
+            memory_strategy_plan
+                .decisions
+                .push(MemoryStrategyDecision::new(
+                    "qmoe_layers",
+                    memory_strategy_plan
+                        .per_layer_weight_bytes
+                        .len()
+                        .to_string(),
+                    DecisionSource::Inference,
+                    "QMoE graph helper found routed expert layers after native graph load",
+                    format!(
+                        "per_layer_weight_bytes={:?}",
+                        memory_strategy_plan.per_layer_weight_bytes
+                    ),
+                ));
+            log_memory_strategy_plan(&memory_strategy_plan);
+        }
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = reconcile_cuda_offload_budget_after_native_load(
             &native_session,
@@ -666,6 +725,7 @@ impl Engine {
             session: None,
             native_session: Some(native_session),
             weight_placement,
+            memory_strategy_plan,
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,
@@ -1085,6 +1145,22 @@ pub(crate) fn kv_pages_for_budget(
 /// the provider exists; other paths still reserve the whole package.
 fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
     onnx_genai_ort::model_weight_bytes(model_path)
+}
+
+fn weight_access_pattern_from_metadata(
+    metadata: &InferenceMetadata,
+    fallback: WeightAccessPattern,
+) -> WeightAccessPattern {
+    if metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.mixture_of_experts.as_ref())
+        .is_some()
+    {
+        WeightAccessPattern::MoeRouted
+    } else {
+        fallback
+    }
 }
 
 /// The temporary startup reservation, given the package size and offload budget.

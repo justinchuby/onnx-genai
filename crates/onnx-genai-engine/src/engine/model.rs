@@ -40,6 +40,8 @@ pub struct Engine {
     /// Load-time static device/host placement plan for pageable weight layers.
     #[cfg(feature = "native-backend")]
     pub(crate) weight_placement: Option<WeightPlacementReport>,
+    /// Memory strategy inferred at load before applying any strategy-specific policy.
+    pub(crate) memory_strategy_plan: MemoryStrategyPlan,
     /// Multi-session native state: per-session token history keyed by session id.
     /// The active session (whose KV is loaded in `native_session`) is tracked by
     /// `native_active_session`. When switching, the engine re-prefills from the
