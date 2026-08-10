@@ -66,16 +66,186 @@ fn log_weight_offload_capture_exclusion() {
     });
 }
 
+fn cuda_step_profile_enabled() -> bool {
+    std::env::var_os("ONNX_GENAI_PROFILE_CUDA_DECODE_STEPS").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StepOffloadSnapshot {
+    materialize_ns: u64,
+    htod_ns: u64,
+    admit_sync_ns: u64,
+    page_ins: u64,
+    staging_fill_bytes: u64,
+    staging_fill_regions: u64,
+    staging_fill_calls: u64,
+    materialize_fallback_calls: u64,
+    htod_bytes: u64,
+    vram_alloc_ns: u64,
+    vram_free_ns: u64,
+}
+
+impl StepOffloadSnapshot {
+    fn read() -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::global_offload_stats();
+            Self {
+                materialize_ns: stats.materialize_ns,
+                htod_ns: stats.htod_ns,
+                admit_sync_ns: stats.admit_sync_ns,
+                page_ins: stats.page_ins,
+                staging_fill_bytes: stats.staging_fill_bytes,
+                staging_fill_regions: stats.staging_fill_regions,
+                staging_fill_calls: stats.staging_fill_calls,
+                materialize_fallback_calls: stats.materialize_fallback_calls,
+                htod_bytes: stats.htod_bytes,
+                vram_alloc_ns: stats.vram_alloc_ns,
+                vram_free_ns: stats.vram_free_ns,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::default()
+        }
+    }
+
+    fn delta(self, before: Self) -> Self {
+        Self {
+            materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
+            htod_ns: self.htod_ns.saturating_sub(before.htod_ns),
+            admit_sync_ns: self.admit_sync_ns.saturating_sub(before.admit_sync_ns),
+            page_ins: self.page_ins.saturating_sub(before.page_ins),
+            staging_fill_bytes: self
+                .staging_fill_bytes
+                .saturating_sub(before.staging_fill_bytes),
+            staging_fill_regions: self
+                .staging_fill_regions
+                .saturating_sub(before.staging_fill_regions),
+            staging_fill_calls: self
+                .staging_fill_calls
+                .saturating_sub(before.staging_fill_calls),
+            materialize_fallback_calls: self
+                .materialize_fallback_calls
+                .saturating_sub(before.materialize_fallback_calls),
+            htod_bytes: self.htod_bytes.saturating_sub(before.htod_bytes),
+            vram_alloc_ns: self.vram_alloc_ns.saturating_sub(before.vram_alloc_ns),
+            vram_free_ns: self.vram_free_ns.saturating_sub(before.vram_free_ns),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaStepWallBreakdown {
+    run_ms: f64,
+    logits_read_ms: f64,
+    capture_check_ms: f64,
+    finite_check_ms: f64,
+}
+
+struct CudaStepProfile {
+    past_len: usize,
+    total_len: usize,
+    before: StepOffloadSnapshot,
+    start: std::time::Instant,
+}
+
+impl CudaStepProfile {
+    fn begin(past_len: usize, total_len: usize) -> Option<Self> {
+        if !cuda_step_profile_enabled() {
+            return None;
+        }
+        onnx_runtime_session::enable_exec_phase_profile_for_process();
+        onnx_runtime_session::reset_exec_phase_profile();
+        Some(Self {
+            past_len,
+            total_len,
+            before: StepOffloadSnapshot::read(),
+            start: std::time::Instant::now(),
+        })
+    }
+
+    fn finish(self, path: &'static str, wall: CudaStepWallBreakdown) {
+        let total_ms = self.start.elapsed().as_secs_f64() * 1_000.0;
+        let delta = StepOffloadSnapshot::read().delta(self.before);
+        let staging_ms = ns_to_ms(delta.materialize_ns);
+        let h2d_ms = ns_to_ms(delta.htod_ns);
+        let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
+        let vram_alloc_ms = ns_to_ms(delta.vram_alloc_ns);
+        let vram_free_ms = ns_to_ms(delta.vram_free_ns);
+        let phase_stats = onnx_runtime_session::exec_phase_stats();
+        let phase_ms = |phase: &str| -> f64 {
+            phase_stats
+                .iter()
+                .find_map(|(name, total_ns, _)| (*name == phase).then_some(*total_ns))
+                .map(|ns| ns as f64 / 1_000_000.0)
+                .unwrap_or(0.0)
+        };
+        let kernel_host_ms = phase_ms("exec_kernel.compute");
+        let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
+        let build_inputs_attributed_ms =
+            staging_ms + h2d_ms + admit_sync_ms + vram_alloc_ms + vram_free_ms;
+        let build_inputs_unattributed_ms = (build_inputs_ms - build_inputs_attributed_ms).max(0.0);
+        let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
+        let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
+        let residual_ms = total_ms
+            - staging_ms
+            - h2d_ms
+            - admit_sync_ms
+            - vram_alloc_ms
+            - vram_free_ms
+            - kernel_host_ms
+            - build_inputs_unattributed_ms
+            - executor_other_ms
+            - wall.logits_read_ms
+            - wall.capture_check_ms
+            - wall.finite_check_ms;
+        static HEADER: std::sync::Once = std::sync::Once::new();
+        HEADER.call_once(|| {
+            eprintln!(
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+            );
+        });
+        eprintln!(
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{}",
+            self.past_len,
+            self.total_len,
+            wall.logits_read_ms,
+            wall.capture_check_ms,
+            wall.finite_check_ms,
+            delta.page_ins,
+            delta.staging_fill_bytes,
+            delta.staging_fill_regions,
+            delta.staging_fill_calls,
+            delta.materialize_fallback_calls,
+            delta.htod_bytes
+        );
+    }
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
+    pub kv_committed_len: usize,
     pub hard_max_len: usize,
     pub max_len_source: String,
     pub device_ptrs: Vec<usize>,
     pub kv_committed_bytes: usize,
     pub kv_physical_bytes_by_binding: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
+    pub kv_growth_events: u64,
+    pub kv_growth_d2d_copy_bytes: u64,
     pub graph: CudaGraphDebugStats,
 }
 
@@ -100,6 +270,7 @@ pub struct CudaGraphDebugStats {
     pub captures: u64,
     pub replays: u64,
     pub fallbacks: u64,
+    pub invalidations: u64,
     pub allocation_counts: DeviceAllocationCounts,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
@@ -174,6 +345,9 @@ pub(crate) struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    graph_invalidations: u64,
+    kv_growth_events: u64,
+    kv_growth_d2d_copy_bytes: u64,
     capacity: CudaKvCapacity,
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
@@ -305,6 +479,99 @@ pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDecli
 }
 
 impl NativeDecodeSession {
+    pub(crate) fn prepare_cuda_prefill_workspace(
+        &mut self,
+        token_ids: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        self.prepare_cuda_prefill_workspace_with_step_inputs(token_ids, 0, &[])
+    }
+
+    pub(crate) fn prepare_cuda_prefill_workspace_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        if self.has_eager_step_inputs() {
+            let workspace_nodes = self.session.workspace_node_locations();
+            if workspace_nodes.is_empty() {
+                return Ok(onnx_runtime_session::WorkspaceRequirement::NONE);
+            }
+        }
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+        let input_len = token_ids.len();
+        let total_len = past_len
+            .checked_add(input_len)
+            .context("native CUDA workspace preparation length overflow")?;
+        let supplied = step_inputs
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<HashMap<_, _>>();
+        let mut owned =
+            if let Some(name) = self.step_input_name(NativeStepInputSource::InputsEmbeds) {
+                if let Some(tensor) = supplied.get(name) {
+                    vec![(name.to_owned(), (*tensor).try_clone()?)]
+                } else {
+                    let meta = self
+                        .session
+                        .inputs()
+                        .iter()
+                        .find(|meta| meta.name == name)
+                        .with_context(|| {
+                            format!("missing native CUDA inputs_embeds metadata for '{name}'")
+                        })?;
+                    let hidden = match meta.shape.last() {
+                        Some(Dim::Static(hidden)) => *hidden,
+                        _ => bail!(
+                            "prepare-only QMoE workspace planning cannot conservatively bind \
+                             inputs_embeds '{name}': expected a static hidden width, got {:?}",
+                            meta.shape
+                        ),
+                    };
+                    vec![(
+                        name.to_owned(),
+                        Tensor::zeros(meta.dtype, vec![1, input_len, hidden])?,
+                    )]
+                }
+            } else {
+                let token_input = self
+                    .step_input_name(NativeStepInputSource::TokenIds)
+                    .context("native CUDA decoder has no token or inputs_embeds input binding")?
+                    .to_owned();
+                let ids = token_ids
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect::<Vec<_>>();
+                vec![(token_input, Tensor::from_i64(&[1, input_len], &ids)?)]
+            };
+        for (name, tensor) in step_inputs {
+            if !owned.iter().any(|(bound, _)| bound == name) {
+                owned.push((name.clone(), tensor.try_clone()?));
+            }
+        }
+        if let Some(position_input) = position_input {
+            owned.push((
+                position_input,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(past_len, total_len, total_len)?;
+        let inputs = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        self.session
+            .prepare_with_device_bindings(&inputs, &mut state.bindings[..state.base_binding_count])
+            .context("prepare native CUDA prefill workspace")
+    }
+
     /// Run one eager (uncaptured) `[1, K]` device forward pass and return host
     /// `[K, vocab]` logits.
     ///
@@ -375,7 +642,9 @@ impl NativeDecodeSession {
             Ok(outputs) => outputs,
             Err(error) => {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA {error_context} forward pass failed{diagnosis}: {error}");
+                return Err(anyhow::Error::new(error).context(format!(
+                    "native CUDA {error_context} forward pass failed{diagnosis}"
+                )));
             }
         };
         let names = self
@@ -499,11 +768,19 @@ impl NativeDecodeSession {
                 // exec's capture machine stays dormant on decode, so the shared
                 // EP's single graph slot + capture-error latch are owned solely by
                 // the sibling.
+                let step_profile = CudaStepProfile::begin(past_len, total_len);
+                let mut step_wall = CudaStepWallBreakdown::default();
+                let run_start = std::time::Instant::now();
                 if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                    bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                    return Err(error.context(format!(
+                        "native CUDA decode-inline forward pass failed{diagnosis}"
+                    )));
                 }
+                step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+                let logits_start = std::time::Instant::now();
                 let logits = state.read_logits()?;
+                step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
                 // Detection-before-consumption (Harry #588 PR-3 rec #1): the
                 // logits read above is the single per-step device→host sync.
                 // Piggyback on it to poll the shared capture-error word — a
@@ -511,39 +788,61 @@ impl NativeDecodeSession {
                 // latches the flag; fail hard before consuming the produced token.
                 // The latch lives on the shared EP, so this reads the sibling's
                 // replay result even though the poll is the main-exec-facing call.
+                let capture_check_start = std::time::Instant::now();
                 let capture_error = self.session.check_device_capture_error()?;
+                step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
                 if capture_error != 0 {
                     let _ = state.invalidate_graph(&mut self.session);
                     bail!(
                         "native CUDA decode-inline aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode-inline graph was invalidated"
                     );
                 }
+                let finite_check_start = std::time::Instant::now();
                 if logits.iter().flatten().any(|value| !value.is_finite()) {
                     bail!("native decoder produced non-finite logits");
+                }
+                step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+                if let Some(profile) = step_profile {
+                    profile.finish("decode_inline", step_wall);
                 }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
             }
+            let step_profile = CudaStepProfile::begin(past_len, total_len);
+            let mut step_wall = CudaStepWallBreakdown::default();
+            let run_start = std::time::Instant::now();
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decoder forward pass failed{diagnosis}"
+                )));
             }
+            step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+            let logits_start = std::time::Instant::now();
             let logits = state.read_logits()?;
+            step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
             // Detection-before-consumption: the logits read above is the single
             // per-step device→host sync. Piggyback on it to poll the shared
             // capture-error word (no extra synchronize). If a captured replay
             // violates a device-side bound, kernels latch the flag and avoid the
             // unsafe access, so fail hard before consuming the produced token.
+            let capture_check_start = std::time::Instant::now();
             let capture_error = self.session.check_device_capture_error()?;
+            step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
             if capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
                 bail!(
                     "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
                 );
             }
+            let finite_check_start = std::time::Instant::now();
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
+            }
+            step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+            if let Some(profile) = step_profile {
+                profile.finish("decode", step_wall);
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -612,14 +911,24 @@ impl NativeDecodeSession {
         state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
         state.write_captured_step_inputs(supplied, position)?;
 
+        let step_profile = CudaStepProfile::begin(past_len, total_len);
+        let mut step_wall = CudaStepWallBreakdown::default();
+        let run_start = std::time::Instant::now();
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
+        step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+        let logits_start = std::time::Instant::now();
         let logits = state.read_logits()?;
+        step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
         // Detection-before-consumption: piggyback on the single logits sync to
         // poll the shared capture-error word (mirrors the token captured path).
+        let capture_check_start = std::time::Instant::now();
         let capture_error = self.session.check_device_capture_error()?;
+        step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
         if capture_error != 0 {
             let _ = self
                 .cuda
@@ -630,8 +939,13 @@ impl NativeDecodeSession {
                 "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay of a per-step-input decode; the produced token was rejected before consumption and the decode graph was invalidated"
             );
         }
+        let finite_check_start = std::time::Instant::now();
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
+        }
+        step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+        if let Some(profile) = step_profile {
+            profile.finish("captured_step_inputs", step_wall);
         }
         let state = self
             .cuda
@@ -862,7 +1176,9 @@ impl NativeDecodeSession {
             // never round-trip to the host.
             if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decode-inline forward pass failed{diagnosis}"
+                )));
             }
             // Detection-before-consumption (Harry #588 PR-3 rec #1): the greedy
             // device-argmax read already returns the shared capture-error word;
@@ -881,7 +1197,9 @@ impl NativeDecodeSession {
         }
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
         let (token_id, capture_error) = state.read_greedy_result()?;
         if capture_error != 0 {
@@ -1062,15 +1380,38 @@ impl DecodeCudaState {
             let old_capacity = self.max_len;
             let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
             let valid_len = self.logical_len;
-            self.commit_vmm_growth(new_capacity).map_err(|error| {
-                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
-                    .map_err(|error| error.to_string());
-                self.growth_failed_error(old_capacity, new_capacity, error, memory)
-            })?;
+            let mapped_growth_bytes = self.vmm_growth_mapped_bytes(new_capacity)?;
+            let mut grant = session
+                .prepare_mapped_growth(
+                    mapped_growth_bytes,
+                    onnx_runtime_memory_governor::MemoryRole::KvCache,
+                )
+                .context("prepare transactional native CUDA KV growth")?;
+            tracing::info!(
+                mapped_growth_bytes,
+                grant_prepared = grant.is_some(),
+                "prepared native CUDA KV mapped-growth transaction"
+            );
+            let actual_mapped_bytes = self
+                .commit_vmm_growth(new_capacity, grant.as_mut())
+                .map_err(|error| {
+                    let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                        .map_err(|error| error.to_string());
+                    self.growth_failed_error(old_capacity, new_capacity, error, memory)
+                })?;
+            if let Some(grant) = grant {
+                grant
+                    .commit_bytes(actual_mapped_bytes)
+                    .context("commit native CUDA KV mapped-growth attribution")?;
+            }
             native_cuda_device_barrier(session)?;
             self.apply_vmm_growth(new_capacity, valid_len)?;
             self.invalidate_graph(session)?;
             self.max_len = new_capacity;
+            self.kv_growth_events += 1;
+            self.kv_growth_d2d_copy_bytes = self.kv_growth_d2d_copy_bytes.saturating_add(
+                (valid_len as u64).saturating_mul(self.capacity.bytes_per_token as u64),
+            );
             tracing::info!(
                 old_len = old_capacity,
                 new_len = new_capacity,
@@ -1091,6 +1432,12 @@ impl DecodeCudaState {
                 new_capacity,
                 valid_len,
             } => {
+                backend.state.kv_growth_events += 1;
+                backend.state.kv_growth_d2d_copy_bytes =
+                    backend.state.kv_growth_d2d_copy_bytes.saturating_add(
+                        (valid_len as u64)
+                            .saturating_mul(backend.state.capacity.bytes_per_token as u64),
+                    );
                 tracing::info!(
                     old_len = old_capacity,
                     new_len = new_capacity,
@@ -1111,11 +1458,46 @@ impl DecodeCudaState {
     /// the old shapes and hold the old layout. Extra committed granules are
     /// only installed after their lease succeeds, so the governor remains the
     /// single source of memory truth.
-    fn commit_vmm_growth(&mut self, new_capacity: usize) -> anyhow::Result<()> {
-        let mut committed: Vec<(usize, usize, usize)> = Vec::new();
-        let kv_indices = self.kv_binding_range.clone().collect::<Vec<_>>();
-        for index in kv_indices {
-            let binding = &mut self.bindings[index];
+    fn commit_vmm_growth(
+        &mut self,
+        new_capacity: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
+        }
+        .context("commit native CUDA KV binding ranges atomically")
+    }
+
+    fn vmm_growth_mapped_bytes(&self, new_capacity: usize) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size native CUDA KV mapped-growth transaction")
+    }
+
+    fn vmm_growth_requests(
+        &self,
+        new_capacity: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
             let mut new_shape = binding.physical_shape().to_vec();
             if new_shape.len() != 4 {
                 bail!(
@@ -1132,40 +1514,15 @@ impl DecodeCudaState {
                     new_shape
                 )
             })?;
-            let old_bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
-                .with_context(|| {
-                    format!(
-                        "VMM-backed CUDA KV '{}' current size overflows for shape {:?}",
-                        binding.input_name(),
-                        binding.physical_shape()
-                    )
-                })?;
-            if let Err(error) = binding.commit_range(0, bytes) {
-                rollback_vmm_growth_commits(&mut self.bindings, &committed);
-                return Err(error.into());
-            }
-            committed.push((index, old_bytes, bytes.saturating_sub(old_bytes)));
+            requested.push((index, 0, bytes));
         }
         let mask_bytes = new_capacity
             .checked_mul(std::mem::size_of::<i64>())
             .with_context(|| {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
-        let old_mask_bytes =
-            checked_shape_bytes(self.bindings[0].physical_shape(), DataType::Int64).with_context(
-                || {
-                    format!(
-                        "VMM-backed CUDA mask current size overflows for shape {:?}",
-                        self.bindings[0].physical_shape()
-                    )
-                },
-            )?;
-        if let Err(error) = self.bindings[0].commit_range(0, mask_bytes) {
-            rollback_vmm_growth_commits(&mut self.bindings, &committed);
-            return Err(error.into());
-        }
-        committed.push((0, old_mask_bytes, mask_bytes.saturating_sub(old_mask_bytes)));
-        Ok(())
+        requested.push((0, 0, mask_bytes));
+        Ok(requested)
     }
 
     /// Grow VMM-backed KV in place, keeping the reserved address range stable.
@@ -1773,6 +2130,9 @@ impl DecodeCudaState {
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            graph_invalidations: 0,
+            kv_growth_events: 0,
+            kv_growth_d2d_copy_bytes: 0,
             capacity,
             kv_commits_on_demand,
             graph_fallback_reason: None,
@@ -2276,6 +2636,7 @@ impl DecodeCudaState {
         session.reset_decode_inline_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+        self.graph_invalidations += 1;
         Ok(())
     }
 
@@ -2327,17 +2688,21 @@ impl DecodeCudaState {
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
+            kv_committed_len: self.max_len,
             hard_max_len: self.capacity.max_len,
             max_len_source: self.capacity.source.clone(),
             device_ptrs,
             kv_committed_bytes,
             kv_physical_bytes_by_binding,
             kv_transfers: transfers,
+            kv_growth_events: self.kv_growth_events,
+            kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,
                 captures: self.graph_captures,
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
+                invalidations: self.graph_invalidations,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
                 fallback_report: self.graph_fallback_report.clone(),
             },
@@ -2679,18 +3044,6 @@ pub(super) fn in_place_copy_route(
         InPlaceCopyRoute::Scratch
     } else {
         InPlaceCopyRoute::DeviceToDevice
-    }
-}
-
-fn rollback_vmm_growth_commits(
-    bindings: &mut [DeviceIoBinding],
-    committed: &[(usize, usize, usize)],
-) {
-    for &(index, old_bytes, extra_bytes) in committed.iter().rev() {
-        if extra_bytes == 0 {
-            continue;
-        }
-        let _ = bindings[index].decommit_range(old_bytes, extra_bytes);
     }
 }
 

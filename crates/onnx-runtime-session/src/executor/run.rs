@@ -193,7 +193,7 @@ impl Executor {
         Ok(())
     }
 
-    fn validate_required_inputs(
+    pub(super) fn validate_required_inputs(
         &self,
         inputs: &[(&str, &Tensor)],
         external: &ExternalBindings,

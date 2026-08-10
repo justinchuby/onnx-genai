@@ -51,7 +51,8 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
     ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMut, TensorView, WeightHandle,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -120,6 +121,10 @@ mod phase_profile {
     #[cfg(test)]
     pub(super) fn force_enabled(on: bool) {
         STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    pub fn enable_for_process() {
+        STATE.store(2, Ordering::Relaxed);
     }
 
     /// Test-only snapshot of a phase's accumulated `(total_ns, count)`.
@@ -285,6 +290,16 @@ pub fn print_exec_phase_profile() {
 
 pub fn reset_exec_phase_profile() {
     phase_profile::reset();
+}
+
+/// Force executor phase profiling on for targeted per-step attribution.
+///
+/// This is deliberately process-wide because the phase profiler is itself
+/// process-wide. Callers use it only under explicit diagnostic env knobs before
+/// resetting and sampling a single decode step; production paths should leave
+/// the cheap env-gated default untouched.
+pub fn enable_exec_phase_profile_for_process() {
+    phase_profile::enable_for_process();
 }
 
 /// Activation-memory planner metrics from the most recent measured top-level run.
@@ -592,6 +607,12 @@ impl Drop for Executor {
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
+        }
+        if let Some(workspace) = self.persistent_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
+        }
+        if let Some(workspace) = self.step_workspace.take() {
+            let _ = self.ep.deallocate(workspace.buffer);
         }
         self.shared_buffers.clear();
     }

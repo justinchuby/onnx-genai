@@ -561,6 +561,7 @@ mod tests {
     /// **fp16-rounded** inputs so the only residual error the parity test sees is
     /// the kernel's fp16 output rounding plus its fp32 (vs f64) accumulation —
     /// not the input quantization, which both sides share.
+    #[allow(clippy::too_many_arguments)]
     fn cpu_reference(
         query: &[f32],
         key: &[f32],

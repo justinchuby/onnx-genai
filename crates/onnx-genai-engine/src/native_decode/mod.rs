@@ -854,6 +854,63 @@ impl NativeDecodeSession {
         )
     }
 
+    pub(crate) fn prepare_generation_workspace_for_query_rows(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        query_rows: usize,
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        self.prepare_generation_workspace_inner(prompt_tokens, query_rows, true)
+    }
+
+    pub(crate) fn prepare_generation_workspace_preserving_state(
+        &mut self,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        self.prepare_generation_workspace_inner(prompt_tokens, prompt_tokens.len(), false)
+    }
+
+    pub(crate) fn prepare_generation_workspace_with_step_inputs(
+        &mut self,
+        tokens: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        if tokens.is_empty() {
+            bail!("native workspace preparation requires at least one input token");
+        }
+        if self.cuda.is_some() {
+            self.prepare_cuda_prefill_workspace_with_step_inputs(tokens, past_len, step_inputs)
+        } else {
+            Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
+        }
+    }
+
+    fn prepare_generation_workspace_inner(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        query_rows: usize,
+        reset: bool,
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        if prompt_tokens.is_empty() {
+            bail!("native workspace preparation requires at least one prompt token");
+        }
+        if reset {
+            self.reset()?;
+        }
+        if self.cuda.is_some() {
+            if query_rows <= prompt_tokens.len() {
+                self.prepare_cuda_prefill_workspace(prompt_tokens)
+            } else {
+                let mut planning_tokens = Vec::with_capacity(query_rows);
+                planning_tokens.extend_from_slice(prompt_tokens);
+                planning_tokens.resize(query_rows, prompt_tokens[0]);
+                self.prepare_cuda_prefill_workspace(&planning_tokens)
+            }
+        } else {
+            Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
+        }
+    }
+
     /// Generate incrementally: reuse KV state up to `resume_from` and only
     /// prefill `prompt_tokens[resume_from..]`. The caller must ensure that
     /// `prompt_tokens[..resume_from]` matches the tokens already in the KV cache.

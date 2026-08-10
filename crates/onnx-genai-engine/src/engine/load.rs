@@ -2,11 +2,29 @@
 
 use super::*;
 use crate::engine::memory_plan::Holder;
+use crate::memory_authority::{
+    DeviceCompatibilityDomain, MemoryAuthorityProvider, SharedMemoryAuthorityProvider,
+};
 
 impl Engine {
     /// Load a model from a directory.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false)
+        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
+    }
+
+    /// Load a model using a caller-owned device authority provider.
+    pub fn from_dir_with_memory_authority_provider(
+        model_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::from_dir_impl(
+            model_dir,
+            config,
+            SessionOptions::default(),
+            false,
+            Some(provider),
+        )
     }
 
     /// Load a model from a directory with explicit ORT session options.
@@ -15,7 +33,7 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        Self::from_dir_impl(model_dir, config, session_options, true)
+        Self::from_dir_impl(model_dir, config, session_options, true, None)
     }
 
     fn from_dir_impl(
@@ -23,6 +41,7 @@ impl Engine {
         mut config: EngineConfig,
         mut session_options: SessionOptions,
         session_options_are_programmatic: bool,
+        authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
@@ -30,6 +49,7 @@ impl Engine {
             ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
+        let operator_vram_limit = config.limits.vram_limit;
         let metadata_hints = load_model_metadata_hints(&model_directory.model_path)?;
         report_metadata_hint_warnings(&metadata_hints);
         if metadata_hints.has_errors() {
@@ -38,6 +58,13 @@ impl Engine {
             );
         }
         apply_model_memory_hints(&mut config, &metadata_hints)?;
+        // A shared production authority is process policy. Model metadata may
+        // advise placement inside that policy, but must never establish or
+        // lower the device ceiling (especially when the operator selected
+        // Auto). Standalone engines keep the historical metadata behavior.
+        if authority_provider.is_some() {
+            config.limits.vram_limit = operator_vram_limit;
+        }
         apply_model_placement_hints(
             &mut session_options,
             &metadata_hints,
@@ -48,16 +75,48 @@ impl Engine {
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?
         };
         if decode_backend == EngineDecodeBackend::Native {
-            return augment_backend_error(
-                Self::from_native_model_directory(
-                    model_directory,
-                    config,
-                    &session_options,
-                    metadata_hints,
-                ),
-                EngineDecodeBackend::Native,
-            );
+            #[cfg(feature = "native-backend")]
+            {
+                let native_device =
+                    resolve_native_decode_device(config.native_device.clone(), &session_options)?;
+                let domain = native_device_domain(&native_device);
+                validate_shared_authority_limit(
+                    authority_provider.as_ref(),
+                    &domain,
+                    config.limits.vram_limit,
+                )?;
+                return augment_backend_error(
+                    Self::from_native_model_directory(
+                        model_directory,
+                        config,
+                        &session_options,
+                        metadata_hints,
+                        native_device,
+                        authority_provider.as_ref(),
+                        &domain,
+                    ),
+                    EngineDecodeBackend::Native,
+                );
+            }
+            #[cfg(not(feature = "native-backend"))]
+            {
+                return augment_backend_error(
+                    Self::from_native_model_directory(
+                        model_directory,
+                        config,
+                        &session_options,
+                        metadata_hints,
+                    ),
+                    EngineDecodeBackend::Native,
+                );
+            }
         }
+        let domain = session_device_domain(&session_options)?;
+        validate_shared_authority_limit(
+            authority_provider.as_ref(),
+            &domain,
+            config.limits.vram_limit,
+        )?;
         fail_explicit_vram_limit_without_offload(
             &config,
             device_weight_package_bytes(&model_directory.model_path),
@@ -114,8 +173,14 @@ impl Engine {
         };
 
         // Stage: resource governor and batch scheduler.
-        let (governor, scheduler) =
-            build_governor_and_scheduler(&config, &model_directory, kv_model.as_ref())?;
+        let (governor, scheduler) = build_governor_and_scheduler(
+            &config,
+            &model_directory,
+            kv_model.as_ref(),
+            &decode_path,
+            authority_provider.as_ref(),
+            &domain,
+        )?;
 
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
@@ -206,8 +271,11 @@ impl Engine {
     fn from_native_model_directory(
         model_directory: ModelDirectory,
         config: EngineConfig,
-        session_options: &SessionOptions,
+        _session_options: &SessionOptions,
         metadata_hints: MetadataHints,
+        native_device: crate::native_decode::NativeDecodeDevice,
+        authority_provider: Option<&SharedMemoryAuthorityProvider>,
+        authority_domain: &DeviceCompatibilityDomain,
     ) -> anyhow::Result<Self> {
         if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
         {
@@ -218,9 +286,6 @@ impl Engine {
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
         }
-        let native_device =
-            resolve_native_decode_device(config.native_device.clone(), session_options)?;
-
         let metadata = {
             let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
             if let Some(metadata_path) = &model_directory.metadata_path {
@@ -240,14 +305,40 @@ impl Engine {
         if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
             anyhow::bail!("Unsupported capabilities: {unsupported:?}");
         }
-
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
             Tokenizer::from_file(&model_directory.tokenizer_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
         };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
-        let governor_kv_config = governor_kv_config(None, &config)?;
+        let kv_model = {
+            let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
+            let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+            let kv_inputs = model_io
+                .and_then(|io| io.kv_inputs.clone())
+                .unwrap_or_default();
+            let kv_outputs = model_io
+                .and_then(|io| io.kv_outputs.clone())
+                .unwrap_or_default();
+            let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
+                &model_directory.model_path,
+                &kv_inputs,
+                &kv_outputs,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to read native decoder graph I/O for KV geometry: {e}")
+            })?;
+            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
+                .context("failed to infer native decoder KV geometry from model graph I/O")?
+        };
+        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let governor_kv_config = match kv_model.as_ref() {
+            Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
+            None if model_io_declares_only_fixed_state(model_io) => {
+                governor_no_paged_kv_config(&config)?
+            }
+            None => governor_kv_config(None, &config)?,
+        };
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
         #[cfg(feature = "cuda")]
         let cuda_offload_resolution =
@@ -255,17 +346,26 @@ impl Engine {
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
         #[cfg(feature = "cuda")]
-        let weight_reservation_bytes = device_weight_reservation_for(
+        let governed_physical_pool = uses_governed_physical_pool(
+            cuda_offload_resolution,
+            dynamic_lending_enabled(),
+            onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled(),
+        );
+        #[cfg(feature = "cuda")]
+        let weight_reservation_bytes = cuda_weight_startup_reservation(
             model_weight_bytes,
-            cuda_offload_resolution.and_then(|resolution| {
-                resolution.policy.enabled.then(|| {
-                    resolution
-                        .policy
-                        .device_budget_bytes
-                        .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
-                })
-            }),
+            cuda_offload_resolution,
+            governed_physical_pool,
             governor_kv_config.page_size_bytes,
+        );
+        #[cfg(feature = "cuda")]
+        tracing::info!(
+            managed_no_spill = cuda_offload_resolution
+                .is_some_and(|resolution| resolution.policy.managed_no_spill),
+            dynamic_lending = dynamic_lending_enabled(),
+            governed_physical_pool,
+            weight_reservation_bytes,
+            "resolved CUDA device-memory strategy before governor creation"
         );
         #[cfg(not(feature = "cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
@@ -275,11 +375,14 @@ impl Engine {
         );
         let governor = {
             let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
-            EngineResourceGovernor::new(
+            EngineResourceGovernor::new_with_authority_and_reservation(
                 config.limits.clone(),
                 config.allow_runtime_override,
                 governor_kv_config,
+                model_weight_bytes,
                 weight_reservation_bytes,
+                authority_provider,
+                Some(authority_domain),
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
         };
@@ -290,17 +393,10 @@ impl Engine {
         // the count from a memory budget would build hundreds of millions of
         // empty structs for storage that is never allocated.
         let native_kv_pages = BOOKKEEPING_POOL_PAGES;
-        if scheduler_config.bytes_per_token.is_none() {
-            scheduler_config.bytes_per_token = Some(
-                governor_kv_config
-                    .page_size_bytes
-                    .div_ceil(governor_kv_config.tokens_per_page),
-            );
-        }
-        let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
+        populate_scheduler_bytes_per_token(&mut scheduler_config, governor_kv_config)?;
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
-            build_connector_bridge(&config.kv_connector, &model_directory, None)?
+            build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
         };
         let startup_trace = onnx_genai_ort::profile::tracing_enabled()
             .then(crate::runtime_trace::context)
@@ -314,6 +410,8 @@ impl Engine {
                     host_cache: governor.weight_offload_host_cache(),
                     #[cfg(feature = "cuda")]
                     cuda_offload_policy,
+                    #[cfg(feature = "cuda")]
+                    cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
                     io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                     metadata_max_len: metadata
                         .model
@@ -546,6 +644,12 @@ impl Engine {
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
+        // Native CUDA can replace its conservative startup weight reservation
+        // with the provider's smaller governed residency pool during load.
+        // Size the scheduler only after that handoff so its static maximum does
+        // not remain pinned to the single KV page deliberately left at startup.
+        let scheduler =
+            Scheduler::with_byte_budget(scheduler_config, governor.byte_budget_after_native_load());
 
         Ok(Self {
             decode_backend: EngineDecodeBackend::Native,
@@ -554,7 +658,7 @@ impl Engine {
             kv_cache: PagedKvCache::new(config.page_size, native_kv_pages),
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
-            kv_model: None,
+            kv_model,
             decode_path: ModelDecodePath::Legacy,
             scheduler,
             governor,
@@ -703,28 +807,127 @@ fn build_governor_and_scheduler(
     config: &EngineConfig,
     model_directory: &ModelDirectory,
     kv_model: Option<&KvModelInfo>,
+    decode_path: &ModelDecodePath,
+    authority_provider: Option<&SharedMemoryAuthorityProvider>,
+    authority_domain: &DeviceCompatibilityDomain,
 ) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
-    let governor_kv_config = governor_kv_config(kv_model, config)?;
+    let governor_kv_config = match (kv_model, decode_path) {
+        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Legacy) => {
+            governor_no_paged_kv_config(config)?
+        }
+        _ => governor_kv_config(kv_model, config)?,
+    };
     let governor = {
         let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
-        EngineResourceGovernor::new(
+        EngineResourceGovernor::new_with_authority(
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
             device_weight_package_bytes(&model_directory.model_path),
+            authority_provider,
+            Some(authority_domain),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
     };
     let mut scheduler_config = config.scheduler.clone();
     if scheduler_config.bytes_per_token.is_none() {
-        scheduler_config.bytes_per_token = Some(
-            governor_kv_config
-                .page_size_bytes
-                .div_ceil(governor_kv_config.tokens_per_page),
-        );
+        scheduler_config.bytes_per_token = match governor_kv_config.bytes_per_token() {
+            Some(bytes_per_token) => Some(bytes_per_token),
+            None if governor_kv_config.page_geometry_required => {
+                required_bytes_per_token_from_kv_config(governor_kv_config)?
+            }
+            None => None,
+        };
     }
+
     let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
     Ok((governor, scheduler))
+}
+
+pub(crate) fn validate_shared_authority_limit(
+    provider: Option<&SharedMemoryAuthorityProvider>,
+    domain: &DeviceCompatibilityDomain,
+    limit: ResourceLimit,
+) -> anyhow::Result<()> {
+    if let Some(provider) = provider {
+        provider.validate_limit(domain, limit)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn session_device_domain(
+    session_options: &SessionOptions,
+) -> anyhow::Result<DeviceCompatibilityDomain> {
+    let Some(provider) = session_options
+        .execution_providers
+        .iter()
+        .find(|provider| !provider.caps.is_host())
+    else {
+        return Ok(DeviceCompatibilityDomain::Host);
+    };
+    let index = provider.caps.device_id().unwrap_or(0);
+    let index = u32::try_from(index).map_err(|_| {
+        anyhow::anyhow!(
+            "execution provider {} has negative device id {index}",
+            provider.caps.name
+        )
+    })?;
+    if provider.caps.is_nvidia() {
+        Ok(DeviceCompatibilityDomain::Cuda(index))
+    } else {
+        Ok(DeviceCompatibilityDomain::Accelerator {
+            backend: provider.caps.name.to_ascii_lowercase(),
+            index,
+        })
+    }
+}
+
+#[cfg(feature = "native-backend")]
+fn native_device_domain(
+    device: &crate::native_decode::NativeDecodeDevice,
+) -> DeviceCompatibilityDomain {
+    match device {
+        crate::native_decode::NativeDecodeDevice::Cpu => DeviceCompatibilityDomain::Host,
+        crate::native_decode::NativeDecodeDevice::Cuda { index } => {
+            DeviceCompatibilityDomain::Cuda(index.unwrap_or(0))
+        }
+        crate::native_decode::NativeDecodeDevice::Plugin { provider_name, .. } => {
+            DeviceCompatibilityDomain::Accelerator {
+                backend: provider_name.to_ascii_lowercase(),
+                index: 0,
+            }
+        }
+    }
+}
+
+fn required_bytes_per_token_from_kv_config(
+    kv_config: ModelKvConfig,
+) -> anyhow::Result<Option<u64>> {
+    kv_config.bytes_per_token().map(Some).with_context(|| {
+        format!(
+            "cannot derive scheduler bytes_per_token because KV page byte geometry is unknown \
+             for {} token(s) per page; fix by declaring model.io.kv_inputs and \
+             model.io.kv_outputs so admission uses real KV memory costs",
+            kv_config.tokens_per_page
+        )
+    })
+}
+
+#[cfg(feature = "native-backend")]
+fn populate_scheduler_bytes_per_token(
+    scheduler: &mut onnx_genai_scheduler::SchedulerConfig,
+    kv_config: ModelKvConfig,
+) -> anyhow::Result<()> {
+    if scheduler.bytes_per_token.is_none() {
+        scheduler.bytes_per_token = match kv_config.bytes_per_token() {
+            Some(bytes_per_token) => Some(bytes_per_token),
+            None if kv_config.page_geometry_required => {
+                required_bytes_per_token_from_kv_config(kv_config)?
+            }
+            None => None,
+        };
+    }
+    Ok(())
 }
 
 fn load_draft_model(
@@ -817,11 +1020,11 @@ const BOOKKEEPING_POOL_PAGES: usize = 1024;
 /// How many pages of real KV storage fit in the governor's KV budget.
 ///
 /// Deliberately **not** `derived_budget.total_pages`. That figure divides the
-/// budget by the governor's own `page_size_bytes`, which is a placeholder when
-/// no KV model has been inferred — on a machine with 8 GiB of device memory it
-/// resolves to hundreds of millions of pages, and the pool would try to
-/// allocate a `Page` for every one of them. The page count has to come from the
-/// geometry the pages will actually have.
+/// budget by an unavailable or stale page-size estimate — on a machine with 8
+/// GiB of device memory, a token-count placeholder would resolve to hundreds of
+/// millions of pages, and the pool would try to allocate a `Page` for every one
+/// of them. The page count has to come from the geometry the pages will
+/// actually have.
 pub(crate) fn kv_pages_for_budget(
     kv_budget_bytes: u64,
     host_ram_bytes: u64,
@@ -890,23 +1093,24 @@ fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
 /// residency lease after session load. Leaving one KV page unreserved prevents
 /// the governor from taking the "reservation does not fit; drop it" warning path
 /// that hid #712 while preserving the later ledger-enforced admission point.
+#[cfg(any(feature = "native-backend", test))]
 fn device_weight_reservation_for(
     package_bytes: u64,
     offload_budget: Option<u64>,
-    kv_page_size_bytes: u64,
+    kv_page_size_bytes: Option<u64>,
 ) -> u64 {
     match offload_budget {
         // A budget larger than the model cannot be filled, so the device still
         // holds at most the package.
         Some(budget) => {
             let reservation = budget.min(package_bytes);
-            reservation.saturating_sub(kv_page_size_bytes.min(reservation))
+            reservation.saturating_sub(kv_page_size_bytes.unwrap_or(0).min(reservation))
         }
         None => package_bytes,
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 #[derive(Clone, Copy, Debug)]
 struct CudaOffloadResolution {
     policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
@@ -914,7 +1118,56 @@ struct CudaOffloadResolution {
     auto_enabled_from_vram_limit: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn dynamic_lending_enabled() -> bool {
+    !std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn uses_governed_physical_pool(
+    resolution: Option<CudaOffloadResolution>,
+    lending_enabled: bool,
+    configured_pool_enabled: bool,
+) -> bool {
+    resolution.is_some_and(|resolution| {
+        (resolution.policy.enabled && configured_pool_enabled)
+            || (resolution.policy.managed_no_spill && lending_enabled)
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn cuda_weight_startup_reservation(
+    model_weight_bytes: u64,
+    resolution: Option<CudaOffloadResolution>,
+    governed_physical_pool: bool,
+    kv_page_size_bytes: Option<u64>,
+) -> u64 {
+    if governed_physical_pool {
+        // The physical pool charges each handle to this authority, including
+        // resident weights when managed VMM does not need weight offload.
+        // Reserving package bytes here would charge the same weights twice.
+        return 0;
+    }
+    device_weight_reservation_for(
+        model_weight_bytes,
+        resolution.and_then(|resolution| {
+            resolution.policy.enabled.then(|| {
+                resolution
+                    .policy
+                    .device_budget_bytes
+                    .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+            })
+        }),
+        kv_page_size_bytes,
+    )
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn resolve_cuda_offload_policy(
     native_device: &crate::native_decode::NativeDecodeDevice,
     limits: &ResourceLimits,
@@ -928,7 +1181,7 @@ fn resolve_cuda_offload_policy(
     )
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn resolve_cuda_offload_policy_from_env_policy(
     native_device: &crate::native_decode::NativeDecodeDevice,
     limits: &ResourceLimits,
@@ -942,9 +1195,16 @@ fn resolve_cuda_offload_policy_from_env_policy(
         return None;
     }
 
+    let explicit_byte_limit = matches!(limits.vram_limit, ResourceLimit::Bytes(_));
     if env_policy.enabled {
+        let mut policy = env_policy;
+        policy.managed_no_spill = explicit_byte_limit;
+        policy.managed_limit_bytes = explicit_byte_limit.then_some(match limits.vram_limit {
+            ResourceLimit::Bytes(bytes) => bytes,
+            _ => unreachable!("explicit_byte_limit checked above"),
+        });
         return Some(CudaOffloadResolution {
-            policy: env_policy,
+            policy,
             device_budget_is_override: env_policy.device_budget_bytes.is_some(),
             auto_enabled_from_vram_limit: false,
         });
@@ -954,7 +1214,15 @@ fn resolve_cuda_offload_policy_from_env_policy(
         return None;
     };
     if package_bytes <= resolved_vram_bytes {
-        return None;
+        return Some(CudaOffloadResolution {
+            policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                managed_no_spill: true,
+                managed_limit_bytes: Some(resolved_vram_bytes),
+                ..env_policy
+            },
+            device_budget_is_override: false,
+            auto_enabled_from_vram_limit: false,
+        });
     }
 
     let offload_device_budget_bytes = env_policy
@@ -963,15 +1231,18 @@ fn resolve_cuda_offload_policy_from_env_policy(
     Some(CudaOffloadResolution {
         policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
             enabled: true,
+            managed_no_spill: true,
+            managed_limit_bytes: Some(resolved_vram_bytes),
             device_budget_bytes: Some(offload_device_budget_bytes),
             async_pagein: env_policy.async_pagein,
+            scan_resistant_dense: env_policy.scan_resistant_dense,
         },
         device_budget_is_override: env_policy.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: true,
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn reconcile_cuda_offload_budget_after_native_load(
     native_session: &crate::native_decode::NativeDecodeSession,
     max_context: Option<usize>,
@@ -1500,14 +1771,135 @@ mod pool_sizing_tests {
             .collect()
     }
 
+    fn tiny_llm_model_path() -> anyhow::Result<std::path::PathBuf> {
+        Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
+            .canonicalize()?)
+    }
+
+    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::ModelIoSpec> {
+        let metadata_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml")
+            .canonicalize()?;
+        let metadata = onnx_genai_metadata::load_metadata(&metadata_path)?;
+        metadata
+            .model
+            .and_then(|model| model.io)
+            .context("tiny-llm fixture must declare model.io")
+    }
+
+    fn profile_json(name: &str) -> anyhow::Result<serde_json::Value> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/profiles")
+            .join(name);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read profile {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse profile {}", path.display()))
+    }
+
+    fn profile_u64(profile: &serde_json::Value, pointer: &str) -> anyhow::Result<u64> {
+        profile
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .with_context(|| format!("profile field {pointer} must be a u64"))
+    }
+
+    #[test]
+    fn native_graph_io_kv_page_cost_matches_ort_session_for_same_model() -> anyhow::Result<()> {
+        let model_path = tiny_llm_model_path()?;
+        let io = tiny_llm_io()?;
+        let config = EngineConfig::default();
+
+        let environment = Environment::new("onnx-genai-engine-native-kv-geometry-test")
+            .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?;
+        let session = Session::new(&environment, &model_path, SessionOptions::default())
+            .map_err(|e| anyhow::anyhow!("Failed to load ORT fixture session: {e}"))?;
+        let ort_kv_model =
+            infer_kv_model_info(&session, Some(&io), config.page_size, config.kv_cache_dtype)?
+                .context("ORT fixture session should expose KV geometry")?;
+
+        let native_graph_io =
+            onnx_genai_ort::graph_io_from_model_path(&model_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read native fixture graph I/O metadata: {e}")
+            })?;
+        let native_kv_model = infer_kv_model_info(
+            &native_graph_io,
+            Some(&io),
+            config.page_size,
+            config.kv_cache_dtype,
+        )?
+        .context("native graph I/O should expose KV geometry")?;
+
+        let ort_config = governor_kv_config(Some(&ort_kv_model), &config)?;
+        let native_config = governor_native_kv_config(Some(&native_kv_model), &config)?;
+
+        assert_eq!(native_config.page_size_bytes, ort_config.page_size_bytes);
+        assert_eq!(
+            native_config.bytes_per_token(),
+            ort_config.bytes_per_token()
+        );
+        assert_ne!(
+            native_config.page_size_bytes,
+            Some(config.page_size as u64),
+            "KV page byte size must not be the token count"
+        );
+        assert!(
+            native_config
+                .bytes_per_token()
+                .is_some_and(|bytes| bytes > 1),
+            "KV bytes/token must come from real geometry, not the old 1 B/token fallback"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_native_profiles_use_ort_kv_page_geometry() -> anyhow::Result<()> {
+        for (ort_name, native_name) in [
+            ("qwen2.5-0.5b-cpu.json", "qwen2.5-0.5b-native.json"),
+            ("qwen2.5-0.5b-metal.json", "qwen2.5-0.5b-native-mlx.json"),
+            ("qwen2.5-0.5b-f16-cpu.json", "qwen2.5-0.5b-f16-native.json"),
+        ] {
+            let ort = profile_json(ort_name)?;
+            let native = profile_json(native_name)?;
+            let native_page_bytes = profile_u64(&native, "/device_memory_breakdown/kv_page_bytes")?;
+            let native_tokens = profile_u64(&native, "/kv_cache_max_tokens")?;
+
+            assert_eq!(
+                native_page_bytes,
+                profile_u64(&ort, "/device_memory_breakdown/kv_page_bytes")?,
+                "{native_name} must report the same KV page byte geometry as {ort_name}"
+            );
+            assert_eq!(
+                profile_u64(&native, "/device_memory_breakdown/kv_pages")?,
+                profile_u64(&ort, "/device_memory_breakdown/kv_pages")?,
+                "{native_name} must report the same derived KV page count as {ort_name}"
+            );
+            assert_eq!(
+                native_tokens,
+                profile_u64(&ort, "/kv_cache_max_tokens")?,
+                "{native_name} must report the same derived KV token budget as {ort_name}"
+            );
+            assert_ne!(
+                native_page_bytes, 16,
+                "{native_name} must not store a token count in kv_page_bytes"
+            );
+            assert!(
+                native_page_bytes.div_ceil(16) > 1,
+                "{native_name} must not imply 1 B/token admission"
+            );
+        }
+        Ok(())
+    }
+
     /// The pool must never be sized by a budget divided by the wrong page size.
     ///
-    /// `derived_budget.total_pages` divides the KV budget by the governor's own
-    /// `page_size_bytes`, which is a placeholder when no KV model has been
-    /// inferred. On an 8 GiB device it comes to ~483 million pages, and because
-    /// the table pre-creates one `Page` per slot, building that pool exhausts
-    /// the machine before any KV exists -- which is exactly how this was found,
-    /// as a CI runner dying with SIGTERM mid-test.
+    /// `derived_budget.total_pages` divides the KV budget by the governor's
+    /// page byte size. If that byte size ever came from a token-count
+    /// placeholder, an 8 GiB device would resolve to ~483 million pages, and
+    /// because the table pre-creates one `Page` per slot, building that pool
+    /// exhausts the machine before any KV exists -- which is exactly how this
+    /// was found, as a CI runner dying with SIGTERM mid-test.
     ///
     /// So the count has to come from the geometry the pages will really have,
     /// and the resulting pool has to fit the budget it was derived from.
@@ -1672,12 +2064,12 @@ mod pool_sizing_tests {
         let package = 6u64 << 30;
 
         assert_eq!(
-            device_weight_reservation_for(package, None, 0),
+            device_weight_reservation_for(package, None, None),
             package,
             "with offload off every weight is resident"
         );
         assert_eq!(
-            device_weight_reservation_for(package, Some(2 << 30), 0),
+            device_weight_reservation_for(package, Some(2 << 30), None),
             2 << 30,
             "with offload on the device holds the residency budget, not the package"
         );
@@ -1692,7 +2084,7 @@ mod pool_sizing_tests {
     fn a_budget_larger_than_the_model_reserves_only_the_model() {
         let package = 1u64 << 30;
         assert_eq!(
-            device_weight_reservation_for(package, Some(4 << 30), 0),
+            device_weight_reservation_for(package, Some(4 << 30), None),
             package
         );
     }
@@ -1700,7 +2092,7 @@ mod pool_sizing_tests {
     #[test]
     fn offload_startup_reservation_leaves_one_kv_page_unwarned() {
         assert_eq!(
-            device_weight_reservation_for(10_000, Some(6_000), 128),
+            device_weight_reservation_for(10_000, Some(6_000), Some(128)),
             5_872,
             "the temporary startup claim must leave the governor a one-page KV floor; \
              the CUDA provider later adopts the full offload budget as the real claim"
@@ -1756,16 +2148,35 @@ mod pool_sizing_tests {
             10_000,
             onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 enabled: false,
+                managed_no_spill: false,
+                managed_limit_bytes: None,
                 device_budget_bytes: None,
                 async_pagein: true,
+                scan_resistant_dense: true,
             },
         )
         .expect("weights above an explicit CUDA VRAM limit should enable offload");
 
         assert!(policy.policy.enabled);
+        assert!(policy.policy.managed_no_spill);
+        assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert_eq!(policy.policy.device_budget_bytes, Some(6_000));
         assert!(policy.policy.async_pagein);
         assert!(policy.auto_enabled_from_vram_limit);
+        assert!(uses_governed_physical_pool(Some(policy), true, false));
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), true, None),
+            0
+        );
+        assert!(
+            !uses_governed_physical_pool(Some(policy), false, false),
+            "the lending opt-out must preserve the compatibility reservation path"
+        );
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), false, None),
+            6_000,
+            "the non-pool offload path keeps its existing device-budget reservation"
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -1780,13 +2191,80 @@ mod pool_sizing_tests {
             10_000,
             onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 enabled: false,
+                managed_no_spill: false,
+                managed_limit_bytes: None,
                 device_budget_bytes: Some(4_000),
                 async_pagein: false,
+                scan_resistant_dense: true,
             },
         )
         .expect("the explicit limit still triggers offload");
 
         assert_eq!(policy.policy.device_budget_bytes, Some(4_000));
+        assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert!(policy.device_budget_is_override);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn explicit_vram_limit_selects_managed_mode_even_when_weights_fit() {
+        let policy = resolve_cuda_offload_policy_from_env_policy(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(12_000),
+                ..ResourceLimits::default()
+            },
+            10_000,
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy::default(),
+        )
+        .expect("explicit byte limit selects managed allocation");
+        assert!(!policy.policy.enabled);
+        assert!(policy.policy.managed_no_spill);
+        assert!(
+            uses_governed_physical_pool(Some(policy), true, false),
+            "managed VMM owns physical weight handles even when offload is unnecessary"
+        );
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), true, Some(256)),
+            0,
+            "pool-owned resident weights must not also reserve package bytes"
+        );
+        assert!(
+            !uses_governed_physical_pool(Some(policy), false, false),
+            "lending opt-out keeps the resident package-reservation path"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resident_non_vmm_weights_keep_package_reservation() {
+        let resolution = CudaOffloadResolution {
+            policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                enabled: false,
+                managed_no_spill: false,
+                ..onnx_runtime_ep_cuda::DeviceOffloadPolicy::default()
+            },
+            device_budget_is_override: false,
+            auto_enabled_from_vram_limit: false,
+        };
+
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(resolution), false, Some(256)),
+            10_000
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native-backend")]
+    fn native_state_only_scheduler_does_not_require_kv_geometry() {
+        let mut scheduler = onnx_genai_scheduler::SchedulerConfig::default();
+        let kv_config =
+            governor_no_paged_kv_config(&EngineConfig::default()).expect("state-only KV config");
+
+        populate_scheduler_bytes_per_token(&mut scheduler, kv_config)
+            .expect("state-only native load keeps absent KV geometry valid");
+
+        assert!(!kv_config.page_geometry_required);
+        assert_eq!(scheduler.bytes_per_token, None);
     }
 }

@@ -36,6 +36,7 @@ impl PipelineEngine {
     pub(crate) fn run_autoregressive(
         &mut self,
         pipeline_request: PipelineGenerateRequest,
+        admission: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<(GenerateResult, PipelineTensors)> {
         // Guard first: a non-autoregressive pipeline (single-pass / iterative
@@ -97,6 +98,12 @@ impl PipelineEngine {
                     &self.models,
                     &ar.decoder,
                     self.native_device.as_ref(),
+                    #[cfg(feature = "cuda")]
+                    std::sync::Arc::new(
+                        self.native_cuda_authority
+                            .clone()
+                            .unwrap_or_else(|| self.resource_governor.device_authority()),
+                    ),
                 )?)
             } else {
                 None
@@ -273,6 +280,7 @@ impl PipelineEngine {
             };
         let mut backend = PipelineDecodeLoopBackend {
             decoder: decoder_component,
+            admission,
             paged: paged_mirror,
             pool: &mut tensors,
             step_components,

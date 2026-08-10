@@ -26,11 +26,14 @@ use onnx_genai_engine::{
 use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, EngineDriver, GenerateSubmitError},
+    driver::{
+        DriverEvent, DriverFailure, DriverFailureKind, DriverGeneration, EngineDriver,
+        GenerateSubmitError,
+    },
     multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
@@ -78,6 +81,8 @@ pub(crate) use sessions::{create_session, delete_session};
 const SESSION_ID_HEADER: &str = "x-session-id";
 const MAX_SESSION_ID_LEN: usize = 128;
 const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+const MEMORY_OVERLOAD_MESSAGE: &str =
+    "request exceeds the configured KV memory limit; retry later or reduce context/output length";
 const MAX_CHAT_TOP_LOGPROBS: usize = 20;
 const MAX_COMPLETION_LOGPROBS: usize = 5;
 /// Path of the downloadable Perfetto trace endpoint, reported by the trace
@@ -307,6 +312,7 @@ struct ErrorBody {
 pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
+    kind: &'static str,
     retry_after_secs: Option<u64>,
 }
 
@@ -333,6 +339,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -341,6 +348,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -349,6 +357,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -357,6 +366,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -365,6 +375,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            kind: "server_error",
             retry_after_secs: None,
         }
     }
@@ -373,7 +384,23 @@ impl ApiError {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
+            kind: "resource_limit_error",
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
+        }
+    }
+}
+
+fn generation_failure(error: DriverFailure) -> ApiError {
+    match error.kind {
+        DriverFailureKind::MemoryOverload => {
+            tracing::warn!(
+                error = %error,
+                "generation rejected by the KV memory governor"
+            );
+            ApiError::too_many_requests(MEMORY_OVERLOAD_MESSAGE)
+        }
+        DriverFailureKind::Internal => {
+            ApiError::internal(format!("generation failed: {}", error.message))
         }
     }
 }
@@ -444,7 +471,7 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorResponse {
             error: ErrorBody {
                 message: self.message,
-                kind: "server_error",
+                kind: self.kind,
             },
         });
         let mut response = (self.status, body).into_response();
@@ -537,4 +564,59 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn memory_admission_failure_maps_to_stable_overload_response() {
+        let response = generation_failure(DriverFailure {
+            message: "scheduler admission failed: KV byte budget exhausted".to_string(),
+            kind: DriverFailureKind::MemoryOverload,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+        assert_eq!(body["error"]["message"], MEMORY_OVERLOAD_MESSAGE);
+        assert!(!body.to_string().contains("scheduler admission failed"));
+    }
+
+    #[tokio::test]
+    async fn unreclaimable_mapped_capacity_is_a_pre_header_overload() {
+        let error: anyhow::Error = onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+            tier: "device",
+            requested: 4096,
+            available: 0,
+            role: onnx_runtime_memory_governor::MemoryRole::KvCache,
+            detail: "mapped holder could not reach its tentative reclaim target".into(),
+        }
+        .into();
+        let response = generation_failure(DriverFailure::from_engine_error(&error)).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "resource_limit_error");
+    }
+
+    #[test]
+    fn unrelated_generation_failure_remains_internal() {
+        let error = generation_failure(DriverFailure {
+            message: "backend execution failed".to_string(),
+            kind: DriverFailureKind::Internal,
+        });
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+    }
 }

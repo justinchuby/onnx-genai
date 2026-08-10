@@ -376,8 +376,9 @@ pub trait ExecutionProvider: Send + Sync {
         &self,
         key: u64,
         weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
     ) -> Result<Option<crate::PagedWeight>> {
-        let _ = (key, weight);
+        let _ = (key, weight, source);
         Ok(None)
     }
 
@@ -386,8 +387,13 @@ pub trait ExecutionProvider: Send + Sync {
     /// enqueued, so callers can distinguish a real prefetch from a no-op or
     /// eviction-neutrality guard decline. The default is a no-op so providers
     /// that do not own a residency cache do not need to participate.
-    fn prefetch_lazy_weight(&self, key: u64, weight: &crate::LazyWeight) -> Result<bool> {
-        let _ = (key, weight);
+    fn prefetch_lazy_weight(
+        &self,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<bool> {
+        let _ = (key, weight, source);
         Ok(false)
     }
 
@@ -480,6 +486,21 @@ pub trait ExecutionProvider: Send + Sync {
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;
 
+    fn allocate_with_mapped_growth(
+        &self,
+        size: usize,
+        alignment: usize,
+        grant: onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<DeviceBuffer> {
+        let newly_mapped_bytes = self.mapped_bytes_for_allocation(size, alignment)?;
+        let allocation = self.allocate(size, alignment)?;
+        if let Err(error) = grant.commit_bytes(newly_mapped_bytes) {
+            let _ = self.deallocate(allocation);
+            return Err(EpError::Memory(error));
+        }
+        Ok(allocation)
+    }
+
     /// Allocate device address space while committing only selected byte ranges.
     ///
     /// Providers whose allocator cannot reserve without committing should use
@@ -509,17 +530,45 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Commit all listed ranges as one allocator transaction.
+    fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
+        for &(buffer, offset, bytes) in ranges {
+            self.commit_allocation_range(buffer, offset, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn commit_allocation_ranges_with_mapped_growth(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+        grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
+    ) -> Result<u64> {
+        let _ = grant;
+        self.commit_allocation_ranges(ranges)?;
+        self.mapped_bytes_for_allocation_ranges(ranges)
+    }
+
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[(&DeviceBuffer, usize, usize)],
+    ) -> Result<u64> {
+        Ok(ranges.iter().fold(0_u64, |total, (_, _, bytes)| {
+            total.saturating_add(*bytes as u64)
+        }))
+    }
+
     /// Release physical backing from a byte range in an existing allocation
     /// while preserving its virtual address. Eager providers keep the default
     /// no-op; lazy providers use this for transactional growth rollback.
+    /// Returns the bytes actually unmapped after shared references are applied.
     fn decommit_allocation_range(
         &self,
         buffer: &DeviceBuffer,
         offset: usize,
         bytes: usize,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _ = (buffer, offset, bytes);
-        Ok(())
+        Ok(0)
     }
 
     /// Physical bytes currently claimed by `buffer`. Eager providers return
@@ -530,6 +579,15 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
+
+    /// Free device memory and report mapped-zone bytes actually unmapped.
+    ///
+    /// The report is based on global mapping references, not which allocation
+    /// originally caused the mapping.
+    fn deallocate_with_unmapped(&self, buffer: DeviceBuffer) -> Result<u64> {
+        self.deallocate(buffer)?;
+        Ok(0)
+    }
 
     /// Synchronous copy (host↔device or device↔device).
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()>;
@@ -684,6 +742,43 @@ pub trait ExecutionProvider: Send + Sync {
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// Reserve governed bytes for executor-owned kernel workspace.
+    ///
+    /// Providers whose allocator already charges committed bytes may return
+    /// `None`; providers backed by an eager allocator retain the returned lease
+    /// alongside the allocation. The default preserves compatibility for
+    /// providers without a device-memory governor.
+    fn reserve_workspace(
+        &self,
+        _bytes: u64,
+        _role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        Ok(None)
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        // `role` describes content/lifetime. Providers whose allocator
+        // suballocates shared granules must canonicalize it to the arena's
+        // physical mapped-attribution zone.
+        let _ = (bytes, role);
+        Ok(None)
+    }
+
+    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
+        let _ = alignment;
+        Ok(bytes as u64)
+    }
+
+    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+        // This must use the same canonical physical zone as
+        // `prepare_mapped_growth`; allocation lifetime is not map ownership.
+        let _ = (bytes, role);
     }
 
     /// Place any long-lived device memory this provider holds under `governor`.

@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity regressions for the frozen `pkg.nxrt::BlockQuantizedMoE` v1 op.
 //!
 //! Every case builds small synthetic block-quantized MoE tensors (mxfp4-packed
@@ -9,7 +23,8 @@
 //! these as ignored unless `gpu-tests` is enabled.
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata,
+    TensorMut, TensorView, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -360,7 +375,22 @@ fn run_gpu(
         &output_strides,
         ep.device_id(),
     );
-    kernel.execute(&views, &mut [output_view])?;
+    let metadata = views
+        .iter()
+        .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata)?;
+    let workspace_bytes = usize::try_from(requirement.bytes)
+        .map_err(|_| onnx_runtime_ep_api::EpError::KernelFailed("workspace too large".into()))?;
+    let mut workspace = ep.allocate(workspace_bytes, requirement.alignment)?;
+    kernel.execute_with_workspace(
+        &views,
+        &mut [output_view],
+        Some(WorkspaceView::new(
+            DevicePtrMut(workspace.as_mut_ptr()),
+            workspace_bytes,
+        )),
+    )?;
     let mut output = vec![0u8; output_len * 4];
     // SAFETY: the destination exactly covers the f32 output allocation.
     unsafe { runtime.dtoh(&mut output, cuptr(output_buffer.as_ptr()))? };
@@ -369,6 +399,7 @@ fn run_gpu(
         ep.deallocate(buffer)?;
     }
     ep.deallocate(output_buffer)?;
+    ep.deallocate(workspace)?;
     Ok(output
         .chunks_exact(4)
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))

@@ -5,14 +5,15 @@ use crate::decode::{
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
-    Engine, EngineConfig, component_governor, model_requires_native_backend,
-    requested_decode_backend,
+    Engine, EngineConfig, EngineResourceGovernor, component_governor,
+    model_requires_native_backend, requested_decode_backend,
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
     sequence_pages_for_len,
 };
 use crate::logits::TokenId;
+use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
@@ -220,6 +221,13 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 /// Engine for metadata-declared multi-model pipelines.
 pub struct PipelineEngine {
     models: PipelineModels,
+    /// Owns the pipeline's component-weight reservation. It is created before
+    /// any component session, so a failed load rolls the reservation back.
+    resource_governor: EngineResourceGovernor,
+    /// Autoregressive pipelines need a second plan after session graph I/O is
+    /// available. Both governors delegate device accounting to the same
+    /// authority; this one owns only the KV plan.
+    _kv_governor: Option<EngineResourceGovernor>,
     plan: PipelinePlan,
     decode_backend: EngineDecodeBackend,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
@@ -247,6 +255,8 @@ pub struct PipelineEngine {
     /// `--ep cuda`), honored by the native pipeline decoder when the
     /// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` override is unset.
     native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
+    #[cfg(feature = "cuda")]
+    native_cuda_authority: Option<crate::memory_authority::DeviceMemoryAuthority>,
 }
 
 /// Paged KV storage for an autoregressive pipeline decoder.
@@ -306,6 +316,20 @@ fn native_backend_not_compiled_error() -> anyhow::Error {
          decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) to use ONNX \
          Runtime."
     )
+}
+
+/// Resolve and validate an explicitly requested pipeline backend without
+/// touching model files. Server construction calls this before its own package
+/// discovery so both entry points preserve the same fail-fast behavior.
+pub fn validate_pipeline_backend_request(
+    requested: EngineDecodeBackend,
+) -> anyhow::Result<EngineDecodeBackend> {
+    let backend = requested_decode_backend(requested)?;
+    #[cfg(not(feature = "native-backend"))]
+    if backend == EngineDecodeBackend::Native {
+        return Err(native_backend_not_compiled_error());
+    }
+    Ok(backend)
 }
 
 /// Construct all pipeline components through the native
@@ -489,10 +513,14 @@ fn build_step_component_session<'a>(
 /// nothing from the pipeline decode state. Requesting the native decoder in a
 /// build without the `native-backend` feature is a clear error, mirroring
 /// [`build_step_component_session`].
+#[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
 fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
     config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+    #[cfg(feature = "cuda")] governor: std::sync::Arc<
+        dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+    >,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
@@ -518,6 +546,8 @@ fn build_native_pipeline_decoder(
             path,
             native_decoder_device(config_device),
             io,
+            #[cfg(feature = "cuda")]
+            governor,
         )?;
         Ok(Box::new(native))
     }
@@ -617,6 +647,14 @@ impl Engine {
         PipelineEngine::from_dir_with_config(pipeline_dir, config)
     }
 
+    pub fn from_pipeline_dir_with_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<PipelineEngine> {
+        PipelineEngine::from_dir_with_memory_authority_provider(pipeline_dir, config, provider)
+    }
+
     /// Load a pipeline directory with a custom [`SchedulerRegistry`] so users
     /// can plug in their own [`Scheduler`] implementations.
     pub fn from_pipeline_dir_with_schedulers(
@@ -660,6 +698,22 @@ impl PipelineEngine {
             config,
             &SchedulerRegistry::builtin(),
             session_options,
+            None,
+        )
+    }
+
+    /// Load a pipeline using a caller-owned device authority provider.
+    pub fn from_dir_with_memory_authority_provider(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        provider: Arc<dyn MemoryAuthorityProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            pipeline_dir,
+            config,
+            &SchedulerRegistry::builtin(),
+            SessionOptions::default(),
+            Some(provider),
         )
     }
 
@@ -672,7 +726,13 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
     ) -> anyhow::Result<Self> {
-        Self::build(pipeline_dir, config, schedulers, SessionOptions::default())
+        Self::build(
+            pipeline_dir,
+            config,
+            schedulers,
+            SessionOptions::default(),
+            None,
+        )
     }
 
     fn build(
@@ -680,8 +740,29 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
         session_options: SessionOptions,
+        authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        let decode_backend = requested_decode_backend(config.decode_backend)?;
+        // Explicit backend requests must fail before touching the model
+        // directory. In particular, a binary without native support should
+        // report the actionable rebuild error even when the path is invalid.
+        let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
+        let authority_domain = crate::engine::session_device_domain(&session_options)?;
+        crate::engine::validate_shared_authority_limit(
+            authority_provider.as_ref(),
+            &authority_domain,
+            config.limits.vram_limit,
+        )?;
+        let directory = PipelineModelDirectory::load(pipeline_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
+        let model_weights_bytes =
+            directory
+                .model_paths
+                .values()
+                .try_fold(0_u64, |total, path| {
+                    total
+                        .checked_add(onnx_genai_ort::model_weight_bytes(path))
+                        .ok_or_else(|| anyhow::anyhow!("pipeline component weight size overflow"))
+                })?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
         // backends resolve without touching the model directory (so a bad
         // request fails fast); `Auto` inspects the components' declared
@@ -689,12 +770,42 @@ impl PipelineEngine {
         let backend = match decode_backend {
             EngineDecodeBackend::Ort => PipelineBackend::Ort,
             EngineDecodeBackend::Native => PipelineBackend::Native,
-            EngineDecodeBackend::Auto => {
-                let directory = PipelineModelDirectory::load(pipeline_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
-                resolve_auto_pipeline_backend(&directory)?
-            }
+            EngineDecodeBackend::Auto => resolve_auto_pipeline_backend(&directory)?,
         };
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let authority_domain = if backend == PipelineBackend::Native {
+            match native_decoder_device(config.native_device.as_ref()) {
+                crate::native_decode_device::NativeDecodeDevice::Cuda { index } => {
+                    crate::memory_authority::DeviceCompatibilityDomain::Cuda(index.unwrap_or(0))
+                }
+                _ => authority_domain,
+            }
+        } else {
+            authority_domain
+        };
+        // Reserve every component's package bytes before constructing the
+        // first session. Native CUDA components and their VMM pool share this
+        // same authority, including in standalone pipelines.
+        let resource_governor = component_governor(
+            &config,
+            None,
+            model_weights_bytes,
+            authority_provider.as_ref(),
+            &authority_domain,
+        )?;
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let native_cuda_authority = if backend == PipelineBackend::Native {
+            match native_decoder_device(config.native_device.as_ref()) {
+                crate::native_decode_device::NativeDecodeDevice::Cuda { .. } => {
+                    Some(resource_governor.device_authority())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(all(feature = "cuda", not(feature = "native-backend")))]
+        let native_cuda_authority = None;
         if backend == PipelineBackend::Native {
             // The native backend constructs every declared component through the
             // backend-neutral `ComponentSession` seam (GAP 1). When the crate is
@@ -713,8 +824,6 @@ impl PipelineEngine {
             // the plan is known (below), rather than at construction.
         }
         let native_ort_skips = if backend == PipelineBackend::Native {
-            let directory = PipelineModelDirectory::load(pipeline_dir)
-                .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
             match PipelinePlan::from_spec(&directory.spec, schedulers)? {
                 PipelinePlan::Autoregressive(ar) => {
                     let mut skips = BTreeSet::from([ar.decoder]);
@@ -753,105 +862,122 @@ impl PipelineEngine {
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
         let mut paged: Option<PipelinePagedKv> = None;
-        let (decoder_state, tokenizer_component, fixed_state_budget_bytes) =
-            match &plan {
-                PipelinePlan::Autoregressive(ar) => {
-                    let decoder = models.graph_io(&ar.decoder).with_context(|| {
-                        format!("pipeline decoder '{}' was not loaded", ar.decoder)
-                    })?;
-                    let decoder_io = models
-                        .directory
-                        .spec
-                        .models
-                        .get(&ar.decoder)
-                        .and_then(|component| component.io.as_ref());
-                    let kv_model = infer_kv_model_info(
-                        decoder,
-                        decoder_io,
-                        config.page_size,
-                        config.kv_cache_dtype,
-                    )?;
-                    let component_governor = component_governor(&config, kv_model.as_ref())?;
-                    let fixed_state_budget_bytes =
-                        component_governor.snapshot().resolved_limits.host_ram_bytes;
-                    let pipeline_pages = match kv_model.as_ref() {
-                        Some(kv_model) => crate::engine::kv_pages_for_budget(
-                            component_governor.snapshot().derived_budget.kv_bytes,
-                            component_governor.snapshot().resolved_limits.host_ram_bytes,
-                            config.scheduler.max_total_tokens,
-                            kv_model.tensor_config.page_size,
-                            kv_model.tensor_config.dtype,
-                            &kv_model.layer_configs,
-                        ),
-                        None => 0,
-                    };
-                    // A zero page size makes `div_ceil` panic and the page-boundary
-                    // walk below produce zeros forever, so it is refused rather than
-                    // carried into arithmetic that assumes it is positive.
-                    paged = match kv_model.filter(|kv_model| kv_model.tensor_config.page_size > 0) {
+        let mut kv_governor = None;
+        let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
+            PipelinePlan::Autoregressive(ar) => {
+                let decoder = models
+                    .graph_io(&ar.decoder)
+                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
+                let decoder_io = models
+                    .directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                let kv_model = infer_kv_model_info(
+                    decoder,
+                    decoder_io,
+                    config.page_size,
+                    config.kv_cache_dtype,
+                )?;
+                let kv_config = match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
+                    None => crate::engine::governor_no_paged_kv_config(&config)?,
+                };
+                let component_governor = EngineResourceGovernor::new_for_shared_pipeline_kv(
+                    config.limits.clone(),
+                    config.allow_runtime_override,
+                    kv_config,
+                    resource_governor.snapshot().vram.used,
+                    authority_provider.as_ref(),
+                    &authority_domain,
+                )
+                .context("failed to resolve the shared pipeline KV memory budget")?;
+                let fixed_state_budget_bytes =
+                    component_governor.snapshot().resolved_limits.host_ram_bytes;
+                let pipeline_pages = match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::kv_pages_for_budget(
+                        component_governor.snapshot().derived_budget.kv_bytes,
+                        component_governor.snapshot().resolved_limits.host_ram_bytes,
+                        config.scheduler.max_total_tokens,
+                        kv_model.tensor_config.page_size,
+                        kv_model.tensor_config.dtype,
+                        &kv_model.layer_configs,
+                    ),
+                    None => 0,
+                };
+                // A zero page size makes `div_ceil` panic and the page-boundary
+                // walk below produce zeros forever, so it is refused rather than
+                // carried into arithmetic that assumes it is positive.
+                paged = match kv_model.filter(|kv_model| kv_model.tensor_config.page_size > 0) {
                     Some(kv_model) => Some(PipelinePagedKv {
-                        cache: component_governor.plan().kv_pool(
-                            crate::engine::memory_plan::Holder::PipelineKvPool,
-                            kv_model.tensor_config.page_size,
-                            kv_model.tensor_config.dtype,
-                            kv_model.layer_configs.clone(),
-                            pipeline_pages,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "cannot allocate the pipeline KV page pool: {pipeline_pages} \
+                        cache: component_governor
+                            .plan()
+                            .kv_pool(
+                                crate::engine::memory_plan::Holder::PipelineKvPool,
+                                kv_model.tensor_config.page_size,
+                                kv_model.tensor_config.dtype,
+                                kv_model.layer_configs.clone(),
+                                pipeline_pages,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "cannot allocate the pipeline KV page pool: {pipeline_pages} \
                                  page(s) across {} layer(s) do not fit the resolved KV/host \
                                  memory budget",
-                                kv_model.layer_configs.len()
-                            )
-                        })?,
+                                    kv_model.layer_configs.len()
+                                )
+                            })?,
                         kv_model,
                         prefix: PrefixCache::new(),
                         active: None,
                     }),
                     None => None,
                 };
-                    let decoder_io = models
-                        .directory
-                        .spec
-                        .models
-                        .get(&ar.decoder)
-                        .and_then(|component| component.io.as_ref());
-                    let positions = models.directory.spec.positions.as_ref();
-                    (
-                        Some(DecodeState::new_with_io_positions_and_state_budget(
-                            decoder,
-                            decoder_io,
-                            positions,
-                            fixed_state_budget_bytes,
-                        )?),
-                        ar.decoder.clone(),
+                kv_governor = Some(component_governor);
+                let decoder_io = models
+                    .directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                let positions = models.directory.spec.positions.as_ref();
+                (
+                    Some(DecodeState::new_with_io_positions_and_state_budget(
+                        decoder,
+                        decoder_io,
+                        positions,
                         fixed_state_budget_bytes,
-                    )
-                }
-                // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
-                // decode loops with per-loop `DecodeState`s built inside the driver,
-                // so no shared decode state is created here. The tokenizer component
-                // is the outer decoder (talker).
-                PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone(), 0),
-                PipelinePlan::SinglePass(sp) => (None, sp.model.clone(), 0),
-                PipelinePlan::Iterative(it) => (None, it.denoiser.clone(), 0),
-                // A pure composite produces tensors (run_pipeline), not text; it has
-                // no autoregressive decode state. Use the last stage's model as the
-                // nominal tokenizer component (unused unless a tokenizer is queried).
-                PipelinePlan::Composite(c) => (
-                    None,
-                    c.stages
-                        .last()
-                        .map(|stage| match &stage.kind {
-                            CompositeStageKind::SinglePass { model } => model.clone(),
-                        })
-                        .unwrap_or_default(),
-                    0,
-                ),
-            };
+                    )?),
+                    ar.decoder.clone(),
+                    fixed_state_budget_bytes,
+                )
+            }
+            // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
+            // decode loops with per-loop `DecodeState`s built inside the driver,
+            // so no shared decode state is created here. The tokenizer component
+            // is the outer decoder (talker).
+            PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone(), 0),
+            PipelinePlan::SinglePass(sp) => (None, sp.model.clone(), 0),
+            PipelinePlan::Iterative(it) => (None, it.denoiser.clone(), 0),
+            // A pure composite produces tensors (run_pipeline), not text; it has
+            // no autoregressive decode state. Use the last stage's model as the
+            // nominal tokenizer component (unused unless a tokenizer is queried).
+            PipelinePlan::Composite(c) => (
+                None,
+                c.stages
+                    .last()
+                    .map(|stage| match &stage.kind {
+                        CompositeStageKind::SinglePass { model } => model.clone(),
+                    })
+                    .unwrap_or_default(),
+                0,
+            ),
+        };
         Ok(Self {
             models,
+            resource_governor,
+            _kv_governor: kv_governor,
             plan,
             decode_backend: match backend {
                 PipelineBackend::Ort => EngineDecodeBackend::Ort,
@@ -867,7 +993,47 @@ impl PipelineEngine {
             retained: None,
             paged,
             native_device: config.native_device.clone(),
+            #[cfg(feature = "cuda")]
+            native_cuda_authority,
         })
+    }
+
+    pub fn resource_snapshot(&self) -> onnx_genai_scheduler::GovernorSnapshot {
+        #[cfg(feature = "cuda")]
+        {
+            let mut snapshot = self.resource_governor.snapshot();
+            if let Some(authority) = &self.native_cuda_authority {
+                snapshot.vram.used = authority.used_bytes();
+                snapshot.vram.limit = authority.limit_bytes();
+                snapshot.vram.headroom = authority.headroom_bytes();
+                snapshot.resolved_limits.vram_bytes = authority.limit_bytes();
+            }
+            snapshot
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.resource_governor.snapshot()
+        }
+    }
+
+    pub fn models(&self) -> &PipelineModels {
+        &self.models
+    }
+
+    pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {
+        #[cfg(feature = "cuda")]
+        if let Some(authority) = &self.native_cuda_authority {
+            return authority.clone();
+        }
+        self.resource_governor.device_authority()
+    }
+
+    pub fn set_vram_limit(
+        &self,
+        limit: onnx_genai_scheduler::ResourceLimit,
+    ) -> Result<onnx_genai_scheduler::GovernorReconfigureOutcome, crate::engine::EngineGovernorError>
+    {
+        self.resource_governor.set_vram_limit(limit)
     }
 
     /// Generate text from a pipeline with no extra non-text tensors.
@@ -890,15 +1056,30 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callbacks(pipeline_request, None, callback)
+    }
+
+    /// Generate text with a pre-token admission callback. For a native routed
+    /// decoder, admission fires only after exact step inputs have prepared and
+    /// reserved governed workspace.
+    pub fn generate_with_callbacks(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+        mut admission: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
         // loops; `generate` returns the flattened per-frame code tokens (use
         // `synthesize` to also run the post-decode vocoder into a waveform).
         if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
+            if let Some(admitted) = admission.as_mut() {
+                admitted();
+            }
             return self
                 .run_nested_autoregressive(pipeline_request)
                 .map(|(result, _pool)| result);
         }
-        self.run_autoregressive(pipeline_request, callback)
+        self.run_autoregressive(pipeline_request, admission, callback)
             .map(|(result, _pool)| result)
     }
 
@@ -926,7 +1107,7 @@ impl PipelineEngine {
         if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
             return self.synthesize_nested(pipeline_request);
         }
-        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None)?;
+        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None, None)?;
         let ar = self.plan.autoregressive_plan()?.clone();
 
         // Publish the AR decoder's generated code sequence into the shared pool

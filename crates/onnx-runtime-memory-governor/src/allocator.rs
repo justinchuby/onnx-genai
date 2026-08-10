@@ -37,7 +37,22 @@
 use std::fmt::Debug;
 use std::ptr::NonNull;
 
-use crate::{MemoryError, Tier};
+use crate::{MappedPhysicalCapacityToken, MemoryError, Tier};
+
+#[derive(Clone, Copy, Debug)]
+pub struct AllocationCommitRange {
+    pub ptr: NonNull<u8>,
+    pub allocation_bytes: usize,
+    pub align: usize,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct MappedAllocation<T> {
+    pub allocation: T,
+    pub newly_mapped_bytes: u64,
+}
 
 /// Which physical device memory comes from.
 ///
@@ -132,6 +147,24 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         self.allocate(bytes, align)
     }
 
+    fn allocate_committed_with_capacity(
+        &self,
+        bytes: usize,
+        align: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<MappedAllocation<NonNull<u8>>, MemoryError> {
+        let _ = capacity;
+        let allocation = self.allocate_committed(bytes, align, committed_ranges)?;
+        let newly_mapped_bytes = committed_ranges.iter().fold(0_u64, |total, range| {
+            total.saturating_add(range.len() as u64)
+        });
+        Ok(MappedAllocation {
+            allocation,
+            newly_mapped_bytes,
+        })
+    }
+
     /// Ensure `offset..offset + bytes` in an existing allocation is physically
     /// backed.
     ///
@@ -151,12 +184,59 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         Ok(())
     }
 
+    /// Commit several allocation ranges as one allocator transaction.
+    ///
+    /// Lazy allocators override this to union shared physical granules under a
+    /// single lock. The eager/default implementation preserves compatibility.
+    fn commit_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<(), MemoryError> {
+        for range in ranges {
+            self.commit_allocation_range(
+                range.ptr,
+                range.allocation_bytes,
+                range.align,
+                range.offset,
+                range.bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn commit_allocation_ranges_with_capacity(
+        &self,
+        ranges: &[AllocationCommitRange],
+        capacity: &mut MappedPhysicalCapacityToken,
+    ) -> Result<u64, MemoryError> {
+        let _ = capacity;
+        self.commit_allocation_ranges(ranges)?;
+        self.mapped_bytes_for_allocation_ranges(ranges)
+    }
+
+    /// Mapped attribution bytes represented by a batched set of ranges.
+    fn mapped_bytes_for_allocation_ranges(
+        &self,
+        ranges: &[AllocationCommitRange],
+    ) -> Result<u64, MemoryError> {
+        Ok(ranges.iter().fold(0_u64, |total, range| {
+            total.saturating_add(range.bytes as u64)
+        }))
+    }
+
+    /// Mapped bytes required to fully back a new allocation.
+    fn mapped_bytes_for_allocation(&self, bytes: usize, align: usize) -> Result<u64, MemoryError> {
+        let _ = align;
+        Ok(bytes as u64)
+    }
+
     /// Release physical backing from a byte range in an existing allocation
     /// while keeping its virtual address reserved.
     ///
     /// The default is a no-op because eager allocators cannot partially unmap
     /// allocations. Lazy allocators may override this so callers can roll back
     /// a failed multi-buffer growth without leaving committed bytes charged.
+    /// Returns the physical bytes whose global mapping reference reached zero.
     fn decommit_allocation_range(
         &self,
         ptr: NonNull<u8>,
@@ -164,9 +244,9 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         align: usize,
         offset: usize,
         bytes: usize,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<u64, MemoryError> {
         let _ = (ptr, allocation_bytes, align, offset, bytes);
-        Ok(())
+        Ok(0)
     }
 
     /// Physical bytes currently claimed by this allocation.
@@ -229,6 +309,21 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// allocator with exactly this `bytes` and `align`, and must not be
     /// deallocated twice.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize);
+
+    /// Free an allocation and report bytes whose global mapping reference
+    /// count transitioned from one to zero.
+    ///
+    /// Eager allocators have no shared-granule attribution and return zero.
+    ///
+    /// # Safety
+    ///
+    /// `ptr`, `bytes`, and `align` must identify one live allocation returned
+    /// by this allocator, exactly as required by [`DeviceAllocator::deallocate`].
+    unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
+        // SAFETY: forwarded under this method's identical contract.
+        unsafe { self.deallocate(ptr, bytes, align) };
+        0
+    }
 
     /// Which device this allocator serves.
     fn device(&self) -> DeviceKey;

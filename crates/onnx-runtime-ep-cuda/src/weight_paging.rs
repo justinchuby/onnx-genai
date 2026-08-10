@@ -17,31 +17,89 @@
 //! page, and async prefetch overlap (issues #82/#87).
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    LazyDeviceWeightBinder, LazyWeight, MmapRegionSource, WeightHandleError,
+    LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource, WeightHandleError,
 };
 use onnx_runtime_ir::DataType;
+use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
 use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 
-/// Process-global weight-offload activity counters. Every [`CudaWeightResidency`]
-/// updates these in addition to its own instance stats, so an end-to-end decode
-/// driven through an opaque engine (where the residency handle is not reachable)
-/// can still be observed — e.g. a token-parity test asserting that paging and
-/// eviction actually happened. Instance [`CudaResidencyStats`] remain the precise
-/// per-cache view; these are a coarse cross-cache tally.
+/// Process-global weight-offload activity counters. These may be reset between
+/// benchmark measurement windows while caches remain alive.
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_ISSUED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_DECLINED_GUARD: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_JOINED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_STAGING_ALLOCS: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_PREFETCH_STAGING_REUSES: AtomicU64 = AtomicU64::new(0);
+// Time spent filling the host staging buffer from mmap regions. This is a
+// host-blocking CPU memcpy span and contains no CUDA synchronization.
+static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+// CUDA-event elapsed time for H2D DMA: start event before cuMemcpyHtoDAsync,
+// end event after it, then host-block on the end event to read elapsed time.
+static GLOBAL_HTOD_NS: AtomicU64 = AtomicU64::new(0);
+// Host-blocking compute-stream synchronize taken before evicting pages whose
+// VRAM might still be referenced by earlier kernels.
+static GLOBAL_ADMIT_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_REGIONS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_STAGING_FILL_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_MATERIALIZE_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
+// Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
+static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
+// Process-lifetime high-water gauge. Resetting activity counters must not write
+// it: a concurrent page-in could otherwise be overwritten with a stale value.
+static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+// Process-global live-state gauges. Unlike the activity counters above, these
+// are changed only when a cache, page, or mapping changes state. Resetting a
+// benchmark window must preserve them because hits do not rewrite residency.
+static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_CONTENT_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_WEIGHT_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn add_duration(counter: &AtomicU64, elapsed: Duration) {
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    counter.fetch_add(nanos, Ordering::Relaxed);
+}
+
+fn replace_global_budget(old: u64, new: u64) {
+    if new >= old {
+        GLOBAL_BUDGET_BYTES.fetch_add(new - old, Ordering::Relaxed);
+    } else {
+        let decrease = old - new;
+        let _ = GLOBAL_BUDGET_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(decrease))
+        });
+    }
+}
+
+fn committed_admission_fits(
+    required_mapped: u64,
+    zone_available: u64,
+    required_owned: u64,
+    global_available: u64,
+) -> bool {
+    required_mapped <= zone_available && required_owned <= global_available
+}
+
+fn eviction_made_committed_progress(
+    before_owned: u64,
+    after_owned: u64,
+    before_required_owned: u64,
+    after_required_owned: u64,
+    before_required_mapped: u64,
+    after_required_mapped: u64,
+) -> bool {
+    after_owned < before_owned
+        || after_required_owned < before_required_owned
+        || after_required_mapped < before_required_mapped
+}
 
 /// Snapshot of the process-global weight-offload counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,11 +107,21 @@ pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
     pub evictions: u64,
-    pub prefetch_issued: u64,
-    pub prefetch_declined_guard: u64,
-    pub prefetch_joined: u64,
-    pub prefetch_staging_allocs: u64,
-    pub prefetch_staging_reuses: u64,
+    pub materialize_ns: u64,
+    pub htod_ns: u64,
+    pub admit_sync_ns: u64,
+    pub staging_fill_bytes: u64,
+    pub staging_fill_regions: u64,
+    pub staging_fill_calls: u64,
+    pub materialize_fallback_calls: u64,
+    pub htod_bytes: u64,
+    pub vram_alloc_ns: u64,
+    pub vram_free_ns: u64,
+    pub budget_bytes: u64,
+    pub peak_resident_bytes: u64,
+    pub content_resident_bytes: u64,
+    pub physical_owned_bytes: u64,
+    pub mapped_physical_bytes: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -62,24 +130,45 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
-        prefetch_issued: GLOBAL_PREFETCH_ISSUED.load(Ordering::Relaxed),
-        prefetch_declined_guard: GLOBAL_PREFETCH_DECLINED_GUARD.load(Ordering::Relaxed),
-        prefetch_joined: GLOBAL_PREFETCH_JOINED.load(Ordering::Relaxed),
-        prefetch_staging_allocs: GLOBAL_PREFETCH_STAGING_ALLOCS.load(Ordering::Relaxed),
-        prefetch_staging_reuses: GLOBAL_PREFETCH_STAGING_REUSES.load(Ordering::Relaxed),
+        materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
+        htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
+        admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
+        staging_fill_bytes: GLOBAL_STAGING_FILL_BYTES.load(Ordering::Relaxed),
+        staging_fill_regions: GLOBAL_STAGING_FILL_REGIONS.load(Ordering::Relaxed),
+        staging_fill_calls: GLOBAL_STAGING_FILL_CALLS.load(Ordering::Relaxed),
+        materialize_fallback_calls: GLOBAL_MATERIALIZE_FALLBACK_CALLS.load(Ordering::Relaxed),
+        htod_bytes: GLOBAL_HTOD_BYTES.load(Ordering::Relaxed),
+        vram_alloc_ns: GLOBAL_VRAM_ALLOC_NS.load(Ordering::Relaxed),
+        vram_free_ns: GLOBAL_VRAM_FREE_NS.load(Ordering::Relaxed),
+        budget_bytes: GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed),
+        peak_resident_bytes: GLOBAL_PEAK_RESIDENT_BYTES.load(Ordering::Relaxed),
+        content_resident_bytes: GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
+        physical_owned_bytes: crate::virtual_memory::total_physical_pool_owned_bytes(),
+        mapped_physical_bytes: GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
     }
 }
 
-/// Reset the process-global weight-offload counters (test observability helper).
+/// Reset cumulative weight-offload activity for a new measurement window.
+///
+/// Live gauges (`budget_bytes`, `content_resident_bytes`,
+/// `mapped_physical_bytes`, authority-owned physical bytes, and the
+/// process-lifetime `peak_resident_bytes`) are preserved. Caches and mappings
+/// may outlive a benchmark warmup reset, and cache hits do not rewrite those
+/// values. Benchmarks needing an interval peak must track it locally.
 pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_ISSUED.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_DECLINED_GUARD.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_JOINED.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_STAGING_ALLOCS.store(0, Ordering::Relaxed);
-    GLOBAL_PREFETCH_STAGING_REUSES.store(0, Ordering::Relaxed);
+    GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
+    GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
+    GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_REGIONS.store(0, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_MATERIALIZE_FALLBACK_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
+    GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -91,47 +180,88 @@ pub const WEIGHT_OFFLOAD_ENV: &str = onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV;
 /// manager is constructed with a caller-chosen default.
 pub const WEIGHT_OFFLOAD_DEVICE_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES";
 
-/// Sub-knob (default OFF / opt-IN) selecting the asynchronous, fence-ordered
+/// Sub-knob (default ON / opt-OUT) selecting the asynchronous, fence-ordered
 /// residency page-in over the synchronous `cuMemcpyHtoD`. Set to a truthy value
-/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to enable async page-in;
-/// unset or any other value uses the synchronous page-in. Async is opt-in because
-/// a measured A/B (qwen3-0.6b-int4, 96MiB budget, eviction/thrash regime) showed
-/// sync is FASTER (15.84 vs 12.16 tok/s): when every admit evicts, the async path
-/// cannot overlap and still pays a non-overlappable pinned-staging alloc+copy. The
-/// async path stays fully intact behind this flag (the A/B "after" arm) and is
-/// expected to become a net win once a warm-host materialize cache lands. This
+/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to force async page-in;
+/// set to a falsy value (`0`/`false`/`no`/`off`) to force synchronous page-in.
+/// Unset uses async because the not-fit WDDM regime needs a prefetchable,
+/// fence-ordered H2D path; keeping the old synchronous default made every
+/// lookahead request decline before it could overlap the known layer order. This
 /// knob only has any effect when weight offload itself is enabled
 /// (`ONNX_GENAI_WEIGHT_OFFLOAD=1`); with offload off the resident fast path is
 /// untouched and byte-identical regardless.
 pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN";
 
-/// Pure opt-in parse for [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is
-/// **default-off**: only an explicit truthy value (`1`/`true`/`yes`/`on`,
-/// case/whitespace-insensitive) enables it; unset (`None`) or any other value
-/// keeps the synchronous page-in.
+/// Sub-knob (default ON / opt-OUT) selecting scan-resistant residency for dense
+/// per-layer weight walks. Set to a falsey value (`0`/`false`/`no`/`off`,
+/// case/whitespace-insensitive) to force the old LRU policy for A/B.
+///
+/// Default is ON because qwen2.5-14b measured 0/6,936 LRU hits at a 6 GB
+/// budget, while stable dense residency measured 5,145/6,936 hits (74.18%) and
+/// reduced evictions from 6,286 to 0 in the same harness.
+pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_SCAN_RESISTANT";
+
+/// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
+/// unset (`None`) enables it, an explicit falsy value disables it, and truthy
+/// values keep it enabled.
 pub(crate) fn async_pagein_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         ),
-        None => false,
+        None => true,
+    }
+}
+
+/// Parse [`WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV`]. Scan-resistant dense residency
+/// defaults ON; explicit falsey values force old LRU for A/B and rollback.
+pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => true,
     }
 }
 
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceOffloadPolicy {
     pub enabled: bool,
+    /// An explicit device byte limit selected authority-managed VMM allocation
+    /// instead of the WDDM-spill-compatible allocator.
+    pub managed_no_spill: bool,
+    /// The explicit authority ceiling that selected managed no-spill mode.
+    pub managed_limit_bytes: Option<u64>,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
     pub device_budget_bytes: Option<u64>,
-    /// Use the asynchronous, fence-ordered page-in (default `false` / opt-IN).
-    /// Enabled only when `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` is set to a
-    /// truthy value (`1`/`true`/`yes`/`on`); otherwise the synchronous page-in
-    /// is used, which is faster in the eviction/thrash regime (measured A/B).
+    /// Use the asynchronous, fence-ordered page-in (default `true` / opt-out).
+    /// This is the only path that can prefetch the next known layer while the
+    /// current layer runs; set `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0` to
+    /// force the old synchronous demand page-in for A/B measurements.
     pub async_pagein: bool,
+    /// Use scan-resistant stable-subset residency for dense per-layer weights.
+    /// Default-on / opt-out via `ONNX_GENAI_WEIGHT_OFFLOAD_SCAN_RESISTANT=0`;
+    /// MoE boundaries stay on LRU even when this is enabled to avoid regressing
+    /// skewed expert selection.
+    pub scan_resistant_dense: bool,
+}
+
+impl Default for DeviceOffloadPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            managed_no_spill: false,
+            managed_limit_bytes: None,
+            device_budget_bytes: None,
+            async_pagein: false,
+            scan_resistant_dense: true,
+        }
+    }
 }
 
 impl DeviceOffloadPolicy {
@@ -141,16 +271,25 @@ impl DeviceOffloadPolicy {
         let device_budget_bytes = std::env::var(WEIGHT_OFFLOAD_DEVICE_BYTES_ENV)
             .ok()
             .and_then(|value| parse_budget_bytes(&value));
-        // Async page-in defaults OFF (opt-in); only an explicit truthy value enables it.
+        // Async page-in defaults ON; an explicit falsy value restores the old
+        // synchronous demand-copy path for A/B.
         let async_pagein = async_pagein_from_env_value(
             std::env::var(WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV)
                 .ok()
                 .as_deref(),
         );
+        let scan_resistant_dense = scan_resistant_from_env_value(
+            std::env::var(WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV)
+                .ok()
+                .as_deref(),
+        );
         Self {
             enabled,
+            managed_no_spill: false,
+            managed_limit_bytes: None,
             device_budget_bytes,
             async_pagein,
+            scan_resistant_dense,
         }
     }
 }
@@ -166,7 +305,12 @@ fn parse_budget_bytes(value: &str) -> Option<u64> {
 /// A snapshot of [`CudaWeightResidency`] activity for observability / tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CudaResidencyStats {
-    /// Budget the cache tries to stay within, in bytes.
+    /// Configured budget in bytes.
+    ///
+    /// With production VMM pooling, admission uses incremental physical bytes
+    /// and the shared governor's headroom. Without VMM, the allocator cannot
+    /// truthfully report physical ownership, so this retains content-byte
+    /// semantics.
     pub budget_bytes: u64,
     /// Bytes currently resident across all cached pages.
     pub resident_bytes: u64,
@@ -180,16 +324,16 @@ pub struct CudaResidencyStats {
     pub hits: u64,
     /// LRU evictions that freed a page's VRAM.
     pub evictions: u64,
-    /// Lookahead page-ins issued on the transfer stream.
-    pub prefetch_issued: u64,
-    /// Lookahead requests declined because admitting them would evict or grow.
-    pub prefetch_declined_guard: u64,
-    /// Demand page-ins that consumed an in-flight lookahead page.
-    pub prefetch_joined: u64,
-    /// Pinned staging buffers allocated for prefetch.
-    pub prefetch_staging_allocs: u64,
-    /// Pinned staging buffers reused from the prefetch pool.
-    pub prefetch_staging_reuses: u64,
+    /// Authority-owned physical bytes for the shared VMM pool.
+    ///
+    /// This is distinct from `resident_bytes`: content can share a granule,
+    /// and an unmapped retained handle remains physically owned.
+    pub physical_owned_bytes: u64,
+    /// Physical granules currently mapped and attributed to this weight zone.
+    pub mapped_physical_bytes: u64,
+    /// Admission passes that stopped because eviction made no physical or
+    /// reusable-pool progress.
+    pub admission_no_progress: u64,
 }
 
 /// A live VRAM residency page for one offloaded weight tensor.
@@ -200,10 +344,19 @@ pub struct CudaResidencyStats {
 /// for a consuming kernel's `TensorView`.
 pub struct CudaWeightPage {
     runtime: Arc<CudaRuntime>,
+    allocation: WeightAllocation,
     ptr: CUdeviceptr,
     len: usize,
     dtype: DataType,
     shape: Vec<usize>,
+}
+
+enum WeightAllocation {
+    Runtime,
+    Vmm {
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        allowance: onnx_runtime_memory_governor::MappedAllowance,
+    },
 }
 
 impl CudaWeightPage {
@@ -219,11 +372,14 @@ impl CudaWeightPage {
         if bytes.is_empty() {
             return Err(WeightHandleError::MissingRegions);
         }
+        let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(bytes.len())
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         let page = Self {
             runtime: Arc::clone(runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len: bytes.len(),
             dtype,
@@ -231,8 +387,11 @@ impl CudaWeightPage {
         };
         // SAFETY: `ptr` owns `bytes.len()` bytes; `page`'s Drop frees it if the
         // copy below fails.
+        let copy_start = std::time::Instant::now();
         unsafe { runtime.htod(bytes, ptr) }
             .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
+        add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(page)
     }
 
@@ -260,9 +419,11 @@ impl CudaWeightPage {
                 bytes.len()
             )));
         }
+        let alloc_start = std::time::Instant::now();
         let ptr = runtime
             .alloc_raw(bytes.len())
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
         staging.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         // Own the VRAM `ptr` before enqueuing the copy, so any error below drops
         // `page` and frees it exactly once. The pinned staging remains owned by
@@ -270,6 +431,7 @@ impl CudaWeightPage {
         // the source alive until the fence completes.
         let page = Self {
             runtime: Arc::clone(runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len: bytes.len(),
             dtype,
@@ -278,13 +440,60 @@ impl CudaWeightPage {
         // SAFETY: `dst` (`ptr`) owns `len` bytes; the async source is pinned
         // staging owned by the caller until the returned fence is awaited.
         let staged = &staging.as_slice()[..bytes.len()];
+        let copy_start = std::time::Instant::now();
         unsafe { runtime.htod_async(staged, ptr) }.map_err(|error| {
             WeightHandleError::DeviceBinding(format!("async H2D copy: {error}"))
         })?;
         let fence = runtime
             .record_copy_fence()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("copy fence: {error}")))?;
+        add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+        GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok((page, fence, staging))
+    }
+
+    /// Asynchronous upload from an already-filled pinned staging buffer.
+    ///
+    /// The live weight-offload path uses this to copy directly from the package
+    /// mmap into reusable pinned staging, avoiding the failure mode where every
+    /// page-in first rebuilt a throwaway owned host tensor.
+    pub fn upload_staged_async(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        len: usize,
+        staging: PinnedStaging,
+    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+        if len == 0 {
+            return Err(WeightHandleError::MissingRegions);
+        }
+        if staging.len() < len {
+            return Err(WeightHandleError::InvalidResident(format!(
+                "pinned staging buffer is too small: {} < {}",
+                staging.len(),
+                len
+            )));
+        }
+        let alloc_start = std::time::Instant::now();
+        let ptr = runtime
+            .alloc_raw(len)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        add_duration(&GLOBAL_VRAM_ALLOC_NS, alloc_start.elapsed());
+        let page = Self {
+            runtime: Arc::clone(runtime),
+            allocation: WeightAllocation::Runtime,
+            ptr,
+            len,
+            dtype,
+            shape,
+        };
+        let staged = &staging.as_slice()[..len];
+        let copy_ms = unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+        })?;
+        GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
+        GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        Ok((page, 0, staging))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -313,6 +522,44 @@ impl CudaWeightPage {
     }
 }
 
+fn fill_staging_from_regions(
+    weight: &LazyWeight,
+    source: &dyn MmapRegionSource,
+    staging: &mut PinnedStaging,
+) -> Result<(), WeightHandleError> {
+    let total = weight.region_bytes_len();
+    if total == 0 {
+        return Err(WeightHandleError::MissingRegions);
+    }
+    if staging.len() < total {
+        return Err(WeightHandleError::InvalidResident(format!(
+            "pinned staging buffer is too small: {} < {}",
+            staging.len(),
+            total
+        )));
+    }
+    let mut offset = 0usize;
+    for region in &weight.regions {
+        let bytes = source.region_bytes(region)?;
+        if bytes.len() != region.len {
+            return Err(WeightHandleError::DeviceBinding(format!(
+                "region source returned {} bytes for a {}-byte region",
+                bytes.len(),
+                region.len
+            )));
+        }
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            WeightHandleError::InvalidResident("staging byte count overflow".into())
+        })?;
+        staging.as_mut_slice()[offset..end].copy_from_slice(bytes);
+        offset = end;
+    }
+    GLOBAL_STAGING_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_REGIONS.fetch_add(weight.regions.len() as u64, Ordering::Relaxed);
+    GLOBAL_STAGING_FILL_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+    Ok(())
+}
+
 impl std::fmt::Debug for CudaWeightPage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -328,7 +575,36 @@ impl Drop for CudaWeightPage {
     fn drop(&mut self) {
         // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
         // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
-        let _ = unsafe { self.runtime.free_raw(self.ptr) };
+        let free_start = std::time::Instant::now();
+        match &self.allocation {
+            WeightAllocation::Runtime => {
+                let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            }
+            WeightAllocation::Vmm {
+                allocator,
+                allowance,
+            } => {
+                // Unlike cuMemFree, unmapping a VMM span does not implicitly
+                // wait for kernels that still reference its virtual address.
+                // Retire the mapping only after both CUDA streams are idle so
+                // a pooled handle cannot be recycled under in-flight work.
+                if self.runtime.synchronize().is_err()
+                    || self.runtime.copy_stream().synchronize().is_err()
+                {
+                    return;
+                }
+                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
+                    let unmapped = allocator.deallocate_span(ptr);
+                    allowance.unmap(unmapped);
+                    let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(unmapped)),
+                    );
+                }
+            }
+        }
+        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 }
 
@@ -336,18 +612,18 @@ impl Drop for CudaWeightPage {
 ///
 /// Copies the canonical compressed region bytes host→device, so the device page
 /// is byte-identical to the resident tensor a stock EP would upload.
-pub struct CudaWeightPager<'a, S: MmapRegionSource> {
+pub struct CudaWeightPager<'a, S: MmapRegionSource + ?Sized> {
     runtime: Arc<CudaRuntime>,
     source: &'a S,
 }
 
-impl<'a, S: MmapRegionSource> CudaWeightPager<'a, S> {
+impl<'a, S: MmapRegionSource + ?Sized> CudaWeightPager<'a, S> {
     pub fn new(runtime: Arc<CudaRuntime>, source: &'a S) -> Self {
         Self { runtime, source }
     }
 }
 
-impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
+impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
     type Binding = CudaWeightPage;
 
     fn bind_block_quantized_moe(
@@ -368,6 +644,7 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
             .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
         let page = CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
+            allocation: WeightAllocation::Runtime,
             ptr,
             len: total,
             dtype: weight.dtype,
@@ -388,8 +665,11 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
             // SAFETY: `dst` lies within the `total`-byte allocation `page` owns
             // ([offset, offset + region.len) with the running sum bounded by
             // `total`); `bytes` covers exactly `region.len` bytes.
+            let copy_start = std::time::Instant::now();
             unsafe { self.runtime.htod(bytes, dst) }
                 .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
+            add_duration(&GLOBAL_HTOD_NS, copy_start.elapsed());
+            GLOBAL_HTOD_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             offset += region.len;
         }
 
@@ -406,6 +686,12 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
 /// [`CudaWeightPage`] is reused with no H2D traffic. When admitting a page would
 /// exceed the VRAM budget, least-recently-used pages are evicted first.
 ///
+/// Production VMM pooling changes the admission unit, not the cache-efficiency
+/// unit: the governor admits incremental authority-owned granules while hit
+/// rate and resident-content metrics continue to count canonical weight bytes.
+/// The non-VMM path intentionally retains content-byte admission until its
+/// allocator can report truthful physical ownership.
+///
 /// Eviction is use-safe: a page is only reclaimed while the cache is its sole
 /// owner (`Arc::strong_count == 1`). A page handed out and still referenced by an
 /// in-flight kernel is never freed, so a paged weight can never be pulled out from
@@ -414,40 +700,25 @@ impl<S: MmapRegionSource> LazyDeviceWeightBinder for CudaWeightPager<'_, S> {
 /// A single weight larger than the whole budget is still paged in (correctness
 /// beats the budget); the cache simply runs transiently over budget for it.
 ///
-/// Page-in defaults to the asynchronous, fence-ordered path
-/// ([`CudaWeightPage::upload_async`]): the H2D copy is enqueued on the runtime's
-/// dedicated transfer stream so it overlaps the in-flight compute, and the
-/// consuming compute stream is ordered after it with a completion fence. The
-/// full compute-stream drain is now taken **only when admitting must evict** (so
-/// eviction never frees a page a prior kernel still reads); a page-in that fits
-/// the budget no longer host-blocks, which is what lets the transfer overlap.
-/// Set `async_pagein = true` (env `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=1`) to
-/// opt into the asynchronous page-in for A/B comparison; the synchronous page-in
-/// is the default (faster in the eviction/thrash regime, measured A/B).
+/// Page-in currently performs measured, host-blocking H2D copies. The earlier
+/// prefetch/in-flight path was removed because it kept VRAM outside the lease
+/// and reported non-blocking stream-wait enqueue time as copy waiting.
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
-    /// Whether misses page in asynchronously (see [`CudaWeightPage::upload_async`]).
-    async_pagein: bool,
+    scan_resistant_dense: bool,
+    physical: OnceLock<PhysicalAdmission>,
     inner: Mutex<ResidencyInner>,
 }
 
+struct PhysicalAdmission {
+    allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+    governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+}
+
 struct ResidencyInner {
-    budget: u64,
-    resident_bytes: u64,
-    peak_resident_bytes: u64,
-    page_ins: u64,
-    hits: u64,
-    evictions: u64,
-    prefetch_issued: u64,
-    prefetch_declined_guard: u64,
-    prefetch_joined: u64,
-    prefetch_staging_allocs: u64,
-    prefetch_staging_reuses: u64,
-    /// LRU order: front = least-recently-used, back = most-recently-used.
-    order: Vec<u64>,
+    policy: WeightResidencyPolicy,
     pages: HashMap<u64, Arc<CudaWeightPage>>,
-    in_flight: HashMap<u64, InFlightPage>,
-    prefetch_staging_pool: Vec<PinnedStaging>,
+    mapped_allowance: Option<onnx_runtime_memory_governor::MappedAllowance>,
     /// The governor grant this budget came from, when it came from one.
     ///
     /// Held for its `Drop`: releasing the lease is how the tier learns these
@@ -465,42 +736,202 @@ struct ResidencyInner {
     /// independently, so a caller outliving the cache still outlives the lease.
     /// See `residency_holds_its_lease_until_its_pages_are_gone`.
     lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    admission_no_progress: u64,
 }
 
-struct InFlightPage {
-    page: Arc<CudaWeightPage>,
-    copy_fence: u64,
-    staging: PinnedStaging,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeightEvictionPolicy {
+    Lru,
+    StableResident,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct WeightPolicyAccess {
+    hit: bool,
+    admitted: bool,
+    evicted: Vec<u64>,
+}
+
+/// Pure bounded-residency eviction/accounting state.
+///
+/// This owns only keys, byte sizes, recency order, the byte budget, and cache
+/// counters. CUDA page ownership and `Arc` liveness checks stay in
+/// [`CudaWeightResidency`], which supplies an evictability predicate when it
+/// asks this policy state to make room.
+#[derive(Debug)]
+struct WeightResidencyPolicy {
+    budget: u64,
+    resident_bytes: u64,
+    peak_resident_bytes: u64,
+    page_ins: u64,
+    hits: u64,
+    evictions: u64,
+    /// LRU order: front = least-recently-used, back = most-recently-used.
+    order: Vec<u64>,
+    bytes_by_key: HashMap<u64, u64>,
+}
+
+impl WeightResidencyPolicy {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            resident_bytes: 0,
+            peak_resident_bytes: 0,
+            page_ins: 0,
+            hits: 0,
+            evictions: 0,
+            order: Vec::new(),
+            bytes_by_key: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn access(
+        &mut self,
+        key: u64,
+        bytes: u64,
+        eviction: WeightEvictionPolicy,
+    ) -> WeightPolicyAccess {
+        if self.bytes_by_key.contains_key(&key) {
+            self.record_hit(key);
+            return WeightPolicyAccess {
+                hit: true,
+                admitted: false,
+                evicted: Vec::new(),
+            };
+        }
+        if eviction == WeightEvictionPolicy::StableResident && !self.can_fit(bytes) {
+            self.record_page_in();
+            return WeightPolicyAccess {
+                hit: false,
+                admitted: false,
+                evicted: Vec::new(),
+            };
+        }
+        let evicted = self.evict_to_fit(bytes, eviction, |_| true);
+        self.insert_page(key, bytes);
+        WeightPolicyAccess {
+            hit: false,
+            admitted: true,
+            evicted,
+        }
+    }
+
+    fn can_fit(&self, incoming: u64) -> bool {
+        self.resident_bytes.saturating_add(incoming) <= self.budget
+    }
+
+    fn touch(&mut self, key: u64) {
+        if let Some(position) = self.order.iter().position(|&k| k == key) {
+            let key = self.order.remove(position);
+            self.order.push(key);
+        }
+    }
+
+    fn record_hit(&mut self, key: u64) {
+        self.touch(key);
+        self.hits += 1;
+    }
+
+    fn insert_page(&mut self, key: u64, bytes: u64) {
+        self.bytes_by_key.insert(key, bytes);
+        self.order.push(key);
+        self.resident_bytes += bytes;
+        self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
+        self.record_page_in();
+    }
+
+    fn remove_page(&mut self, key: u64) -> Option<u64> {
+        if let Some(position) = self.order.iter().position(|&candidate| candidate == key) {
+            self.order.remove(position);
+        }
+        let bytes = self.bytes_by_key.remove(&key)?;
+        self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        self.evictions = self.evictions.saturating_add(1);
+        Some(bytes)
+    }
+
+    fn record_page_in(&mut self) {
+        self.page_ins += 1;
+    }
+
+    fn evict_to_fit<F>(
+        &mut self,
+        incoming: u64,
+        eviction: WeightEvictionPolicy,
+        mut evictable: F,
+    ) -> Vec<u64>
+    where
+        F: FnMut(u64) -> bool,
+    {
+        let mut evicted = Vec::new();
+        while self.resident_bytes.saturating_add(incoming) > self.budget && !self.order.is_empty() {
+            let Some(index) = self.next_evictable_index(eviction, &mut evictable) else {
+                break;
+            };
+            let key = self.order.remove(index);
+            if let Some(bytes) = self.bytes_by_key.remove(&key) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+                self.evictions += 1;
+                evicted.push(key);
+            }
+        }
+        evicted
+    }
+
+    fn next_evictable_index<F>(
+        &self,
+        eviction: WeightEvictionPolicy,
+        evictable: &mut F,
+    ) -> Option<usize>
+    where
+        F: FnMut(u64) -> bool,
+    {
+        match eviction {
+            WeightEvictionPolicy::Lru | WeightEvictionPolicy::StableResident => {
+                self.order.iter().position(|&key| evictable(key))
+            }
+        }
+    }
+}
+
+fn eviction_for_boundary(
+    scan_resistant_dense: bool,
+    boundary: LazyWeightBoundary,
+) -> WeightEvictionPolicy {
+    if scan_resistant_dense
+        && matches!(
+            boundary,
+            LazyWeightBoundary::MatMul | LazyWeightBoundary::MatMulNBits
+        )
+    {
+        WeightEvictionPolicy::StableResident
+    } else {
+        WeightEvictionPolicy::Lru
+    }
 }
 
 impl CudaWeightResidency {
-    /// Build a residency cache with an explicit VRAM `budget_bytes`. Page-in is
-    /// synchronous by default; chain [`Self::with_async_pagein`] to opt into async.
+    /// Build a residency cache with an explicit VRAM `budget_bytes`. This
+    /// constructor is synchronous by itself so tests can choose deliberately;
+    /// [`DeviceOffloadPolicy::from_env`] supplies the runtime default.
     ///
     /// Prefer [`Self::new_leased`] where a governor exists. A budget invented
     /// here is a second claim on the same VRAM the governor is already handing
     /// out, and neither side can see the other's.
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
+        replace_global_budget(0, budget_bytes);
         Self {
             runtime,
-            async_pagein: false,
+            scan_resistant_dense: false,
+            physical: OnceLock::new(),
             inner: Mutex::new(ResidencyInner {
-                budget: budget_bytes,
+                policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
-                resident_bytes: 0,
-                peak_resident_bytes: 0,
-                page_ins: 0,
-                hits: 0,
-                evictions: 0,
-                prefetch_issued: 0,
-                prefetch_declined_guard: 0,
-                prefetch_joined: 0,
-                prefetch_staging_allocs: 0,
-                prefetch_staging_reuses: 0,
-                order: Vec::new(),
                 pages: HashMap::new(),
-                in_flight: HashMap::new(),
-                prefetch_staging_pool: Vec::new(),
+                mapped_allowance: None,
+                admission_no_progress: 0,
             }),
         }
     }
@@ -538,26 +969,17 @@ impl CudaWeightResidency {
             onnx_runtime_memory_governor::MemoryRole::Weights,
             holder,
         )?;
+        replace_global_budget(0, lease.bytes());
         Ok(Self {
             runtime,
-            async_pagein: false,
+            scan_resistant_dense: false,
+            physical: OnceLock::new(),
             inner: Mutex::new(ResidencyInner {
-                budget: lease.bytes(),
+                policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
-                resident_bytes: 0,
-                peak_resident_bytes: 0,
-                page_ins: 0,
-                hits: 0,
-                evictions: 0,
-                prefetch_issued: 0,
-                prefetch_declined_guard: 0,
-                prefetch_joined: 0,
-                prefetch_staging_allocs: 0,
-                prefetch_staging_reuses: 0,
-                order: Vec::new(),
                 pages: HashMap::new(),
-                in_flight: HashMap::new(),
-                prefetch_staging_pool: Vec::new(),
+                mapped_allowance: None,
+                admission_no_progress: 0,
             }),
         })
     }
@@ -568,7 +990,10 @@ impl CudaWeightResidency {
     /// with any other claim on the same device.
     pub fn budget(&self) -> (u64, bool) {
         let inner = self.inner.lock().expect("residency lock poisoned");
-        (inner.budget, inner.lease.is_some())
+        (
+            inner.policy.budget,
+            inner.lease.is_some() || inner.mapped_allowance.is_some(),
+        )
     }
 
     /// Replace the locally chosen budget before the cache is governed.
@@ -583,11 +1008,13 @@ impl CudaWeightResidency {
         budget_bytes: u64,
     ) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
         let mut inner = self.inner.lock().expect("residency lock poisoned");
-        if inner.lease.is_some() {
-            return Ok(inner.budget);
+        if inner.lease.is_some() || inner.mapped_allowance.is_some() {
+            return Ok(inner.policy.budget);
         }
-        inner.budget = budget_bytes;
-        Ok(inner.budget)
+        let old = inner.policy.budget;
+        inner.policy.budget = budget_bytes;
+        replace_global_budget(old, budget_bytes);
+        Ok(inner.policy.budget)
     }
 
     /// Replace a locally chosen budget with one leased from `governor`.
@@ -613,12 +1040,31 @@ impl CudaWeightResidency {
         tier: onnx_runtime_memory_governor::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
+        if let Some(physical) = self.physical.get() {
+            if physical.governor.authority_id() != governor.authority_id() {
+                return Err(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    tier: tier.name(),
+                    requested: 0,
+                    reason: "VMM weight residency was built with a different physical-memory authority",
+                });
+            }
+            let mut inner = self.lock();
+            if inner.mapped_allowance.is_none() {
+                inner.mapped_allowance = Some(governor.reserve_mapped_allowance(
+                    tier,
+                    inner.policy.budget,
+                    onnx_runtime_memory_governor::MemoryRole::Weights,
+                    holder,
+                )?);
+            }
+            return Ok(inner.policy.budget);
+        }
         let requested = {
             let inner = self.inner.lock().expect("residency lock poisoned");
             if inner.lease.is_some() {
-                return Ok(inner.budget);
+                return Ok(inner.policy.budget);
             }
-            inner.budget
+            inner.policy.budget
         };
         let lease = governor.reserve(
             tier,
@@ -628,15 +1074,82 @@ impl CudaWeightResidency {
         )?;
         let granted = lease.bytes();
         let mut inner = self.inner.lock().expect("residency lock poisoned");
-        inner.budget = granted;
+        let old = inner.policy.budget;
+        inner.policy.budget = granted;
         inner.lease = Some(lease);
+        replace_global_budget(old, granted);
         Ok(granted)
     }
 
     /// Select the asynchronous (default `true`) vs synchronous page-in path.
-    pub fn with_async_pagein(mut self, async_pagein: bool) -> Self {
-        self.async_pagein = async_pagein;
+    pub fn with_async_pagein(self, async_pagein: bool) -> Self {
+        let _ = async_pagein;
         self
+    }
+
+    /// Select whether dense per-layer weights use scan-resistant residency.
+    pub fn with_scan_resistant_dense(mut self, scan_resistant_dense: bool) -> Self {
+        self.scan_resistant_dense = scan_resistant_dense;
+        self
+    }
+
+    /// Use the production VMM arena and its existing physical-memory authority
+    /// for weight pages. The configured cache budget remains an observability
+    /// value; admission is governed by incremental authority-owned bytes, not
+    /// by a second private lease.
+    pub fn with_vmm_admission(
+        self,
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<Self, WeightHandleError> {
+        if self.lock().lease.is_some() {
+            return Err(WeightHandleError::DeviceBinding(
+                "cannot install VMM physical admission on a cache that already holds a \
+                 content-byte governor lease"
+                    .into(),
+            ));
+        }
+        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
+            return Err(WeightHandleError::DeviceBinding(
+                "VMM weight residency and its governor must share one physical-memory authority"
+                    .into(),
+            ));
+        }
+        let _ = self.physical.set(PhysicalAdmission {
+            allocator,
+            governor,
+        });
+        Ok(self)
+    }
+
+    pub(crate) fn install_vmm_admission(
+        &self,
+        allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Result<(), WeightHandleError> {
+        if self.lock().lease.is_some() {
+            return Err(WeightHandleError::DeviceBinding(
+                "cannot install VMM physical admission on a cache that already holds a \
+                 content-byte governor lease"
+                    .into(),
+            ));
+        }
+        if allocator.physical_pool_authority() != Some(governor.authority_id()) {
+            return Err(WeightHandleError::DeviceBinding(
+                "VMM weight residency and its governor must share one physical-memory authority"
+                    .into(),
+            ));
+        }
+        self.physical
+            .set(PhysicalAdmission {
+                allocator,
+                governor,
+            })
+            .map_err(|_| {
+                WeightHandleError::DeviceBinding(
+                    "VMM weight residency admission was installed more than once".into(),
+                )
+            })
     }
 
     /// Return the device page for `key`, paging it in from `source` on a miss and
@@ -651,11 +1164,80 @@ impl CudaWeightResidency {
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
         }
+        if self.physical.get().is_some() {
+            let resident = weight.materialize()?;
+            GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+            let bytes = resident.bytes().to_vec();
+            return self.resident_vmm_with(
+                key,
+                resident.dtype,
+                resident.shape.clone(),
+                bytes.len(),
+                self.eviction_for(weight.boundary),
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
+                    })
+                },
+            );
+        }
         // Copy region bytes host→device before re-locking so a failed bind never
         // mutates cache accounting.
         let pager = CudaWeightPager::new(Arc::clone(&self.runtime), source);
         let page = Arc::new(pager.bind_block_quantized_moe(weight)?);
-        self.admit(key, page)
+        self.admit(key, page, self.eviction_for(weight.boundary))
+    }
+
+    /// Live-dispatch entry point backed directly by the package mmap.
+    ///
+    /// This avoids calling [`LazyWeight::materialize`] on the hot path. On a
+    /// not-fit model the same layer weights are paged every token; rebuilding an
+    /// owned host tensor for each miss made CPU materialization dominate decode
+    /// time.
+    pub fn resident_mapped(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        if let Some(hit) = self.get_hit(key) {
+            return Ok(hit);
+        }
+        let len = weight.region_bytes_len();
+        let mut staging = self
+            .runtime
+            .alloc_pinned(len)
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
+        let materialize_start = std::time::Instant::now();
+        fill_staging_from_regions(weight, source, &mut staging)?;
+        add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        if self.physical.get().is_some() {
+            return self.resident_vmm_with(
+                key,
+                weight.dtype,
+                weight.shape.clone(),
+                len,
+                self.eviction_for(weight.boundary),
+                move |runtime, ptr| {
+                    let staged = &staging.as_slice()[..len];
+                    let copy_ms =
+                        unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+                            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+                        })?;
+                    GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
+                    GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+        }
+        let (page, _, _staging) = CudaWeightPage::upload_staged_async(
+            &self.runtime,
+            weight.dtype,
+            weight.shape.clone(),
+            len,
+            staging,
+        )?;
+        self.admit(key, Arc::new(page), self.eviction_for(weight.boundary))
     }
 
     /// Live-dispatch entry point: return the device page for `key`, paging it in
@@ -668,190 +1250,205 @@ impl CudaWeightResidency {
         key: u64,
         weight: &LazyWeight,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
-        if let Some(prefetched) = self.join_in_flight(key)? {
-            return Ok(prefetched);
-        }
         if let Some(hit) = self.get_hit(key) {
             return Ok(hit);
         }
+        let materialize_start = std::time::Instant::now();
         let resident = weight.materialize()?;
-        if self.async_pagein {
-            // Async, fence-ordered page-in: enqueue the H2D on the transfer stream
-            // (overlapping the in-flight compute), admit, then order the compute
-            // stream after the transfer's completion event so the consuming kernel
-            // waits only on the copy — never a full host sync.
-            let staging = self
-                .runtime
-                .alloc_pinned(resident.bytes().len())
-                .map_err(|error| {
-                    WeightHandleError::DeviceBinding(format!("pinned alloc: {error}"))
-                })?;
-            let (page, copy_fence, staging) = CudaWeightPage::upload_async(
-                &self.runtime,
+        GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+        add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
+        if self.physical.get().is_some() {
+            let bytes = resident.bytes().to_vec();
+            return self.resident_vmm_with(
+                key,
                 resident.dtype,
                 resident.shape.clone(),
-                resident.bytes(),
-                staging,
-            )?;
-            let admitted = self.admit(key, Arc::new(page))?;
-            self.runtime
-                .compute_wait_fence(copy_fence)
-                .map_err(|error| {
-                    WeightHandleError::DeviceBinding(format!("copy fence wait: {error}"))
-                })?;
-            drop(staging);
-            Ok(admitted)
-        } else {
-            // Legacy synchronous page-in (A/B "before" arm / kill-switch): the
-            // blocking `htod` serializes the transfer with compute.
-            let page = Arc::new(CudaWeightPage::upload(
-                &self.runtime,
-                resident.dtype,
-                resident.shape.clone(),
-                resident.bytes(),
-            )?);
-            self.admit(key, page)
+                bytes.len(),
+                self.eviction_for(weight.boundary),
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
+                    })
+                },
+            );
         }
-    }
-
-    /// Best-effort single-weight lookahead page-in. It only engages for the
-    /// asynchronous path and only when the new page fits inside the current
-    /// residency budget without evicting or growing the lease.
-    ///
-    /// Depth is intentionally a scheduler knob, not a residency-policy knob:
-    /// qwen2.5-0.5b on RTX 4060 at a 1.5 GiB weight budget was swept at 1, 2,
-    /// 4, 8, and 16 nodes of lookahead. The requested issue-to-join gap was
-    /// reachable and no evictions occurred, but no speedup was established; 16
-    /// nodes was worse. Keep the guard conservative unless a larger,
-    /// transfer-bound model proves a deeper default helps.
-    pub fn prefetch_materialized(
-        &self,
-        key: u64,
-        weight: &LazyWeight,
-    ) -> Result<bool, WeightHandleError> {
-        if !self.async_pagein {
-            return Ok(false);
-        }
-        {
-            let inner = self.lock();
-            if inner.pages.contains_key(&key) || inner.in_flight.contains_key(&key) {
-                return Ok(false);
-            }
-        }
-        let bytes = weight
-            .regions
-            .iter()
-            .try_fold(0_u64, |total, region| total.checked_add(region.len as u64))
-            .ok_or_else(|| {
-                WeightHandleError::InvalidResident("prefetch weight byte count overflow".into())
-            })?;
-        {
-            let inner = self.lock();
-            if inner.pages.contains_key(&key)
-                || inner.in_flight.contains_key(&key)
-                || inner.resident_bytes.saturating_add(bytes) > inner.budget
-            {
-                if inner.resident_bytes.saturating_add(bytes) > inner.budget {
-                    drop(inner);
-                    self.record_prefetch_declined_guard();
-                }
-                return Ok(false);
-            }
-        }
-        let resident = weight.materialize()?;
-        let staging = self.take_prefetch_staging(resident.bytes().len())?;
-        let (page, copy_fence, staging) = CudaWeightPage::upload_async(
+        let page = Arc::new(CudaWeightPage::upload(
             &self.runtime,
             resident.dtype,
             resident.shape.clone(),
             resident.bytes(),
-            staging,
-        )?;
-        let page = Arc::new(page);
-        let mut inner = self.lock();
-        if inner.pages.contains_key(&key)
-            || inner.in_flight.contains_key(&key)
-            || inner.resident_bytes.saturating_add(bytes) > inner.budget
-        {
-            let declined_by_guard = inner.resident_bytes.saturating_add(bytes) > inner.budget;
-            drop(inner);
-            self.drain_copy_stream()?;
-            self.recycle_prefetch_staging(staging);
-            if declined_by_guard {
-                self.record_prefetch_declined_guard();
-            }
-            return Ok(false);
-        }
-        inner.insert_page(key, Arc::clone(&page), bytes);
-        inner.record_prefetch_issued();
-        inner.in_flight.insert(
-            key,
-            InFlightPage {
-                page,
-                copy_fence,
-                staging,
+        )?);
+        self.admit(key, page, self.eviction_for(weight.boundary))
+    }
+
+    fn resident_vmm_with<F>(
+        &self,
+        key: u64,
+        dtype: DataType,
+        shape: Vec<usize>,
+        len: usize,
+        eviction: WeightEvictionPolicy,
+        fill: F,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError>
+    where
+        F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
+    {
+        let physical = self
+            .physical
+            .get()
+            .expect("VMM residency helper requires physical admission");
+        let ptr = physical
+            .allocator
+            .allocate_committed(len, 256, &[])
+            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+        let allowance = self.lock().mapped_allowance.clone().ok_or_else(|| {
+            WeightHandleError::DeviceBinding(
+                "VMM weight residency has no authority-scoped mapped-byte allowance; \
+                     adopt the memory governor before page-in"
+                    .into(),
+            )
+        })?;
+        let page = Arc::new(CudaWeightPage {
+            runtime: Arc::clone(&self.runtime),
+            allocation: WeightAllocation::Vmm {
+                allocator: Arc::clone(&physical.allocator),
+                allowance: allowance.clone(),
             },
-        );
-        Ok(true)
-    }
+            ptr: ptr.as_ptr() as CUdeviceptr,
+            len,
+            dtype,
+            shape,
+        });
 
-    fn join_in_flight(&self, key: u64) -> Result<Option<Arc<CudaWeightPage>>, WeightHandleError> {
         let mut inner = self.lock();
-        let Some(prefetch) = inner.in_flight.remove(&key) else {
-            return Ok(None);
-        };
-        let page = Arc::clone(&prefetch.page);
-        let copy_fence = prefetch.copy_fence;
-        inner.touch(key);
-        self.runtime
-            .compute_wait_fence(copy_fence)
-            .map_err(|error| {
-                WeightHandleError::DeviceBinding(format!("prefetch fence wait: {error}"))
-            })?;
-        inner.record_prefetch_joined();
-        inner.prefetch_staging_pool.push(prefetch.staging);
-        Ok(Some(page))
-    }
+        if let Some(existing) = inner.pages.get(&key).cloned() {
+            inner.record_hit(key);
+            return Ok(existing);
+        }
 
-    fn take_prefetch_staging(&self, bytes: usize) -> Result<PinnedStaging, WeightHandleError> {
-        {
-            let mut inner = self.lock();
-            if let Some(index) = inner
-                .prefetch_staging_pool
-                .iter()
-                .position(|staging| staging.len() >= bytes)
-            {
-                inner.prefetch_staging_reuses += 1;
-                GLOBAL_PREFETCH_STAGING_REUSES.fetch_add(1, Ordering::Relaxed);
-                return Ok(inner.prefetch_staging_pool.swap_remove(index));
+        let mut fill = Some(fill);
+        let max_evictions = inner.pages.len();
+        let mut evictions = 0usize;
+        let mut bypass = false;
+        loop {
+            let required_owned = physical
+                .allocator
+                .incremental_owned_bytes_for_span(ptr, len, 0, len)
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+            let required_mapped = physical
+                .allocator
+                .incremental_mapped_bytes_for_span(ptr, len, 0, len)
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+            let global_available = physical.governor.available(Tier::Device);
+            let zone_available = allowance.available();
+            if committed_admission_fits(
+                required_mapped,
+                zone_available,
+                required_owned,
+                global_available,
+            ) {
+                allowance
+                    .try_map(required_mapped)
+                    .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+                GLOBAL_WEIGHT_MAPPED_BYTES.fetch_add(required_mapped, Ordering::Relaxed);
+                match physical.allocator.try_commit_span(
+                    ptr,
+                    len,
+                    0,
+                    len,
+                    required_mapped,
+                    global_available,
+                ) {
+                    Ok(commit) => {
+                        let excess = required_mapped.saturating_sub(commit.newly_mapped_bytes);
+                        if excess > 0 {
+                            allowance.unmap(excess);
+                            let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |current| Some(current.saturating_sub(excess)),
+                            );
+                        }
+                        fill.take().expect("VMM page fill runs once")(&self.runtime, page.ptr)?;
+                        if bypass {
+                            inner.record_bypassed_page_in();
+                        } else {
+                            inner.insert_page(key, Arc::clone(&page), len as u64);
+                        }
+                        return Ok(page);
+                    }
+                    Err(error) => {
+                        allowance.unmap(required_mapped);
+                        let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| Some(current.saturating_sub(required_mapped)),
+                        );
+                        if evictions >= max_evictions {
+                            return Err(WeightHandleError::DeviceBinding(error.to_string()));
+                        }
+                    }
+                }
+            } else if eviction == WeightEvictionPolicy::StableResident {
+                bypass = true;
+            }
+
+            if evictions >= max_evictions {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "weight residency requires {required_mapped} incremental mapped bytes with \
+                     {zone_available} bytes of weight-zone headroom and {required_owned} \
+                     incremental committed bytes with {global_available} bytes of physical \
+                     headroom after {evictions} eviction(s)"
+                )));
+            }
+            let before_owned = physical
+                .allocator
+                .physical_pool_stats()
+                .map_or(0, |stats| stats.snapshot().total_owned_bytes);
+            let before_required_owned = required_owned;
+            let before_required_mapped = required_mapped;
+            let Some(evicted_key) = inner.next_evictable_key(eviction) else {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "weight residency requires {required_mapped} incremental mapped bytes with \
+                     {zone_available} bytes of weight-zone headroom and {required_owned} \
+                     incremental committed bytes with {global_available} bytes of physical \
+                     headroom, and no page is evictable"
+                )));
+            };
+            inner.remove_page(evicted_key);
+            evictions += 1;
+            let after_owned = physical
+                .allocator
+                .physical_pool_stats()
+                .map_or(0, |stats| stats.snapshot().total_owned_bytes);
+            let after_required_owned = physical
+                .allocator
+                .incremental_owned_bytes_for_span(ptr, len, 0, len)
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+            let after_required_mapped = physical
+                .allocator
+                .incremental_mapped_bytes_for_span(ptr, len, 0, len)
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
+            if !eviction_made_committed_progress(
+                before_owned,
+                after_owned,
+                before_required_owned,
+                after_required_owned,
+                before_required_mapped,
+                after_required_mapped,
+            ) {
+                inner.admission_no_progress = inner.admission_no_progress.saturating_add(1);
             }
         }
-        let staging = self
-            .runtime
-            .alloc_pinned(bytes)
-            .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
-        let mut inner = self.lock();
-        inner.prefetch_staging_allocs += 1;
-        GLOBAL_PREFETCH_STAGING_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        Ok(staging)
     }
 
-    fn recycle_prefetch_staging(&self, staging: PinnedStaging) {
-        self.lock().prefetch_staging_pool.push(staging);
-    }
-
-    fn record_prefetch_declined_guard(&self) {
-        let mut inner = self.lock();
-        inner.prefetch_declined_guard += 1;
-        GLOBAL_PREFETCH_DECLINED_GUARD.fetch_add(1, Ordering::Relaxed);
+    fn eviction_for(&self, boundary: LazyWeightBoundary) -> WeightEvictionPolicy {
+        eviction_for_boundary(self.scan_resistant_dense, boundary)
     }
 
     /// Look up `key`, marking it most-recently-used and counting a hit.
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
-        if inner.in_flight.contains_key(&key) {
-            return None;
-        }
         if let Some(page) = inner.pages.get(&key).cloned() {
             inner.record_hit(key);
             Some(page)
@@ -876,12 +1473,14 @@ impl CudaWeightResidency {
     /// in-flight kernel still references an about-to-be-freed page's VRAM (the
     /// original WAR/reuse guarantee). A page-in that fits the budget frees nothing
     /// and therefore skips the sync, letting its async transfer overlap the
-    /// current compute. (Offload is mutually exclusive with CUDA graph capture, so
-    /// this sync is never capture-illegal.)
+    /// current compute. This sync is one of the quantities reported in the
+    /// offload counters because an unexpected host drain can erase prefetch
+    /// overlap without changing correctness.
     fn admit(
         &self,
         key: u64,
         page: Arc<CudaWeightPage>,
+        eviction: WeightEvictionPolicy,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
         let bytes = page.len() as u64;
         {
@@ -897,7 +1496,7 @@ impl CudaWeightResidency {
             }
             // Fits without eviction: nothing is freed, so no consumer drain is
             // needed. Admit directly so the async transfer keeps overlapping.
-            if inner.resident_bytes.saturating_add(bytes) <= inner.budget {
+            if inner.policy.can_fit(bytes) {
                 inner.insert_page(key, Arc::clone(&page), bytes);
                 return Ok(page);
             }
@@ -906,9 +1505,11 @@ impl CudaWeightResidency {
         // Weight offload and CUDA graph capture are mutually exclusive (the decode
         // session declines capture whenever offload is enabled), so this
         // synchronize is never capture-illegal.
+        let sync_start = std::time::Instant::now();
         self.runtime
             .synchronize()
             .map_err(|error| WeightHandleError::DeviceBinding(format!("stream sync: {error}")))?;
+        add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
         let mut inner = self.lock();
         // Re-check after releasing the lock for the sync.
         if let Some(existing) = inner.pages.get(&key).cloned() {
@@ -917,7 +1518,11 @@ impl CudaWeightResidency {
             self.drain_copy_stream()?;
             return Ok(existing);
         }
-        inner.evict_to_fit(bytes);
+        if eviction == WeightEvictionPolicy::StableResident && !inner.policy.can_fit(bytes) {
+            inner.record_bypassed_page_in();
+            return Ok(page);
+        }
+        inner.evict_to_fit(bytes, eviction);
         // Eviction is best effort: a page larger than the whole budget, or
         // pinned pages that cannot be evicted, both leave no room. Admitting
         // anyway is what this used to do, and it left the cache physically
@@ -928,9 +1533,10 @@ impl CudaWeightResidency {
         // G4, so a refusal leaves the tier and the lease exactly as they were,
         // and the page-in fails instead of the accounting quietly going wrong.
         if let Some(over) = inner
+            .policy
             .resident_bytes
             .saturating_add(bytes)
-            .checked_sub(inner.budget)
+            .checked_sub(inner.policy.budget)
             .filter(|over| *over > 0)
         {
             match inner.lease.as_mut() {
@@ -940,16 +1546,20 @@ impl CudaWeightResidency {
                             "the weight-residency cache needs {over} bytes beyond its \
                              {} byte budget for a {bytes} byte page, and eviction could not \
                              free them: {error}",
-                            inner.budget
+                            inner.policy.budget
                         ))
                     })?;
-                    inner.budget = inner.budget.saturating_add(over);
+                    inner.policy.budget = inner.policy.budget.saturating_add(over);
+                    replace_global_budget(inner.policy.budget - over, inner.policy.budget);
                 }
                 // No lease means no governor knows about this cache, so there is
                 // nothing to ask and nothing whose total this would falsify.
                 // Keep the previous behaviour rather than inventing a refusal
                 // the operator never asked for.
-                None => inner.budget = inner.budget.saturating_add(over),
+                None => {
+                    inner.policy.budget = inner.policy.budget.saturating_add(over);
+                    replace_global_budget(inner.policy.budget - over, inner.policy.budget);
+                }
             }
         }
         inner.insert_page(key, Arc::clone(&page), bytes);
@@ -959,19 +1569,30 @@ impl CudaWeightResidency {
     /// Snapshot the cache's activity counters.
     pub fn stats(&self) -> CudaResidencyStats {
         let inner = self.lock();
+        let physical_owned_bytes = self
+            .physical
+            .get()
+            .and_then(|physical| physical.allocator.physical_pool_stats())
+            .map_or(inner.policy.resident_bytes, |stats| {
+                stats.snapshot().total_owned_bytes
+            });
+        let mapped_physical_bytes = inner
+            .mapped_allowance
+            .as_ref()
+            .map_or(inner.policy.resident_bytes, |allowance| {
+                allowance.mapped_bytes()
+            });
         CudaResidencyStats {
-            budget_bytes: inner.budget,
-            resident_bytes: inner.resident_bytes,
-            peak_resident_bytes: inner.peak_resident_bytes,
+            budget_bytes: inner.policy.budget,
+            resident_bytes: inner.policy.resident_bytes,
+            peak_resident_bytes: inner.policy.peak_resident_bytes,
             pages_resident: inner.pages.len() as u64,
-            page_ins: inner.page_ins,
-            hits: inner.hits,
-            evictions: inner.evictions,
-            prefetch_issued: inner.prefetch_issued,
-            prefetch_declined_guard: inner.prefetch_declined_guard,
-            prefetch_joined: inner.prefetch_joined,
-            prefetch_staging_allocs: inner.prefetch_staging_allocs,
-            prefetch_staging_reuses: inner.prefetch_staging_reuses,
+            page_ins: inner.policy.page_ins,
+            hits: inner.policy.hits,
+            evictions: inner.policy.evictions,
+            physical_owned_bytes,
+            mapped_physical_bytes,
+            admission_no_progress: inner.admission_no_progress,
         }
     }
 
@@ -991,67 +1612,148 @@ impl std::fmt::Debug for CudaWeightResidency {
     }
 }
 
-impl ResidencyInner {
-    /// Move `key` to the most-recently-used end of the LRU order.
-    fn touch(&mut self, key: u64) {
-        if let Some(position) = self.order.iter().position(|&k| k == key) {
-            let key = self.order.remove(position);
-            self.order.push(key);
-        }
+impl onnx_runtime_memory_governor::ReclaimableMappedHolder for CudaWeightResidency {
+    fn allowance(&self) -> onnx_runtime_memory_governor::MappedAllowance {
+        self.lock()
+            .mapped_allowance
+            .clone()
+            .expect("registered VMM weight residency must have a mapped allowance")
     }
 
+    fn reclaim_priority(&self) -> u32 {
+        0
+    }
+
+    fn mapped_bytes(&self) -> u64 {
+        self.lock()
+            .mapped_allowance
+            .as_ref()
+            .map_or(0, |allowance| allowance.mapped_bytes())
+    }
+
+    fn reclaim_mapped(
+        &self,
+        target_bytes: u64,
+    ) -> Result<
+        onnx_runtime_memory_governor::MappedReclaimReport,
+        onnx_runtime_memory_governor::MemoryError,
+    > {
+        let allowance = self.allowance();
+        let before = allowance.mapped_bytes();
+        let mut inner = self.lock();
+        let max_attempts = inner.pages.len();
+        let mut attempts = 0usize;
+        while before.saturating_sub(allowance.mapped_bytes()) < target_bytes
+            && attempts < max_attempts
+        {
+            let Some(key) = inner.next_evictable_key(WeightEvictionPolicy::Lru) else {
+                break;
+            };
+            inner.remove_page(key);
+            attempts += 1;
+        }
+        let reclaimed = before.saturating_sub(allowance.mapped_bytes());
+        Ok(onnx_runtime_memory_governor::MappedReclaimReport {
+            target_bytes,
+            reclaimed_bytes: reclaimed,
+        })
+    }
+}
+
+impl Drop for CudaWeightResidency {
+    fn drop(&mut self) {
+        let budget = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .policy
+            .budget;
+        let resident = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .policy
+            .resident_bytes;
+        replace_global_budget(budget, 0);
+        let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(resident)),
+        );
+    }
+}
+
+impl ResidencyInner {
     /// Record a cache hit for `key`: mark it most-recently-used and bump the
     /// per-instance and process-global hit counters.
     fn record_hit(&mut self, key: u64) {
-        self.touch(key);
-        self.hits += 1;
+        self.policy.record_hit(key);
         GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the LRU
+    /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the
     /// order, residency accounting, and the page-in counters.
     fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64) {
         self.pages.insert(key, page);
-        self.order.push(key);
-        self.resident_bytes += bytes;
-        self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
-        self.page_ins += 1;
+        self.policy.insert_page(key, bytes);
+        let global_resident = GLOBAL_CONTENT_RESIDENT_BYTES
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(global_resident, Ordering::Relaxed);
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_prefetch_issued(&mut self) {
-        self.prefetch_issued += 1;
-        GLOBAL_PREFETCH_ISSUED.fetch_add(1, Ordering::Relaxed);
+    /// Count a miss whose freshly paged-in allocation is returned directly to
+    /// the caller instead of becoming part of the resident set.
+    fn record_bypassed_page_in(&mut self) {
+        self.policy.record_page_in();
+        GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_prefetch_joined(&mut self) {
-        self.prefetch_joined += 1;
-        GLOBAL_PREFETCH_JOINED.fetch_add(1, Ordering::Relaxed);
+    fn next_evictable_key(&self, eviction: WeightEvictionPolicy) -> Option<u64> {
+        self.policy
+            .next_evictable_index(eviction, &mut |key| {
+                self.pages
+                    .get(&key)
+                    .is_some_and(|page| Arc::strong_count(page) == 1)
+            })
+            .map(|index| self.policy.order[index])
     }
 
-    /// Evict least-recently-used, currently-unreferenced pages until admitting
-    /// `incoming` bytes fits the budget (best effort; stops when nothing more is
-    /// evictable).
-    fn evict_to_fit(&mut self, incoming: u64) {
-        let mut index = 0;
-        while self.resident_bytes.saturating_add(incoming) > self.budget && index < self.order.len()
+    fn remove_page(&mut self, key: u64) {
+        if self.pages.remove(&key).is_some()
+            && let Some(bytes) = self.policy.remove_page(key)
         {
-            let key = self.order[index];
-            let evictable = self
-                .pages
-                .get(&key)
-                .is_some_and(|page| Arc::strong_count(page) == 1);
-            if evictable {
-                if let Some(page) = self.pages.remove(&key) {
-                    self.resident_bytes = self.resident_bytes.saturating_sub(page.len() as u64);
-                    self.evictions += 1;
-                    GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
-                    // `page`'s Drop frees the VRAM here (sole owner).
-                }
-                self.order.remove(index);
-                // Do not advance `index`: the vector shifted left under it.
-            } else {
-                index += 1;
+            let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(bytes)),
+            );
+            GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Evict currently-unreferenced pages until admitting `incoming` bytes fits
+    /// the budget (best effort; stops when nothing more is evictable).
+    fn evict_to_fit(&mut self, incoming: u64, eviction: WeightEvictionPolicy) {
+        let evicted = {
+            let pages = &self.pages;
+            self.policy.evict_to_fit(incoming, eviction, |key| {
+                pages
+                    .get(&key)
+                    .is_some_and(|page| Arc::strong_count(page) == 1)
+            })
+        };
+        for key in evicted {
+            if let Some(page) = self.pages.remove(&key) {
+                let bytes = page.len() as u64;
+                let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| Some(current.saturating_sub(bytes)),
+                );
+                GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                // The page's Drop frees VRAM here when the cache was sole owner.
             }
         }
     }
@@ -1066,24 +1768,40 @@ mod tests {
         let policy = DeviceOffloadPolicy::default();
         assert!(!policy.enabled);
         assert_eq!(policy.device_budget_bytes, None);
-        // Async page-in is opt-in: the default policy uses the synchronous path.
+        // The struct default is inert; from-env supplies the offload runtime default.
         assert!(!policy.async_pagein);
+        assert!(policy.scan_resistant_dense);
     }
 
     #[test]
-    fn async_pagein_env_is_opt_in() {
-        // Unset => synchronous (default off).
-        assert!(!async_pagein_from_env_value(None));
-        // Truthy spellings enable async, case/whitespace-insensitive.
+    fn async_pagein_env_is_default_on_with_explicit_opt_out() {
+        // Unset => async (default on), so weight prefetch can overlap decode.
+        assert!(async_pagein_from_env_value(None));
+        // Truthy spellings keep async enabled, case/whitespace-insensitive.
         assert!(async_pagein_from_env_value(Some("1")));
         assert!(async_pagein_from_env_value(Some("true")));
         assert!(async_pagein_from_env_value(Some("YES")));
         assert!(async_pagein_from_env_value(Some("  On ")));
-        // Explicit falsey / anything else stays synchronous.
+        // Explicit falsey / anything else forces the old synchronous path.
         assert!(!async_pagein_from_env_value(Some("0")));
         assert!(!async_pagein_from_env_value(Some("false")));
         assert!(!async_pagein_from_env_value(Some("")));
         assert!(!async_pagein_from_env_value(Some("maybe")));
+    }
+
+    #[test]
+    fn scan_resistant_env_defaults_on_with_lru_opt_out() {
+        assert!(scan_resistant_from_env_value(None));
+        assert!(scan_resistant_from_env_value(Some("1")));
+        assert!(scan_resistant_from_env_value(Some("true")));
+        assert!(scan_resistant_from_env_value(Some("YES")));
+        assert!(scan_resistant_from_env_value(Some("  On ")));
+        assert!(!scan_resistant_from_env_value(Some("0")));
+        assert!(!scan_resistant_from_env_value(Some("false")));
+        assert!(!scan_resistant_from_env_value(Some("NO")));
+        assert!(!scan_resistant_from_env_value(Some("  off ")));
+        assert!(scan_resistant_from_env_value(Some("")));
+        assert!(scan_resistant_from_env_value(Some("maybe")));
     }
 
     #[test]
@@ -1094,6 +1812,231 @@ mod tests {
         assert_eq!(parse_budget_bytes(""), None);
         assert_eq!(parse_budget_bytes("lots"), None);
         assert_eq!(parse_budget_bytes("-5"), None);
+    }
+
+    #[test]
+    fn vmm_admission_requires_both_zone_and_global_headroom() {
+        assert!(committed_admission_fits(0, 0, 0, 0));
+        assert!(
+            !committed_admission_fits(2 << 20, 0, 0, 8 << 30),
+            "pooled ownership cannot bypass a full weight zone"
+        );
+        assert!(
+            !committed_admission_fits(0, 8 << 30, 2 << 20, 742 << 10),
+            "zone room cannot bypass missing global creation headroom"
+        );
+    }
+
+    #[test]
+    fn zero_committed_byte_eviction_is_observable_no_progress() {
+        assert!(!eviction_made_committed_progress(8, 8, 4, 4, 4, 4));
+        assert!(
+            eviction_made_committed_progress(8, 8, 4, 0, 4, 4),
+            "returning an owned handle to the pool is useful even though owned bytes stay flat"
+        );
+        assert!(eviction_made_committed_progress(8, 4, 4, 4, 4, 4));
+        assert!(eviction_made_committed_progress(8, 8, 4, 4, 4, 0));
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn vmm_weight_admission_reuses_owned_granules_without_runtime_alloc_free() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
+        };
+
+        unsafe {
+            std::env::set_var(
+                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+                (64usize << 20).to_string(),
+            );
+        }
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!(
+                "SKIPPED (CUDA runtime dependencies unavailable): VMM weight admission GPU test"
+            );
+            return;
+        };
+        let baseline_global = global_offload_stats();
+        let granule = 2usize << 20;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            (granule * 2) as u64,
+            0,
+            0,
+        )));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(736),
+                MemoryRole::Weights,
+            )
+            .expect("VMM allocator"),
+        );
+        let authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            governor.clone();
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(736))
+            .expect("reserve mapped weight allowance");
+        let before = runtime.allocation_counts();
+
+        let first_bytes = vec![0x31u8; granule];
+        let first = residency
+            .resident_vmm_with(
+                1,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&first_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .expect("first physical page");
+
+        let zone_error = residency
+            .resident_vmm_with(
+                2,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::StableResident,
+                |_, _| panic!("zone refusal must happen before copy"),
+            )
+            .expect_err("global room cannot bypass a full mapped weight allowance");
+        assert!(zone_error.to_string().contains("weight-zone headroom"));
+        drop(first);
+
+        let second_bytes = vec![0x42u8; granule];
+        let second = residency
+            .resident_vmm_with(
+                2,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&second_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .expect("second page reuses the owned handle");
+        drop(second);
+
+        let stats = residency.stats();
+        assert_eq!(stats.resident_bytes, granule as u64);
+        assert_eq!(stats.mapped_physical_bytes, granule as u64);
+        assert_eq!(stats.physical_owned_bytes, granule as u64);
+        assert_eq!(stats.page_ins, 2);
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(runtime.allocation_counts(), before);
+        assert_eq!(governor.used(Tier::Device), granule as u64);
+
+        let live_before_reset = global_offload_stats();
+        assert_eq!(
+            live_before_reset.content_resident_bytes,
+            baseline_global.content_resident_bytes + granule as u64
+        );
+        assert_eq!(
+            live_before_reset.mapped_physical_bytes,
+            baseline_global.mapped_physical_bytes + granule as u64
+        );
+        assert_eq!(
+            live_before_reset.budget_bytes,
+            baseline_global.budget_bytes + granule as u64
+        );
+        assert!(live_before_reset.page_ins > 0);
+        assert!(live_before_reset.evictions > 0);
+
+        // Model an earlier lifetime high-water above current live residency.
+        // The reset must perform no write to the peak; storing either zero or a
+        // sampled live value would make this assertion fail.
+        let lifetime_peak = live_before_reset
+            .content_resident_bytes
+            .saturating_add(granule as u64);
+        GLOBAL_PEAK_RESIDENT_BYTES.fetch_max(lifetime_peak, Ordering::Relaxed);
+        let live_before_reset = global_offload_stats();
+
+        reset_global_offload_stats();
+        let live_after_reset = global_offload_stats();
+        assert_eq!(live_after_reset.page_ins, 0);
+        assert_eq!(live_after_reset.hits, 0);
+        assert_eq!(live_after_reset.evictions, 0);
+        assert_eq!(
+            live_after_reset.content_resident_bytes,
+            live_before_reset.content_resident_bytes
+        );
+        assert_eq!(
+            live_after_reset.mapped_physical_bytes,
+            live_before_reset.mapped_physical_bytes
+        );
+        assert_eq!(
+            live_after_reset.budget_bytes,
+            live_before_reset.budget_bytes
+        );
+        assert_eq!(
+            live_after_reset.peak_resident_bytes,
+            live_before_reset.peak_resident_bytes
+        );
+        assert!(live_after_reset.peak_resident_bytes >= live_after_reset.content_resident_bytes);
+
+        let second_authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            governor.clone();
+        let other = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_vmm_admission(Arc::clone(&allocator), second_authority)
+            .expect("install second VMM admission");
+        other
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(737))
+            .expect("reserve second mapped allowance");
+        let _kv = governor
+            .reserve(
+                Tier::Device,
+                granule as u64,
+                MemoryRole::KvCache,
+                HolderId::new(9),
+            )
+            .expect("KV consumes remaining physical headroom");
+        let global_error = other
+            .resident_vmm_with(
+                3,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                |_, _| panic!("global refusal must happen before copy"),
+            )
+            .expect_err("zone room cannot bypass missing global physical headroom");
+        assert!(global_error.to_string().contains("physical headroom"));
+        drop(_kv);
+        drop(other);
+        drop(residency);
+        let unloaded = global_offload_stats();
+        assert_eq!(
+            unloaded.content_resident_bytes,
+            baseline_global.content_resident_bytes
+        );
+        assert_eq!(
+            unloaded.mapped_physical_bytes,
+            baseline_global.mapped_physical_bytes
+        );
+        assert_eq!(unloaded.budget_bytes, baseline_global.budget_bytes);
+        let retained = allocator
+            .physical_pool_stats()
+            .expect("pool stats after unload")
+            .snapshot();
+        assert_eq!(retained.mapped_bytes, 0);
+        assert_eq!(retained.pooled_unmapped_bytes, granule as u64);
+        assert_eq!(retained.total_owned_bytes, granule as u64);
     }
 
     /// A locally chosen budget becomes a claim the rest of the system can see.
@@ -1166,107 +2109,100 @@ mod tests {
         );
     }
 
-    #[test]
-    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
-    fn prefetched_materialized_weight_is_joined_by_demand_page_in() {
-        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
-            eprintln!("SKIPPED (no CUDA runtime): prefetch join check did NOT run.");
-            return;
-        };
-        let residency =
-            CudaWeightResidency::new(Arc::clone(&runtime), 1024).with_async_pagein(true);
-        let payload: Arc<[u8]> = Arc::from([9_u8, 8, 7, 6]);
-        let materialized = Arc::clone(&payload);
-        let weight = LazyWeight::new(
-            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
-            DataType::Uint8,
-            vec![4],
-            vec![onnx_runtime_ep_api::ExternalMmapRegion {
-                mapping_id: 0,
-                offset: 0,
-                len: 4,
-            }],
-            move || {
-                onnx_runtime_ep_api::ResidentWeight::new(
-                    DataType::Uint8,
-                    vec![4],
-                    Arc::clone(&materialized),
-                )
-            },
-        )
-        .unwrap();
+    fn drive_repeated_scan(
+        policy: &mut WeightResidencyPolicy,
+        eviction: WeightEvictionPolicy,
+        working_set: u64,
+        cycles: u64,
+    ) -> u64 {
+        let hits_before = policy.hits;
+        for _ in 0..cycles {
+            for key in 0..working_set {
+                let _ = policy.access(key, 1, eviction);
+            }
+        }
+        policy.hits - hits_before
+    }
 
-        residency.prefetch_materialized(7, &weight).unwrap();
-        let prefetched = residency.stats();
-        assert_eq!(prefetched.page_ins, 1);
-        assert_eq!(prefetched.prefetch_issued, 1);
-        assert_eq!(prefetched.prefetch_declined_guard, 0);
-        let page = residency.resident_materialized(7, &weight).unwrap();
-        let joined = residency.stats();
-        assert_eq!(
-            joined.page_ins, 1,
-            "demand page-in must join the prefetch fence, not start a second copy"
-        );
-        assert_eq!(joined.prefetch_joined, 1);
-        let mut observed = [0_u8; 4];
-        unsafe { runtime.dtoh(&mut observed, page.ptr) }.unwrap();
-        assert_eq!(&observed, payload.as_ref());
+    fn measured_scan_hits(capacity: u64, eviction: WeightEvictionPolicy) -> u64 {
+        const WORKING_SET: u64 = 10;
+        const MEASURED_CYCLES: u64 = 5;
+        let mut policy = WeightResidencyPolicy::new(capacity);
+
+        let _ = drive_repeated_scan(&mut policy, eviction, WORKING_SET, 1);
+        drive_repeated_scan(&mut policy, eviction, WORKING_SET, MEASURED_CYCLES)
     }
 
     #[test]
-    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
-    fn prefetch_guard_declines_when_admission_would_evict() {
-        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
-            eprintln!("SKIPPED (no CUDA runtime): prefetch guard check did NOT run.");
-            return;
-        };
-        let residency = CudaWeightResidency::new(Arc::clone(&runtime), 4).with_async_pagein(true);
-        let payload: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
-        let materialized = Arc::clone(&payload);
-        let weight = LazyWeight::new(
-            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
-            DataType::Uint8,
-            vec![4],
-            vec![onnx_runtime_ep_api::ExternalMmapRegion {
-                mapping_id: 0,
-                offset: 0,
-                len: 4,
-            }],
-            move || {
-                onnx_runtime_ep_api::ResidentWeight::new(
-                    DataType::Uint8,
-                    vec![4],
-                    Arc::clone(&materialized),
-                )
-            },
-        )
-        .unwrap();
-        let other_payload: Arc<[u8]> = Arc::from([5_u8, 6, 7, 8]);
-        let other_materialized = Arc::clone(&other_payload);
-        let other = LazyWeight::new(
-            onnx_runtime_ep_api::LazyWeightBoundary::MatMulNBits,
-            DataType::Uint8,
-            vec![4],
-            vec![onnx_runtime_ep_api::ExternalMmapRegion {
-                mapping_id: 1,
-                offset: 0,
-                len: 4,
-            }],
-            move || {
-                onnx_runtime_ep_api::ResidentWeight::new(
-                    DataType::Uint8,
-                    vec![4],
-                    Arc::clone(&other_materialized),
-                )
-            },
-        )
-        .unwrap();
+    fn lru_has_zero_steady_state_hits_across_cyclic_scan_capacity_sweep() {
+        const WORKING_SET: u64 = 10;
+        const MEASURED_CYCLES: u64 = 5;
+        let accesses = WORKING_SET * MEASURED_CYCLES;
 
-        let _resident = residency.resident_materialized(1, &weight).unwrap();
-        residency.prefetch_materialized(2, &other).unwrap();
-        let stats = residency.stats();
-        assert_eq!(stats.prefetch_issued, 0);
-        assert_eq!(stats.prefetch_declined_guard, 1);
-        assert_eq!(stats.evictions, 0, "prefetch guard must not evict");
+        for capacity in [2, 4, 6, 8] {
+            let hits = measured_scan_hits(capacity, WeightEvictionPolicy::Lru);
+            assert_eq!(
+                hits,
+                0,
+                "LRU should be pessimal for a clean cycle larger than capacity; \
+                 B={capacity}/{WORKING_SET}, hit_rate={:.1}%",
+                (hits as f64 / accesses as f64) * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn stable_subset_recovers_capacity_fraction_across_cyclic_scan_sweep() {
+        const WORKING_SET: u64 = 10;
+        const MEASURED_CYCLES: u64 = 5;
+        let accesses = WORKING_SET * MEASURED_CYCLES;
+
+        for capacity in [2, 4, 6, 8] {
+            let hits = measured_scan_hits(capacity, WeightEvictionPolicy::StableResident);
+            assert_eq!(hits, capacity * MEASURED_CYCLES);
+            assert_eq!(
+                (hits as f64) / (accesses as f64),
+                (capacity as f64) / (WORKING_SET as f64),
+                "stable-subset residency should recover B/W for B={capacity}/{WORKING_SET}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_subset_matches_lru_when_whole_scan_fits() {
+        const WORKING_SET: u64 = 10;
+        const MEASURED_CYCLES: u64 = 5;
+
+        for capacity in [10, 12] {
+            let lru_hits = measured_scan_hits(capacity, WeightEvictionPolicy::Lru);
+            let stable_hits = measured_scan_hits(capacity, WeightEvictionPolicy::StableResident);
+
+            assert_eq!(lru_hits, WORKING_SET * MEASURED_CYCLES);
+            assert_eq!(stable_hits, lru_hits);
+        }
+    }
+
+    #[test]
+    fn scan_resistant_mode_leaves_moe_skew_on_lru() {
+        let selected = eviction_for_boundary(true, LazyWeightBoundary::QMoe);
+        assert_eq!(selected, WeightEvictionPolicy::Lru);
+
+        const CYCLES: u64 = 20;
+        let skewed = [0, 0, 0, 0, 1, 0, 1, 2, 0, 3, 0, 1];
+        let mut baseline = WeightResidencyPolicy::new(3);
+        let mut moe = WeightResidencyPolicy::new(3);
+        for _ in 0..CYCLES {
+            for &key in &skewed {
+                let _ = baseline.access(key, 1, WeightEvictionPolicy::Lru);
+                let _ = moe.access(key, 1, selected);
+            }
+        }
+
+        assert_eq!(moe.hits, baseline.hits);
+        assert_eq!(moe.page_ins, baseline.page_ins);
+        assert_eq!(moe.evictions, baseline.evictions);
+        assert_eq!(moe.hits, 178);
+        assert_eq!(moe.page_ins, 62);
+        assert_eq!(moe.evictions, 59);
     }
 }

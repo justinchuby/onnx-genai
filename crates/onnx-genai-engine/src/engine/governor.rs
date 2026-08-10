@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::engine::memory_plan::{Holder, ModelMemoryPlan};
+use crate::memory_authority::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryGovernor,
+    SharedMemoryAuthorityProvider,
+};
 
 #[cfg(feature = "native-backend")]
 pub(crate) fn resolve_native_decode_device(
@@ -99,7 +103,7 @@ pub struct EngineResourceGovernor {
     /// Shared, so every lease this engine hands out is counted against the same
     /// ledger; a per-caller governor would let each holder believe it had the
     /// whole tier to itself.
-    memory: onnx_runtime_memory_governor::LedgerGovernor,
+    memory: EngineMemoryGovernor,
     /// The fixed device reservation -- weights and runtime overhead -- held as a
     /// lease rather than subtracted before the ledger sees it.
     ///
@@ -110,6 +114,7 @@ pub struct EngineResourceGovernor {
 }
 
 impl EngineResourceGovernor {
+    #[cfg(test)]
     pub(crate) fn new(
         limits: ResourceLimits,
         allow_runtime_override: bool,
@@ -126,6 +131,7 @@ impl EngineResourceGovernor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_capacities(
         limits: ResourceLimits,
         allow_runtime_override: bool,
@@ -133,6 +139,89 @@ impl EngineResourceGovernor {
         kv_config: ModelKvConfig,
         model_weights_bytes: u64,
     ) -> Result<Self, ResourceError> {
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (model_weights_bytes, model_weights_bytes),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_authority(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        model_weights_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: Option<&DeviceCompatibilityDomain>,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (model_weights_bytes, model_weights_bytes),
+            provider,
+            domain,
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn new_with_authority_and_reservation(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        model_weights_bytes: u64,
+        reservation_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: Option<&DeviceCompatibilityDomain>,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (model_weights_bytes, reservation_bytes),
+            provider,
+            domain,
+        )
+    }
+
+    pub(crate) fn new_for_shared_pipeline_kv(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        existing_device_usage_bytes: u64,
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: &DeviceCompatibilityDomain,
+    ) -> Result<Self, ResourceError> {
+        let capacities = fallback_capacity_providers(&limits);
+        Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (existing_device_usage_bytes, 0),
+            provider,
+            Some(domain),
+        )
+    }
+
+    fn new_with_capacities_and_authority(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        capacities: CapacityProviders,
+        kv_config: ModelKvConfig,
+        model_weight_bytes: (u64, u64),
+        provider: Option<&SharedMemoryAuthorityProvider>,
+        domain: Option<&DeviceCompatibilityDomain>,
+    ) -> Result<Self, ResourceError> {
+        let (model_weights_bytes, reservation_bytes) = model_weight_bytes;
         // Model weights are measured from the package on disk (graph plus its
         // ONNX external-data blob), so the KV budget is derived from what is
         // actually left rather than from the whole ceiling.
@@ -182,28 +271,54 @@ impl EngineResourceGovernor {
         // what remains after a claim the ledger can see, rather than after
         // arithmetic it cannot.
         let snapshot = inner.snapshot();
-        let memory = onnx_runtime_memory_governor::LedgerGovernor::new(
-            onnx_runtime_memory_governor::LeaseLedger::new(
+        let device = match (provider, domain) {
+            (Some(provider), Some(domain)) => provider
+                .authority(domain, snapshot.resolved_limits.vram_bytes)
+                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                    operation: "acquiring the shared device memory authority",
+                    reason: error.to_string(),
+                })?,
+            (None, Some(domain)) => {
+                DeviceMemoryAuthority::new(domain.clone(), snapshot.resolved_limits.vram_bytes)
+            }
+            _ => DeviceMemoryAuthority::new(
+                DeviceCompatibilityDomain::Accelerator {
+                    backend: "standalone".to_string(),
+                    index: 0,
+                },
                 snapshot.resolved_limits.vram_bytes,
-                snapshot.resolved_limits.host_ram_bytes,
-                snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
             ),
+        };
+        let memory = EngineMemoryGovernor::new(
+            device,
+            snapshot.resolved_limits.host_ram_bytes,
+            snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
         );
+        if provider.is_some()
+            && reservation_bytes > 0
+            && !snapshot.derived_budget.reservation_applied
+        {
+            return Err(ResourceError::BudgetArithmeticOverflow {
+                operation: "reserving production model weights before session load",
+                reason: format!(
+                    "{reservation_bytes} bytes of model weights do not fit under the resolved \
+                     {} byte device-authority limit",
+                    snapshot.resolved_limits.vram_bytes
+                ),
+            });
+        }
         // `reservation_applied` is false when honouring the reservation would
         // have left no room for even one KV page. It is an estimate over a
         // ceiling that may itself be provisional, so it must never be the reason
         // a model refuses to start -- and when it was not applied there is
         // nothing to charge.
         let mut plan = ModelMemoryPlan::new(memory.clone());
-        if snapshot.derived_budget.reservation_applied {
-            plan.reserve(
-                Holder::FixedDeviceReservation,
-                snapshot.derived_budget.reserved_bytes,
-            )
-            .map_err(|error| ResourceError::BudgetArithmeticOverflow {
-                operation: "charging the fixed device reservation to the memory ledger",
-                reason: error.to_string(),
-            })?;
+        if snapshot.derived_budget.reservation_applied && reservation_bytes > 0 {
+            plan.reserve(Holder::FixedDeviceReservation, reservation_bytes)
+                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                    operation: "charging the fixed device reservation to the memory ledger",
+                    reason: error.to_string(),
+                })?;
         }
         #[cfg(feature = "native-backend")]
         // A host-cache lease is a standing claim on RAM. Take it only when the
@@ -290,8 +405,13 @@ impl EngineResourceGovernor {
         )
     }
 
-    pub fn memory(&self) -> &onnx_runtime_memory_governor::LedgerGovernor {
+    #[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+    pub(crate) fn memory(&self) -> &EngineMemoryGovernor {
         &self.memory
+    }
+
+    pub fn device_authority(&self) -> DeviceMemoryAuthority {
+        self.memory.device_authority()
     }
 
     /// Point-in-time configured, resolved, derived, and live per-tier state.
@@ -299,8 +419,11 @@ impl EngineResourceGovernor {
         use onnx_runtime_memory_governor::Tier;
 
         let mut snapshot = self.inner.snapshot();
-        snapshot.vram =
-            Self::tier_snapshot_from_ledger(&self.memory, Tier::Device, snapshot.vram.limit);
+        snapshot.vram = Self::tier_snapshot_from_ledger(
+            &self.memory,
+            Tier::Device,
+            self.memory.device_authority().limit_bytes(),
+        );
         snapshot.host_ram =
             Self::tier_snapshot_from_ledger(&self.memory, Tier::Host, snapshot.host_ram.limit);
         if let Some(disk) = snapshot.disk_spill.as_mut() {
@@ -319,7 +442,21 @@ impl EngineResourceGovernor {
         }
         // TODO(§26.11.2): execute the returned priority/offload/eviction order
         // across live engine sessions when the outcome reports an overage.
-        Ok(self.inner.set_vram_limit(limit)?)
+        let outcome = self.inner.set_vram_limit(limit)?;
+        let authority = self.memory.device_authority();
+        if let Err(error) = authority.try_set_limit_bytes(outcome.new_limits.vram_bytes) {
+            let _ = self
+                .inner
+                .set_vram_limit(ResourceLimit::Bytes(outcome.old_limits.vram_bytes));
+            return Err(EngineGovernorError::Resource(
+                ResourceError::CannotSatisfyLoweredLimit {
+                    requested_bytes: outcome.new_limits.vram_bytes,
+                    minimum_bytes: authority.used_bytes(),
+                    reason: error.to_string(),
+                },
+            ));
+        }
+        Ok(outcome)
     }
 
     /// Report live use from the lease ledger, not from the scheduler's transient
@@ -327,7 +464,7 @@ impl EngineResourceGovernor {
     /// the budget here made a loaded model look like 0 bytes until a scheduled
     /// request happened to be active, so admission saw an empty card (#706).
     fn tier_snapshot_from_ledger(
-        memory: &onnx_runtime_memory_governor::LedgerGovernor,
+        memory: &EngineMemoryGovernor,
         tier: onnx_runtime_memory_governor::Tier,
         limit: u64,
     ) -> onnx_genai_scheduler::TierSnapshot {
@@ -346,6 +483,23 @@ impl EngineResourceGovernor {
                 memory: self.memory.clone(),
                 kv_pool_bytes: self.plan().kv_pool_bytes_handle(),
             }))
+    }
+
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn byte_budget_after_native_load(&self) -> onnx_genai_scheduler::ByteBudget {
+        use onnx_runtime_memory_governor::MemoryGovernor as _;
+
+        let kv_pool_bytes = self.plan().kv_pool_bytes_handle();
+        let limit = self
+            .memory
+            .available(onnx_runtime_memory_governor::Tier::Device)
+            .saturating_add(kv_pool_bytes.load(std::sync::atomic::Ordering::Relaxed));
+        onnx_genai_scheduler::ByteBudget::new(limit).with_ceiling(std::sync::Arc::new(
+            LedgerAdmissionCeiling {
+                memory: self.memory.clone(),
+                kv_pool_bytes,
+            },
+        ))
     }
 
     #[cfg(feature = "native-backend")]
@@ -383,7 +537,7 @@ impl EngineResourceGovernor {
 /// and `a_device_tier_pool_is_added_back` in `memory_plan` pin both halves.
 #[derive(Debug)]
 struct LedgerAdmissionCeiling {
-    memory: onnx_runtime_memory_governor::LedgerGovernor,
+    memory: EngineMemoryGovernor,
     kv_pool_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -436,18 +590,12 @@ pub(crate) fn governor_kv_config(
     kv_model: Option<&KvModelInfo>,
     config: &EngineConfig,
 ) -> anyhow::Result<ModelKvConfig> {
-    let tokens_per_page = u64::try_from(config.page_size)
-        .context("KV page size does not fit the Resource Governor's u64 accounting")?
-        .max(1);
+    let tokens_per_page = governor_tokens_per_page(config)?;
     let Some(kv_model) = kv_model else {
-        return Ok(ModelKvConfig {
-            page_size_bytes: tokens_per_page,
-            tokens_per_page,
-        });
+        return Ok(ModelKvConfig::unknown(tokens_per_page));
     };
 
-    let page_size = u64::try_from(config.page_size)
-        .context("KV page size does not fit the Resource Governor's u64 accounting")?;
+    let page_size = tokens_per_page;
     let mut page_size_bytes = 0_u64;
     for layer in &kv_model.layer_configs {
         let heads = u64::try_from(layer.num_kv_heads)
@@ -477,10 +625,64 @@ pub(crate) fn governor_kv_config(
             .checked_add(layer_bytes)
             .context("total KV page byte size overflowed Resource Governor accounting")?;
     }
-    Ok(ModelKvConfig {
-        page_size_bytes: page_size_bytes.max(1),
-        tokens_per_page,
-    })
+    Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
+}
+
+#[cfg_attr(
+    not(feature = "native-backend"),
+    expect(
+        dead_code,
+        reason = "native KV admission is used only by the native backend"
+    )
+)]
+pub(crate) fn governor_native_kv_config(
+    kv_model: Option<&KvModelInfo>,
+    config: &EngineConfig,
+) -> anyhow::Result<ModelKvConfig> {
+    let tokens_per_page = governor_tokens_per_page(config)?;
+    let Some(kv_model) = kv_model else {
+        return Ok(ModelKvConfig::unknown(tokens_per_page));
+    };
+
+    let page_size_bytes =
+        crate::kv_sizing::kv_cache_bytes_for_tensors(&kv_model.native_kv_tensors, tokens_per_page)?;
+    Ok(ModelKvConfig::known(page_size_bytes, tokens_per_page))
+}
+
+pub(crate) fn governor_no_paged_kv_config(config: &EngineConfig) -> anyhow::Result<ModelKvConfig> {
+    Ok(ModelKvConfig::no_paged_cache(governor_tokens_per_page(
+        config,
+    )?))
+}
+
+fn governor_tokens_per_page(config: &EngineConfig) -> anyhow::Result<u64> {
+    let tokens_per_page = u64::try_from(config.page_size)
+        .context("KV page_size does not fit the Resource Governor's u64 accounting")?;
+    if tokens_per_page == 0 {
+        anyhow::bail!(
+            "KV page_size must be greater than zero; set EngineConfig::page_size to the number of tokens per KV page"
+        );
+    }
+    Ok(tokens_per_page)
+}
+
+#[cfg(any(feature = "native-backend", test))]
+pub(crate) fn model_io_declares_only_fixed_state(
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> bool {
+    let Some(io) = io else {
+        return false;
+    };
+    let has_state_pairs = io
+        .state_pairs
+        .as_ref()
+        .is_some_and(|pairs| !pairs.is_empty());
+    let has_kv_pairs = io.kv_inputs.as_ref().is_some_and(|ports| !ports.is_empty())
+        || io
+            .kv_outputs
+            .as_ref()
+            .is_some_and(|ports| !ports.is_empty());
+    has_state_pairs && !has_kv_pairs
 }
 
 /// Build a governor for a component that owns memory but is not the engine.
@@ -493,14 +695,209 @@ pub(crate) fn governor_kv_config(
 pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
+    model_weights_bytes: u64,
+    provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
+    domain: &crate::memory_authority::DeviceCompatibilityDomain,
 ) -> anyhow::Result<EngineResourceGovernor> {
-    EngineResourceGovernor::new(
+    let kv_config = match kv_model {
+        Some(kv_model) => governor_kv_config(Some(kv_model), config)?,
+        None => governor_no_paged_kv_config(config)?,
+    };
+    EngineResourceGovernor::new_with_authority(
         config.limits.clone(),
         config.allow_runtime_override,
-        governor_kv_config(kv_model, config)?,
-        // This resolves ceilings only; the model path is not in scope here, so
-        // the weight reservation is left at zero.
-        0,
+        kv_config,
+        model_weights_bytes,
+        provider,
+        Some(domain),
     )
     .context("failed to resolve the engine memory budget for decoder fixed state")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_kv_geometry_is_unknown_not_a_token_count_byte_size() {
+        let config = EngineConfig {
+            page_size: 16,
+            ..EngineConfig::default()
+        };
+
+        let kv_config = governor_kv_config(None, &config).unwrap();
+
+        assert_eq!(kv_config.tokens_per_page, 16);
+        assert_eq!(kv_config.page_size_bytes, None);
+        assert_eq!(kv_config.bytes_per_token(), None);
+    }
+
+    #[test]
+    fn zero_page_size_fails_instead_of_manufacturing_one_byte_tokens() {
+        let config = EngineConfig {
+            page_size: 0,
+            ..EngineConfig::default()
+        };
+        let kv_model = KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 1,
+                head_dim: 1,
+                page_size: 0,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 1,
+                head_dim: 1,
+            }],
+            native_kv_tensors: Vec::new(),
+            layers: Vec::new(),
+        };
+
+        for result in [
+            governor_kv_config(None, &config),
+            governor_kv_config(Some(&kv_model), &config),
+            governor_no_paged_kv_config(&config),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("page_size must be greater than zero"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_kv_accounting_uses_graph_storage_width() {
+        let config = EngineConfig::default();
+        let kv_model = KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                page_size: config.page_size,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 4,
+            }],
+            native_kv_tensors: vec![
+                crate::kv_sizing::KvTensorSpec {
+                    name: "key".into(),
+                    dtype: crate::kv_sizing::KvStorageType::Float16,
+                    shape: vec![
+                        crate::kv_sizing::KvDimension::PerSequenceBatch,
+                        crate::kv_sizing::KvDimension::Fixed(2),
+                        crate::kv_sizing::KvDimension::Context,
+                        crate::kv_sizing::KvDimension::Fixed(4),
+                    ],
+                },
+                crate::kv_sizing::KvTensorSpec {
+                    name: "value".into(),
+                    dtype: crate::kv_sizing::KvStorageType::Float16,
+                    shape: vec![
+                        crate::kv_sizing::KvDimension::PerSequenceBatch,
+                        crate::kv_sizing::KvDimension::Fixed(2),
+                        crate::kv_sizing::KvDimension::Context,
+                        crate::kv_sizing::KvDimension::Fixed(4),
+                    ],
+                },
+            ],
+            layers: Vec::new(),
+        };
+
+        let native = governor_native_kv_config(Some(&kv_model), &config).unwrap();
+        let host_mirror = governor_kv_config(Some(&kv_model), &config).unwrap();
+
+        assert_eq!(native.bytes_per_token(), Some(32));
+        assert_eq!(host_mirror.bytes_per_token(), Some(64));
+    }
+
+    fn native_kv_model_with_specs(specs: Vec<crate::kv_sizing::KvTensorSpec>) -> KvModelInfo {
+        KvModelInfo {
+            tensor_config: onnx_genai_kv::PageTensorConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                page_size: 16,
+                dtype: KvDType::F32,
+            },
+            layer_configs: vec![onnx_genai_kv::LayerTensorConfig {
+                num_kv_heads: 2,
+                head_dim: 4,
+            }],
+            native_kv_tensors: specs,
+            layers: Vec::new(),
+        }
+    }
+
+    fn native_kv_spec(
+        name: &str,
+        dtype: crate::kv_sizing::KvStorageType,
+        head_dim: u64,
+    ) -> crate::kv_sizing::KvTensorSpec {
+        crate::kv_sizing::KvTensorSpec {
+            name: name.into(),
+            dtype,
+            shape: vec![
+                crate::kv_sizing::KvDimension::PerSequenceBatch,
+                crate::kv_sizing::KvDimension::Fixed(2),
+                crate::kv_sizing::KvDimension::Context,
+                crate::kv_sizing::KvDimension::Fixed(head_dim),
+            ],
+        }
+    }
+
+    #[test]
+    fn native_kv_accounting_sums_asymmetric_key_and_value_geometry() {
+        let config = EngineConfig::default();
+        let model = native_kv_model_with_specs(vec![
+            native_kv_spec("key", crate::kv_sizing::KvStorageType::Float16, 4),
+            native_kv_spec("value", crate::kv_sizing::KvStorageType::Float16, 8),
+        ]);
+
+        let admission = governor_native_kv_config(Some(&model), &config).unwrap();
+
+        assert_eq!(admission.bytes_per_token(), Some(48));
+        assert_eq!(
+            admission.page_size_bytes,
+            Some(
+                crate::kv_sizing::kv_cache_bytes_for_tensors(
+                    &model.native_kv_tensors,
+                    config.page_size as u64
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn native_kv_accounting_sums_asymmetric_storage_widths() {
+        let config = EngineConfig::default();
+        let model = native_kv_model_with_specs(vec![
+            native_kv_spec("key", crate::kv_sizing::KvStorageType::Float16, 4),
+            native_kv_spec("value", crate::kv_sizing::KvStorageType::Float32, 4),
+        ]);
+
+        let admission = governor_native_kv_config(Some(&model), &config).unwrap();
+
+        assert_eq!(admission.bytes_per_token(), Some(48));
+    }
+
+    #[test]
+    fn state_only_metadata_is_a_valid_non_paged_cache_not_unknown_geometry() {
+        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+            "state_pairs": [
+                { "input": "conv_state_in", "output": "conv_state_out" }
+            ]
+        }))
+        .unwrap();
+
+        assert!(model_io_declares_only_fixed_state(Some(&io)));
+        let kv_config = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
+        assert_eq!(kv_config.page_size_bytes, None);
+        assert!(!kv_config.page_geometry_required);
+        assert_eq!(kv_config.bytes_per_token(), None);
+    }
 }

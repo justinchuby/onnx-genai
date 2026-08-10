@@ -7,7 +7,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{ArgGroup, Args};
-use onnx_genai_engine::KvDType;
+use onnx_genai_engine::{KvDType, ResourceLimit, parse_resource_limit};
 
 #[cfg(feature = "native-backend")]
 use crate::parse_native_device;
@@ -99,6 +99,12 @@ pub struct ServeArgs {
     )]
     pub kv_cache_dtype: KvDType,
 
+    /// VRAM ceiling for the engine resource governor. Resolved before model load so
+    /// native CUDA can choose governed weight offload instead of relying on WDDM paging.
+    /// Accepted values: bytes, fractions such as 0.9, byte strings such as 8GiB, or auto.
+    #[arg(long, env = "ONNX_GENAI_VRAM_LIMIT", value_parser = parse_limit)]
+    pub vram_limit: Option<ResourceLimit>,
+
     /// Device for native decoder execution: cpu, cuda, or cuda:<index>.
     /// Falls back to ONNX_GENAI_EP when omitted.
     #[cfg(feature = "native-backend")]
@@ -106,10 +112,29 @@ pub struct ServeArgs {
     pub native_device: Option<onnx_genai_engine::NativeDecodeDevice>,
 }
 
-/// Build the server state from [`ServeArgs`] and serve until shutdown.
-pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
-    let server_config = ServerConfig {
-        node_id: args.node_id.unwrap_or_else(default_node_id),
+fn parse_limit(input: &str) -> Result<ResourceLimit, String> {
+    parse_resource_limit(input).map_err(|error| error.to_string())
+}
+
+fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
+    let mut engine_config = onnx_genai_engine::EngineConfig {
+        kv_cache_dtype: args.kv_cache_dtype,
+        #[cfg(feature = "native-backend")]
+        native_device: args.native_device.clone(),
+        #[cfg(feature = "native-backend")]
+        decode_backend: if args.native_device.is_some() {
+            onnx_genai_engine::EngineDecodeBackend::Native
+        } else {
+            onnx_genai_engine::EngineDecodeBackend::default()
+        },
+        ..Default::default()
+    };
+    if let Some(vram_limit) = args.vram_limit {
+        engine_config.limits.vram_limit = vram_limit;
+    }
+
+    ServerConfig {
+        node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
@@ -117,13 +142,13 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         enable_admin_endpoints: args.enable_admin_endpoints,
         max_loaded_models: args.max_loaded_models,
         eviction_policy: Default::default(),
-        engine_config: onnx_genai_engine::EngineConfig {
-            kv_cache_dtype: args.kv_cache_dtype,
-            #[cfg(feature = "native-backend")]
-            native_device: args.native_device,
-            ..Default::default()
-        },
-    };
+        engine_config,
+    }
+}
+
+/// Build the server state from [`ServeArgs`] and serve until shutdown.
+pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    let server_config = server_config_from_args(&args);
 
     // Build the model spec list from whichever source flag was provided.
     // Exactly one of --model / --models-dir / --models-config is required (ArgGroup).
@@ -152,4 +177,63 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let state = AppState::load_from_specs(specs, server_config)?;
     tracing::info!(addr = %args.addr, model = state.model_id(), "starting onnx-genai server");
     serve(args.addr, state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    #[test]
+    fn serve_vram_limit_flows_into_engine_config_before_load() {
+        let cli =
+            TestCli::parse_from(["test", "--model", "model-dir", "--vram-limit", "6000000000"]);
+
+        let config = server_config_from_args(&cli.serve);
+
+        assert_eq!(
+            config.engine_config.limits.vram_limit,
+            ResourceLimit::Bytes(6_000_000_000)
+        );
+    }
+
+    #[test]
+    fn serve_vram_limit_accepts_fraction_and_auto() {
+        let fraction = TestCli::parse_from(["test", "--model", "model-dir", "--vram-limit", "0.5"]);
+        let auto = TestCli::parse_from(["test", "--model", "model-dir", "--vram-limit", "auto"]);
+
+        assert_eq!(
+            server_config_from_args(&fraction.serve)
+                .engine_config
+                .limits
+                .vram_limit,
+            ResourceLimit::Fraction(0.5)
+        );
+        assert_eq!(
+            server_config_from_args(&auto.serve)
+                .engine_config
+                .limits
+                .vram_limit,
+            ResourceLimit::Auto
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn explicit_native_device_selects_native_decode() {
+        let cli = TestCli::parse_from(["test", "--model", "model-dir", "--native-device", "cpu"]);
+
+        assert_eq!(
+            server_config_from_args(&cli.serve)
+                .engine_config
+                .decode_backend,
+            onnx_genai_engine::EngineDecodeBackend::Native
+        );
+    }
 }

@@ -33,10 +33,11 @@ pub use executor::{
     ControlFlowStats, DENSE_WEIGHT_PREFETCH_LOOKAHEAD_ENV, DensePrefetchGapStats,
     DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
     ExecutionProviderFallbackReport, PrefetchStep, SeamReason, dense_prefetch_gap_stats,
-    dense_weight_prefetch_lookahead_nodes, drive_double_buffer, exec_phase_stats,
-    plan_double_buffer, print_exec_phase_profile, reset_dense_prefetch_gap_stats,
-    reset_exec_phase_profile,
+    dense_weight_prefetch_lookahead_nodes, drive_double_buffer,
+    enable_exec_phase_profile_for_process, exec_phase_stats, plan_double_buffer,
+    print_exec_phase_profile, reset_dense_prefetch_gap_stats, reset_exec_phase_profile,
 };
+pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
@@ -1133,6 +1134,36 @@ impl InferenceSession {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         self.exec.run_with_device_bindings(inputs, bindings)
+    }
+
+    /// Prepare exact kernel workspace for a bound run without launching kernels.
+    pub fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.exec.prepare_with_device_bindings(inputs, bindings)
+    }
+
+    pub fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        self.exec.prepare_mapped_growth(bytes, role)
+    }
+
+    pub fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.exec.release_mapped_growth(bytes, role);
+    }
+
+    /// Locations of graph nodes that declare owned kernel workspace.
+    pub fn workspace_node_locations(&self) -> Vec<String> {
+        self.exec.workspace_node_locations()
     }
 
     /// Lazily build the decode-specialized inlined-body sibling executor

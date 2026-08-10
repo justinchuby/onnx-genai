@@ -31,10 +31,13 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it; still opt-in** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM`. **It has not earned the default**, and on Windows it is currently *worse*: `cuMemCreate` cannot exceed dedicated VRAM while `cudaMalloc` silently spills into WDDM shared memory, so enabling the arena can turn a working load into an OOM (#704). The KV cache still has no virtually contiguous layout (#656) |
-| Composability of the memory paths | — | **broken: 2 of 4 configurations fail to load** | The VMM arena, weight offload and the baseline do not compose. Measured on qwen2.5-14b int4: neither → 6.01 tok/s; arena only → OOM; offload only → double-counted budget (fixed by #707); both → 0.22 tok/s. Every A/B that toggled one of these compared a working configuration against a broken one (#704) |
-| Weight offload vs the OS | — | **27x slower than doing nothing** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
-| `--vram-limit` | — | **does not limit VRAM** | Bounds only the KV budget derivation. A 2 GB ceiling on a model needing ~15.5 GB still generates successfully, warning and proceeding. #712 proposes making it the single knob that also drives offload automatically |
+| Virtual contiguity | §1.6 | **implemented; selected by an explicit byte VRAM limit for native CUDA** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. `serve --vram-limit <bytes>` deliberately selects the authority-governed VMM/pool path: this is managed **no-spill** mode and does not rely on WDDM shared-memory fallback. Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. Without an explicit byte limit, existing behavior is preserved and `ONNX_GENAI_CUDA_VMM` remains the manual opt-in. `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` disables the automatic VMM/pool selection and restores the compatibility fallback. |
+| Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). Under an explicit byte limit, native CUDA now constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The compatibility path remains available through the lending opt-out; performance parity with WDDM remains separate work. |
+| Weight offload vs the OS | — | **27x slower than doing nothing; cause identified 2026-08-06** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload path is far behind. The gap now has a named mechanism rather than a mystery: the residency cache never served a single weight without copying it (see the row below), so every decode step re-staged 7.33 GiB and paid 6,936 `cuMemAlloc`/`cuMemFree` pairs. Measured with CUDA events, that places **~39% of step time downstream of one eviction-policy defect** — `h2d_copy` 18.8%, `staging_fill` 9.0%, `vram_free` 9.0%, `vram_alloc` 2.3%. The remainder is not yet accounted for, and graph capture — worth **2.6x** in isolation, ranges non-overlapping — is disabled on **every** offload runffload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
+| `--vram-limit` | — | **enforced; explicit bytes select managed no-spill mode** | The limit is resolved before native CUDA session construction. If package weights exceed it, weight offload is enabled and its allowance is derived as `limit − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` restores the prior non-VMM/WDDM-capable compatibility fallback. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. |
+| Weight residency cache (CUDA) | — | **had a 0% hit rate for its entire life; fixed 2026-08-06** | `evict_to_fit` was a plain LRU evicting from the least-recently-used end, while the decode weight walk is a **cyclic sequential scan** over the layers — the pessimal pairing, which returns the hit rate to zero at *every* capacity. Measured: **6,936 page-ins, 0 hits, at both 3 GB and 6 GB budgets**, with staged bytes identical (7,870,916,608 per step) because miss traffic under this pathology is invariant to capacity. Rivals eliminated on hardware: the budget knob works (peak resident 3.0 vs 6.0 GB) and staged bytes reconcile with `page_ins × page size`. A stable-resident-subset policy measures **74.18%** against a `B/W ≈ 76%` ceiling, page-ins 6,936 → 1,791, evictions 6,286 → **0**. #720, PR #723 |
+| KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stages 2–5 in #721. PR #726 |
+| Captured graphs across a VMM remap | — | **verified on hardware 2026-08-06** | A CUDA graph instantiated before `cuMemUnmap`/`cuMemCreate`/`cuMemMap` at the same virtual address replays correctly afterwards and writes into the **new** physical pages — sentinel-proven, closing the page-recycling confound. The growth-shaped case passes, and one physical handle mapped at two virtual addresses is readable by captured work through either. Untested and treated as unsafe: unmapping while a replay is in flight. `cuMemMap` during capture returns `CUDA_SUCCESS` but is **not** proven replayable, so growth is issued outside the captured segment. This is the premise under #721 stage 4 and under re-scoping #716, and its stated falsifier did not fire. PR #727 |
 | Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
 | Governor integration, server path | — | **fixed 2026-08-06** | `/metrics` reported `vram_used_bytes = 0` while a 14B was loaded and generating, because the server read the scheduler's `ByteBudget` rather than the engine's lease ledger. Admission therefore saw a permanently empty card and never applied back-pressure: 16 concurrent requests cost **12.8x** the wall clock of 8, with zero rejections. Fixed in #711 (16-concurrent 472.8 s → 126.4 s median); the tail is still bad (#706) |
@@ -137,6 +140,62 @@ Two corollaries worth stating because both cost time here:
   preserves the source mtime, so restoring a file from a `.bak` can leave cargo
   reusing a stale artifact.
 
+### A third failure mode: the instrument itself
+
+The two above are about code that never runs and numbers that mean something
+else. There is a third, and it cost the most: **an instrument that runs, reports
+a plausible number, and measures the wrong thing.**
+
+`h2d_enqueue_copy_ms` reported host-to-device transfer at **1.7%** of decode step
+time. That figure retired an entire line of work — prefetch depth, pinned versus
+pageable staging, transfer overlap — and was published on #705 and #718.
+
+It was wrong by an order of magnitude. The arithmetic gives it away: the same
+step stages **7.33 GiB**, and 7.33 GiB in 30 ms would be ~250 GB/s, roughly ten
+times this machine's PCIe link. The counter bracketed an *asynchronous enqueue
+returning*, not a transfer completing.
+
+The first repair renamed it `copy_wait_ms` and pointed it at
+`compute_wait_fence`, whose own doc comment reads *"a stream-ordered, **non
+host-blocking** cross-stream wait."* The same non-measurement survived under a
+name that invited the wrong reading more strongly than before. Measured properly
+with CUDA events — start event on the copy stream before `cuMemcpyHtoDAsync`, end
+event after, host-block to read `cuEventElapsedTime` — transfer is **18.8%**.
+
+Two habits, both cheap:
+
+**Divide the bytes by the time and ask whether the answer is a real bandwidth.**
+A number near link speed, near memcpy speed, or ten times either is telling you
+what the counter actually bracketed. This is what caught it, and it takes
+seconds.
+
+**State, in a comment on every timing counter, exactly what lies between start
+and stop and whether anything there blocks the host.** A host-side `Instant` span
+around a stream-ordered call must never carry a name suggesting it waited for
+device work. Enforced in `weight_paging.rs` since #715.
+
+The corollary is about naming, not timing: a counter whose name overstates what
+it brackets is worse than no counter, because it is believed. The same is true of
+a counter that is emitted with nothing writing it — a row reading `0.00` cannot
+be distinguished from a row that was never measured, which is why #715 removed
+the dead ones and added a test that every emitted counter has a live writer.
+
+### The pattern underneath all three
+
+Telemetry that never reaches the operator, three times in one subsystem:
+documented environment variables that nothing reads (#688); counters computed,
+used to gate a profile section, and then never printed (#719); counters printed
+with nothing writing them (#715).
+
+The #719 case is the sharpest. A residency cache paging at a **0% hit rate**
+printed a weight-offload section in which **every visible row read `0.00`** — and
+the first reading of that output was that the cache was inert. The opposite was
+true, and provably so: the section printing at all required one of the three
+*hidden* counters to be non-zero. The instrument reported the exact inverse of
+what it measured.
+
+After the third instance the response should be a guard, not more vigilance.
+
 The `Challenger` role (`.squad/agents/challenger/charter.md`) exists to apply
 this systematically to any result that would change technical direction.
 
@@ -230,6 +289,26 @@ commits physically on demand and leases each granule, it knows about the
 weights — so that half of the reservation is released at adoption, and only the
 half nothing else accounts for is kept. Holding both charged the same memory
 twice and made the ledger refuse the arena.
+
+**Workspace lifetime is not physical mapping ownership.** Step-scoped and
+session-persistent workspace remain distinct content/lease categories, but
+allocations packed into one VMM arena use one `WorkspaceZone` mapped allowance.
+The zone charges global granule transitions `0→1` and refunds `1→0`, so the
+last surviving allocation may perform the refund regardless of which lifetime
+first mapped the granule. An arena rejects a grant from another mapped zone
+before physical allocation. The current native provider also suballocates KV
+from that arena, so KV and workspace content metrics remain distinct while
+their physical mapped attribution uses the same arena-zone allowance. Weight
+paging has separate storage and mapped attribution.
+
+Mapped-zone refund is an allocator/provider responsibility, not a workspace
+caller responsibility. Every VMM deallocation observes the arena's actual
+global granule transition `1→0` and refunds the canonical arena allowance
+itself. This includes ordinary executor buffers that happen to be the final
+reference to a granule first mapped by governed workspace; specialized
+workspace cleanup must not issue a second refund. Retained physical-pool
+handles remain authority-owned—the refund concerns virtual mapped-zone
+attribution only.
 
 ### 1.1 The lease contract, and who may replace it
 

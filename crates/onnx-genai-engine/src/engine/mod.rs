@@ -36,7 +36,8 @@ pub(crate) use onnx_genai_ort::{
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
     GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
-    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, Scheduler, VramBreakdown,
+    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, ScheduledRequest, Scheduler,
+    VramBreakdown,
 };
 pub(crate) use onnx_std::{MetadataHints, MetadataWarning, PlacementStrength};
 pub(crate) use std::collections::HashMap;
@@ -74,7 +75,9 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor};
-pub(crate) use load::kv_pages_for_budget;
+pub(crate) use load::{
+    kv_pages_for_budget, session_device_domain, validate_shared_authority_limit,
+};
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
 pub(crate) use metadata::*;
@@ -189,10 +192,7 @@ mod tests {
         let governor = EngineResourceGovernor::new(
             ResourceLimits::default(),
             false,
-            ModelKvConfig {
-                page_size_bytes: 1,
-                tokens_per_page: 1,
-            },
+            ModelKvConfig::known(1, 1),
             0,
         )?;
 
@@ -1299,10 +1299,7 @@ mod tests {
             limits.clone(),
             true,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1334,10 +1331,7 @@ mod tests {
             },
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1348,10 +1342,7 @@ mod tests {
             },
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1380,16 +1371,8 @@ mod tests {
             host_ram_limit: ResourceLimit::Fraction(0.5),
             disk_spill_limit: Some(ResourceLimit::Auto),
         };
-        let governor = EngineResourceGovernor::new(
-            limits,
-            false,
-            ModelKvConfig {
-                page_size_bytes: 1,
-                tokens_per_page: 1,
-            },
-            0,
-        )
-        .unwrap();
+        let governor =
+            EngineResourceGovernor::new(limits, false, ModelKvConfig::known(1, 1), 0).unwrap();
         let snapshot = governor.snapshot();
         assert_eq!(
             snapshot.resolved_limits.vram_bytes,
@@ -1422,10 +1405,7 @@ mod tests {
             },
             false,
             capacities,
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
@@ -1477,10 +1457,7 @@ mod tests {
             ResourceLimits::default(),
             false,
             test_capacities(),
-            ModelKvConfig {
-                page_size_bytes: 100,
-                tokens_per_page: 16,
-            },
+            ModelKvConfig::known(100, 16),
             0,
         )
         .unwrap();
