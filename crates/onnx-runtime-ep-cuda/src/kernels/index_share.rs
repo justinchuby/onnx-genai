@@ -1761,3 +1761,29 @@ fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep {OP}: {}", message.into()))
 }
+
+#[cfg(test)]
+mod raw_allocation_guard {
+    /// Regression guard for issue #736: the IndexShare kernel is governed through
+    /// `Kernel::workspace_requirement` + executor-prepared persistent workspace, so
+    /// it must never reintroduce an ungoverned raw device allocation. This CPU-only
+    /// test fails if a raw-allocation seam is added back to this file, catching the
+    /// regression the mock-based session test and GPU-only tests cannot see.
+    #[test]
+    fn index_share_source_has_no_raw_device_allocation() {
+        const SOURCE: &str = include_str!("index_share.rs");
+        // The needles are assembled at runtime so the literals below do not
+        // themselves match when this file is scanned by `include_str!`.
+        let raw_alloc = ["alloc", "_raw("].concat();
+        let scratch_pool = ["Scratch", "Pool"].concat();
+        assert!(
+            !SOURCE.contains(raw_alloc.as_str()),
+            "IndexShare must not reintroduce a raw device allocation (`alloc_raw`); \
+             route scratch through Kernel::workspace_requirement instead (#736)."
+        );
+        assert!(
+            !SOURCE.contains(scratch_pool.as_str()),
+            "IndexShare must not reintroduce the ungoverned scratch-pool allocator (#736)."
+        );
+    }
+}
