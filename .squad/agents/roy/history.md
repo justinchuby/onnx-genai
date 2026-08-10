@@ -152,3 +152,35 @@ Full pre-compaction history in `history-archive.md`.
 - `.squad/decisions/inbox/roy-ep-inventory-complete.md`
 - `docs/EP_PLUGIN_EXPORT_PR.md` updated (both milestones, branch structure, M2 state, §524 table, corrected NEW-1 status, Follow-Ups updated).
 - `.squad/agents/roy/history.md` (this entry).
+
+---
+
+## 2026-08-10T23:52Z — Milestone 2 documentation pass
+
+**Branch:** `squad/ep-plugin-parity-cuda` at `5a5b40877`
+
+**Task:** Re-verify M2 state from scratch; update all EP plugin export docs accurately.
+
+**Validation observed (Roy, personal):**
+
+| Command | Result |
+|---------|--------|
+| `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` | **FAILS** — 2 errors `ep.rs:1041,1047` (`needless_borrows_for_generic_args`) |
+| `cargo test -p onnx-runtime-ep-plugin` | **141 pass** (132 lib + 9 parity), 0 fail |
+| `cargo test -p onnx-runtime-ep-cpu-plugin` | **23 pass** (6 + 17 e2e incl. f16/bf16), 0 fail |
+| `cargo check --workspace` | **pass** |
+
+**Key findings:**
+
+1. M2 largely complete: parity proven (9 tests), f16/bf16 end-to-end proven (bit-exact), device surfaces exist, CUDA shim crate scaffolded.
+2. M2-1 (EP leak in `stream_release`) — OPEN, Leon not yet fixed.
+3. M2-2 (misleading doc `device.rs:86`) — OPEN, Leon not yet fixed.
+4. Clippy regression: 2 trivial errors at `ep.rs:1041,1047` — pre-merge blocker for M2.
+5. Declined-set correction: Squeeze/ReduceMean/Conv now resolve; only opset-13 data-dependent Unsqueeze and NonZero are truly Declined.
+6. Native nxrt dynamic ABI: still unimplemented in both milestones — §524 gap documented plainly.
+
+**Deliverables written:**
+- `docs/EP_PLUGIN_EXPORT_PR.md` — full M2 update (branch table, Validation, Milestone 2 section, Security, §524, Known Limitations, Follow-Ups).
+- `docs/EP_PLUGIN_EXPORT_INVENTORY.md` — summary table and Roy verification note updated for M2 CUDA scaffold state.
+- `.squad/decisions/inbox/roy-milestone2-status.md` — final status of both milestones.
+- `.squad/agents/roy/history.md` (this entry).

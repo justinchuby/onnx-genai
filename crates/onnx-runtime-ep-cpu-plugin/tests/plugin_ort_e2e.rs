@@ -1892,8 +1892,7 @@ fn stress_register_run_unregister_cycles() {
 fn conformance_add_float16() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_f16", &model_path) })
@@ -1966,8 +1965,7 @@ fn conformance_add_float16() {
 fn conformance_add_bfloat16() {
     let _lock = ORT_EP_LOCK.lock().unwrap();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_bf16", &model_path) })

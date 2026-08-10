@@ -346,7 +346,9 @@ pub(crate) fn node_passes_dtype_filter(
     } else {
         node.domain.as_str()
     };
-    let entry = entries.iter().find(|e| e.op_type == node.op_type && e.domain == domain);
+    let entry = entries
+        .iter()
+        .find(|e| e.op_type == node.op_type && e.domain == domain);
     let Some(entry) = entry else {
         return false;
     };
@@ -746,13 +748,7 @@ pub fn build_ort_kernel_registry(
             unsafe { release_builder(builder) };
             continue;
         }
-        let s = unsafe {
-            set_since_version(
-                builder,
-                entry.since_version,
-                entry.end_version,
-            )
-        };
+        let s = unsafe { set_since_version(builder, entry.since_version, entry.end_version) };
         if !s.is_null() {
             unsafe { release_builder(builder) };
             continue;
@@ -835,20 +831,20 @@ unsafe extern "C" fn noop_kernel_create(
 /// Map `DataType` to `ONNXTensorElementDataType` enum value.
 fn dtype_to_onnx_tensor_elem(dtype: DataType) -> ort::ONNXTensorElementDataType {
     match dtype {
-        DataType::Float32 => 1,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        DataType::Uint8 => 2,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
-        DataType::Int8 => 3,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
-        DataType::Uint16 => 4,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
-        DataType::Int16 => 5,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
-        DataType::Int32 => 6,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-        DataType::Int64 => 7,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-        DataType::Bool => 9,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
-        DataType::Float16 => 10, // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
-        DataType::Float64 => 11, // ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
-        DataType::Uint32 => 12,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
-        DataType::Uint64 => 13,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
+        DataType::Float32 => 1,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+        DataType::Uint8 => 2,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
+        DataType::Int8 => 3,      // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
+        DataType::Uint16 => 4,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
+        DataType::Int16 => 5,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
+        DataType::Int32 => 6,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+        DataType::Int64 => 7,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+        DataType::Bool => 9,      // ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
+        DataType::Float16 => 10,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
+        DataType::Float64 => 11,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
+        DataType::Uint32 => 12,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
+        DataType::Uint64 => 13,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
         DataType::BFloat16 => 16, // ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-        _ => 0,                  // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
+        _ => 0,                   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
     }
 }
 
@@ -1038,13 +1034,13 @@ mod tests {
         let inputs: Vec<Option<onnx_runtime_ir::ValueId>> = input_dtypes
             .iter()
             .map(|&dt| {
-                let vid = g.create_named_value(&format!("in_{dt:?}"), dt, Shape::default());
+                let vid = g.create_named_value(format!("in_{dt:?}"), dt, Shape::default());
                 Some(vid)
             })
             .collect();
         let outputs: Vec<onnx_runtime_ir::ValueId> = output_dtypes
             .iter()
-            .map(|&dt| g.create_named_value(&format!("out_{dt:?}"), dt, Shape::default()))
+            .map(|&dt| g.create_named_value(format!("out_{dt:?}"), dt, Shape::default()))
             .collect();
         let mut node = Node::new(NodeId(0), op_type, inputs, outputs);
         node.domain = domain.to_string();
@@ -1062,7 +1058,12 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
         }];
-        let (g, nid) = graph_with_node("Add", "", &[DataType::Float32, DataType::Float32], &[DataType::Float32]);
+        let (g, nid) = graph_with_node(
+            "Add",
+            "",
+            &[DataType::Float32, DataType::Float32],
+            &[DataType::Float32],
+        );
         let node = g.nodes.get(nid).unwrap();
         assert!(super::node_passes_dtype_filter(node, &g, &entries));
     }
@@ -1078,7 +1079,12 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
         }];
-        let (g, nid) = graph_with_node("Add", "", &[DataType::Int64, DataType::Int64], &[DataType::Int64]);
+        let (g, nid) = graph_with_node(
+            "Add",
+            "",
+            &[DataType::Int64, DataType::Int64],
+            &[DataType::Int64],
+        );
         let node = g.nodes.get(nid).unwrap();
         assert!(!super::node_passes_dtype_filter(node, &g, &entries));
     }

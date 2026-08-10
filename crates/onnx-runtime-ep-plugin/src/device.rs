@@ -83,7 +83,8 @@ pub struct DeviceAllocator {
     /// the allocator (guaranteed by ORT calling `ReleaseAllocator` before the
     /// factory is released which destroys the EP).
     pub ep: *const dyn ExecutionProvider,
-    /// Memory info pointer. Owned by this allocator; freed on drop.
+    /// Memory info pointer. Borrowed from ORT; NOT freed by this allocator.
+    /// ORT owns the lifetime and releases it when `ReleaseEpDevice` is called.
     /// Must not be passed to `EpDevice_AddAllocatorInfo` (that's separate).
     pub memory_info: *const ort::OrtMemoryInfo,
 }
@@ -230,9 +231,15 @@ unsafe extern "C" fn stream_release(this: *mut ort::OrtSyncStreamImpl) {
         if this.is_null() {
             return;
         }
-        // Reconstruct and drop the Box.
+        // Reconstruct and drop the Box, then reclaim the owned EP.
+        // The EP was created via `Box::into_raw` in `factory_create_sync_stream`
+        // and must be reclaimed here — ORT calls `Release` exactly once per
+        // created stream (header line ~207–216).
         unsafe {
-            drop(Box::from_raw(this.cast::<DeviceSyncStream>()));
+            let stream = Box::from_raw(this.cast::<DeviceSyncStream>());
+            if !stream.ep.is_null() {
+                drop(Box::from_raw(stream.ep as *mut dyn ExecutionProvider));
+            }
         }
     }));
 }
@@ -317,9 +324,15 @@ impl DeviceSupport {
 
     /// Return the `OrtMemoryInfoDeviceType` for device-default memory on this EP.
     pub fn memory_device_type(&self) -> ort::OrtMemoryInfoDeviceType {
-        if self.hardware_types.contains(&ort::OrtHardwareDeviceType_GPU) {
+        if self
+            .hardware_types
+            .contains(&ort::OrtHardwareDeviceType_GPU)
+        {
             ort::OrtMemoryInfoDeviceType_GPU
-        } else if self.hardware_types.contains(&ort::OrtHardwareDeviceType_NPU) {
+        } else if self
+            .hardware_types
+            .contains(&ort::OrtHardwareDeviceType_NPU)
+        {
             ort::OrtMemoryInfoDeviceType_NPU
         } else {
             ort::OrtMemoryInfoDeviceType_CPU
@@ -424,7 +437,9 @@ mod tests {
             _input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
-            KernelMatch::Unsupported { reason: "mock".into() }
+            KernelMatch::Unsupported {
+                reason: "mock".into(),
+            }
         }
 
         fn get_kernel(
@@ -444,7 +459,10 @@ mod tests {
             let layout = std::alloc::Layout::from_size_align(size.max(1), 16).unwrap();
             let ptr = unsafe { std::alloc::alloc(layout) };
             if ptr.is_null() {
-                return Err(EpError::OutOfMemory { requested: size, available: 0 });
+                return Err(EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                });
             }
             Ok(unsafe {
                 onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
@@ -456,10 +474,7 @@ mod tests {
             })
         }
 
-        fn deallocate(
-            &self,
-            buffer: onnx_runtime_ep_api::provider::DeviceBuffer,
-        ) -> EpResult<()> {
+        fn deallocate(&self, buffer: onnx_runtime_ep_api::provider::DeviceBuffer) -> EpResult<()> {
             let ptr = buffer.as_ptr();
             let size = buffer.len();
             // DeviceBuffer has no Drop impl: binding to `_` discards the handle
@@ -530,7 +545,9 @@ mod tests {
             _input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
-            KernelMatch::Unsupported { reason: "mock".into() }
+            KernelMatch::Unsupported {
+                reason: "mock".into(),
+            }
         }
 
         fn get_kernel(
@@ -550,7 +567,10 @@ mod tests {
             let layout = std::alloc::Layout::from_size_align(size.max(1), 16).unwrap();
             let ptr = unsafe { std::alloc::alloc(layout) };
             if ptr.is_null() {
-                return Err(EpError::OutOfMemory { requested: size, available: 0 });
+                return Err(EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                });
             }
             Ok(unsafe {
                 onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
@@ -562,10 +582,7 @@ mod tests {
             })
         }
 
-        fn deallocate(
-            &self,
-            buffer: onnx_runtime_ep_api::provider::DeviceBuffer,
-        ) -> EpResult<()> {
+        fn deallocate(&self, buffer: onnx_runtime_ep_api::provider::DeviceBuffer) -> EpResult<()> {
             let ptr = buffer.as_ptr();
             let size = buffer.len();
             // DeviceBuffer has no Drop impl: binding to `_` discards the handle
@@ -645,19 +662,28 @@ mod tests {
     #[test]
     fn gpu_ep_supports_gpu_hardware() {
         let ep = MockGpuEp;
-        assert!(ep_supports_hardware_type(&ep, ort::OrtHardwareDeviceType_GPU));
+        assert!(ep_supports_hardware_type(
+            &ep,
+            ort::OrtHardwareDeviceType_GPU
+        ));
     }
 
     #[test]
     fn gpu_ep_does_not_support_cpu_hardware() {
         let ep = MockGpuEp;
-        assert!(!ep_supports_hardware_type(&ep, ort::OrtHardwareDeviceType_CPU));
+        assert!(!ep_supports_hardware_type(
+            &ep,
+            ort::OrtHardwareDeviceType_CPU
+        ));
     }
 
     #[test]
     fn cpu_ep_does_not_support_gpu_hardware() {
         let ep = MockCpuEp;
-        assert!(!ep_supports_hardware_type(&ep, ort::OrtHardwareDeviceType_GPU));
+        assert!(!ep_supports_hardware_type(
+            &ep,
+            ort::OrtHardwareDeviceType_GPU
+        ));
     }
 
     // ─── DeviceSupport config tests ─────────────────────────────────────────
@@ -683,7 +709,10 @@ mod tests {
     #[test]
     fn gpu_support_memory_device_type_is_gpu() {
         let support = DeviceSupport::gpu("Cuda", 0x10DE);
-        assert_eq!(support.memory_device_type(), ort::OrtMemoryInfoDeviceType_GPU);
+        assert_eq!(
+            support.memory_device_type(),
+            ort::OrtMemoryInfoDeviceType_GPU
+        );
     }
 
     // ─── Fail-closed validation tests ───────────────────────────────────────
@@ -740,7 +769,8 @@ mod tests {
     #[test]
     fn device_allocator_alloc_and_free_roundtrip() {
         let ep = MockGpuEp;
-        let alloc = unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, ptr::null()) };
+        let alloc =
+            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, ptr::null()) };
         let alloc_ptr = Box::into_raw(alloc);
 
         // Allocate
@@ -759,7 +789,8 @@ mod tests {
         let ep = MockGpuEp;
         let sentinel: u8 = 42;
         let fake_mem_info = &sentinel as *const u8 as *const ort::OrtMemoryInfo;
-        let alloc = unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, fake_mem_info) };
+        let alloc =
+            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, fake_mem_info) };
         let alloc_ptr = Box::into_raw(alloc);
 
         let info = unsafe { device_info(alloc_ptr.cast()) };
@@ -778,15 +809,16 @@ mod tests {
 
     #[test]
     fn device_sync_stream_flush_succeeds() {
-        let ep = MockGpuEp;
-        let stream = unsafe { DeviceSyncStream::new(&ep as *const dyn ExecutionProvider) };
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
+        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
         let stream_ptr = Box::into_raw(stream);
 
         let status = unsafe { stream_flush(stream_ptr.cast()) };
         // null = success (no ORT API for real status)
         assert!(status.is_null());
 
-        // Release via vtable
+        // Release via vtable (also reclaims the EP)
         unsafe { stream_release(stream_ptr.cast()) };
     }
 
@@ -799,8 +831,9 @@ mod tests {
 
     #[test]
     fn device_sync_stream_get_handle_returns_null_for_mock() {
-        let ep = MockGpuEp;
-        let stream = unsafe { DeviceSyncStream::new(&ep as *const dyn ExecutionProvider) };
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
+        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
         let stream_ptr = Box::into_raw(stream);
 
         let handle = unsafe { stream_get_handle(stream_ptr.cast()) };
@@ -811,8 +844,9 @@ mod tests {
 
     #[test]
     fn device_sync_stream_release_does_not_panic() {
-        let ep = MockGpuEp;
-        let stream = unsafe { DeviceSyncStream::new(&ep as *const dyn ExecutionProvider) };
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
+        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
         let stream_ptr = Box::into_raw(stream);
         // Should not panic or leak.
         unsafe { stream_release(stream_ptr.cast()) };
@@ -822,6 +856,122 @@ mod tests {
     fn device_sync_stream_release_null_does_not_panic() {
         // Null release must be safe.
         unsafe { stream_release(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn stream_release_reclaims_owned_ep_no_leak() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        /// An EP whose Drop increments a counter, proving the EP is reclaimed.
+        struct CountingEp;
+
+        impl Drop for CountingEp {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl ExecutionProvider for CountingEp {
+            fn name(&self) -> &str {
+                "counting_ep"
+            }
+            fn device_type(&self) -> DeviceType {
+                DeviceType::Cuda
+            }
+            fn device_id(&self) -> DeviceId {
+                DeviceId::cuda(0)
+            }
+            fn initialize(
+                &mut self,
+                _config: &onnx_runtime_ep_api::provider::EpConfig,
+            ) -> EpResult<()> {
+                Ok(())
+            }
+            fn shutdown(&mut self) -> EpResult<()> {
+                Ok(())
+            }
+            fn supports_op(
+                &self,
+                _op: &Node,
+                _opset: u64,
+                _shapes: &[Shape],
+                _input_dtypes: &[DataType],
+                _layouts: &[TensorLayout],
+            ) -> KernelMatch {
+                KernelMatch::Unsupported {
+                    reason: "counting".into(),
+                }
+            }
+            fn get_kernel(
+                &self,
+                _op: &Node,
+                _shapes: &[Vec<usize>],
+                _opset: u64,
+            ) -> EpResult<Box<dyn Kernel>> {
+                Err(EpError::KernelFailed("counting: no kernel".into()))
+            }
+            fn allocate(
+                &self,
+                _size: usize,
+                _alignment: usize,
+            ) -> EpResult<onnx_runtime_ep_api::provider::DeviceBuffer> {
+                Err(EpError::OutOfMemory {
+                    requested: 0,
+                    available: 0,
+                })
+            }
+            fn deallocate(
+                &self,
+                _buffer: onnx_runtime_ep_api::provider::DeviceBuffer,
+            ) -> EpResult<()> {
+                Ok(())
+            }
+            fn copy(
+                &self,
+                _src: &onnx_runtime_ep_api::provider::DeviceBuffer,
+                _dst: &mut onnx_runtime_ep_api::provider::DeviceBuffer,
+                _size: usize,
+            ) -> EpResult<()> {
+                Ok(())
+            }
+            fn copy_async(
+                &self,
+                _src: &onnx_runtime_ep_api::provider::DeviceBuffer,
+                _dst: &mut onnx_runtime_ep_api::provider::DeviceBuffer,
+                _size: usize,
+            ) -> EpResult<onnx_runtime_ep_api::provider::Fence> {
+                Ok(onnx_runtime_ep_api::provider::Fence::signalled())
+            }
+            fn sync(&self) -> EpResult<()> {
+                Ok(())
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        // Simulate the factory path: Box the EP, leak it, pass to stream.
+        let ep: Box<dyn ExecutionProvider> = Box::new(CountingEp);
+        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
+
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        let stream_ptr = Box::into_raw(stream);
+
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            0,
+            "EP must not be dropped yet"
+        );
+
+        // Release the stream — this must also reclaim the EP.
+        unsafe { stream_release(stream_ptr.cast()) };
+
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "stream_release must drop the owned EP exactly once (leak regression)"
+        );
     }
 
     // ─── Hardware type → memory device type mapping ─────────────────────────

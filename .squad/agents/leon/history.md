@@ -138,3 +138,49 @@ unsupported-dtype fail-closed, and the supported-dtypes constant.
 - `cargo test -p onnx-runtime-ep-plugin --lib` → 90 passed (was 82)
 - `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → clean
 - `cargo test -p onnx-runtime-ep-cpu-plugin` → 15 passed
+
+---
+
+## 2026-08-10 — M2-1/M2-2: stream EP memory leak + doc comment (device.rs)
+
+**Branch:** squad/ep-plugin-parity-cuda  
+**Triggered by:** Holden milestone-2 audit; Nabil locked out (reviewer rejection).
+
+### M2-1 (MEDIUM): EP instance leaked in `stream_release`
+
+**Root cause:** `factory_create_sync_stream` (factory.rs:668) creates a fresh EP via
+`Box::into_raw(ep)` and stores the pointer in `DeviceSyncStream.ep`. The `stream_release`
+callback only dropped the `DeviceSyncStream` Box but never reclaimed the EP pointer.
+
+**Fix:** Added `Box::from_raw(stream.ep as *mut dyn ExecutionProvider)` in
+`stream_release` after dropping the stream Box. The null guard prevents UB if
+somehow called with a null EP.
+
+**Double-free ruling:** ORT header (lines 207–216) confirms `Release` is called
+exactly once per created stream. No other code reclaims the stream EP. The allocator
+path has its own independent EP instance created in `factory_create_allocator`.
+
+**Regression test:** `stream_release_reclaims_owned_ep_no_leak` — uses an EP whose
+Drop increments a static `AtomicUsize`; asserts count goes from 0→1 after release.
+
+**Test fix:** Updated 3 existing stream tests to use `Box::into_raw(Box::new(MockGpuEp))`
+instead of stack references, matching the real factory path and preventing UB under
+the new release logic.
+
+### M2-2 (LOW): misleading doc comment on `DeviceAllocator::memory_info`
+
+Comment claimed "Owned; freed on drop" but there is no `Drop` impl and the pointer
+is ORT-borrowed (`EpDevice_AddAllocatorInfo` stores raw pointer; ORT releases via
+`ReleaseEpDevice`). Fixed to: "Borrowed from ORT; NOT freed by this allocator."
+
+### Audit — no other unpaired `into_raw` in device.rs
+
+All `Box::into_raw` in device.rs are in tests and are paired with `Box::from_raw`
+or `stream_release`. No factory.rs change needed for this fix.
+
+### Validation
+
+- `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → clean
+- `cargo test -p onnx-runtime-ep-plugin --lib` → 133 passed (132 + 1 new)
+- `cargo test -p onnx-runtime-ep-cpu-plugin --all-targets` → 17 passed
+- `cargo check --workspace` → success

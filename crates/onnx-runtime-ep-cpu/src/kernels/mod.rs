@@ -21,7 +21,9 @@
 //! strides and byte offset) into a dense row-major buffer. This keeps the
 //! per-kernel `unsafe` surface to the two element accessors in this module.
 
-use onnx_runtime_ep_api::{EpError, OpKey, OpRegistry, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, KernelFactory, OpKey, OpRegistry, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::DataType;
 
 use crate::strided::{elem_offset, next_index, numel};
@@ -55,7 +57,8 @@ impl RecordingOpRegistry {
     }
 
     fn register(&mut self, key: OpKey, factory: Box<dyn KernelFactory>) {
-        self.keys.push((key.op_type.clone(), key.domain.clone(), key.since_version));
+        self.keys
+            .push((key.op_type.clone(), key.domain.clone(), key.since_version));
         self.inner.register(key, factory);
     }
 
@@ -122,39 +125,103 @@ static F32_ONLY: &[DataType] = &[DataType::Float32];
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     // Byte-mover ops: dtype-agnostic (just copy bytes, no arithmetic).
     match (op_type, domain) {
-        ("Identity", "") | ("Reshape", "") | ("Flatten", "") | ("Squeeze", "")
-        | ("Unsqueeze", "") | ("Expand", "") | ("Concat", "") | ("Slice", "")
-        | ("Split", "") | ("Transpose", "") | ("Gather", "") | ("GatherElements", "")
-        | ("GatherND", "") | ("ScatterElements", "") | ("ScatterND", "")
-        | ("Shape", "") | ("Size", "") | ("Pad", "") | ("ConstantOfShape", "")
-        | ("Constant", "") | ("Tile", "") | ("Compress", "") | ("Trilu", "")
-        | ("OneHot", "") | ("Dropout", "") | ("Unique", "") => ALL_DTYPES,
+        ("Identity", "")
+        | ("Reshape", "")
+        | ("Flatten", "")
+        | ("Squeeze", "")
+        | ("Unsqueeze", "")
+        | ("Expand", "")
+        | ("Concat", "")
+        | ("Slice", "")
+        | ("Split", "")
+        | ("Transpose", "")
+        | ("Gather", "")
+        | ("GatherElements", "")
+        | ("GatherND", "")
+        | ("ScatterElements", "")
+        | ("ScatterND", "")
+        | ("Shape", "")
+        | ("Size", "")
+        | ("Pad", "")
+        | ("ConstantOfShape", "")
+        | ("Constant", "")
+        | ("Tile", "")
+        | ("Compress", "")
+        | ("Trilu", "")
+        | ("OneHot", "")
+        | ("Dropout", "")
+        | ("Unique", "") => ALL_DTYPES,
 
         // Arithmetic ops (dispatch_arith!): f32, f16, bf16, f64, int types.
-        ("Add", "") | ("Sub", "") | ("Mul", "") | ("Div", "") | ("Mod", "")
-        | ("Pow", "") | ("Min", "") | ("Max", "") | ("Sum", "") | ("Mean", "") => ARITH_DTYPES,
+        ("Add", "")
+        | ("Sub", "")
+        | ("Mul", "")
+        | ("Div", "")
+        | ("Mod", "")
+        | ("Pow", "")
+        | ("Min", "")
+        | ("Max", "")
+        | ("Sum", "")
+        | ("Mean", "") => ARITH_DTYPES,
 
         // MatMul supports f32 natively + f16/bf16 via half_gemm.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
 
         // Float-only ops (dispatch_float! or explicit float handling).
-        ("Sqrt", "") | ("Erf", "") | ("Tanh", "") | ("Exp", "") | ("Log", "")
-        | ("Sigmoid", "") | ("Softplus", "") | ("Softsign", "") | ("Reciprocal", "")
-        | ("Sin", "") | ("Cos", "") | ("Tan", "") | ("Acos", "") | ("Acosh", "")
-        | ("Asin", "") | ("Asinh", "") | ("Atan", "") | ("Atanh", "")
-        | ("Cosh", "") | ("Sinh", "") | ("Abs", "") | ("Neg", "")
-        | ("Sign", "") | ("Floor", "") | ("Ceil", "") | ("Round", "")
-        | ("Relu", "") | ("Elu", "") | ("LeakyRelu", "") | ("HardSigmoid", "")
-        | ("Selu", "") | ("ThresholdedRelu", "") => FLOAT_DTYPES,
+        ("Sqrt", "")
+        | ("Erf", "")
+        | ("Tanh", "")
+        | ("Exp", "")
+        | ("Log", "")
+        | ("Sigmoid", "")
+        | ("Softplus", "")
+        | ("Softsign", "")
+        | ("Reciprocal", "")
+        | ("Sin", "")
+        | ("Cos", "")
+        | ("Tan", "")
+        | ("Acos", "")
+        | ("Acosh", "")
+        | ("Asin", "")
+        | ("Asinh", "")
+        | ("Atan", "")
+        | ("Atanh", "")
+        | ("Cosh", "")
+        | ("Sinh", "")
+        | ("Abs", "")
+        | ("Neg", "")
+        | ("Sign", "")
+        | ("Floor", "")
+        | ("Ceil", "")
+        | ("Round", "")
+        | ("Relu", "")
+        | ("Elu", "")
+        | ("LeakyRelu", "")
+        | ("HardSigmoid", "")
+        | ("Selu", "")
+        | ("ThresholdedRelu", "") => FLOAT_DTYPES,
 
         // Softmax, LogSoftmax, ReduceMean, LayerNorm, etc.: float-only.
-        ("Softmax", "") | ("LogSoftmax", "") | ("ReduceMean", "")
-        | ("ReduceSum", "") | ("ReduceMax", "") | ("ReduceMin", "")
-        | ("ReduceProd", "") | ("ReduceSumSquare", "") | ("ReduceL1", "")
-        | ("ReduceL2", "") | ("ReduceLogSum", "") | ("ReduceLogSumExp", "")
-        | ("LayerNormalization", "") | ("Gelu", "") | ("RMSNormalization", "")
-        | ("RotaryEmbedding", "") | ("Swish", "") | ("Attention", "")
-        | ("LpNormalization", "") | ("Hardmax", "") => FLOAT_DTYPES,
+        ("Softmax", "")
+        | ("LogSoftmax", "")
+        | ("ReduceMean", "")
+        | ("ReduceSum", "")
+        | ("ReduceMax", "")
+        | ("ReduceMin", "")
+        | ("ReduceProd", "")
+        | ("ReduceSumSquare", "")
+        | ("ReduceL1", "")
+        | ("ReduceL2", "")
+        | ("ReduceLogSum", "")
+        | ("ReduceLogSumExp", "")
+        | ("LayerNormalization", "")
+        | ("Gelu", "")
+        | ("RMSNormalization", "")
+        | ("RotaryEmbedding", "")
+        | ("Swish", "")
+        | ("Attention", "")
+        | ("LpNormalization", "")
+        | ("Hardmax", "") => FLOAT_DTYPES,
 
         // Cast/CastLike handle all types.
         ("Cast", "") | ("CastLike", "") => ALL_DTYPES,
@@ -164,8 +231,11 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         // Logical: bool/int inputs.
         ("And", "") | ("Or", "") | ("Xor", "") | ("Not", "") => &[DataType::Bool],
-        ("Equal", "") | ("Greater", "") | ("GreaterOrEqual", "")
-        | ("Less", "") | ("LessOrEqual", "") => ARITH_DTYPES,
+        ("Equal", "")
+        | ("Greater", "")
+        | ("GreaterOrEqual", "")
+        | ("Less", "")
+        | ("LessOrEqual", "") => ARITH_DTYPES,
 
         // Where: all types (condition is bool, data can be anything).
         ("Where", "") => ALL_DTYPES,
@@ -174,25 +244,37 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("NonZero", "") | ("NonMaxSuppression", "") => ALL_DTYPES,
 
         // Bitwise: integer types.
-        ("BitShift", "") | ("BitwiseAnd", "") | ("BitwiseOr", "")
-        | ("BitwiseXor", "") | ("BitwiseNot", "") => &[
-            DataType::Uint8, DataType::Uint16, DataType::Uint32, DataType::Uint64,
-            DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64,
+        ("BitShift", "")
+        | ("BitwiseAnd", "")
+        | ("BitwiseOr", "")
+        | ("BitwiseXor", "")
+        | ("BitwiseNot", "") => &[
+            DataType::Uint8,
+            DataType::Uint16,
+            DataType::Uint32,
+            DataType::Uint64,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
         ],
 
         // IsInf, IsNaN: float inputs.
         ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
 
         // Quantization: specific types but advertise broad.
-        ("QuantizeLinear", "") | ("DequantizeLinear", "")
-        | ("DynamicQuantizeLinear", "") | ("QLinearMatMul", "") => ARITH_DTYPES,
+        ("QuantizeLinear", "")
+        | ("DequantizeLinear", "")
+        | ("DynamicQuantizeLinear", "")
+        | ("QLinearMatMul", "") => ARITH_DTYPES,
 
         // Sequence/range ops.
         ("Range", "") | ("CumSum", "") | ("CumProd", "") => ARITH_DTYPES,
 
         // Window functions.
-        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "")
-        | ("DFT", "") => FLOAT_DTYPES,
+        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
+            FLOAT_DTYPES
+        }
 
         // com.microsoft contrib ops.
         ("LayerNormalization", "com.microsoft")
@@ -215,8 +297,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LinearAttention", "com.microsoft")
         | ("GatherBlockQuantized", "com.microsoft") => FLOAT_DTYPES,
 
-        ("SimplifiedLayerNormalization", "")
-        | ("LinearAttention", "") => FLOAT_DTYPES,
+        ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
 
         ("MatMulNBits", "com.microsoft") => F32_ONLY,
         ("MoE", "com.microsoft") | ("QMoE", "com.microsoft") => F32_ONLY,
@@ -225,13 +306,24 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         (_, "pkg.nxrt") => F32_ONLY,
 
         // CNN ops (feature-gated).
-        ("Conv", "") | ("ConvTranspose", "") | ("AveragePool", "")
-        | ("MaxPool", "") | ("GlobalAveragePool", "") | ("GlobalMaxPool", "")
-        | ("LpPool", "") | ("GlobalLpPool", "") | ("Resize", "")
-        | ("GridSample", "") | ("AffineGrid", "") | ("Col2Im", "")
-        | ("CenterCropPad", "") | ("SpaceToDepth", "")
-        | ("BatchNormalization", "") | ("InstanceNormalization", "")
-        | ("GroupNormalization", "") | ("PRelu", "") => FLOAT_DTYPES,
+        ("Conv", "")
+        | ("ConvTranspose", "")
+        | ("AveragePool", "")
+        | ("MaxPool", "")
+        | ("GlobalAveragePool", "")
+        | ("GlobalMaxPool", "")
+        | ("LpPool", "")
+        | ("GlobalLpPool", "")
+        | ("Resize", "")
+        | ("GridSample", "")
+        | ("AffineGrid", "")
+        | ("Col2Im", "")
+        | ("CenterCropPad", "")
+        | ("SpaceToDepth", "")
+        | ("BatchNormalization", "")
+        | ("InstanceNormalization", "")
+        | ("GroupNormalization", "")
+        | ("PRelu", "") => FLOAT_DTYPES,
 
         // NCHWC domain ops: f32-only.
         (_, "com.microsoft.nchwc") => F32_ONLY,
@@ -608,9 +700,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    let (reg, _keys) = build_cpu_registry_recorded_inner(
-        qmoe::default_weight_offload_host_cache().clone(),
-    );
+    let (reg, _keys) =
+        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
     reg
 }
 
@@ -618,14 +709,18 @@ pub fn build_cpu_registry() -> OpRegistry {
 /// type-constraint advertisement). The keys are derived from the exact same
 /// registration calls — not hand-maintained.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let (reg, keys) = build_cpu_registry_recorded_inner(
-        qmoe::default_weight_offload_host_cache().clone(),
-    );
+    let (reg, keys) =
+        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
     let descriptors = keys
         .into_iter()
         .map(|(op_type, domain, since_version)| {
             let dtypes = supported_dtypes_for_op(&op_type, &domain);
-            CpuOpDescriptor { op_type, domain, since_version, supported_dtypes: dtypes }
+            CpuOpDescriptor {
+                op_type,
+                domain,
+                since_version,
+                supported_dtypes: dtypes,
+            }
         })
         .collect();
     (reg, descriptors)
@@ -640,7 +735,12 @@ pub fn build_cpu_registry_with_descriptors_and_cache(
         .into_iter()
         .map(|(op_type, domain, since_version)| {
             let dtypes = supported_dtypes_for_op(&op_type, &domain);
-            CpuOpDescriptor { op_type, domain, since_version, supported_dtypes: dtypes }
+            CpuOpDescriptor {
+                op_type,
+                domain,
+                since_version,
+                supported_dtypes: dtypes,
+            }
         })
         .collect();
     (reg, descriptors)
@@ -2148,7 +2248,10 @@ mod tests {
             .iter()
             .filter(|d| d.op_type == "MatMul" && d.domain.is_empty())
             .collect();
-        assert!(!matmul_entries.is_empty(), "MatMul must appear in descriptors");
+        assert!(
+            !matmul_entries.is_empty(),
+            "MatMul must appear in descriptors"
+        );
         for entry in &matmul_entries {
             assert!(
                 entry.supported_dtypes.contains(&DataType::Float16),

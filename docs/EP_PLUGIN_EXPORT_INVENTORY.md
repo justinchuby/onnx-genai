@@ -159,8 +159,8 @@ Evidence:
 
 | EP | Crate | `impl EP`? | `todo!`/stubs | Op registrations | Memory model | Build deps | ORT export readiness |
 |---|---|---|---|---|---|---|---|
-| **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | **NEAR** — adapter exists but has compile error (9 missing `OrtEp` fields in `ep.rs:34`) |
-| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | **BLOCKED** — adapter compile error + runtime hardware required + buffer/stream/context ABI complexity |
+| **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | ✅ **DONE (M1+M2)** — `onnx-runtime-ep-cpu-plugin` is a working ORT plugin EP; 23 conformance tests pass including f16/bf16; dtype-aware capability claiming via `GetKernelRegistry` |
+| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🟡 **SCAFFOLDED (M2)** — `onnx-runtime-ep-cuda-plugin` crate exists with `DeviceAllocator`/`DeviceSyncStream`/`DeviceSupport` surfaces. Tested with mock EPs. **Not a working CUDA EP:** real device-pointer/stream/allocator integration requires CUDA hardware not available on this host. |
 | LegacyOrtEp | `onnx-runtime-ep-api` | Yes (inbound only) | — | — | Inbound adapter | — | Not a candidate |
 | PluginExecutionProvider | `onnx-runtime-session` | Yes (inbound bridge) | — | — | Inbound bridge | — | Not a candidate |
 | onnx-runtime-eager | `onnx-runtime-eager` | No (orchestrator) | — | — | — | — | Not a candidate |
@@ -168,7 +168,7 @@ Evidence:
 
 ---
 
-## 6. Roy Verification Note (2026-08-10)
+## 6. Roy Verification Note — Updated for M2 (2026-08-10 @ 5a5b40877)
 
 Re-ran `grep -rn "impl ExecutionProvider" crates/` independently. Results match Deckard's
 inventory exactly: 2 production EPs (CPU + CUDA), 2 inbound adapters, 7 test/mock
@@ -178,11 +178,17 @@ implementations (excluded). Inventory is complete and correct.
 The sibling repo described in `.squad/team.md` is **not checked out here**. No Metal/MPS EP
 is in scope for this workspace. Deckard's exclusion is correct.
 
-**Adapter state update:** Since Deckard's inventory was written, `onnx-runtime-ep-plugin` and
-`onnx-runtime-ep-cpu-plugin` crates have been created by Nabil. However, the adapter has a
-compile error (`OrtEp` struct initializer missing 9 optional fields). The `as_ort_plugin()`
-trait-method path described in Q4 is now superseded by the dedicated adapter crate architecture;
-the trait method is no longer the outbound export mechanism.
+**M1 completion:** `onnx-runtime-ep-plugin` and `onnx-runtime-ep-cpu-plugin` compile and pass
+23 ORT conformance tests, including f16/bf16 end-to-end with exact bit-pattern assertions.
+The original compile error (9 missing `OrtEp` fields) was resolved. The `as_ort_plugin()`
+trait-method path is superseded by the dedicated adapter crate architecture.
 
-**CUDA build note:** The CUDA EP builds cleanly via `cargo check` on this no-CUDA host because
-`cudarc` uses `dynamic-loading` feature (dlopen at runtime, not linked at build time).
+**M2 CUDA scaffold state:** `crates/onnx-runtime-ep-cuda-plugin/` exists with `DeviceAllocator`,
+`DeviceSyncStream`, and `DeviceSupport` surfaces. Feature-gated behind `cuda`; `cargo check
+--workspace` passes without CUDA toolkit. The device surfaces are tested with mock EPs; they
+are **not** a complete CUDA EP — real device-pointer and data-transfer work remains, requiring
+CUDA hardware not available on this host.
+
+**CUDA build note:** The CUDA EP (`onnx-runtime-ep-cuda`) builds cleanly via `cargo check`
+on this no-CUDA host because `cudarc` uses `dynamic-loading` feature (dlopen at runtime, not
+linked at build time). This has not changed from M1.

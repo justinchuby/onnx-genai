@@ -429,12 +429,12 @@ unsafe extern "C" fn factory_get_supported_devices(
             let status = unsafe {
                 create_mem_info_v2(
                     alloc_name.as_ptr(),
-                    support.memory_device_type(),      // device_type from support
-                    support.vendor_id,                 // vendor_id from support
-                    0,                                 // device_id
-                    ort::OrtDeviceMemoryType_DEFAULT,  // mem_type
-                    0,                                 // alignment (default)
-                    ort::OrtDeviceAllocator,           // allocator_type
+                    support.memory_device_type(), // device_type from support
+                    support.vendor_id,            // vendor_id from support
+                    0,                            // device_id
+                    ort::OrtDeviceMemoryType_DEFAULT, // mem_type
+                    0,                            // alignment (default)
+                    ort::OrtDeviceAllocator,      // allocator_type
                     &mut mem_info,
                 )
             };

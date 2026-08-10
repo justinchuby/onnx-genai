@@ -24,9 +24,9 @@
 //! An unsupported op is declined by both paths. A shape-inference `Declined` op
 //! is supported by the trait but excluded by the C ABI — documented divergence.
 
+use onnx_runtime_ep_api::EpConfig;
 use onnx_runtime_ep_api::abi::OrtGraphView;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
-use onnx_runtime_ep_api::EpConfig;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_plugin::compute::ShapeInference;
 use onnx_runtime_ir::{DataType, Dim, Graph, GraphView, GraphViewCache, Node, NodeId};
@@ -40,8 +40,7 @@ fn single_op_graph(op_type: &str, domain: &str, input_shapes: &[&[usize]]) -> Gr
     let mut graph = Graph::default();
     graph.opset_imports.insert(String::new(), 13);
 
-    let shape_for =
-        |dims: &[usize]| -> Vec<Dim> { dims.iter().map(|&d| Dim::Static(d)).collect() };
+    let shape_for = |dims: &[usize]| -> Vec<Dim> { dims.iter().map(|&d| Dim::Static(d)).collect() };
 
     // Create input values.
     let input_vids: Vec<_> = input_shapes

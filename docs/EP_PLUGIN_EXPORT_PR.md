@@ -1,20 +1,24 @@
-# PR: ORT Plugin EP Export — Rust CPU EP via upstream ORT 1.27.0 (Milestone 1) + Parity & CUDA Prep (Milestone 2 in progress)
+# PR: ORT Plugin EP Export — Rust CPU EP via upstream ORT 1.27.0 (Milestone 1) + Parity, f16/bf16, Device Surfaces & CUDA Prep (Milestone 2)
 
 ## Branch structure
 
 | Branch | Milestone | Status |
 |---|---|---|
 | `squad/ep-plugin-export` | M1 — CPU EP fully exported as ORT plugin | 🟡 YELLOW — may ship (all CRITICAL/HIGH cleared) |
-| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity, CUDA shim, f16/bf16 type constraints | 🔴 IN PROGRESS — no M2 commits landed yet (stacked; not independently mergeable) |
+| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim | 🟡 YELLOW — may ship (one MEDIUM resource-leak and one LOW doc advisory open; clippy regression must be fixed before merge) |
 
 **Recommendation: two stacked PRs, not one.**
-M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it now unblocks downstream tooling without waiting for M2. M2 (`squad/ep-plugin-parity-cuda`) adds parity tests and CUDA scaffolding that are genuinely additive; they depend on M1's adapter but don't affect M1 correctness. Squashing them into one PR would make the review surface larger with no benefit, and would stall M1 behind M2's hardware-gated CUDA work. Stack PR2 on PR1 with a base-branch dependency in the PR description.
+M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it now unblocks downstream tooling without waiting for M2. M2 (`squad/ep-plugin-parity-cuda`) adds parity tests, dtype routing, and device surfaces that are genuinely additive; they depend on M1's adapter but don't affect M1 correctness. Squashing them into one PR would make the review surface larger with no benefit. Stack PR2 on PR1 with a base-branch dependency in the PR description.
+
+**One M2 pre-merge blocker:** `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` fails with 2 lint errors at `ep.rs:1041,1047` (`needless_borrows_for_generic_args`). These are trivial to fix (remove `&` on `format!` arguments) but must be resolved before the M2 PR is opened. Owner: last committer on M2 (`5a5b40877`).
 
 **Push is blocked:** No `GH_TOKEN`/`GITHUB_TOKEN`, no SSH private key, and GCM cache is empty on this host. `git ls-remote origin refs/heads/squad/ep-plugin-export` returned empty — neither branch exists remotely. A user or CI runner with write credentials must push and open the PRs.
 
 ---
 
 **M1 commits:** `526a883`, `f81d98d`, `09635cd`, `c92838d`, `2fb7150`, `bad3682`, `415289bc`, `5fa8cb2a`
+
+**M2 commits (stacked on M1):** `2da0c4e7f`, `577047a74`, `5a5b40877`
 
 ---
 
@@ -132,76 +136,132 @@ Integration tests covering:
 
 ## Validation
 
-All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `5fa8cb2a8`,
-2026-08-10T23:30Z. Output is quoted verbatim. (The branch is currently at the same
-commit as `squad/ep-plugin-export`; no M2 commits have landed yet.)
+All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `5a5b40877`,
+2026-08-10T23:52Z. Output is quoted verbatim.
 
 ### `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`
 
 ```
-Checking onnx-runtime-ep-plugin v0.1.0-dev.5 (...)
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.59s
+error: the borrowed expression implements the required traits
+  --> crates/onnx-runtime-ep-plugin/src/ep.rs:1041:48
+   |
+   | let vid = g.create_named_value(&format!("in_{dt:?}"), dt, ...);
+   |                                ^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("in_{dt:?}")`
+   = note: -D clippy::needless-borrows-for-generic-args
+
+error: the borrowed expression implements the required traits
+  --> crates/onnx-runtime-ep-plugin/src/ep.rs:1047:45
+   |
+   | .map(|&dt| g.create_named_value(&format!("out_{dt:?}"), ...))
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("out_{dt:?}")`
+
+error: could not compile `onnx-runtime-ep-plugin` (lib test) due to 2 previous errors
 ```
 
-Zero warnings, zero errors.
+**⚠️ M2 CLIPPY REGRESSION — 2 errors in `ep.rs:1041,1047`.** Both are trivial
+`needless_borrows_for_generic_args` fixes (remove `&` from `format!` arguments).
+Must be resolved before the M2 PR is opened. This is a pre-merge blocker for M2
+only; M1 (`squad/ep-plugin-export`) was clippy-clean at its own HEAD.
 
-### `cargo test -p onnx-runtime-ep-plugin --lib`
+### `cargo test -p onnx-runtime-ep-plugin`
 
 ```
-test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 132 tests
+... [all lib tests] ...
+test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+running 9 tests
+test capability_parity_supported_but_shape_declined ... ok
+test capability_parity_com_microsoft_domain ... ok
+test capability_parity_unsupported_ops ... ok
+test capability_parity_mixed_graph ... ok
+test error_parity_unknown_op_declined_by_both ... ok
+test error_parity_declined_shape_inference_is_cabi_only ... ok
+test numerical_parity_device_copy ... ok
+test capability_parity_supported_ops_with_known_shapes ... ok
+test numerical_parity_memory_roundtrip ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Doc-tests: 0 passed; 0 failed; 1 ignored
 ```
+
+132 lib tests + 9 trait↔C-ABI parity tests = **141 total**, zero failures.
 
 ### `cargo test -p onnx-runtime-ep-cpu-plugin`
 
 ```
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored (lib)
+
+running 6 tests
+test result: ok. 6 passed; 0 failed; 0 ignored (plugin_export_abi)
+
+running 17 tests
+test conformance_add_bfloat16 ... ok
+test conformance_add_broadcast ... ok
+test conformance_add_dynamic_dim ... ok
+test conformance_add_int32 ... ok
+test conformance_chain_add_mul ... ok
+test conformance_add_float16 ... ok
+test conformance_matmul_2d ... ok
+test conformance_matmul_batched_nd ... ok
+test conformance_mixed_partition ... ok
+test conformance_multiple_run_calls ... ok
+test conformance_two_sessions ... ok
+test ort_api_sanity ... ok
+test diag_ort_ep_api_nullcheck ... ok
+test ort_loads_our_ep_and_runs_model ... ok
+test ort_register_ep_library ... ok
+test ort_unsupported_op_declines_not_crashes ... ok
+test stress_register_run_unregister_cycles ... ok
+test result: ok. 17 passed; 0 failed; 0 ignored (plugin_ort_e2e)
 ```
 
-21 tests total (6 lib + 15 integration), zero failures, zero ignored.
+**23 total** (6 lib + 17 integration — up from 21 in M1; `conformance_add_float16`
+and `conformance_add_bfloat16` are new M2 tests that pass with exact bit-pattern
+assertions). The ORT warning `Skipping pci_bus_id for PCI path at ...
+5620e0c7-...` is an ORT device-discovery diagnostic for this host's virtual PCI
+bus; it does not affect correctness.
 
 ### `cargo check --workspace`
 
 ```
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
 ```
 
-Workspace compiles cleanly. (Note: `crates/onnx-runtime-cpuinfo/vendor/cpuinfo`
-was a pre-existing uninitialized git submodule on this host — unrelated to this
-work; initializing it was a one-time host setup step.)
-
-The ORT warning `Skipping pci_bus_id for PCI path at ... 5620e0c7-...` is an ORT
-device-discovery diagnostic for this host's virtual PCI bus; it does not affect
-correctness.
+Workspace compiles cleanly (warnings in unrelated `onnx-genai-bench/src/bin/compare.rs`
+— pre-existing, not introduced by this branch). The `onnx-runtime-ep-cuda-plugin`
+crate compiles because it is feature-gated behind `cuda`; `cargo check --workspace`
+uses the default feature set, which excludes it. No CUDA toolkit required for the
+workspace-level build.
 
 ---
 
 ## Security
 
-Holden's **final verdict: 🟡 YELLOW — May ship**
-(`docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`, `.squad/decisions/inbox/holden-ep-plugin-final-verdict.md`,
-2026-08-10T22:42Z). All three original ship-blocking findings resolved; no new
-CRITICAL or HIGH findings. Two LOW advisory items are recorded for post-merge
-follow-up — they do not block merge.
+Holden's **milestone 2 verdict: 🟡 YELLOW — May ship**
+(`docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`, 2026-08-10T23:09:23Z).
 
-### Resolved findings (all ship-blockers cleared)
+### Resolved findings (all ship-blockers cleared — both milestones)
 
 | ID | Finding | Fixer | Status |
 |----|---------|-------|--------|
 | H1 | `static mut HOST_ORT_API` data race | Nabil | **RESOLVED** — `AtomicPtr` Acquire/Release |
 | H2 | `graphs` null-deref in `ep_compile` | Nabil | **RESOLVED** — null guard at `ep.rs` |
 | H3 | Unsound `Send+Sync` on `OutboundGraphReader` | Nabil | **RESOLVED** — impls removed |
-| N1 | `compute_execute` missing `catch_unwind` (CRITICAL) | Leon | **RESOLVED** — `compute.rs:552`; regression test at line 2115 |
-| N2 | Negative dims wrap to `usize::MAX` in `kernel_ctx.rs` (HIGH) | Leon | **RESOLVED** — `validate_dims()` wired into `read_inputs`; 8 boundary tests |
-| N3 | Macro entry points `CreateEpFactories`/`ReleaseEpFactory` unguarded (MEDIUM) | Isidore | **RESOLVED** — both wrapped; `ReleaseEpFactory` return type corrected to `void` |
-| UAF | `OrtMemoryInfo` released while ORT holds pointer (CRITICAL) | Deckard | **RESOLVED** — `c92838d`; Holden confirmed correct, no double-free possible |
+| N1 | `compute_execute` missing `catch_unwind` (CRITICAL) | Leon | **RESOLVED** — `compute.rs:552` |
+| N2 | Negative dims wrap to `usize::MAX` in `kernel_ctx.rs` (HIGH) | Leon | **RESOLVED** — `validate_dims()` wired; 8 boundary tests |
+| N3 | Macro entry points `CreateEpFactories`/`ReleaseEpFactory` unguarded (MEDIUM) | Isidore | **RESOLVED** — both wrapped |
+| UAF | `OrtMemoryInfo` released while ORT holds pointer (CRITICAL) | Deckard | **RESOLVED** — `c92838d` |
+| NEW-1 | `compute_release_state` lacks `catch_unwind` | Leon | **RESOLVED** — `compute.rs:1563`; present in M1 code, not post-merge. |
+| NEW-2 | `ep_compile_inner` does not clean up `out_infos[0..i]` on mid-loop failure | Deckard | **RESOLVED** — `cleanup_partial_infos` helper + `ep_compile_inner` error paths; verified by Holden. |
 
-### Post-merge advisory items status (re-verified at `5fa8cb2a8`)
+### Open findings (post-merge advisories — do not block M2 merge)
 
-| ID | Item | Actual status |
-|----|------|---------------|
-| NEW-1 | `compute_release_state` lacks `catch_unwind` | **RESOLVED** — `catch_unwind` is present at `compute.rs:1563`; comment explicitly says "This fixes NEW-1 from the EP plugin security audit." Leon's work landed before the M1 hand-off, not post-merge. The PR doc listed it as post-merge advisory in error. |
-| NEW-2 | `ep_compile_inner` does not clean up `out_infos[0..i]` on mid-loop failure | **OPEN** — no cleanup logic found in `ep_compile_inner` (`ep.rs:229`). LOW risk; ORT contract on `Compile` errors is still unspecified. Owner: Deckard. |
+| ID | Finding | Severity | Owner | Status |
+|----|---------|----------|-------|--------|
+| M2-1 | EP instance leaked in `stream_release` (`factory.rs:667` / `device.rs:228`) | MEDIUM | Leon | **OPEN** — `DeviceSyncStream` has no `Drop` impl; `ep: *const dyn ExecutionProvider` set via `Box::into_raw` at `factory.rs:666–667` is never freed when the stream is released. Compare with `factory_release_allocator` which correctly calls `Box::from_raw` on its EP pointer. **Leon must fix before M2 merge.** |
+| M2-2 | Misleading doc on `DeviceAllocator::memory_info` ownership | LOW | Leon | **OPEN** — `device.rs:86` still says "Owned by this allocator; freed on drop." Actual behavior is correct (not freeing), but the comment is wrong. **Leon must fix before M2 merge.** |
 
 ---
 
@@ -223,41 +283,93 @@ The Reviewer Rejection Protocol was enforced throughout this branch:
 
 ---
 
-## Milestone 2 — In-progress work (branch `squad/ep-plugin-parity-cuda`)
+## Milestone 2 — What landed (branch `squad/ep-plugin-parity-cuda`)
 
-As of HEAD `5fa8cb2a8`, the M2 branch has zero new commits beyond M1. The four
-engineers are working concurrently but nothing has been committed to this branch yet.
-Status per engineer based on code inspection:
+Three commits on top of M1: `2da0c4e7f`, `577047a74`, `5a5b40877`.
+
+### Trait↔C-ABI parity — PROVEN (Pris)
+
+`crates/onnx-runtime-ep-plugin/tests/trait_cabi_parity.rs` — 9 tests, all passing.
+The tests verify the pinned §524 rule:
+
+> `C_ABI_claims = trait_claims ∩ { nodes where ShapeInference::for_node != Declined }`
+
+**Important nuance on the Declined set** (verified in code): the set of ops
+that `for_node` actually returns `Declined` for is **smaller** than originally
+assumed. `for_node` *can* infer Squeeze (empty-axes case), ReduceMean, and Conv.
+The confirmed genuine `Declined` case is opset≥13 `Unsqueeze` with data-dependent
+`axes` (runtime input — axes cannot be resolved at compile time). NonZero is also
+`Declined` (data-dependent output shape). Any doc or comment claiming that Squeeze,
+ReduceMean, or Conv are Declined is wrong; update accordingly.
+
+The parity tests exercise:
+- `capability_parity_supported_ops_with_known_shapes` — C ABI and trait agree on supported nodes
+- `capability_parity_supported_but_shape_declined` — opset-13 data-dependent Unsqueeze is declined by both
+- `capability_parity_unsupported_ops` — unknown ops declined by both
+- `capability_parity_mixed_graph` — a graph with a mix; both surfaces agree on the partition
+- `capability_parity_com_microsoft_domain` — `com.microsoft` domain ops
+- `error_parity_*` — error propagation is identical across both surfaces
+- `numerical_parity_device_copy` / `numerical_parity_memory_roundtrip` — bit-exact numeric results
+
+### f16/bf16 end-to-end routing — PROVEN (Pris)
+
+`conformance_add_float16` and `conformance_add_bfloat16` pass with exact
+bit-pattern assertions in `plugin_ort_e2e.rs`. This is **our EP claiming and
+executing** those nodes — not ORT falling back to its own CPU EP. The key M2
+mechanism: `GetKernelRegistry` + `build_cpu_registry_with_descriptors()` derives
+type constraints from the real CPU registry via a `RecordingOpRegistry`, and
+`node_passes_dtype_filter()` rejects nodes whose element types we don't support.
+The claim predicate and advertised type constraints share one `Vec<KernelRegistryEntry>`
+so they cannot drift.
+
+### Dtype-aware capability claiming (Deckard)
+
+`node_passes_dtype_filter()` is now the sole gate for dtype acceptance. The
+`KernelRegistryEntry` vec is the single source of truth for both claim decisions and
+advertised type constraints. There is no separate list to keep in sync.
+
+### Device surfaces (Nabil)
+
+`device.rs` adds `DeviceSupport`, `DeviceAllocator` (OrtAllocator vtable),
+and `DeviceSyncStream` (OrtSyncStreamImpl). Integrated into `factory.rs`.
+Exercised by mock GPU/CPU EPs in device tests (`device::tests::*`, 30 tests)
+on a machine with no GPU.
+
+### New `onnx-runtime-ep-cuda-plugin` crate (Nabil)
+
+`crates/onnx-runtime-ep-cuda-plugin/` — feature-gated behind `cuda`, workspace
+member but not a default member. `cargo check --workspace` passes with no CUDA
+toolkit because the default feature set excludes it.
+
+### Engineer status summary
 
 | Engineer | Task | Status |
 |---|---|---|
-| Leon | `catch_unwind` on `compute_release_state` (NEW-1) | ✅ **DONE** — landed before M1 hand-off; code at `compute.rs:1563` with explicit comment. Formerly listed as "post-merge advisory" in error. |
-| Pris | Trait ↔ C-ABI capability/numeric/error parity tests | 🔴 **NOT YET COMMITTED** — no such tests in `crates/onnx-runtime-ep-api/tests/`. §524 trait-half proof depends on this work. |
-| Deckard | NEW-2 `ep_compile_inner` partial cleanup + `GetKernelRegistry` f16/bf16 | 🔴 **NOT YET COMMITTED** — `GetKernelRegistry: None` at `ep.rs:48`; no cleanup in `ep_compile_inner`. |
-| Nabil | Device/allocator/stream adapter surfaces + `onnx-runtime-ep-cuda-plugin` shim | 🔴 **NOT YET COMMITTED** — crate `onnx-runtime-ep-cuda-plugin` does not exist. |
+| Pris | Trait↔C-ABI parity tests | ✅ **DONE** — 9 tests in `tests/trait_cabi_parity.rs`; all pass |
+| Deckard | Dtype filter + `GetKernelRegistry` + NEW-2 cleanup | ✅ **DONE** — `node_passes_dtype_filter`, `build_cpu_registry_with_descriptors`, `cleanup_partial_infos` |
+| Nabil | Device/allocator/stream surfaces + CUDA shim crate | ✅ **DONE** (surfaces exist and are tested; CUDA shim is a workspace-member scaffold, not a complete CUDA EP) |
+| Leon | M2-1 EP leak in `stream_release` + M2-2 doc fix | 🔴 **NOT YET DONE** — neither fix is in the code at `5a5b40877`. Both are required before M2 merge. |
 
 ---
 
 ## Known Limitations / Not In Scope
 
-- **CUDA EP:** Blocked on two fronts: (1) no CUDA toolkit or GPU on this host;
-  (2) genuine adapter design work remains — allocator via `CreateAllocator`, stream/sync
-  via `CreateSyncStreamForDevice`, device pointer crossing the ABI. This is not purely
-  hardware-blocked.
-- **f16/bf16 end-to-end coverage:** Our CPU kernels implement f16/bf16, but the EP
-  implements no `GetKernelRegistry`, so type-constraint metadata is never registered
-  with ORT. End-to-end f16/bf16 cannot be proven without wiring `GetKernelRegistry`.
-  No fake test was written. Owner if pursued: Nabil / `ep.rs`.
-- **Ops still declined:** Any op not in the 22 shape-inference rules is declined
-  (`Declined` / fail-closed). They fall through to ORT's own CPU EP.
+- **CUDA EP:** The `onnx-runtime-ep-cuda-plugin` shim crate now exists (M2), and
+  `DeviceAllocator`, `DeviceSyncStream`, and `DeviceSupport` surfaces are implemented
+  and tested with mock EPs. However, the shim is **not a working CUDA EP**. Two
+  blockers remain: (1) no CUDA toolkit or GPU on this host — device-pointer and
+  data-transfer code cannot be written or tested here; (2) genuine design work for
+  real device-pointer crossing the ORT plugin ABI, cuMemAlloc/cuMemFree integration,
+  and stream/event mapping remains unstarted. This is both hardware-gated and
+  requiring real engineering; do not describe it as purely hardware-blocked.
+- **Ops still declined:** Any op not in the shape-inference rules is declined
+  (`Declined` / fail-closed). They fall through to ORT's own CPU EP. Note:
+  Squeeze/ReduceMean/Conv now resolve; confirmed declined cases are NonZero
+  and opset≥13 Unsqueeze with data-dependent axes.
 - **No GitHub push credentials:** This host has no `GH_TOKEN`/`GITHUB_TOKEN`, no
   SSH private key, and GCM cache is empty. The branch is committed locally. The PR
   must be opened by the user or a runner with credentials.
-- **nxrt-native Rust trait ABI:** The `ExecutionProvider` Rust trait surface is
-  implemented in `onnx-runtime-ep-api` but is not independently tested as a
-  first-class plugin surface in this PR. The extension contract §524 requires both
-  C ABI and Rust trait; the Rust trait half is partially wired but not separately
-  validated end-to-end.
+- **M2 clippy regression:** `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` fails with 2 trivial lint errors in `ep.rs:1041,1047`. Must be fixed before the M2 PR is opened.
 
 ---
 
@@ -270,21 +382,28 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 | Requirement | M1 status | M2 status |
 |-------------|-----------|-----------|
 | Stable C ABI with dynamic loading | ✅ Complete — `CreateEpFactories`/`ReleaseEpFactory` exports; ORT `dlopen`s the cdylib | ✅ Unchanged |
-| First-class Rust trait | 🟡 `ExecutionProvider` trait exists and is implemented; plugin adapter bridges it | 🔴 Trait↔C-ABI parity tests (Pris's work) have NOT landed yet on `squad/ep-plugin-parity-cuda`. §524 requires both seams proven; only the C ABI side is verified by the 21 ORT conformance tests. |
-| ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim; core logic lives in the Rust trait impl | ✅ Unchanged |
-| Fail closed on unsupported capabilities | ✅ `Declined` path in shape inference; 22 explicit rules, no wildcard accept | ✅ Unchanged |
-| Native nxrt dynamic ABI | 🔴 Not implemented — no `extern "C"` nxrt-native ABI exists; the only dynamic-loading surface is the ORT plugin ABI | 🔴 Not started in M2 either |
+| First-class Rust trait (proven) | 🟡 Trait wired; only C ABI side verified by ORT conformance tests | ✅ **Proven** — 9 parity tests (`trait_cabi_parity.rs`) confirm trait↔C-ABI agreement on capabilities, errors, and numeric results |
+| Trait↔C-ABI parity rule | — | ✅ `C_ABI_claims = trait_claims ∩ { for_node != Declined }`. Pinned and tested. Declined set is smaller than originally assumed — Squeeze/ReduceMean/Conv resolve; confirmed Declined: NonZero, opset-13 data-dependent Unsqueeze. |
+| Fail closed on unsupported capabilities | ✅ `Declined` path; shape-inference rules | ✅ Strengthened — `node_passes_dtype_filter()` adds dtype-level fail-closed gating |
+| ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim | ✅ Unchanged |
+| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. This is the remaining §524 gap. The good news in M2 (trait parity proven) does not close it. |
 
-**Honest M2 §524 status:** The C ABI half is complete and verified by 21 ORT conformance tests. The Rust trait half is structurally wired — `CpuExecutionProvider` implements the trait and the adapter bridges it — but the trait surface has NOT been independently tested as a first-class plugin seam. Pris's trait↔C-ABI parity tests are the intended evidence for the trait half; they are in scope for M2 but have not been committed yet. The native nxrt dynamic ABI remains entirely undesigned and unimplemented in both milestones.
+**Honest M2 §524 status:**
+- C ABI: ✅ Complete and proven by 23 ORT conformance tests.
+- Rust trait: ✅ **Now proven** — 9 parity tests confirm agreement.
+- Fail-closed: ✅ Complete — shape-inference Declined path + dtype filter.
+- **Native nxrt dynamic ABI: 🔴 Not implemented.** No nxrt-native `extern "C"` ABI exists in either milestone. Tracking required.
 
 ---
 
 ## Follow-Ups
 
-1. ~~**Leon:** Add `catch_unwind` to `compute_release_state` (NEW-1)~~ — **DONE** (already in code at `compute.rs:1563`).
-2. **Deckard:** Handle `out_infos[0..i]` cleanup on mid-loop `ep_compile_inner` failure once ORT contract is clarified (NEW-2 LOW advisory).
-3. **Deckard/Nabil:** Wire `GetKernelRegistry` so f16/bf16 type constraints are registered with ORT; enables end-to-end f16/bf16 conformance testing.
-4. **Pris:** Add trait↔C-ABI parity tests (capability round-trip, numeric precision, error propagation) in `crates/onnx-runtime-ep-api/tests/`. These are the §524 evidence for the Rust trait half.
-5. **Nabil:** Design and implement `onnx-runtime-ep-cuda-plugin` shim with allocator ABI (`CreateAllocator`), stream/sync ABI (`CreateSyncStreamForDevice`), and device-pointer crossing. Validate on a CUDA-capable host.
-6. **Shape inference:** Add per-op rules for Reshape (computed dims), Split, TopK, Slice (negative axis) to expand what the CPU EP can claim.
-7. **Native nxrt dynamic ABI:** Design and implement a first-class native nxrt `extern "C"` ABI (separate from the ORT plugin ABI) to complete §524 compliance.
+1. ~~**Leon:** Add `catch_unwind` to `compute_release_state` (NEW-1)~~ — **DONE**.
+2. ~~**Deckard:** NEW-2 `ep_compile_inner` cleanup~~ — **DONE** (`cleanup_partial_infos`).
+3. ~~**Deckard/Nabil:** Wire `GetKernelRegistry` for f16/bf16~~ — **DONE** (`build_cpu_registry_with_descriptors`).
+4. ~~**Pris:** Trait↔C-ABI parity tests~~ — **DONE** (9 tests in `trait_cabi_parity.rs`).
+5. **Leon (pre-M2-merge):** Fix M2-1 EP leak in `stream_release` — add `Box::from_raw` for the EP pointer or implement `Drop for DeviceSyncStream`.
+6. **Leon (pre-M2-merge):** Fix M2-2 misleading doc on `DeviceAllocator::memory_info:86` — change to "Borrowed from ORT; NOT owned by this allocator."
+7. **Any M2 committer (pre-M2-merge):** Fix clippy regression in `ep.rs:1041,1047` — remove `&` from the two `format!()` arguments.
+8. **CUDA EP work (post-both-PRs):** `onnx-runtime-ep-cuda-plugin` shim + real device-pointer/stream/allocator integration — hardware-gated; requires CUDA toolkit and GPU.
+9. **Native nxrt dynamic ABI:** Design and implement a first-class native nxrt `extern "C"` ABI to complete §524 compliance.

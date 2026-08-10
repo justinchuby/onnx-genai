@@ -53,3 +53,9 @@ Pre-2026-08-10 entries moved to `history-archive.md`. Covers: kernel pre-binding
 - **Wiring**: `ExportedEp` gains `registry_entries: Vec<KernelRegistryEntry>`, populated via `new_with_registry_and_entries()` from factory's `CreateEp`. Backward-compatible: `new_with_registry()` passes empty entries (filter bypassed).
 - **Tests**: 5 new unit tests (f32 claimed, unsupported rejected, Undefined rejected, unknown op rejected, empty entries bypassed). 132 ep-plugin tests, 23 cpu-plugin tests pass. Clippy clean. Workspace check succeeds.
 - **f16/bf16 routing verdict**: The claim predicate is now dtype-aware and will claim f16/bf16 nodes for ops that list Float16/BFloat16. Cannot empirically prove e2e on this host (no f16 model in conformance suite). Instruction to Pris: **un-ignore the f16/bf16 conformance tests.**
+
+## 2026-08-10 — needless_borrow clippy fixes in ep.rs test helper
+
+- **What**: Removed two `&` in `graph_with_node` test helper (ep.rs:1041, ep.rs:1047). `format!()` returns `String`, which already implements the required trait; the borrow was redundant (`needless_borrows_for_generic_args`).
+- **Assertion sanity check**: Reviewed all five `node_passes_dtype_filter` call sites (lines 1067, 1083, 1098, 1113, and the `&entries` calls). All assertions are meaningful: they test distinct, real cases (f32 claimed, Int64 rejected, Undefined rejected, unknown-op rejected, empty-entries bypass). No vacuous assertion found — each test constructs a unique graph type and asserts the correct boolean outcome.
+- **Validation**: `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → clean (no errors). `cargo test -p onnx-runtime-ep-plugin --lib` → 132 passed. `cargo test -p onnx-runtime-ep-cpu-plugin --all-targets` → 23 passed including `conformance_add_float16` and `conformance_add_bfloat16`.

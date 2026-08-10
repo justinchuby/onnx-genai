@@ -504,7 +504,10 @@ mod tests {
         let half_max_plus_1 = i64::MAX / 2 + 1; // 4611686018427387904
         let dims = [half_max_plus_1, 2i64];
         let err = super::validate_dims(&dims, DataType::Float16, "f16_overflow").unwrap_err();
-        assert!(err.contains("overflows"), "expected overflow error, got: {err}");
+        assert!(
+            err.contains("overflows"),
+            "expected overflow error, got: {err}"
+        );
     }
 
     #[test]
