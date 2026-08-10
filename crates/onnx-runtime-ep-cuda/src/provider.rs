@@ -1001,6 +1001,10 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
+        self.deallocate_with_unmapped(buffer).map(|_| ())
+    }
+
+    fn deallocate_with_unmapped(&self, buffer: DeviceBuffer) -> Result<u64> {
         assert_eq!(
             buffer.device(),
             self.device,
@@ -1011,21 +1015,21 @@ impl ExecutionProvider for CudaExecutionProvider {
         // cuMemFree'd. CUDA does not yet produce borrowed buffers, but keep the
         // invariant sound so one can never be freed here.
         if buffer.is_borrowed() {
-            return Ok(());
+            return Ok(0);
         }
         self.synchronize_before_pooled_unmap()?;
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw();
         let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
-            return Ok(());
+            return Ok(0);
         };
         // SAFETY: `ptr`, `size` and `align` are the triple this EP obtained
         // from `self.memory` in `allocate`; `into_raw` consumed the owning
         // handle so no alias remains, and this is its single free.
-        unsafe { self.memory().deallocate(ptr, size, align) };
+        let unmapped = unsafe { self.memory().deallocate_with_unmapped(ptr, size, align) };
         self.ep_frees.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(unmapped)
     }
 
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {

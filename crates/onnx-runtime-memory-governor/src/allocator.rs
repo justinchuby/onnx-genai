@@ -309,6 +309,21 @@ pub trait DeviceAllocator: Send + Sync + Debug {
     /// deallocated twice.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize);
 
+    /// Free an allocation and report bytes whose global mapping reference
+    /// count transitioned from one to zero.
+    ///
+    /// Eager allocators have no shared-granule attribution and return zero.
+    ///
+    /// # Safety
+    ///
+    /// `ptr`, `bytes`, and `align` must identify one live allocation returned
+    /// by this allocator, exactly as required by [`DeviceAllocator::deallocate`].
+    unsafe fn deallocate_with_unmapped(&self, ptr: NonNull<u8>, bytes: usize, align: usize) -> u64 {
+        // SAFETY: forwarded under this method's identical contract.
+        unsafe { self.deallocate(ptr, bytes, align) };
+        0
+    }
+
     /// Which device this allocator serves.
     fn device(&self) -> DeviceKey;
 }

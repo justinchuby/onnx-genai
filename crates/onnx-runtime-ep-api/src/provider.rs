@@ -578,6 +578,15 @@ pub trait ExecutionProvider: Send + Sync {
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
 
+    /// Free device memory and report mapped-zone bytes actually unmapped.
+    ///
+    /// The report is based on global mapping references, not which allocation
+    /// originally caused the mapping.
+    fn deallocate_with_unmapped(&self, buffer: DeviceBuffer) -> Result<u64> {
+        self.deallocate(buffer)?;
+        Ok(0)
+    }
+
     /// Synchronous copy (host↔device or device↔device).
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()>;
     /// Asynchronous copy; returns a [`Fence`] to await.

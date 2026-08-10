@@ -1470,15 +1470,16 @@ impl KernelDispatchContext<'_> {
                     // before retiring the old disposable workspace. Release it
                     // before acquiring the replacement to avoid charging both.
                     self.ep.sync()?;
-                    let old_mapped = prepared.as_ref().map_or(0, |old| old.mapped_bytes);
+                    if let Some(old) = prepared.take() {
+                        let unmapped = self.ep.deallocate_with_unmapped(old.buffer)?;
+                        self.ep.release_mapped_growth(unmapped, old.role);
+                    }
                     let target_mapped = self
                         .ep
                         .mapped_bytes_for_allocation(required, requirement.alignment)?;
-                    let growth = target_mapped.saturating_sub(old_mapped);
-                    let mut grant = self.ep.prepare_mapped_growth(growth, requirement.role)?;
-                    if let Some(old) = prepared.take() {
-                        self.ep.deallocate(old.buffer)?;
-                    }
+                    let mut grant = self
+                        .ep
+                        .prepare_mapped_growth(target_mapped, requirement.role)?;
                     let lease = match self
                         .ep
                         .reserve_workspace(requirement.bytes, requirement.role)
@@ -1486,56 +1487,34 @@ impl KernelDispatchContext<'_> {
                         Ok(lease) => lease,
                         Err(error) => {
                             drop(grant);
-                            self.ep.release_mapped_growth(old_mapped, requirement.role);
                             return Err(error.into());
                         }
                     };
                     let (buffer, actual_mapped_bytes) = match grant.as_mut() {
-                        Some(grant) => match self.ep.allocate_with_mapped_growth(
-                            required,
-                            requirement.alignment,
-                            grant,
-                        ) {
-                            Ok(allocation) => {
-                                (allocation.allocation, allocation.newly_mapped_bytes)
-                            }
-                            Err(error) => {
-                                self.ep.release_mapped_growth(old_mapped, requirement.role);
-                                return Err(error.into());
-                            }
-                        },
-                        None => match self.ep.allocate(required, requirement.alignment) {
-                            Ok(allocation) => (allocation, old_mapped),
-                            Err(error) => {
-                                self.ep.release_mapped_growth(old_mapped, requirement.role);
-                                return Err(error.into());
-                            }
-                        },
-                    };
-                    let mapped_bytes = if let Some(grant) = grant {
-                        let added_mapped = actual_mapped_bytes.saturating_sub(old_mapped);
-                        if let Err(error) = grant.commit_bytes(added_mapped) {
-                            let _ = self.ep.deallocate(buffer);
-                            self.ep.release_mapped_growth(old_mapped, requirement.role);
-                            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                                "workspace mapped-growth commit failed: {error}"
-                            ))
-                            .into());
+                        Some(grant) => {
+                            let allocation = self.ep.allocate_with_mapped_growth(
+                                required,
+                                requirement.alignment,
+                                grant,
+                            )?;
+                            (allocation.allocation, allocation.newly_mapped_bytes)
                         }
-                        self.ep.release_mapped_growth(
-                            old_mapped.saturating_sub(actual_mapped_bytes),
-                            requirement.role,
-                        );
-                        actual_mapped_bytes
-                    } else {
-                        old_mapped
+                        None => (self.ep.allocate(required, requirement.alignment)?, 0),
                     };
+                    if let Some(grant) = grant
+                        && let Err(error) = grant.commit_bytes(actual_mapped_bytes)
+                    {
+                        let _ = self.ep.deallocate(buffer);
+                        return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                            "workspace mapped-growth commit failed: {error}"
+                        ))
+                        .into());
+                    }
                     *prepared = Some(PreparedWorkspace {
                         buffer,
                         _lease: lease,
                         bytes: required,
                         alignment: requirement.alignment,
-                        mapped_bytes,
                         role: requirement.role,
                     });
                 }

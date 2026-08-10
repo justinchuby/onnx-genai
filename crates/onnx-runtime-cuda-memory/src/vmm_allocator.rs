@@ -1494,6 +1494,15 @@ impl DeviceAllocator for CudaVmmAllocator {
         let _ = self.deallocate_span(ptr);
     }
 
+    unsafe fn deallocate_with_unmapped(
+        &self,
+        ptr: NonNull<u8>,
+        _bytes: usize,
+        _align: usize,
+    ) -> u64 {
+        self.deallocate_span(ptr)
+    }
+
     /// True: spans are carved from granules mapped as they are needed, and
     /// each granule is leased before it is mapped.
     fn commits_on_demand(&self) -> bool {

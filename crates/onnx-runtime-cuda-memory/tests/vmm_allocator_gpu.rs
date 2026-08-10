@@ -150,7 +150,10 @@ fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
     assert_eq!(grant.physical_capacity().remaining_bytes(), 0);
     grant.commit_bytes(granule).expect("mapped attribution");
     assert_eq!(governor.used(Tier::Device), granule);
-    unsafe { allocator.deallocate(pointer, 4096, 256) };
+    let unmapped = allocator.deallocate_span(pointer);
+    assert_eq!(unmapped, granule, "a nonshared allocation unmaps itself");
+    assert_eq!(requester.unmap(unmapped), unmapped);
+    assert_eq!(requester.mapped_bytes(), 0);
     assert_eq!(governor.used(Tier::Device), 0);
 }
 
@@ -160,62 +163,72 @@ fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
 )]
 #[test]
 fn adjacent_shared_granule_consumes_mapped_growth_once() {
-    let granule = 2_u64 << 20;
-    let (allocator, governor) = allocator(64 << 20, granule * 2);
-    let requester = governor
-        .reserve_mapped_allowance(
-            Tier::Device,
-            granule * 2,
-            MemoryRole::KvCache,
-            HolderId::new(24),
-        )
-        .expect("requester allowance");
-    let full = 0..4096;
-    let mut first_grant = governor
-        .prepare_mapped_growth(&requester, granule)
-        .expect("first granule grant");
-    let first = allocator
-        .allocate_committed_with_capacity(
-            4096,
-            256,
-            std::slice::from_ref(&full),
-            first_grant.physical_capacity(),
-        )
-        .expect("first workspace allocation");
-    assert_eq!(first.newly_mapped_bytes, granule);
-    first_grant
-        .commit_bytes(first.newly_mapped_bytes)
-        .expect("attribute first granule");
+    fn run(reverse: bool) {
+        let granule = 2_u64 << 20;
+        let (allocator, governor) = allocator(64 << 20, granule * 2);
+        let requester = governor
+            .reserve_mapped_allowance(
+                Tier::Device,
+                granule * 2,
+                MemoryRole::Workspace { step_scoped: false },
+                HolderId::new(if reverse { 25 } else { 24 }),
+            )
+            .expect("requester allowance");
+        let full = 0..4096;
+        let mut first_grant = governor
+            .prepare_mapped_growth(&requester, granule)
+            .expect("first granule grant");
+        let first = allocator
+            .allocate_committed_with_capacity(
+                4096,
+                256,
+                std::slice::from_ref(&full),
+                first_grant.physical_capacity(),
+            )
+            .expect("first workspace allocation");
+        assert_eq!(first.newly_mapped_bytes, granule);
+        first_grant
+            .commit_bytes(first.newly_mapped_bytes)
+            .expect("attribute first granule");
 
-    let mut second_grant = governor
-        .prepare_mapped_growth(&requester, granule)
-        .expect("workspace reserves its rounded upper bound");
-    let second = allocator
-        .allocate_committed_with_capacity(
-            4096,
-            256,
-            std::slice::from_ref(&full),
-            second_grant.physical_capacity(),
-        )
-        .expect("adjacent packed workspace allocation");
-    assert_eq!(
-        second.newly_mapped_bytes, 0,
-        "the second workspace only adds a reference to the mapped granule"
-    );
-    second_grant
-        .commit_bytes(second.newly_mapped_bytes)
-        .expect("attribute no additional bytes");
-    assert_eq!(requester.mapped_bytes(), granule);
+        let mut second_grant = governor
+            .prepare_mapped_growth(&requester, granule)
+            .expect("workspace reserves its rounded upper bound");
+        let second = allocator
+            .allocate_committed_with_capacity(
+                4096,
+                256,
+                std::slice::from_ref(&full),
+                second_grant.physical_capacity(),
+            )
+            .expect("adjacent packed workspace allocation");
+        assert_eq!(second.newly_mapped_bytes, 0);
+        second_grant
+            .commit_bytes(second.newly_mapped_bytes)
+            .expect("attribute no additional bytes");
+        assert_eq!(requester.mapped_bytes(), granule);
 
-    unsafe { allocator.deallocate(first.allocation, 4096, 256) };
-    assert_eq!(
-        allocator.committed_and_reserved().0,
-        granule as usize,
-        "the second reference retains the shared granule"
-    );
-    unsafe { allocator.deallocate(second.allocation, 4096, 256) };
-    assert_eq!(allocator.committed_and_reserved().0, 0);
-    assert_eq!(governor.used(Tier::Device), 0);
+        let (early, last) = if reverse {
+            (second.allocation, first.allocation)
+        } else {
+            (first.allocation, second.allocation)
+        };
+        let early_unmapped = allocator.deallocate_span(early);
+        assert_eq!(early_unmapped, 0, "the surviving workspace retains mapping");
+        requester.unmap(early_unmapped);
+        assert_eq!(requester.mapped_bytes(), granule);
+        assert_eq!(allocator.committed_and_reserved().0, granule as usize);
+
+        let last_unmapped = allocator.deallocate_span(last);
+        assert_eq!(last_unmapped, granule, "last reference owns the unmap");
+        requester.unmap(last_unmapped);
+        assert_eq!(requester.mapped_bytes(), 0);
+        assert_eq!(allocator.committed_and_reserved().0, 0);
+        assert_eq!(governor.used(Tier::Device), 0);
+    }
+
+    run(false);
+    run(true);
 }
 
 /// A partial commit is a real allocation claim, not just a map operation.

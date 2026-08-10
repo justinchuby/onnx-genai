@@ -150,62 +150,42 @@ impl Executor {
         {
             return Ok(peak);
         }
-        let old_mapped = slot.as_ref().map_or(0, |old| old.mapped_bytes);
-        let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
-        let growth = target_mapped.saturating_sub(old_mapped);
-        let mut grant = self.ep.prepare_mapped_growth(growth, peak.role)?;
         if let Some(old) = slot.take() {
-            self.ep.deallocate(old.buffer)?;
+            let unmapped = self.ep.deallocate_with_unmapped(old.buffer)?;
+            self.ep.release_mapped_growth(unmapped, old.role);
         }
+        let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
+        let mut grant = self.ep.prepare_mapped_growth(target_mapped, peak.role)?;
         let lease = match self.ep.reserve_workspace(peak.bytes, peak.role) {
             Ok(lease) => lease,
             Err(error) => {
                 drop(grant);
-                self.ep.release_mapped_growth(old_mapped, peak.role);
                 return Err(error.into());
             }
         };
         let (fresh, actual_mapped_bytes) = match grant.as_mut() {
-            Some(grant) => match self
-                .ep
-                .allocate_with_mapped_growth(bytes, peak.alignment, grant)
-            {
-                Ok(allocation) => (allocation.allocation, allocation.newly_mapped_bytes),
-                Err(error) => {
-                    self.ep.release_mapped_growth(old_mapped, peak.role);
-                    return Err(error.into());
-                }
-            },
-            None => match self.ep.allocate(bytes, peak.alignment) {
-                Ok(allocation) => (allocation, old_mapped),
-                Err(error) => {
-                    self.ep.release_mapped_growth(old_mapped, peak.role);
-                    return Err(error.into());
-                }
-            },
-        };
-        let mapped_bytes = if let Some(grant) = grant {
-            let added_mapped = actual_mapped_bytes.saturating_sub(old_mapped);
-            if let Err(error) = grant.commit_bytes(added_mapped) {
-                let _ = self.ep.deallocate(fresh);
-                self.ep.release_mapped_growth(old_mapped, peak.role);
-                return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                    "workspace mapped-growth commit failed: {error}"
-                ))
-                .into());
+            Some(grant) => {
+                let allocation =
+                    self.ep
+                        .allocate_with_mapped_growth(bytes, peak.alignment, grant)?;
+                (allocation.allocation, allocation.newly_mapped_bytes)
             }
-            self.ep
-                .release_mapped_growth(old_mapped.saturating_sub(actual_mapped_bytes), peak.role);
-            actual_mapped_bytes
-        } else {
-            old_mapped
+            None => (self.ep.allocate(bytes, peak.alignment)?, 0),
         };
+        if let Some(grant) = grant
+            && let Err(error) = grant.commit_bytes(actual_mapped_bytes)
+        {
+            let _ = self.ep.deallocate(fresh);
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "workspace mapped-growth commit failed: {error}"
+            ))
+            .into());
+        }
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
             _lease: lease,
             bytes,
             alignment: peak.alignment,
-            mapped_bytes,
             role: peak.role,
         });
         Ok(peak)
@@ -286,10 +266,9 @@ impl Executor {
 
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
         if let Some(workspace) = self.step_workspace.take() {
-            let mapped_bytes = workspace.mapped_bytes;
             let role = workspace.role;
-            self.ep.deallocate(workspace.buffer)?;
-            self.ep.release_mapped_growth(mapped_bytes, role);
+            let unmapped = self.ep.deallocate_with_unmapped(workspace.buffer)?;
+            self.ep.release_mapped_growth(unmapped, role);
         }
         Ok(())
     }
