@@ -346,28 +346,27 @@ impl Engine {
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
         #[cfg(feature = "cuda")]
-        let weight_reservation_bytes =
-            if cuda_offload_resolution.is_some_and(|resolution| resolution.policy.enabled)
-                && onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled()
-            {
-                // The production pool charges each physical handle to this same
-                // authority. A content-sized startup lease would double-charge
-                // weights and prevent the native session from creating even its
-                // initial workspace before the mapped weight allowance is derived.
-                0
-            } else {
-                device_weight_reservation_for(
-                    model_weight_bytes,
-                    cuda_offload_resolution.and_then(|resolution| {
-                        resolution.policy.enabled.then(|| {
-                            resolution.policy.device_budget_bytes.unwrap_or(
-                                onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
-                            )
-                        })
-                    }),
-                    governor_kv_config.page_size_bytes,
-                )
-            };
+        let governed_physical_pool = uses_governed_physical_pool(
+            cuda_offload_resolution,
+            dynamic_lending_enabled(),
+            onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled(),
+        );
+        #[cfg(feature = "cuda")]
+        let weight_reservation_bytes = cuda_weight_startup_reservation(
+            model_weight_bytes,
+            cuda_offload_resolution,
+            governed_physical_pool,
+            governor_kv_config.page_size_bytes,
+        );
+        #[cfg(feature = "cuda")]
+        tracing::info!(
+            managed_no_spill = cuda_offload_resolution
+                .is_some_and(|resolution| resolution.policy.managed_no_spill),
+            dynamic_lending = dynamic_lending_enabled(),
+            governed_physical_pool,
+            weight_reservation_bytes,
+            "resolved CUDA device-memory strategy before governor creation"
+        );
         #[cfg(not(feature = "cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
             model_weight_bytes,
@@ -394,10 +393,7 @@ impl Engine {
         // the count from a memory budget would build hundreds of millions of
         // empty structs for storage that is never allocated.
         let native_kv_pages = BOOKKEEPING_POOL_PAGES;
-        if scheduler_config.bytes_per_token.is_none() {
-            scheduler_config.bytes_per_token =
-                required_bytes_per_token_from_kv_config(governor_kv_config)?;
-        }
+        populate_scheduler_bytes_per_token(&mut scheduler_config, governor_kv_config)?;
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
             build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
@@ -917,6 +913,23 @@ fn required_bytes_per_token_from_kv_config(
     })
 }
 
+#[cfg(feature = "native-backend")]
+fn populate_scheduler_bytes_per_token(
+    scheduler: &mut onnx_genai_scheduler::SchedulerConfig,
+    kv_config: ModelKvConfig,
+) -> anyhow::Result<()> {
+    if scheduler.bytes_per_token.is_none() {
+        scheduler.bytes_per_token = match kv_config.bytes_per_token() {
+            Some(bytes_per_token) => Some(bytes_per_token),
+            None if kv_config.page_geometry_required => {
+                required_bytes_per_token_from_kv_config(kv_config)?
+            }
+            None => None,
+        };
+    }
+    Ok(())
+}
+
 fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
@@ -1106,6 +1119,55 @@ struct CudaOffloadResolution {
 }
 
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn dynamic_lending_enabled() -> bool {
+    !std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn uses_governed_physical_pool(
+    resolution: Option<CudaOffloadResolution>,
+    lending_enabled: bool,
+    configured_pool_enabled: bool,
+) -> bool {
+    resolution.is_some_and(|resolution| {
+        (resolution.policy.enabled && configured_pool_enabled)
+            || (resolution.policy.managed_no_spill && lending_enabled)
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn cuda_weight_startup_reservation(
+    model_weight_bytes: u64,
+    resolution: Option<CudaOffloadResolution>,
+    governed_physical_pool: bool,
+    kv_page_size_bytes: Option<u64>,
+) -> u64 {
+    if governed_physical_pool {
+        // The physical pool charges each handle to this authority, including
+        // resident weights when managed VMM does not need weight offload.
+        // Reserving package bytes here would charge the same weights twice.
+        return 0;
+    }
+    device_weight_reservation_for(
+        model_weight_bytes,
+        resolution.and_then(|resolution| {
+            resolution.policy.enabled.then(|| {
+                resolution
+                    .policy
+                    .device_budget_bytes
+                    .unwrap_or(onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES)
+            })
+        }),
+        kv_page_size_bytes,
+    )
+}
+
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn resolve_cuda_offload_policy(
     native_device: &crate::native_decode::NativeDecodeDevice,
     limits: &ResourceLimits,
@@ -1133,9 +1195,16 @@ fn resolve_cuda_offload_policy_from_env_policy(
         return None;
     }
 
+    let explicit_byte_limit = matches!(limits.vram_limit, ResourceLimit::Bytes(_));
     if env_policy.enabled {
+        let mut policy = env_policy;
+        policy.managed_no_spill = explicit_byte_limit;
+        policy.managed_limit_bytes = explicit_byte_limit.then_some(match limits.vram_limit {
+            ResourceLimit::Bytes(bytes) => bytes,
+            _ => unreachable!("explicit_byte_limit checked above"),
+        });
         return Some(CudaOffloadResolution {
-            policy: env_policy,
+            policy,
             device_budget_is_override: env_policy.device_budget_bytes.is_some(),
             auto_enabled_from_vram_limit: false,
         });
@@ -1145,7 +1214,15 @@ fn resolve_cuda_offload_policy_from_env_policy(
         return None;
     };
     if package_bytes <= resolved_vram_bytes {
-        return None;
+        return Some(CudaOffloadResolution {
+            policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                managed_no_spill: true,
+                managed_limit_bytes: Some(resolved_vram_bytes),
+                ..env_policy
+            },
+            device_budget_is_override: false,
+            auto_enabled_from_vram_limit: false,
+        });
     }
 
     let offload_device_budget_bytes = env_policy
@@ -1154,6 +1231,8 @@ fn resolve_cuda_offload_policy_from_env_policy(
     Some(CudaOffloadResolution {
         policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
             enabled: true,
+            managed_no_spill: true,
+            managed_limit_bytes: Some(resolved_vram_bytes),
             device_budget_bytes: Some(offload_device_budget_bytes),
             async_pagein: env_policy.async_pagein,
             scan_resistant_dense: env_policy.scan_resistant_dense,
@@ -2069,6 +2148,8 @@ mod pool_sizing_tests {
             10_000,
             onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 enabled: false,
+                managed_no_spill: false,
+                managed_limit_bytes: None,
                 device_budget_bytes: None,
                 async_pagein: true,
                 scan_resistant_dense: true,
@@ -2077,9 +2158,25 @@ mod pool_sizing_tests {
         .expect("weights above an explicit CUDA VRAM limit should enable offload");
 
         assert!(policy.policy.enabled);
+        assert!(policy.policy.managed_no_spill);
+        assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert_eq!(policy.policy.device_budget_bytes, Some(6_000));
         assert!(policy.policy.async_pagein);
         assert!(policy.auto_enabled_from_vram_limit);
+        assert!(uses_governed_physical_pool(Some(policy), true, false));
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), true, None),
+            0
+        );
+        assert!(
+            !uses_governed_physical_pool(Some(policy), false, false),
+            "the lending opt-out must preserve the compatibility reservation path"
+        );
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), false, None),
+            6_000,
+            "the non-pool offload path keeps its existing device-budget reservation"
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -2094,6 +2191,8 @@ mod pool_sizing_tests {
             10_000,
             onnx_runtime_ep_cuda::DeviceOffloadPolicy {
                 enabled: false,
+                managed_no_spill: false,
+                managed_limit_bytes: None,
                 device_budget_bytes: Some(4_000),
                 async_pagein: false,
                 scan_resistant_dense: true,
@@ -2102,6 +2201,70 @@ mod pool_sizing_tests {
         .expect("the explicit limit still triggers offload");
 
         assert_eq!(policy.policy.device_budget_bytes, Some(4_000));
+        assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert!(policy.device_budget_is_override);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn explicit_vram_limit_selects_managed_mode_even_when_weights_fit() {
+        let policy = resolve_cuda_offload_policy_from_env_policy(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &ResourceLimits {
+                vram_limit: ResourceLimit::Bytes(12_000),
+                ..ResourceLimits::default()
+            },
+            10_000,
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy::default(),
+        )
+        .expect("explicit byte limit selects managed allocation");
+        assert!(!policy.policy.enabled);
+        assert!(policy.policy.managed_no_spill);
+        assert!(
+            uses_governed_physical_pool(Some(policy), true, false),
+            "managed VMM owns physical weight handles even when offload is unnecessary"
+        );
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(policy), true, Some(256)),
+            0,
+            "pool-owned resident weights must not also reserve package bytes"
+        );
+        assert!(
+            !uses_governed_physical_pool(Some(policy), false, false),
+            "lending opt-out keeps the resident package-reservation path"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resident_non_vmm_weights_keep_package_reservation() {
+        let resolution = CudaOffloadResolution {
+            policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
+                enabled: false,
+                managed_no_spill: false,
+                ..onnx_runtime_ep_cuda::DeviceOffloadPolicy::default()
+            },
+            device_budget_is_override: false,
+            auto_enabled_from_vram_limit: false,
+        };
+
+        assert_eq!(
+            cuda_weight_startup_reservation(10_000, Some(resolution), false, Some(256)),
+            10_000
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native-backend")]
+    fn native_state_only_scheduler_does_not_require_kv_geometry() {
+        let mut scheduler = onnx_genai_scheduler::SchedulerConfig::default();
+        let kv_config =
+            governor_no_paged_kv_config(&EngineConfig::default()).expect("state-only KV config");
+
+        populate_scheduler_bytes_per_token(&mut scheduler, kv_config)
+            .expect("state-only native load keeps absent KV geometry valid");
+
+        assert!(!kv_config.page_geometry_required);
+        assert_eq!(scheduler.bytes_per_token, None);
     }
 }

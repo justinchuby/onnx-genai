@@ -1,6 +1,22 @@
 use super::*;
 
 impl Executor {
+    pub(crate) fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        Ok(self.ep.prepare_mapped_growth(bytes, role)?)
+    }
+
+    pub(crate) fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.ep.release_mapped_growth(bytes, role);
+    }
+
     pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
         fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
             for (node_id, node) in graph.nodes.iter() {
@@ -133,12 +149,25 @@ impl Executor {
             .is_some_and(|prepared| prepared.bytes >= bytes && prepared.alignment >= peak.alignment)
         {
             return Ok(peak);
-        }
+        };
         if let Some(old) = slot.take() {
             self.ep.deallocate(old.buffer)?;
         }
-        let lease = self.ep.reserve_workspace(peak.bytes, peak.role)?;
-        let fresh = self.ep.allocate(bytes, peak.alignment)?;
+        let target_mapped = self.ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
+        let mut grant = self.ep.prepare_mapped_growth(target_mapped, peak.role)?;
+        let lease = match self.ep.reserve_workspace(peak.bytes, peak.role) {
+            Ok(lease) => lease,
+            Err(error) => {
+                drop(grant);
+                return Err(error.into());
+            }
+        };
+        let fresh = match grant.take() {
+            Some(grant) => self
+                .ep
+                .allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
+            None => self.ep.allocate(bytes, peak.alignment)?,
+        };
         *slot = Some(PreparedWorkspace {
             buffer: fresh,
             _lease: lease,

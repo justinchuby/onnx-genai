@@ -138,14 +138,17 @@ impl DriverFailure {
         }
     }
 
-    fn from_engine_error(error: &anyhow::Error) -> Self {
+    pub(crate) fn from_engine_error(error: &anyhow::Error) -> Self {
         let memory_overload = error.chain().any(|source| {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),
                 Some(SchedulerAdmissionError::ByteBudget { .. })
             ) || matches!(
                 source.downcast_ref::<onnx_runtime_memory_governor::MemoryError>(),
-                Some(onnx_runtime_memory_governor::MemoryError::TierExhausted { .. })
+                Some(
+                    onnx_runtime_memory_governor::MemoryError::TierExhausted { .. }
+                        | onnx_runtime_memory_governor::MemoryError::CapacityUnavailable { .. },
+                )
             )
         });
         Self {
@@ -1552,7 +1555,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn only_kv_byte_budget_admission_is_memory_overload() {
+    fn governed_capacity_failures_are_memory_overload() {
         let memory_error: anyhow::Error = SchedulerAdmissionError::ByteBudget {
             request_id: 1,
             seq_id: 2,
@@ -1586,6 +1589,30 @@ mod admission_tests {
         assert_eq!(
             DriverFailure::from_engine_error(&workspace_error).kind,
             DriverFailureKind::MemoryOverload
+        );
+        let mapped_physical_error: anyhow::Error =
+            onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+                tier: "device",
+                requested: 4096,
+                available: 0,
+                role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                detail: "physical handle pool lease refused".into(),
+            }
+            .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&mapped_physical_error).kind,
+            DriverFailureKind::MemoryOverload
+        );
+        let invalid_error: anyhow::Error =
+            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                tier: "device",
+                requested: 1,
+                reason: "invalid allocation range",
+            }
+            .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&invalid_error).kind,
+            DriverFailureKind::Internal
         );
 
         let batch_error: anyhow::Error = SchedulerAdmissionError::BatchFull {

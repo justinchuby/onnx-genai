@@ -2,8 +2,9 @@ use std::{fmt, sync::Arc};
 
 use onnx_genai_scheduler::ResourceLimit;
 use onnx_runtime_memory_governor::{
-    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MemoryAuthorityId,
-    MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthGrant,
+    MappedGrowthMetrics, MappedHolderRegistration, MemoryAuthorityId, MemoryError, MemoryGovernor,
+    MemoryLease, MemoryRole, ReclaimableMappedHolder, Tier,
 };
 
 /// Physical-device compatibility domain for a shared device memory authority.
@@ -69,8 +70,18 @@ impl DeviceMemoryAuthority {
         self.governor.available(Tier::Device)
     }
 
+    pub fn growth_metrics(&self) -> MappedGrowthMetrics {
+        self.governor.mapped_growth_metrics().unwrap_or_default()
+    }
+
     pub fn pause_reconfiguration(&self) -> onnx_runtime_memory_governor::LeaseLimitGuard<'_> {
         self.governor.ledger().pause_claims(Tier::Device)
+    }
+
+    pub fn pause_mapped_growth(
+        &self,
+    ) -> Result<onnx_runtime_memory_governor::MappedGrowthOperationGuard, MemoryError> {
+        self.governor.pause_mapped_growth()
     }
 
     pub fn trim_unmapped_bytes(&self, bytes: u64) -> anyhow::Result<u64> {
@@ -113,6 +124,7 @@ impl DeviceMemoryAuthority {
     /// handles. Mapped or otherwise leased bytes make the shrink fail without
     /// changing the old limit.
     pub fn try_set_limit_bytes(&self, bytes: u64) -> anyhow::Result<()> {
+        let _mapped_growth = self.governor.pause_mapped_growth()?;
         let guard = self.pause_reconfiguration();
         #[cfg(feature = "cuda")]
         let pool_gate = self.physical_pool_operation_gate();
@@ -169,6 +181,25 @@ impl MemoryGovernor for DeviceMemoryAuthority {
     ) -> Result<MappedAllowance, MemoryError> {
         self.governor
             .reserve_mapped_allowance(tier, bytes, role, holder)
+    }
+
+    fn register_reclaimable_mapped_holder(
+        &self,
+        holder: &Arc<dyn ReclaimableMappedHolder>,
+    ) -> Result<MappedHolderRegistration, MemoryError> {
+        self.governor.register_reclaimable_mapped_holder(holder)
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        requester: &MappedAllowance,
+        bytes: u64,
+    ) -> Result<MappedGrowthGrant, MemoryError> {
+        self.governor.prepare_mapped_growth(requester, bytes)
+    }
+
+    fn mapped_growth_metrics(&self) -> Option<MappedGrowthMetrics> {
+        self.governor.mapped_growth_metrics()
     }
 
     fn available(&self, tier: Tier) -> u64 {
@@ -267,6 +298,25 @@ impl MemoryGovernor for EngineMemoryGovernor {
     ) -> Result<MappedAllowance, MemoryError> {
         self.governor(tier)
             .reserve_mapped_allowance(tier, bytes, role, holder)
+    }
+
+    fn register_reclaimable_mapped_holder(
+        &self,
+        holder: &Arc<dyn ReclaimableMappedHolder>,
+    ) -> Result<MappedHolderRegistration, MemoryError> {
+        self.device.register_reclaimable_mapped_holder(holder)
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        requester: &MappedAllowance,
+        bytes: u64,
+    ) -> Result<MappedGrowthGrant, MemoryError> {
+        self.device.prepare_mapped_growth(requester, bytes)
+    }
+
+    fn mapped_growth_metrics(&self) -> Option<MappedGrowthMetrics> {
+        self.device.mapped_growth_metrics()
     }
 
     fn available(&self, tier: Tier) -> u64 {

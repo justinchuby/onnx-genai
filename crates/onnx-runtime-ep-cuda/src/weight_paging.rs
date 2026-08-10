@@ -232,6 +232,11 @@ pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceOffloadPolicy {
     pub enabled: bool,
+    /// An explicit device byte limit selected authority-managed VMM allocation
+    /// instead of the WDDM-spill-compatible allocator.
+    pub managed_no_spill: bool,
+    /// The explicit authority ceiling that selected managed no-spill mode.
+    pub managed_limit_bytes: Option<u64>,
     /// Explicit VRAM budget in bytes, if the operator pinned one.
     pub device_budget_bytes: Option<u64>,
     /// Use the asynchronous, fence-ordered page-in (default `true` / opt-out).
@@ -250,6 +255,8 @@ impl Default for DeviceOffloadPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
+            managed_no_spill: false,
+            managed_limit_bytes: None,
             device_budget_bytes: None,
             async_pagein: false,
             scan_resistant_dense: true,
@@ -278,6 +285,8 @@ impl DeviceOffloadPolicy {
         );
         Self {
             enabled,
+            managed_no_spill: false,
+            managed_limit_bytes: None,
             device_budget_bytes,
             async_pagein,
             scan_resistant_dense,
@@ -1600,6 +1609,54 @@ impl std::fmt::Debug for CudaWeightResidency {
             .debug_struct("CudaWeightResidency")
             .field("stats", &self.stats())
             .finish_non_exhaustive()
+    }
+}
+
+impl onnx_runtime_memory_governor::ReclaimableMappedHolder for CudaWeightResidency {
+    fn allowance(&self) -> onnx_runtime_memory_governor::MappedAllowance {
+        self.lock()
+            .mapped_allowance
+            .clone()
+            .expect("registered VMM weight residency must have a mapped allowance")
+    }
+
+    fn reclaim_priority(&self) -> u32 {
+        0
+    }
+
+    fn mapped_bytes(&self) -> u64 {
+        self.lock()
+            .mapped_allowance
+            .as_ref()
+            .map_or(0, |allowance| allowance.mapped_bytes())
+    }
+
+    fn reclaim_mapped(
+        &self,
+        target_bytes: u64,
+    ) -> Result<
+        onnx_runtime_memory_governor::MappedReclaimReport,
+        onnx_runtime_memory_governor::MemoryError,
+    > {
+        let allowance = self.allowance();
+        let before = allowance.mapped_bytes();
+        let mut inner = self.lock();
+        let max_attempts = inner.pages.len();
+        let mut attempts = 0usize;
+        while before.saturating_sub(allowance.mapped_bytes()) < target_bytes
+            && attempts < max_attempts
+        {
+            let Some(key) = inner.next_evictable_key(WeightEvictionPolicy::Lru) else {
+                break;
+            };
+            inner.remove_page(key);
+            attempts += 1;
+        }
+        let reclaimed = before.saturating_sub(allowance.mapped_bytes());
+        Ok(onnx_runtime_memory_governor::MappedReclaimReport {
+            target_bytes,
+            reclaimed_bytes: reclaimed,
+        })
     }
 }
 

@@ -248,6 +248,12 @@ pub(crate) struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    pub(crate) fn aggregate_growth_metrics(
+        &self,
+    ) -> anyhow::Result<Option<onnx_genai_engine::MappedGrowthMetrics>> {
+        self.authority_provider.aggregate_growth_metrics()
+    }
+
     fn config_for_load(&self) -> anyhow::Result<ServerConfig> {
         let mut config = (*self.config).clone();
         config.engine_config.limits.vram_limit = self.authority_provider.configured_limit()?;

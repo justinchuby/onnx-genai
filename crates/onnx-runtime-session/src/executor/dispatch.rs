@@ -1473,10 +1473,30 @@ impl KernelDispatchContext<'_> {
                     if let Some(old) = prepared.take() {
                         self.ep.deallocate(old.buffer)?;
                     }
-                    let lease = self
+                    let target_mapped = self
                         .ep
-                        .reserve_workspace(requirement.bytes, requirement.role)?;
-                    let buffer = self.ep.allocate(required, requirement.alignment)?;
+                        .mapped_bytes_for_allocation(required, requirement.alignment)?;
+                    let mut grant = self
+                        .ep
+                        .prepare_mapped_growth(target_mapped, requirement.role)?;
+                    let lease = match self
+                        .ep
+                        .reserve_workspace(requirement.bytes, requirement.role)
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            drop(grant);
+                            return Err(error.into());
+                        }
+                    };
+                    let buffer = match grant.take() {
+                        Some(grant) => self.ep.allocate_with_mapped_growth(
+                            required,
+                            requirement.alignment,
+                            grant,
+                        )?,
+                        None => self.ep.allocate(required, requirement.alignment)?,
+                    };
                     *prepared = Some(PreparedWorkspace {
                         buffer,
                         _lease: lease,
