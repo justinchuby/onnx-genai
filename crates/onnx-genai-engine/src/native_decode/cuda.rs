@@ -1375,6 +1375,11 @@ impl DecodeCudaState {
                     onnx_runtime_memory_governor::MemoryRole::KvCache,
                 )
                 .context("prepare transactional native CUDA KV growth")?;
+            tracing::info!(
+                mapped_growth_bytes,
+                grant_prepared = grant.is_some(),
+                "prepared native CUDA KV mapped-growth transaction"
+            );
             self.commit_vmm_growth(new_capacity, grant.as_mut())
                 .map_err(|error| {
                     let memory = cuda_device_memory_snapshot(session.device_id().index as i32)

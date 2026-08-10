@@ -8,4 +8,5 @@
 - Governed CUDA workspace and native KV use the same requester/grant contract.
 - An explicit byte `serve --vram-limit` selects managed no-spill VMM/pool mode;
   `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` restores the non-VMM compatibility
-  path. A 6 GiB qwen2.5-14b int4 live run loaded and generated correctly.
+  path. A 6 GiB qwen2.5-14b int4 live run loaded and generated correctly; its
+  first physical KV growth transferred and attributed 201,326,592 bytes.

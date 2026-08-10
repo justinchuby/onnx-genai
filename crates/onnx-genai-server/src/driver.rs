@@ -143,10 +143,19 @@ impl DriverFailure {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),
                 Some(SchedulerAdmissionError::ByteBudget { .. })
-            ) || matches!(
-                source.downcast_ref::<onnx_runtime_memory_governor::MemoryError>(),
-                Some(onnx_runtime_memory_governor::MemoryError::TierExhausted { .. })
-            )
+            ) || match source.downcast_ref::<onnx_runtime_memory_governor::MemoryError>() {
+                Some(onnx_runtime_memory_governor::MemoryError::TierExhausted { .. }) => true,
+                Some(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                    reason, ..
+                }) => reason.contains("cannot reserve"),
+                Some(_) => false,
+                None => {
+                    let message = source.to_string();
+                    message.contains("cannot reserve")
+                        && (message.contains("device memory")
+                            || message.contains("physical handle pool lease"))
+                }
+            }
         });
         Self {
             message: error.to_string(),
@@ -1552,7 +1561,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn only_kv_byte_budget_admission_is_memory_overload() {
+    fn governed_capacity_failures_are_memory_overload() {
         let memory_error: anyhow::Error = SchedulerAdmissionError::ByteBudget {
             request_id: 1,
             seq_id: 2,
@@ -1586,6 +1595,35 @@ mod admission_tests {
         assert_eq!(
             DriverFailure::from_engine_error(&workspace_error).kind,
             DriverFailureKind::MemoryOverload
+        );
+        let mapped_physical_error: anyhow::Error =
+            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                tier: "device",
+                requested: 4096,
+                reason: "cuMemMap: growing physical handle pool lease failed: cannot reserve bytes",
+            }
+            .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&mapped_physical_error).kind,
+            DriverFailureKind::MemoryOverload
+        );
+        let erased_physical_error = anyhow::anyhow!(
+            "cuMemMap: growing physical handle pool lease failed: cannot reserve 2097152 bytes of device memory"
+        );
+        assert_eq!(
+            DriverFailure::from_engine_error(&erased_physical_error).kind,
+            DriverFailureKind::MemoryOverload
+        );
+        let invalid_error: anyhow::Error =
+            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
+                tier: "device",
+                requested: 1,
+                reason: "invalid allocation range",
+            }
+            .into();
+        assert_eq!(
+            DriverFailure::from_engine_error(&invalid_error).kind,
+            DriverFailureKind::Internal
         );
 
         let batch_error: anyhow::Error = SchedulerAdmissionError::BatchFull {
