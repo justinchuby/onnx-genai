@@ -121,3 +121,44 @@ grep for duplicate ABI symbols → none found
 ```
 
 **Nothing missing from Nabil's ABI.** All types and functions the host needs are exported.
+
+
+## 2026-08-11 — ABI correctness: enum UB, struct_size, CUDA status loss
+
+**Task:** Fix four ABI-correctness findings from third Opus review of PR #762.
+
+**Changes (commit 94bbbe545):**
+
+1. **Unknown enum discriminant UB removed.** `NxrtStatus.code` changed from
+   `NxrtStatusCode` (enum) to `u32` (wire type). Safe accessor
+   `status_code() -> Option<NxrtStatusCode>` added via `from_u32()`.
+   Test `unknown_discriminant_does_not_cause_ub` proves no UB: a status with
+   code=255 returns `None` from `status_code()`.
+
+2. **struct_size validated before vtable access.** `provider_adapter.rs` now
+   checks `struct_size >= offset_of(create_ep)+size` before dereferencing
+   factory.create_ep, and validates EP struct_size after creation.
+
+3. **CUDA diagnostic status loss fixed.** `CreateEpFactories` now calls
+   `set_host_api(api)` from `api_base` BEFORE `construct_ep_with_stream()`.
+   Previously, the error status was null (ORT interprets as success).
+
+4. **Vacuous CUDA tests replaced.** `cuda_plugin_error_status_or_null_without_ort`
+   and `cuda_plugin_diagnostic_message_contract` replaced with tests that assert
+   specific properties (out_num always zeroed, diagnostic message is actionable).
+
+**Pre-fix failure evidence:**
+- Fix 1: Before the change, code like `s.code = 255u32` wouldn't compile because
+  `code` was typed as enum. With the old type, receiving 255 from a plugin would
+  be UB (invalid enum discriminant). Now it compiles and `status_code()` returns None.
+- Fix 2: No struct_size check existed; reading past a smaller struct would occur.
+- Fix 3: `fail_status()` returns null when host API not set (documented in
+  `status.rs:31`). New code sets API first.
+- Fix 4: Old tests only called `eprintln!` — no assert could fail.
+
+**Validation:**
+- `cargo test --no-fail-fast` across 5 EP crates: 264 tests, 0 failures.
+- `cargo check --features cuda`: compiles.
+- `cargo clippy` on owned crates: clean.
+- `cargo fmt --check`: clean.
+- Workspace clippy has pre-existing failures in `onnx-genai-engine` (not mine).
