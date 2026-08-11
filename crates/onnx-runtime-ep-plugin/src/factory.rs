@@ -626,12 +626,20 @@ unsafe extern "C" fn factory_create_ep(
             ep
         };
 
+        let registry_outcome = crate::ep::build_ort_kernel_registry(
+            &exported.kernel_registry_entries,
+            exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
+        );
+        if !registry_outcome.failures.is_empty() {
+            return fail_status(&format!(
+                "CreateEp: kernel registry build had {} failure(s): {}",
+                registry_outcome.failures.len(),
+                registry_outcome.failures.join("; ")
+            ));
+        }
         let exported_ep = Box::new(ExportedEp::new_with_registry_and_entries(
             ep,
-            crate::ep::build_ort_kernel_registry(
-                &exported.kernel_registry_entries,
-                exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
-            ),
+            registry_outcome.registry,
             exported.kernel_registry_entries.clone(),
         ));
         let ep_ptr = Box::into_raw(exported_ep);

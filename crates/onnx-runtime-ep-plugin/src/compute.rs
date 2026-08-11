@@ -105,15 +105,19 @@ pub enum ShapeInference {
     RotaryEmbedding,
     /// LayerNormalization family: output 0 = input[0] shape,
     /// outputs 1+ (Mean, InvStdDev) = input[0] shape with dims from `axis`
-    /// onward replaced by 1 (keepdims reduction).  `axis` is already
-    /// resolved to a non-negative index into input[0].
+    /// onward replaced by 1 (keepdims reduction).
+    ///
+    /// `raw_axis` is stored as-is from the ONNX attribute (may be negative)
+    /// and resolved against the **runtime** input rank in `infer_shapes`.
+    /// This avoids pre-resolving against a truncated static shape that has
+    /// symbolic dimensions stripped.
     ///
     /// For SkipLayerNormalization the last output (input_skip_bias_sum) is
     /// full-shaped — `full_shape_outputs` lists the output indices that
     /// should keep input[0]'s shape verbatim.
     LayerNorm {
-        /// Non-negative axis: dims `[axis..]` are the normalized axes.
-        axis: usize,
+        /// Raw axis from the ONNX attribute; resolved at runtime.
+        raw_axis: i64,
         num_outputs: usize,
         /// Output indices (besides 0) that keep the full input shape,
         /// e.g. the `input_skip_bias_sum` output of SkipLayerNormalization.
@@ -303,27 +307,10 @@ impl ShapeInference {
             "LayerNormalization" | "RMSNormalization" | "SimplifiedLayerNormalization" => {
                 // ONNX spec: axis defaults to -1; Mean/InvStdDev shapes are
                 // [d[0]..d[axis-1], 1, .., 1].
+                // Store raw axis — resolve at runtime against actual rank.
                 let raw_axis = int_attr("axis").unwrap_or(-1);
-                if input_shapes.is_empty() {
-                    return Self::Declined {
-                        op_type: op.to_string(),
-                        domain: domain.to_string(),
-                    };
-                }
-                let rank = input_shapes[0].len() as i64;
-                let resolved = if raw_axis < 0 {
-                    raw_axis + rank
-                } else {
-                    raw_axis
-                };
-                if resolved < 0 || resolved > rank {
-                    return Self::Declined {
-                        op_type: op.to_string(),
-                        domain: domain.to_string(),
-                    };
-                }
                 Self::LayerNorm {
-                    axis: resolved as usize,
+                    raw_axis,
                     num_outputs,
                     full_shape_outputs: vec![],
                 }
@@ -333,19 +320,10 @@ impl ShapeInference {
                 // Outputs: [output, mean, inv_std_dev, input_skip_bias_sum]
                 // output and input_skip_bias_sum are full-shaped; mean and
                 // inv_std_dev are reduced.
-                if input_shapes.is_empty() {
-                    return Self::Declined {
-                        op_type: op.to_string(),
-                        domain: domain.to_string(),
-                    };
-                }
-                let rank = input_shapes[0].len();
-                // Last axis is the normalized axis.
-                let axis = if rank > 0 { rank - 1 } else { 0 };
-                // Output index 3 (input_skip_bias_sum) keeps full shape.
+                // raw_axis = -1 (last axis); resolved at runtime.
                 let full_shape_outputs = if num_outputs > 3 { vec![3] } else { vec![] };
                 Self::LayerNorm {
-                    axis,
+                    raw_axis: -1,
                     num_outputs,
                     full_shape_outputs,
                 }
@@ -1076,7 +1054,7 @@ fn infer_shapes(
         }
 
         ShapeInference::LayerNorm {
-            axis,
+            raw_axis,
             num_outputs,
             full_shape_outputs,
         } => {
@@ -1084,15 +1062,21 @@ fn infer_shapes(
                 return Err("LayerNorm: no inputs".into());
             }
             let full_shape = inputs[0].shape.to_vec();
-            // Reduced shape: dims before `axis` are kept, dims from `axis`
-            // onward become 1 (keepdims reduction over the normalised axes).
-            let axis = *axis;
-            if axis > full_shape.len() {
+            let rank = full_shape.len() as i64;
+            // Resolve raw axis against runtime rank.
+            let resolved = if *raw_axis < 0 {
+                *raw_axis + rank
+            } else {
+                *raw_axis
+            };
+            if resolved < 0 || resolved > rank {
                 return Err(format!(
-                    "LayerNorm: axis {axis} out of range for rank {}",
-                    full_shape.len()
+                    "LayerNorm: axis {raw_axis} out of range for rank {rank}",
                 ));
             }
+            let axis = resolved as usize;
+            // Reduced shape: dims before `axis` are kept, dims from `axis`
+            // onward become 1 (keepdims reduction over the normalised axes).
             let mut reduced_shape = full_shape.clone();
             for d in reduced_shape[axis..].iter_mut() {
                 *d = 1;

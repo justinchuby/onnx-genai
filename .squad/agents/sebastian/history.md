@@ -22,3 +22,10 @@
 - 2026-08-11T03:47:00+0000: AVX2 LayerNorm/RMSNorm benchmark — measured against true scalar fp32 baseline (Welford's fallback from `layer_norm_impl.cc`). Found Pris's original fp64-reference numbers were conservative, not inflated. True speedup: LayerNorm 15–22× (algorithmic + SIMD), RMSNorm 3–4× (pure SIMD). Updated benchmark in `test_layernorm.cpp` to use correct baseline. Report: `.squad/decisions/inbox/sebastian-layernorm-benchmark.md`. Upstream PR #31973.
 
 Full pre-compaction history in `history-archive.md`.
+
+- 2026-08-11T13:30:00+0000: BL1/BL3 fixes for PR #762 (ep-plugin-parity-cuda).
+  - **BL1:** LayerNorm axis no longer pre-resolved against truncated static shape. `ShapeInference::LayerNorm` stores `raw_axis: i64`, resolved at runtime in `infer_shapes` against actual input rank.
+  - **BL3 carry-over:** `build_subgraph_routing` now emits `NodeInputSource::Absent` for `None` inputs instead of `Ort(0)`.
+  - **Registry:** `build_ort_kernel_registry` validates `end_version >= since_version > 0`, collects per-entry failures in `RegistryBuildOutcome`, and surfaces them as actionable status in factory CreateEp.
+  - **Test:** `layernorm_dynamic_axis.rs` — real ORT, dynamic `[B, S, H]`, axis=-1, asserts Mean/InvStdDev shape `[2, 3, 1]`. Fails pre-fix (axis resolves against `[4]` rank-1).
+  - Test counts: 216 passed / 0 failed (baseline was 215).

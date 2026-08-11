@@ -57,6 +57,7 @@ pub struct ExportedEp {
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
 ///
 /// Releases it on drop via `ReleaseKernelRegistry`.
+#[derive(Debug)]
 pub struct OrtKernelRegistryHolder {
     ptr: *mut ort::OrtKernelRegistry,
 }
@@ -594,7 +595,7 @@ fn build_subgraph_routing(
                     }
                 }
                 None => {
-                    sources.push(NodeInputSource::Ort(0));
+                    sources.push(NodeInputSource::Absent);
                 }
             }
         }
@@ -697,80 +698,256 @@ unsafe extern "C" fn ep_get_kernel_registry(
 
 /// Build an ORT `OrtKernelRegistry` from a slice of [`KernelRegistryEntry`].
 ///
+/// Outcome of building the ORT kernel registry, including any entry-level failures.
+#[derive(Debug)]
+pub struct RegistryBuildOutcome {
+    pub registry: Option<OrtKernelRegistryHolder>,
+    /// Diagnostic messages for entries that failed to register.
+    pub failures: Vec<String>,
+}
+
 /// Requires the ORT host API to be set (called after `set_host_api`).
-/// Returns `None` if the entries slice is empty or ORT API is unavailable.
+/// Returns `None` registry if the entries slice is empty or ORT API is unavailable.
+/// Any per-entry failures are reported in `failures` rather than silently swallowed.
 ///
 /// The returned registry is valid for the EP's lifetime. ORT never frees it;
 /// we free it in [`OrtKernelRegistryHolder::drop`].
 pub fn build_ort_kernel_registry(
     entries: &[KernelRegistryEntry],
     ep_name: &str,
-) -> Option<OrtKernelRegistryHolder> {
+) -> RegistryBuildOutcome {
     if entries.is_empty() {
-        return None;
+        return RegistryBuildOutcome {
+            registry: None,
+            failures: vec![],
+        };
     }
     let api = crate::status::host_api();
     if api.is_null() {
-        return None;
+        return RegistryBuildOutcome {
+            registry: None,
+            failures: vec!["host API not set".into()],
+        };
     }
     let ep_api = unsafe {
-        let get_ep_api = (*api).GetEpApi?;
+        let get_ep_api = match (*api).GetEpApi {
+            Some(f) => f,
+            None => {
+                return RegistryBuildOutcome {
+                    registry: None,
+                    failures: vec!["GetEpApi unavailable".into()],
+                };
+            }
+        };
         get_ep_api()
     };
     if ep_api.is_null() {
-        return None;
+        return RegistryBuildOutcome {
+            registry: None,
+            failures: vec!["EP API is null".into()],
+        };
     }
 
     // Create the kernel registry.
-    let create_registry = unsafe { (*ep_api).CreateKernelRegistry }?;
+    let create_registry = match unsafe { (*ep_api).CreateKernelRegistry } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["CreateKernelRegistry unavailable".into()],
+            };
+        }
+    };
     let mut registry_ptr: *mut ort::OrtKernelRegistry = ptr::null_mut();
     let status = unsafe { create_registry(&mut registry_ptr) };
     if !status.is_null() || registry_ptr.is_null() {
-        return None;
+        return RegistryBuildOutcome {
+            registry: None,
+            failures: vec!["CreateKernelRegistry call failed".into()],
+        };
     }
 
-    let create_builder = unsafe { (*ep_api).CreateKernelDefBuilder }?;
-    let set_op_type = unsafe { (*ep_api).KernelDefBuilder_SetOperatorType }?;
-    let set_domain = unsafe { (*ep_api).KernelDefBuilder_SetDomain }?;
-    let set_since_version = unsafe { (*ep_api).KernelDefBuilder_SetSinceVersion }?;
-    let set_ep = unsafe { (*ep_api).KernelDefBuilder_SetExecutionProvider }?;
-    let add_type_constraint = unsafe { (*ep_api).KernelDefBuilder_AddTypeConstraint }?;
-    let build_def = unsafe { (*ep_api).KernelDefBuilder_Build }?;
-    let release_builder = unsafe { (*ep_api).ReleaseKernelDefBuilder }?;
-    let add_kernel = unsafe { (*ep_api).KernelRegistry_AddKernel }?;
-    let release_def = unsafe { (*ep_api).ReleaseKernelDef }?;
-    let get_tensor_data_type = unsafe { (*ep_api).GetTensorDataType }?;
+    let create_builder = match unsafe { (*ep_api).CreateKernelDefBuilder } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["CreateKernelDefBuilder unavailable".into()],
+            };
+        }
+    };
+    let set_op_type = match unsafe { (*ep_api).KernelDefBuilder_SetOperatorType } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["SetOperatorType unavailable".into()],
+            };
+        }
+    };
+    let set_domain = match unsafe { (*ep_api).KernelDefBuilder_SetDomain } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["SetDomain unavailable".into()],
+            };
+        }
+    };
+    let set_since_version = match unsafe { (*ep_api).KernelDefBuilder_SetSinceVersion } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["SetSinceVersion unavailable".into()],
+            };
+        }
+    };
+    let set_ep = match unsafe { (*ep_api).KernelDefBuilder_SetExecutionProvider } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["SetExecutionProvider unavailable".into()],
+            };
+        }
+    };
+    let add_type_constraint = match unsafe { (*ep_api).KernelDefBuilder_AddTypeConstraint } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["AddTypeConstraint unavailable".into()],
+            };
+        }
+    };
+    let build_def = match unsafe { (*ep_api).KernelDefBuilder_Build } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["Build unavailable".into()],
+            };
+        }
+    };
+    let release_builder = match unsafe { (*ep_api).ReleaseKernelDefBuilder } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["ReleaseKernelDefBuilder unavailable".into()],
+            };
+        }
+    };
+    let add_kernel = match unsafe { (*ep_api).KernelRegistry_AddKernel } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["AddKernel unavailable".into()],
+            };
+        }
+    };
+    let release_def = match unsafe { (*ep_api).ReleaseKernelDef } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["ReleaseKernelDef unavailable".into()],
+            };
+        }
+    };
+    let get_tensor_data_type = match unsafe { (*ep_api).GetTensorDataType } {
+        Some(f) => f,
+        None => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["GetTensorDataType unavailable".into()],
+            };
+        }
+    };
 
-    let ep_name_c = std::ffi::CString::new(ep_name).ok()?;
+    let ep_name_c = match std::ffi::CString::new(ep_name) {
+        Ok(c) => c,
+        Err(_) => {
+            return RegistryBuildOutcome {
+                registry: None,
+                failures: vec!["invalid ep_name".into()],
+            };
+        }
+    };
+
+    let mut failures: Vec<String> = Vec::new();
 
     for entry in entries {
-        let op_c = std::ffi::CString::new(entry.op_type).ok()?;
-        let domain_c = std::ffi::CString::new(entry.domain).ok()?;
+        // Validate version range.
+        if entry.end_version < entry.since_version || entry.since_version <= 0 {
+            failures.push(format!(
+                "{}/{}: invalid version range since={} end={}",
+                entry.domain, entry.op_type, entry.since_version, entry.end_version
+            ));
+            continue;
+        }
+
+        let op_c = match std::ffi::CString::new(entry.op_type) {
+            Ok(c) => c,
+            Err(_) => {
+                failures.push(format!("{}: invalid op_type", entry.op_type));
+                continue;
+            }
+        };
+        let domain_c = match std::ffi::CString::new(entry.domain) {
+            Ok(c) => c,
+            Err(_) => {
+                failures.push(format!("{}: invalid domain", entry.op_type));
+                continue;
+            }
+        };
 
         let mut builder: *mut ort::OrtKernelDefBuilder = ptr::null_mut();
         let s = unsafe { create_builder(&mut builder) };
         if !s.is_null() || builder.is_null() {
+            failures.push(format!(
+                "{}/{}: CreateKernelDefBuilder failed",
+                entry.domain, entry.op_type
+            ));
             continue;
         }
 
         let s = unsafe { set_op_type(builder, op_c.as_ptr()) };
         if !s.is_null() {
             unsafe { release_builder(builder) };
+            failures.push(format!(
+                "{}/{}: SetOperatorType failed",
+                entry.domain, entry.op_type
+            ));
             continue;
         }
         let s = unsafe { set_domain(builder, domain_c.as_ptr()) };
         if !s.is_null() {
             unsafe { release_builder(builder) };
+            failures.push(format!(
+                "{}/{}: SetDomain failed",
+                entry.domain, entry.op_type
+            ));
             continue;
         }
         let s = unsafe { set_since_version(builder, entry.since_version, entry.end_version) };
         if !s.is_null() {
             unsafe { release_builder(builder) };
+            failures.push(format!(
+                "{}/{}: SetSinceVersion({}, {}) failed",
+                entry.domain, entry.op_type, entry.since_version, entry.end_version
+            ));
             continue;
         }
         let s = unsafe { set_ep(builder, ep_name_c.as_ptr()) };
         if !s.is_null() {
             unsafe { release_builder(builder) };
+            failures.push(format!(
+                "{}/{}: SetExecutionProvider failed",
+                entry.domain, entry.op_type
+            ));
             continue;
         }
 
@@ -797,6 +974,10 @@ pub fn build_ort_kernel_registry(
             };
             if !s.is_null() {
                 unsafe { release_builder(builder) };
+                failures.push(format!(
+                    "{}/{}: AddTypeConstraint failed",
+                    entry.domain, entry.op_type
+                ));
                 continue;
             }
         }
@@ -805,6 +986,10 @@ pub fn build_ort_kernel_registry(
         let s = unsafe { build_def(builder, &mut kernel_def) };
         unsafe { release_builder(builder) };
         if !s.is_null() || kernel_def.is_null() {
+            failures.push(format!(
+                "{}/{}: KernelDefBuilder_Build failed",
+                entry.domain, entry.op_type
+            ));
             continue;
         }
 
@@ -821,12 +1006,18 @@ pub fn build_ort_kernel_registry(
         };
         unsafe { release_def(kernel_def) };
         if !s.is_null() {
-            // Non-fatal: skip this entry.
+            failures.push(format!(
+                "{}/{}: AddKernel failed",
+                entry.domain, entry.op_type
+            ));
             continue;
         }
     }
 
-    Some(OrtKernelRegistryHolder { ptr: registry_ptr })
+    RegistryBuildOutcome {
+        registry: Some(OrtKernelRegistryHolder { ptr: registry_ptr }),
+        failures,
+    }
 }
 
 /// No-op kernel create function. For compile-based EPs using a kernel registry
@@ -1032,7 +1223,10 @@ mod tests {
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
         }];
         let result = build_ort_kernel_registry(&entries, "test_ep");
-        assert!(result.is_none(), "must return None without host API");
+        assert!(
+            result.registry.is_none(),
+            "must return None registry without host API"
+        );
     }
 
     // ─── dtype filter tests ─────────────────────────────────────────────────
