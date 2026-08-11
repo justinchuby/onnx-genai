@@ -267,13 +267,23 @@ fn ep_get_capability_inner(
                 let Some(node) = ir_graph.nodes.get(nid) else {
                     return false;
                 };
-                // Fail-closed: every output must have a resolved, producible dtype.
+                // Fail-closed: every output must have a resolved, producible dtype
+                // UNLESS it is an intentionally absent optional output slot
+                // (sentinel created by graph_reader with name `__absent_output_*`).
                 for &vid in &node.outputs {
                     let Some(value) = ir_graph.values.get(vid) else {
                         return false;
                     };
                     if value.dtype == DataType::Undefined {
-                        return false;
+                        // Absent optional outputs are a known absence, not an
+                        // unresolved dtype — do not decline the node for these.
+                        let is_absent_slot = value
+                            .name
+                            .as_ref()
+                            .is_some_and(|n| n.starts_with("__absent_output_"));
+                        if !is_absent_slot {
+                            return false;
+                        }
                     }
                 }
                 node_passes_dtype_filter(node, ir_graph, &exported.registry_entries)
@@ -384,6 +394,14 @@ pub(crate) fn node_passes_dtype_filter(
             continue;
         };
         if value.dtype == DataType::Undefined {
+            // Absent optional output — known absence, not unknown dtype.
+            let is_absent = value
+                .name
+                .as_ref()
+                .is_some_and(|n| n.starts_with("__absent_output_"));
+            if is_absent {
+                continue;
+            }
             return false;
         }
         if !entry.supported_dtypes.contains(&value.dtype) {
@@ -500,12 +518,30 @@ fn ep_compile_inner(
                     let shape_inference =
                         crate::compute::ShapeInference::for_node(node, &shapes, num_outputs);
 
+                    // Build input_slots: maps node input position → ORT index
+                    // (sequential for present inputs, None for absent).
+                    let mut ort_input_idx = 0usize;
+                    let input_slots: Vec<Option<usize>> = view
+                        .node_inputs(node_idx)
+                        .iter()
+                        .map(|input| {
+                            if input.is_some() {
+                                let idx = ort_input_idx;
+                                ort_input_idx += 1;
+                                Some(idx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
                     entries.push(crate::compute::CompiledKernelEntry {
                         kernel,
                         num_inputs,
                         num_outputs,
                         output_dtypes,
                         shape_inference,
+                        input_slots,
                     });
                 }
                 Err(e) => {

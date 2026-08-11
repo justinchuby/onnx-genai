@@ -176,7 +176,8 @@ impl ShapeInference {
             | "IsInf"
             | "BitCount"
             | "Bernoulli"
-            | "NegativeLogLikelihoodLoss" => Self::SameAsInput(0),
+            | "NegativeLogLikelihoodLoss"
+            | "Clip" => Self::SameAsInput(0),
 
             // ── Shape-preserving normalisation ops ───────────────────────
             "Softmax"
@@ -301,7 +302,8 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
-            | "LpNormalization" => Self::SameAsInput(0),
+            | "LpNormalization"
+            | "Clip" => Self::SameAsInput(0),
 
             // ── LayerNorm / SkipLayerNorm family ──────────────────────────
             "LayerNormalization" | "RMSNormalization" | "SimplifiedLayerNormalization" => {
@@ -564,6 +566,10 @@ pub struct CompiledKernelEntry {
     /// this is the authoritative dtype for each output tensor.
     pub output_dtypes: Vec<DataType>,
     pub shape_inference: ShapeInference,
+    /// Maps node input position → `Some(ort_index)` for present inputs,
+    /// `None` for absent optional inputs. Used by the single-kernel fast
+    /// path to reconstruct the positional input list with absent sentinels.
+    pub input_slots: Vec<Option<usize>>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -883,7 +889,16 @@ unsafe extern "C" fn compute_execute(
         } else if exported.entries.len() == 1 {
             // ── Fast path: single-kernel subgraph ─────────────────────────
             let entry = &exported.entries[0];
-            let kernel_inputs: Vec<_> = inputs.iter().map(|i| i.view()).collect();
+            // Reconstruct positional inputs with absent sentinels so the
+            // kernel sees the correct arity and position.
+            let kernel_inputs: Vec<_> = entry
+                .input_slots
+                .iter()
+                .map(|slot| match slot {
+                    Some(ort_idx) => inputs[*ort_idx].view(),
+                    None => TensorView::absent(DataType::Undefined),
+                })
+                .collect();
             let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                 Ok(s) => s,
                 Err(e) => {
@@ -912,9 +927,18 @@ unsafe extern "C" fn compute_execute(
                         // kernel can write without bounds error, but the data
                         // is discarded.
                         let numel: usize = shape.iter().product::<usize>().max(1);
-                        // Use Float32 byte size for the scratch — kernels
-                        // write f32 for mean/inv_std in LayerNorm.
-                        let buf = vec![0u8; numel * 4];
+                        // Size from the primary output's dtype (slot 0 is always
+                        // present). Fall back to 8 bytes if unknown, to cover
+                        // f64/i64 without under-allocating.
+                        let elem_bytes = entry
+                            .output_dtypes
+                            .first()
+                            .copied()
+                            .filter(|dt| *dt != DataType::Undefined)
+                            .map(|dt| dt.byte_size())
+                            .filter(|&s| s > 0)
+                            .unwrap_or(8);
+                        let buf = vec![0u8; numel * elem_bytes];
                         let idx = absent_bufs.len();
                         absent_bufs.push(buf);
                         slot_map.push(SlotKind::Absent(idx));
@@ -1069,7 +1093,7 @@ fn infer_shapes(
             } else {
                 *raw_axis
             };
-            if resolved < 0 || resolved > rank {
+            if resolved < 0 || resolved >= rank {
                 return Err(format!(
                     "LayerNorm: axis {raw_axis} out of range for rank {rank}",
                 ));
@@ -2650,5 +2674,43 @@ mod tests {
     fn contiguous_strides_scalar() {
         let s = super::contiguous_strides(&[1]);
         assert_eq!(s, vec![1i64]);
+    }
+
+    // ── S2: axis bounds check ─────────────────────────────────────────────────
+
+    #[test]
+    fn layer_norm_axis_eq_rank_is_out_of_bounds() {
+        // rank=3 tensor [2,4,8]; axis=3 is out of bounds (valid: 0..2).
+        let strat = ShapeInference::LayerNorm {
+            raw_axis: 3,
+            num_outputs: 1,
+            full_shape_outputs: vec![],
+        };
+        let v = view(&[2, 4, 8], &[32, 8, 1]);
+        let result = infer(&strat, &[v]);
+        assert!(
+            result.is_err(),
+            "axis == rank should be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn layer_norm_axis_eq_rank_minus_one_is_valid() {
+        // rank=3 tensor [2,4,8]; axis=2 is the last valid axis.
+        let strat = ShapeInference::LayerNorm {
+            raw_axis: 2,
+            num_outputs: 2,
+            full_shape_outputs: vec![],
+        };
+        let v = view(&[2, 4, 8], &[32, 8, 1]);
+        let result = infer(&strat, &[v]);
+        assert!(
+            result.is_ok(),
+            "axis == rank-1 should be valid, got {result:?}"
+        );
+        let shapes = result.unwrap();
+        // Output 0 = full shape, output 1 = reduced (dims from axis onward → 1).
+        assert_eq!(shapes[0], vec![2, 4, 8]);
+        assert_eq!(shapes[1], vec![2, 4, 1]);
     }
 }

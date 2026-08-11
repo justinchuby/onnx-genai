@@ -155,6 +155,22 @@ unsafe fn setup(
     let status = unsafe { ((*api).CreateSessionOptions.unwrap())(&mut session_options) };
     unsafe { check_status(api, status, "CreateSessionOptions") };
 
+    // Disable ORT's built-in CPU EP fallback so that if our EP declines a
+    // node, ORT errors instead of silently running it on the default EP.
+    // Without this, tests pass vacuously even if our EP never claims the node.
+    let key = std::ffi::CString::new("session.disable_cpu_ep_fallback").unwrap();
+    let val = std::ffi::CString::new("1").unwrap();
+    let add_config =
+        unsafe { (*api).AddSessionConfigEntry }.expect("AddSessionConfigEntry not in OrtApi");
+    let status = unsafe { add_config(session_options, key.as_ptr(), val.as_ptr()) };
+    unsafe {
+        check_status(
+            api,
+            status,
+            "AddSessionConfigEntry(disable_cpu_ep_fallback)",
+        )
+    };
+
     let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
     let status = unsafe {
         ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(

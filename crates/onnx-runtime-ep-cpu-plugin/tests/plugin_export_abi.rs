@@ -371,10 +371,9 @@ fn compute_add_end_to_end() {
         num_outputs: 1,
         output_dtypes: vec![DataType::Float32],
         shape_inference: ShapeInference::ElementwiseBroadcast,
+        input_slots: vec![Some(0), Some(1)],
     };
     let mut info = ExportedComputeInfo::new(vec![entry]);
-
-    // Call Compute through the vtable (same path ORT would use).
     let compute_fn = info.vtable.Compute.expect("Compute is null");
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
     // Use a dummy kernel context pointer — our mocks use thread-local state.
@@ -437,6 +436,7 @@ fn compute_add_broadcast() {
         num_outputs: 1,
         output_dtypes: vec![DataType::Float32],
         shape_inference: ShapeInference::ElementwiseBroadcast,
+        input_slots: vec![Some(0), Some(1)],
     };
     let mut info = ExportedComputeInfo::new(vec![entry]);
 
