@@ -7,7 +7,7 @@ Branch: `squad/moe-profile-nextlever`
 
 The 35B-A3B decode artifact uses fused SwiGLU FC1 (`fc3` absent): FC1 emits `2 * intermediate` gate/up rows, then `qmoe_activate` reduces that scratch to `activated`, and FC2/down remains `qmoe_linear_f32`.
 
-A conservative small-route decode fusion (`rows == 1`, `routes <= 16`) now computes the two FC1 reductions and SwiGLU activation in one `qmoe_gate_up_activate_*` kernel, preserving each fp32 K-reduction order. It removes the separate `qmoe_activate` launch and the `fc1_output` global scratch round-trip for this regime. For Qwen3.6-35B-A3B (`routes=8`, `inter=512`) that is one launch plus ~64 KiB/layer/token of FC1 scratch write/read traffic eliminated; `activated` remains global because FC2/down is still a separate GEMV.
+A conservative small-route decode fusion (`rows == 1`, `routes <= 16`) now computes the two FC1 reductions and SwiGLU activation in one `qmoe_gate_up_activate_*` kernel. The fused path is deterministic, argmax-stable, and within GPU/CPU parity tolerance. It removes the separate `qmoe_activate` launch and the `fc1_output` global scratch round-trip for this regime. For Qwen3.6-35B-A3B (`routes=8`, `inter=512`) that is one launch plus ~64 KiB/layer/token of FC1 scratch write/read traffic eliminated; `activated` remains global because FC2/down is still a separate GEMV.
 
 ## Measurement
 
