@@ -39,9 +39,21 @@ TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
 # not a GPU test that happens to be awkward. It still runs on the CPU lane via
 # the dedicated `cargo test ... --test capture_sync_contract` CI step.
 #
+# `dummy_fill_and_crossover` is a pure-CPU design probe for the #759 dummy-page
+# VMM KV scheme: it proves the correctness-safe dummy fill value (zeros, never
+# NaN) from additive-masking algebra and derives the fixed-stride+dummy vs
+# bucket-growth memory crossover from real model KV geometry. It issues no CUDA
+# calls and touches no device (unlike every `*_gpu` sibling in the same crate),
+# so it legitimately *passes* on the CPU-only lane and cannot honor the
+# "ignored, not passed" GPU rule -- it is a CPU probe, not a GPU test. Its name
+# deliberately omits the `_gpu` suffix its device-bound siblings carry.
+#
 # Anything added here needs the same argument: not "this one is awkward" but
-# "this one is checking the checker".
-ALWAYS_RUN = frozenset({"suite_canary_gpu", "capture_sync_contract"})
+# "this one is checking the checker" (or otherwise a genuine CPU-only probe that
+# issues no CUDA calls).
+ALWAYS_RUN = frozenset(
+    {"suite_canary_gpu", "capture_sync_contract", "dummy_fill_and_crossover"}
+)
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
