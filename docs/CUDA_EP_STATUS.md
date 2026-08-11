@@ -1,23 +1,24 @@
 # CUDA EP Status — Compiles, Unvalidated on Hardware
 
-**Author:** Roy (Lead), Sapper (GPU/Systems)
-**Updated:** 2026-08-11 (post-defect-resolution)
+**Author:** Roy (Lead), Sapper (GPU/Systems), Nabil (FFI/Systems, B1/B3/S4 revision)
+**Updated:** 2026-08-11 (post-Gaff re-review revision)
 **Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
 
 ---
 
-## Summary — Four defects resolved; hardware validation pending
+## Summary — Three blockers fixed; hardware validation pending
 
-The B4 rubber-duck review found four implementation defects preventing the CUDA
-plugin from functioning correctly. **All four have been resolved** in the shared
-adapter (`onnx-runtime-ep-plugin`) and the CUDA plugin
-(`onnx-runtime-ep-cuda-plugin`). The fixes are correct by construction but have
-**not been validated on a physical CUDA GPU** — this host has no GPU.
+Gaff's adversarial re-review (commit range `2ca515eb7..7aba5cb93`) identified
+three blocking defects (B1: use-after-free, B3: wrong copy direction, S4: panic
+bomb preventing factory creation) that invalidated the earlier "four defects
+resolved" claim. **Those three are now fixed.** Defect #4 (Free size tracking)
+was genuinely fixed previously.
 
 **Current behavior:**
 - With `cuda` feature ON: `CreateEpFactories` attempts to construct a
   `CudaExecutionProvider`. If a GPU is available, it advertises 1 factory. If
-  no GPU is available, it returns 0 factories with an actionable error.
+  no GPU is available, it returns 0 factories with an actionable `OrtStatus`.
+  This is **fail-closed by design** (not by accidental panic).
 - With `cuda` feature OFF: returns 0 factories ("not available").
 - The CPU path is unchanged and unaffected.
 
@@ -30,127 +31,68 @@ hardware validation on a real CUDA GPU.
 
 | # | Defect | Resolution | Status |
 |---|--------|------------|--------|
-| **1** | **Separate CUDA runtime/context per component.** | `ExportedFactory::shared_ep` holds a single `CudaExecutionProvider` wrapped in `Arc<Mutex<..>>`. All components (allocator, stream, data transfer) borrow this shared EP instead of constructing their own. Ownership tracked via `owns_ep` flag. | ✅ **Fixed** (unvalidated on hardware) |
-| **2** | **`CreateDataTransfer` returns NULL.** | `factory_create_data_transfer` now creates a `DeviceDataTransferFull` for device EPs with: ORT API pointer for tensor data extraction, `OrtEpApi` pointer for `MemoryDevice_GetDeviceType`-based `CanCopy` direction classification, and the shared EP for actual copy operations. | ✅ **Fixed** (unvalidated on hardware) |
-| **3** | **`GetHandle` returns NULL stream handle.** | `DeviceSyncStream` now carries a configurable `stream_handle` field. The CUDA plugin extracts the real `cudaStream_t` via `CudaRuntime::stream_ptr()` and stores it in `ExportedFactory::stream_handle`. `GetHandle` returns this handle. | ✅ **Fixed** (unvalidated on hardware) |
-| **4** | **`Free` passes `size=0` violating the allocator contract.** | `DeviceAllocator` now tracks allocation sizes in a `Mutex<HashMap<usize, usize>>`. `Alloc` records `(pointer_addr, size)`. `Free` looks up the size and passes it to `deallocate`. | ✅ **Fixed** (unvalidated on hardware) |
+| **1** | **Shared CUDA runtime/context — use-after-free (B1).** Raw pointer derived from `MutexGuard` was dangling after guard dropped. | Components now hold `Arc<Mutex<..>>` clones via `EpRef::Shared`. Each use locks the mutex; the EP outlives all components by construction. No raw pointers from guards. | ✅ **Fixed** (unvalidated on hardware) |
+| **2** | **`CopyTensors` doesn't classify direction (B3).** Both src/dst wrapped as device buffers — host pointers would be passed to `cudaMemcpyDeviceToDevice`. | `transfer_full_copy_tensors` now uses `Value_GetMemoryDevice` + `MemoryDevice_GetDeviceType` to classify each tensor, then dispatches to `copy_from_host`, `copy_to_host`, or `copy`. | ✅ **Fixed** (unvalidated on hardware) |
+| **3** | **Panic bomb makes success unreachable (S4).** `create_ep_factories` called constructor to read EP name; CUDA's constructor was a panic bomb. | New `create_ep_factories_for_shared_ep` takes `ep_name` directly — no constructor call. The CUDA plugin passes the name from the pre-constructed EP. | ✅ **Fixed** (unvalidated on hardware) |
+| **4** | **`Free` passes `size=0` violating the allocator contract.** | `DeviceAllocator` tracks sizes in `HashMap<usize,usize>`. Unknown pointers are no-op'd (S1 fix: skip rather than fabricate `size=0`). | ✅ **Fixed** (unvalidated on hardware) |
 
 **All four are resolved in code. None have been validated on GPU hardware.**
 
 ---
 
-## 2. Implementation Details
+## 2. Gaff's Substantive Items — Disposition
 
-### Shared EP Architecture (Defect #1)
+| # | Issue | Disposition |
+|---|-------|-------------|
+| **S1** | `device_free` falls back to `size=0` for unknown pointers | ✅ **Fixed.** Unknown pointers are now no-op'd (early return). |
+| **S2** | `Mutex::lock().unwrap()` across extern "C" | ✅ **Fixed.** `EpRef::with_ep` uses `.lock().map_err()` — no unwrap. Poisoned mutex returns an actionable error. |
+| **S3** | `factory_create_ep` ignores `shared_ep` | ✅ **Fixed.** Returns an actionable error status explaining the shared EP is used by components directly. |
+| **S4** | CUDA constructor panics in factory creation | ✅ **Fixed.** See defect #3 above. |
+| **B2** | `CanCopy` same-device uses pointer equality | 🟡 **Deferred.** Pointer equality is conservative (fail-closed): it may cause ORT to fall back for same-GPU copies, but won't corrupt. Proper fix requires `MemoryDevice_GetDeviceId` which may not exist in ORT 1.27. Filed as known gap. |
+| **N1** | Comments say "mock" in production code | ✅ **Fixed.** Comments updated. |
+| **N2** | `factory_get_vendor_id` always returns 0 | ✅ **Fixed.** Now reads `exported.device_support.vendor_id`. |
 
-**File:** `crates/onnx-runtime-ep-plugin/src/factory.rs`
+---
+
+## 3. Ownership Architecture (B1 fix)
 
 ```
 ExportedFactory {
     shared_ep: Option<Arc<Mutex<Box<dyn ExecutionProvider + Send>>>>,
-    stream_handle: *mut c_void,
     ...
 }
+
+// Each component stores:
+DeviceAllocator       { ep_ref: EpRef::Shared(Arc::clone(&shared_ep)), ... }
+DeviceSyncStream      { ep_ref: EpRef::Shared(Arc::clone(&shared_ep)), ... }
+DeviceDataTransferFull { ep_ref: EpRef::Shared(Arc::clone(&shared_ep)), ... }
 ```
 
-When `shared_ep` is `Some`, factory callbacks (`CreateAllocator`,
-`CreateSyncStreamForDevice`, `CreateDataTransfer`) borrow the shared EP
-instead of calling the constructor. Each component tracks whether it owns
-its EP reference (`owns_ep` flag) to prevent double-free.
+**Why no Mutex deadlock:** Each callback locks the mutex only for the duration
+of the EP method call (allocate, sync, copy). ORT's threading model ensures
+these are not re-entrant on the same factory. The mutex is not held across
+blocking CUDA calls — `ep.sync()` / `ep.copy()` execute with the lock held
+briefly (the actual CUDA synchronization happens inside the EP implementation
+which does not re-lock).
 
-The CPU path is unaffected: `shared_ep` defaults to `None` and
-`host_accessible` is `true`, so CPU callbacks use ORT's built-in
-allocator and never create device allocators/streams/transfers.
-
-### Data Transfer (Defect #2)
-
-**File:** `crates/onnx-runtime-ep-plugin/src/transfer.rs`
-
-`DeviceDataTransferFull` now stores both `OrtApi*` and `OrtEpApi*`.
-`CanCopy` classifies directions via `OrtEpApi::MemoryDevice_GetDeviceType`,
-then applies the direction matrix:
-
-| Direction | Supported | Method |
-|-----------|-----------|--------|
-| H→D | ✓ | `copy_from_host` |
-| D→H | ✓ | `copy_to_host` |
-| D→D (same) | ✓ | `copy` |
-| D→D (cross) | ✗ | rejected |
-| H→H | ✗ | ORT handles |
-
-Without `OrtEpApi` (null), `CanCopy` returns `false` (fail-closed).
-
-### Stream Handle (Defect #3)
-
-**File:** `crates/onnx-runtime-ep-plugin/src/device.rs`
-
-`DeviceSyncStream::stream_handle` is set to:
-- `null_mut()` for non-stream-aware EPs (CPU)
-- `CudaRuntime::stream_ptr() as *mut c_void` for CUDA
-
-### Allocator Size Tracking (Defect #4)
-
-**File:** `crates/onnx-runtime-ep-plugin/src/device.rs`
-
-```
-DeviceAllocator {
-    alloc_sizes: Mutex<HashMap<usize, usize>>,
-    owns_ep: bool,
-    ...
-}
-```
-
-`device_alloc` records `sizes.insert(ptr as usize, size)`.
-`device_free` looks up `sizes.remove(&(p as usize))` and passes the
-real size to `ep.deallocate()`.
+**Why Arc, not raw pointer:** A raw pointer extracted from a `MutexGuard` is
+only valid while the guard is held. Once the guard drops, another thread could
+lock and move the contents. By storing an `Arc` clone, each component holds
+a strong reference that keeps the heap allocation alive independently.
 
 ---
 
-## 3. Status of the Standalone CUDA EP (nxrt-native, not ORT plugin)
+## 4. What Remains Unknowable Without a GPU
 
-### Status levels
-
-| Level | Meaning |
-|---|---|
-| **CODE EXISTS** | Source code compiles via `cargo check`. Correctness unproven. |
-| **STUB** | Deliberate no-op or placeholder. Semantically honest. |
-| **VALIDATED** | Run on a physical CUDA GPU with output compared to reference. **No capability has reached this level.** |
-
-### Capability table
-
-| Capability | Status | Notes |
-|---|---|---|
-| ORT plugin-EP export | **CODE EXISTS** | `CreateEpFactories` advertises 1 factory when GPU available. All four defects resolved. **Unvalidated on hardware.** |
-| Device enumeration | CODE EXISTS | Returns `DeviceType::Cuda` and `DeviceId::new(Cuda, ordinal)`. |
-| Initialize / bind device | CODE EXISTS | `runtime.bind()`. Not run on hardware. |
-| Device allocator | CODE EXISTS | VMM arena or `cuMemAlloc`. Size-tracked in plugin adapter. |
-| Data transfer (sync/async) | CODE EXISTS | Plugin adapter wired with OrtApi tensor access. |
-| Stream synchronization | CODE EXISTS | `runtime.synchronize()`. |
-| Op support query | CODE EXISTS | 109 entries in `src/kernels/mod.rs`. |
-| Kernel execution | CODE EXISTS | cuBLASLt for GEMM; custom kernels. |
-| `prefetch_lazy_weight` | **STUB** | Deferred to post-Phase-2a. Returns `Ok(false)`. |
-
-**Every "CODE EXISTS" row is unvalidated.**
-
----
-
-## 4. What Must Happen Before CUDA is Production-Ready
-
-### Phase A: Hardware validation (Issue #768)
-
-All four implementation defects are resolved. The remaining gate is
-running the code on a physical CUDA GPU (compute ≥ 7.0, driver ≥ 535.x).
-No self-hosted GPU runner exists in this repository.
-
-### Phase B: ORT integration design gaps
-
-| Gap | Description | Status |
-|---|---|---|
-| **Device-pointer ORT ABI marshaling** | ORT passes device pointers via `OrtKernelContext_GetInput`. | 🔴 Not designed |
-| **Stream/context sharing with ORT** | ORT may provide its own context/stream. | 🔴 Not designed |
-| **cuBLAS/cuDNN handle binding** | Handles bound to nxrt's stream. | 🔴 Not designed |
-| **Weight paging in plugin model** | `CudaWeightResidency` manages its own VMM pool. | 🔴 Not designed |
-| **CUDA graph capture** | Assumes stream ownership; incompatible with ORT. | 🔴 Not designed |
+- Whether `cudarc` dynamic loading actually finds `libcuda.so` and `libcudart.so`
+- Whether `CudaRuntime::stream_ptr()` returns a valid `cudaStream_t`
+- Whether ORT's `Value_GetMemoryDevice` returns the correct device type for
+  tensors allocated by our allocator
+- Whether the EP's `copy_from_host`/`copy_to_host`/`copy` implementations
+  produce correct results on real CUDA memory
+- Whether the Mutex lock duration is acceptable for performance (no contention
+  profiling possible without hardware)
+- B2: whether ORT ever passes two distinct `OrtMemoryDevice*` for the same GPU
 
 ---
 
@@ -159,7 +101,6 @@ No self-hosted GPU runner exists in this repository.
 **Location:** `crates/onnx-runtime-ep-cuda/src/provider.rs:564–573`
 
 Returns `Ok(false)` — "no transfer enqueued." Deferred to post-Phase-2a.
-Not a correctness bug; a functional gap.
 
 ---
 

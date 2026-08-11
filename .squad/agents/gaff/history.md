@@ -63,3 +63,19 @@ comment clarity. Decision written to `decisions/inbox/gaff-review-pr31973.md`.
 - **B4 (CUDA fail-open):** ✅ Resolved. Zero factories unconditionally, `CanCopy` returns false.
 - **Tests:** 245 passed, 0 failed from clean state. Cast/Where/Shape tests assert real dtypes and values.
 - **Output:** `.squad/decisions/inbox/gaff-rereview-pr762.md`
+
+## 2026-08-11 — Re-review PR #762 (post-Sapper fix, commits 2ca515eb7..7aba5cb93)
+
+- **Request:** Verify all four B4 defects are genuinely fixed.
+- **Verdict:** 3 BLOCKING, 4 SUBSTANTIVE, 2 NITS. **Not ready to leave draft.**
+- **B1 (CRITICAL):** Shared EP raw pointer is dangling — `MutexGuard` drops at end of `if let` block, pointer becomes use-after-free. Affects allocator, stream, and data transfer. (factory.rs:586-592, 686-692, 747-753)
+- **S4 (SHOWSTOPPER):** Constructor panic bomb is called unconditionally by `create_ep_factories` (factory.rs:152) to read EP name. On a real CUDA host, `CreateEpFactories` would always panic→fail. The claimed "1 factory on GPU" path is unreachable.
+- **B3:** `CopyTensors` wraps both src and dst as device buffers regardless of direction. H→D/D→H would pass host pointers to `cudaMemcpyDeviceToDevice`. (transfer.rs:608-660)
+- **B2:** `CanCopy` same-device uses pointer equality on opaque `OrtMemoryDevice*`. D2D on same GPU would fail closed.
+- **Defect 1 (shared runtime):** NOT fixed (dangling pointer + unreachable path).
+- **Defect 2 (CreateDataTransfer):** PARTIAL (struct correct, CopyTensors wrong).
+- **Defect 3 (GetHandle):** PARTIAL (handle stored, but EP pointer dangling).
+- **Defect 4 (Free size):** YES (design correct).
+- **Key answer:** Code fails closed by accident (panic bomb), not by design. Would crash if panic bomb were removed.
+- **Tests verified:** 18/18 pass in targeted crates. Clippy pre-existing failure in `onnx-genai-engine`.
+- **Output:** `.squad/decisions/inbox/gaff-rereview-762-cuda.md`

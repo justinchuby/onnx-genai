@@ -52,11 +52,12 @@
 //! `Release`.
 
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
 
-use crate::device::DeviceSupport;
+use crate::device::{DeviceSupport, EpRef};
 use crate::status::fail_status;
 
 // ─── Copy direction enum ─────────────────────────────────────────────────────
@@ -344,60 +345,74 @@ unsafe extern "C" fn transfer_copy_tensors(
 /// Full-featured data-transfer adapter that stores the ORT API pointer,
 /// enabling actual tensor data extraction and copy operations.
 ///
-/// This is the adapter a real CUDA EP would use.
+/// **B1 fix:** The EP is held via `EpRef` — either an `Arc<Mutex<..>>` clone
+/// (shared) or an owned raw pointer. No dangling pointers.
+///
+/// **B3 fix:** `CopyTensors` uses `ep_api` to classify each tensor's memory
+/// device type and dispatches to the correct copy method.
 #[repr(C)]
 pub struct DeviceDataTransferFull {
     pub vtable: ort::OrtDataTransferImpl,
-    /// The EP backing this data transfer.
-    ep: *const dyn ExecutionProvider,
+    /// EP reference — shared Arc or owned raw pointer.
+    ep_ref: EpRef,
     /// Cached device support info.
     support: DeviceSupport,
     /// ORT API pointer for tensor data access.
     api: *const ort::OrtApi,
     /// ORT EP API pointer for `MemoryDevice_GetDeviceType`.
     ep_api: *const ort::OrtEpApi,
-    /// Whether this transfer owns the EP (and should drop it on release).
-    owns_ep: bool,
 }
 
 unsafe impl Send for DeviceDataTransferFull {}
 unsafe impl Sync for DeviceDataTransferFull {}
 
 impl DeviceDataTransferFull {
-    /// Create a full data-transfer adapter with ORT API access.
-    ///
-    /// # Constructor signature for `factory.rs`
-    ///
-    /// ```ignore
-    /// let transfer = DeviceDataTransferFull::new(ep_ptr, support.clone(), api, ep_api, false);
-    /// let raw = Box::into_raw(transfer) as *mut OrtDataTransferImpl;
-    /// *out_data_transfer = raw;
-    /// ```
+    fn vtable() -> ort::OrtDataTransferImpl {
+        ort::OrtDataTransferImpl {
+            ort_version_supported: ort::ORT_API_VERSION,
+            Release: Some(transfer_full_release),
+            CanCopy: Some(transfer_full_can_copy),
+            CopyTensors: Some(transfer_full_copy_tensors),
+        }
+    }
+
+    /// Create a full data-transfer adapter backed by a shared EP (`Arc` clone).
     ///
     /// # Safety
     ///
-    /// `ep`, `api`, and `ep_api` must remain valid until ORT calls `Release`.
-    /// `ep_api` may be null if `OrtApi::GetEpApi` is unavailable; `CanCopy`
-    /// will fall back to fail-closed.
-    pub unsafe fn new(
+    /// `api` and `ep_api` must remain valid until ORT calls `Release`.
+    pub unsafe fn new_shared(
+        shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+        support: DeviceSupport,
+        api: *const ort::OrtApi,
+        ep_api: *const ort::OrtEpApi,
+    ) -> Box<Self> {
+        Box::new(Self {
+            vtable: Self::vtable(),
+            ep_ref: EpRef::Shared(shared),
+            support,
+            api,
+            ep_api,
+        })
+    }
+
+    /// Create a full data-transfer adapter that owns its EP.
+    ///
+    /// # Safety
+    ///
+    /// `ep` must be from `Box::into_raw`. `api`/`ep_api` must remain valid.
+    pub unsafe fn new_owned(
         ep: *const dyn ExecutionProvider,
         support: DeviceSupport,
         api: *const ort::OrtApi,
         ep_api: *const ort::OrtEpApi,
-        owns_ep: bool,
     ) -> Box<Self> {
         Box::new(Self {
-            vtable: ort::OrtDataTransferImpl {
-                ort_version_supported: ort::ORT_API_VERSION,
-                Release: Some(transfer_full_release),
-                CanCopy: Some(transfer_full_can_copy),
-                CopyTensors: Some(transfer_full_copy_tensors),
-            },
-            ep,
+            vtable: Self::vtable(),
+            ep_ref: EpRef::Owned(ep),
             support,
             api,
             ep_api,
-            owns_ep,
         })
     }
 }
@@ -408,10 +423,8 @@ unsafe extern "C" fn transfer_full_release(this: *mut ort::OrtDataTransferImpl) 
             return;
         }
         unsafe {
-            let transfer = Box::from_raw(this.cast::<DeviceDataTransferFull>());
-            if transfer.owns_ep && !transfer.ep.is_null() {
-                drop(Box::from_raw(transfer.ep as *mut dyn ExecutionProvider));
-            }
+            // Dropping DeviceDataTransferFull drops EpRef, which handles cleanup.
+            drop(Box::from_raw(this.cast::<DeviceDataTransferFull>()));
         }
     }));
 }
@@ -432,8 +445,7 @@ unsafe extern "C" fn transfer_full_can_copy(
 
         // Use OrtEpApi::MemoryDevice_GetDeviceType to classify copy direction.
         if transfer.ep_api.is_null() {
-            // No EpApi available — fail closed.
-            return false;
+            return false; // fail closed
         }
         let ep_api = unsafe { &*transfer.ep_api };
         let get_dev_type = match ep_api.MemoryDevice_GetDeviceType {
@@ -446,7 +458,6 @@ unsafe extern "C" fn transfer_full_can_copy(
 
         let src_is_cpu = src_type == ort::OrtMemoryInfoDeviceType_CPU;
         let dst_is_cpu = dst_type == ort::OrtMemoryInfoDeviceType_CPU;
-        // Same-device: both non-CPU and pointer equality (conservative).
         let same_device = src_memory_device == dst_memory_device;
 
         let direction = CopyDirection::classify(src_is_cpu, dst_is_cpu, same_device);
@@ -455,6 +466,9 @@ unsafe extern "C" fn transfer_full_can_copy(
     result.unwrap_or(false)
 }
 
+/// **B3 fix:** CopyTensors now classifies direction using `ep_api` to call
+/// `Value_GetMemoryDevice` + `MemoryDevice_GetDeviceType` on each OrtValue,
+/// then dispatches to `copy_from_host` / `copy_to_host` / `copy` accordingly.
 unsafe extern "C" fn transfer_full_copy_tensors(
     this_ptr: *mut ort::OrtDataTransferImpl,
     src_tensors: *mut *const ort::OrtValue,
@@ -474,13 +488,32 @@ unsafe extern "C" fn transfer_full_copy_tensors(
         }
 
         let transfer = unsafe { &*(this_ptr.cast::<DeviceDataTransferFull>()) };
-        if transfer.ep.is_null() || transfer.api.is_null() {
-            return fail_status("CopyTensors: null EP or API pointer");
+        if transfer.api.is_null() {
+            return fail_status("CopyTensors: null API pointer");
         }
-        let ep = unsafe { &*transfer.ep };
         let api = unsafe { &*transfer.api };
 
-        // Resolve ORT API function pointers needed for tensor data access.
+        // B3 fix: resolve EP API for direction classification.
+        if transfer.ep_api.is_null() {
+            return fail_status("CopyTensors: null EpApi pointer — cannot classify copy direction");
+        }
+        let ep_api = unsafe { &*transfer.ep_api };
+
+        // Resolve OrtEpApi functions for memory device classification.
+        let value_get_mem_device = match ep_api.Value_GetMemoryDevice {
+            Some(f) => f,
+            None => {
+                return fail_status("CopyTensors: Value_GetMemoryDevice not available");
+            }
+        };
+        let get_dev_type = match ep_api.MemoryDevice_GetDeviceType {
+            Some(f) => f,
+            None => {
+                return fail_status("CopyTensors: MemoryDevice_GetDeviceType not available");
+            }
+        };
+
+        // Resolve ORT API function pointers for tensor data access.
         let get_tensor_data = match api.GetTensorData {
             Some(f) => f,
             None => return fail_status("CopyTensors: GetTensorData not available"),
@@ -516,6 +549,35 @@ unsafe extern "C" fn transfer_full_copy_tensors(
 
             if src_value.is_null() || dst_value.is_null() {
                 return fail_status(&format!("CopyTensors: null tensor at index {i}"));
+            }
+
+            // B3 fix: classify direction from memory device types.
+            let src_mem_device = unsafe { value_get_mem_device(src_value) };
+            let dst_mem_device = unsafe { value_get_mem_device(dst_value as *const ort::OrtValue) };
+
+            let src_type = if src_mem_device.is_null() {
+                ort::OrtMemoryInfoDeviceType_CPU // assume CPU if unknown
+            } else {
+                unsafe { get_dev_type(src_mem_device) }
+            };
+            let dst_type = if dst_mem_device.is_null() {
+                ort::OrtMemoryInfoDeviceType_CPU
+            } else {
+                unsafe { get_dev_type(dst_mem_device) }
+            };
+
+            let src_is_cpu = src_type == ort::OrtMemoryInfoDeviceType_CPU;
+            let dst_is_cpu = dst_type == ort::OrtMemoryInfoDeviceType_CPU;
+            let same_device = !src_is_cpu
+                && !dst_is_cpu
+                && !src_mem_device.is_null()
+                && src_mem_device == dst_mem_device;
+            let direction = CopyDirection::classify(src_is_cpu, dst_is_cpu, same_device);
+
+            if !direction.is_supported() {
+                return fail_status(&format!(
+                    "CopyTensors: unsupported copy direction {direction:?} at index {i}"
+                ));
             }
 
             // Get source data pointer.
@@ -593,68 +655,102 @@ unsafe extern "C" fn transfer_full_copy_tensors(
             };
 
             if byte_len == 0 {
-                continue; // Zero-size tensor, nothing to copy.
+                continue;
             }
 
-            // Determine copy direction from device accessibility.
-            // For a real CUDA EP: src on host = copy_from_host; src on device = device copy.
-            // Without OrtEpApi access to query memory device types, we use the EP's
-            // device type and the pointer values as heuristics.
-            //
-            // The correct production approach: store OrtEpApi and call
-            // Value_GetMemoryDevice on src/dst OrtValues, then
-            // MemoryDevice_GetDeviceType to classify. For now, we attempt
-            // the copy through the EP trait and report failure clearly.
-
-            // Create temporary DeviceBuffers wrapping the raw pointers for the EP's
-            // copy methods. These are borrowed (non-owning) handles.
-            let src_device = ep.device_id();
-            let src_buf = unsafe {
-                onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_parts(
-                    src_data as *mut c_void,
-                    src_device,
-                    byte_len,
-                    1,
-                )
-            };
-            let mut dst_buf = match unsafe {
-                onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_mut_parts(
-                    dst_data, src_device, byte_len, 1,
-                )
-            } {
-                Some(buf) => buf,
-                None => {
-                    return fail_status(&format!("CopyTensors: null dst buffer at index {i}"));
-                }
-            };
-
-            // If stream-aware and a stream is provided, use async copy.
-            let has_stream = !streams.is_null() && {
-                let s = unsafe { *streams.add(i) };
-                !s.is_null()
-            };
-
-            let copy_result = if has_stream {
-                // Async copy with fence — stream-ordered.
-                match ep.copy_async(&src_buf, &mut dst_buf, byte_len) {
-                    Ok(fence) => {
-                        if !fence.is_signalled() {
-                            // The fence is pending — the stream ordering guarantees
-                            // that a consumer after the stream flush sees the data.
-                            // We don't need to wait here; ORT manages stream ordering.
-                            let _ = ep.wait_fence(&fence);
-                        }
-                        Ok(())
+            // B3 fix: dispatch by classified direction.
+            let copy_result = transfer.ep_ref.with_ep(|ep| {
+                match direction {
+                    CopyDirection::HostToDevice => {
+                        // src is host memory — safe to read as a byte slice.
+                        let src_slice =
+                            unsafe { std::slice::from_raw_parts(src_data as *const u8, byte_len) };
+                        let mut dst_buf = match unsafe {
+                            onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_mut_parts(
+                                dst_data,
+                                ep.device_id(),
+                                byte_len,
+                                1,
+                            )
+                        } {
+                            Some(buf) => buf,
+                            None => {
+                                return Err(format!("CopyTensors: null dst buffer at index {i}"));
+                            }
+                        };
+                        ep.copy_from_host(src_slice, &mut dst_buf)
+                            .map_err(|e| format!("copy_from_host failed at index {i}: {e}"))
                     }
-                    Err(e) => Err(e),
-                }
-            } else {
-                // Synchronous copy.
-                ep.copy(&src_buf, &mut dst_buf, byte_len)
-            };
+                    CopyDirection::DeviceToHost => {
+                        // dst is host memory — safe to write as a byte slice.
+                        let dst_slice = unsafe {
+                            std::slice::from_raw_parts_mut(dst_data as *mut u8, byte_len)
+                        };
+                        let src_buf = unsafe {
+                            onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_parts(
+                                src_data as *mut c_void,
+                                ep.device_id(),
+                                byte_len,
+                                1,
+                            )
+                        };
+                        ep.copy_to_host(&src_buf, dst_slice)
+                            .map_err(|e| format!("copy_to_host failed at index {i}: {e}"))
+                    }
+                    CopyDirection::DeviceToSameDevice => {
+                        // Both are device memory.
+                        let src_buf = unsafe {
+                            onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_parts(
+                                src_data as *mut c_void,
+                                ep.device_id(),
+                                byte_len,
+                                1,
+                            )
+                        };
+                        let mut dst_buf = match unsafe {
+                            onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_mut_parts(
+                                dst_data,
+                                ep.device_id(),
+                                byte_len,
+                                1,
+                            )
+                        } {
+                            Some(buf) => buf,
+                            None => {
+                                return Err(format!("CopyTensors: null dst buffer at index {i}"));
+                            }
+                        };
 
-            if let Err(e) = copy_result {
-                return fail_status(&format!("CopyTensors: copy failed at index {i}: {e}"));
+                        let has_stream = !streams.is_null() && {
+                            let s = unsafe { *streams.add(i) };
+                            !s.is_null()
+                        };
+
+                        if has_stream {
+                            match ep.copy_async(&src_buf, &mut dst_buf, byte_len) {
+                                Ok(fence) => {
+                                    if !fence.is_signalled() {
+                                        let _ = ep.wait_fence(&fence);
+                                    }
+                                    Ok(())
+                                }
+                                Err(e) => Err(format!("copy_async failed at index {i}: {e}")),
+                            }
+                        } else {
+                            ep.copy(&src_buf, &mut dst_buf, byte_len)
+                                .map_err(|e| format!("copy failed at index {i}: {e}"))
+                        }
+                    }
+                    _ => Err(format!(
+                        "CopyTensors: unsupported direction {direction:?} at index {i}"
+                    )),
+                }
+            });
+
+            match copy_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return fail_status(&format!("CopyTensors: {e}")),
+                Err(msg) => return fail_status(&format!("CopyTensors: {msg}")),
             }
         }
 
@@ -1206,22 +1302,25 @@ mod tests {
     #[test]
     fn transfer_full_create_and_release_no_leak() {
         let dc = DropCounter::new();
-        let ep = Box::new(MockDeviceEp::new(dc.clone()));
-        let ep_ptr: *const dyn ExecutionProvider = &*ep;
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockDeviceEp::new(dc.clone()));
+        let shared = Arc::new(Mutex::new(ep));
         let support = DeviceSupport::gpu("MockGpu", 0);
 
-        // Use a dummy OrtApi (null functions — we won't call CopyTensors).
-        let api = ort::OrtApi::default();
-        let api_ptr: *const ort::OrtApi = &api;
-
         let transfer = unsafe {
-            DeviceDataTransferFull::new(ep_ptr, support, api_ptr, std::ptr::null(), false)
+            DeviceDataTransferFull::new_shared(
+                shared.clone(),
+                support,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
         };
         let raw = Box::into_raw(transfer) as *mut ort::OrtDataTransferImpl;
 
         // Release.
         unsafe { transfer_full_release(raw) };
-        assert_eq!(ep.name(), "mock_device_ep"); // EP still alive.
+        // EP still alive via `shared` Arc.
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.name(), "mock_device_ep");
     }
 
     // ─── Ownership: drop counter verifies no leaks ───────────────────────────

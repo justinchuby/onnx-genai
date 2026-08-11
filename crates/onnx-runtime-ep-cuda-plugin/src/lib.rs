@@ -6,37 +6,32 @@
 //!
 //! # CUDA EP status: COMPILES, UNVALIDATED ON HARDWARE
 //!
-//! The four implementation defects identified by the B4 rubber-duck review
-//! have been resolved:
+//! The following defects have been addressed:
 //!
 //! 1. **Shared CUDA runtime/context.** A single `CudaExecutionProvider` is
-//!    constructed once and shared across EP, allocator, stream, and data
-//!    transfer via `ExportedFactory::shared_ep`. All components operate on
-//!    the same `CUcontext` and `cudaStream_t`.
+//!    constructed once and shared across allocator, stream, and data transfer
+//!    via `Arc<Mutex<..>>`. Each component holds a strong `Arc` clone (B1 fix).
 //!
-//! 2. **`CreateDataTransfer` returns a real adapter.** The factory creates a
-//!    `DeviceDataTransferFull` with ORT API access for tensor data extraction
-//!    and `OrtEpApi` access for `MemoryDevice_GetDeviceType`-based copy
-//!    direction classification.
+//! 2. **`CreateDataTransfer` returns a real adapter.** `DeviceDataTransferFull`
+//!    now classifies copy direction using `Value_GetMemoryDevice` +
+//!    `MemoryDevice_GetDeviceType` and dispatches to `copy_from_host`,
+//!    `copy_to_host`, or `copy` accordingly (B3 fix).
 //!
 //! 3. **`GetHandle` returns the real stream handle.** The native
-//!    `cudaStream_t` is extracted from `CudaRuntime::stream_ptr()` and stored
-//!    in `ExportedFactory::stream_handle`, returned by `GetHandle`.
+//!    `cudaStream_t` is extracted from `CudaRuntime::stream_ptr()`.
 //!
 //! 4. **`Free` passes the true allocation size.** `DeviceAllocator` tracks
-//!    sizes in a `HashMap<usize, usize>` populated by `Alloc` and looked up
-//!    by `Free`.
+//!    sizes in a `HashMap<usize, usize>`. Unknown pointers are no-op'd (S1 fix).
 //!
 //! **With the `cuda` feature ON**, `CreateEpFactories` attempts to construct
 //! the EP. If a CUDA GPU is available, it advertises one factory. If no GPU
 //! is available (this build host), it returns zero factories with an
-//! actionable error.
+//! actionable error — **by design, not by accidental panic.**
 //!
 //! **Without the `cuda` feature**, zero factories are returned.
 //!
 //! **This code has not been validated on a physical CUDA GPU.** Issue #768
-//! tracks hardware validation. The code is correct by construction but
-//! unproven at runtime.
+//! tracks hardware validation.
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
@@ -148,46 +143,27 @@ pub unsafe extern "C" fn CreateEpFactories(
                 }
             };
 
+            let ep_name = ep.name().to_string();
             let entries = cuda_impl::build_kernel_registry_entries();
             let support = cuda_impl::device_support();
             let shared_ep = std::sync::Arc::new(std::sync::Mutex::new(ep));
 
-            // Use the shared adapter to create the factory, then patch in
-            // the CUDA-specific shared EP and stream handle.
+            // S4 fix: use create_ep_factories_for_shared_ep which takes the
+            // EP name directly, avoiding the constructor call that would panic.
             let status = unsafe {
-                onnx_runtime_ep_plugin::factory::create_ep_factories_with_device_support(
+                onnx_runtime_ep_plugin::factory::create_ep_factories_for_shared_ep(
                     api_base,
                     out_factories,
                     max_factories,
                     out_num_raw,
-                    // Constructor closure — only used as fallback when shared_ep
-                    // is None. Since we set shared_ep below, this should not be
-                    // called, but fail-closed if it is.
-                    || {
-                        panic!("CUDA EP constructor called but shared_ep should be used instead");
-                    },
+                    &ep_name,
+                    shared_ep,
                     entries,
                     support,
+                    stream_handle,
                 )
             };
-            if !status.is_null() {
-                return status;
-            }
-
-            // Patch the factory's shared_ep and stream_handle fields.
-            if !out_factories.is_null() {
-                let factory_ptr = unsafe { *out_factories };
-                if !factory_ptr.is_null() {
-                    let exported = unsafe {
-                        &mut *(factory_ptr
-                            .cast::<onnx_runtime_ep_plugin::factory::ExportedFactory>())
-                    };
-                    exported.shared_ep = Some(shared_ep);
-                    exported.stream_handle = stream_handle;
-                }
-            }
-
-            onnx_runtime_ep_plugin::status::ok_status()
+            status
         }
 
         #[cfg(not(feature = "cuda"))]

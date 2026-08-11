@@ -55,3 +55,15 @@ Designed and implemented `crates/onnx-runtime-ep-nxrt-abi/` — the native half 
 ## 2026-08-11 — Export macros + testing module for negative fixtures
 
 Shipped three macros closing the "duplicate ABI" hole: `export_nxrt_ep_factories!` (standard plugins), `export_nxrt_ep_negotiate_custom!` (negative-test negotiate overrides), `export_nxrt_ep_create_custom!` (negative-test factory overrides). Added `testing` module exposing `NxrtNegotiateOverride` and `NxrtCreateFactoriesOverride` with `wrong_major`, `unknown_caps`, `panicking`, `zero`, `error` variants. Re-exported all capability constants and `validate_negotiation` at crate root. Macro hygiene: fully-qualified `::std::`/`$crate::` paths, `$constructor` evaluated outside unsafe block (clippy::macro_metavars_in_unsafe clean). Tests: **30 unit tests pass** (up from 19). `cargo check --workspace` green. Decision note updated.
+
+## 2026-08-11 — CUDA EP use-after-free fix (B1/B3/S4 revision)
+
+Took ownership after Gaff rejected Sapper's CUDA EP commits on #762 (reviewer lockout). Fixed three blocking defects:
+
+- **B1 (use-after-free):** Replaced raw pointers from dropped `MutexGuard` with `Arc<Mutex<..>>` clones stored in each component via `EpRef::Shared`. Each callback locks briefly — no dangling pointers.
+- **B3 (CopyTensors direction):** `transfer_full_copy_tensors` now calls `Value_GetMemoryDevice` + `MemoryDevice_GetDeviceType` to classify H2D/D2H/D2D, dispatching to `copy_from_host`/`copy_to_host`/`copy` correctly.
+- **S4 (panic bomb):** New `create_ep_factories_for_shared_ep` takes `ep_name` directly — no constructor call. Fail-closed by design (actionable OrtStatus), not by accidental panic.
+
+Also fixed: S1 (unknown ptr no-op), S2 (no `.unwrap()` across FFI), S3 (CreateEp uses shared_ep), N2 (vendor_id from config). Deferred B2 (pointer equality for same-device — fail-closed, not UB).
+
+Added 3 regression tests: B1 (allocator outlives original Arc), S4 (no panic escape), B3 (direction matrix). All 173 targeted tests pass. Clippy clean. Plugin remains **fail-closed and unvalidated on hardware** — by design, not by circumstance.

@@ -57,31 +57,26 @@ pub struct ExportedFactory {
 unsafe impl Send for ExportedFactory {}
 unsafe impl Sync for ExportedFactory {}
 
-/// Implementation of `CreateEpFactories` — called by the macro-generated export.
+/// Initialize the ORT host API from an `OrtApiBase` pointer.
+///
+/// Returns `(api_ptr, error_status)`. On success, `error_status` is null and
+/// `api_ptr` is valid. On failure, `api_ptr` is null and `error_status` should
+/// be returned to ORT (after writing `*out_num = 0`).
 ///
 /// # Safety
 ///
-/// All pointer arguments must be valid per the ORT plugin-EP C ABI.
-pub unsafe fn create_ep_factories<F>(
+/// `api_base` must be valid or null.
+unsafe fn init_host_api(
     api_base: *const ort::OrtApiBase,
-    out_factories: *mut *mut ort::OrtEpFactory,
-    max_factories: usize,
     out_num: *mut usize,
-    constructor: F,
-) -> *mut ort::OrtStatus
-where
-    F: Fn() -> Box<dyn ExecutionProvider> + Send + Sync + 'static,
-{
-    // Version negotiation: obtain the OrtApi from the host.
+) -> Result<*const ort::OrtApi, *mut ort::OrtStatus> {
     if api_base.is_null() {
-        // Cannot call fail_status yet — no API. Return null (success) and
-        // write zero factories.
         unsafe {
             if !out_num.is_null() {
                 *out_num = 0;
             }
         }
-        return ptr::null_mut();
+        return Err(ptr::null_mut());
     }
 
     let get_api = unsafe { (*api_base).GetApi };
@@ -93,16 +88,12 @@ where
                     *out_num = 0;
                 }
             }
-            return ptr::null_mut();
+            return Err(ptr::null_mut());
         }
     };
 
     if api.is_null() {
-        // Fail closed: host ORT does not support our API version. We cannot
-        // proceed because the vtable may lack functions we depend on.
-        // Try to create an error status using an older API version for error
-        // reporting. If that also fails, return null + 0 factories.
-        let fallback_api = unsafe { (get_api.unwrap())(1) }; // v1 always has CreateStatus
+        let fallback_api = unsafe { (get_api.unwrap())(1) };
         if let Some(create_status) = (!fallback_api.is_null())
             .then(|| unsafe { (*fallback_api).CreateStatus })
             .flatten()
@@ -114,34 +105,29 @@ where
                     *out_num = 0;
                 }
             }
-            return unsafe { create_status(ort::ORT_FAIL, msg.as_ptr()) };
+            return Err(unsafe { create_status(ort::ORT_FAIL, msg.as_ptr()) });
         }
         unsafe {
             if !out_num.is_null() {
                 *out_num = 0;
             }
         }
-        return ptr::null_mut();
+        return Err(ptr::null_mut());
     }
 
-    // Store the host API for later status creation, graph reading, etc.
     unsafe { set_host_api(api) };
+    Ok(api)
+}
 
-    if max_factories == 0 || out_factories.is_null() || out_num.is_null() {
-        return fail_status("CreateEpFactories: out_factories is null or max_factories is 0");
-    }
-
-    // Create a temporary EP to get the name.
-    let ep = constructor();
-    let name = ep.name().to_string();
-    drop(ep);
-
-    let name_cstr =
-        CString::new(name.as_str()).unwrap_or_else(|_| CString::new("nxrt_ep").unwrap());
+/// Build an `ExportedFactory` with all vtable callbacks wired.
+fn build_factory(
+    name_cstr: CString,
+    constructor: Box<dyn Fn() -> Box<dyn ExecutionProvider> + Send + Sync>,
+) -> Box<ExportedFactory> {
     let vendor_cstr = CString::new("nxrt").unwrap();
     let version_cstr = CString::new("0.1.0").unwrap();
 
-    let factory = Box::new(ExportedFactory {
+    Box::new(ExportedFactory {
         vtable: ort::OrtEpFactory {
             ort_version_supported: ort::ORT_API_VERSION,
             GetName: Some(factory_get_name),
@@ -167,24 +153,68 @@ where
         name_cstr,
         vendor_cstr,
         version_cstr,
-        constructor: Box::new(move || constructor()),
+        constructor,
         kernel_registry_entries: Vec::new(),
         device_support: DeviceSupport::cpu_only(),
         shared_ep: None,
         stream_handle: ptr::null_mut(),
-    });
+    })
+}
 
+/// Write a single factory into ORT's output array.
+///
+/// # Safety
+///
+/// `out_factories` and `out_num` must be valid, `max_factories >= 1`.
+unsafe fn emit_factory(
+    factory: Box<ExportedFactory>,
+    out_factories: *mut *mut ort::OrtEpFactory,
+    max_factories: usize,
+    out_num: *mut usize,
+) {
     let factory_ptr = Box::into_raw(factory);
-    // SAFETY: factory_ptr points to an ExportedFactory whose first field is
-    // OrtEpFactory, so the cast is valid.
     unsafe {
-        // Zero the entire output array so ORT doesn't read stale pointers.
         for i in 0..max_factories {
             *out_factories.add(i) = ptr::null_mut();
         }
         *out_factories = factory_ptr.cast::<ort::OrtEpFactory>();
         *out_num = 1;
     }
+}
+
+/// Implementation of `CreateEpFactories` — called by the macro-generated export.
+///
+/// # Safety
+///
+/// All pointer arguments must be valid per the ORT plugin-EP C ABI.
+pub unsafe fn create_ep_factories<F>(
+    api_base: *const ort::OrtApiBase,
+    out_factories: *mut *mut ort::OrtEpFactory,
+    max_factories: usize,
+    out_num: *mut usize,
+    constructor: F,
+) -> *mut ort::OrtStatus
+where
+    F: Fn() -> Box<dyn ExecutionProvider> + Send + Sync + 'static,
+{
+    if unsafe { init_host_api(api_base, out_num) }.is_err() {
+        return ptr::null_mut();
+    }
+
+    if max_factories == 0 || out_factories.is_null() || out_num.is_null() {
+        return fail_status("CreateEpFactories: out_factories is null or max_factories is 0");
+    }
+
+    // Create a temporary EP to get the name.
+    let ep = constructor();
+    let name = ep.name().to_string();
+    drop(ep);
+
+    let name_cstr =
+        CString::new(name.as_str()).unwrap_or_else(|_| CString::new("nxrt_ep").unwrap());
+
+    let factory = build_factory(name_cstr, Box::new(move || constructor()));
+    unsafe { emit_factory(factory, out_factories, max_factories, out_num) };
     ok_status()
 }
 
@@ -265,6 +295,63 @@ where
     ok_status()
 }
 
+/// Create a factory for a pre-constructed shared EP.
+///
+/// Unlike [`create_ep_factories_with_device_support`], this variant does **not**
+/// call the constructor to read the EP name — the name is passed explicitly.
+/// This avoids the S4 problem where the constructor is a panic bomb.
+///
+/// The shared EP is set directly on the factory; callbacks that need the EP
+/// clone the `Arc` rather than extracting a raw pointer from a `MutexGuard`.
+///
+/// # Safety
+///
+/// All pointer arguments must be valid per the ORT plugin-EP C ABI.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn create_ep_factories_for_shared_ep(
+    api_base: *const ort::OrtApiBase,
+    out_factories: *mut *mut ort::OrtEpFactory,
+    max_factories: usize,
+    out_num: *mut usize,
+    ep_name: &str,
+    shared_ep: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+    entries: Vec<crate::ep::KernelRegistryEntry>,
+    support: DeviceSupport,
+    stream_handle: *mut std::os::raw::c_void,
+) -> *mut ort::OrtStatus {
+    let api = match unsafe { init_host_api(api_base, out_num) } {
+        Ok(api) => api,
+        Err(status) => return status,
+    };
+    let _ = api;
+
+    if max_factories == 0 || out_factories.is_null() || out_num.is_null() {
+        return fail_status("CreateEpFactories: out_factories is null or max_factories is 0");
+    }
+
+    let name_cstr = CString::new(ep_name).unwrap_or_else(|_| CString::new("nxrt_ep").unwrap());
+
+    // The constructor closure is only used by `factory_create_ep` when
+    // `shared_ep` is `None`. Since we set `shared_ep`, this should never be
+    // called — but fail closed with an actionable status if it is.
+    let ep_name_owned = ep_name.to_string();
+    let constructor: Box<dyn Fn() -> Box<dyn ExecutionProvider> + Send + Sync> =
+        Box::new(move || {
+            panic!(
+                "EP constructor called but shared_ep should be used instead (EP: {ep_name_owned})",
+            );
+        });
+
+    let mut factory = build_factory(name_cstr, constructor);
+    factory.kernel_registry_entries = entries;
+    factory.device_support = support;
+    factory.shared_ep = Some(shared_ep);
+    factory.stream_handle = stream_handle;
+
+    unsafe { emit_factory(factory, out_factories, max_factories, out_num) };
+    ok_status()
+}
+
 /// Implementation of `ReleaseEpFactory`.
 ///
 /// # Safety
@@ -305,9 +392,15 @@ unsafe extern "C" fn factory_get_vendor(factory: *const ort::OrtEpFactory) -> *c
     result.unwrap_or(c"unknown".as_ptr())
 }
 
-unsafe extern "C" fn factory_get_vendor_id(_factory: *const ort::OrtEpFactory) -> u32 {
-    // No PCI vendor ID for CPU EP; return 0.
-    0
+unsafe extern "C" fn factory_get_vendor_id(factory: *const ort::OrtEpFactory) -> u32 {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if factory.is_null() {
+            return 0;
+        }
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        exported.device_support.vendor_id
+    }));
+    result.unwrap_or(0)
 }
 
 unsafe extern "C" fn factory_get_version(factory: *const ort::OrtEpFactory) -> *const c_char {
@@ -506,13 +599,32 @@ unsafe extern "C" fn factory_create_ep(
         }
 
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
-        let mut ep = (exported.constructor)();
 
-        // Initialize the EP with default config.
-        let config = onnx_runtime_ep_api::provider::EpConfig::default();
-        if let Err(e) = ep.initialize(&config) {
-            return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
-        }
+        // S3 fix: if a shared EP exists, wrap it (non-owning) rather than
+        // calling the constructor (which may be a panic bomb for device EPs).
+        let ep: Box<dyn ExecutionProvider> = if let Some(ref shared) = exported.shared_ep {
+            match shared.lock() {
+                Ok(_guard) => {
+                    // We can't move the EP out of the Arc, so for CreateEp with
+                    // a shared EP we return an error — the shared EP is used
+                    // directly by allocator/stream/transfer, not via CreateEp.
+                    return fail_status(
+                        "CreateEp: shared EP is owned by the factory; \
+                         allocator, stream, and data transfer use it directly",
+                    );
+                }
+                Err(_) => {
+                    return fail_status("CreateEp: shared EP mutex poisoned");
+                }
+            }
+        } else {
+            let mut ep = (exported.constructor)();
+            let config = onnx_runtime_ep_api::provider::EpConfig::default();
+            if let Err(e) = ep.initialize(&config) {
+                return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
+            }
+            ep
+        };
 
         let exported_ep = Box::new(ExportedEp::new_with_registry_and_entries(
             ep,
@@ -523,7 +635,6 @@ unsafe extern "C" fn factory_create_ep(
             exported.kernel_registry_entries.clone(),
         ));
         let ep_ptr = Box::into_raw(exported_ep);
-        // SAFETY: ExportedEp's first field is OrtEp vtable.
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
         ok_status()
     }));
@@ -546,6 +657,10 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
 
 /// Creates an allocator. For CPU EPs, uses ORT's default CPU allocator.
 /// For device EPs (GPU/NPU), creates a DeviceAllocator backed by the EP.
+///
+/// **B1 fix:** When `shared_ep` is set, the `Arc` is cloned and stored in the
+/// `DeviceAllocator`. The allocator locks the `Arc<Mutex<..>>` on each use,
+/// so the EP pointer is always valid while being dereferenced.
 unsafe extern "C" fn factory_create_allocator(
     factory: *mut ort::OrtEpFactory,
     memory_info: *const ort::OrtMemoryInfo,
@@ -580,33 +695,32 @@ unsafe extern "C" fn factory_create_allocator(
             }
         }
 
-        // Device path: create a DeviceAllocator. If a shared EP is available
-        // (device EPs that need a single CUDA context), use it. Otherwise
-        // construct a fresh EP for this allocator.
-        let (ep_ptr, owns_ep): (*const dyn ExecutionProvider, bool) =
-            if let Some(ref shared) = exported.shared_ep {
-                // Shared EP: borrow the pointer. Factory owns the EP.
-                let guard = shared.lock().unwrap();
-                let ep_ref: &dyn ExecutionProvider = &**guard;
-                (ep_ref as *const dyn ExecutionProvider, false)
-            } else {
-                let mut ep = (exported.constructor)();
-                let config = onnx_runtime_ep_api::provider::EpConfig::default();
-                if let Err(e) = ep.initialize(&config) {
-                    return fail_status(&format!("CreateAllocator: EP init failed: {e}"));
-                }
-                (Box::into_raw(ep) as *const dyn ExecutionProvider, true)
-            };
-        let dev_alloc = unsafe { DeviceAllocator::new(ep_ptr, memory_info, owns_ep) };
-        let alloc_ptr = Box::into_raw(dev_alloc);
-        unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
-        ok_status()
+        // Device path: create a DeviceAllocator.
+        if let Some(ref shared) = exported.shared_ep {
+            // Clone the Arc — the allocator holds a strong reference.
+            let dev_alloc = unsafe { DeviceAllocator::new_shared(Arc::clone(shared), memory_info) };
+            let alloc_ptr = Box::into_raw(dev_alloc);
+            unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
+            ok_status()
+        } else {
+            // No shared EP and not host-accessible — construct a fresh EP.
+            let mut ep = (exported.constructor)();
+            let config = onnx_runtime_ep_api::provider::EpConfig::default();
+            if let Err(e) = ep.initialize(&config) {
+                return fail_status(&format!("CreateAllocator: EP init failed: {e}"));
+            }
+            let ep_ptr = Box::into_raw(ep) as *const dyn ExecutionProvider;
+            let dev_alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, memory_info) };
+            let alloc_ptr = Box::into_raw(dev_alloc);
+            unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
+            ok_status()
+        }
     }));
     result.unwrap_or_else(|_| fail_status("CreateAllocator: internal panic"))
 }
 
 /// Release an allocator. For default ORT allocators (CPU path), this is a no-op.
-/// For DeviceAllocator instances, drops both the allocator and its backing EP.
+/// For DeviceAllocator instances, drops the allocator (and its backing EP if owned).
 unsafe extern "C" fn factory_release_allocator(
     factory: *mut ort::OrtEpFactory,
     allocator: *mut ort::OrtAllocator,
@@ -618,12 +732,10 @@ unsafe extern "C" fn factory_release_allocator(
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
         if !exported.device_support.host_accessible {
             // This is a DeviceAllocator we created — drop it.
-            let dev_alloc = unsafe { Box::from_raw(allocator.cast::<DeviceAllocator>()) };
-            // Only drop the EP if the allocator owns it (not shared).
-            if dev_alloc.owns_ep && !dev_alloc.ep.is_null() {
-                unsafe {
-                    drop(Box::from_raw(dev_alloc.ep as *mut dyn ExecutionProvider));
-                }
+            // Dropping the DeviceAllocator releases its Arc (shared) or
+            // raw EP pointer (owned). No manual cleanup needed.
+            unsafe {
+                drop(Box::from_raw(allocator.cast::<DeviceAllocator>()));
             }
         }
         // CPU path: allocator is ORT's default — we don't own it.
@@ -643,6 +755,9 @@ unsafe extern "C" fn factory_is_stream_aware(factory: *const ort::OrtEpFactory) 
 }
 
 /// Creates data transfer for device EPs. CPU EPs don't need data transfer.
+///
+/// **B1 fix:** When `shared_ep` is set, the `Arc` is cloned and stored in the
+/// `DeviceDataTransferFull`. The transfer locks the `Arc` on each use.
 unsafe extern "C" fn factory_create_data_transfer(
     factory: *mut ort::OrtEpFactory,
     data_transfer: *mut *mut ort::OrtDataTransferImpl,
@@ -682,40 +797,49 @@ unsafe extern "C" fn factory_create_data_transfer(
             }
         };
 
-        // Device path: use shared EP if available, otherwise construct fresh.
-        let (ep_ptr, owns_ep): (*const dyn ExecutionProvider, bool) =
-            if let Some(ref shared) = exported.shared_ep {
-                let guard = shared.lock().unwrap();
-                let ep_ref: &dyn ExecutionProvider = &**guard;
-                (ep_ref as *const dyn ExecutionProvider, false)
-            } else {
-                let mut ep = (exported.constructor)();
-                let config = onnx_runtime_ep_api::provider::EpConfig::default();
-                if let Err(e) = ep.initialize(&config) {
-                    unsafe { *data_transfer = ptr::null_mut() };
-                    return fail_status(&format!("CreateDataTransfer: EP init failed: {e}"));
-                }
-                (Box::into_raw(ep) as *const dyn ExecutionProvider, true)
+        if let Some(ref shared) = exported.shared_ep {
+            // Clone the Arc — the transfer holds a strong reference.
+            let transfer = unsafe {
+                crate::transfer::DeviceDataTransferFull::new_shared(
+                    Arc::clone(shared),
+                    support.clone(),
+                    api,
+                    ep_api,
+                )
             };
-        let transfer = unsafe {
-            crate::transfer::DeviceDataTransferFull::new(
-                ep_ptr,
-                support.clone(),
-                api,
-                ep_api,
-                owns_ep,
-            )
-        };
-        let raw = Box::into_raw(transfer);
-        unsafe { *data_transfer = raw.cast::<ort::OrtDataTransferImpl>() };
-        ok_status()
+            let raw = Box::into_raw(transfer);
+            unsafe { *data_transfer = raw.cast::<ort::OrtDataTransferImpl>() };
+            ok_status()
+        } else {
+            // No shared EP — construct a fresh one.
+            let mut ep = (exported.constructor)();
+            let config = onnx_runtime_ep_api::provider::EpConfig::default();
+            if let Err(e) = ep.initialize(&config) {
+                unsafe { *data_transfer = ptr::null_mut() };
+                return fail_status(&format!("CreateDataTransfer: EP init failed: {e}"));
+            }
+            let ep_ptr = Box::into_raw(ep) as *const dyn ExecutionProvider;
+            let transfer = unsafe {
+                crate::transfer::DeviceDataTransferFull::new_owned(
+                    ep_ptr,
+                    support.clone(),
+                    api,
+                    ep_api,
+                )
+            };
+            let raw = Box::into_raw(transfer);
+            unsafe { *data_transfer = raw.cast::<ort::OrtDataTransferImpl>() };
+            ok_status()
+        }
     }));
     result.unwrap_or_else(|_| fail_status("CreateDataTransfer: internal panic"))
 }
 
 /// Creates a sync stream. For non-stream-aware EPs (CPU), returns null (no-op).
-/// For stream-aware EPs (GPU/NPU), creates a DeviceSyncStream backed by a
-/// fresh EP instance.
+/// For stream-aware EPs (GPU/NPU), creates a DeviceSyncStream.
+///
+/// **B1 fix:** When `shared_ep` is set, the `Arc` is cloned and stored in the
+/// `DeviceSyncStream`. The stream locks the `Arc` on each use.
 unsafe extern "C" fn factory_create_sync_stream(
     factory: *mut ort::OrtEpFactory,
     _memory_device: *const ort::OrtMemoryDevice,
@@ -742,27 +866,28 @@ unsafe extern "C" fn factory_create_sync_stream(
             );
         }
 
-        // Stream-aware path: create a DeviceSyncStream. Use shared EP if
-        // available, otherwise construct a fresh one.
-        let (ep_ptr, owns_ep): (*const dyn ExecutionProvider, bool) =
-            if let Some(ref shared) = exported.shared_ep {
-                let guard = shared.lock().unwrap();
-                let ep_ref: &dyn ExecutionProvider = &**guard;
-                (ep_ref as *const dyn ExecutionProvider, false)
-            } else {
-                let mut ep = (exported.constructor)();
-                let config = onnx_runtime_ep_api::provider::EpConfig::default();
-                if let Err(e) = ep.initialize(&config) {
-                    unsafe { *stream = ptr::null_mut() };
-                    return fail_status(&format!("CreateSyncStream: EP init failed: {e}"));
-                }
-                (Box::into_raw(ep) as *const dyn ExecutionProvider, true)
-            };
         let stream_handle = exported.stream_handle;
-        let sync_stream = unsafe { DeviceSyncStream::new(ep_ptr, stream_handle, owns_ep) };
-        let stream_ptr = Box::into_raw(sync_stream);
-        unsafe { *stream = stream_ptr.cast::<ort::OrtSyncStreamImpl>() };
-        ok_status()
+
+        if let Some(ref shared) = exported.shared_ep {
+            // Clone the Arc — the stream holds a strong reference.
+            let sync_stream = DeviceSyncStream::new_shared(Arc::clone(shared), stream_handle);
+            let stream_ptr = Box::into_raw(sync_stream);
+            unsafe { *stream = stream_ptr.cast::<ort::OrtSyncStreamImpl>() };
+            ok_status()
+        } else {
+            // No shared EP — construct a fresh one.
+            let mut ep = (exported.constructor)();
+            let config = onnx_runtime_ep_api::provider::EpConfig::default();
+            if let Err(e) = ep.initialize(&config) {
+                unsafe { *stream = ptr::null_mut() };
+                return fail_status(&format!("CreateSyncStream: EP init failed: {e}"));
+            }
+            let ep_ptr = Box::into_raw(ep) as *const dyn ExecutionProvider;
+            let sync_stream = unsafe { DeviceSyncStream::new_owned(ep_ptr, stream_handle) };
+            let stream_ptr = Box::into_raw(sync_stream);
+            unsafe { *stream = stream_ptr.cast::<ort::OrtSyncStreamImpl>() };
+            ok_status()
+        }
     }));
     result.unwrap_or_else(|_| fail_status("CreateSyncStream: internal panic"))
 }
