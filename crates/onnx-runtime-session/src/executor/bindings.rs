@@ -4,12 +4,15 @@ use super::*;
 /// capacity refusal surfaces before request admission rather than as a late
 /// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
 /// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
-/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch. All
+/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch;
+/// `com.microsoft::GroupQueryAttention` (#736) reserves a session-persistent f32
+/// reference score buffer (only on the paths that materialize scores). All
 /// report their exact bytes via [`Kernel::workspace_requirement`].
 pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
     (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
         && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
-        || (node.domain == "com.microsoft" && node.op_type == "Attention")
+        || (node.domain == "com.microsoft"
+            && matches!(node.op_type.as_str(), "Attention" | "GroupQueryAttention"))
 }
 
 /// Merge a per-node workspace requirement into the running peak for its
