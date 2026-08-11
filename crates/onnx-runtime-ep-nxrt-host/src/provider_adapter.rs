@@ -74,6 +74,20 @@ impl NxrtExecutionProvider {
                     ),
                 })?;
 
+        // Validate struct_size covers the create_ep field before dereferencing.
+        let factory_struct_size = unsafe { (*factory_ptr).struct_size } as usize;
+        let create_ep_end =
+            memoffset_of_create_ep() + std::mem::size_of::<unsafe extern "C" fn()>();
+        if factory_struct_size < create_ep_end {
+            return Err(NxrtHostError::FactoryFailed {
+                path: plugin.path.clone().to_path_buf(),
+                status: format!(
+                    "factory struct_size ({factory_struct_size}) too small to contain create_ep \
+                     (need at least {create_ep_end}). Plugin may be an older ABI version."
+                ),
+            });
+        }
+
         let mut ep_ptr: *mut NxrtEpVtable = std::ptr::null_mut();
         let status =
             unsafe { ((*factory_ptr).create_ep)((*factory_ptr).ctx, device_ordinal, &mut ep_ptr) };
@@ -90,6 +104,23 @@ impl NxrtExecutionProvider {
             return Err(NxrtHostError::FactoryFailed {
                 path: plugin.path.clone().to_path_buf(),
                 status: "create_ep returned Ok but EP pointer is null".into(),
+            });
+        }
+
+        // Validate EP struct_size covers minimum required fields.
+        let ep_struct_size = unsafe { (*ep_ptr).struct_size } as usize;
+        let ep_min_size = std::mem::size_of::<NxrtEpVtable>();
+        if ep_struct_size < ep_min_size {
+            // Release the EP since we can't safely use it.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                unsafe { ((*ep_ptr).release)((*ep_ptr).ctx) };
+            }));
+            return Err(NxrtHostError::FactoryFailed {
+                path: plugin.path.clone().to_path_buf(),
+                status: format!(
+                    "EP struct_size ({ep_struct_size}) smaller than expected ({ep_min_size}). \
+                     Plugin may be an older ABI version."
+                ),
             });
         }
 
@@ -113,6 +144,16 @@ impl NxrtExecutionProvider {
             initialized: false,
         })
     }
+}
+
+/// Byte offset past the `create_ep` field in `NxrtEpFactoryVtable`.
+/// Used for struct_size validation before dereferencing that vtable slot.
+fn memoffset_of_create_ep() -> usize {
+    // Layout: struct_size(u32) + num_devices(u32) + name(*const u8) + create_ep(fn ptr)
+    // On 64-bit: 4 + 4 + 8 + 8 = 24 (offset of create_ep is 16, end is 24)
+    // We compute it precisely using a dummy to avoid hardcoding.
+    let base = std::mem::size_of::<u32>() * 2 + std::mem::size_of::<*const u8>();
+    base + std::mem::size_of::<unsafe extern "C" fn()>()
 }
 
 impl Drop for NxrtExecutionProvider {

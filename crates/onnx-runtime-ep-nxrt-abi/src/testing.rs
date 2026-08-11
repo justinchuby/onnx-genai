@@ -238,7 +238,7 @@ mod tests {
         let over = NxrtCreateFactoriesOverride::error(NxrtStatusCode::DeviceError);
         let mut num: usize = 99;
         let status = unsafe { over.execute(std::ptr::null_mut(), 0, &mut num) };
-        assert_eq!(status.code, NxrtStatusCode::DeviceError);
+        assert_eq!(status.status_code(), Some(NxrtStatusCode::DeviceError));
         assert_eq!(num, 0);
     }
 

@@ -52,6 +52,24 @@ impl NxrtStatusCode {
     pub fn is_ok(self) -> bool {
         matches!(self, Self::Ok)
     }
+
+    /// Checked conversion from a raw `u32` wire code.
+    ///
+    /// Returns `None` for unrecognised discriminants. This is the safe path
+    /// for handling values from an untrusted plugin — **never transmute**.
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Ok),
+            1 => Some(Self::VersionMismatch),
+            2 => Some(Self::UnsupportedCapability),
+            3 => Some(Self::InvalidArgument),
+            4 => Some(Self::InternalError),
+            5 => Some(Self::NotImplemented),
+            6 => Some(Self::DeviceError),
+            7 => Some(Self::OutOfMemory),
+            _ => None,
+        }
+    }
 }
 
 /// ABI-stable status value returned by all nxrt entry points.
@@ -60,7 +78,7 @@ impl NxrtStatusCode {
 ///
 /// ```text
 /// struct NxrtStatus {
-///     code:        u32,       // NxrtStatusCode discriminant
+///     code:        u32,       // NxrtStatusCode discriminant (wire value)
 ///     message_len: u32,       // length of message in bytes (0 = no message)
 ///     message:     [u8; 256], // inline NUL-terminated UTF-8 message buffer
 /// }
@@ -70,6 +88,15 @@ impl NxrtStatusCode {
 /// no pointers, no cross-module free. This makes it safe to return by value
 /// across a `cdylib` boundary regardless of CRT configuration.
 ///
+/// # Wire-code safety
+///
+/// The `code` field is stored as a raw `u32` — **not** as `NxrtStatusCode`.
+/// This is deliberate: the nxrt ABI is a plugin boundary, and the other side
+/// may be a newer plugin version that sends status codes unknown to this host.
+/// Transmuting an unrecognised discriminant into a Rust enum is undefined
+/// behaviour. The safe accessor [`NxrtStatus::status_code()`] performs a
+/// checked conversion, mapping unknown values to `None`.
+///
 /// # Cross-module safety
 ///
 /// Because the message is inline, there is no allocator coupling between
@@ -78,7 +105,10 @@ impl NxrtStatusCode {
 #[repr(C)]
 #[derive(Clone)]
 pub struct NxrtStatus {
-    pub code: NxrtStatusCode,
+    /// Wire status code as a raw `u32`. Use [`Self::status_code()`] for
+    /// checked conversion to `NxrtStatusCode`. Do **not** transmute — an
+    /// untrusted plugin may send an unrecognised discriminant.
+    pub code: u32,
     /// Number of valid UTF-8 bytes in `message` (excluding NUL terminator).
     /// Zero means no message. Always ≤ [`NXRT_STATUS_MESSAGE_MAX`].
     pub message_len: u32,
@@ -95,7 +125,8 @@ unsafe impl Sync for NxrtStatus {}
 impl std::fmt::Debug for NxrtStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NxrtStatus")
-            .field("code", &self.code)
+            .field("code", &self.status_code())
+            .field("code_raw", &self.code)
             .field("message", &self.message_str())
             .finish()
     }
@@ -105,7 +136,7 @@ impl NxrtStatus {
     /// Create a success status.
     pub const fn ok() -> Self {
         Self {
-            code: NxrtStatusCode::Ok,
+            code: NxrtStatusCode::Ok as u32,
             message_len: 0,
             message: [0u8; MESSAGE_BUF_LEN],
         }
@@ -114,7 +145,7 @@ impl NxrtStatus {
     /// Create a status from a code with no message.
     pub const fn from_code(code: NxrtStatusCode) -> Self {
         Self {
-            code,
+            code: code as u32,
             message_len: 0,
             message: [0u8; MESSAGE_BUF_LEN],
         }
@@ -136,9 +167,18 @@ impl NxrtStatus {
         status
     }
 
-    /// Whether this status is success.
+    /// Whether this status is success (wire code == 0).
     pub fn is_ok(&self) -> bool {
-        self.code.is_ok()
+        self.code == NxrtStatusCode::Ok as u32
+    }
+
+    /// Checked conversion from the raw wire code to a known `NxrtStatusCode`.
+    ///
+    /// Returns `None` if the discriminant is not recognised — this is the
+    /// **expected** case when a newer plugin sends a code unknown to this host.
+    /// Callers must treat `None` as a fatal error (fail closed).
+    pub fn status_code(&self) -> Option<NxrtStatusCode> {
+        NxrtStatusCode::from_u32(self.code)
     }
 
     /// Get the message as a string slice, if present.
@@ -191,7 +231,7 @@ mod tests {
             "major version 99 not supported",
         );
         assert!(!s.is_ok());
-        assert_eq!(s.code, NxrtStatusCode::VersionMismatch);
+        assert_eq!(s.status_code(), Some(NxrtStatusCode::VersionMismatch));
         let msg = s.message_str().unwrap();
         assert!(msg.contains("major version 99"));
     }
@@ -207,7 +247,7 @@ mod tests {
         let s = catch_status_panic(|| {
             panic!("deliberate test panic");
         });
-        assert_eq!(s.code, NxrtStatusCode::InternalError);
+        assert_eq!(s.status_code(), Some(NxrtStatusCode::InternalError));
         let msg = s.message_str().unwrap();
         assert!(msg.contains("panic"));
     }
@@ -250,5 +290,35 @@ mod tests {
         let size = std::mem::size_of::<NxrtStatus>();
         // code(4) + message_len(4) + message(256) = 264
         assert_eq!(size, 264);
+    }
+
+    #[test]
+    fn unknown_discriminant_does_not_cause_ub() {
+        // Simulate a newer plugin sending an unknown status code.
+        // The raw u32 wire format means no transmute, no UB.
+        let mut s = NxrtStatus::ok();
+        s.code = 255; // unknown discriminant
+        // Must not be Ok
+        assert!(!s.is_ok());
+        // Checked conversion returns None (fail closed)
+        assert_eq!(s.status_code(), None);
+    }
+
+    #[test]
+    fn all_known_codes_roundtrip_through_from_u32() {
+        let codes = [
+            NxrtStatusCode::Ok,
+            NxrtStatusCode::VersionMismatch,
+            NxrtStatusCode::UnsupportedCapability,
+            NxrtStatusCode::InvalidArgument,
+            NxrtStatusCode::InternalError,
+            NxrtStatusCode::NotImplemented,
+            NxrtStatusCode::DeviceError,
+            NxrtStatusCode::OutOfMemory,
+        ];
+        for code in codes {
+            let s = NxrtStatus::from_code(code);
+            assert_eq!(s.status_code(), Some(code));
+        }
     }
 }

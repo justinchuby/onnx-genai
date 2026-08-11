@@ -281,7 +281,7 @@ fn negotiate_rejects_incompatible_major_version() {
     };
     let mut resp = NxrtNegotiateResponse::zeroed();
     let status = unsafe { negotiate(&req, &mut resp) };
-    assert_eq!(status.code, NxrtStatusCode::VersionMismatch);
+    assert_eq!(status.status_code(), Some(NxrtStatusCode::VersionMismatch));
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn factory_panic_is_contained() {
 
     // The macro catches the panic and returns InternalError
     let status = unsafe { create_factories(&mut factory_ptr, 1, &mut num) };
-    assert_eq!(status.code, NxrtStatusCode::InternalError);
+    assert_eq!(status.status_code(), Some(NxrtStatusCode::InternalError));
     assert_eq!(num, 0, "num must be zeroed on panic");
 
     // B3: Verify the inline message buffer survives the cdylib boundary.
@@ -379,7 +379,7 @@ fn factory_error_is_contained() {
     let mut num: usize = 99;
 
     let status = unsafe { create_factories(&mut factory_ptr, 1, &mut num) };
-    assert_eq!(status.code, NxrtStatusCode::InternalError);
+    assert_eq!(status.status_code(), Some(NxrtStatusCode::InternalError));
     assert_eq!(num, 0);
 
     std::env::remove_var("NXRT_TEST_FACTORY_ERROR");

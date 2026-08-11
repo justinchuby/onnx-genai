@@ -241,7 +241,7 @@ mod tests {
         };
         let mut resp = NxrtNegotiateResponse::zeroed();
         let status = unsafe { negotiate(&req, &mut resp) };
-        assert_eq!(status.code, NxrtStatusCode::VersionMismatch);
+        assert_eq!(status.status_code(), Some(NxrtStatusCode::VersionMismatch));
         let msg = status.message_str().unwrap();
         assert!(msg.contains("plugin major version"));
     }
@@ -266,7 +266,7 @@ mod tests {
     fn negotiate_null_pointers_fail_closed() {
         let mut resp = NxrtNegotiateResponse::zeroed();
         let status = unsafe { negotiate(ptr::null(), &mut resp) };
-        assert_eq!(status.code, NxrtStatusCode::InvalidArgument);
+        assert_eq!(status.status_code(), Some(NxrtStatusCode::InvalidArgument));
     }
 
     #[test]

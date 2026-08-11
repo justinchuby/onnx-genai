@@ -315,7 +315,7 @@ mod tests {
             panic!("constructor panic for test");
         });
         assert!(!status.is_ok());
-        assert_eq!(status.code, NxrtStatusCode::InternalError);
+        assert_eq!(status.status_code(), Some(NxrtStatusCode::InternalError));
     }
 
     #[test]

@@ -435,7 +435,7 @@ mod tests {
     fn create_ep_factories_rejects_null() {
         let status =
             unsafe { create_ep_factories(ptr::null_mut(), 1, ptr::null_mut(), || unreachable!()) };
-        assert_eq!(status.code, NxrtStatusCode::InvalidArgument);
+        assert_eq!(status.status_code(), Some(NxrtStatusCode::InvalidArgument));
     }
 
     #[test]
@@ -443,6 +443,6 @@ mod tests {
         let mut out: *mut NxrtEpFactoryVtable = ptr::null_mut();
         let mut num: usize = 0;
         let status = unsafe { create_ep_factories(&mut out, 0, &mut num, || unreachable!()) };
-        assert_eq!(status.code, NxrtStatusCode::InvalidArgument);
+        assert_eq!(status.status_code(), Some(NxrtStatusCode::InvalidArgument));
     }
 }

@@ -125,6 +125,22 @@ pub unsafe extern "C" fn CreateEpFactories(
     // Used only with `cuda` feature; suppress warnings for non-cuda builds.
     let _ = (api_base, max_factories, out_factories);
     let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        // Initialize the host API early so diagnostic error statuses can be
+        // delivered to ORT. Without this, `panic_to_fail_status` returns null
+        // (interpreted as success by ORT), silently losing the error message.
+        if !api_base.is_null() {
+            unsafe {
+                let get_api = (*api_base).GetApi;
+                if let Some(get_api_fn) = get_api {
+                    let api =
+                        get_api_fn(onnx_runtime_ep_plugin::onnx_genai_ort_sys::ORT_API_VERSION);
+                    if !api.is_null() {
+                        onnx_runtime_ep_plugin::status::set_host_api(api);
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "cuda")]
         {
             // Attempt to construct the CUDA EP. If no GPU is available, fail
