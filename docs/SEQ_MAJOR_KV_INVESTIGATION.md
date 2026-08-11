@@ -25,39 +25,75 @@ model-size-independent crossover where content fills those granules is
 `granule / (head_dim × sizeof(dtype))` ≈ **16,384 tokens** (head_dim 64/fp16)
 and **8,192 tokens** (head_dim 128/fp16) at a 2 MiB granule.
 
-Seq-major (BSNH `[batch, seq, kv_heads, head_dim]`) removes that floor: the live
-prefix of all heads is one contiguous region, commit is
-`ceil(live_bytes / granule)`, and the token stride (`kv_heads × head_dim`) is
-independent of sequence length, so growth never moves an offset and never
-invalidates a captured CUDA graph.
+Seq-major (BSNH `[batch, seq, kv_heads, head_dim]`) **shrinks that floor by a
+factor of `kv_heads`** — it does *not* remove it (correction folded in, verified
+below). Each layer's K and V remain **separate tensors/bindings**, so the number
+of separately-strided regions that each floor to their own granule goes from
+`layers × 2 × kv_heads` (head-major: every head is its own stripe) to
+`layers × 2` (seq-major: all heads of a layer-side are contiguous, so the whole
+buffer shares one stripe). The token stride within a buffer becomes
+`kv_heads × head_dim`, independent of sequence length, so growth never moves an
+offset and never invalidates a captured CUDA graph.
+
+**Corrected floor + crossover table** (verified numerically; matches owner):
+
+| layout | floor granules | qwen14b (48L, kv8, hd128) | qwen0.5b (24L, kv2, hd64) | crossover formula |
+|---|---|---|---|---|
+| head-major (today) | `layers×2×kv_heads` | 768 → 1.50 GiB | 96 → 192 MiB | `granule/(hd·dtype)` |
+| **seq-major** | `layers×2` | 96 → 192 MiB | 48 → 96 MiB | `granule/(kv_heads·hd·dtype)` |
+| token-major (all layers) | `1` | 1 → 2 MiB | 1 → 2 MiB | — |
+
+The seq-major crossover is `granule / (kv_heads × head_dim × sizeof(dtype))`:
+- qwen14b: 2 MiB / (8·128·2) = **1,024 tokens** (vs 8,192 head-major → **8×**).
+- qwen0.5b: 2 MiB / (2·64·2) = **8,192 tokens** (vs 16,384 head-major → **2×**).
+
+**Important consequence of the correction: the seq-major crossover is NOT
+model-size independent** — it scales with `kv_heads`. So seq-major looks much
+better on wide-GQA models (qwen14b, 8 kv-heads → 8×) than on narrow ones
+(qwen0.5b, 2 kv-heads → 2×). The head-major crossover *is* model-independent
+(`layers`/`kv_heads` cancel, hardware-verified by #776); seq-major trades that
+independence for a `kv_heads`-proportional improvement.
+
+**Token-major across all layers** (one reservation, all layers' K/V interleaved
+by token) would take the floor to a **single granule** (2 MiB, both models). It
+is *not prototyped* here per scope, but evaluated in §2 against the measured
+strided-read numbers: because those reads are cheap, token-major is worth a
+future experiment — with the caveat that its read stride is ~`layers×2` larger
+than the seq-major stride actually measured, so its TLB/locality cost is the open
+question a targeted microbench would have to settle before committing.
 
 **The granule lever is dead on this hardware (#776 / draft #776,
-`vmm_granularity_gpu.rs`).** The parallel #759 probe queried both granularities
-for the exact production allocation properties and found
-`CU_MEM_ALLOC_GRANULARITY_MINIMUM == CU_MEM_ALLOC_GRANULARITY_RECOMMENDED ==
-2 MiB` — **there is no 64 KiB device granule.** So the alternative fix for the
-`objects × granule` floor — shrink the granule and collapse the crossover ~32×
-into the low hundreds of tokens — **cannot be pulled.** The crossover stays at
-8,192 tokens (head_dim 128/fp16) and 16,384 (head_dim 64/fp16). The same probe
-hardware-verified the crossover derivation across a 480× model-size range plus
-both real models: the floor unit is genuinely per-head-stripe, `layers` and
-`kv_heads` cancel, and `crossover = granule / (head_dim × sizeof(dtype))` holds.
+`vmm_granularity_gpu.rs`), independently re-confirmed by this round's
+`remap_burst` bench (`granule MINIMUM == RECOMMENDED == 2 MiB`).** The parallel
+#759 probe queried both granularities for the exact production allocation
+properties and found `CU_MEM_ALLOC_GRANULARITY_MINIMUM ==
+CU_MEM_ALLOC_GRANULARITY_RECOMMENDED == 2 MiB` — **there is no 64 KiB device
+granule.** So the alternative fix for the `objects × granule` floor — shrink the
+granule and collapse the crossover ~32× — **cannot be pulled.** The head-major
+crossover stays at 8,192 tokens (head_dim 128/fp16) and 16,384 (head_dim 64/fp16).
+The same probe hardware-verified the head-major derivation across a 480×
+model-size range plus both real models: the floor unit is genuinely
+per-head-stripe, `layers` and `kv_heads` cancel, and `crossover_headmajor =
+granule / (head_dim × sizeof(dtype))` holds.
 
 **Quantized KV makes the head-major floor worse, not better.** fp8/int8 halves
 bytes per token, which *doubles* the crossover in tokens (fewer live bytes fill
 each granule more slowly). Since we are independently moving toward quantized KV,
 the two optimizations fight each other under head-major — but not under
-seq-major, which removes the floor concept entirely. And §2 shows the strided
-read stays free even at quantized (32 B) run sizes, so seq-major is compatible
-with the quantized-KV direction while head-major is antagonistic to it.
+seq-major, which cuts the crossover by `kv_heads` regardless. And §2 shows the
+strided read stays free even at quantized (32 B) run sizes, so seq-major is
+compatible with the quantized-KV direction while head-major is antagonistic to it.
 
-**Consequence:** seq-major is no longer one of two candidate fixes for the
-granule floor — it is the **only** one, and it does not merely shrink the floor,
-it removes the concept (commit becomes `ceil(live_bytes / granule)` total, no
-crossover at all). Combined with #777 prefix sharing (practical only under
-seq-major), this is the single convergence point for three goals: lower
-committed bytes, no CUDA-graph re-capture on growth, and cross-request prefix
-sharing. This investigation is therefore **decision-critical**, not exploratory.
+**Consequence:** with the granule lever dead, seq-major is the only *layout* lever
+that lowers the floor without a finer granule, and it does so by exactly
+`kv_heads` (14B: 8×; 0.5b: 2×). It does **not** remove the floor concept —
+`layers × 2` granules remain because K and V stay separate bindings — but it
+brings the crossover down to a reachable context length (1,024 tokens on 14B).
+Combined with #777 prefix sharing (practical only under seq-major, §3) and the
+measured remap-burst reduction (§2.1), this is the convergence point for three
+goals: lower committed bytes, no CUDA-graph re-capture on growth, and
+cross-request prefix sharing. This investigation is therefore **decision-critical**,
+not exploratory.
 
 ---
 
@@ -195,6 +231,76 @@ counts — but *both layouts are equally bound*, so the relative delta (what we
 care about) is valid and near-zero. A production seq-major kernel would use the
 same split-K / multi-warp strategy as today's head-major kernel; the strided LD
 only changes the base-offset arithmetic, not the coalescing within a token row.
+
+**Bearing on token-major (owner item 1).** Token-major-across-all-layers would
+push the read stride to `layers × 2 × kv_heads × head_dim` — roughly `layers×2`
+larger than the seq-major stride actually measured above — in exchange for a
+1-granule floor. The measured result says the *stride magnitude itself* is not
+what costs bandwidth (seq-major already strides by `kv_heads × head_dim` with
+zero penalty because each token still contributes a contiguous `head_dim × dtype`
+run). So token-major is **worth a future experiment** on the strength of these
+numbers — but not conclusively free, because the untested risk at that stride is
+TLB/page-locality (each per-token run now lands in a different 2 MiB granule for
+the *same* layer), not cache-line coalescing. Verdict: promising, gated on a
+targeted stride-sweep microbench; not dead, not proven. Do not prototype this
+round.
+
+---
+
+## 2.1 Remap cost is a lockstep BURST, not a per-token tax — MEASURED
+
+Owner correction folded in: remap frequency is a non-issue (a granule holds many
+tokens of headroom — ~8,192 tokens per head-major stripe, ~1,024 per seq-major
+buffer on qwen14b — so remaps are naturally batched and amortize to <0.2% of a
+decode step). **The real cost is that all `layers × 2 [× kv_heads]` buffers cross
+their granule boundary on the *same* decode step**, because they grow in lockstep
+with sequence length, so the cost lands as a single-token latency spike.
+
+Measured directly on this hardware with a new real-VMM microbench
+(`bench-seqmajor/src/bin/remap_burst.rs`, driver `cuMemCreate` + `cuMemMap` +
+`cuMemSetAccess` into a pre-reserved range — the exact production commit path):
+
+| scenario (buffers crossing together) | N granules | measured burst |
+|---|---|---|
+| qwen0.5b seq-major (`layers×2`) | 48 | **2.8 ms** |
+| qwen0.5b head-major (`layers×2×kv`) | 96 | **4.9 ms** |
+| qwen14b seq-major (`layers×2`) | 96 | **4.5 ms** |
+| qwen14b head-major (`layers×2×kv`) | 768 | **49.5 ms** |
+
+Per-granule commit measured **~48–64 µs** (median of 32), *lower* than the #776
+probe's ~150 µs/granule estimate — likely because that figure folded in
+first-touch page-in; the pure reserve→map→set-access path is cheaper. Granule
+independently re-confirmed **MINIMUM == RECOMMENDED == 2 MiB**.
+
+**Reading the numbers honestly:** against a ~12 ms/token decode step, qwen14b
+head-major's **49.5 ms** burst is a ~5× step blow-up — a very visible stutter in
+streaming inter-token latency. Seq-major cuts it to **4.5 ms** (≈`1/kv_heads`),
+about a third of a step — noticeable but far milder. So the seq-major win here is
+the *same* `kv_heads` factor as the floor, now on the growth-spike axis. This is
+a second, independent reason to prefer seq-major that is orthogonal to committed
+bytes.
+
+**Mitigation 1 — commit ahead of the write frontier (evaluated, recommended).**
+Because `cuMemMap` can run on any step, a high-water-mark-plus-slack policy
+commits the next granule(s) *before* the write frontier reaches them, moving the
+remap off the critical decode step entirely. This is functionally what today's
+bucket-growth realloc already does — **the VMM advantage is that the virtual
+address does not change**, so pre-committing does **not** invalidate a captured
+CUDA graph (bucket growth reallocates and forces re-capture). That is the
+concrete, stateable win: same pre-growth policy, zero graph re-capture.
+
+**Mitigation 2 — stagger the boundaries (evaluated; achievable, not inherent).**
+The lockstep spike is an artifact of every buffer being granule-*aligned* at the
+same phase, so they all cross together. Giving each buffer a different sub-granule
+starting offset (phase) — e.g. pre-committing `i mod k` extra tokens of slack on
+buffer `i`, or reserving each buffer at a staggered base — spreads the crossings
+across up to `crossover` distinct steps, flattening the `N × per_granule` spike
+to ~`per_granule` per step. This is correctness-neutral: each (layer, side)
+buffer is independent, nothing requires their boundaries to coincide, and the
+only cost is a bounded amount of extra committed slack. **So lockstep is NOT
+inherent** — it is the default that staggering removes. Combined with
+Mitigation 1, the growth spike is fully removable; even unmitigated, seq-major
+already shrinks it by `kv_heads`.
 
 ---
 
@@ -385,11 +491,16 @@ it needs a layout tag, not a structural change.
 ## 5. Recommendation and smallest next increment
 
 **GO / NO-GO: GO** for seq-major on the native backend, as a per-backend
-capability. Both falsifiers that could have blocked it are cleared, and the
-granule lever being dead (#776, 2 MiB min == recommended) means seq-major is the
-**only** remaining fix for the granule floor — it is now the single convergence
-point for three separate goals (lower committed bytes, no CUDA-graph re-capture
-on growth, cross-request prefix sharing), not an optional optimization.
+capability. Both falsifiers that could have blocked it are cleared, and with the
+granule lever dead (#776, 2 MiB min == recommended) seq-major is the only
+*layout* lever that lowers the granule floor without a finer granule — it shrinks
+the floor and crossover by exactly `kv_heads` (14B: 8×, crossover 8,192 → 1,024
+tokens; 0.5b: 2×). It is a convergence point for three goals (lower committed
+bytes, no CUDA-graph re-capture on growth, cross-request prefix sharing), not an
+optional optimization. **Correction folded in:** seq-major does *not* remove the
+floor — `layers × 2` granules remain because K and V stay separate per-layer
+bindings — and the crossover is no longer model-size independent (it scales with
+`kv_heads`), so the win is large on wide-GQA models and modest on narrow ones.
 
 The two falsification risks are cleared:
 1. ORT compatibility is preserved *by divergence*, not by a bridge — ORT stays
@@ -406,24 +517,31 @@ And the upside is large and concrete, now led by prefix sharing (#777):
   concurrency. The mechanism (multi-map #727, charge-once granule-ref ledger
   #740/#745) is real; only a 1:N handle-bookkeeping extension is missing.
   Impossible under head-major at realistic prefix lengths (§3.4).
-- Eliminates the model-size-independent granule floor and keeps the token stride
+- Shrinks the granule floor and crossover by `kv_heads` (14B: 768→96 granules,
+  crossover 8,192→1,024 tok; §intro) and keeps the token stride
   sequence-independent (no CUDA-graph re-capture on growth).
+- **Cuts the lockstep growth-spike by `kv_heads` (§2.1, measured):** qwen14b
+  boundary-crossing burst 49.5 ms → 4.5 ms; fully removable via commit-ahead
+  and/or boundary staggering, both of which the fixed VA makes graph-safe.
 
 Caveat surfaced by this round: page sharing has its own **granule floor** — it
 saves nothing when the per-(layer,side) shared stripe is sub-granule
 (P < ~1K tok on 14B, < 8K tok on 0.5b), so the prize is a large-model /
-long-prefix win, not universal (§3.1).
+long-prefix win, not universal (§3.1). And the layout win itself is
+`kv_heads`-proportional (§intro), so it is far more compelling on wide-GQA models
+(qwen14b, 8 kv-heads) than narrow ones (qwen0.5b, 2 kv-heads).
 
 **Relationship to the #759 fixed-stride + dummy-tail design.** Because the
 granule lever is dead (#776), the #759 fixed-stride + dummy-page design is a
 **long-context-only** optimization under head-major — it beats bucket growth only
 *above* the 8K/16K crossover, where content finally fills the reserved granules.
-Seq-major makes that same benefit **unconditional** (no crossover at all). The
-two coexist and are complementary: the #759 dummy page remains valuable
-independent of layout for fault safety (a read-only tail page faults loudly
-instead of reading stale KV) and for enabling under-commitment; seq-major removes
-the floor while #759 hardens the tail. Nothing here supersedes #759 — it
-reframes it as a long-context hardening layer rather than the primary floor fix.
+Seq-major lowers that crossover by `kv_heads` (to 1,024 tok on 14B), making the
+benefit reachable at far shorter contexts. The two coexist and are complementary:
+the #759 dummy page remains valuable independent of layout for fault safety (a
+read-only tail page faults loudly instead of reading stale KV) and for enabling
+under-commitment; seq-major shrinks the floor while #759 hardens the tail.
+Nothing here supersedes #759 — it reframes it as a long-context hardening layer
+rather than the primary floor fix.
 
 **Smallest next increment** (one reviewable PR, not a fleet-wide conversion):
 1. Add a `KvLayout` tag to the native KV store / `KvPageStore` (default
@@ -451,9 +569,12 @@ kernel rewrite.
 ```
 # the bench is its own workspace; run it from inside its directory
 cd bench-seqmajor
-cargo run --release            # prints the §2 strided-read table
+cargo run --release                    # prints the §2 strided-read table
+cargo run --release --bin remap_burst  # prints the §2.1 remap-burst table
 ```
-The §2 strided-read numbers come from `bench-seqmajor/` (GPU). The §3.1/§3.2
+The §2 strided-read and §2.1 remap-burst numbers come from `bench-seqmajor/`
+(GPU; `remap_burst` uses the real driver VMM path `cuMemCreate`/`cuMemMap`/
+`cuMemSetAccess`). The §3.1/§3.2
 prefix-sharing and capacity tables are closed-form from
 `bytes_per_token = layers·2·kv_heads·head_dim·dtype` with a 2 MiB granule and
 per-(layer,side) granule rounding (formulas inline in §3). The §3.3 mechanism
