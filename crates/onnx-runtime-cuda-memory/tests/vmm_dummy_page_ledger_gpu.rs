@@ -32,7 +32,9 @@ use onnx_runtime_memory_governor::{
 };
 
 const HOLDER: HolderId = HolderId::new(759);
-const SENTINEL: u8 = 0xFF;
+/// Arbitrary non-zero byte used to prove VA aliasing; not the production fill
+/// (the masking rule decides that — zeros, never NaN).
+const READBACK_MARKER: u8 = 0x5a;
 
 fn check(call: &'static str, result: cu::CUresult) {
     assert_eq!(result, cu::CUresult::CUDA_SUCCESS, "{call}: {result:?}");
@@ -117,7 +119,7 @@ fn one_dummy_handle_at_many_vas_is_one_physical_page() {
     let used = baseline_free.saturating_sub(mapped_free);
 
     // Aliasing: a write through the first VA is visible through the last.
-    let payload = vec![SENTINEL; 4096];
+    let payload = vec![READBACK_MARKER; 4096];
     check("cuMemcpyHtoD_v2", unsafe {
         cu::cuMemcpyHtoD_v2(base, payload.as_ptr().cast(), payload.len())
     });
@@ -129,7 +131,7 @@ fn one_dummy_handle_at_many_vas_is_one_physical_page() {
             back.len(),
         )
     });
-    let aliased = back.iter().all(|&b| b == SENTINEL);
+    let aliased = back.iter().all(|&b| b == READBACK_MARKER);
 
     for i in 0..VAS {
         let _ = unsafe { cu::cuMemUnmap(base + (i * granule) as u64, granule) };

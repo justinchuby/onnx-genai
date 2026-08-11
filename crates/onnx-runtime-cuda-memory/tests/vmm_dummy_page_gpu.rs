@@ -12,37 +12,36 @@
 //! works) and `vmm_kv_contiguous_tail_gpu.rs` (#772: a *padded* read one byte
 //! into the uncommitted tail faults `CUDA_ERROR_INVALID_VALUE`).
 //!
-//! This file answers three of the five #759 questions; the other two live in
-//! their own binaries so a poisoned context or a process-global counter cannot
-//! contaminate them (`vmm_dummy_write_protect_gpu.rs` for the write-protection
-//! stickiness question, `vmm_dummy_page_ledger_gpu.rs` for the real
-//! allocator/ledger charge-once question):
+//! This file answers two of the five #759 questions with driver-level tests;
+//! the rest live in their own binaries so a poisoned context or a
+//! process-global counter cannot contaminate them
+//! (`vmm_dummy_write_protect_gpu.rs` for the write-protection stickiness
+//! question Q3, `vmm_dummy_page_ledger_gpu.rs` for the real allocator/ledger
+//! charge-once question Q4), and the fill-choice rule (Q2) and crossover
+//! analysis live in `dummy_fill_and_crossover.rs` because they are IEEE-754
+//! arithmetic and geometry, not CUDA calls:
 //!
 //! * [`dummy_backed_tail_removes_the_padded_read_fault`] (Q1) — the positive
 //!   counterpart of #772's faulting padded read: with one dummy handle mapped
 //!   across the tail granules, a full-padded read *and a captured-graph replay
 //!   that reads into the tail* both succeed instead of faulting.
-//! * [`dummy_read_is_detectable_not_silent`] (Q2) — with the sentinel fill, a
-//!   read that reaches the dummy tail returns a value that is observably broken
-//!   (NaN in every float width), not a silently-neutral zero.
 //! * [`dummy_to_real_growth_remap_cost`] (Q5) — measures the
 //!   `cuMemUnmap`/`cuMemCreate`/`cuMemMap`/`cuMemSetAccess` cost of a
 //!   dummy->real growth step, including the fixed-full-context-stride case
 //!   where ~96 objects each need a remap per token.
 //!
-//! ## Correctness caveat carried from #759
+//! ## The fill value is NOT chosen here — and it is not NaN
 //!
-//! #759's premise that a *zero-filled* dummy page is safe because "attention on
-//! zeros contributes nothing after softmax" is **false**: a zero key gives a
-//! score `q·0 = 0`, and softmax weights `exp(0) = 1` — a full-strength
-//! contribution, silently wrong output. Neutrality requires the *score* to be
-//! `-inf` (masking), which the key value cannot supply. The dummy page is
-//! therefore a **fault-safety net, not a correctness net**. So this probe does
-//! **not** zero-fill: it fills the dummy with [`SENTINEL`] = `0xFF` bytes, which
-//! is a NaN in f16, bf16 and f32 alike (all-ones exponent, non-zero mantissa).
-//! A dummy KV value that actually reaches the softmax then produces NaN logits
-//! that the engine's existing finite-check trips — safety *and* detectability,
-//! instead of a silently-wrong result.
+//! An earlier draft filled the dummy with a NaN "sentinel" for detectability.
+//! That is wrong: #721 stage 4's decode kernel reads the padded shape and masks
+//! (`score -> -inf` past the live length), and NaN defeats additive masking
+//! (`NaN + (-inf) = NaN`, `exp(NaN) = NaN`), poisoning even the correctly-masked
+//! output. The fill must be chosen from the measured masking rule in
+//! `dummy_fill_and_crossover::masking_determines_the_safe_dummy_fill`: **zeros
+//! when the kernel's tail masking is verified in the EP, never NaN**. These
+//! driver-level tests only need the read to *succeed and be consistent*, so
+//! they write an arbitrary [`READBACK_MARKER`] to prove the mapping and its
+//! aliasing — that byte is a test probe, not the production fill.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -51,11 +50,11 @@ use std::time::Instant;
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
 
-/// `0xFF` bytes: a NaN in f16 (`0xFFFF`), bf16 (`0xFFFF`) and f32
-/// (`0xFFFFFFFF`) — every float width the KV cache uses. A dummy value that
-/// reaches the softmax becomes a NaN logit the finite-check catches, rather
-/// than a zero that softmax would silently weight `exp(0) = 1`.
-const SENTINEL: u8 = 0xFF;
+/// An arbitrary non-zero byte used only to prove a dummy read returns what was
+/// written and that every tail VA aliases the one physical page. It is **not**
+/// the production fill — that is decided by the masking rule (zeros, never NaN;
+/// see `dummy_fill_and_crossover`).
+const READBACK_MARKER: u8 = 0x5a;
 
 fn require_cuda() -> Arc<CudaContext> {
     match CudaContext::new(0) {
@@ -231,15 +230,6 @@ impl Drop for CapturedCopy {
     }
 }
 
-/// True while every 2-byte lane of `bytes` is a NaN f16 (all-ones exponent,
-/// non-zero mantissa) — the property the engine's finite-check on logits trips.
-fn all_f16_lanes_are_nan(bytes: &[u8]) -> bool {
-    bytes.chunks_exact(2).all(|lane| {
-        let bits = u16::from_le_bytes([lane[0], lane[1]]);
-        (bits & 0x7c00) == 0x7c00 && (bits & 0x03ff) != 0
-    })
-}
-
 /// Q1 — the dummy page removes the fault. #772 proved a padded read one byte
 /// into the uncommitted tail faults `CUDA_ERROR_INVALID_VALUE`. Here one dummy
 /// physical handle mapped across every tail granule makes the same padded read
@@ -288,11 +278,13 @@ fn dummy_backed_tail_removes_the_padded_read_fault() {
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // Fill the live prefix with ordinary data and, through one tail VA,
-        // fill the shared dummy page with the sentinel. Because every tail
-        // granule aliases the one dummy handle, this single write is visible at
-        // all of them.
+        // write an arbitrary readback marker into the shared dummy page. Because
+        // every tail granule aliases the one dummy handle, this single write is
+        // visible at all of them. The marker only proves the read works and
+        // aliases; the production fill is decided by the masking rule (zeros,
+        // never NaN), not here.
         write_host(base, 0x11, live);
-        write_host(base + live as u64, SENTINEL, granule);
+        write_host(base + live as u64, READBACK_MARKER, granule);
 
         // The #772 fault, now backed: a full-padded host read across the whole
         // reservation (live prefix + dummy tail) succeeds where the unbacked
@@ -310,8 +302,8 @@ fn dummy_backed_tail_removes_the_padded_read_fault() {
             "live prefix must survive the dummy mapping"
         );
         assert!(
-            host[live..].iter().all(|&b| b == SENTINEL),
-            "every dummy-backed tail byte must read the sentinel"
+            host[live..].iter().all(|&b| b == READBACK_MARKER),
+            "every dummy-backed tail byte must read back the marker written through one alias"
         );
 
         // The decode hot path: a captured graph that reads the entire padded
@@ -327,8 +319,8 @@ fn dummy_backed_tail_removes_the_padded_read_fault() {
         let copied = read_host(sink, total);
         assert!(
             copied[..live].iter().all(|&b| b == 0x11)
-                && copied[live..].iter().all(|&b| b == SENTINEL),
-            "the captured copy must reproduce the live prefix and the sentinel tail"
+                && copied[live..].iter().all(|&b| b == READBACK_MARKER),
+            "the captured copy must reproduce the live prefix and the dummy-backed tail"
         );
     }));
 
@@ -349,60 +341,6 @@ fn dummy_backed_tail_removes_the_padded_read_fault() {
     free_reservation(sink, total);
     free_reservation(base, total);
     destroy_stream(stream);
-    result.unwrap();
-}
-
-/// Q2 — a dummy read is detectable, not silent. The whole point of the sentinel
-/// (over #759's zero fill) is that a value which slips through into the softmax
-/// is loudly broken. This confirms the dummy page reads back as a NaN in every
-/// float width, and is emphatically not the silently-neutral zero #759 assumed.
-#[cfg_attr(
-    not(feature = "gpu-tests"),
-    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-)]
-#[test]
-fn dummy_read_is_detectable_not_silent() {
-    let context = require_cuda();
-    context.bind_to_thread().expect("bind CUDA context");
-    let device = 0;
-    let granule = granularity(device);
-
-    let base = reserve(granule);
-    let dummy = create_handle(device, granule);
-    map_handle(device, base, granule, dummy);
-
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        write_host(base, SENTINEL, granule);
-        let seen = read_host(base, granule);
-        assert!(
-            seen.iter().all(|&b| b == SENTINEL),
-            "the dummy page must read back the sentinel byte pattern"
-        );
-        assert!(
-            seen.iter().any(|&b| b != 0),
-            "the sentinel must not be zero: a zero dummy is softmax-neutral and silently wrong, \
-             the exact failure mode #759 assumed was safe"
-        );
-        assert!(
-            all_f16_lanes_are_nan(&seen),
-            "every f16 lane of the dummy page must be a NaN so a value reaching the softmax \
-             produces a non-finite logit the engine's finite-check trips"
-        );
-        // f32 view: 0xFFFFFFFF is also NaN, so wider-dtype reads are caught too.
-        assert!(
-            seen.chunks_exact(4)
-                .all(|lane| { f32::from_le_bytes([lane[0], lane[1], lane[2], lane[3]]).is_nan() }),
-            "every f32 lane of the dummy page must be NaN as well"
-        );
-        eprintln!(
-            "Q2 sentinel: dummy page reads 0x{SENTINEL:02x} bytes -> NaN in f16/bf16/f32; \
-             detectable, not the softmax-neutral zero #759 assumed"
-        );
-    }));
-
-    unmap(base, granule);
-    release_handle(dummy);
-    free_reservation(base, granule);
     result.unwrap();
 }
 

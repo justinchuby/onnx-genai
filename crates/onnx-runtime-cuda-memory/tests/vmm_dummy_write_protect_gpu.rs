@@ -25,7 +25,9 @@ use std::sync::Arc;
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
 
-const SENTINEL: u8 = 0xFF;
+/// Arbitrary non-zero byte written to confirm reads work; not the production
+/// fill (which the masking rule decides — zeros, never NaN).
+const READBACK_MARKER: u8 = 0x5a;
 
 fn require_cuda() -> Arc<CudaContext> {
     match CudaContext::new(0) {
@@ -179,8 +181,9 @@ fn read_only_dummy_write_fault_is_non_sticky() {
 
     let base = reserve(granule);
     let dummy = create_handle(device, granule);
-    // Fill the dummy with the sentinel while it is still writable, then downgrade
-    // the mapping to read-only — the production posture for a shared dummy page.
+    // Fill the dummy with a readback marker while it is still writable, then
+    // downgrade the mapping to read-only — the production posture for a shared
+    // dummy page.
     map(
         device,
         base,
@@ -190,7 +193,7 @@ fn read_only_dummy_write_fault_is_non_sticky() {
     );
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        write_host(base, SENTINEL, granule);
+        write_host(base, READBACK_MARKER, granule);
         set_access_flags(
             device,
             base,
@@ -207,7 +210,7 @@ fn read_only_dummy_write_fault_is_non_sticky() {
             "a read of the read-only dummy must still succeed; got {read:?}"
         );
         assert!(
-            back.iter().all(|&b| b == SENTINEL),
+            back.iter().all(|&b| b == READBACK_MARKER),
             "read-only dummy keeps its contents"
         );
 
