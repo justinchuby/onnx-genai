@@ -44,6 +44,7 @@ members = [
     # ── Python packaging + unified CLI (onnx-genai / onnx-genai-server wheels) ──
     "crates/onnx-genai-python",
     "crates/onnx-genai-cli",
+    "crates/onnx-genai-cuda-version-guard",
 
     # ── Protocol conformance framework (new — see docs/PRESSURE_PROTOCOL_IMPL.md) ──
     "crates/onnx-runtime-protocol-trace",

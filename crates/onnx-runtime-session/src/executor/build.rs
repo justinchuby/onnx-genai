@@ -495,6 +495,7 @@ impl Executor {
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
 
         let plan_len = plan.len();
+        let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
             graph,
             weights,
@@ -524,6 +525,7 @@ impl Executor {
             capture_warm_shapes: HashMap::new(),
             capture_warm_seeded: HashMap::new(),
             capture_quarantine_ops: HashSet::new(),
+            capture_growing_symbols,
             last_capture_failed_node: None,
             views: HashMap::new(),
             pinned: HashSet::new(),
@@ -1701,6 +1703,8 @@ impl Executor {
                 .collect();
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
+            let seq_independent =
+                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -1708,6 +1712,7 @@ impl Executor {
                 &input_dtypes,
                 &constant_inputs,
                 opset,
+                seq_independent,
                 self.ep.as_ref(),
             )?;
             // Pre-populate the kernel binding so the first decode step already

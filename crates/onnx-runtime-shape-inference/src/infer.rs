@@ -172,6 +172,22 @@ impl InferenceRegistry {
                 .or_insert_with(|| SymbolConstraints::new(sym, None));
         }
 
+        // Persist the authoritative symbol-lineage records for this graph. A
+        // fresh (overwriting) assignment, not an append: each inference run is a
+        // complete pass, so the last run's records are the ones that match the
+        // shapes just written back. Consumers (e.g. the CUDA-graph
+        // capture-eligibility classifier) read these instead of re-deriving a
+        // partial copy of `broadcast_dim`'s/`lower`'s lineage per op.
+        graph.symbol_unifications = interner.unifications().to_vec();
+        // Derivation edges can be recorded on every cache hit for a hot derived
+        // dim, so dedup before persisting (order-independent consumers).
+        let mut derivations = interner.derivations().to_vec();
+        derivations.sort_unstable_by_key(|&(SymbolId(d), SymbolId(s))| (d, s));
+        derivations.dedup();
+        graph.symbol_derivations = derivations;
+        graph.symbol_opaque = interner.opaque().to_vec();
+        graph.inference_symbol_floor = Some(interner.initial_floor());
+
         let unresolved: Vec<ValueId> = graph
             .values
             .keys()

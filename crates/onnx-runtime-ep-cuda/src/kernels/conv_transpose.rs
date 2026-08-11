@@ -408,6 +408,9 @@ impl Kernel for ConvTransposeKernel {
             })
         }
         .map_err(|error| driver_err("launch ConvTranspose", error))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }

@@ -9,7 +9,7 @@ keywords = ["onnx", "runtime", "inference", "ffi"]
 categories = ["api-bindings", "science"]
 
 [features]
-default = ["cuda-12060"]
+default = ["cuda-13000"]
 # `cuda` pulls in `libloading` so the shared-KV grow path can dynamically load
 # cudart and issue device-to-device copies (see `src/cuda_rt.rs`). It is not
 # linked at build time, keeping non-CUDA builds free of a CUDA toolkit.
@@ -18,17 +18,17 @@ default = ["cuda-12060"]
 # CUDA toolkit) so the captured greedy decode can keep logits on-device and run
 # an on-device argmax kernel instead of copying the full vocabulary host-side.
 #
-# `cuda` uses the CUDA 12.6 API set by default through this crate's default
+# `cuda` uses the CUDA 13.0 API set by default through this crate's default
 # features. Downstreams that need another API version must disable default
 # features and enable exactly one `cuda-*` feature alongside `cuda`; cudarc's
 # generated bindings cannot compile with multiple CUDA-version features active.
-cuda = ["dep:libloading", "dep:cudarc"]
+cuda = ["dep:libloading", "dep:cudarc", "onnx-genai-cuda-version-guard/cuda"]
 # Weak passthroughs keep selecting a CUDA API version from activating the
 # optional cudarc dependency unless `cuda` is also enabled.
-cuda-12060 = ["cudarc?/cuda-12060"]
-cuda-12080 = ["cudarc?/cuda-12080"]
-cuda-12090 = ["cudarc?/cuda-12090"]
-cuda-13000 = ["cudarc?/cuda-13000"]
+cuda-12060 = ["cudarc?/cuda-12060", "onnx-genai-cuda-version-guard/cuda-12060"]
+cuda-12080 = ["cudarc?/cuda-12080", "onnx-genai-cuda-version-guard/cuda-12080"]
+cuda-12090 = ["cudarc?/cuda-12090", "onnx-genai-cuda-version-guard/cuda-12090"]
+cuda-13000 = ["cudarc?/cuda-13000", "onnx-genai-cuda-version-guard/cuda-13000"]
 
 [dependencies]
 half = { workspace = true, features = ["use-intrinsics"] }
@@ -58,6 +58,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
+
+[build-dependencies]
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5" }
 
 [lints]
 workspace = true
