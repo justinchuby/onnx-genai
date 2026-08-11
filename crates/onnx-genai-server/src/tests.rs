@@ -1809,6 +1809,88 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
 }
 
 #[tokio::test]
+async fn explicit_max_batch_above_one_is_refused_on_non_batching_backend() {
+    // tiny-llm is a plain past/present model with no shared KV buffer on the CPU
+    // EP, so it cannot batch. An explicit `--max-batch 4` must be refused at
+    // startup (issue #750), not silently accepted and served one-at-a-time.
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let error = match AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            max_batch: Some(4),
+            ..ServerConfig::default()
+        },
+    ) {
+        Ok(_) => panic!("explicit --max-batch 4 must be refused on a non-batching backend"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("--max-batch 4") && error.contains("cannot be honored"),
+        "refusal must name the flag and the reason: {error}"
+    );
+}
+
+#[tokio::test]
+async fn default_max_batch_is_silently_clamped_on_non_batching_backend() {
+    // With no explicit `--max-batch`, the same non-batching model must still load
+    // (the default width is clamped, not refused), and `/v1/resources` must
+    // report the honest capability so an operator is not left guessing.
+    let router = app(tiny_state());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["batching"]["supported"], false,
+        "tiny-llm cannot batch on the CPU EP"
+    );
+    assert_eq!(
+        body["batching"]["effective_max_batch"], 1,
+        "non-batching backend must clamp the effective width to 1"
+    );
+    assert!(
+        body["batching"]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "batching report must carry a non-empty reason"
+    );
+}
+
+#[tokio::test]
+async fn resources_reports_batching_supported_on_static_cache_backend() {
+    // The static-cache fixture decodes a shared batch, so the report must say so:
+    // this is the positive control proving the capability is read from the decode
+    // path and not hard-coded to false.
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let state =
+        AppState::load(&model_dir, Some("tiny-llm-scatter".to_string())).expect("load scatter");
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["batching"]["supported"], true,
+        "static-cache decode supports continuous batching"
+    );
+}
+
+#[tokio::test]
 async fn admin_vram_override_requires_engine_runtime_override() {
     let response = app(resource_state(false))
         .oneshot(

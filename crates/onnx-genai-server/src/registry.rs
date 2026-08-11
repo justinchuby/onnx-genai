@@ -799,6 +799,9 @@ mod tests {
                     "registry test stub",
                 )),
                 device_authority: None,
+                // A stub drives no engine, so it advertises the honest "no
+                // batching" report used by every non-batching backend.
+                batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
             },
             tokenizer,
             chat_template: None,

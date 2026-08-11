@@ -126,6 +126,13 @@ pub(crate) struct GenerationMetrics {
 impl GenerationMetrics {
     pub(crate) fn start() -> Self {
         decrement(&REGISTRY.pending);
+        // NOTE (issue #750): this counts *admitted generations*, not sequences
+        // that are actually co-decoded in one batched forward pass. On a backend
+        // that cannot batch (native, or a legacy / non-shared-buffer ORT model)
+        // this gauge still climbs with concurrent requests even though each is
+        // decoded one at a time via the per-request fallback path. That is why
+        // `onnx_genai_batch_size_current` alone never revealed the missing
+        // batching — read `/v1/resources` `batching.supported` for the truth.
         REGISTRY.batch_size.fetch_add(1, Ordering::Relaxed);
         Self {
             started: Instant::now(),
@@ -289,7 +296,9 @@ pub(crate) fn encode_prometheus() -> String {
     gauge(
         &mut output,
         "onnx_genai_batch_size_current",
-        "Current generation batch size.",
+        // Counts admitted generations, not sequences co-decoded in one batched
+        // pass; it moves even on non-batching backends (issue #750).
+        "Current number of admitted generations (not necessarily co-batched).",
         REGISTRY.batch_size.load(Ordering::Relaxed),
     );
     let hits = REGISTRY.prefix_cache_hits.load(Ordering::Relaxed);
