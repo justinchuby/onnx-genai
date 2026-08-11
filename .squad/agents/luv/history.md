@@ -65,3 +65,16 @@ Re-reviewed commit `142cb563c5` for @justinchuby. Verdict: APPROVE. The fix corr
 - All 96 LayerNorm tests pass, no regressions
 
 ### Honest test count: 17 BF16 CPU EP operator tests
+
+## 2026-08-11 — PR #762 third review (head 034876d30)
+
+**Task:** Third adversarial review of PR #762.
+
+**Verdict:** No blockers. Substantive findings:
+
+- **S1 (HIGH):** Optional-slot conformance tests may be vacuous — claim filter at ep.rs:275 rejects `DataType::Undefined` outputs; absent optional outputs use that dtype; EP likely declines these nodes; ORT falls back silently. BL2 compute-path fix is dead code in ORT plugin path.
+- **S2 (LOW):** LayerNorm axis bounds allows `resolved == rank` (off-by-one vs ONNX spec).
+- **S3 (LOW):** Scratch buffer hardcodes 4 bytes/element; unsafe for f64/i64.
+- Confirmed Isidore's ABI fixes, Freysa's fallback disable, Sebastian's runtime axis genuine.
+
+**Outcome:** S1 confirmed by Mariette. Fixes landed via Mariette, Challenger, Coco, Resch, Rachael chain. Reviewer lockout held.

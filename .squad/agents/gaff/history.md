@@ -103,3 +103,22 @@ comment clarity. Decision written to `decisions/inbox/gaff-review-pr31973.md`.
 **PR #762 re-review at `31687667a` → NO BLOCKERS:** All four B items resolved. 211+ tests pass. CUDA docs honest.
 
 **PR #31973 review:** 40/40 tests pass. Welford pairwise merge correct. Centered two-pass approach verified. Two substantive items (S1 RMSNorm sum, S2 reference mismatch comment).
+
+**PR #762 final delta review at `bb280c0ea` (2026-08-11):** Scoped to Rachael's test-hardening + Zhora's doc pass. Assertions are genuinely falsifiable — `"cpu_ep"` is our EP (not ORT's `CPUExecutionProvider`), `disable_cpu_ep_fallback=1` prevents silent fallback, `Session_GetEpGraphAssignmentInfo` directly queries node ownership. BL1 shape assertions intact. One substantive: helper duplicated across two test files (not blocking). CUDA honesty preserved. **Ready to leave draft: yes.**
+
+## 2026-08-11 — PR #762 final scoped delta review
+
+**Task:** Final delta review of commits `c1d2556b5` through `bb280c0ea`.
+
+**Verdict:** No blockers. Ready.
+
+**Verified:**
+- EP name `"cpu_ep"` originates from `provider.rs:120`, distinct from ORT's `"CPUExecutionProvider"`.
+- `disable_cpu_ep_fallback=1` set before session creation in both test files.
+- `Session_GetEpGraphAssignmentInfo` + subgraph/node iteration logic correct in both copies.
+- BL1 shape assertions intact: mean/inv_std `[2, 3, 1]`, value assertions `[2.5, 6.5, 10.5, 14.5, 18.5, 22.5]`.
+- No CUDA hardware claims in docs.
+
+**Substantive finding:** Helper duplication — `layernorm_dynamic_axis.rs:155` and `plugin_ort_e2e.rs:838` define equivalent `assert_op_assigned_to_our_ep` independently. Will drift. Tech debt for follow-up.
+
+Took on trust: the "269 passed" figure; Rachael's forced-failure screenshot (consistent with code logic).

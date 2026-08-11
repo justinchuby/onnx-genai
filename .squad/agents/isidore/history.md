@@ -162,3 +162,15 @@ grep for duplicate ABI symbols → none found
 - `cargo clippy` on owned crates: clean.
 - `cargo fmt --check`: clean.
 - Workspace clippy has pre-existing failures in `onnx-genai-engine` (not mine).
+
+## 2026-08-11 — PR #762 third corrective wave: ABI safety
+
+**Task:** Fix ABI issues: `NxrtStatus` UB from unknown discriminant, `struct_size` not checked before vtable access, CUDA diagnostic status loss.
+
+**Commits:** `94bbbe545`, `24ba2fe31`
+
+- `NxrtStatus.code` is now raw `u32` (wire type). Safe accessor `status_code() -> Option<NxrtStatusCode>` uses `from_u32()`. Unknown codes → `None` → fail closed. No transmute UB.
+- Host validates `struct_size` before calling through any vtable slot.
+- CUDA plugin initialises ORT host API before running diagnostics.
+
+**Outcome:** All three ABI issues genuinely fixed. Verified by Luv. Struct size unchanged (264 bytes).

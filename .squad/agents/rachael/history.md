@@ -77,3 +77,17 @@ Full pre-compaction history in `history-archive.md`.
 **Files modified:**
 - `crates/onnx-runtime-ep-cpu-plugin/tests/layernorm_dynamic_axis.rs`
 - `crates/onnx-runtime-ep-cpu-plugin/tests/plugin_ort_e2e.rs`
+
+## 2026-08-11 — PR #762 final test hardening
+
+**Task:** Harden BL1 regression test (lacked fallback guard per Pris). Add f16/bf16 and LayerNorm/RMSNorm assignment assertions.
+
+**Commit:** `c1d2556b5`
+
+- `layernorm_dynamic_axis.rs`: added `disable_cpu_ep_fallback=1` and EP assignment assertion for `LayerNormalization`.
+- New conformance tests: `conformance_add_float16`, `conformance_add_bfloat16`, `conformance_layer_norm_multi_output`, `conformance_layer_norm_neg_axis`, `conformance_rms_norm` — all with assignment assertions.
+- 14 total EP assignment assertions across two test files.
+- BL1 shape assertions (mean/inv_std shape `[2, 3, 1]`) fully preserved.
+- Non-vacuity proved: forced `"Relu"` assertion in two tests produced correct failure messages.
+
+**Outcome:** Gaff's final review confirmed assertions real and falsifiable, EP name correct, BL1 logic preserved. PR marked ready for review.

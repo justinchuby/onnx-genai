@@ -86,3 +86,17 @@ Full pre-compaction history in `history-archive.md`.
 - **Task 2:** Replaced `unwrap_or(0)` with named `DIM_UNKNOWN` constant + loud invariant
   documenting that kernels must not pre-allocate from compile-time shapes.
 - 269 passed, 0 failed across all 5 EP crates.
+
+## 2026-08-11 — PR #762: Session_GetEpGraphAssignmentInfo wiring
+
+**Task:** Wire `Session_GetEpGraphAssignmentInfo` (present since ORT 1.24; corrected by Fact Checker).
+
+**Commit:** `e0ef1f0a8`
+
+- Enable `session.record_ep_graph_assignment_info=1` in `conformance_setup`.
+- Use `Session_GetEpGraphAssignmentInfo` → `EpAssignedSubgraph_GetEpName` → `EpAssignedNode_GetOperatorType` to query per-node EP assignment.
+- 8 conformance tests now assert specific ops assigned to `"cpu_ep"` (distinct from ORT's `"CPUExecutionProvider"` by exact string).
+- `DIM_UNKNOWN = 0` constant documented with invariant comment.
+- Non-vacuity: forced `"Relu"` assertion produces expected failure message.
+
+**Outcome:** Pris's sixth review found BL1 regression test still lacked fallback guard. Rachael hardened.

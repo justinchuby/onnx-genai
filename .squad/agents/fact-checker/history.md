@@ -32,3 +32,13 @@
 - Output: `.squad/decisions/inbox/fact-checker-fifth-review-762.md`
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-11 — PR #762 fifth review: API existence check
+
+**Task:** Fifth review of PR #762. Verify factual claims.
+
+**Key finding:** Contradicted the claim that ORT 1.27 lacks per-node provider attribution. `Session_GetEpGraphAssignmentInfo` has existed since ORT 1.24. Two prior deferrals (Freysa, Coco) cited a non-existent API gap. API present in the generated bindings; confirmed by examining ORT header and generated Rust bindings.
+
+**Outcome:** Resch wired the API in; 8 conformance tests now assert specific op assignments to `"cpu_ep"`.
+
+**Lesson reinforced:** Verify an API's absence before deferring on it. Check the generated bindings.

@@ -41,3 +41,16 @@ Full pre-compaction history in `history-archive.md`.
 - Swept docs: updated 8 stale SHA refs in `NXRT_ABI.md`, stale commit in `EP_PLUGIN_EXPORT.md`, rewrote header in `EP_PLUGIN_EXPORT_PR.md`, updated `EP_PLUGIN_EXPORT_INVENTORY.md`.
 - `CUDA_EP_STATUS.md` was already accurate — no changes needed.
 - No code modified. PR remains draft. Decision record at `.squad/decisions/inbox/zhora-final-docs-762.md`.
+
+## 2026-08-11 — PR #762 documentation accuracy pass
+
+**Task:** Docs and PR-body accuracy pass before undrafting.
+
+**Commit:** `bb280c0ea`
+
+- PR body completely rewritten: all three late-breaking blockers documented, test story upgraded (14 assignment assertions, non-vacuity proof), correct numbers (269 EP tests, 4598/20/436 workspace), explicit "What Is NOT Proven" section for CUDA.
+- `docs/NXRT_ABI.md`, `docs/EP_PLUGIN_EXPORT.md`, `docs/EP_PLUGIN_EXPORT_PR.md`, `docs/EP_PLUGIN_EXPORT_INVENTORY.md`: 8 stale SHA refs (`fb9d757b3`, `62f23440f`) → `c1d2556b5`.
+- `docs/CUDA_EP_STATUS.md`: already accurate, no change.
+- No CUDA hardware claims made anywhere.
+
+**Outcome:** Gaff's final review confirmed doc accuracy. PR marked ready for review.

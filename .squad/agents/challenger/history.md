@@ -52,3 +52,16 @@ read `onnxruntime_c_api.h` and `onnxruntime_ep_c_api.h` directly.
 **What changed:** Full authoritative vtable dump and call sequence written to
 `docs/EP_PLUGIN_EXPORT_ABI_TRUTH.md`. Decision record filed. Implementation
 unblocked for e2e testing.
+
+## 2026-08-11 — PR #762 fourth review (fbd565160..4757e25b6)
+
+**Task:** Fourth adversarial review of PR #762.
+
+**Verdict:** 2 BLOCKERS.
+
+- **B1 (BLOCKER):** `__absent_output_*` string sentinel is forgeable from model content. In-band signalling; any model naming a tensor `__absent_output_0_2` bypasses dtype validation and allocates a scratch buffer. Replace with out-of-band `HashSet<ValueId>` (arena indices uninfluenceable from model content).
+- **B2 (BLOCKER):** `filter_map(|d| d.as_static())` on shape dims destroys rank. `[batch, seq, 768]` → `[768]`. Same class as original output-slot compaction bug. Fix with `map(|d| d.as_static())` → `Vec<Option<usize>>`.
+- S1: `conformance_mixed_partition` doesn't assert EP claimed any subgraph.
+- S3: `input_slots` logic verified correct for all-present/absent-interior/trailing cases.
+
+Coco fixed both blockers.

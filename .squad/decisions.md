@@ -227,3 +227,34 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 **CUDA upstream candidates dead:** Both MatMulNBits int4 block-128 GEMV and QMoE parallel routing are already covered by upstream ORT `main`. No portable gap found. Our CUDA advantages (graph capture, VMM, tiered KV) are runtime-level and not portable.
 
 **`.squad/` leakage purged from both upstream branches via `filter-branch` + force-push.** Trees verified byte-identical after purge.
+
+## Current active wave — 2026-08-11 (PR #762 third corrective wave)
+
+### PR #762 — optional slot fidelity, ABI safety, test integrity (third rejection correction)
+
+**By:** Leon, Sebastian, Isidore, Freysa (fixes); Luv, Challenger, Fact Checker, Pris, Gaff (reviews); Mariette, Coco, Resch, Rachael (corrections/hardening); Zhora (docs)
+
+**Outcome:** PR #762 marked **ready for review**. EP crates 269 passed / 0 failed; workspace 4598 passed / 20 failed / 436 ignored — the 20 pre-existing on base `675b697bc`, none in EP crates. Five EP crates clippy-clean; fmt clean.
+
+**Key resolved defects:**
+
+- **BL2 — Output slot compaction (Leon):** `filter_map` in `graph_reader.rs` compacted optional absent outputs, breaking positional indexing. Fixed with `ValueId` placeholders for empty-named slots and scratch buffers for `DataType::Undefined` slots. `NodeInputSource::Absent` + `TensorView::absent()` added for BL3.
+- **BL1 — LayerNorm axis pre-resolved against truncated rank (Sebastian):** `filter_map(|d| d.as_static())` collapsed `[B, S, H]` to `[H]`, resolving `axis=-1` to index 0. Fixed: `raw_axis: i64` stored; resolved per-invocation against actual runtime rank.
+- **ABI safety (Isidore):** `NxrtStatus.code` is now raw `u32`; checked conversion via `NxrtStatusCode::from_u32()`; unknown codes → `None` → fail closed. `struct_size` validated before vtable access. CUDA diagnostics initialised before running status queries.
+- **`disable_cpu_ep_fallback` (Freysa):** Set in `conformance_setup()`. Forces ORT to error if any node falls back; proved non-vacuous by observing `mixed_partition` fail correctly before exemption.
+- **Dead code / EP declined optional-slot nodes (Mariette):** With fallback=1, optional-slot tests failed — EP was declining nodes. Three roots: claim filter rejecting `DataType::Undefined` outputs; `Clip` missing from shape-inference list; single-kernel fast path skipping input slot mapping. Fixed all three; scratch buffer sized from primary output dtype, not hardcoded 4 bytes.
+- **Forgeable sentinel (Coco):** `__absent_output_*` prefix replaced with `absent_outputs: HashSet<ValueId>` (out-of-band; arena indices are uninfluenceable from model content). Rank destruction eliminated: `filter_map` → `map` → `Vec<Option<usize>>`; `build_conv` fails closed on `None` dims.
+- **`Session_GetEpGraphAssignmentInfo` (Resch):** False deferral claim corrected by Fact Checker — API present since ORT 1.24. Wired in; 8 tests now assert specific ops owned by `"cpu_ep"`.
+- **Test hardening (Rachael):** 14 tests now assert EP assignment. f16/bf16 and LayerNorm/RMSNorm coverage added. Non-vacuity proved via forced `"Relu"` assertion failures.
+- **Docs accuracy (Zhora):** PR body rewritten; 8 stale SHA refs updated to `c1d2556b5`; explicit "What Is NOT Proven" section for CUDA hardware gap.
+- **Final delta (Gaff):** No blockers. Helper duplication in test files noted as follow-up tech debt.
+
+**Reviewer lockout chain:** Deckard → Batty/Sapper/Luba/Iran/Chew → Nabil → Batty → Leon/Sebastian/Isidore/Freysa → Mariette → Coco → Resch → Rachael; Gaff, Holden, Luv, Challenger, Fact Checker, Pris reviewed without revising own findings.
+
+### Durable lessons from PR #762 (third corrective wave)
+
+- **A passing test is not evidence the code under test ran.** Leon's BL2 fix shipped green while our EP declined the nodes and ORT's built-in CPU EP produced correct answers. Require `disable_cpu_ep_fallback=1` **and** `Session_GetEpGraphAssignmentInfo` assignment assertions for every real-ORT test.
+- **Never encode semantics in a name.** `__absent_output_*` matched by `starts_with` was forgeable from untrusted model content. Use out-of-band state (`HashSet<ValueId>`) — ValueIds are arena indices the reader assigns; model content cannot influence them.
+- **`filter_map` is wrong wherever position or rank is load-bearing.** It caused four separate bugs here: compacted output slots, compacted input slots, truncated rank for axis resolution, and truncated rank at two further sites. Use `map` to `Option<T>` and preserve length.
+- **Verify an API's absence before deferring on it.** Two deferrals were justified by ORT APIs that existed: `MemoryDevice_GetDeviceId` (1.27) and `Session_GetEpGraphAssignmentInfo` (since 1.24). Check the generated bindings before filing a deferral.
+- **Reviewer lockout held across seven rounds.** Chain above closed cleanly; no author revised their own rejected artifact.

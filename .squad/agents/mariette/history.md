@@ -31,3 +31,19 @@ Full pre-compaction history in `history-archive.md`.
 - Scratch buffer sized from primary output dtype
 
 **Result:** 266 passed, 0 failed. All optional_slots tests pass with fallback disabled.
+
+## 2026-08-11 — PR #762: S1–S3 optional-slot liveness proof
+
+**Task:** Confirm and fix S1–S3 from Luv's review.
+
+**Commits:** `fbd565160`, `4757e25b6`
+
+**Findings:** With `disable_cpu_ep_fallback=1`, optional-slot tests failed at `CreateSession` — EP was declining nodes. Three root causes:
+1. Claim filter (`ep.rs:275`) rejects `DataType::Undefined` outputs.
+2. Dtype filter same rejection.
+3. `Clip` missing from shape inference op lists.
+4. Single-kernel fast path passed ORT inputs directly without injecting absent sentinels.
+
+**Fixes:** Claim filter carve-out for absent outputs; Clip added to `SameAsInput(0)`; `input_slots` mapping in fast path; axis bounds: `>= rank`; scratch buffer: `numel * primary_output.byte_size()`.
+
+**Outcome:** Challenger's review found the `__absent_output_*` sentinel was forgeable from model content. Locked out; Coco fixed.

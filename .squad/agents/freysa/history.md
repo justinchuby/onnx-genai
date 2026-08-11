@@ -31,3 +31,16 @@ WP-B landed: Freysa's raw-protobuf admission rejection was resolved in the final
 - Proved non-vacuity: with flag applied universally, mixed_partition correctly fails with ORT's "fallback disabled" error
 - Profiling assertion not practical: ORT 1.27 plugin-EP API has no post-session per-node provider query
 - 23 tests pass, 0 fail. No test count decrease.
+
+## 2026-08-11 — PR #762 third corrective wave: disable_cpu_ep_fallback
+
+**Task:** Set `session.disable_cpu_ep_fallback=1` in `conformance_setup()` to prove our EP executes nodes.
+
+**Commit:** `034876d30`
+
+- Applied to all 21 conformance tests. `conformance_mixed_partition` exempted (`disable_fallback: false`) — intentionally tests unsupported ops.
+- Non-vacuity proved: before exemption, `mixed_partition` failed with ORT error about nodes assigned to default CPU EP with fallback explicitly disabled.
+
+**Outcome:** Correct. Later in the wave, Fact Checker found `Session_GetEpGraphAssignmentInfo` existed since ORT 1.24 — the profiling assertion deferral was incorrect. Resch wired the direct API.
+
+**Lesson:** Verify an API's absence before deferring on it. Check the generated bindings.

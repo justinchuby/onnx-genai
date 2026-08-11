@@ -29,3 +29,17 @@ Full pre-compaction history in `history-archive.md`.
   - **Registry:** `build_ort_kernel_registry` validates `end_version >= since_version > 0`, collects per-entry failures in `RegistryBuildOutcome`, and surfaces them as actionable status in factory CreateEp.
   - **Test:** `layernorm_dynamic_axis.rs` — real ORT, dynamic `[B, S, H]`, axis=-1, asserts Mean/InvStdDev shape `[2, 3, 1]`. Fails pre-fix (axis resolves against `[4]` rank-1).
   - Test counts: 216 passed / 0 failed (baseline was 215).
+
+## 2026-08-11 — PR #762 third corrective wave: BL1 runtime axis resolution
+
+**Task:** BL1 fix — `raw_axis` preserved, resolved at runtime against actual input rank; `build_subgraph_routing` emits `NodeInputSource::Absent`; `end_version` validation.
+
+**Commit:** `168e40c3e`
+
+- `ShapeInference::LayerNorm` stores `raw_axis: i64`; resolved per-invocation in `infer_shapes()` against actual input rank.
+- Eliminates false resolution of `axis=-1` to index 0 on `[B, S, H]` inputs where B and S are symbolic (filter_map collapsed them).
+- `ep.rs` emits `NodeInputSource::Absent` for None inputs in `build_subgraph_routing`.
+
+**Outcome:** BL1 fix genuine. Challenger's review found residual `filter_map(|d| d.as_static())` at claim time in ep.rs still destroyed rank at two sites. Coco fixed.
+
+**Lesson reinforced:** filter_map is wrong wherever position or rank is load-bearing; use map → Vec<Option<usize>>.
