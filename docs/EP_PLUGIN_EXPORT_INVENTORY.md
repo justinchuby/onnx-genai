@@ -65,7 +65,7 @@ Results (non-test, non-mock):
 | **Op coverage** | **109 entries** registered in `src/kernels/mod.rs` (verified with `grep -c "reg.register"` → 109). Covers MatMul, GEMM, custom attention, fused ops, quantized matmul, MoE, activation, norm, element-wise, rotary embedding, etc. — subset of CPU EP coverage. |
 | **Device / memory model** | Device buffers (CUDA device-virtual pointers, not host-dereferenceable). Separate compute stream + transfer stream for async weight paging. CUDA events as `Fence`. Optional VMM arena (physical granule mapping). Memory governor integration. cuBLASLt for GEMM. cuDNN for attention. |
 | **Build deps** | CUDA toolkit ≥ 12.6, cuBLAS, cuDNN, `cudarc`. Does **not** build without CUDA toolkit. Cannot use `--no-default-features` and still compile this crate. |
-| **Readiness for outbound ORT plugin export** | **IMPLEMENTATION-BLOCKED** — `onnx-runtime-ep-cuda-plugin` exists but fails closed (zero factories). Four defects prevent correct operation on any host: (1) separate CUDA runtime/context per component, (2) CreateDataTransfer returns NULL, (3) GetHandle returns NULL stream, (4) Free passes size=0. These are implementation defects, not hardware-absent gaps. See `docs/CUDA_EP_STATUS.md`. |
+| **Readiness for outbound ORT plugin export** | **HARDWARE-BLOCKED** — `onnx-runtime-ep-cuda-plugin` exists and fails closed by design (zero factories when no GPU is available). The four implementation defects (B1–B4) are resolved in code but **unvalidated on hardware** — no self-hosted GPU runner exists. Issue #768 tracks GPU validation. See `docs/CUDA_EP_STATUS.md`. |
 
 ---
 
@@ -160,7 +160,7 @@ Evidence:
 | EP | Crate | `impl EP`? | `todo!`/stubs | Op registrations | Memory model | Build deps | ORT export readiness |
 |---|---|---|---|---|---|---|---|
 | **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | ✅ **DONE (M1+M2)** — `onnx-runtime-ep-cpu-plugin` is a working ORT plugin EP; 23 conformance tests pass including f16/bf16; dtype-aware capability claiming via `GetKernelRegistry` |
-| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🔴 **IMPLEMENTATION-BLOCKED** — `onnx-runtime-ep-cuda-plugin` exists but `CreateEpFactories` returns zero factories (fail-closed). Four implementation defects prevent correct operation on any host, GPU or not. See `docs/CUDA_EP_STATUS.md`. |
+| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🟡 **HARDWARE-BLOCKED** — `onnx-runtime-ep-cuda-plugin` compiles and fails closed by design (zero factories without a GPU). All four implementation defects (B1–B4) are resolved. Unvalidated on hardware; #768 tracks GPU validation. See `docs/CUDA_EP_STATUS.md`. |
 | LegacyOrtEp | `onnx-runtime-ep-api` | Yes (inbound only) | — | — | Inbound adapter | — | Not a candidate |
 | PluginExecutionProvider | `onnx-runtime-session` | Yes (inbound bridge) | — | — | Inbound bridge | — | Not a candidate |
 | onnx-runtime-eager | `onnx-runtime-eager` | No (orchestrator) | — | — | — | — | Not a candidate |
@@ -174,10 +174,10 @@ Re-ran `grep -rn "impl ExecutionProvider" crates/` independently. Results match 
 inventory exactly: 2 production EPs (CPU + CUDA), 2 inbound adapters, 7 test/mock
 implementations (excluded). Inventory is complete and correct.
 
-**CUDA EP status correction:** The CUDA plugin is **implementation-blocked**, not
-merely hardware-blocked or "scaffolded." Four defects found by the rubber-duck review
-of PR #762 prevent correct operation on any host. The plugin now fails closed (zero
-factories). See `docs/CUDA_EP_STATUS.md` for the full specification.
+**CUDA EP status correction:** The CUDA plugin is **hardware-blocked**, not
+implementation-blocked. All four defects (B1–B4) are resolved in code. The plugin
+fails closed (zero factories) when no GPU is present. Hardware validation is tracked
+by #768; the repository has no self-hosted GPU runners.
 
 **CPU EP plugin:** Working end-to-end. 154 lib + 9 parity + 6 ABI + 20 ORT e2e = 189
 passing tests, 1 ignored (LayerNorm Mean-shape bug, being fixed by Batty).

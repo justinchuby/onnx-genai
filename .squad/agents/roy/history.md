@@ -352,3 +352,19 @@ Follow-Ups item 9, decisions inbox).
 **What is genuinely working:** CPU EP plugin (end-to-end with ORT). nxrt native ABI (negotiate → create → compute → release). Workspace compiles.
 
 **What is known-broken:** CUDA EP plugin (implementation-blocked, four defects, fails closed). LayerNorm Mean-shape (being fixed by Batty).
+
+---
+
+## 2026-08-11 — Final documentation pass (PR #762 pre-undraft)
+
+**Task:** Fix stale SHAs, correct CUDA status terminology, rewrite PR body.
+
+**Changes:**
+- `docs/NXRT_ABI.md`: 4× SHA `087d34888` → `fb9d757b3`
+- `docs/EP_PLUGIN_EXPORT_INVENTORY.md`: CUDA status 🔴 IMPLEMENTATION-BLOCKED → 🟡 HARDWARE-BLOCKED (3 locations)
+- `docs/EP_PLUGIN_EXPORT_PR.md`: 2× SHA `087d34888` → `fb9d757b3`
+- PR #762 body: complete rewrite — honest claims only, no CUDA overclaims
+
+**What is genuinely working:** CPU EP plugin (23 ORT conformance tests). nxrt native ABI (10 round-trip tests). Workspace compiles.
+
+**What is known-blocked:** CUDA EP plugin (hardware-blocked — code fixed, no GPU to validate). LayerNorm Mean-shape (being fixed by Batty).

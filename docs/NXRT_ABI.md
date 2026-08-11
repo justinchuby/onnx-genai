@@ -3,7 +3,7 @@
 **Author:** Roy (Lead)
 **Date:** 2026-08-11
 **Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
-**HEAD at time of writing:** `087d34888`
+**HEAD at time of writing:** `fb9d757b3`
 
 ---
 
@@ -28,7 +28,7 @@ genuine workspace member and exports through the macro shipped in that crate.
 
 ## Preamble — What "nxrt ABI" Means Today
 
-| Surface | Committed at HEAD `087d34888` | Location |
+| Surface | Committed at HEAD `fb9d757b3` | Location |
 |---|---|---|
 | **Rust `ExecutionProvider` trait** | ✅ | `crates/onnx-runtime-ep-api/src/provider.rs` |
 | **ORT plugin-EP C ABI adapter** | ✅ | `crates/onnx-runtime-ep-plugin/` |
@@ -236,7 +236,7 @@ misdiagnosed as an ORT ABI discrepancy) and once in nxrt status handling (B3).
 
 ---
 
-## 6. Native nxrt Dynamic ABI — Committed at `087d34888`
+## 6. Native nxrt Dynamic ABI — Committed at `fb9d757b3`
 
 ### 6.1 Overview
 
@@ -262,7 +262,7 @@ Symbol name constants in the ABI crate: `NXRT_SYMBOL_NEGOTIATE = b"NxrtNegotiate
 
 ### 6.3 Version negotiation rules
 
-ABI version at `087d34888`: **major=1, minor=0**.
+ABI version at `fb9d757b3`: **major=1, minor=0**.
 
 1. Host fills `NxrtNegotiateRequest { struct_size, host_range: NxrtVersionRange { major_min, major_max, minor_max } }`.
 2. Plugin's `NxrtNegotiate` checks compatibility and fills `NxrtNegotiateResponse { struct_size, agreed_major, agreed_minor, plugin_range, capability_flags }`.

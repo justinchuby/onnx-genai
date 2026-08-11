@@ -231,7 +231,7 @@ Integration tests covering:
 
 ## Validation
 
-All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `087d34888`,
+All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `fb9d757b3`,
 2026-08-11T01:08Z. Output is quoted verbatim.
 
 ### `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`
@@ -464,9 +464,9 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 | Trait↔C-ABI parity rule | — | ✅ `C_ABI_claims = trait_claims ∩ { for_node != Declined }`. Pinned and tested. Declined set is smaller than originally assumed — Squeeze/ReduceMean/Conv resolve; confirmed Declined: NonZero, opset-13 data-dependent Unsqueeze. | ✅ Unchanged |
 | Fail closed on unsupported capabilities | ✅ `Declined` path; shape-inference rules | ✅ Strengthened — `node_passes_dtype_filter()` adds dtype-level fail-closed gating | ✅ Unchanged |
 | ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim | ✅ Unchanged | ✅ Unchanged |
-| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. | ✅ **GREEN at `087d34888`, 10/10 round-trip passing.** `onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`, and `onnx-runtime-ep-nxrt-testplugin` are genuine workspace members. Exports `NxrtNegotiate`/`NxrtCreateEpFactories`; vtable-based ownership; `struct_size` forward compat; major/minor negotiation; fail-closed on unknown capability bits; panic containment; `export_nxrt_ep_factories!` macro; `Arc<Library>` lifetime guarantee in host loader. ABI unit tests: 30/30 passing. Host roundtrip: **10/10 passing** — env-var race fixed by Pris (`ENV_MUTEX` serializing tests that set `NXRT_TEST_PANIC` / `NXRT_TEST_FACTORY_ERROR`). See [docs/NXRT_ABI.md](docs/NXRT_ABI.md). |
+| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. | ✅ **GREEN at `fb9d757b3`, 10/10 round-trip passing.** `onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`, and `onnx-runtime-ep-nxrt-testplugin` are genuine workspace members. Exports `NxrtNegotiate`/`NxrtCreateEpFactories`; vtable-based ownership; `struct_size` forward compat; major/minor negotiation; fail-closed on unknown capability bits; panic containment; `export_nxrt_ep_factories!` macro; `Arc<Library>` lifetime guarantee in host loader. ABI unit tests: 30/30 passing. Host roundtrip: **10/10 passing** — env-var race fixed by Pris (`ENV_MUTEX` serializing tests that set `NXRT_TEST_PANIC` / `NXRT_TEST_FACTORY_ERROR`). See [docs/NXRT_ABI.md](docs/NXRT_ABI.md). |
 
-**Honest §524 status as of HEAD `087d34888`:**
+**Honest §524 status as of HEAD `fb9d757b3`:**
 - C ABI: ✅ Complete and proven by 23 ORT conformance tests.
 - Rust trait: ✅ **Proven** — 9 parity tests confirm agreement.
 - Fail-closed: ✅ Complete — shape-inference Declined path + dtype filter + nxrt `NXRT_CAP_KNOWN_MASK` reject.
