@@ -20,7 +20,9 @@ use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ep_cuda::{CudaExecutionProvider, GroupQueryAttentionKernel};
+use onnx_runtime_ep_cuda::{
+    CudaExecutionProvider, GroupQueryAttentionBackend, GroupQueryAttentionKernel,
+};
 use onnx_runtime_ir::{DataType, compute_contiguous_strides};
 
 const BATCH: usize = 1;
@@ -128,6 +130,45 @@ fn cpu_reference(
                 acc += scores[p] / denom * value[kvh][p][d].to_f32();
             }
             out[qh * HEAD_DIM + d] = acc;
+        }
+    }
+    out
+}
+
+fn cpu_prefill_reference(
+    query: &[f16],
+    key: &[Vec<Vec<f16>>],
+    value: &[Vec<Vec<f16>>],
+    sequence_length: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; sequence_length * QUERY_HEADS * HEAD_DIM];
+    for query_pos in 0..sequence_length {
+        for qh in 0..QUERY_HEADS {
+            let kvh = qh / GROUP;
+            let mut scores = vec![0.0_f32; query_pos + 1];
+            let mut max_score = f32::NEG_INFINITY;
+            for key_pos in 0..=query_pos {
+                let mut dot = 0.0_f32;
+                for d in 0..HEAD_DIM {
+                    let q_index = (query_pos * QUERY_HEADS + qh) * HEAD_DIM + d;
+                    dot += query[q_index].to_f32() * key[kvh][key_pos][d].to_f32();
+                }
+                scores[key_pos] = dot * scale;
+                max_score = max_score.max(scores[key_pos]);
+            }
+            let mut denominator = 0.0_f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                denominator += *score;
+            }
+            for d in 0..HEAD_DIM {
+                let mut acc = 0.0_f32;
+                for key_pos in 0..=query_pos {
+                    acc += scores[key_pos] / denominator * value[kvh][key_pos][d].to_f32();
+                }
+                out[(query_pos * QUERY_HEADS + qh) * HEAD_DIM + d] = acc;
+            }
         }
     }
     out
@@ -390,6 +431,360 @@ fn seq_major_decode_is_bit_identical_to_head_major() {
         current_value_buffer,
         current_key_buffer,
         query_buffer,
+    ] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
+    const PREFILL_LEN: usize = 10;
+
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let scale = 1.0_f32;
+    let device = ep.device_id();
+
+    let prefill_query: Vec<f16> = (0..PREFILL_LEN * QUERY_HEADS * HEAD_DIM)
+        .map(|i| f16::from_f32(((i * 17 % 97) as f32 - 48.0) / 256.0))
+        .collect();
+    let decode_query: Vec<f16> = (0..QUERY_HEADS * HEAD_DIM)
+        .map(|i| f16::from_f32(((i * 23 % 89) as f32 - 44.0) / 256.0))
+        .collect();
+    let mut key = vec![vec![vec![f16::ZERO; HEAD_DIM]; PREFILL_LEN + 1]; KV_HEADS];
+    let mut value = vec![vec![vec![f16::ZERO; HEAD_DIM]; PREFILL_LEN + 1]; KV_HEADS];
+    for h in 0..KV_HEADS {
+        for t in 0..=PREFILL_LEN {
+            for d in 0..HEAD_DIM {
+                key[h][t][d] =
+                    f16::from_f32((((h * 131 + t * 13 + d * 7) % 101) as f32 - 50.0) / 256.0);
+                value[h][t][d] =
+                    f16::from_f32((((h * 29 + t * 19 + d * 3) % 113) as f32 - 56.0) / 128.0);
+            }
+        }
+    }
+    let flatten_current = |position: usize| {
+        let mut values = vec![f16::ZERO; KV_HEADS * HEAD_DIM];
+        for h in 0..KV_HEADS {
+            for d in 0..HEAD_DIM {
+                values[h * HEAD_DIM + d] = key[h][position][d];
+            }
+        }
+        values
+    };
+    let flatten_prefill = |logical: &[Vec<Vec<f16>>]| {
+        let mut values = vec![f16::ZERO; PREFILL_LEN * KV_HEADS * HEAD_DIM];
+        for t in 0..PREFILL_LEN {
+            for h in 0..KV_HEADS {
+                for d in 0..HEAD_DIM {
+                    values[(t * KV_HEADS + h) * HEAD_DIM + d] = logical[h][t][d];
+                }
+            }
+        }
+        values
+    };
+    let prefill_key = flatten_prefill(&key);
+    let prefill_value = flatten_prefill(&value);
+    let decode_key = flatten_current(PREFILL_LEN);
+    let decode_value = {
+        let mut values = vec![f16::ZERO; KV_HEADS * HEAD_DIM];
+        for h in 0..KV_HEADS {
+            for d in 0..HEAD_DIM {
+                values[h * HEAD_DIM + d] = value[h][PREFILL_LEN][d];
+            }
+        }
+        values
+    };
+
+    let prefill_query_shape = [BATCH, PREFILL_LEN, QUERY_HEADS * HEAD_DIM];
+    let prefill_current_shape = [BATCH, PREFILL_LEN, KV_HEADS * HEAD_DIM];
+    let decode_query_shape = [BATCH, 1, QUERY_HEADS * HEAD_DIM];
+    let decode_current_shape = [BATCH, 1, KV_HEADS * HEAD_DIM];
+    let cache_shape = [BATCH, KV_HEADS, CACHE_CAPACITY, HEAD_DIM];
+    let seqlens_shape = [BATCH];
+    let scalar_shape: [usize; 0] = [];
+    let prefill_query_strides = compute_contiguous_strides(&prefill_query_shape);
+    let prefill_current_strides = compute_contiguous_strides(&prefill_current_shape);
+    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let seqlens_strides = compute_contiguous_strides(&seqlens_shape);
+    let scalar_strides = compute_contiguous_strides(&scalar_shape);
+
+    let prefill_query_buffer = upload(&ep, typed_bytes(&prefill_query)).unwrap();
+    let prefill_key_buffer = upload(&ep, typed_bytes(&prefill_key)).unwrap();
+    let prefill_value_buffer = upload(&ep, typed_bytes(&prefill_value)).unwrap();
+    let decode_query_buffer = upload(&ep, typed_bytes(&decode_query)).unwrap();
+    let decode_key_buffer = upload(&ep, typed_bytes(&decode_key)).unwrap();
+    let decode_value_buffer = upload(&ep, typed_bytes(&decode_value)).unwrap();
+    let prefill_seqlens = [(PREFILL_LEN - 1) as i32];
+    let decode_seqlens = [PREFILL_LEN as i32];
+    let capacity = [CACHE_CAPACITY as i32];
+    let prefill_seqlens_buffer = upload(&ep, typed_bytes(&prefill_seqlens)).unwrap();
+    let decode_seqlens_buffer = upload(&ep, typed_bytes(&decode_seqlens)).unwrap();
+    let capacity_buffer = upload(&ep, typed_bytes(&capacity)).unwrap();
+
+    let run_layout = |seq_major: bool, capture: bool| -> (Vec<u8>, Vec<u8>) {
+        let kernel = GroupQueryAttentionKernel::new(
+            runtime.clone(),
+            QUERY_HEADS,
+            KV_HEADS,
+            Some(scale),
+            false,
+            false,
+            -1,
+            0.0,
+        )
+        .unwrap()
+        .with_backend(GroupQueryAttentionBackend::Fused)
+        .with_kv_layout(if seq_major { 1 } else { 0 });
+        let mut cache_key = ep
+            .allocate(
+                BATCH * KV_HEADS * CACHE_CAPACITY * HEAD_DIM * std::mem::size_of::<f16>(),
+                256,
+            )
+            .unwrap();
+        let mut cache_value = ep
+            .allocate(
+                BATCH * KV_HEADS * CACHE_CAPACITY * HEAD_DIM * std::mem::size_of::<f16>(),
+                256,
+            )
+            .unwrap();
+        let mut prefill_output = ep
+            .allocate(
+                PREFILL_LEN * QUERY_HEADS * HEAD_DIM * std::mem::size_of::<f16>(),
+                256,
+            )
+            .unwrap();
+        let mut decode_output = ep
+            .allocate(QUERY_HEADS * HEAD_DIM * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+
+        {
+            let prefill_inputs = [
+                TensorView::new(
+                    DevicePtr(prefill_query_buffer.as_ptr()),
+                    DataType::Float16,
+                    &prefill_query_shape,
+                    &prefill_query_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(prefill_key_buffer.as_ptr()),
+                    DataType::Float16,
+                    &prefill_current_shape,
+                    &prefill_current_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(prefill_value_buffer.as_ptr()),
+                    DataType::Float16,
+                    &prefill_current_shape,
+                    &prefill_current_strides,
+                    device,
+                ),
+                TensorView::absent(DataType::Float16),
+                TensorView::absent(DataType::Float16),
+                TensorView::new(
+                    DevicePtr(prefill_seqlens_buffer.as_ptr()),
+                    DataType::Int32,
+                    &seqlens_shape,
+                    &seqlens_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(capacity_buffer.as_ptr()),
+                    DataType::Int32,
+                    &scalar_shape,
+                    &scalar_strides,
+                    device,
+                ),
+            ];
+            let mut prefill_outputs = [
+                TensorMut::new(
+                    DevicePtrMut(prefill_output.as_mut_ptr()),
+                    DataType::Float16,
+                    &prefill_query_shape,
+                    &prefill_query_strides,
+                    device,
+                ),
+                TensorMut::new(
+                    DevicePtrMut(cache_key.as_mut_ptr()),
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorMut::new(
+                    DevicePtrMut(cache_value.as_mut_ptr()),
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+            ];
+            kernel
+                .execute(&prefill_inputs, &mut prefill_outputs)
+                .unwrap();
+        }
+
+        {
+            let decode_query_strides = compute_contiguous_strides(&decode_query_shape);
+            let decode_current_strides = compute_contiguous_strides(&decode_current_shape);
+            let decode_inputs = [
+                TensorView::new(
+                    DevicePtr(decode_query_buffer.as_ptr()),
+                    DataType::Float16,
+                    &decode_query_shape,
+                    &decode_query_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(decode_key_buffer.as_ptr()),
+                    DataType::Float16,
+                    &decode_current_shape,
+                    &decode_current_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(decode_value_buffer.as_ptr()),
+                    DataType::Float16,
+                    &decode_current_shape,
+                    &decode_current_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(cache_key.as_ptr()),
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(cache_value.as_ptr()),
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(decode_seqlens_buffer.as_ptr()),
+                    DataType::Int32,
+                    &seqlens_shape,
+                    &seqlens_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(capacity_buffer.as_ptr()),
+                    DataType::Int32,
+                    &scalar_shape,
+                    &scalar_strides,
+                    device,
+                ),
+            ];
+            let mut decode_outputs = [
+                TensorMut::new(
+                    DevicePtrMut(decode_output.as_mut_ptr()),
+                    DataType::Float16,
+                    &decode_query_shape,
+                    &decode_query_strides,
+                    device,
+                ),
+                TensorMut::new(
+                    DevicePtrMut(cache_key.as_mut_ptr()),
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorMut::new(
+                    DevicePtrMut(cache_value.as_mut_ptr()),
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+            ];
+            kernel.execute(&decode_inputs, &mut decode_outputs).unwrap();
+            if capture {
+                runtime.begin_graph_capture(&[]).unwrap();
+                kernel.execute(&decode_inputs, &mut decode_outputs).unwrap();
+                runtime.end_graph_capture().unwrap();
+                assert_eq!(
+                    runtime.graph_segment_count().unwrap(),
+                    1,
+                    "full-generation decode must install one captured segment"
+                );
+                runtime.replay_graph().unwrap();
+                runtime.reset_graph().unwrap();
+            }
+        }
+
+        let prefill_bytes = read(
+            &ep,
+            &prefill_output,
+            PREFILL_LEN * QUERY_HEADS * HEAD_DIM * std::mem::size_of::<f16>(),
+        )
+        .unwrap();
+        let decode_bytes = read(
+            &ep,
+            &decode_output,
+            QUERY_HEADS * HEAD_DIM * std::mem::size_of::<f16>(),
+        )
+        .unwrap();
+        for buffer in [decode_output, prefill_output, cache_value, cache_key] {
+            ep.deallocate(buffer).unwrap();
+        }
+        (prefill_bytes, decode_bytes)
+    };
+
+    let (bnsh_prefill, bnsh_decode) = run_layout(false, false);
+    let (bsnh_prefill, bsnh_decode) = run_layout(true, false);
+    let (bnsh_captured_prefill, bnsh_captured_decode) = run_layout(false, true);
+    let (bsnh_captured_prefill, bsnh_captured_decode) = run_layout(true, true);
+    assert_eq!(bnsh_prefill, bsnh_prefill);
+    assert_eq!(bnsh_decode, bsnh_decode);
+    assert_eq!(bnsh_prefill, bnsh_captured_prefill);
+    assert_eq!(bnsh_decode, bnsh_captured_decode);
+    assert_eq!(bsnh_prefill, bsnh_captured_prefill);
+    assert_eq!(bsnh_decode, bsnh_captured_decode);
+
+    let prefill_expected = cpu_prefill_reference(&prefill_query, &key, &value, PREFILL_LEN, scale);
+    let prefill_got = fp16_values(&bnsh_prefill);
+    let prefill_max_err = prefill_got
+        .iter()
+        .zip(&prefill_expected)
+        .map(|(got, expected)| (got - expected).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        prefill_max_err < 3e-3,
+        "head-major GPU prefill diverged from CPU oracle: max_abs={prefill_max_err:e}"
+    );
+    let decode_expected = cpu_reference(&decode_query, &key, &value, scale);
+    let decode_got = fp16_values(&bnsh_decode);
+    let decode_max_err = decode_got
+        .iter()
+        .zip(&decode_expected)
+        .map(|(got, expected)| (got - expected).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        decode_max_err < 3e-3,
+        "head-major GPU full-generation decode diverged from CPU oracle: \
+         max_abs={decode_max_err:e}"
+    );
+
+    for buffer in [
+        capacity_buffer,
+        decode_seqlens_buffer,
+        prefill_seqlens_buffer,
+        decode_value_buffer,
+        decode_key_buffer,
+        decode_query_buffer,
+        prefill_value_buffer,
+        prefill_key_buffer,
+        prefill_query_buffer,
     ] {
         ep.deallocate(buffer).unwrap();
     }

@@ -154,20 +154,20 @@ than copying conclusions, following the anti-staleness rule established in
 
 **Status, as of 2026-08-11:**
 
-- **Implemented:** head-major BNSH remains the default. PR #782 added a
-  per-backend `KvLayout` tag (default `HeadMajorBnsh`) and landed the
-  seq-major BSNH fused fp16 single-token decode append/read pair. Seq-major is
-  hard-gated to those converted paths; unsupported readers and writers fail
-  rather than silently mis-index. It is not yet an end-to-end layout for every
-  attention path.
+- **Implemented:** head-major BNSH remains the default. PR #782 landed the
+  seq-major BSNH fused fp16 single-token decode append/read pair, and #792
+  replaced its layout enum with a symbolic stride descriptor and static
+  per-layout NVRTC specialization. Flash prefill now uses the same descriptor
+  for cache preparation and reads, enabling full seq-major prefill + fp16
+  decode generations when the fused-flash shape gate applies. Unsupported
+  readers and writers still fail rather than silently mis-index.
 - **Measured, not implemented:** token-major across all layers. Its residency
   floor and 192 KiB-stride read cost were measured in #787, but no production
   kernel or binding layout uses it.
-- **Proposed, in progress:** replace the growing layout enum with a stride
-  descriptor and make layout selection a per-EP, per-platform capability
-  (#783). The descriptor, binding views, layout negotiation, prefix multi-map,
-  staggering, and commit-ahead policy described below are design intent, not
-  present-tense capabilities.
+- **Proposed, in progress:** make layout selection a per-EP, per-platform
+  capability (#783). Binding views, layout negotiation, prefix multi-map,
+  staggering, and commit-ahead policy described below remain design intent,
+  not present-tense capabilities.
 
 #### Governing rule: layout controls residency
 
@@ -269,8 +269,19 @@ measured 2 MiB CUDA granule:
 | Layout | Floor unit | Near-empty floor | Evidence/status |
 |---|---:|---:|---|
 | BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
-| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Decode pair landed in #782 |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Geometry only — **not realized today**, see below |
 | token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
+
+> **These floors are properties of the layout geometry, not of what the runtime
+> currently commits.** Measured in #794 on both qwen2.5-0.5b and qwen14b,
+> head-major and seq-major commit **identical** physical bytes (100,663,296 B and
+> 402,653,184 B respectively). The reason is that the native CUDA bindings still
+> allocate bucket-sized packed shapes and commit flat bucket ranges without
+> consuming the KV layout metadata, so seq-major currently changes **kernel
+> indexing only** — not reservation or commit geometry. Realizing the `layers × 2`
+> floor requires layout-aware binding and residency allocation, which is the
+> binding-views work still outstanding. #787 reached the same conclusion from the
+> other direction: the read path is free, and the cost sits on the binding layer.
 
 The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
 **96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).
