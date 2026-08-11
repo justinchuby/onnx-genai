@@ -67,3 +67,13 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 - Restored compact finish reason and end-to-end throughput to the always-on TTY block now that Justin allowed two lines; non-TTY opt-in stats keep the single-line formatter for byte stability.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-11 — Test hardening: EP assignment assertions
+
+**Task:** Add `disable_cpu_ep_fallback` + `Session_GetEpGraphAssignmentInfo` assertions to layernorm_dynamic_axis and f16/bf16/LN/RMS tests.
+
+**Result:** 6 tests now assert EP ownership. 269 passed, 0 failed. Non-vacuity proven (Relu assertion → immediate panics). Commit `ecfaeeec5`.
+
+**Files modified:**
+- `crates/onnx-runtime-ep-cpu-plugin/tests/layernorm_dynamic_axis.rs`
+- `crates/onnx-runtime-ep-cpu-plugin/tests/plugin_ort_e2e.rs`
