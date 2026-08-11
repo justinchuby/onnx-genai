@@ -1,7 +1,7 @@
 use super::*;
 
 /// Model properties that are baked into the graph or advertised as configurable.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ModelCapabilities {
     /// Attention architecture and dimensions.
     pub attention: Option<AttentionConfig>,
