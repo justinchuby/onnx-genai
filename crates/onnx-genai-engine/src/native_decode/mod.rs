@@ -6,9 +6,7 @@ use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{
-    KvOwnership, LoopStatePair, ModelIoSpec, SequenceInputKind, SharedKvGroup,
-};
+use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -16,7 +14,7 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 

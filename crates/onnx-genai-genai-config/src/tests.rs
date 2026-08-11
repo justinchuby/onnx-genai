@@ -498,6 +498,47 @@ fn derive_decoder_io_from_graph_dense_has_no_state_pairs() {
 }
 
 #[test]
+fn derive_model_io_spec_from_graph_dense_returns_none() {
+    // A pure-dense decoder derives KV ports but no recurrent state pairs, so the
+    // shared helper's safety gate must return None, leaving the caller's
+    // `io = None` shape-inference path untouched.
+    assert!(
+        GenAiConfig::derive_model_io_spec_from_graph(&qwen06b_dense_graph()).is_none(),
+        "dense decoder must not auto-derive an io spec"
+    );
+}
+
+#[test]
+fn derive_model_io_spec_from_graph_hybrid_binds_ports() {
+    // The recurrent-hybrid case: the helper reuses the guarded classifier,
+    // passes the non-empty state_pairs safety gate, binds the conventional
+    // non-KV ports by name-presence, and assembles the ModelIoSpec.
+    let io = GenAiConfig::derive_model_io_spec_from_graph(&qwen27b_hybrid_graph())
+        .expect("hybrid graph auto-derives an io spec");
+    assert_eq!(io.token_input.as_deref(), Some("input_ids"));
+    assert_eq!(io.attention_mask_input.as_deref(), Some("attention_mask"));
+    assert_eq!(io.position_ids_input.as_deref(), Some("position_ids"));
+    assert_eq!(io.logits_output.as_deref(), Some("logits"));
+    assert_eq!(io.kv_inputs.as_ref().map(Vec::len), Some(32));
+    assert_eq!(io.kv_outputs.as_ref().map(Vec::len), Some(32));
+    let state_pairs = io
+        .state_pairs
+        .expect("hybrid derives recurrent state pairs");
+    assert_eq!(state_pairs.len(), 96);
+    assert!(
+        state_pairs
+            .iter()
+            .all(|pair| pair.init.as_deref() == Some("zeros")
+                && pair.update.as_deref() == Some("replace"))
+    );
+    // Fields the auto-derive path never populates stay unset.
+    assert!(io.kv_layout.is_none());
+    assert!(io.sequence_source.is_none());
+    assert!(io.kv_update.is_none());
+    assert!(io.static_cache.is_none());
+}
+
+#[test]
 fn uniform_decoder_graph_matches_pattern_expansion() {
     // A dense-KV model must produce the SAME kv_inputs whether or not the
     // graph is supplied, and must never gain state pairs.
