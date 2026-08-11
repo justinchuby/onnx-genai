@@ -586,6 +586,12 @@ pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityPr
     }
 }
 
+pub(crate) fn resolve_vram_limit_bytes(limits: &ResourceLimits) -> anyhow::Result<u64> {
+    let capacities = fallback_capacity_providers(limits);
+    onnx_genai_scheduler::resolve_limit(limits.vram_limit, capacities.vram.as_ref(), "vram")
+        .map_err(anyhow::Error::new)
+}
+
 pub(crate) fn governor_kv_config(
     kv_model: Option<&KvModelInfo>,
     config: &EngineConfig,
@@ -666,7 +672,6 @@ fn governor_tokens_per_page(config: &EngineConfig) -> anyhow::Result<u64> {
     Ok(tokens_per_page)
 }
 
-#[cfg(any(feature = "native-backend", test))]
 pub(crate) fn model_io_declares_only_fixed_state(
     io: Option<&onnx_genai_metadata::ModelIoSpec>,
 ) -> bool {

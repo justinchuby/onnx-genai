@@ -3857,6 +3857,25 @@ async fn debug_profile_reports_stage_totals() {
             .is_some_and(|note| note.contains("ONNX_GENAI_PROFILE")),
         "an empty profile must say how to fill it: {body}"
     );
+    let plans = body["memory_strategy_plans"]
+        .as_array()
+        .expect("profile must expose model memory strategy plans");
+    assert_eq!(plans.len(), 1, "body: {body}");
+    assert_eq!(plans[0]["model_id"], "tiny-llm");
+    assert!(
+        plans[0]["plan"]["strategy"].is_string(),
+        "the effective strategy must be present: {body}"
+    );
+    assert!(
+        plans[0]["plan"]["decisions"]
+            .as_array()
+            .is_some_and(|decisions| decisions.iter().all(|decision| {
+                decision["source"].is_string()
+                    && decision["reason"].is_string()
+                    && decision["evidence"].is_string()
+            })),
+        "every strategy decision must include provenance: {body}"
+    );
 }
 
 #[tokio::test]
