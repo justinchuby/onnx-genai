@@ -842,8 +842,6 @@ impl Engine {
 /// (no state pairs) are left untouched and keep their existing load path.
 #[cfg(feature = "native-backend")]
 fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path: &Path) {
-    use onnx_genai_metadata::{LoopStatePair, ModelIoSpec};
-
     // A declared `io` block is always authoritative.
     if metadata
         .model
@@ -855,52 +853,10 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
         return;
     };
-    let Some(derived) =
-        onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph_info)
+    let Some(io) =
+        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph_info)
     else {
         return;
-    };
-    // Safety gate: only the recurrent-hybrid case the shape-inference path cannot
-    // classify. Pure-dense decoders derive no state pairs and are left untouched.
-    if derived.state_pairs.is_empty() {
-        return;
-    }
-    let input_names: std::collections::HashSet<&str> =
-        graph_info.inputs.iter().map(|t| t.name.as_str()).collect();
-    let output_names: std::collections::HashSet<&str> =
-        graph_info.outputs.iter().map(|t| t.name.as_str()).collect();
-    let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
-    let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
-    let state_pairs = derived
-        .state_pairs
-        .into_iter()
-        .map(|pair| LoopStatePair {
-            input: pair.input,
-            output: pair.output,
-            init: Some("zeros".to_owned()),
-            update: Some("replace".to_owned()),
-        })
-        .collect::<Vec<_>>();
-    let io = ModelIoSpec {
-        sequence_source: None,
-        kv_ownership: None,
-        kv_layout: None,
-        token_input: present_input("input_ids"),
-        inputs_embeds_input: None,
-        attention_mask_input: present_input("attention_mask"),
-        position_ids_input: present_input("position_ids"),
-        logits_output: present_output("logits"),
-        hidden_output: None,
-        kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
-        kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
-        encoder_hidden_states_input: None,
-        audio_features_input: None,
-        cross_kv_inputs: None,
-        cross_kv_outputs: None,
-        kv_update: None,
-        state_pairs: Some(state_pairs),
-        optional_inputs: std::collections::BTreeMap::new(),
-        static_cache: None,
     };
     let model = metadata
         .model
