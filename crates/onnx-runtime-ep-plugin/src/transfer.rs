@@ -108,6 +108,45 @@ impl CopyDirection {
     }
 }
 
+// ─── Device-id comparison (B2 fix) ───────────────────────────────────────────
+
+/// Determine whether two non-CPU memory devices are on the same physical device.
+///
+/// Uses `MemoryDevice_GetDeviceId` when available. If the function pointer is
+/// absent (`None`), or either memory device pointer is null, **fails closed** —
+/// returns `false` (treated as cross-device → unsupported).
+///
+/// For CPU tensors, this function is irrelevant; callers should only invoke it
+/// when both sides are non-CPU.
+fn is_same_device(
+    ep_api: &ort::OrtEpApi,
+    src: *const ort::OrtMemoryDevice,
+    dst: *const ort::OrtMemoryDevice,
+    src_is_cpu: bool,
+    dst_is_cpu: bool,
+) -> bool {
+    // Not a D2D comparison — same_device is only meaningful for non-CPU pairs.
+    if src_is_cpu || dst_is_cpu {
+        return false;
+    }
+    // Pointer equality is the fast path (same OrtMemoryDevice instance).
+    if src == dst {
+        return true;
+    }
+    // Null guard — fail closed.
+    if src.is_null() || dst.is_null() {
+        return false;
+    }
+    // Try device-id comparison.
+    let get_device_id = match ep_api.MemoryDevice_GetDeviceId {
+        Some(f) => f,
+        None => return false, // fail closed: cannot determine device equality
+    };
+    let src_id = unsafe { get_device_id(src) };
+    let dst_id = unsafe { get_device_id(dst) };
+    src_id == dst_id
+}
+
 // ─── ORT data-transfer adapter ───────────────────────────────────────────────
 
 /// Heap-allocated data-transfer adapter projecting an EP's copy methods through
@@ -458,7 +497,13 @@ unsafe extern "C" fn transfer_full_can_copy(
 
         let src_is_cpu = src_type == ort::OrtMemoryInfoDeviceType_CPU;
         let dst_is_cpu = dst_type == ort::OrtMemoryInfoDeviceType_CPU;
-        let same_device = src_memory_device == dst_memory_device;
+        let same_device = is_same_device(
+            ep_api,
+            src_memory_device,
+            dst_memory_device,
+            src_is_cpu,
+            dst_is_cpu,
+        );
 
         let direction = CopyDirection::classify(src_is_cpu, dst_is_cpu, same_device);
         direction.is_supported()
@@ -568,10 +613,13 @@ unsafe extern "C" fn transfer_full_copy_tensors(
 
             let src_is_cpu = src_type == ort::OrtMemoryInfoDeviceType_CPU;
             let dst_is_cpu = dst_type == ort::OrtMemoryInfoDeviceType_CPU;
-            let same_device = !src_is_cpu
-                && !dst_is_cpu
-                && !src_mem_device.is_null()
-                && src_mem_device == dst_mem_device;
+            let same_device = is_same_device(
+                ep_api,
+                src_mem_device,
+                dst_mem_device,
+                src_is_cpu,
+                dst_is_cpu,
+            );
             let direction = CopyDirection::classify(src_is_cpu, dst_is_cpu, same_device);
 
             if !direction.is_supported() {
@@ -1340,5 +1388,140 @@ mod tests {
         ep.deallocate(buf2).unwrap();
         ep.deallocate(buf3).unwrap();
         assert_eq!(dc.count(), 3);
+    }
+
+    // ─── B2 fix: is_same_device tests ───────────────────────────────────────
+
+    /// Create a zeroed OrtEpApi with only the specified function pointers set.
+    unsafe fn make_ep_api_for_device_id(
+        get_device_id: Option<unsafe extern "C" fn(*const ort::OrtMemoryDevice) -> u32>,
+    ) -> ort::OrtEpApi {
+        let mut api: ort::OrtEpApi = unsafe { std::mem::zeroed() };
+        api.MemoryDevice_GetDeviceId = get_device_id;
+        api
+    }
+
+    /// Mock GetDeviceId that reads a u32 from the OrtMemoryDevice pointer.
+    /// In tests we point OrtMemoryDevice* at a u32 on the stack.
+    unsafe extern "C" fn mock_get_device_id(mem_device: *const ort::OrtMemoryDevice) -> u32 {
+        // We cast a *const u32 to *const OrtMemoryDevice in tests, so reverse it.
+        unsafe { *(mem_device as *const u32) }
+    }
+
+    #[test]
+    fn is_same_device_same_id_different_pointers() {
+        // B2 fix: two distinct OrtMemoryDevice* with the same device id → same device.
+        let device_id_a: u32 = 0;
+        let device_id_b: u32 = 0;
+        let src = &device_id_a as *const u32 as *const ort::OrtMemoryDevice;
+        let dst = &device_id_b as *const u32 as *const ort::OrtMemoryDevice;
+        // Pointers are different.
+        assert_ne!(src, dst);
+
+        let ep_api = unsafe { make_ep_api_for_device_id(Some(mock_get_device_id)) };
+        let result = is_same_device(&ep_api, src, dst, false, false);
+        assert!(
+            result,
+            "same device id (0 == 0) must be recognized as same device"
+        );
+    }
+
+    #[test]
+    fn is_same_device_different_ids_rejected() {
+        // Cross-device: different device ids → must fail closed (not same device).
+        let device_id_a: u32 = 0;
+        let device_id_b: u32 = 1;
+        let src = &device_id_a as *const u32 as *const ort::OrtMemoryDevice;
+        let dst = &device_id_b as *const u32 as *const ort::OrtMemoryDevice;
+
+        let ep_api = unsafe { make_ep_api_for_device_id(Some(mock_get_device_id)) };
+        let result = is_same_device(&ep_api, src, dst, false, false);
+        assert!(
+            !result,
+            "different device ids (0 != 1) must be rejected as cross-device"
+        );
+    }
+
+    #[test]
+    fn is_same_device_no_get_device_id_fails_closed() {
+        // When MemoryDevice_GetDeviceId is None, fail closed — treat as cross-device.
+        let device_id_a: u32 = 0;
+        let device_id_b: u32 = 0;
+        let src = &device_id_a as *const u32 as *const ort::OrtMemoryDevice;
+        let dst = &device_id_b as *const u32 as *const ort::OrtMemoryDevice;
+        assert_ne!(src, dst);
+
+        let ep_api = unsafe { make_ep_api_for_device_id(None) };
+        let result = is_same_device(&ep_api, src, dst, false, false);
+        assert!(
+            !result,
+            "missing GetDeviceId must fail closed (cross-device)"
+        );
+    }
+
+    #[test]
+    fn is_same_device_pointer_equality_still_works() {
+        // Fast path: same pointer → same device, regardless of GetDeviceId.
+        let device_id: u32 = 7;
+        let ptr = &device_id as *const u32 as *const ort::OrtMemoryDevice;
+
+        // Even with None for GetDeviceId, pointer equality is conclusive.
+        let ep_api = unsafe { make_ep_api_for_device_id(None) };
+        let result = is_same_device(&ep_api, ptr, ptr, false, false);
+        assert!(result, "pointer equality must always mean same device");
+    }
+
+    #[test]
+    fn is_same_device_null_pointer_fails_closed() {
+        let device_id: u32 = 0;
+        let valid = &device_id as *const u32 as *const ort::OrtMemoryDevice;
+
+        let ep_api = unsafe { make_ep_api_for_device_id(Some(mock_get_device_id)) };
+        // null src
+        assert!(!is_same_device(
+            &ep_api,
+            std::ptr::null(),
+            valid,
+            false,
+            false
+        ));
+        // null dst
+        assert!(!is_same_device(
+            &ep_api,
+            valid,
+            std::ptr::null(),
+            false,
+            false
+        ));
+    }
+
+    /// Non-vacuity proof: this test MUST FAIL against the old pointer-equality logic.
+    /// The old code: `same_device = src_memory_device == dst_memory_device`
+    /// would return false for two distinct pointers with device id 0, causing
+    /// `CopyDirection::DeviceToDifferentDevice` (unsupported). The new code
+    /// correctly returns `DeviceToSameDevice` (supported).
+    #[test]
+    fn is_same_device_proves_b2_fix_non_vacuous() {
+        let device_id_a: u32 = 0;
+        let device_id_b: u32 = 0;
+        let src = &device_id_a as *const u32 as *const ort::OrtMemoryDevice;
+        let dst = &device_id_b as *const u32 as *const ort::OrtMemoryDevice;
+        assert_ne!(
+            src, dst,
+            "precondition: pointers must differ to exercise the new path"
+        );
+
+        let ep_api = unsafe { make_ep_api_for_device_id(Some(mock_get_device_id)) };
+        let same = is_same_device(&ep_api, src, dst, false, false);
+        let direction = CopyDirection::classify(false, false, same);
+        assert_eq!(
+            direction,
+            CopyDirection::DeviceToSameDevice,
+            "B2 fix: same-device D2D must be classified as DeviceToSameDevice, not DeviceToDifferentDevice"
+        );
+        assert!(
+            direction.is_supported(),
+            "same-device D2D must be supported"
+        );
     }
 }

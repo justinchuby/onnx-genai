@@ -48,7 +48,7 @@ hardware validation on a real CUDA GPU.
 | **S2** | `Mutex::lock().unwrap()` across extern "C" | ✅ **Fixed.** `EpRef::with_ep` uses `.lock().map_err()` — no unwrap. Poisoned mutex returns an actionable error. |
 | **S3** | `factory_create_ep` ignores `shared_ep` | ✅ **Fixed.** Returns an actionable error status explaining the shared EP is used by components directly. |
 | **S4** | CUDA constructor panics in factory creation | ✅ **Fixed.** See defect #3 above. |
-| **B2** | `CanCopy` same-device uses pointer equality | 🟡 **Deferred.** Pointer equality is conservative (fail-closed): it may cause ORT to fall back for same-GPU copies, but won't corrupt. Proper fix requires `MemoryDevice_GetDeviceId` which may not exist in ORT 1.27. Filed as known gap. |
+| **B2** | `CanCopy` same-device uses pointer equality | ✅ **Fixed.** Now uses `MemoryDevice_GetDeviceId` (present in ORT 1.27 bindings, `OrtEpApi` offset 96) to compare device IDs when pointer equality fails. Same-device D2D copies are accepted; cross-device (peer-to-peer) copies fail closed with an actionable error status. If `GetDeviceId` is `None` at runtime, fails closed (cross-device). Compiles and type-checks; **unvalidated on hardware** — blocked on #768. |
 | **N1** | Comments say "mock" in production code | ✅ **Fixed.** Comments updated. |
 | **N2** | `factory_get_vendor_id` always returns 0 | ✅ **Fixed.** Now reads `exported.device_support.vendor_id`. |
 
@@ -92,7 +92,6 @@ a strong reference that keeps the heap allocation alive independently.
   produce correct results on real CUDA memory
 - Whether the Mutex lock duration is acceptable for performance (no contention
   profiling possible without hardware)
-- B2: whether ORT ever passes two distinct `OrtMemoryDevice*` for the same GPU
 
 ---
 

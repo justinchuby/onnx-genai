@@ -79,3 +79,15 @@ comment clarity. Decision written to `decisions/inbox/gaff-review-pr31973.md`.
 - **Key answer:** Code fails closed by accident (panic bomb), not by design. Would crash if panic bomb were removed.
 - **Tests verified:** 18/18 pass in targeted crates. Clippy pre-existing failure in `onnx-genai-engine`.
 - **Output:** `.squad/decisions/inbox/gaff-rereview-762-cuda.md`
+
+## 2026-08-11 — Verify #762 CUDA EP Fix (d64a49d59)
+
+- **Task:** Verify Nabil's revision against B1/B3/S4 blockers from previous rejection.
+- **B1 (UAF):** GENUINELY FIXED. `EpRef::Shared(Arc<Mutex<..>>)` — no raw pointers from guards.
+- **B3 (copy direction):** GENUINELY FIXED. `Value_GetMemoryDevice` + `MemoryDevice_GetDeviceType` classifies; dispatches correctly.
+- **S4 (panic bomb):** GENUINELY FIXED. `create_ep_factories_for_shared_ep` takes name directly.
+- **B2 (pointer equality):** Deferral justification is WRONG — `MemoryDevice_GetDeviceId` exists in ORT 1.27 bindings. Fail-closed but functionally broken for D2D same-device.
+- **New issue:** Mutex held across `cudaStreamSynchronize` serializes all operations (perf, not correctness).
+- **Tests:** 16/16 pass. B1 test is non-vacuous; B3 tests classification only; S4 test is marginal.
+- **Verdict:** Conditional pass — fix B2 (5 lines) before leaving draft, or accept D2D-same-device is broken.
+- **Output:** `.squad/decisions/inbox/gaff-verify-762-cuda-fix.md`

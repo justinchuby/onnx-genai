@@ -125,3 +125,11 @@ Reduction outputs (Mean, InvStdDev) follow keepdims semantics over the normalise
 **Verdict:** STILL UNKNOWN — strong OOM circumstantial evidence but cannot conclusively prove without dmesg/kernel logs. No code fix applied. Recommended re-trigger to test flakiness.
 
 **Decision doc:** `.squad/decisions/inbox/batty-arm64-31973.md`
+
+## 2026-08-11 — B2 Fix: Device-ID Comparison for D2D Copies (PR #762)
+
+Fixed the last CUDA EP blocker (B2). Added `is_same_device()` to `transfer.rs`
+using `MemoryDevice_GetDeviceId` for device-id comparison when pointer equality
+fails. Same-device D2D accepted; cross-device fails closed. 6 new tests, all
+non-vacuous. CPU path unaffected. Compiles and type-checks; unvalidated on
+hardware (blocked on #768).
