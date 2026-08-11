@@ -29,10 +29,6 @@ DENYLIST: dict[str, str] = {
     # CI is not the right harness.
     "onnx-genai-python": "PyO3 extension crate requires wheel packaging/runtime DLL staging",
     "onnx-runtime-python": "PyO3 extension crate requires wheel packaging/runtime DLL staging",
-    # FIXME(#686): the server suite has a known red compatibility fixture
-    # (`vlm-executable` lacks executable ONNX files). Keep this exception
-    # visible until the fixture is repaired and the server joins the ORT lane.
-    "onnx-genai-server": "known red sidecar-free VLM compatibility fixture; see #686",
 }
 
 # Packages that need the ORT-backed lane because they directly or transitively
@@ -45,6 +41,7 @@ ORT_BACKED = frozenset(
         "onnx-genai-cli",
         "onnx-genai-engine",
         "onnx-genai-ort",
+        "onnx-genai-server",
     }
 )
 

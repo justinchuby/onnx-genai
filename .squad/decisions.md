@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-08-11T16:03:10Z (Scribe TopK-perf + 27B-native batch; 37 inbox drops merged, full narrative archived to 2026-08.md; live file ~28KB, under size gate — no compaction needed)
+Last consolidated: 2026-08-11T17:55:00Z (Scribe issue-triage session + autonomous fixes; 7 inbox drops merged — 6 new: mobius io-metadata #477 + cosmos3-edge readiness assessment, GBQ zero-point #785, ORT recurrent guard/loader dedup #786, VLM fixture #788, DRY decoder-io #784, VMM contiguous-VA investigation; 1 deduped: qwen35-27b-native already recorded under #779. 30-day archive gate evaluated at 28KB: no dated entries older than 2026-07-12, so nothing archived. Prior: 2026-08-11T16:03:10Z Scribe TopK-perf + 27B-native batch; 37 inbox drops merged, full narrative archived to 2026-08.md)
 
 Standing governance rules and active directives. Full narrative is archived in `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and older `.squad/decisions/archive/` files.
 
@@ -9,6 +9,180 @@ This compaction preserved the complete pre-compaction live file in `.squad/decis
 ## Ledger health rule
 
 Archive by SIZE, not age. Age-only no-ops during high-volume campaigns because most entries are recent, so the live file can exceed spawn-budget while "older than N days" matches nothing. When over the gate, preserve full history in `.squad/decisions-archive/{YYYY-MM}.md`, dedupe rebase-reintroduced sections, and keep live `decisions.md` to standing directives plus pointers. Concurrent Scribe runs are a structural hazard; assemble from inbox drops and check `git log origin/main..HEAD` before committing.
+
+## Current active wave — 2026-08-11 (issue-triage session + autonomous fixes)
+
+### mobius #477: emit full `io` metadata for streamed-weight decoders (external repo, NOT merged)
+
+**By:** Cohaagen
+
+**What:** Fixed the root cause in **mobius** that shipped thin onnx-genai
+`inference_metadata.yaml` (no `model.io` block) for large streamed-weight decoders —
+opened mobius PR **onnxruntime/mobius#477** (branch
+`cohaagen/onnx-genai-io-metadata-robustness`, based on mobius `main`, **NOT merged**
+per the never-self-merge-mobius directive; left for the mobius team). Root cause:
+`src/mobius/integrations/onnx_genai/auto_export.py` `_add_explicit_io_to_file`
+returned **silently** whenever a package component lacked a `.graph` attribute;
+external-data/streamed-weight decoders don't retain the `ir.Graph` in memory, so the
+sidecar shipped with only `model.attention` + `kv_cache` and no `io` (this produced
+the thin qwen3.6-27b-int4-cuda sidecar that forced the #779 runtime workaround and
+broke ORT-genai's `token_input` resolution). Fix: when `.graph` is absent, reload the
+ONNX graph from the sibling `model.onnx` via `onnx_ir.load` (external data resolves
+relative to the model file) and derive ports from it; in-memory fast path preserved;
+if the graph is truly unavailable (memory *and* disk), emit a loud `logging.warning`
+and skip — never silently ship thin metadata. Attribute-driven, no model-name gates.
+3 regression tests added; onnx_genai suite 115 passed / 3 skipped; lintrunner clean.
+
+**Validation:** re-emitted the real Qwen3.6-27B sidecar (metadata-only, against the
+existing on-disk `model.onnx`, no re-export) with the patch — the `io` block now
+appears with **32 KV entries + 96 conv/recurrent `state_pairs`**,
+`token_input: input_ids`, `logits_output: logits`. Confirms the fix removes the need
+for the #779 runtime workaround and unblocks ORT-genai on the same artifact. #779
+remains a valuable safety net; new artifacts built with patched mobius ship complete
+`io` and won't depend on it.
+
+### Cosmos / world-model (cosmos3-edge) native-EP readiness (assessment only, no code)
+
+**By:** Cohaagen
+
+**What:** Assessed whether cosmos-edge world models can run on the native CUDA EP
+(mobius already supports cosmos: `models/cosmos.py`, `models/cosmos3_omni.py`,
+`_configs/per_model/_cosmos3_edge_vision.py`; `mobius list models` exposes
+`cosmos3_edge`, `cosmos3_edge_text`, `cosmos3_omni`).
+- **`cosmos3_edge_text` (plain decoder) — likely quick native-CUDA win.** Pure GQA
+  decoder (`CausalLMModel`) with two quirks: a non-gated squared-ReLU FFN (`FCMLP`,
+  `down_proj(relu2(up_proj(x)))`) and 3D mrope that reduces to standard 1D RoPE for
+  text-only. **No hybrid recurrent/conv state** (unlike Qwen3.6-27B) — standard
+  append KV only. After the mobius #477 fix its sidecar gains a complete `io` block,
+  and `relu2 = Relu(x)²` decomposes to ONNX ops the EP already runs. Recommendation:
+  build and smoke-test load/decode on native CUDA EP; only risk is activation-op
+  coverage, easily verified.
+- **Full `cosmos3_edge` VL pipeline — larger lift.** Metadata is not the blocker
+  (mobius emits the encoders→embedding→AR composite). Native EP still needs: SigLIP-
+  style vision encoder execution + image preprocessing; the pixel-shuffle merger
+  projector (2×2 block merge + matmul); and `inputs_embeds` fusion (scatter image
+  features at `image_token_id`) — the main missing runtime piece. NVIDIA publishes no
+  modeling code, so pixel-shuffle parity is L1 graph-construction confidence only.
+- **Recommended sequencing:** (1) land mobius io fix #477, (2) prove
+  `cosmos3_edge_text` on native CUDA EP, (3) scope full VL (vision encoder ops +
+  projector + inputs_embeds fusion) as a separate track. No cosmos code implemented
+  (report only).
+
+### CUDA GatherBlockQuantized default symmetric zero-point (#702, PR #785 MERGED)
+
+**By:** Quaid
+
+**What:** The CUDA `com.microsoft::GatherBlockQuantized` kernel
+(`crates/onnx-runtime-ep-cuda/src/kernels/gather_block_quantized.rs`) left dequant
+`offset = 0` when the optional `zero_points` input was absent, while the CPU
+reference and ORT use the symmetric midpoint `default_zp = 1 << (bits - 1)`.
+GGUF-style embedding tables in mobius-converted 14B/27B models carry no explicit
+zero-point, so CUDA dequantized every embedding against 0 instead of 8 (int4) —
+empty output (immediate EOS) on the 14B, non-finite logits on the 27B: a
+native-vs-CPU correctness divergence (#702). Fix initializes
+`int offset = 1 << (bits - 1);` in the NVRTC source and only overrides from
+`zero_points` when non-null; explicit-zero_points path byte-unchanged. General
+fix, no model-name gate.
+
+**Tests:** CUDA parity oracle extended to the symmetric midpoint for `with_zp==false`
+(proves CUDA==CPU/ORT across int4/int8, fp16/fp32) plus host-only guard
+`gather_block_quantized_source_uses_symmetric_default_zero_point`; both pass on RTX
+GPU. Incidentally fixed 4 pre-existing `gqa_decode_fp16.rs` call sites missing the
+`kv_layout` arg (#782) by passing `0` (legacy BNSH).
+
+### ORT paged-KV recurrent guard (#701) + loader error dedup (#467) (PR #786 MERGED)
+
+**By:** Roy
+
+- **#701:** Added `ort_session_has_recurrent_state(session, io)` in
+  `crates/onnx-genai-engine/src/kv_bridge.rs`, mirroring the native
+  `has_recurrent_state()` gate (#700). Purely structural (RULES.md §2): a state is
+  recurrent only when the I/O spec declares it a loop-carried `state_pair` input AND
+  that input's shape has a static penultimate (feature) axis. Threaded into the ORT
+  paged-reuse **decision** in `Engine::prepare_session_prefix` (`engine/runtime.rs`)
+  via a new accessor — not deep inside `load_materialized_past`. No-op for every
+  attention-only model loadable today; trips only for hybrid recurrent models,
+  forcing correct full recompute.
+- **#467:** Hoisted the triplicated `"model directory does not exist: {}"` literal
+  in `crates/onnx-genai-ort/src/loader.rs` to a single `model_dir_missing_err(root)`
+  referenced at all three `pub fn load*` sites; error text byte-identical.
+- Incidental: added missing `kv_layout: None` to `engine/load.rs` `ModelIoSpec`
+  (native-backend) — a pre-existing `--features native-backend` build break (#782).
+- Verified: `cargo build -p onnx-genai-ort`, `cargo build -p onnx-genai-engine
+  --features native-backend`, `cargo test -p onnx-genai-ort loader` (9), `cargo test
+  -p onnx-genai-engine --lib kv_bridge` (23, incl. 2 new).
+
+### VLM compat fixture graphs + server CI re-enable (#686, PR #788 MERGED)
+
+**By:** Fenster
+
+**What:** `onnx-genai-server`'s sidecar-free VLM compatibility fixture
+(`vlm-executable`) had no executable ONNX graphs, so its test was red and the crate
+was deny-listed from CI. Root cause: the full VLM synthesizer
+(`to_strict_pipeline_metadata`) omitted `sequence_source`, so decode I/O resolution
+(`decode/resolved_io.rs`) defaulted to `TokenIds` and failed to resolve the
+`inputs_embeds` (rank-3) decoder port. Fix (route b — explicit metadata in the
+production synth): declare `decoder_io.insert("sequence_source", "inputs_embeds")`,
+mirroring the text-only fallback and matching real split VLMs (Mobius Gemma4,
+onnxruntime-genai). Added reproducible tiny identity fixture graphs
+(`vision.onnx`/`embedding.onnx`/`text.onnx`) via
+`scripts/build_vlm_executable_fixture.py`, removed the `onnx-genai-server` deny-list
+entry in `.github/scripts/workspace_test_packages.py`, and added it to `ORT_BACKED`
+(loads ORT at runtime). Coverage guard: 40 tested, 5 denied.
+
+**Evidence:** target test
+`sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image`
+PASSES; `onnx-genai-genai-config` 33/33. Two `onnx-genai-server` failures are
+unrelated to #686 (one parallel-load flake that passes in isolation; one
+pre-existing GPU-dependent VRAM-ledger test, verified environmental with changes
+stashed).
+
+### DRY decoder-io derivation glue into a shared helper (PR #784 MERGED)
+
+**By:** Cohaagen
+
+**What:** `NativeDecodeLoad::derive_fallback_io` (`native_decode/load.rs`, live
+`InferenceSession` ports) and `maybe_fill_hybrid_io_from_graph` (`engine/load.rs`,
+disk graph, `#[cfg(feature = "native-backend")]`) duplicated ~40 lines building an
+identical `ModelIoSpec` from a graph-derived `DerivedDecoderIo`. Extracted one
+shared helper `GenAiConfig::derive_model_io_spec_from_graph(graph) ->
+Option<ModelIoSpec>` in `onnx-genai-genai-config/src/compatibility.rs` (which
+already owns `DerivedDecoderIo`/`ModelGraphInfo` and depends on `onnx-genai-metadata`
+— no cycle). It encapsulates canonical derivation → empty-`state_pairs`
+recurrent-hybrid gate → name-presence port binding → `ModelIoSpec` assembly.
+Behavior-preserving: the authoritative `io.is_some()`-wins gate, the
+`state_pairs.is_empty()` safety gate, and the native-backend cfg gating are
+unchanged; engine-side spec now also carries `kv_layout: None` explicitly, unifying
+the two specs. Validated: fmt, `build -p onnx-genai-engine --features native-backend`
+clean, `test -p onnx-genai-genai-config derive` (5, incl. 2 new), `test
+-p onnx-genai-engine --features native-backend --lib native_decode` (68).
+
+### VMM contiguous-VA-per-sequence KV: crux answered, bucket-stride floor stands
+
+**By:** Copilot (investigation)
+
+**What:** Isolating GPU test (`vmm_kv_contiguous_tail_gpu.rs`) confirmed the decode
+kernel's **read pattern**, not the VA reservation, forces the physical commit: a
+read bounded to live length leaves the reservation tail uncommitted; a read one byte
+into the tail faults `CUDA_ERROR_INVALID_VALUE` (non-sticky) — #721 stage 4 in
+isolation. A fixed full-context stride (the "one flat VA, never re-strided" ideal)
+pays an `objects × granule` floor because KV is head-major: qwen2.5-0.5b = 96
+head-stripes × 2 MiB = 192 MiB for ~12 KiB of content (1.5 GB at 32K, 32× over
+bucket growth). The landed `kv_commits_on_demand` path (#682/#740/#748) is the right
+realization at bucket stride (full-context VA reserved, only current bucket
+committed, stable `device_ptrs`, verified on real qwen2.5-0.5b) but still
+re-strides/re-captures on growth. Low committed bytes AND no re-capture cannot both
+hold under head-major layout without sub-bucket commit (open: does the ORT GQA CUDA
+kernel touch the bucket tail `[logical_len, bucket)`?) or a seq-major KV layout
+(needs re-exported models / custom kernel). Device KV paging is owned by the CUDA VMM
+layer (`CudaVmmAllocator` granule mapping under a fixed reservation + governor
+grants), not `onnx-genai-kv`; the native CUDA decode path has no
+`PageTable`/`PagedKvCache` consumer — that machinery stays host-only.
+
+> **Dedup note:** Qwen3.5/3.6-27B hybrid GDN native-CUDA enablement via io-derivation
+> (Cohaagen) is already recorded above as "27B hybrid GDN native CUDA enablement via
+> io-derivation (#779, ...)"; the `cohaagen-qwen35-27b-native.md` inbox drop was
+> consolidated there and not duplicated here.
 
 ## Current active wave — 2026-08-06
 
