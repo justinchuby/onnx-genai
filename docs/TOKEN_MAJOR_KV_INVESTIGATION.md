@@ -24,6 +24,14 @@ real #740 pool: the whole model's live KV for a fresh sequence commits **one
 2 MiB granule** token-major versus **1.5 GiB** head-major — a **768×** floor
 reduction for identical live content.
 
+And on memory *granularity* token-major is **equivalent-or-finer than vLLM
+paging** (§6): vLLM's real per-sequence allocation quantum is `block_size × all
+layers` = **~3 MiB** on qwen14b (16 tokens), versus token-major's **2 MiB**
+granule (~10.7 tokens) — same order, and token-major keeps flat kernels (no page
+walk) and returns physical memory on demand. Quantized KV makes token-major
+*denser* (21.3 tokens/granule at fp8) while making head-major's crossover
+*worse* — the asymmetry reinforces the quantized-KV direction.
+
 The smallest next increment is **not** a kernel rewrite: it is a `KvLayout`
 stride-descriptor (§4, siding with #783 over a third enum variant) plus binding
 the per-layer KV views as sub-ranges of one reservation, validated on the
@@ -226,6 +234,73 @@ support N-way mapping of a pooled handle; token-major just makes the shared unit
 So token-major makes #777 both **cleaner** (one multi-map) and **more robust to
 short prefixes** (the sharing granule floor is per-sequence, not per-stripe). This
 is an independent second reason to prefer it, orthogonal to the read-path result.
+
+## 6. Comparison with vLLM paging — token-major is equivalent-or-finer on granularity
+
+A correction folded in (and independently re-verified below): vLLM's block is
+often described as "small and dense (~32 KB)", but that is the **per-layer**
+block. The unit that actually costs memory is the **per-sequence allocation
+quantum**: growing a sequence by one 16-token block requires giving *every layer*
+a block, so the quantum is `block_size × kv_bytes_per_token`. For qwen14b that is
+**~3 MiB**, the same order as our 2 MiB granule — not orders smaller. Token-major
++ VMM is therefore not merely "approaching paged behaviour"; on memory
+granularity it is **equivalent or slightly finer**, while keeping flat kernels and
+on-demand physical release.
+
+Verified arithmetic (`kv_bytes_per_token = layers × 2 × kv_heads × head_dim ×
+dtype`; granule = 2 MiB):
+
+| model | per-layer K+V/tok | kv_bytes_per_token (all layers) | **token-major tokens/granule** = `granule / kv_bytes_per_token` | **vLLM tokens/quantum** = `block_size` | vLLM per-seq quantum = `block_size × kv_bytes_per_token` |
+|---|---|---|---|---|---|
+| qwen14b (48L, kv8, hd128, fp16)   | 4,096 B | 196,608 B (192 KiB) | **10.67** | 16 | **3.00 MiB** |
+| qwen2.5-0.5b (24L, kv2, hd64, fp16) | 512 B | 12,288 B (12 KiB)  | **170.67** | 16 | **0.188 MiB** |
+
+General formulas (reproducible for any model):
+- **token-major:** `tokens_per_granule = granule / kv_bytes_per_token`.
+- **vLLM-equivalent:** `tokens_per_quantum = block_size` (default 16), at a
+  per-sequence physical quantum of `block_size × kv_bytes_per_token`.
+
+| | Per-sequence quantum | Kernel walks a page table? | Physical memory returnable? |
+|---|---|---|---|
+| vLLM paging | `block_size × kv_bytes_per_token` (**~3 MiB** qwen14b) | **yes** | no — pool pre-committed |
+| **token-major + VMM** | **1 granule = 2 MiB** (~**10.7** tokens qwen14b) | **no** | **yes** |
+
+### Internal fragmentation per sequence
+- **token-major:** at most **one partial granule** = **≤ 2 MiB** wasted per
+  sequence, *model-independent* (the last granule holds the write frontier;
+  everything before it is dense).
+- **paged:** at most **one partial block** = `≤ block_size × kv_bytes_per_token`,
+  which *scales with the model* — 3 MiB on qwen14b, 0.19 MiB on qwen0.5b.
+
+**Honest reading, both directions.** On qwen14b token-major is *slightly finer*
+(2 MiB vs 3 MiB bound; 10.7 vs 16 tokens/quantum) — equivalent-or-better, as
+claimed. But the bound cuts the other way on small models: on qwen0.5b the 2 MiB
+granule holds 170 tokens, so token-major's ≤ 2 MiB waste is *coarser* than paged's
+≤ 0.19 MiB. This is the same amortizes-with-model-size theme as the floor
+(#778): token-major's granularity story is strong exactly where multi-request
+serving cares — large models — and the absolute waste is one 2 MiB granule per
+sequence regardless (≈16 MiB across 8 concurrent sequences), which is negligible.
+
+### Quantized KV flips the asymmetry the right way
+Halving bytes per token (fp16 → fp8/int8) **halves `kv_bytes_per_token`, doubling
+tokens per granule** under token-major: qwen14b 10.67 → **21.33**, qwen0.5b
+170.67 → **341.33** — token-major gets *denser* and its fragmentation ratio
+*improves*. The opposite happens to the **head-major** granule crossover
+`granule / (head_dim × dtype)`, which *doubles* in tokens (8,192 → 16,384 on
+qwen14b) — the floor dominates *longer*. Since we are independently moving toward
+quantized KV, this asymmetry matters: quantization and token-major reinforce each
+other, whereas quantization and head-major fight.
+
+### Historical note — layout is the whole story
+The "≈10.7 tokens per granule" figure was computed early in this work, applied to
+**head-major**, found wrong, and publicly retracted — head-major scatters one
+token's live bytes across 96 stripes (768 objects), each landing in its own
+granule, so a single token costs 768 granules and the tokens-per-granule
+arithmetic does not hold. Under **token-major** that same arithmetic is *exactly*
+correct, because the token's bytes are one contiguous 192 KiB run. Same granule,
+same model, same VMM — **only the layout differs.** That is the entire thesis of
+this line of work, restated as a single number that is false one way and true the
+other. (Verified: `python` check of both models, reproduced in the commit.)
 
 ---
 
