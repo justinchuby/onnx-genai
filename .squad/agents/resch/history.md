@@ -42,3 +42,11 @@ Full pre-compaction history in `history-archive.md`.
 **Phase 3:** Implemented `layernorm_kernel_avx2.cpp` — two-pass vectorized kernel (8-wide reduce + normalize) with FMA3 fused multiply-add for bias case. Wired dispatch in `platform.cpp` AVX2 block, declared in `mlasi.h`, added to both Windows and Linux CMake lists. 5 files changed.
 
 **Phase 4:** Full `onnxruntime_mlas` library compiled successfully (zero warnings). No runtime benchmark — stated honestly. Entry points documented for Pris.
+
+## 2026-08-11: AVX2 LayerNorm Hardening (PR #31973)
+
+**Task 1 — Small-N threshold:** Measured crossover on AMD EPYC 9V74. Added `NormSize < 8` guard in `layernorm.cpp` dispatch. Below 8, zero SIMD iterations execute — pure scalar tail with overhead. RMSNorm regresses 3-22% for N≤7; threshold returns `false` so caller uses scalar `ComputeJob`. All 30 tests at N≥8 pass; 9 tests at N∈{1,7} need assertion updates (Chew).
+
+**Task 2 — Welford SIMD (option a):** Replaced two-pass variance with Welford's online algorithm using 8 parallel AVX2 accumulators + pairwise merge. 5-7× faster than scalar Welford at typical sizes (128-4096). Confirmed two-pass suffers catastrophic cancellation on adversarial inputs (mean~1e6: output error 4.18 vs Welford SIMD 0.049). RMSNorm unchanged (sum-of-squares has no cancellation risk).
+
+**Needs from Chew:** (1) Update test assertions for N<8, (2) fix `worst_welford` unused-variable build error, (3) adversarial precision tests at various mean offsets.

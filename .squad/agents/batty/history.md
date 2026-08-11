@@ -55,3 +55,25 @@ Inbox drop `batty-reasoning-fixture-revision.md` was lost when the worktree was 
 before Scribe ran; content reconstructed into `.squad/decisions.md`.
 
 Full pre-compaction history in `history-archive.md`.
+
+### 2026-08-11 — CUDA Upstream Audit: Both Candidates Dead
+
+Audited the two CUDA candidates from PR #763 against upstream `main` @ `16b486a2`:
+
+1. **MatMulNBits int4 block-128 GEMV** — DEAD. Upstream already has `block_size == 128`
+   in the M=1 GEMV (`matmul_4bits_m1_impl.cuh:152`) and the fpA_intB GEMV/GEMM paths.
+   Issue #23004 is about CPU, not CUDA.
+
+2. **QMoE parallel routing** — DEAD. PR #28980 (optimize SoftmaxTopK) already merged.
+   Issue #28987 tracks 8+ active Microsoft PRs on QMoE optimization.
+
+Evaluated four next-best options (accuracy_level=4, GGUF formats, QMoE grouping,
+graph capture/VMM/tiered KV) — all either already covered, not upstreamable, or
+entangled with our runtime. Conclusion: no viable portable CUDA gap exists.
+
+No kernel was implemented. No upstream PR is warranted.
+Decision file: `.squad/decisions/inbox/batty-cuda-upstream-audit.md`
+
+Durable lesson: The upstream CUDA EP is mature and actively staffed; our competitive
+advantages are runtime-level (graph capture, VMM weight paging, tiered KV) and
+architecturally not portable to upstream.

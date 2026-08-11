@@ -628,3 +628,26 @@ tested locally.
 **Tolerance:** rel 0.5% + abs 1e-4 floor (matching upstream CloseEnough). Zero-variance: abs 2e-4 floor.
 
 **Benchmark note:** Scalar baseline is fp64 C++ reference, not the exact upstream scalar path. Speedup is honest but reflects both vectorization and fp32-vs-fp64.
+
+## 2026-08-11 — CUDA candidate CPU-reference test harness
+
+**Context:** Batty auditing two CUDA candidates (MatMulNBits int4 GEMV / QMoE parallel routing). No GPU on host.
+
+**Actions:**
+1. Read upstream test conventions: `matmul_4bits_test.cc`, `moe_test.cc`, `matmul_nbits_sm90_validation_test.cc`, `softmax_topk_kernel_test.cc`, `cuda_op_test_utils.h`
+2. Built `cuda_candidate_cpu_reference_test.cc` (718 lines) covering both candidates
+3. clang-format applied
+4. Cannot compile — no gtest headers on host (ORT fetches via cmake)
+5. GPU tests use SKIP_IF_NO_GPU() → loud [UNVALIDATED] message, never silent pass
+
+**Key findings from upstream:**
+- `HasCudaEnvironment()` pattern: `DefaultCudaExecutionProvider() == nullptr` → false
+- CPU reference exists: `QuantizeDequantize()` + scalar matmul in matmul_4bits_test.cc
+- MoE test runs separate CPU and CUDA OpTester paths
+- `matmul_nbits_sm90_validation_test.cc` is the GPU-free model: pure logic, same build target
+
+**What's validated:** Algorithm correctness for int4 dequant + matmul (11 tests) and MoE top-k routing with tie-breaking (7 tests). All CPU-only, no hardware dependency.
+
+**What's NOT validated:** Actual CUDA kernel execution (3 GPU-required stubs skip loudly). Registration checks require USE_CUDA build. Compilation requires ORT cmake build with gtest.
+
+**File ownership:** `onnxruntime/test/contrib_ops/cuda_kernels/cuda_candidate_cpu_reference_test.cc` in `/workspace/upstream/ort-cuda`
