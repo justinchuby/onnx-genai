@@ -32,11 +32,11 @@ genuine workspace member and exports through the macro shipped in that crate.
 |---|---|---|
 | **Rust `ExecutionProvider` trait** | ✅ | `crates/onnx-runtime-ep-api/src/provider.rs` |
 | **ORT plugin-EP C ABI adapter** | ✅ | `crates/onnx-runtime-ep-plugin/` |
-| **Native nxrt dynamic ABI** (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) | ✅ Committed at `087d34888` | `crates/onnx-runtime-ep-nxrt-abi/`, `crates/onnx-runtime-ep-nxrt-host/`, `crates/onnx-runtime-ep-nxrt-testplugin/` |
+| **Native nxrt dynamic ABI** (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) | ✅ Committed at `62f23440f` | `crates/onnx-runtime-ep-nxrt-abi/`, `crates/onnx-runtime-ep-nxrt-host/`, `crates/onnx-runtime-ep-nxrt-testplugin/` |
 
-> **Test status as of HEAD `087d34888`:**
-> `onnx-runtime-ep-nxrt-abi`: **30/30 passing**.
-> `onnx-runtime-ep-nxrt-host`: **4 lib + 10 round-trip = 14/14 passing** (env-var race fixed via `ENV_MUTEX`).
+> **Test status as of HEAD `62f23440f`:**
+> `onnx-runtime-ep-nxrt-abi`: **32/32 passing** (4 ignored doc-tests).
+> `onnx-runtime-ep-nxrt-host`: **10/10 round-trip passing** (env-var race fixed via `ENV_MUTEX`).
 > See §6.10 for details.
 
 ---
@@ -209,6 +209,31 @@ must have a single source of truth. A private `abi_contract.rs` that re-defines
 the protocol locally breaks the invariant silently — `cargo check` will never
 catch it if the inconsistent crate isn't a workspace member.
 
+**A fourth lesson, from B3 — Status-message ownership (cross-module free):**
+Memory allocated by a plugin and freed by the host (or vice versa) is undefined
+behaviour when the two sides link against different C runtimes. This is the norm
+on Windows and common with Rust `cdylib` boundaries everywhere. The nxrt ABI
+enforces this with a **pure-value-type rule**: `NxrtStatus` carries a fixed inline
+`[u8; 256]` message buffer (264 bytes total). No heap allocation, no pointers, no
+cross-module free. The struct is returned by value and can be `memcpy`'d freely.
+See `crates/onnx-runtime-ep-nxrt-abi/src/status.rs`.
+
+> **ABI contract:** No nxrt ABI type may contain a pointer to memory that the
+> other side of the boundary is expected to free. If a value must carry variable-
+> length data, use a fixed inline buffer with a length field and truncation
+> semantics.
+
+**A fifth lesson, from B2/B3 — `c_char` portability:**
+`std::ffi::c_char` is `i8` on x86_64 and `u8` on aarch64. Casting a pointer
+with `as *const i8` instead of `as *const c_char` is unsound on ARM and causes
+type-mismatch errors or UB. This class of bug has bitten this project twice:
+once in the `ReleaseEpFactory` ABI test (B2, where an arm64/macOS failure was
+misdiagnosed as an ORT ABI discrepancy) and once in nxrt status handling (B3).
+
+> **ABI rule:** All FFI string/byte pointers must use `c_char`, never `i8` or
+> `u8` directly. `grep -rn "as \*const i8\|as \*mut i8" crates/` must return
+> zero hits in ABI-crossing code.
+
 ---
 
 ## 6. Native nxrt Dynamic ABI — Committed at `087d34888`
@@ -367,35 +392,24 @@ instance derived from the plugin structurally shares the `Arc<Library>` — the
 library cannot be unloaded while live references exist. `FactorySet::drop` releases
 all factory vtables via their `release` pointers with `catch_unwind`.
 
-### 6.10 Current test results (observed at HEAD `087d34888`)
+### 6.10 Current test results (observed at HEAD `62f23440f`)
 
-#### `onnx-runtime-ep-nxrt-abi` — 30/30 passing
+#### `onnx-runtime-ep-nxrt-abi` — 32/32 passing (4 ignored doc-tests)
 
 ```
-test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 Tests cover: negotiate success, major reject, minor min, null-pointer fail-closed,
 unknown capability flags reject, known capability flags accept, version constants,
 macro compile + both symbols, panic containment in constructor, custom negotiate
-override, custom create override (zero factories).
+override, custom create override (zero factories), status inline buffer,
+message truncation, struct size stability (264 bytes).
 
-#### `onnx-runtime-ep-nxrt-host` — 4 lib + 10 round-trip = 14/14 passing
+#### `onnx-runtime-ep-nxrt-host` — 10/10 round-trip passing
 
 ```
-test factory_error_is_contained ... ok
-test missing_library_file_fails_gracefully ... ok
-test missing_symbol_fails_gracefully ... ok
-test factory_panic_is_contained ... ok
-test full_lifecycle_negotiate_create_release ... ok
-test negotiate_succeeds_with_matching_version ... ok
-test validate_rejects_plugin_minor_newer_than_host ... ok
-test negotiate_rejects_incompatible_major_version ... ok
-test validate_rejects_unknown_capability_bits ... ok
-test ownership_lifetime_drop_counter_returns_to_zero ... ok
-
-test result: ok. 4 passed; 0 failed; 0 ignored (lib)
-test result: ok. 10 passed; 0 failed; 0 ignored (integration)
+test result: ok. 10 passed; 0 failed; 0 ignored
 ```
 
 The `full_lifecycle_negotiate_create_release` env-var race that was previously
@@ -423,10 +437,10 @@ cargo test -p onnx-runtime-ep-nxrt-host
 cargo check --workspace
 ```
 
-As of HEAD `087d34888`:
+As of HEAD `62f23440f`:
 - `cargo check --workspace` — clean.
 - `cargo test -p onnx-runtime-ep-plugin` — all tests passing (154 lib + 9 parity).
-- `cargo test -p onnx-runtime-ep-nxrt-abi` — 30/30 passing.
-- `cargo test -p onnx-runtime-ep-nxrt-host` — 14/14 passing (4 lib + 10 integration).
+- `cargo test -p onnx-runtime-ep-nxrt-abi` — 32/32 passing.
+- `cargo test -p onnx-runtime-ep-nxrt-host` — 10/10 passing.
 
 CUDA EP tests require hardware; see `docs/CUDA_EP_STATUS.md`.

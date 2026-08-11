@@ -325,3 +325,30 @@ Follow-Ups item 9, decisions inbox).
 **`docs/NXRT_ABI.md` links:** Confirmed intact at lines ~35 and in the §524 table. Not removed or mangled.
 
 **CUDA honest status:** UNVALIDATED. No self-hosted GPU workflow exists in this repo. `prefetch_lazy_weight` is a deliberate `Ok(false)` stub.
+
+### 2026-08-11T06:34:00+0000 — PR #762 rejection response: doc rewrite for B1-B4 corrective wave
+
+**Mission:** Correct docs after rubber-duck review rejected PR #762 with four blockers. Reframe CUDA from "hardware-blocked" to "implementation-blocked."
+
+**Docs updated:**
+- `docs/CUDA_EP_STATUS.md` — complete rewrite. Removed the misleading IMPLEMENTED/COMPILE-CHECKED/VALIDATED-ON-HARDWARE three-column table. Introduced honest status levels (CODE EXISTS / STUB / VALIDATED). Documented the four specific implementation defects as a specification. Recorded fail-closed state (zero factories).
+- `docs/EP_PLUGIN_EXPORT_PR.md` — recorded the rejection with B1–B4 details, including the instructive history of B2 (test changed to match wrong impl). Updated validation to 62f23440f: 231 tests, 1 ignored (LayerNorm Mean). Updated CUDA language from "hardware-gated" to "implementation-blocked."
+- `docs/NXRT_ABI.md` — added two new ABI contracts: (1) inline buffer rule (no cross-module free), (2) `c_char` portability rule (`c_char` is `u8` on aarch64). Updated test counts to 32/32 ABI + 10/10 host.
+- `docs/EP_PLUGIN_EXPORT_INVENTORY.md` — changed CUDA from 🟡 SCAFFOLDED to 🔴 IMPLEMENTATION-BLOCKED. Updated readiness field with the four specific defects.
+
+**Stale claims removed:**
+- "IMPLEMENTED" status in CUDA_EP_STATUS.md (replaced with "CODE EXISTS")
+- "SCAFFOLDED" status for CUDA plugin in inventory (replaced with "IMPLEMENTATION-BLOCKED")
+- "hardware-gated" framing in PR doc follow-ups (replaced with "implementation-blocked on four defects")
+
+**Validation (personally observed at `62f23440f`):**
+- `cargo test -p onnx-runtime-ep-plugin` → 154 lib + 9 parity = 163 pass, 3 ignored doc-tests
+- `cargo test -p onnx-runtime-ep-cpu-plugin` → 6 ABI + 20 ORT e2e = 26 pass, 1 ignored (LayerNorm Mean)
+- `cargo test -p onnx-runtime-ep-nxrt-abi` → 32 pass, 4 ignored doc-tests
+- `cargo test -p onnx-runtime-ep-nxrt-host` → 10 pass
+- `cargo check --workspace` → clean
+- Total: **231 passing, 0 failures, 1 functionally ignored test**
+
+**What is genuinely working:** CPU EP plugin (end-to-end with ORT). nxrt native ABI (negotiate → create → compute → release). Workspace compiles.
+
+**What is known-broken:** CUDA EP plugin (implementation-blocked, four defects, fails closed). LayerNorm Mean-shape (being fixed by Batty).

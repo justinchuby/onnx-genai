@@ -1,66 +1,142 @@
-# CUDA EP Status — Honest Capability Table
+# CUDA EP Status — Implementation-Blocked
 
 **Author:** Roy (Lead)
-**Date:** 2026-08-11
-**Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
-**HEAD at time of writing:** `087d34888`
+**Updated:** 2026-08-11 (post-rejection rewrite)
+**Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762 — REJECTED by review, kept draft)
+**HEAD at time of writing:** `62f23440f`
 
 ---
 
-## Justin's constraint (hard)
+## Summary — CUDA is implementation-blocked, not merely hardware-blocked
 
-> Do not claim working CUDA without real GPU validation.
+We have repeatedly described the CUDA EP as "hardware-validation-blocked" — that
+the implementation was done and only a GPU was missing. **That was wrong.**
 
-This host has no CUDA toolkit and no GPU. No capability in this document has been
-validated on hardware. "VALIDATED-ON-HARDWARE" in the table below means code
-was actually run on a GPU and produced a verified result. Today that column is
-empty for every row. Every row marked IMPLEMENTED was written and compiled by a
-developer on this host; every row marked COMPILE-CHECKED was verified to build
-with `cargo check --workspace` (which excludes the `cuda` feature). No row is
-VALIDATED-ON-HARDWARE.
+A rubber-duck review of PR #762 found the CUDA plugin was **failing open**: it
+advertised a working GPU EP while every component behind it was broken. Four
+implementation defects (§1 below) mean that even with a physical GPU present,
+this code could not have produced correct results. Issue
+[#768](https://github.com/justinchuby/onnx-genai/issues/768) (GPU hardware
+validation) remains necessary but is **no longer sufficient**.
+
+The CUDA plugin now **fails closed**: `CreateEpFactories` returns zero factories
+and an actionable error status in both `cuda` and `no-cuda` feature
+configurations. ORT is never offered an EP we cannot honour.
 
 ---
 
-## Status column definitions
+## 1. The Four Implementation Defects (B4 blocker, rubber-duck review)
 
-| Column | Meaning |
+These are the specific defects found by the review. Each is a specification for
+whoever resolves it — they must all be fixed before the CUDA plugin may advertise
+any factories.
+
+| # | Defect | Why it breaks | Current state |
+|---|--------|---------------|---------------|
+| **1** | **Separate CUDA runtime/context per component.** The EP, allocator, and stream each construct independent CUDA runtime and context instances. | Allocations made by the allocator are invisible to kernels on the EP's stream. Stream-ordered copies are incoherent. Memory corruption on any real workload. | 🔴 Not fixed. A correct implementation must share a single `CUcontext` + `cudaStream_t` across EP, allocator, and stream. |
+| **2** | **`CreateDataTransfer` returns NULL.** The factory wires a `DeviceDataTransfer`, but it lacks `OrtApi` access and has no shared CUDA stream, so `CopyTensors` returns an error unconditionally. | ORT calls `CanCopy` → `CopyTensors` to move data between host and device. A NULL or non-functional transfer means no data reaches the GPU. | 🔴 Not fixed. Requires `OrtApi` to be stored and a shared `cudaMemcpyAsync` stream. `CanCopy` now returns `false` (fail-closed), so ORT will not attempt the copy. |
+| **3** | **`GetHandle` returns NULL stream handle.** `stream_get_handle` returns `null_mut()` — no `cudaStream_t` exists. | ORT and downstream consumers call `GetHandle` to order work on the EP's stream. A null handle causes undefined behaviour or silent fallback to the default stream, breaking ordering guarantees. | 🔴 Not fixed. Requires a real `cudaStream_t` owned or adopted by the plugin. |
+| **4** | **`Free` passes `size=0` violating the allocator contract.** `device_free` reconstructs a `DeviceBuffer` with `size=0` because the allocation size is not tracked. | The EP's `deallocate` may require the size for `cudaFree`-style bookkeeping or arena management. Passing `size=0` violates the contract in `onnxruntime_ep_c_api.h`. | 🔴 Not fixed. Requires tracking allocation sizes (e.g. a `HashMap<*mut u8, usize>`) across `Alloc`/`Free`. |
+
+**All four are implementation defects, not hardware-absent gaps.**
+
+---
+
+## 2. Fail-Closed Implementation
+
+**File:** `crates/onnx-runtime-ep-cuda-plugin/src/lib.rs`
+
+With the `cuda` feature enabled:
+- `CreateEpFactories` sets `*out_num = 0` and returns an `OrtStatus*` error
+  listing all four defects.
+- The `cuda_impl` module's `construct_ep`, `device_support`, and
+  `build_kernel_registry_entries` exist but are intentionally unused (suppressed
+  with `let _ = &...`).
+- `CanCopy` returns `false` unconditionally for device EPs
+  (`crates/onnx-runtime-ep-plugin/src/transfer.rs`).
+
+Without the `cuda` feature:
+- `CreateEpFactories` returns zero factories with a "not available" status.
+
+`ReleaseEpFactory` returns `OrtStatus*` (not `void` — see B2 correction below).
+
+---
+
+## 3. Status of the Standalone CUDA EP (nxrt-native, not ORT plugin)
+
+The standalone CUDA EP (`crates/onnx-runtime-ep-cuda/`) implements the Rust
+`ExecutionProvider` trait for direct use within nxrt. This is a separate path
+from the ORT plugin export.
+
+### Status levels
+
+| Level | Meaning |
 |---|---|
-| **IMPLEMENTED** | Code exists; logic is complete; correctness is a developer claim, not a measurement. |
-| **COMPILE-CHECKED** | Source was checked with `cargo check` or `cargo build --features cuda` with a real CUDA toolkit on a dev machine. Does not imply runtime correctness. |
-| **VALIDATED-ON-HARDWARE** | Code was run on a physical CUDA GPU; output was compared to a reference (CPU or oracle); verdict: PASS or FAIL with evidence. |
+| **CODE EXISTS** | Source code is present and compiles via `cargo check` (using `cudarc` dynamic-loading — no CUDA toolkit at build time). Correctness is a developer claim that has **not survived review**. |
+| **STUB** | Method body is a deliberate no-op or placeholder. Semantically honest (returns "not done" rather than claiming success). |
+| **VALIDATED** | Code was run on a physical CUDA GPU with output compared to a reference. **No capability has reached this level.** |
+
+### Capability table
+
+| Capability | Status | Notes |
+|---|---|---|
+| Device enumeration (`device_type`, `device_id`) | CODE EXISTS | Returns `DeviceType::Cuda` and `DeviceId::new(Cuda, ordinal)`. No `cuDeviceGet` call. |
+| Initialize / bind device | CODE EXISTS | `runtime.bind()`. Not run on hardware. |
+| Device allocator (`allocate`, `deallocate`) | CODE EXISTS | VMM arena or `cuMemAlloc`. Cross-device guard. |
+| Synchronous data transfer (`copy`) | CODE EXISTS | DtoD via `CUmemcpyDtoD`. No stream ordering. |
+| Async data transfer (`copy_async`) | CODE EXISTS | HTD/DTD on transfer stream; returns `Fence`. |
+| Host↔device transfer | CODE EXISTS | Transfer stream; `copy_from_host_at` supports offset. |
+| Stream synchronization | CODE EXISTS | `runtime.synchronize()`. Fence methods use CUDA events. |
+| Capability advertisement | CODE EXISTS | Advertises weight-paging when offload enabled. |
+| Weight paging (`page_lazy_weight`) | CODE EXISTS | LRU residency via `CudaWeightResidency`. |
+| Prefetch lookahead (`prefetch_lazy_weight`) | **STUB** | Body: `let _ = (self, key, weight, source); Ok(false)`. Deferred to post-Phase-2a. Returns "no transfer enqueued" — honest decline. |
+| CUDA graph capture/replay | CODE EXISTS | Assumes stream ownership — **incompatible** with ORT plugin model. |
+| Device argmax | CODE EXISTS | CUDA kernel. |
+| VMM arena | CODE EXISTS | `cuMemCreate`/`cuMemMap`. |
+| Op support query (`supports_op`) | CODE EXISTS | 109 entries in `src/kernels/mod.rs`. Registry-keyed, opset-aware. |
+| Kernel execution | CODE EXISTS | cuBLASLt for GEMM; custom kernels. No validated run. |
+| ORT plugin-EP export | **FAILS CLOSED** | `CreateEpFactories` returns 0 factories. See §1–§2. |
+
+**Every "CODE EXISTS" row is unvalidated.** The previous table used "IMPLEMENTED"
+which implied a level of confidence the review disproved. "Code exists" is the
+honest description: the code compiles, but correctness is unproven.
 
 ---
 
-## Capability Status Table
+## 4. What Must Happen Before CUDA Advertises Factories
 
-| Capability | IMPLEMENTED | COMPILE-CHECKED | VALIDATED-ON-HARDWARE | Notes |
-|---|---|---|---|---|
-| **Device enumeration** (`device_type`, `device_id`) | ✅ | ✅ (no-toolkit path via `cargo check`) | ❌ None | Returns `DeviceType::Cuda` and `DeviceId::new(Cuda, ordinal)`. Ordinal from constructor. No `cuDeviceGet` call — does not verify device exists at enumeration time. |
-| **Initialize / bind device** (`initialize`) | ✅ | ✅ | ❌ None | Calls `self.runtime.bind()` to confirm device is reachable on current thread. Not run on real hardware. |
-| **Device allocator** (`allocate`, `deallocate`) | ✅ | ✅ | ❌ None | VMM arena or `cuMemAlloc` path. Cross-device guard. No-op for borrowed buffers. |
-| **Synchronous data transfer** (`copy`) | ✅ | ✅ | ❌ None | DtoD with size check. Uses `CUmemcpyDtoD`. No stream ordering. |
-| **Async data transfer** (`copy_async`) | ✅ | ✅ | ❌ None | HTD/DTD on dedicated transfer stream; returns real `Fence` (CUDA event). |
-| **Host↔device transfer** (`copy_from_host`, `copy_to_host`, `copy_from_host_at`) | ✅ | ✅ | ❌ None | Uses transfer stream; `copy_from_host_at` supports offset. |
-| **Stream synchronization** (`sync`, `wait_fence`, `record_compute_fence`, `copy_wait_fence`) | ✅ | ✅ | ❌ None | `sync` calls `runtime.synchronize()` at `provider.rs:1500`. Fence methods use CUDA events. |
-| **Capability advertisement** (`capabilities`) | ✅ | ✅ | ❌ None | Advertises nxrt weight-paging when `ONNX_GENAI_WEIGHT_OFFLOAD` enabled. |
-| **Weight paging** (`page_lazy_weight`) | ✅ | ✅ | ❌ None | LRU residency cache page-in via `CudaWeightResidency`. |
-| **Prefetch lookahead** (`prefetch_lazy_weight`) | ❌ **STUB** | ✅ | ❌ None | `provider.rs:564–573`: body is `let _ = (self, key, weight, source); Ok(false)`. Deckard's decision: deferred to post-Phase-2a. Returns `false` (no transfer enqueued). |
-| **CUDA graph capture** (`begin/end/abort_device_graph_capture`) | ✅ | ✅ | ❌ None | Segmented capture. Assumes ownership of stream — incompatible with ORT plugin model (stream not owned by plugin). |
-| **CUDA graph replay** (`replay_device_graph`, `replay_device_graph_segment`) | ✅ | ✅ | ❌ None | |
-| **Device argmax** (`device_argmax_supported`, `device_argmax`) | ✅ | ✅ | ❌ None | CUDA kernel. |
-| **VMM arena** (`allocate_committed`, `commit_allocation_range/ranges`, `decommit_allocation_range`, etc.) | ✅ | ✅ | ❌ None | `cuMemCreate`/`cuMemMap` VMM allocator. |
-| **Op support query** (`supports_op`) | ✅ | ✅ | ❌ None | 109 entries registered in `src/kernels/mod.rs`. Registry-keyed, opset-aware, actionable declines. |
-| **Kernel execution** (`get_kernel` + CUDA kernel dispatch) | ✅ | ✅ | ❌ None | cuBLASLt for GEMM; custom kernels for attention, norms, MoE, etc. No end-to-end validated run. |
-| **ORT plugin-EP export** (`as_ort_plugin`) | ❌ **ABSENT** | N/A | ❌ None | `onnx-runtime-ep-cuda-plugin` crate exists as scaffold; `CreateEpFactories`/`ReleaseEpFactory` are wired behind `#[cfg(feature = "cuda")]`. Not a working CUDA plugin (device-pointer ABI marshaling and stream/context sharing remain undesigned). |
-| **Compile-time build** | ❌ | — | — | Requires CUDA toolkit ≥ 12.6 + cuBLAS + cuDNN + `cudarc`. This host has none. `cargo check --workspace` excludes `cuda` feature. |
+### Phase A: Fix the four plugin defects (§1)
+
+All four defects are implementation work, not hardware work. They can be designed
+and partially implemented without a GPU (the shared-context architecture, the
+allocation-size tracking, the `OrtApi` storage), but runtime validation requires
+a GPU.
+
+### Phase B: Resolve the ORT integration design gaps
+
+| Gap | Description | Status |
+|---|---|---|
+| **Device-pointer ORT ABI marshaling** | ORT passes device pointers via `OrtKernelContext_GetInput`. nxrt uses `DeviceBuffer`. Requires shared CUDA context. | 🔴 Not designed |
+| **Stream/context sharing** | nxrt creates its own primary context and compute stream. ORT provides its own. Must adopt ORT's context or synchronize. | 🔴 Not designed |
+| **cuBLAS/cuDNN handle binding** | Handles bound to nxrt's stream; must rebind for ORT's context/stream. | 🔴 Not designed |
+| **Weight paging in plugin model** | `CudaWeightResidency` manages its own VMM pool; ORT owns weight memory in the plugin model. | 🔴 Not designed |
+| **CUDA graph capture** | Graph capture assumes stream ownership; incompatible with ORT. Must disable or coordinate. | 🔴 Not designed |
+
+### Phase C: Hardware validation
+
+Issue [#768](https://github.com/justinchuby/onnx-genai/issues/768). Requires a
+CUDA GPU (compute ≥ 7.0, driver ≥ 535.x). No self-hosted GPU runner exists in
+this repository.
+
+**Phases A and B are prerequisites for Phase C.** #768 is necessary but not
+sufficient — the code must be correct before hardware validation is meaningful.
 
 ---
 
-## `prefetch_lazy_weight` — Stub Decision Record
+## 5. `prefetch_lazy_weight` — Stub Decision Record
 
 **Location:** `crates/onnx-runtime-ep-cuda/src/provider.rs:564–573`
 
-**Code:**
 ```rust
 fn prefetch_lazy_weight(
     &self,
@@ -73,93 +149,32 @@ fn prefetch_lazy_weight(
 }
 ```
 
-**Deckard's decision:** Explicitly deferred to post-Phase-2a. The Phase-2a CUDA EP
-scope is standard GEMM (`MatMul`) via cuBLASLt. Prefetch lookahead requires the
-weight-residency cache infrastructure and accurate stream-ordering guarantees that
-are not needed for Phase-2a correctness. The `Ok(false)` return is semantically
-correct: it means "no transfer was enqueued," which is true for a no-op. It does
-not claim to have prefetched and have that claim fail — it honestly declines.
-
-This is a **real functional gap**: a model relying on prefetch lookahead for memory
-pressure management will not benefit from it. Not a correctness bug for the current
-scope.
+Deckard's decision: deferred to post-Phase-2a. Returns `Ok(false)` — "no transfer
+enqueued," which is true. Not a correctness bug; a functional gap for models that
+rely on prefetch for memory pressure management.
 
 ---
 
-## Running the Hardware Conformance Runner
+## 6. Hardware Conformance Runner
 
-**`scripts/cuda_conformance_runner.sh` is committed at HEAD `087d34888`.**
+`scripts/cuda_conformance_runner.sh` is committed. Exit codes: 0 = VALIDATED,
+1 = FAILED, 2 = UNVALIDATED (preconditions not met).
 
-### Preconditions (runner validates these before testing)
-
-1. `nvidia-smi` reachable and a GPU detected.
-2. `libcuda.so` loadable (via `ldconfig -p` or standard CUDA paths).
-3. `libcublasLt.so.13` loadable.
-4. At least one CUDA GPU present.
-5. CUDA toolkit ≥ 12.6, cuBLAS, cuDNN, Rust stable.
-
-If any precondition fails, the runner exits with **code 2 (UNVALIDATED)** — not a
-test failure, just "can't run here."
-
-### Exit code contract
-
-| Code | Meaning |
-|---|---|
-| **0** | VALIDATED — all tests passed on real GPU hardware |
-| **1** | FAILED — test failures on GPU hardware (real bugs) |
-| **2** | UNVALIDATED — preconditions not met (no GPU, no driver, `cuda` feature not enabled) |
-
-### Build and invoke
-
-```bash
-# Build with CUDA feature first (requires CUDA toolkit ≥ 12.6):
-cargo build --features cuda -p onnx-runtime-ep-cuda
-
-# Run the conformance suite:
-./scripts/cuda_conformance_runner.sh
-
-# Target a specific GPU:
-CUDA_VISIBLE_DEVICES=0 ./scripts/cuda_conformance_runner.sh
-```
-
-### What the runner exercises
-
-- `CudaExecutionProvider::initialize` → device bind → success
-- `allocate` / `copy_from_host` / `copy_to_host` → bit-exact roundtrip
-- At least one `MatMul` kernel invocation with reference output comparison
-- `sync` / `wait_fence` ordering under concurrent dispatch
-- `device_argmax` on a known vector
-- Weight offload with `ONNX_GENAI_WEIGHT_OFFLOAD=1`
-
-The runner outputs per-test PASS/FAIL, CUDA device name, toolkit version, driver
-version, commit SHA, and a validated timestamp.
-
-**This host has no CUDA GPU.** The conformance runner was not run here. Every row
-in the VALIDATED-ON-HARDWARE column above remains empty.
+**This host has no CUDA GPU.** The runner exits 2 (UNVALIDATED). Every capability
+in §3 remains unvalidated. No self-hosted GPU workflow exists in this repository.
 
 ---
 
-## Known Hard Blockers for a Working CUDA ORT Plugin
+## 7. History — How We Got This Wrong
 
-These are engineering gaps, not merely hardware-absent gaps:
+The original version of this document used a three-column IMPLEMENTED /
+COMPILE-CHECKED / VALIDATED-ON-HARDWARE table. "IMPLEMENTED" was a developer
+claim that did not survive review. The rubber-duck review of PR #762 found that
+the CUDA plugin was failing open: it advertised a GPU EP while every component
+behind it was non-functional. We described this as "hardware-validation-blocked"
+in multiple documents and sessions. That framing was wrong — the code had
+implementation defects that would cause failures on any host, GPU or not.
 
-| Blocker | Reason | Status |
-|---|---|---|
-| **Device-pointer ORT ABI marshaling** | ORT's plugin ABI passes device pointers through `OrtKernelContext_GetInput`. nxrt's CUDA EP uses `DeviceBuffer` (opaque CUDA device pointer). Adapting the two requires a shared CUDA context between ORT and the plugin. Design unstarted. | 🔴 Not designed |
-| **Stream/context sharing** | nxrt creates its own CUDA primary context and compute stream. ORT provides its own context/stream. Kernels must execute on ORT's stream or synchronize. Must either adopt ORT's context or introduce sync points. | 🔴 Not designed |
-| **cuBLAS/cuDNN handle binding** | nxrt's handles are bound to its own stream. Must be re-bound for ORT's context/stream. | 🔴 Not designed |
-| **Weight paging in plugin model** | nxrt's `CudaWeightResidency` manages its own VMM pool; in the plugin model, ORT owns weight memory. The paging system cannot operate without a redesign. | 🔴 Not designed |
-| **CUDA graph capture in plugin model** | nxrt's graph capture assumes stream ownership; ORT may have its own capture semantics. Must be disabled or coordinated. | 🔴 Not designed |
-
-These are in addition to the hardware requirement. A host with a GPU still cannot
-produce a working CUDA ORT plugin without first resolving the design blockers above.
-
-## GPU validation tracking
-
-Hardware validation is tracked in [#768](https://github.com/justinchuby/onnx-genai/issues/768).
-This repository has **zero self-hosted runners** (`GET /repos/justinchuby/onnx-genai/actions/runners` -> `total_count: 0`)
-and the owner is a User account, so there is no org-level GPU pool. Hosted runners have no NVIDIA GPU,
-so CUDA cannot be validated by CI as configured; it requires a human-operated CUDA host.
-
-Run `scripts/cuda_conformance_runner.sh`; exit 0 = VALIDATED, 1 = FAILED, 2 = UNVALIDATED.
-See #768 for prerequisites and the acceptance evidence required.
+This rewrite corrects the framing. CUDA is implementation-blocked. The code
+exists but is known non-functional. Issue #768 gates the final validation step
+but cannot substitute for fixing the code.

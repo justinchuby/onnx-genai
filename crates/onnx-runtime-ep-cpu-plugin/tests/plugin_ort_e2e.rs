@@ -2077,6 +2077,42 @@ unsafe fn assert_output_dtype(
     eprintln!("  ✓ {label}: dtype={elem_type} (matches expected {expected})");
 }
 
+/// Assert that `output` has the given shape (via ORT API).  Panics with a
+/// diagnostic message on shape mismatch, so a regression is immediately visible.
+unsafe fn assert_output_shape(
+    api: *const ort::OrtApi,
+    output: *const ort::OrtValue,
+    expected: &[i64],
+    label: &str,
+) {
+    let get_type_shape =
+        unsafe { (*api).GetTensorTypeAndShape }.expect("GetTensorTypeAndShape not in OrtApi");
+    let get_dims_count =
+        unsafe { (*api).GetDimensionsCount }.expect("GetDimensionsCount not in OrtApi");
+    let get_dims = unsafe { (*api).GetDimensions }.expect("GetDimensions not in OrtApi");
+    let release_info = unsafe { (*api).ReleaseTensorTypeAndShapeInfo }
+        .expect("ReleaseTensorTypeAndShapeInfo not in OrtApi");
+
+    let mut info: *mut ort::OrtTensorTypeAndShapeInfo = ptr::null_mut();
+    let status = unsafe { get_type_shape(output, &mut info) };
+    unsafe { check_status(api, status, &format!("GetTensorTypeAndShape({label})")) };
+
+    let mut rank: usize = 0;
+    let status = unsafe { get_dims_count(info, &mut rank) };
+    unsafe { check_status(api, status, &format!("GetDimensionsCount({label})")) };
+
+    let mut dims: Vec<i64> = vec![0i64; rank];
+    let status = unsafe { get_dims(info, dims.as_mut_ptr(), rank) };
+    unsafe { check_status(api, status, &format!("GetDimensions({label})")) };
+    unsafe { release_info(info) };
+
+    assert_eq!(
+        dims, expected,
+        "{label}: shape mismatch: got {dims:?}, expected {expected:?}"
+    );
+    eprintln!("  ✓ {label}: shape={dims:?} (matches expected {expected:?})");
+}
+
 // ─── B1 dtype: Cast (f32 → i64) ─────────────────────────────────────────────
 
 /// Cast f32 [2,3] → i64.  Output dtype must be INT64, not FLOAT.
@@ -2314,20 +2350,13 @@ fn conformance_shape_f32() {
     }
 }
 
-// ─── B1 dtype: LayerNormalization (multi-output) ─────────────────────────────
+// ─── LayerNormalization: multi-output, shape and value correctness ────────────
 
 /// LayerNormalization(X [2,4], Scale [4]) → 3 outputs (Y, Mean, InvStdDev).
-/// All outputs must be f32 and must have 3 separate outputs.
-///
-/// BUG FOUND: our EP's shape inference for LayerNormalization Mean/InvStdDev
-/// outputs produces shape [2,4] instead of [2,1], causing an element-count
-/// mismatch at Compute time. The kernel correctly produces 2 mean values but
-/// ORT allocates an 8-element buffer based on the wrong shape inference.
-/// Owner: Batty (crates/onnx-runtime-ep-plugin/src/compute.rs or
-///        crates/onnx-runtime-ep-cpu/src/kernels/layernorm.rs — shape inference).
+/// axis=-1; Mean and InvStdDev must have shape [2,1], not [2,4].
+/// Verifies the fix to the ShapePreservingNorm → LayerNorm shape inference
+/// refactor: the old code emitted input[0]'s full shape for every output.
 #[test]
-#[ignore = "B1-layernorm: EP shape inference bug — Mean shape [2,4] vs kernel output 2 elements. \
-            Owner: Batty (compute.rs / layernorm.rs shape inference)"]
 fn conformance_layer_norm_multi_output() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -2393,6 +2422,12 @@ fn conformance_layer_norm_multi_output() {
             "layer_norm_InvStdDev",
         );
 
+        // Assert output shapes: Y=[2,4], Mean=[2,1], InvStdDev=[2,1].
+        // The old ShapePreservingNorm bug emitted [2,4] for Mean and InvStdDev.
+        assert_output_shape(api, outputs[0], &[2, 4], "layer_norm_Y");
+        assert_output_shape(api, outputs[1], &[2, 1], "layer_norm_Mean");
+        assert_output_shape(api, outputs[2], &[2, 1], "layer_norm_InvStdDev");
+
         // Check Y values (layer-norm of [1,2,3,4] with scale=[1,1,1,1]):
         // mean=2.5, var=1.25, invstd=1/sqrt(1.25+eps)
         // Y = (X - mean) * invstd * scale
@@ -2412,7 +2447,7 @@ fn conformance_layer_norm_multi_output() {
             );
         }
 
-        // Check Mean output
+        // Check Mean output: row means are 2.5 and 6.5.
         let status = ((*api).GetTensorMutableData.unwrap())(outputs[1], &mut data_ptr);
         check_status(api, status, "GetTensorMutableData(Mean)");
         let mean_result = std::slice::from_raw_parts(data_ptr as *const f32, 2);
@@ -2428,12 +2463,225 @@ fn conformance_layer_norm_multi_output() {
             mean_result[1]
         );
 
+        // Check InvStdDev output: both rows have var=1.25, so invstd≈0.8944.
+        let status = ((*api).GetTensorMutableData.unwrap())(outputs[2], &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(InvStdDev)");
+        let inv_result = std::slice::from_raw_parts(data_ptr as *const f32, 2);
+        eprintln!("  InvStdDev output: {inv_result:?}");
+        let expected_inv = 1.0_f32 / 1.25_f32.sqrt(); // ≈ 0.8944
+        for (i, &v) in inv_result.iter().enumerate() {
+            assert!(
+                (v - expected_inv).abs() < 1e-3,
+                "InvStdDev[{i}]={v}, want ≈{expected_inv}"
+            );
+        }
+
         for out in &outputs {
             ((*api).ReleaseValue.unwrap())(*out);
         }
         ((*api).ReleaseValue.unwrap())(x_val);
         ((*api).ReleaseValue.unwrap())(s_val);
         conformance_teardown(api, env, opts, session, "cpu_ep_ln");
-        eprintln!("\n✅ conformance_layer_norm_multi_output: PASSED — 3 outputs, all f32");
+        eprintln!(
+            "\n✅ conformance_layer_norm_multi_output: PASSED — shapes [2,1] and values verified"
+        );
+    }
+}
+
+// ─── LayerNormalization: 3-D input, axis=-1 (reduced shape = [2,3,1]) ────────
+
+/// LayerNormalization(X [2,3,4], Scale [4]) with axis=-1.
+/// Mean / InvStdDev shapes must be [2,3,1], not [2,3,4].
+/// This catches a regression where the old ShapePreservingNorm emitted the
+/// full input shape for every output — the difference is obvious in 3D.
+///
+/// X[0] = [[1,2,3,4],[5,6,7,8],[9,10,11,12]]
+/// X[1] = [[-4,-3,-2,-1],[1,1,1,1],[0,1,2,3]]
+/// Expected Mean (6 values, shape [2,3,1]): [2.5, 6.5, 10.5, -2.5, 1.0, 1.5]
+#[test]
+fn conformance_layer_norm_neg_axis() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_neg_axis_f32/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_ln_neg", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_layer_norm_neg_axis — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        #[rustfmt::skip]
+        let mut x_data: [f32; 24] = [
+            1.0,  2.0,  3.0,  4.0,
+            5.0,  6.0,  7.0,  8.0,
+            9.0, 10.0, 11.0, 12.0,
+           -4.0, -3.0, -2.0, -1.0,
+            1.0,  1.0,  1.0,  1.0,
+            0.0,  1.0,  2.0,  3.0,
+        ];
+        let mut scale_data: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        let x_shape: [i64; 3] = [2, 3, 4];
+        let s_shape: [i64; 1] = [4];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+        let s_val = make_float_tensor(api, &mut scale_data, &s_shape);
+
+        let input_names = [c"X".as_ptr(), c"Scale".as_ptr()];
+        let output_names = [c"Y".as_ptr(), c"Mean".as_ptr(), c"InvStdDev".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, s_val];
+        let mut outputs: [*mut ort::OrtValue; 3] = [ptr::null_mut(); 3];
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            3,
+            outputs.as_mut_ptr(),
+        );
+        check_status(api, status, "Run(layer_norm_neg_axis)");
+
+        for (i, out) in outputs.iter().enumerate() {
+            assert!(!out.is_null(), "LayerNorm(neg_axis) output[{i}] is null");
+        }
+
+        // Shapes: Y=[2,3,4], Mean=[2,3,1], InvStdDev=[2,3,1].
+        assert_output_shape(api, outputs[0], &[2, 3, 4], "ln_neg_Y");
+        assert_output_shape(api, outputs[1], &[2, 3, 1], "ln_neg_Mean");
+        assert_output_shape(api, outputs[2], &[2, 3, 1], "ln_neg_InvStdDev");
+
+        // Mean values (6 elements stored flat in [2,3,1]).
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(outputs[1], &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(ln_neg_Mean)");
+        let mean_result = std::slice::from_raw_parts(data_ptr as *const f32, 6);
+        eprintln!("  Mean output: {mean_result:?}");
+        let expected_means: [f32; 6] = [2.5, 6.5, 10.5, -2.5, 1.0, 1.5];
+        for (i, (&got, &want)) in mean_result.iter().zip(expected_means.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-4, "Mean[{i}]={got}, want {want}");
+        }
+
+        // InvStdDev: rows [1,2,3,4], [5,6,7,8], [9,10,11,12], [-4,-3,-2,-1]
+        // and [0,1,2,3] all have var=1.25 → invstd≈0.8944.
+        // Row [1,1,1,1] has var=0 → invstd=1/sqrt(eps) (very large); skip it.
+        let status = ((*api).GetTensorMutableData.unwrap())(outputs[2], &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(ln_neg_InvStdDev)");
+        let inv_result = std::slice::from_raw_parts(data_ptr as *const f32, 6);
+        eprintln!("  InvStdDev output: {inv_result:?}");
+        let expected_inv = 1.0_f32 / 1.25_f32.sqrt(); // ≈ 0.8944
+        for idx in [0usize, 1, 2, 3, 5] {
+            assert!(
+                (inv_result[idx] - expected_inv).abs() < 1e-3,
+                "InvStdDev[{idx}]={}, want ≈{expected_inv}",
+                inv_result[idx]
+            );
+        }
+
+        for out in &outputs {
+            ((*api).ReleaseValue.unwrap())(*out);
+        }
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(s_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_ln_neg");
+        eprintln!(
+            "\n✅ conformance_layer_norm_neg_axis: PASSED — Mean/InvStdDev shape [2,3,1], values verified"
+        );
+    }
+}
+
+// ─── RMSNormalization: single output, no Mean ─────────────────────────────────
+
+/// RMSNormalization(X [2,4], scale [4]) → 1 output Y [2,4].
+/// axis=-1.  Verifies that the EP handles a LayerNorm-family op with a single
+/// output (no Mean, no InvStdDev) without crashing or misshaping Y.
+/// Also validates that Y values satisfy RMS-norm invariant: rms(Y_row)≈1.
+///
+/// X = [[1,2,3,4],[5,6,7,8]], scale = [1,1,1,1]
+/// Row 0: rms(X)=sqrt(7.5)≈2.7386 → Y[0,0]≈0.3651
+/// Row 1: rms(X)=sqrt(43.5)≈6.5952 → rms(Y row)≈1.0
+#[test]
+fn conformance_rms_norm() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/simplified_layer_norm_f32/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_rms", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_rms_norm — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        let mut x_data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut scale_data: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        let x_shape: [i64; 2] = [2, 4];
+        let s_shape: [i64; 1] = [4];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+        let s_val = make_float_tensor(api, &mut scale_data, &s_shape);
+
+        let input_names = [c"X".as_ptr(), c"scale".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, s_val];
+        let mut outputs: [*mut ort::OrtValue; 1] = [ptr::null_mut()];
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            outputs.as_mut_ptr(),
+        );
+        check_status(api, status, "Run(rms_norm)");
+
+        assert!(!outputs[0].is_null(), "RMSNorm Y output is null");
+
+        // Y shape must be [2,4].
+        assert_output_shape(api, outputs[0], &[2, 4], "rms_norm_Y");
+        assert_output_dtype(
+            api,
+            outputs[0],
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            "rms_norm_Y",
+        );
+
+        // Check Y values.
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(outputs[0], &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(rms_norm_Y)");
+        let y_result = std::slice::from_raw_parts(data_ptr as *const f32, 8);
+        eprintln!("  RMSNorm Y output: {y_result:?}");
+
+        // Y[0,0] ≈ 1.0 / sqrt(7.5)
+        let expected_y00 = 1.0_f32 / 7.5_f32.sqrt();
+        assert!(
+            (y_result[0] - expected_y00).abs() < 1e-4,
+            "Y[0,0]={}, want ≈{expected_y00}",
+            y_result[0]
+        );
+
+        // For each row of Y, rms(row) ≈ 1.0 (RMS-norm invariant).
+        for row in 0..2 {
+            let row_slice = &y_result[row * 4..(row + 1) * 4];
+            let rms: f32 = (row_slice.iter().map(|v| v * v).sum::<f32>() / 4.0).sqrt();
+            assert!(
+                (rms - 1.0).abs() < 1e-4,
+                "RMSNorm Y row {row} rms={rms}, expected ~1.0"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(outputs[0]);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(s_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_rms");
+        eprintln!("\n✅ conformance_rms_norm: PASSED — Y shape [2,4], rms(Y row)≈1.0");
     }
 }

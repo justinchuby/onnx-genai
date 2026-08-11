@@ -44,6 +44,8 @@ models/
 !crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/where_bool_f32/model.onnx
 !crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/shape_f32/model.onnx
 !crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/layer_norm_f32/model.onnx
+!crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/layer_norm_neg_axis_f32/model.onnx
+!crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/simplified_layer_norm_f32/model.onnx
 *.safetensors
 .DS_Store
 

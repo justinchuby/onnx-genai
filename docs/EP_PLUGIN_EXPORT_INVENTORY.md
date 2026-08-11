@@ -65,7 +65,7 @@ Results (non-test, non-mock):
 | **Op coverage** | **109 entries** registered in `src/kernels/mod.rs` (verified with `grep -c "reg.register"` → 109). Covers MatMul, GEMM, custom attention, fused ops, quantized matmul, MoE, activation, norm, element-wise, rotary embedding, etc. — subset of CPU EP coverage. |
 | **Device / memory model** | Device buffers (CUDA device-virtual pointers, not host-dereferenceable). Separate compute stream + transfer stream for async weight paging. CUDA events as `Fence`. Optional VMM arena (physical granule mapping). Memory governor integration. cuBLASLt for GEMM. cuDNN for attention. |
 | **Build deps** | CUDA toolkit ≥ 12.6, cuBLAS, cuDNN, `cudarc`. Does **not** build without CUDA toolkit. Cannot use `--no-default-features` and still compile this crate. |
-| **Readiness for outbound ORT plugin export** | **BLOCKED** on three hard prerequisites: (1) `as_ort_plugin()` not overridden (→ `None`); (2) requires CUDA toolkit to build — not testable in CI without GPU hardware; (3) the device-buffer model (opaque CUDA device pointers) needs additional ABI marshaling to satisfy the ORT C plugin ABI's pointer/allocation contracts. `prefetch_lazy_weight` is also a real functional stub. |
+| **Readiness for outbound ORT plugin export** | **IMPLEMENTATION-BLOCKED** — `onnx-runtime-ep-cuda-plugin` exists but fails closed (zero factories). Four defects prevent correct operation on any host: (1) separate CUDA runtime/context per component, (2) CreateDataTransfer returns NULL, (3) GetHandle returns NULL stream, (4) Free passes size=0. These are implementation defects, not hardware-absent gaps. See `docs/CUDA_EP_STATUS.md`. |
 
 ---
 
@@ -160,7 +160,7 @@ Evidence:
 | EP | Crate | `impl EP`? | `todo!`/stubs | Op registrations | Memory model | Build deps | ORT export readiness |
 |---|---|---|---|---|---|---|---|
 | **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | ✅ **DONE (M1+M2)** — `onnx-runtime-ep-cpu-plugin` is a working ORT plugin EP; 23 conformance tests pass including f16/bf16; dtype-aware capability claiming via `GetKernelRegistry` |
-| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🟡 **SCAFFOLDED (M2)** — `onnx-runtime-ep-cuda-plugin` crate exists with `DeviceAllocator`/`DeviceSyncStream`/`DeviceSupport` surfaces. Tested with mock EPs. **Not a working CUDA EP:** real device-pointer/stream/allocator integration requires CUDA hardware not available on this host. |
+| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🔴 **IMPLEMENTATION-BLOCKED** — `onnx-runtime-ep-cuda-plugin` exists but `CreateEpFactories` returns zero factories (fail-closed). Four implementation defects prevent correct operation on any host, GPU or not. See `docs/CUDA_EP_STATUS.md`. |
 | LegacyOrtEp | `onnx-runtime-ep-api` | Yes (inbound only) | — | — | Inbound adapter | — | Not a candidate |
 | PluginExecutionProvider | `onnx-runtime-session` | Yes (inbound bridge) | — | — | Inbound bridge | — | Not a candidate |
 | onnx-runtime-eager | `onnx-runtime-eager` | No (orchestrator) | — | — | — | — | Not a candidate |
@@ -168,27 +168,16 @@ Evidence:
 
 ---
 
-## 6. Roy Verification Note — Updated for M2 (2026-08-10 @ 5a5b40877)
+## 6. Roy Verification Note — Updated for B1-B4 corrective wave (2026-08-11 @ 62f23440f)
 
 Re-ran `grep -rn "impl ExecutionProvider" crates/` independently. Results match Deckard's
 inventory exactly: 2 production EPs (CPU + CUDA), 2 inbound adapters, 7 test/mock
 implementations (excluded). Inventory is complete and correct.
 
-**`../onnxruntime-mlx`:** `ls /workspace/dev/` confirms only `onnx-genai` exists on this machine.
-The sibling repo described in `.squad/team.md` is **not checked out here**. No Metal/MPS EP
-is in scope for this workspace. Deckard's exclusion is correct.
+**CUDA EP status correction:** The CUDA plugin is **implementation-blocked**, not
+merely hardware-blocked or "scaffolded." Four defects found by the rubber-duck review
+of PR #762 prevent correct operation on any host. The plugin now fails closed (zero
+factories). See `docs/CUDA_EP_STATUS.md` for the full specification.
 
-**M1 completion:** `onnx-runtime-ep-plugin` and `onnx-runtime-ep-cpu-plugin` compile and pass
-23 ORT conformance tests, including f16/bf16 end-to-end with exact bit-pattern assertions.
-The original compile error (9 missing `OrtEp` fields) was resolved. The `as_ort_plugin()`
-trait-method path is superseded by the dedicated adapter crate architecture.
-
-**M2 CUDA scaffold state:** `crates/onnx-runtime-ep-cuda-plugin/` exists with `DeviceAllocator`,
-`DeviceSyncStream`, and `DeviceSupport` surfaces. Feature-gated behind `cuda`; `cargo check
---workspace` passes without CUDA toolkit. The device surfaces are tested with mock EPs; they
-are **not** a complete CUDA EP — real device-pointer and data-transfer work remains, requiring
-CUDA hardware not available on this host.
-
-**CUDA build note:** The CUDA EP (`onnx-runtime-ep-cuda`) builds cleanly via `cargo check`
-on this no-CUDA host because `cudarc` uses `dynamic-loading` feature (dlopen at runtime, not
-linked at build time). This has not changed from M1.
+**CPU EP plugin:** Working end-to-end. 154 lib + 9 parity + 6 ABI + 20 ORT e2e = 189
+passing tests, 1 ignored (LayerNorm Mean-shape bug, being fixed by Batty).

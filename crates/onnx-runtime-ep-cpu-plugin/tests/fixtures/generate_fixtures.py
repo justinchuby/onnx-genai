@@ -256,7 +256,7 @@ def gen_shape_f32():
 
 # ── layer_norm_f32 ───────────────────────────────────────────────────────────
 # LayerNormalization(X [2,4], scale [4]) → 3 outputs (Y, Mean, InvStdDev).
-# All outputs are f32. This tests multi-output dtype handling.
+# All outputs are f32. axis=-1 (last dim), Mean/InvStdDev shape = [2,1].
 def gen_layer_norm_f32():
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 4])
     scale = helper.make_tensor_value_info("Scale", TensorProto.FLOAT, [4])
@@ -277,6 +277,59 @@ def gen_layer_norm_f32():
     save(model, "layer_norm_f32")
 
 
+# ── layer_norm_neg_axis_f32 ──────────────────────────────────────────────────
+# LayerNormalization(X [2,3,4], scale [4]) with axis=-1 (normalized axis=2).
+# → 3 outputs: Y [2,3,4], Mean [2,3,1], InvStdDev [2,3,1].
+# Key regression: old ShapePreservingNorm gave Mean shape [2,3,4]; this
+# fixture detects that because [2,3,1] != [2,3,4].
+# X[0] = [[1,2,3,4],[5,6,7,8],[9,10,11,12]]
+# X[1] = [[-4,-3,-2,-1],[1,1,1,1],[0,1,2,3]]
+# Mean (row means) = [[2.5, 6.5, 10.5], [-2.5, 1.0, 1.5]] → shape [2,3,1].
+def gen_layer_norm_neg_axis_f32():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 3, 4])
+    scale = helper.make_tensor_value_info("Scale", TensorProto.FLOAT, [4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3, 4])
+    Mean = helper.make_tensor_value_info("Mean", TensorProto.FLOAT, [2, 3, 1])
+    InvStdDev = helper.make_tensor_value_info("InvStdDev", TensorProto.FLOAT, [2, 3, 1])
+    node = helper.make_node(
+        "LayerNormalization",
+        inputs=["X", "Scale"],
+        outputs=["Y", "Mean", "InvStdDev"],
+        axis=-1,
+    )
+    graph = helper.make_graph(
+        [node], "layer_norm_neg_axis_f32", [X, scale], [Y, Mean, InvStdDev]
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "layer_norm_neg_axis_f32")
+
+
+# ── simplified_layer_norm_f32 ────────────────────────────────────────────────
+# RMSNormalization(X [2,4], scale [4]) → 1 output: Y [2,4].
+# axis=-1.  No Mean or InvStdDev outputs.
+# Y = X / sqrt(mean(X^2) + eps) * scale.
+# X = [[1,2,3,4],[5,6,7,8]], Scale = [1,1,1,1]
+# Row 0: rms = sqrt(7.5 + eps) ≈ 2.7386, Y[0] ≈ [0.3651, 0.7303, 1.0954, 1.4606]
+# Row 1: rms = sqrt(43.5 + eps) ≈ 6.5952, Y[1] ≈ [0.7583, 0.9099, 1.0616, 1.2132]
+def gen_simplified_layer_norm_f32():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 4])
+    scale = helper.make_tensor_value_info("scale", TensorProto.FLOAT, [4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 4])
+    node = helper.make_node(
+        "RMSNormalization",
+        inputs=["X", "scale"],
+        outputs=["Y"],
+        axis=-1,
+    )
+    graph = helper.make_graph(
+        [node], "simplified_layer_norm_f32", [X, scale], [Y]
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 23)])
+    model.ir_version = 10
+    save(model, "simplified_layer_norm_f32")
+
+
 if __name__ == "__main__":
     print("Generating ONNX conformance fixtures …")
     gen_add_broadcast()
@@ -294,4 +347,6 @@ if __name__ == "__main__":
     gen_where_bool_f32()
     gen_shape_f32()
     gen_layer_norm_f32()
+    gen_layer_norm_neg_axis_f32()
+    gen_simplified_layer_norm_f32()
     print("Done.")

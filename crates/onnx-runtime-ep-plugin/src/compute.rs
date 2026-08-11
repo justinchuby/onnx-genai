@@ -103,9 +103,22 @@ pub enum ShapeInference {
     },
     /// RotaryEmbedding — output same shape as input[0].
     RotaryEmbedding,
-    /// Softmax, LayerNormalization, etc.: shape-preserving single output.
-    /// (same as SameAsInput(0) but makes intent clear for multi-output ops)
-    ShapePreservingNorm { num_outputs: usize },
+    /// LayerNormalization family: output 0 = input[0] shape,
+    /// outputs 1+ (Mean, InvStdDev) = input[0] shape with dims from `axis`
+    /// onward replaced by 1 (keepdims reduction).  `axis` is already
+    /// resolved to a non-negative index into input[0].
+    ///
+    /// For SkipLayerNormalization the last output (input_skip_bias_sum) is
+    /// full-shaped — `full_shape_outputs` lists the output indices that
+    /// should keep input[0]'s shape verbatim.
+    LayerNorm {
+        /// Non-negative axis: dims `[axis..]` are the normalized axes.
+        axis: usize,
+        num_outputs: usize,
+        /// Output indices (besides 0) that keep the full input shape,
+        /// e.g. the `input_skip_bias_sum` output of SkipLayerNormalization.
+        full_shape_outputs: Vec<usize>,
+    },
     /// Op with no modelled shape rule — Compute will error with op details.
     Declined { op_type: String, domain: String },
 }
@@ -169,12 +182,16 @@ impl ShapeInference {
             | "InstanceNormalization"
             | "LpNormalization" => Self::SameAsInput(0),
 
-            // ── LayerNorm family: 1–3 outputs, shape of input[0] ─────────
+            // ── LayerNorm family: requires axis attribute for correct shape ──
+            // Decline here; for_node() resolves the axis.
             "LayerNormalization"
             | "RMSNormalization"
             | "SkipLayerNormalization"
             | "SkipSimplifiedLayerNormalization"
-            | "SimplifiedLayerNormalization" => Self::SameAsInput(0),
+            | "SimplifiedLayerNormalization" => Self::Declined {
+                op_type: op_type.to_string(),
+                domain: domain.to_string(),
+            },
 
             // ── Matrix multiply ───────────────────────────────────────────
             "MatMul" | "MatMulNBits" => Self::MatMul,
@@ -284,11 +301,54 @@ impl ShapeInference {
 
             // ── LayerNorm / SkipLayerNorm family ──────────────────────────
             "LayerNormalization" | "RMSNormalization" | "SimplifiedLayerNormalization" => {
-                // Outputs: [output, mean, inv_std_var] — all same shape as input[0].
-                Self::ShapePreservingNorm { num_outputs }
+                // ONNX spec: axis defaults to -1; Mean/InvStdDev shapes are
+                // [d[0]..d[axis-1], 1, .., 1].
+                let raw_axis = int_attr("axis").unwrap_or(-1);
+                if input_shapes.is_empty() {
+                    return Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                    };
+                }
+                let rank = input_shapes[0].len() as i64;
+                let resolved = if raw_axis < 0 {
+                    raw_axis + rank
+                } else {
+                    raw_axis
+                };
+                if resolved < 0 || resolved > rank {
+                    return Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                    };
+                }
+                Self::LayerNorm {
+                    axis: resolved as usize,
+                    num_outputs,
+                    full_shape_outputs: vec![],
+                }
             }
             "SkipLayerNormalization" | "SkipSimplifiedLayerNormalization" => {
-                Self::ShapePreservingNorm { num_outputs }
+                // Contrib op; normalises the last axis (no axis attr).
+                // Outputs: [output, mean, inv_std_dev, input_skip_bias_sum]
+                // output and input_skip_bias_sum are full-shaped; mean and
+                // inv_std_dev are reduced.
+                if input_shapes.is_empty() {
+                    return Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                    };
+                }
+                let rank = input_shapes[0].len();
+                // Last axis is the normalized axis.
+                let axis = if rank > 0 { rank - 1 } else { 0 };
+                // Output index 3 (input_skip_bias_sum) keeps full shape.
+                let full_shape_outputs = if num_outputs > 3 { vec![3] } else { vec![] };
+                Self::LayerNorm {
+                    axis,
+                    num_outputs,
+                    full_shape_outputs,
+                }
             }
 
             // ── MatMul ────────────────────────────────────────────────────
@@ -937,12 +997,37 @@ fn infer_shapes(
             Ok(vec![shape; *count])
         }
 
-        ShapeInference::ShapePreservingNorm { num_outputs } => {
+        ShapeInference::LayerNorm {
+            axis,
+            num_outputs,
+            full_shape_outputs,
+        } => {
             if inputs.is_empty() {
-                return Err("ShapePreservingNorm: no inputs".into());
+                return Err("LayerNorm: no inputs".into());
             }
-            let shape = inputs[0].shape.to_vec();
-            Ok(vec![shape; *num_outputs])
+            let full_shape = inputs[0].shape.to_vec();
+            // Reduced shape: dims before `axis` are kept, dims from `axis`
+            // onward become 1 (keepdims reduction over the normalised axes).
+            let axis = *axis;
+            if axis > full_shape.len() {
+                return Err(format!(
+                    "LayerNorm: axis {axis} out of range for rank {}",
+                    full_shape.len()
+                ));
+            }
+            let mut reduced_shape = full_shape.clone();
+            for d in reduced_shape[axis..].iter_mut() {
+                *d = 1;
+            }
+            let mut out = Vec::with_capacity(*num_outputs);
+            for i in 0..*num_outputs {
+                if i == 0 || full_shape_outputs.contains(&i) {
+                    out.push(full_shape.clone());
+                } else {
+                    out.push(reduced_shape.clone());
+                }
+            }
+            Ok(out)
         }
 
         ShapeInference::MatMul => {
@@ -2375,17 +2460,27 @@ mod tests {
 
     #[test]
     fn for_op_unary_coverage() {
-        for op in [
-            "Relu",
-            "Sigmoid",
-            "Cast",
-            "Identity",
-            "Softmax",
-            "LayerNormalization",
-        ] {
+        for op in ["Relu", "Sigmoid", "Cast", "Identity", "Softmax"] {
             assert!(
                 matches!(ShapeInference::for_op(op), ShapeInference::SameAsInput(0)),
                 "{op} should be SameAsInput(0)"
+            );
+        }
+    }
+
+    #[test]
+    fn for_op_layer_norm_requires_attributes() {
+        // LayerNorm family needs axis / input shapes — for_op must decline.
+        for op in [
+            "LayerNormalization",
+            "SimplifiedLayerNormalization",
+            "RMSNormalization",
+            "SkipLayerNormalization",
+            "SkipSimplifiedLayerNormalization",
+        ] {
+            assert!(
+                matches!(ShapeInference::for_op(op), ShapeInference::Declined { .. }),
+                "{op} should be Declined in for_op (needs axis attribute)"
             );
         }
     }

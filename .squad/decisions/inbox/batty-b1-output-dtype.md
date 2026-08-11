@@ -30,3 +30,38 @@
 ## Chew action required
 
 `crates/onnx-runtime-ep-cpu-plugin/tests/plugin_export_abi.rs` lines 363 and 429: change `output_dtype: DataType::Float32` → `output_dtypes: vec![DataType::Float32]`.
+
+## Follow-up: Multi-output shape inference fix (2026-08-11)
+
+### Bug
+
+`ShapePreservingNorm` variant emitted `vec![input_shape; num_outputs]` — all outputs
+got input[0]'s full shape. Per ONNX spec, LayerNormalization's Mean and InvStdDev
+outputs have shape `[d[0]..d[axis-1], 1, .., 1]` (keepdims reduction over normalised
+axes). For input `[2,4]` with `axis=-1`, Mean should be `[2,1]` not `[2,4]`.
+
+### Fix — Structural, not per-op
+
+Replaced `ShapePreservingNorm` with `LayerNorm { axis, num_outputs, full_shape_outputs }`.
+
+- `axis` is resolved to a non-negative index at `for_node` time (handles negative axis).
+- Output 0 always gets input[0]'s shape.
+- Outputs 1+ get the reduced shape (dims from axis onward → 1), unless listed in
+  `full_shape_outputs` (e.g. SkipLayerNormalization's 4th output).
+- `for_op_domain` now declines these ops (requires axis + input shapes), ensuring
+  fail-closed: if axis can't be resolved, the node is declined rather than claimed
+  with wrong shapes.
+
+### Ops checked
+
+| Op | axis source | Outputs checked |
+|----|-------------|-----------------|
+| LayerNormalization | `axis` attr (default -1) | Y (full), Mean (reduced), InvStdDev (reduced) |
+| SimplifiedLayerNormalization | `axis` attr (default -1) | Y (full), InvStdDev (reduced) |
+| RMSNormalization | `axis` attr (default -1) | Y (full), InvStdDev (reduced) |
+| SkipLayerNormalization | last axis (contrib, no attr) | output (full), mean (reduced), inv_std_dev (reduced), input_skip_bias_sum (full) |
+| SkipSimplifiedLayerNormalization | last axis (contrib, no attr) | output (full), inv_std_dev (reduced) |
+
+### Chew action required
+
+`conformance_layer_norm_multi_output` in `plugin_ort_e2e.rs` can have its `#[ignore]` removed — it passes with `--include-ignored`.

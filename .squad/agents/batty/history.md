@@ -90,3 +90,26 @@ Decision file: `.squad/decisions/inbox/batty-b1-output-dtype.md`
 Durable lesson: Never infer output dtypes from inputs — always read from the graph's
 declared value info. Ops like Cast, Where, Shape have output types unrelated to their
 first input type.
+
+### 2026-08-11 — B1 follow-up: Multi-output shape inference for LayerNorm family
+
+Root cause: `ShapePreservingNorm` emitted input[0]'s shape for ALL outputs. Per ONNX spec,
+LayerNormalization Mean/InvStdDev have reduced shape `[d[0]..d[axis-1], 1, .., 1]`.
+
+Structural fix: replaced `ShapePreservingNorm` with `LayerNorm { axis, num_outputs,
+full_shape_outputs }`. Resolves axis (including negative) at for_node time. Outputs 1+
+get reduced shape unless listed in full_shape_outputs. for_op_domain declines these ops
+(fail-closed: declined = correct-and-slower; wrong shape = silent corruption).
+
+Checked: LayerNormalization, SimplifiedLayerNormalization, RMSNormalization,
+SkipLayerNormalization, SkipSimplifiedLayerNormalization.
+
+Test results:
+- ep-plugin: 155 passed, 0 failed, 0 ignored (unit); 9 passed (integration)
+- cpu-plugin with --include-ignored: 21 passed, 0 failed, 0 ignored
+  (conformance_layer_norm_multi_output now passes)
+- clippy: clean (RUSTFLAGS="-D warnings")
+- fmt: clean
+
+Durable lesson: Multi-output ops must not assume all outputs share input[0]'s shape.
+Reduction outputs (Mean, InvStdDev) follow keepdims semantics over the normalised axes.

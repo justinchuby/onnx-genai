@@ -59,3 +59,53 @@ Four new ONNX fixtures generated via `generate_fixtures.py`:
 - `layer_norm_f32/model.onnx`
 
 All added to `.gitignore` with `!` negations.
+
+---
+
+## 2026-08-11 Update: LayerNorm shape-inference bug now fixed; test hardened
+
+**Performed by:** Chew (correctness reviewer)  
+**Scope:** Task 1–3 from the B1-layernorm follow-up review comment.
+
+### 1. `#[ignore]` removed
+
+`conformance_layer_norm_multi_output` was parked behind `#[ignore]` after the bug was fixed by Batty's `ShapePreservingNorm` → `LayerNorm` refactor. The attribute and stale bug comment were removed; the test runs by default.
+
+### 2. Existing test strengthened
+
+Added `assert_output_shape` helper (uses `GetDimensionsCount` / `GetDimensions` ORT API) and applied it:
+- `Y` → [2,4], `Mean` → [2,1], `InvStdDev` → [2,1] (directly catches the old regression)
+- `InvStdDev` value assertion: both rows have var=1.25 → invstd≈0.8944
+
+### 3. New test: `conformance_layer_norm_neg_axis`
+
+Fixture `layer_norm_neg_axis_f32`: LayerNormalization on 3D [2,3,4] with `axis=-1`.  
+Old code gave Mean shape [2,3,4] (full shape); correct shape is [2,3,1].  
+Asserts shapes and Mean/InvStdDev values for 5 of 6 rows.
+
+### 4. New test: `conformance_rms_norm`
+
+Fixture `simplified_layer_norm_f32`: `RMSNormalization` (opset 23) on 2D [2,4] with `axis=-1`, single Y output.  
+Covers the no-Mean-output path; asserts Y shape, dtype, spot value, and rms(Y_row)≈1.0.
+
+### 5. Fail-closed path not directly assertable
+
+The EP declines when `input_shapes.is_empty()` or axis resolves out of range.  
+Neither is constructible from a valid ONNX fixture (ONNX checker rejects invalid axes; ORT always resolves static shapes before `for_node()`).  
+The unit-level coverage for this path remains Batty's responsibility.
+
+### Test results
+
+```
+cargo test -p onnx-runtime-ep-cpu-plugin
+test result: ok. 23 passed; 0 failed; 0 ignored
+
+cargo test -p onnx-runtime-ep-plugin
+test result: ok. 9 passed; 0 failed; 0 ignored
+
+RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets -p onnx-runtime-ep-cpu-plugin
+Finished — no warnings or errors
+
+cargo fmt --all -- --check
+0 diffs
+```

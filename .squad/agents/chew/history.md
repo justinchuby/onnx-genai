@@ -105,3 +105,31 @@ All suites green:
 - `onnx-runtime-ep-cuda-plugin`: 6 passed (3 unit + 3 integration), 0 failed
 - clippy: clean (warnings as errors)
 - fmt: clean
+
+---
+
+## 2026-08-11 — PR #762: LayerNorm test hardening
+
+**Task:** Remove `#[ignore]`, strengthen `conformance_layer_norm_multi_output`, add new coverage.
+
+**Files changed (tests/ only):**
+- `crates/onnx-runtime-ep-cpu-plugin/tests/plugin_ort_e2e.rs`
+- `crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/generate_fixtures.py`
+- `.gitignore` (two new `!` negations)
+- New fixture dirs: `layer_norm_neg_axis_f32/`, `simplified_layer_norm_f32/`
+
+**Actions:**
+1. Removed `#[ignore]` and stale bug comment from `conformance_layer_norm_multi_output`.
+2. Added `assert_output_shape` unsafe helper (ORT GetDimensions API).
+3. Strengthened existing test: explicit shape assertions Mean=[2,1], InvStdDev=[2,1]; invstd value check.
+4. New test `conformance_layer_norm_neg_axis`: 3D [2,3,4] input, axis=-1, Mean/InvStdDev [2,3,1] asserted with values.
+5. New test `conformance_rms_norm`: RMSNormalization (opset 23) single-output, shape [2,4], rms(Y_row)≈1.0.
+6. Fail-closed decline path: cannot be tested from a valid ONNX fixture. Noted in decision doc.
+
+**Results:**
+```
+cargo test -p onnx-runtime-ep-cpu-plugin → 23 passed; 0 failed; 0 ignored
+cargo test -p onnx-runtime-ep-plugin     → 9 passed; 0 failed; 0 ignored
+clippy -D warnings                       → clean
+cargo fmt --check                        → clean
+```
