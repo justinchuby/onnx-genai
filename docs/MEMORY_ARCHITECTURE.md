@@ -426,6 +426,15 @@ the seven duplicate copies saves about **2.56 GiB** (#777/#787). This uses the
 multi-map primitive proven in #727, but detection, lifetime, read-only/COW
 enforcement, and 1:N handle bookkeeping are **not yet implemented**.
 
+The #777 isolating GPU probe has now cleared all five primitive questions with
+no kill finding — N-way multi-map under captured-graph replay, charge-once in the
+real #740 ledger, non-sticky/non-corrupting write protection, coexistence with
+the #759 dummy page, and a one-time ~5.5 ms pooled copy-on-write at the boundary.
+Measured answers, the concurrency/saving and capacity tables, and the design for
+an explicit pinned-prefix API (the smallest next increment) are in
+[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md). Integration
+remains unbuilt.
+
 #### Layout belongs to the KV owner
 
 Layout is a per-EP, per-platform capability, not a global constant (#783).
