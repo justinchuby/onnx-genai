@@ -507,14 +507,22 @@ fn ep_compile_inner(
                 })
                 .collect();
 
-            // For the get_kernel trait (which takes &[Vec<usize>]):
-            // substitute 0 for unknown dims. This preserves rank while
-            // signalling "dynamic" — valid static dims are always ≥1 for
-            // non-empty tensors, and the kernel receives actual shapes from
-            // OrtKernelContext at runtime.
+            // INVARIANT: The `get_kernel` trait takes `&[Vec<usize>]` — it cannot
+            // express "unknown dimension" at the type level. We use the sentinel
+            // value `DIM_UNKNOWN` (0) to represent symbolic/dynamic dims.
+            //
+            // This is safe because:
+            //   (a) Valid static dims for non-empty tensors are always ≥ 1.
+            //   (b) Kernels receive actual runtime shapes from OrtKernelContext
+            //       and MUST NOT pre-allocate buffers based on compile-time shapes.
+            //   (c) The `shapes_opt` vector (with full `Option<usize>` fidelity)
+            //       is passed separately to `ShapeInference::for_node` below.
+            //
+            // If the trait is ever extended to accept optional dims, remove this.
+            const DIM_UNKNOWN: usize = 0;
             let shapes: Vec<Vec<usize>> = shapes_opt
                 .iter()
-                .map(|s| s.iter().map(|d| d.unwrap_or(0)).collect())
+                .map(|s| s.iter().map(|d| d.unwrap_or(DIM_UNKNOWN)).collect())
                 .collect();
 
             let opset = ir_graph.effective_opset(node).unwrap_or(0);

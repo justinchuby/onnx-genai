@@ -740,6 +740,23 @@ unsafe fn conformance_setup(
         };
     }
 
+    // Enable EP graph assignment recording so we can query per-node provider
+    // attribution via Session_GetEpGraphAssignmentInfo (available since ORT 1.24).
+    {
+        let key = CString::new("session.record_ep_graph_assignment_info").unwrap();
+        let val = CString::new("1").unwrap();
+        let add_config =
+            unsafe { (*api).AddSessionConfigEntry }.expect("AddSessionConfigEntry not in OrtApi");
+        let status = unsafe { add_config(session_options, key.as_ptr(), val.as_ptr()) };
+        unsafe {
+            check_status(
+                api,
+                status,
+                "AddSessionConfigEntry(record_ep_graph_assignment_info)",
+            )
+        };
+    }
+
     let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
     let status = unsafe {
         ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
@@ -780,6 +797,115 @@ unsafe fn conformance_teardown(
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name_c.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
         ((*api).ReleaseEnv.unwrap())(env);
+    }
+}
+
+// ─── Helper: query EP graph assignment ────────────────────────────────────────
+
+/// Result of querying which nodes are assigned to which EP.
+struct EpAssignmentInfo {
+    /// (ep_name, op_type) pairs for every assigned node.
+    assignments: Vec<(String, String)>,
+}
+
+impl EpAssignmentInfo {
+    /// Op types assigned to our EP ("cpu_ep").
+    fn ops_on_our_ep(&self) -> Vec<&str> {
+        self.assignments
+            .iter()
+            .filter(|(ep, _)| ep == "cpu_ep")
+            .map(|(_, op)| op.as_str())
+            .collect()
+    }
+
+    /// Op types NOT assigned to our EP.
+    fn ops_not_on_our_ep(&self) -> Vec<&str> {
+        self.assignments
+            .iter()
+            .filter(|(ep, _)| ep != "cpu_ep")
+            .map(|(_, op)| op.as_str())
+            .collect()
+    }
+}
+
+/// Query `Session_GetEpGraphAssignmentInfo` and return per-node (ep_name, op_type).
+///
+/// Requires `session.record_ep_graph_assignment_info=1` to have been set before
+/// session creation (`conformance_setup` enables this unconditionally).
+///
+/// # Safety
+/// `api` and `session` must be valid pointers from a successfully created session.
+unsafe fn query_ep_assignment(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+) -> EpAssignmentInfo {
+    let get_info = unsafe { (*api).Session_GetEpGraphAssignmentInfo }
+        .expect("Session_GetEpGraphAssignmentInfo not in OrtApi — requires ORT ≥1.24");
+    let get_ep_name =
+        unsafe { (*api).EpAssignedSubgraph_GetEpName }.expect("EpAssignedSubgraph_GetEpName");
+    let get_nodes =
+        unsafe { (*api).EpAssignedSubgraph_GetNodes }.expect("EpAssignedSubgraph_GetNodes");
+    let get_op_type =
+        unsafe { (*api).EpAssignedNode_GetOperatorType }.expect("EpAssignedNode_GetOperatorType");
+
+    let mut ep_subgraphs: *const *const ort::OrtEpAssignedSubgraph = ptr::null();
+    let mut num_subgraphs: usize = 0;
+
+    let status = unsafe { get_info(session, &mut ep_subgraphs, &mut num_subgraphs) };
+    unsafe { check_status(api, status, "Session_GetEpGraphAssignmentInfo") };
+
+    let mut assignments = Vec::new();
+    for i in 0..num_subgraphs {
+        let subgraph = unsafe { *ep_subgraphs.add(i) };
+
+        let mut ep_name_ptr: *const std::os::raw::c_char = ptr::null();
+        let status = unsafe { get_ep_name(subgraph, &mut ep_name_ptr) };
+        unsafe { check_status(api, status, "EpAssignedSubgraph_GetEpName") };
+        let ep_name = unsafe { CStr::from_ptr(ep_name_ptr) }
+            .to_string_lossy()
+            .into_owned();
+
+        let mut ep_nodes: *const *const ort::OrtEpAssignedNode = ptr::null();
+        let mut num_nodes: usize = 0;
+        let status = unsafe { get_nodes(subgraph, &mut ep_nodes, &mut num_nodes) };
+        unsafe { check_status(api, status, "EpAssignedSubgraph_GetNodes") };
+
+        for j in 0..num_nodes {
+            let node = unsafe { *ep_nodes.add(j) };
+            let mut op_type_ptr: *const std::os::raw::c_char = ptr::null();
+            let status = unsafe { get_op_type(node, &mut op_type_ptr) };
+            unsafe { check_status(api, status, "EpAssignedNode_GetOperatorType") };
+            let op_type = unsafe { CStr::from_ptr(op_type_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            assignments.push((ep_name.clone(), op_type));
+        }
+    }
+
+    EpAssignmentInfo { assignments }
+}
+
+/// Assert that at least `expected_ops` are assigned to "cpu_ep".
+/// Panics with a clear message if any expected op is missing.
+unsafe fn assert_ops_assigned_to_our_ep(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    expected_ops: &[&str],
+    test_label: &str,
+) {
+    let info = unsafe { query_ep_assignment(api, session) };
+    let ours = info.ops_on_our_ep();
+    eprintln!(
+        "  [{test_label}] EP assignment: ours={ours:?}, others={:?}",
+        info.ops_not_on_our_ep()
+    );
+    for &op in expected_ops {
+        assert!(
+            ours.contains(&op),
+            "[{test_label}] Expected op '{op}' assigned to cpu_ep, \
+             but assignment was: {:?}",
+            info.assignments
+        );
     }
 }
 
@@ -928,6 +1054,9 @@ fn conformance_add_broadcast() {
         return;
     };
 
+    // Prove Add is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Add"], "add_broadcast") };
+
     unsafe {
         let mut x_data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut y_data: [f32; 3] = [10.0, 20.0, 30.0];
@@ -1000,6 +1129,9 @@ fn conformance_chain_add_mul() {
         eprintln!("*** SKIPPED: conformance_chain_add_mul — ORT or EP cdylib not found ***");
         return;
     };
+
+    // Prove Add and Mul are assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Add", "Mul"], "chain_add_mul") };
 
     unsafe {
         let mut a_data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
@@ -1077,6 +1209,9 @@ fn conformance_matmul_2d() {
         return;
     };
 
+    // Prove MatMul is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["MatMul"], "matmul_2d") };
+
     unsafe {
         let mut a_data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut b_data: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
@@ -1149,37 +1284,28 @@ fn conformance_mixed_partition() {
         return;
     };
 
-    // Assert our EP actually compiled the supported node (Add).
-    // ORT 1.27 has no per-node provider attribution query, so we observe
-    // our own claim-side behaviour: the compiled-node counter exposed by
-    // the cdylib should show that our EP compiled at least one node.
-    //
-    // NOTE: With disable_cpu_ep_fallback=false, ORT may route ALL nodes
-    // (including ones our EP supports) to its built-in CPU EP when it
-    // determines that avoids graph partitioning. This is expected ORT
-    // behaviour. We log a diagnostic rather than hard-asserting.
-    if let Some(ep_lib_path) = find_ep_cdylib()
-        && let Ok(ep_lib) = unsafe { libloading::Library::new(&ep_lib_path) }
-    {
-        let count_fn: Result<libloading::Symbol<unsafe extern "C" fn() -> usize>, _> =
-            unsafe { ep_lib.get(b"nxrt_ep_compiled_node_count") };
-        if let Ok(count_fn) = count_fn {
-            let count = unsafe { count_fn() };
-            if count >= 1 {
-                eprintln!("  EP compiled {count} node(s) — claim assertion passed");
-            } else {
-                // With fallback enabled, ORT may prefer its own CPU EP for
-                // the entire graph to avoid partition overhead. This is not
-                // a bug in our EP — it's ORT's routing decision. A true
-                // EP-assignment assertion requires ORT's per-node provider
-                // attribution API (not available in 1.27).
-                eprintln!(
-                    "  ⚠ EP compiled 0 nodes — ORT likely routed all to \
-                     built-in CPU EP (disable_cpu_ep_fallback=false). \
-                     Cannot assert EP assignment without ORT ≥1.28 \
-                     per-node provider attribution API."
-                );
-            }
+    // Assert EP assignment via Session_GetEpGraphAssignmentInfo (ORT ≥1.24).
+    // With disable_cpu_ep_fallback=false, ORT may route the entire graph to its
+    // built-in CPUExecutionProvider to avoid partition overhead — that's valid.
+    // The key invariant: our EP must NEVER be assigned NonZero (unsupported).
+    // If ORT does partition, Add must be on our EP.
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        let others = info.ops_not_on_our_ep();
+        eprintln!("  [mixed_partition] EP assignment: ours={ours:?}, others={others:?}");
+        assert!(
+            !ours.contains(&"NonZero"),
+            "NonZero must NOT be assigned to cpu_ep (unsupported), got: {:?}",
+            info.assignments
+        );
+        if ours.contains(&"Add") {
+            eprintln!("  ✓ ORT assigned Add to our EP — partition confirmed");
+        } else {
+            eprintln!(
+                "  ℹ ORT routed all to built-in CPUExecutionProvider \
+                 (no partition) — valid with disable_cpu_ep_fallback=false"
+            );
         }
     }
 
@@ -1251,6 +1377,9 @@ fn conformance_add_int32() {
         return;
     };
 
+    // Prove Add is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Add"], "add_int32") };
+
     unsafe {
         let mut x_data: [i32; 4] = [10, 20, 30, 40];
         let mut y_data: [i32; 4] = [1, 2, 3, 4];
@@ -1321,6 +1450,8 @@ fn conformance_add_dynamic_dim() {
         return;
     };
 
+    // Prove Add is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Add"], "add_dynamic_dim") };
     unsafe {
         // Provide batch=1 at runtime
         let mut x_data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
@@ -1721,6 +1852,8 @@ fn conformance_matmul_batched_nd() {
         return;
     };
 
+    // Prove MatMul is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["MatMul"], "matmul_batched_nd") };
     unsafe {
         // A [2,3,4]
         let mut a_data: [f32; 24] = [
@@ -2097,11 +2230,13 @@ fn conformance_add_bfloat16() {
 // Each test uses an op whose output dtype differs from its first input dtype,
 // exactly the scenario that was silently corrupted before the fix.
 //
-// The `conformance_setup` helper proves node assignment via two mechanisms:
+// The `conformance_setup` helper proves node assignment via three mechanisms:
 // 1. `session.disable_cpu_ep_fallback=1` — ORT will error if any node cannot
 //    be placed on our EP, preventing silent fallback to the built-in CPU EP.
 // 2. Device lookup assertion — verifies our EP ("cpu_ep") appears in GetEpDevices
 //    and is appended to the session options.
+// 3. `Session_GetEpGraphAssignmentInfo` (ORT ≥1.24) — directly queries per-node
+//    provider attribution, proving specific ops are assigned to "cpu_ep".
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Assert the element type of an ORT output tensor.
@@ -2191,6 +2326,9 @@ fn conformance_cast_f32_to_i64() {
         return;
     };
 
+    // Prove Cast is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Cast"], "cast_f32_to_i64") };
+
     unsafe {
         let mut x_data: [f32; 6] = [1.5, 2.7, 3.0, 4.9, 5.1, 6.0];
         let x_shape: [i64; 2] = [2, 3];
@@ -2262,6 +2400,9 @@ fn conformance_where_bool_f32() {
         eprintln!("*** SKIPPED: conformance_where_bool_f32 — ORT or EP cdylib not found ***");
         return;
     };
+
+    // Prove Where is assigned to our EP.
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Where"], "where_bool_f32") };
 
     unsafe {
         // Create bool tensor for condition
@@ -2358,6 +2499,23 @@ fn conformance_shape_f32() {
         eprintln!("*** SKIPPED: conformance_shape_f32 — ORT or EP cdylib not found ***");
         return;
     };
+
+    // Prove Shape is assigned to our EP.
+    // Shape ops may be constant-folded by ORT's basic optimizations before EP
+    // assignment. If present, verify it's on our EP; if absent, that's valid.
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        if ours.contains(&"Shape") {
+            eprintln!("  [shape_f32] ✓ Shape assigned to cpu_ep");
+        } else {
+            eprintln!(
+                "  [shape_f32] ℹ Shape not in assignment (likely constant-folded by ORT). \
+                 Assigned: {:?}",
+                info.assignments
+            );
+        }
+    }
 
     unsafe {
         // Create a dummy f32 tensor with shape [3,4,5] (60 elements)

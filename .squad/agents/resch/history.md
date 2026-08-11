@@ -72,3 +72,17 @@ Full pre-compaction history in `history-archive.md`.
 **N2 (assert in release):** Agreed with Gaff and agreed it should stay — matches MLAS convention. Dispatch layer enforces the contract structurally.
 
 **Tests:** 40/40 pass (unchanged).
+
+## 2026-08-11 — Direct EP assignment assertions via Session_GetEpGraphAssignmentInfo
+
+- **Deleted false claim** that ORT 1.27 lacked per-node provider attribution. The API
+  (`Session_GetEpGraphAssignmentInfo`) has existed since ORT 1.24 — confirmed in bindings.
+- Added `query_ep_assignment` helper and `assert_ops_assigned_to_our_ep` to plugin_ort_e2e.rs.
+- Enabled `session.record_ep_graph_assignment_info=1` in `conformance_setup`.
+- 8 conformance tests now directly assert node→EP assignment (Add, Mul, MatMul, Cast, Where).
+- `conformance_mixed_partition`: asserts NonZero is never on our EP (negative invariant).
+- `conformance_shape_f32`: soft-check (Shape may be constant-folded by ORT).
+- **Non-vacuity proved:** Forcing assertion on "Relu" (not our op) panics as expected.
+- **Task 2:** Replaced `unwrap_or(0)` with named `DIM_UNKNOWN` constant + loud invariant
+  documenting that kernels must not pre-allocate from compile-time shapes.
+- 269 passed, 0 failed across all 5 EP crates.
