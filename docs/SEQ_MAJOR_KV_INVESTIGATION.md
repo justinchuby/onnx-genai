@@ -2,8 +2,17 @@
 
 Status: investigation + measurement + narrow prototype. **No production kernel
 conversion in this round.** References #750 (multi-request batching), #759 (VMM
-dummy-page / unified KV strategy), and builds on #522 and #726 (per-backend KV
-ownership).
+dummy-page / unified KV strategy), and **#777 (page-level prefix sharing)**;
+builds on #522 and #726 (per-backend KV ownership), and on #727 / #740 / #745
+(VMM multi-map proof, physical-handle pool, granule-ref accounting).
+
+**Reordered per owner priority (#777):** page-level prefix sharing is now the
+**co-primary justification** for seq-major, alongside the ORT BSNH compatibility
+crux — ahead of the granule-floor saving that originally motivated it. Rationale:
+the floor is a constant that amortizes with context length, whereas prefix
+sharing scales with **concurrency**, the axis multi-request serving cares about.
+See §3 (promoted, with capacity consequences and a mechanism check against the
+real allocator/ledger).
 
 Context: KV is stored head-major (BNSH `[batch, kv_heads, seq, head_dim]`).
 Under a full-context virtual reservation, each head's live prefix lands in its
@@ -96,6 +105,8 @@ boundary on the native path (see §4).
 Bonus finding relevant to §3: ORT GQA *does* support a shared-KV mode
 (`kv_sequence_length == 0`, past buffer already holds the full shared cache, no
 append) — so ORT has a notion of prefix sharing even though its layout is BNSH.
+This is a logical shared-cache input, not physical page-level sharing across
+distinct sequences' VA ranges; the #777 prize (§3) still requires seq-major.
 
 ---
 
@@ -149,35 +160,136 @@ only changes the base-offset arithmetic, not the coalescing within a token row.
 
 ---
 
-## 3. The prize bigger than the granule floor: page-level prefix sharing — QUANTIFIED
+## 3. CO-PRIMARY: page-level prefix sharing (#777) — quantified prize, capacity consequence, mechanism check
 
 Under seq-major a shared prefix `[0..P]` across all heads is a **single
-contiguous VA range** per layer, so cross-request prefix sharing is "map the same
-physical granules into several sequences' address spaces" — essentially free
-prefix caching / copy-on-write. Under head-major the same prefix is
-`layers × 2 × kv_heads` scattered fragments per sequence, which makes
-page-level sharing impractical.
+contiguous VA range** per (layer, side), so cross-request sharing is "map the
+same physical granules into several sequences' address spaces" — free prefix
+caching with granule-granularity copy-on-write. Under head-major the same prefix
+is `layers × 2 × kv_heads` scattered fragments. This is the #777 prize and it is
+now considered the primary reason to adopt seq-major (§ header).
 
-`bytes_per_token = layers × 2 × kv_heads × head_dim × sizeof(dtype)`. For a
-shared system prompt of `P` tokens across `R` concurrent requests, per-sequence
-duplication commits `R × P × bytes_per_token`; page-level sharing commits
-`P × bytes_per_token` (plus granule rounding). **Savings = `(R-1) × P ×
-bytes_per_token`.**
+### 3.1 Byte saving — checked, not trusted
 
-| model | bytes/token | P | R | duplicated | shared | **saved** |
+`bytes_per_token = layers × 2 × kv_heads × head_dim × sizeof(dtype)`
+(qwen2.5-0.5b = 12 KiB; qwen2.5-14b = 196,608 B = 192 KiB — matches #777).
+Duplicated KV removed by sharing a `P`-token prefix across `R` requests is
+`(R-1) × P × bytes_per_token` (ideal). But page sharing only banks **whole
+granules**, and the shareable unit is a per-(layer,side) stripe of
+`P × kv_heads × head_dim × dtype` bytes, so the granule-rounded saving is
+`(R-1) × floor(P × kv_heads × head_dim × dtype / granule) × granule × layers × 2`.
+
+| model | P (tok) | R | ideal removed | **granule-rounded removed** |
+|---|---|---|---|---|
+| qwen2.5-14b | 512  | 8  | 0.70 GiB  | **0** (sub-granule stripe) |
+| qwen2.5-14b | 2048 | 4  | 1.12 GiB  | **1.12 GiB** |
+| qwen2.5-14b | 2048 | 8  | 2.62 GiB  | **2.62 GiB** |
+| qwen2.5-14b | 2048 | 16 | 5.62 GiB  | **5.62 GiB** |
+| qwen2.5-14b | 8192 | 8  | 10.50 GiB | **10.50 GiB** |
+| qwen2.5-0.5b | 2048 | 8  | 0.16 GiB  | **0** (sub-granule stripe) |
+| qwen2.5-0.5b | 8192 | 8  | 0.66 GiB  | **0.66 GiB** |
+
+**#777's headline confirmed:** 2048-token prefix × 8 concurrent on qwen14b
+removes **2.62 GiB** (owner's "≈2.6 GB" is correct; granule-rounded is *exactly*
+equal here because 2048 tok × 2048 B/tok/stripe = 4 MiB = 2 whole granules).
+
+**New rigor finding (not in #777):** the saving has a *granule floor of its own*.
+Page sharing banks a granule only when the per-(layer,side) stripe prefix
+`P × kv_heads × head_dim × dtype ≥ granule`, i.e.
+`P ≥ granule / (kv_heads × head_dim × dtype)`:
+
+- qwen2.5-14b (kv=8, hd=128): **P ≥ 1024 tokens**.
+- qwen2.5-0.5b (kv=2, hd=64): **P ≥ 8192 tokens**.
+
+Below that the shared prefix is sub-granule per stripe and page sharing saves
+**nothing** — the same granule-floor problem, now on the sharing side. So the
+prize is large for **big models with prefixes ≥ ~1–2K tokens** and evaporates for
+small models / short prefixes unless the arena packs several stripes into shared
+granules (a layout-packing question, out of scope here). The headline #750
+scenario (14B, multi-K-token system prompt) is solidly in the win zone.
+
+### 3.2 Capacity consequence — the number that matters
+
+On a fixed KV budget, sharing the prefix once (charged once) lets the Nth request
+cost only its *private* bytes. Granule-rounded (shared prefix in whole granules;
+private tail rounded up per stripe), same-prompt requests of `ctx` total tokens:
+
+| model | KV budget | ctx | prefix | no-share | **shared** | gain |
 |---|---|---|---|---|---|---|
-| qwen2.5-0.5b | 12 KiB | 2048 | 8 | 192 MiB | 24 MiB | **168 MiB** |
-| qwen2.5-0.5b | 12 KiB | 2048 | 16 | 384 MiB | 24 MiB | **360 MiB** |
-| qwen2.5-14b | 192 KiB | 2048 | 8 | 3072 MiB | 384 MiB | **2.62 GiB** |
-| qwen2.5-14b | 192 KiB | 2048 | 16 | 6144 MiB | 384 MiB | **5.62 GiB** |
-| qwen2.5-14b | 192 KiB | 1024 | 16 | 3072 MiB | 192 MiB | **2.81 GiB** |
+| qwen2.5-14b | 2 GiB | 2560 | 2048 | 3 | **8** | 2.7× |
+| qwen2.5-14b | 4 GiB | 2560 | 2048 | 7 | **19** | 2.7× |
+| qwen2.5-14b | 6 GiB | 2560 | 2048 | 10 | **30** | 3.0× |
+| qwen2.5-14b | 4 GiB | 4096 | 2048 | 5 | **9** | 1.8× |
+| qwen2.5-14b | 2 GiB | 2560 | 512  | 3 | **5** | 1.7× |
+| qwen2.5-0.5b | any | any | ≤2048 | — | — | 1.0× (sub-granule) |
 
-For the multi-request serving target (#750) with a shared system prompt this is
-**GiB-scale** on a 14B model — it dwarfs the granule-floor win (192 MiB for
-qwen0.5b; 1.5 GiB for qwen14b for one token) and is the single largest reason to
-prefer seq-major. It also maps directly onto the #759 unified-VMM /
-`CacheStrategy::Shared` and #726 `KvPageStore` CoW sketch: shared granules are
-mapped read-only into each sequence's reservation and copied on divergence.
+**#777's "2 vs 8" claim confirmed and honest:** qwen14b, 2 GiB KV budget,
+2560-token context with a 2048 shared prefix, goes from **3 → 8** concurrent
+requests (≈2.7×); at 6 GiB, **10 → 30**. The gain grows with the shared fraction
+of the context and is a whole *multiple*, not a percentage — which is why it
+outranks percentage-level optimizations elsewhere. (qwen0.5b shows 1.0× because
+both its shared prefix and private tail are sub-granule at these lengths — the
+granule floor dominates the small model regardless.)
+
+### 3.3 Mechanism — confirmed against the REAL allocator/ledger, not a mock
+
+Verified in `crates/onnx-runtime-cuda-memory/src/{virtual_memory.rs,vmm_allocator.rs}`:
+
+- **Multi-map primitive is proven and available.** #727 already demonstrated on
+  this hardware that **one physical handle mapped at two live VAs works**
+  (captured graph, a DtoD copy from alias A saw bytes written through alias B; no
+  recycling confound because both aliases were simultaneously live). This
+  generalizes to N: `cuMemMap` of one handle into N ranges is the same primitive
+  repeated, and CUDA imposes no N-limit beyond address space. The wrappers exist
+  (`virtual_memory.rs`: `cuMemMap` @1111-1123, `cuMemSetAccess` @1126-1143,
+  `cuMemAddressReserve` @1053-1060).
+- **Charge-once / keep-alive-until-last-unmap is the real ledger's shape.**
+  `Spans.granule_refs: Vec<u32>` (`vmm_allocator.rs:318-337`) is refcounted:
+  first claim sets a granule to 1 and charges (`853-856`); a shared claim
+  increments (`812-814`); release is **refcount-gated** — only
+  `Some(0) => backing.release(...)` frees, otherwise just decrements
+  (`907-924`). Pooled physical handles (#740) are charged to the authority as
+  `Backing { authority }` once, **not per mapping** (`1043-1050`,
+  `physical_memory_accounting`), so a shared granule is already accounted once
+  regardless of map count. This is exactly the "charge the Nth request only its
+  private bytes; keep the shared granule alive until the last sharer unmaps"
+  contract #777 asks for.
+- **The one real gap (bookkeeping, not capability).** The allocator's per-block
+  record `CudaReservation.blocks: Vec<(offset, len, handle)>` currently has each
+  commit create its own handle; there is **no `handle → Vec<VA>` table**, and the
+  KV arena is a *single* `cuMemAddressReserve` range with allocations carved as
+  offsets (`vmm_allocator.rs:709-733`). Prefix sharing therefore needs a
+  bookkeeping extension: allow the same pooled handle to appear at multiple
+  offsets/VAs with a handle-level refcount so release is gated across sharers.
+  The CUDA capability (#727) and the accounting *shape* (granule_refs, pooled
+  authority charge) are already present; what's missing is the 1:N handle map.
+  **This is an implementation task, explicitly out of scope for this round.**
+- **Write-protection composes with #759.** `cuMemSetAccess` is called per mapped
+  subrange (`virtual_memory.rs:1126-1143`), currently only with
+  `CU_MEM_ACCESS_FLAGS_PROT_READWRITE`. Setting a shared prefix range to
+  `PROT_READ` (so any errant write to another request's KV faults loudly instead
+  of silently corrupting it, per #777 point 2) and the #759 uncommitted-fallback
+  range to `PROT_NONE`/read-only dummy page are **independent per-subrange access
+  descriptors on the same reservation** — they do not conflict; both merely need
+  the production path to start emitting non-RW flags, which it does not yet do.
+  No architectural collision between the #777 read-only shared prefix and the
+  #759 dummy-page probe was found.
+
+### 3.4 Head-major impossibility — confirmed, and quantified
+
+Not just repeated from #777: under BNSH each head's prefix is a `P × head_dim ×
+dtype` run separated by the full `capacity × head_dim × dtype` reservation
+stride, and the granule holding a head's prefix *tail* also holds that same
+head's **private future tokens** `[P..capacity]`, so it cannot be shared
+read-only. Shareable whole granules per head-stripe is
+`floor(P × head_dim × dtype / granule)`, requiring
+`P ≥ granule / (head_dim × dtype)` = **8192 tokens (hd128)** / **16384 (hd64)**
+to share even one granule. At the headline P=2048 head-major shares **zero**.
+Seq-major packs all `kv_heads` into one stripe, dividing that threshold by
+`kv_heads` (14B: 8192 → **1024**). So seq-major's sharing advantage is precisely
+a factor-`kv_heads` reduction in the minimum shareable prefix length — there is
+no head-major grouping that recovers it, because the private-tail-in-granule
+problem is structural. **The impossibility claim holds.**
 
 ---
 
@@ -243,10 +355,20 @@ capability.** The two falsification risks are cleared:
 2. The strided-read cost is within ±2% and the head_dim<128 B danger case does
    not materialize for any target model (§2).
 
-And the upside is large and concrete: eliminates the model-size-independent
-granule floor, keeps token stride sequence-independent (no CUDA-graph
-re-capture on growth), and unlocks **GiB-scale** page-level prefix sharing for
-multi-request serving (§3) — the #750 goal.
+And the upside is large and concrete, now led by prefix sharing (#777):
+- **Page-level prefix sharing (co-primary, §3):** removes **2.62 GiB** of
+  duplicated KV and lifts concurrent capacity **≈2.7–3.0×** on qwen14b with a
+  2K-token shared system prompt — a whole multiple, and it scales with
+  concurrency. The mechanism (multi-map #727, charge-once granule-ref ledger
+  #740/#745) is real; only a 1:N handle-bookkeeping extension is missing.
+  Impossible under head-major at realistic prefix lengths (§3.4).
+- Eliminates the model-size-independent granule floor and keeps the token stride
+  sequence-independent (no CUDA-graph re-capture on growth).
+
+Caveat surfaced by this round: page sharing has its own **granule floor** — it
+saves nothing when the per-(layer,side) shared stripe is sub-granule
+(P < ~1K tok on 14B, < 8K tok on 0.5b), so the prize is a large-model /
+long-prefix win, not universal (§3.1).
 
 **Smallest next increment** (one reviewable PR, not a fleet-wide conversion):
 1. Add a `KvLayout` tag to the native KV store / `KvPageStore` (default
@@ -258,8 +380,10 @@ multi-request serving (§3) — the #750 goal.
 3. Reuse the existing **output-level** parity oracle
    (`paged_gqa.rs` / `tests.rs`) to prove bit-identical decode outputs
    head-major vs seq-major on qwen2.5-0.5b.
-4. Only after that lands: extend to flash/prefill and wire page-level prefix
-   sharing into the #726 store to bank the §3 prize.
+4. Then bank the #777 prize: add the 1:N handle-map bookkeeping to the allocator
+   (§3.3) and wire read-only (`PROT_READ`) shared-prefix multi-map into the #726
+   store, charged once via the existing granule-ref ledger.
+5. Only after that: extend the layout to flash/prefill and the remaining kernels.
 
 A negative result was in scope; this is a **positive** one, but deliberately
 staged: the numbers justify the first decode-pair increment, not a big-bang
@@ -271,8 +395,14 @@ kernel rewrite.
 
 ```
 # from this worktree, with the CUDA PATH prepended (see below)
-cargo run --release -p bench-seqmajor   # prints the §2 table
+cargo run --release -p bench-seqmajor   # prints the §2 strided-read table
 ```
+The §2 strided-read numbers come from `bench-seqmajor/` (GPU). The §3.1/§3.2
+prefix-sharing and capacity tables are closed-form from
+`bytes_per_token = layers·2·kv_heads·head_dim·dtype` with a 2 MiB granule and
+per-(layer,side) granule rounding (formulas inline in §3). The §3.3 mechanism
+facts are cited to `crates/onnx-runtime-cuda-memory/src/{virtual_memory.rs,
+vmm_allocator.rs}` line numbers and to #727/#740/#745.
 CUDA PATH (this box): prepend
 `$sp\onnxruntime\capi;$sp\nvidia\cu13\bin\x86_64;$sp\nvidia\cublas\bin;$sp\nvidia\cudnn\bin`
 where `$sp = C:\Users\justinchu\AppData\Local\anaconda3\Lib\site-packages`.
