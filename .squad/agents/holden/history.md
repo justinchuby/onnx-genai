@@ -57,3 +57,11 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - `mem::forget` sites independently verified safe (DeviceBuffer has no Drop impl).
 - RecordingOpRegistry fail-closed by construction (under-advertises, never over-advertises).
 - Verdict: 🟡 YELLOW — may ship. No memory-safety or corruption issues. Decision: `.squad/decisions/inbox/holden-ep-milestone2-audit.md`.
+
+## 2026-08-11 — Independent Re-Review: PR #31973 (AVX2 LayerNorm)
+
+- Adversarial re-review of AVX2 LayerNorm/RMSNorm kernel after two prior accuracy failures.
+- Independently verified: 41/41 tests pass, double-precision first pass is genuine, B1 failure mode eliminated.
+- Found: DISABLED_AdversarialPrecisionReport fails when enabled (Scenario 6 near-fp32-max overflow); main sweep tolerance has 12% headroom (fragile across CPU microarchitectures).
+- Verdict: **READY FOR REVIEW** — no blockers. 2 substantive findings (S1: widen sweep tolerance, S2: fix DISABLED test assertion). Both owned by Pris.
+- Decision: `.squad/decisions/inbox/holden-rereview-pr31973.md`.

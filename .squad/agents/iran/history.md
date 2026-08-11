@@ -28,3 +28,14 @@
 - Remaining ResNet-18 gap (6.7×) is non-Conv ops (BatchNorm, Pool, Add on scalar paths).
 - BNNS Filter API deprecated but no replacement for per-op use. `cblas_sgemm` is durable fallback.
 - 2026-07-28: Small-shape GEMV investigation produced a valid negative result: existing inline paths and cblas already cover the remaining cases. SDPA decode PR #349 merged after attribution and after correcting the headline from 1.9x to 1.37x by naming the model (TinyStories-1M vs -33M). Always state which model each ratio refers to.
+
+## 2026-08-11: AVX2 LayerNorm kernel revision (PR #31973 blockers B1/B2/N2/N3/N4)
+
+- **B1 reproduced:** AVX2 lane-parallel Welford hits 28.2% rel err at base=1e5/spread=1e-2/N=512 vs fp64 oracle (scalar Welford: 0.47%). Root cause: per-lane fp32 mean accumulation rounds before merge.
+- **B2 evaluated:** Centered two-pass with double-precision first-pass sum is 1.8× faster than AVX2 Welford (427ns vs 751ns, N=1024) AND more accurate (worst 5.95e-3 vs 2.82e-1). fp32 sum is catastrophic at base=1e7 (100% error); double sum is essential.
+- **Algorithm replaced:** Welford → centered two-pass with `_mm256_cvtps_pd`+`_mm256_add_pd` for mean, fp32 for centered variance.
+- **N2 fixed:** NormSize<8 gate moved to `#if x86` so RVV is unaffected.
+- **N3 verified:** RMSNorm mean-skip for null MeanOut was already correct; upgraded RMSNorm MeanOut path to double-sum too.
+- **N4 fixed:** Added explicit `set_source_files_properties(/arch:AVX2)` for layernorm_kernel_avx2.cpp on MSVC.
+- **Tests:** 39/41 pass. 2 Pris-owned precision tests fail because they check parity vs scalar Welford (wrong reference now). All 32 functional tests pass.
+- Lesson: centered two-pass ≠ uncentered two-pass. The prior team rejection of "two-pass" conflated E[x²]-mean² (catastrophic) with sum((x-mean)²) (numerically standard). Always specify the formulation.
