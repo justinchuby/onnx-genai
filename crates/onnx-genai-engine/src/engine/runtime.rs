@@ -2472,6 +2472,7 @@ mod tests {
             session: None,
             native_session: None,
             weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,
