@@ -206,3 +206,53 @@ or `stream_release`. No factory.rs change needed for this fix.
 - `cargo check --workspace` → success
 
 **Not proven:** Nothing here proves CUDA works. Hardware-gated.
+
+## 2026-08-11 — BL2/BL3: Optional slot positional integrity (PR #762)
+
+**Branch:** `squad/ep-plugin-parity-cuda` (PR #762, draft)
+**Triggered by:** Third independent Opus review rejection — silent corruption class.
+
+### BL2 — Omitted optional outputs (graph_reader.rs)
+
+**Root cause:** `filter_map` in `from_ort_graph()` dropped empty-named output
+slots, compacting the Vec. SkipLayerNormalization with signature
+`(output, "", "", sum)` became `[output, sum]` (len 2), causing the kernel to
+write mean into position 1 (which was really the sum slot).
+
+**Fix (preferred — slot-map, not fail-closed):** Empty-named outputs get
+placeholder ValueIds with `DataType::Undefined`. In compute.rs fast path,
+Undefined-dtype slots receive local scratch buffers; ORT output indices
+increment only for present slots. Kernel sees full arity (4) and writes
+to correct positions.
+
+### BL3 — Omitted optional inputs (compute.rs)
+
+Added `NodeInputSource::Absent` variant. Compute loop provides
+`TensorView::absent(DataType::Undefined)` for Absent slots. Kernels detect
+absence via `is_absent()`.
+
+**Caveat:** `ep.rs:597` still emits `Ort(0)` for None inputs — Sebastian's
+BL1 pass must change it to `Absent`. The single-node fast path works because
+it passes inputs from ORT directly (no routing table).
+
+### Nonblocker — unwrap_or(DataType::Float32)
+
+All three instances replaced with fail-closed error. A short `output_dtypes`
+vector is now a hard compute failure, not a silent Float32 guess.
+
+### Tests (all real ORT, all numerical)
+
+| Test | Asserts | Pre-fix behavior |
+|------|---------|------------------|
+| `skip_layer_norm_output_sum_position` | sum[0..8] == X+skip | Got mean (2.625) |
+| `clip_omitted_min_with_max` | Y == clip(X, -∞, 5) | Would alias min=X |
+| `skip_layer_norm_omitted_beta_bias` | LN(X+skip, γ=1, β=0) | Would alias β=X |
+| `simplified_layer_norm_two_outputs_position` | inv_std correct | Position coverage |
+
+**Validation:**
+- `cargo test --no-fail-fast -p onnx-runtime-ep-plugin -p onnx-runtime-ep-cpu-plugin -p onnx-runtime-ep-cuda-plugin` → 215 passed / 0 failed
+- `cargo clippy --all-targets -- -D warnings` on all 3 crates → clean
+- `cargo fmt --check` → clean
+
+**Cannot fix within file ownership:** `ep.rs:597` (`NodeInputSource::Ort(0)` for
+None inputs in `build_subgraph_routing`). Documented for Sebastian.
