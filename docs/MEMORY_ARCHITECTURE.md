@@ -269,8 +269,19 @@ measured 2 MiB CUDA granule:
 | Layout | Floor unit | Near-empty floor | Evidence/status |
 |---|---:|---:|---|
 | BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
-| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Decode pair landed in #782 |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Geometry only — **not realized today**, see below |
 | token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
+
+> **These floors are properties of the layout geometry, not of what the runtime
+> currently commits.** Measured in #794 on both qwen2.5-0.5b and qwen14b,
+> head-major and seq-major commit **identical** physical bytes (100,663,296 B and
+> 402,653,184 B respectively). The reason is that the native CUDA bindings still
+> allocate bucket-sized packed shapes and commit flat bucket ranges without
+> consuming the KV layout metadata, so seq-major currently changes **kernel
+> indexing only** — not reservation or commit geometry. Realizing the `layers × 2`
+> floor requires layout-aware binding and residency allocation, which is the
+> binding-views work still outstanding. #787 reached the same conclusion from the
+> other direction: the read path is free, and the cost sits on the binding layer.
 
 The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
 **96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).
