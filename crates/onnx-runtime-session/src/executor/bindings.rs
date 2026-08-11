@@ -3,10 +3,12 @@ use super::*;
 /// Ops whose owned scratch is reserved by prepare-only planning (§736) so that
 /// capacity refusal surfaces before request admission rather than as a late
 /// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
-/// workspace; `com.microsoft::Attention` reserves a step-scoped Phase-2a
-/// scratch. Both report their exact bytes via [`Kernel::workspace_requirement`].
+/// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
+/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch. All
+/// report their exact bytes via [`Kernel::workspace_requirement`].
 pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
-    (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN && node.op_type == "BlockQuantizedMoE")
+    (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+        && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
         || (node.domain == "com.microsoft" && node.op_type == "Attention")
 }
 
@@ -113,6 +115,10 @@ impl Executor {
                 })
                 .collect::<Vec<_>>();
             let opset = effective_opset(&self.graph, node);
+            // Must match what dispatch computes for this node, or prepare-only
+            // planning would key a different kernel than execution uses.
+            let seq_independent =
+                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
             let (kernel, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -120,6 +126,7 @@ impl Executor {
                 &self.plan[pi].input_dtypes,
                 &constant_inputs,
                 opset,
+                seq_independent,
                 self.ep.as_ref(),
             )?;
             self.kernel_bindings[pi] = Some(key);

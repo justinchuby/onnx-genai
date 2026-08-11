@@ -53,7 +53,10 @@
 //! * non-contiguous (strided) Q/K/V/O or mask → actionable "materialise" error.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
@@ -443,6 +446,7 @@ pub struct AttentionKernel {
     /// `head_dim` is known from the Q shape at execute time.
     scale: Option<f32>,
     mode: AttentionMode,
+    last_call_capture_safe: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +484,7 @@ impl AttentionKernel {
             num_kv_heads,
             scale,
             mode: AttentionMode::Auto,
+            last_call_capture_safe: AtomicBool::new(false),
         })
     }
 
@@ -676,6 +681,18 @@ impl AttentionKernel {
         let o_base = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
         let fused = self.use_fused(q.dtype, sq, sk, d);
+        // #757: keep capture admission truthful. The fused path is capture-safe;
+        // the Phase-2a path performs an unconditional trailing synchronize (see
+        // `run_attention_phase2a`, allowlisted in capture_sync_contract.rs) and
+        // must be refused during capture. §736 governs the Phase-2a scratch for
+        // admission, but that does not make the sync capture-safe.
+        self.last_call_capture_safe.store(fused, Ordering::Relaxed);
+        if !fused && self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Attention selected the Phase-2a per-call workspace path during CUDA graph capture"
+                    .into(),
+            ));
+        }
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let score_elements = (batch as u64)
                 .saturating_mul(self.num_heads as u64)
@@ -1005,7 +1022,13 @@ impl Kernel for AttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::Supported
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fused-attention path; the Phase-2a fallback allocates and frees per-call workspace",
+            )
+        }
     }
 }
 

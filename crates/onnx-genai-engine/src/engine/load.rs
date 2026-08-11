@@ -286,7 +286,7 @@ impl Engine {
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
         }
-        let metadata = {
+        let mut metadata = {
             let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
             if let Some(metadata_path) = &model_directory.metadata_path {
                 onnx_genai_metadata::load_metadata(metadata_path)
@@ -301,6 +301,20 @@ impl Engine {
                 default_inference_metadata()
             }
         };
+        // Auto-derive the decoder `io` port contract from the ONNX graph when the
+        // package's `inference_metadata.yaml` declares none. This engages ONLY
+        // for hybrid linear-attention decoders — graphs that expose recurrent
+        // `conv_state`/`recurrent_state` state pairs alongside sparse dense KV
+        // (qwen3.5/3.6). Their thin sidecars declare only `grouped_query_attention`
+        // and no `io` block, so the KV-geometry / Resource-Governor sizing below
+        // (and the native decode step driver) have no port contract and the load
+        // fails `per-layer KV page geometry is unknown`. The derivation is
+        // attribute/shape-driven (via `derive_decoder_io_from_graph`), never
+        // model-name-gated, and mirrors the native decode driver's own
+        // `derive_fallback_io`: a declared `io` block always wins, and pure-dense
+        // decoders (no recurrent state pairs) yield no derived spec and keep their
+        // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
+        maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
         if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
             anyhow::bail!("Unsupported capabilities: {unsupported:?}");
@@ -575,12 +589,18 @@ impl Engine {
         // Sized at full context because a lease is a reservation: charging the
         // current length would admit a sequence the device cannot carry to its
         // limit and discover that mid-generation.
-        match metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.max_sequence_length)
-        {
-            Some(max_context) => {
+        let native_kv_capacity = native_session
+            .cuda_kv_debug_stats()
+            .map(|stats| (stats.hard_max_len, stats.max_len_source));
+        let native_kv_max_context = native_kv_reservation_max_context(
+            native_kv_capacity,
+            metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.max_sequence_length),
+        );
+        match native_kv_max_context {
+            Some((max_context, max_context_source)) => {
                 let (native_kv_bytes, native_kv_tier) = native_session
                     .kv_reservation(max_context)
                     .context("sizing the decoder's KV tensors")?;
@@ -611,10 +631,9 @@ impl Engine {
                             anyhow::anyhow!(
                                 "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
                                  {max_context} tokens of context on {native_kv_tier:?}: {error}; \
-                                 {max_context} is the model's declared max_sequence_length, and \
-                                 --max-context will not lower it because the declared value takes \
-                                 precedence -- raise the limit for that tier, or re-export the \
-                                 model with a shorter declared context"
+                                 KV max length source: {max_context_source}; raise the limit for \
+                                 that tier, set ONNX_GENAI_CUDA_KV_MAX_LEN lower when supported, \
+                                 or re-export the model with a shorter declared context"
                             )
                         })?;
                 }
@@ -699,6 +718,93 @@ impl Engine {
             "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
         )
     }
+}
+
+/// Fill `metadata.model.io` from the ONNX graph's declared ports when the
+/// package's sidecar declares no `io` block AND the graph is a hybrid
+/// linear-attention decoder (exposes recurrent `conv_state`/`recurrent_state`
+/// state pairs).
+///
+/// Hybrid SSM/attention decoders (qwen3.5/3.6) ship a thin
+/// `inference_metadata.yaml` that names only `grouped_query_attention` and no
+/// `io` port contract. Without that contract the Resource Governor cannot derive
+/// the per-layer KV page byte geometry (only the periodic full-attention layers
+/// hold dense KV) and native load fails with `per-layer KV page geometry is
+/// unknown`. The graph itself already encodes the exact topology, so this
+/// derives the sparse dense `kv_inputs`/`kv_outputs` and the fixed recurrent
+/// `state_pairs` directly from the port inventory via
+/// [`GenAiConfig::derive_decoder_io_from_graph`].
+///
+/// This is deliberately attribute/shape-driven, never model-name-gated, and
+/// engages only for the recurrent-hybrid case (the safety gate is a non-empty
+/// derived `state_pairs`, mirroring the native decode driver's
+/// `derive_fallback_io`). A declared `io` block always wins; pure-dense decoders
+/// (no state pairs) are left untouched and keep their existing load path.
+#[cfg(feature = "native-backend")]
+fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path: &Path) {
+    use onnx_genai_metadata::{LoopStatePair, ModelIoSpec};
+
+    // A declared `io` block is always authoritative.
+    if metadata
+        .model
+        .as_ref()
+        .is_some_and(|model| model.io.is_some())
+    {
+        return;
+    }
+    let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
+        return;
+    };
+    let Some(derived) =
+        onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph_info)
+    else {
+        return;
+    };
+    // Safety gate: only the recurrent-hybrid case the shape-inference path cannot
+    // classify. Pure-dense decoders derive no state pairs and are left untouched.
+    if derived.state_pairs.is_empty() {
+        return;
+    }
+    let input_names: std::collections::HashSet<&str> =
+        graph_info.inputs.iter().map(|t| t.name.as_str()).collect();
+    let output_names: std::collections::HashSet<&str> =
+        graph_info.outputs.iter().map(|t| t.name.as_str()).collect();
+    let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
+    let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
+    let state_pairs = derived
+        .state_pairs
+        .into_iter()
+        .map(|pair| LoopStatePair {
+            input: pair.input,
+            output: pair.output,
+            init: Some("zeros".to_owned()),
+            update: Some("replace".to_owned()),
+        })
+        .collect::<Vec<_>>();
+    let io = ModelIoSpec {
+        sequence_source: None,
+        kv_ownership: None,
+        token_input: present_input("input_ids"),
+        inputs_embeds_input: None,
+        attention_mask_input: present_input("attention_mask"),
+        position_ids_input: present_input("position_ids"),
+        logits_output: present_output("logits"),
+        hidden_output: None,
+        kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
+        kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
+        encoder_hidden_states_input: None,
+        audio_features_input: None,
+        cross_kv_inputs: None,
+        cross_kv_outputs: None,
+        kv_update: None,
+        state_pairs: Some(state_pairs),
+        optional_inputs: std::collections::BTreeMap::new(),
+        static_cache: None,
+    };
+    let model = metadata
+        .model
+        .get_or_insert_with(onnx_genai_metadata::ModelCapabilities::default);
+    model.io = Some(io);
 }
 
 fn package_selection_from_session_options(
@@ -1085,6 +1191,18 @@ pub(crate) fn kv_pages_for_budget(
 /// the provider exists; other paths still reserve the whole package.
 fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
     onnx_genai_ort::model_weight_bytes(model_path)
+}
+
+#[cfg(feature = "native-backend")]
+fn native_kv_reservation_max_context(
+    native_capacity: Option<(usize, String)>,
+    metadata_max_len: Option<usize>,
+) -> Option<(usize, String)> {
+    native_capacity
+        .filter(|(max_len, _)| *max_len != usize::MAX)
+        .or_else(|| {
+            metadata_max_len.map(|max_len| (max_len, "model.max_sequence_length".to_owned()))
+        })
 }
 
 /// The temporary startup reservation, given the package size and offload budget.
@@ -2097,6 +2215,51 @@ mod pool_sizing_tests {
             "the temporary startup claim must leave the governor a one-page KV floor; \
              the CUDA provider later adopts the full offload budget as the real claim"
         );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_uses_runtime_capacity_before_metadata() {
+        let (max_len, source) = native_kv_reservation_max_context(
+            Some((4096, "ONNX_GENAI_CUDA_KV_MAX_LEN".into())),
+            Some(131_072),
+        )
+        .expect("runtime capacity should be available");
+
+        assert_eq!(max_len, 4096);
+        assert_eq!(source, "ONNX_GENAI_CUDA_KV_MAX_LEN");
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_falls_back_to_metadata() {
+        let (max_len, source) = native_kv_reservation_max_context(None, Some(131_072))
+            .expect("metadata capacity should be available");
+
+        assert_eq!(max_len, 131_072);
+        assert_eq!(source, "model.max_sequence_length");
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_ignores_unbounded_runtime_capacity_without_metadata() {
+        assert_eq!(
+            native_kv_reservation_max_context(Some((usize::MAX, "unbounded".into())), None),
+            None
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_uses_metadata_after_unbounded_runtime_capacity() {
+        let (max_len, source) = native_kv_reservation_max_context(
+            Some((usize::MAX, "unbounded".into())),
+            Some(131_072),
+        )
+        .expect("metadata capacity should be available");
+
+        assert_eq!(max_len, 131_072);
+        assert_eq!(source, "model.max_sequence_length");
     }
 
     #[test]

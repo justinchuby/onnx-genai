@@ -2016,6 +2016,12 @@ impl Kernel for CompressedSparseAttentionKernel {
         if self.capturable && !self.force_host {
             return self.run_capturable_ratio4(inputs, outputs);
         }
+        if self.runtime.is_capturing()? {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                "CompressedSparseAttention reached its host-staged path during CUDA graph capture"
+                    .into(),
+            ));
+        }
         // Stage every present input host-side. Contiguity is required because the
         // host copy is a dense byte blit; the CPU oracle then reads it densely.
         let mut staged: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());

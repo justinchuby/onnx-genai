@@ -30,9 +30,18 @@ TEST_DIRS = tuple(crate / "tests" for crate in CUDA_CRATES)
 # ignore would remove it from exactly the runs it was written to police -- a
 # CPU-only machine that believes it tested a GPU.
 #
+# `capture_sync_contract` is a static source audit: it reads the CUDA kernel
+# sources and fails if any capture-eligible path reaches an unreviewed
+# unconditional `synchronize()`. It touches no device, so it MUST run on the
+# CPU-only lane and legitimately *passes* there -- holding it to the
+# "ignored, not passed" GPU rule would silence exactly the check that keeps a
+# capture-unsafe sync from landing. It is another "checking the checker" case,
+# not a GPU test that happens to be awkward. It still runs on the CPU lane via
+# the dedicated `cargo test ... --test capture_sync_contract` CI step.
+#
 # Anything added here needs the same argument: not "this one is awkward" but
 # "this one is checking the checker".
-ALWAYS_RUN = frozenset({"suite_canary_gpu"})
+ALWAYS_RUN = frozenset({"suite_canary_gpu", "capture_sync_contract"})
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
