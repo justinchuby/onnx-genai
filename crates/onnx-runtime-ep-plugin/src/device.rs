@@ -158,14 +158,21 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
         }
         let alloc = unsafe { &*(this.cast::<DeviceAllocator>()) };
         let ep = unsafe { &*alloc.ep };
-        // Reconstruct a DeviceBuffer from the raw pointer for deallocation.
-        // Size 0 signals to the EP that this is a free-by-pointer; the EP
-        // should be able to look up the allocation by address.
+        // BUG (defect #4): size is unknown at free time. We pass size=0 which
+        // violates the allocator contract — the EP's `deallocate` may need the
+        // real size for arena management, cudaFree bookkeeping, or leak detection.
+        //
+        // FIX REQUIRED: Track allocation sizes in a side table (e.g.
+        // HashMap<*mut c_void, usize> behind a Mutex) populated by device_alloc
+        // and looked up here. Alternatively, the EP could support free-by-pointer
+        // (ignoring size), but that must be an explicit contract, not an accident.
+        //
+        // Alignment is also hardcoded to 16 — must match what device_alloc used.
         let buf = unsafe {
             onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
                 p,
                 ep.device_id(),
-                0, // size unknown at free time
+                0, // BUG: size unknown — see defect #4 above
                 16,
             )
         };

@@ -149,6 +149,15 @@ macro_rules! export_ep_factories {
 
         /// ORT plugin-EP entry point: release an EP factory.
         ///
+        /// # ABI reference
+        ///
+        /// `onnxruntime_ep_c_api.h:2669`:
+        /// ```c
+        /// typedef OrtStatus* (*ReleaseEpApiFactoryFn)(_In_ OrtEpFactory* factory);
+        /// ```
+        ///
+        /// Returns `nullptr` (success) or an `OrtStatus*` error.
+        ///
         /// # Safety
         ///
         /// `factory` must be a pointer returned by `CreateEpFactories` from this
@@ -156,18 +165,23 @@ macro_rules! export_ep_factories {
         ///
         /// # Panic safety
         ///
-        /// Any panic inside the release path is caught and silently swallowed.
-        /// This function has no status-return channel; unwinding into ORT would be
-        /// undefined behaviour. Leaking the factory on panic is preferable to UB.
+        /// Any panic inside the release path is caught and surfaced as a failure
+        /// `OrtStatus`. Unwinding into ORT would be undefined behaviour.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn ReleaseEpFactory(
             factory: *mut $crate::onnx_genai_ort_sys::OrtEpFactory,
-        ) {
-            let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        ) -> *mut $crate::onnx_genai_ort_sys::OrtStatus {
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                 // SAFETY: caller guarantees the pointer was returned by
                 // CreateEpFactories from this library.
-                unsafe { $crate::factory::release_ep_factory(factory) };
+                unsafe { $crate::factory::release_ep_factory(factory) }
             }));
+            match result {
+                ::std::result::Result::Ok(status) => status,
+                ::std::result::Result::Err(_panic_payload) => $crate::panic_to_fail_status(
+                    "ReleaseEpFactory: panic during factory release (fail-closed)",
+                ),
+            }
         }
     };
 }

@@ -39,3 +39,12 @@
 - **N4 fixed:** Added explicit `set_source_files_properties(/arch:AVX2)` for layernorm_kernel_avx2.cpp on MSVC.
 - **Tests:** 39/41 pass. 2 Pris-owned precision tests fail because they check parity vs scalar Welford (wrong reference now). All 32 functional tests pass.
 - Lesson: centered two-pass ≠ uncentered two-pass. The prior team rejection of "two-pass" conflated E[x²]-mean² (catastrophic) with sum((x-mean)²) (numerically standard). Always specify the formulation.
+
+### 2026-08-11 — B4: CUDA Plugin Fail-Closed (PR #762 Reviewer Rejection)
+- **Owned B4:** CUDA cdylib advertised GPU EP it could not honour.
+- **Root cause:** Implementation-blocked, NOT hardware-blocked. Four defects: (1) separate CUDA runtime/context per EP/allocator/stream, (2) non-functional data transfer (no OrtApi, no shared stream), (3) NULL stream handle, (4) `device_free` passes `size=0`.
+- **Fix:** `CreateEpFactories` returns 0 factories + actionable status in BOTH feature configs. Crate docs specify all 4 defects as a roadmap for future implementation.
+- **CanCopy fail-closed:** Both `transfer_can_copy` and `transfer_full_can_copy` now return `false` for device EPs (were returning `true` unconditionally — fail-open).
+- **device_free defect #4:** Documented the `size=0` contract violation with fix specification (allocation size tracking side-table).
+- **Validation:** `cargo check --workspace` ✓, `cargo check -p onnx-runtime-ep-cuda-plugin --features cuda` ✓, ep-plugin 154+9 tests ✓, clippy clean ✓, fmt clean ✓.
+- **Key correction:** CUDA is implementation-blocked, not hardware-blocked. Even with a GPU, this code cannot work as written.

@@ -254,6 +254,11 @@ fn ep_get_capability_inner(
     // for that op. This ensures the claim predicate and the advertised type
     // constraints agree by construction — both are sourced from the same
     // `KernelRegistryEntry` data.
+    //
+    // Additionally, decline any node with an Undefined output dtype — we
+    // cannot produce a tensor if we don't know its element type. This is
+    // independent of the registry filter: even when no registry entries
+    // exist, we refuse to claim nodes whose output types are unknown.
     let claims: Vec<_> = claims
         .into_iter()
         .filter(|claim| {
@@ -261,6 +266,15 @@ fn ep_get_capability_inner(
                 let Some(node) = ir_graph.nodes.get(nid) else {
                     return false;
                 };
+                // Fail-closed: every output must have a resolved, producible dtype.
+                for &vid in &node.outputs {
+                    let Some(value) = ir_graph.values.get(vid) else {
+                        return false;
+                    };
+                    if value.dtype == DataType::Undefined {
+                        return false;
+                    }
+                }
                 node_passes_dtype_filter(node, ir_graph, &exported.registry_entries)
             })
         })
@@ -471,13 +485,14 @@ fn ep_compile_inner(
                     let num_inputs = view.node_inputs(node_idx).len();
                     let num_outputs = view.node_outputs(node_idx).len();
 
-                    // Determine output dtype from the first input's dtype
-                    // (correct for elementwise ops; fail-closed for others).
-                    let output_dtype = view
-                        .node_inputs(node_idx)
+                    // Read per-output declared dtype from the ORT graph's
+                    // value info — never inferred from inputs. This is the
+                    // authoritative dtype for Cast, Where, Shape, etc.
+                    let output_dtypes: Vec<DataType> = view
+                        .node_outputs(node_idx)
                         .iter()
-                        .find_map(|v| v.map(|val| view.value(val).dtype))
-                        .unwrap_or(onnx_runtime_ir::DataType::Float32);
+                        .map(|&val_idx| view.value(val_idx).dtype)
+                        .collect();
 
                     // Determine shape inference strategy using full node
                     // attributes (wired to Deckard's 22 rules).
@@ -488,7 +503,7 @@ fn ep_compile_inner(
                         kernel,
                         num_inputs,
                         num_outputs,
-                        output_dtype,
+                        output_dtypes,
                         shape_inference,
                     });
                 }

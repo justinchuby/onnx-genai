@@ -17,3 +17,15 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #294 aarch64 build by cfg-gating the x86-only perf probe after Drake lockout.
+
+## 2026-08-11 — B3: NxrtStatus cross-module allocator fix (PR #762 rejection)
+
+**Problem:** `NxrtStatus.message` was heap-allocated in the plugin (`CString::into_raw`) and freed in the host (`CString::from_raw`/`Drop`). Across a `cdylib` boundary with different CRTs this is UB (Windows heap corruption).
+
+**Fix:** Replaced `*mut c_char` with inline `[u8; 256]` buffer + `message_len: u32`. `NxrtStatus` is now a pure value type — no heap, no pointers, no `Drop`, no cross-module free. `message_str()` is no longer `unsafe`.
+
+**Also fixed:** Two `as *const i8` casts in `loader.rs` and `provider_adapter.rs` that fail on aarch64 (where `c_char = u8`). Changed to `as *const c_char`.
+
+**Tests:** 32 nxrt-abi unit tests pass, 4 nxrt-host unit + 10 roundtrip tests pass. Clippy + fmt clean.
+
+**Note for Chew:** Two `as *const i8` casts remain in `tests/nxrt_abi_roundtrip.rs:173,187` — need the same `c_char` fix.

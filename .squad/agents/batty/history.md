@@ -77,3 +77,16 @@ Decision file: `.squad/decisions/inbox/batty-cuda-upstream-audit.md`
 Durable lesson: The upstream CUDA EP is mature and actively staffed; our competitive
 advantages are runtime-level (graph capture, VMM weight paging, tiered KV) and
 architecturally not portable to upstream.
+
+### 2026-08-11 — B1: Output dtype fix (PR #762 reviewer rejection)
+
+Fixed silent wrong-answer bug: `CompiledKernelEntry.output_dtype` was a single dtype
+guessed from the first input. Changed to `output_dtypes: Vec<DataType>` sourced from
+ORT graph value info at Compile time. Added fail-closed Undefined-output-dtype filter
+in GetCapability. No OrtGraph/OrtNode pointers cached past Compile.
+
+Decision file: `.squad/decisions/inbox/batty-b1-output-dtype.md`
+
+Durable lesson: Never infer output dtypes from inputs — always read from the graph's
+declared value info. Ops like Cast, Where, Shape have output types unrelated to their
+first input type.

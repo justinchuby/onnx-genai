@@ -36,7 +36,7 @@ pub mod testing;
 pub mod version;
 pub mod vtable;
 
-pub use status::{NxrtStatus, NxrtStatusCode};
+pub use status::{NXRT_STATUS_MESSAGE_MAX, NxrtStatus, NxrtStatusCode};
 pub use testing::{NxrtCreateFactoriesOverride, NxrtNegotiateOverride};
 pub use version::{
     NXRT_ABI_VERSION_MAJOR, NXRT_ABI_VERSION_MINOR, NXRT_CAP_ALLOCATOR,

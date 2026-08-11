@@ -79,9 +79,7 @@ impl NxrtExecutionProvider {
             unsafe { ((*factory_ptr).create_ep)((*factory_ptr).ctx, device_ordinal, &mut ep_ptr) };
 
         if !status.is_ok() {
-            let msg = unsafe { status.message_str() }
-                .unwrap_or("(no message)")
-                .to_owned();
+            let msg = status.message_str().unwrap_or("(no message)").to_owned();
             return Err(NxrtHostError::FactoryFailed {
                 path: plugin.path.clone().to_path_buf(),
                 status: msg,
@@ -101,7 +99,7 @@ impl NxrtExecutionProvider {
             if ep.name.is_null() {
                 plugin.name().to_owned()
             } else {
-                CStr::from_ptr(ep.name as *const i8)
+                CStr::from_ptr(ep.name as *const std::os::raw::c_char)
                     .to_string_lossy()
                     .into_owned()
             }

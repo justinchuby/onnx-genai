@@ -31,9 +31,10 @@ pub(crate) fn host_api() -> *const ort::OrtApi {
 
 /// Create an `OrtStatus` with `ORT_FAIL` using the host's `CreateStatus`.
 ///
-/// If the host API is not available (should never happen after init), returns
-/// a null pointer which ORT interprets as success — but we document this path
-/// cannot be reached.
+/// If the host API is not available (before `CreateEpFactories` completes
+/// init), returns a null pointer — which ORT interprets as success. Callers in
+/// the pre-init window (e.g. null `api_base`) must handle errors without
+/// `fail_status`. After init, the host API is always set.
 pub fn fail_status(message: &str) -> *mut ort::OrtStatus {
     status_with_code(ort::ORT_FAIL, message)
 }

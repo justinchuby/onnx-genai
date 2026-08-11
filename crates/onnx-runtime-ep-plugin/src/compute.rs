@@ -521,8 +521,10 @@ pub struct CompiledKernelEntry {
     pub kernel: Box<dyn Kernel>,
     pub num_inputs: usize,
     pub num_outputs: usize,
-    /// Output dtype (all outputs share this for elementwise ops).
-    pub output_dtype: DataType,
+    /// Per-output declared IR dtype, read from the ORT graph's value info at
+    /// Compile time. Indexed by output slot. Never inferred from inputs —
+    /// this is the authoritative dtype for each output tensor.
+    pub output_dtypes: Vec<DataType>,
     pub shape_inference: ShapeInference,
 }
 
@@ -748,14 +750,13 @@ unsafe extern "C" fn compute_execute(
                 for (out_slot, (shape, sink)) in output_shapes.iter().zip(sinks).enumerate() {
                     match sink {
                         NodeOutputSink::Ort(ort_idx) => {
+                            let out_dtype = entry
+                                .output_dtypes
+                                .get(out_slot)
+                                .copied()
+                                .unwrap_or(DataType::Float32);
                             match unsafe {
-                                allocate_output(
-                                    api_ref,
-                                    kernel_context,
-                                    *ort_idx,
-                                    shape,
-                                    entry.output_dtype,
-                                )
+                                allocate_output(api_ref, kernel_context, *ort_idx, shape, out_dtype)
                             } {
                                 Ok(out) => ort_outputs.push(out),
                                 Err(e) => {
@@ -765,7 +766,12 @@ unsafe extern "C" fn compute_execute(
                             let _ = out_slot;
                         }
                         NodeOutputSink::Buffer(buf_idx) => {
-                            buf_writes.push((*buf_idx, shape.clone(), entry.output_dtype));
+                            let out_dtype = entry
+                                .output_dtypes
+                                .get(out_slot)
+                                .copied()
+                                .unwrap_or(DataType::Float32);
+                            buf_writes.push((*buf_idx, shape.clone(), out_dtype));
                         }
                     }
                 }
@@ -837,9 +843,13 @@ unsafe extern "C" fn compute_execute(
             };
             let mut owned_outputs = Vec::with_capacity(entry.num_outputs);
             for (out_idx, shape) in output_shapes.iter().enumerate() {
-                match unsafe {
-                    allocate_output(api_ref, kernel_context, out_idx, shape, entry.output_dtype)
-                } {
+                let out_dtype = entry
+                    .output_dtypes
+                    .get(out_idx)
+                    .copied()
+                    .unwrap_or(DataType::Float32);
+                match unsafe { allocate_output(api_ref, kernel_context, out_idx, shape, out_dtype) }
+                {
                     Ok(out) => owned_outputs.push(out),
                     Err(e) => return fail_status(&format!("Compute: {e}")),
                 }

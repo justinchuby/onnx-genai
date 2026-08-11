@@ -238,35 +238,17 @@ unsafe extern "C" fn transfer_can_copy(
         // explicitly do NOT support host→host or cross-device.
 
         // Since we cannot inspect OrtMemoryDevice fields without OrtEpApi,
-        // the safe approach is: this EP can handle any copy that involves at
-        // least one non-CPU endpoint. Cross-device (two different non-CPU
-        // devices) is not supported. Since OrtMemoryDevice is opaque and we
-        // can't distinguish, we conservatively return true for all non-host↔host
-        // pairings that ORT offers us, relying on ORT only asking us about
-        // devices that belong to our EP.
+        // and the underlying data transfer is non-functional (CopyTensors
+        // returns an error unconditionally for device EPs — see defect #2
+        // in the CUDA plugin crate docs), reporting CanCopy=true is fail-open:
+        // ORT would select us for a copy we cannot perform.
         //
-        // ORT's contract: it only calls CanCopy on data transfers it creates
-        // from our factory. So if it asks, at least one endpoint is ours.
-        // We support H↔D and D→D(same device). We cannot distinguish
-        // cross-device without API access, so we return true and let
-        // CopyTensors fail closed if the copy is actually unsupported.
-        //
-        // Actually, safer: always return true when our EP is non-host.
-        // CopyTensors will fail closed for genuinely unsupported combinations.
-        // This matches the ORT contract: CanCopy is advisory, CopyTensors
-        // returning an error status is the definitive failure.
-        //
-        // BUT the mission says "fail closed in CanCopy" — so we need a way to
-        // return false for cross-device. Without OrtEpApi, we use pointer
-        // equality: if both are non-null and different, and neither is "cpu-ish",
-        // that's cross-device. Since we can't tell which is CPU without the API,
-        // the truly fail-closed answer for an opaque type without introspection is:
-        // return true only for src==dst (same device D→D) and always true for
-        // mixed (one is CPU, one is our device). Since we can't tell which is
-        // which, return true unconditionally and let CopyTensors validate.
-        //
-        // Simplification: return `true`. The real guard is CopyTensors.
-        true
+        // Fail closed: return false. ORT will fall back to another data-
+        // transfer provider or report the error to the caller. When the
+        // transfer implementation is actually wired (shared CUDA context,
+        // OrtApi stored, cudaMemcpyAsync operational), restore direction-
+        // aware CanCopy using CopyDirection::classify + is_supported.
+        false
     }));
     result.unwrap_or(false)
 }
@@ -436,8 +418,10 @@ unsafe extern "C" fn transfer_full_can_copy(
         }
         // With OrtEpApi we could call MemoryDevice_GetDeviceType, but the
         // EpApi pointer isn't stored here (it's separate from OrtApi).
-        // Same policy as basic adapter: return true, fail closed in CopyTensors.
-        true
+        // The underlying CopyTensors implementation is non-functional for
+        // device EPs without a shared CUDA context and stream. Returning
+        // true here is fail-open. Fail closed until the transfer is wired.
+        false
     }));
     result.unwrap_or(false)
 }
@@ -938,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn can_copy_returns_true_for_device_ep() {
+    fn can_copy_returns_false_for_device_ep_until_transfer_is_wired() {
         let dc = DropCounter::new();
         let ep = Box::new(MockDeviceEp::new(dc));
         let ep_ptr: *const dyn ExecutionProvider = &*ep;
@@ -952,8 +936,8 @@ mod tests {
 
         let result = unsafe { transfer_can_copy(raw as *const _, dev_ptr, dev_ptr) };
         assert!(
-            result,
-            "device EP should claim CanCopy for device transfers"
+            !result,
+            "device EP CanCopy must return false (fail-closed) until transfer is functional"
         );
 
         unsafe { transfer_release(raw) };

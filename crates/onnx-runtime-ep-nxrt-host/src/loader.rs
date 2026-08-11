@@ -196,7 +196,8 @@ pub fn load_nxrt_plugin(path: impl AsRef<Path>) -> Result<NxrtPlugin, NxrtHostEr
         unsafe { create_fn(factory_ptrs.as_mut_ptr(), MAX_FACTORIES, &mut num_factories) };
 
     if !create_status.is_ok() {
-        let msg = unsafe { create_status.message_str() }
+        let msg = create_status
+            .message_str()
             .unwrap_or("(no message)")
             .to_owned();
         return Err(NxrtHostError::FactoryFailed { path, status: msg });
@@ -236,7 +237,7 @@ pub fn load_nxrt_plugin(path: impl AsRef<Path>) -> Result<NxrtPlugin, NxrtHostEr
         if factory.name.is_null() {
             String::from("unknown")
         } else {
-            CStr::from_ptr(factory.name as *const i8)
+            CStr::from_ptr(factory.name as *const std::os::raw::c_char)
                 .to_string_lossy()
                 .into_owned()
         }

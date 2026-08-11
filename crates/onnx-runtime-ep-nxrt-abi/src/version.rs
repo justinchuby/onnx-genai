@@ -242,7 +242,7 @@ mod tests {
         let mut resp = NxrtNegotiateResponse::zeroed();
         let status = unsafe { negotiate(&req, &mut resp) };
         assert_eq!(status.code, NxrtStatusCode::VersionMismatch);
-        let msg = unsafe { status.message_str() }.unwrap();
+        let msg = status.message_str().unwrap();
         assert!(msg.contains("plugin major version"));
     }
 

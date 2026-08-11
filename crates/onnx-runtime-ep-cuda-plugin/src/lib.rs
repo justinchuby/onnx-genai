@@ -4,9 +4,40 @@
 //! Without the `cuda` feature (default), it compiles as a no-op stub so the
 //! workspace builds on hosts without a CUDA toolkit.
 //!
-//! With `cuda` enabled and `onnx-runtime-ep-cuda` linked, it exports
-//! `CreateEpFactories` and `ReleaseEpFactory` that project the CUDA EP
-//! through the ORT plugin-EP C ABI with real GPU device support.
+//! # CUDA EP status: IMPLEMENTATION-BLOCKED (not merely hardware-blocked)
+//!
+//! Even with `cuda` enabled, `CreateEpFactories` currently returns **zero
+//! factories**. The CUDA EP cannot be advertised to ORT because four
+//! implementation defects prevent it from functioning correctly on *any* host:
+//!
+//! 1. **Separate CUDA runtime/context per component.** The EP, allocator, and
+//!    stream each construct independent CUDA runtime/context instances. A correct
+//!    implementation must share a single `CUcontext` + `cudaStream_t` across all
+//!    three so that allocations are visible to kernels and stream-ordered copies
+//!    are coherent.
+//!
+//! 2. **`CreateDataTransfer` returns NULL.** The factory wires up a
+//!    `DeviceDataTransfer` but it cannot perform actual copies: it lacks access
+//!    to `OrtApi` (needed to extract tensor data pointers) and has no shared
+//!    CUDA stream for `cudaMemcpyAsync`. The `CopyTensors` callback returns an
+//!    error unconditionally.
+//!
+//! 3. **`GetHandle` returns NULL stream handle.** `stream_get_handle` returns
+//!    `null_mut()` — there is no `cudaStream_t` to return. ORT and downstream
+//!    consumers that call `GetHandle` to order work on the EP's stream will
+//!    receive a null pointer, causing undefined behavior or silent fallback to
+//!    the default stream (breaking ordering guarantees).
+//!
+//! 4. **`Free` passes `size=0` violating the allocator contract.** `device_free`
+//!    reconstructs a `DeviceBuffer` with `size=0` because the allocation size is
+//!    not tracked. The EP's `deallocate` implementation may need the size for
+//!    `cudaFree`-style bookkeeping or arena management. Passing `size=0` violates
+//!    the allocator contract documented in `onnxruntime_ep_c_api.h`.
+//!
+//! **Fail-closed policy:** Advertising a GPU EP that cannot honour the contract
+//! is worse than not shipping one — ORT would route real work to it and get
+//! silent corruption or crashes. The plugin returns zero factories until all
+//! four defects are resolved.
 
 // ─── Feature-gated: real CUDA EP ─────────────────────────────────────────────
 
@@ -92,48 +123,48 @@ pub unsafe extern "C" fn CreateEpFactories(
 ) -> *mut onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtStatus {
     let out_num_raw = out_num;
     let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        // ── Fail closed: CUDA EP is implementation-blocked ──────────────
+        //
+        // The CUDA plugin returns zero factories regardless of feature
+        // configuration. Even with `cuda` enabled, the implementation has
+        // four unresolved defects (see crate-level docs) that would cause
+        // silent corruption or crashes if ORT routed work to this EP.
+        //
+        // This is NOT a hardware-validation gate — it is an implementation
+        // gate. The defects exist in the code, not in the test environment.
+        //
+        // When all four defects are resolved, remove this gate and restore
+        // the `create_ep_factories_with_device_support` call.
+        unsafe {
+            if !out_num_raw.is_null() {
+                *out_num_raw = 0;
+            }
+        }
+
         #[cfg(feature = "cuda")]
         {
-            // Verify the EP can actually be constructed on this host.
-            if let Err(msg) = cuda_impl::construct_ep() {
-                eprintln!("[onnx-runtime-ep-cuda-plugin] {msg}");
-                unsafe {
-                    if !out_num_raw.is_null() {
-                        *out_num_raw = 0;
-                    }
-                }
-                return onnx_runtime_ep_plugin::panic_to_fail_status(&msg);
-            }
+            // Suppress unused-import warnings for gated code that will be
+            // restored once the implementation defects are resolved.
+            let _ = &cuda_impl::build_kernel_registry_entries;
+            let _ = &cuda_impl::device_support;
+            let _ = &cuda_impl::construct_ep;
 
-            let entries = cuda_impl::build_kernel_registry_entries();
-            let support = cuda_impl::device_support();
-            unsafe {
-                onnx_runtime_ep_plugin::factory::create_ep_factories_with_device_support(
-                    _api_base,
-                    _out_factories,
-                    _max_factories,
-                    out_num_raw,
-                    || {
-                        // This constructor is called per-session. If it fails
-                        // at runtime (e.g. device yanked), the panic guard in
-                        // the macro catches it.
-                        cuda_impl::construct_ep()
-                            .expect("CUDA EP construction must succeed (device was validated)")
-                    },
-                    entries,
-                    support,
-                )
-            }
+            onnx_runtime_ep_plugin::panic_to_fail_status(
+                "onnx-runtime-ep-cuda-plugin: CUDA EP is IMPLEMENTATION-BLOCKED \
+                 (not merely hardware-blocked). Four defects prevent correct operation: \
+                 (1) separate CUDA runtime/context per component — EP, allocator, and stream \
+                 must share a single CUcontext + cudaStream_t; \
+                 (2) CreateDataTransfer cannot perform actual copies — lacks OrtApi access \
+                 and shared CUDA stream; \
+                 (3) GetHandle returns NULL stream handle — no cudaStream_t exists; \
+                 (4) Free passes size=0 violating the allocator contract. \
+                 Zero factories returned (fail-closed). \
+                 See crate docs for the specification of each defect.",
+            )
         }
 
         #[cfg(not(feature = "cuda"))]
         {
-            // No CUDA feature: zero factories, actionable error.
-            unsafe {
-                if !out_num_raw.is_null() {
-                    *out_num_raw = 0;
-                }
-            }
             onnx_runtime_ep_plugin::panic_to_fail_status(
                 "onnx-runtime-ep-cuda-plugin built without `cuda` feature; \
                  CUDA EP is not available. Rebuild with --features cuda on a CUDA-capable host.",

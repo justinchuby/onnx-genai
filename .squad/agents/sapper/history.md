@@ -34,4 +34,12 @@
 ## 2026-07-28T07:46:01+00:00 — Wave 5
 - PR #331 (`52b1fc59`) merged: added CUDA GatherND, SpaceToDepth, and EyeLike; #67 remains open for later coverage batches. Hallett independently approved the GPU parity and mutation-probe evidence.
 
+## 2026-08-11 — B2: ReleaseEpFactory ABI fix
+
+- Fixed `export_ep_factories!` macro: `ReleaseEpFactory` now returns `*mut OrtStatus` per `onnxruntime_ep_c_api.h:2669`, not `void`.
+- Caught panics now surface as error `OrtStatus` instead of being silently swallowed.
+- Verified `CreateEpFactories` matches header — no second mismatch.
+- CPU and CUDA hand-written shims still return `void` — owners must update (not my files).
+- Told Chew to update ABI test type alias to `-> *mut ort::OrtStatus`.
+
 Full pre-compaction history in `history-archive.md`.

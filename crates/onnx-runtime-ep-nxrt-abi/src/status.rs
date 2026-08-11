@@ -2,14 +2,26 @@
 //!
 //! # Ownership
 //!
-//! An `NxrtStatus` is a value type (32-bit code + optional heap message).
-//! When returned from an `extern "C"` function the **caller owns** the status
-//! and must call [`NxrtStatus::free_message`] if `message` is non-null.
-//! Within Rust code, `Drop` handles this automatically.
+//! `NxrtStatus` is a **pure value type** with a fixed inline message buffer.
+//! No heap allocation, no cross-module free, no CRT coupling. The struct can
+//! be returned by value from `extern "C"` functions and memcpy'd freely.
+//!
+//! ## Why inline?
+//!
+//! The nxrt ABI is a stable `cdylib` boundary. The plugin and host may be
+//! linked against different C runtimes (common on Windows). Memory allocated
+//! by one side and freed by the other is undefined behaviour. An inline
+//! buffer eliminates that class of bug entirely — there is nothing to free.
+//!
+//! The maximum message length is [`NXRT_STATUS_MESSAGE_MAX`] bytes (excluding
+//! the NUL terminator). Messages longer than that are silently truncated.
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use std::ptr;
+/// Maximum number of message bytes (excluding NUL terminator) in an
+/// [`NxrtStatus`]. Messages longer than this are silently truncated.
+pub const NXRT_STATUS_MESSAGE_MAX: usize = 255;
+
+/// Total size of the inline message buffer (including NUL terminator).
+const MESSAGE_BUF_LEN: usize = NXRT_STATUS_MESSAGE_MAX + 1;
 
 /// Status codes for the nxrt ABI. Exhaustive and stable — new codes are
 /// appended, never reordered. Unknown codes must be treated as fatal errors
@@ -48,42 +60,54 @@ impl NxrtStatusCode {
 ///
 /// ```text
 /// struct NxrtStatus {
-///     code: u32,
-///     _reserved: u32,         // padding for alignment; must be 0
-///     message: *mut c_char,   // nullable, heap-allocated, UTF-8 + NUL
+///     code:        u32,       // NxrtStatusCode discriminant
+///     message_len: u32,       // length of message in bytes (0 = no message)
+///     message:     [u8; 256], // inline NUL-terminated UTF-8 message buffer
 /// }
 /// ```
 ///
-/// Size: 16 bytes on 64-bit, 12 on 32-bit. The `_reserved` field ensures
-/// consistent alignment regardless of pointer size — future minor versions
-/// may repurpose it (with a minor version bump).
+/// Size: 264 bytes. The struct is a **pure value type** — no heap allocation,
+/// no pointers, no cross-module free. This makes it safe to return by value
+/// across a `cdylib` boundary regardless of CRT configuration.
+///
+/// # Cross-module safety
+///
+/// Because the message is inline, there is no allocator coupling between
+/// plugin and host. The plugin writes the message into the buffer; the host
+/// reads it. Neither side frees anything the other allocated.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct NxrtStatus {
     pub code: NxrtStatusCode,
-    _reserved: u32,
-    /// Optional NUL-terminated UTF-8 error message. Null for success.
-    ///
-    /// # Ownership
-    ///
-    /// If non-null, the **receiver** owns this allocation and must free it via
-    /// [`NxrtStatus::free_message`] or by taking ownership in Rust (which
-    /// `Drop` does automatically). The plugin allocates with `CString`; the
-    /// host frees with `CString::from_raw`.
-    pub message: *mut c_char,
+    /// Number of valid UTF-8 bytes in `message` (excluding NUL terminator).
+    /// Zero means no message. Always ≤ [`NXRT_STATUS_MESSAGE_MAX`].
+    pub message_len: u32,
+    /// Inline NUL-terminated UTF-8 message buffer. Only the first
+    /// `message_len` bytes are meaningful; `message[message_len]` is `0`.
+    /// For success statuses this is typically all zeros.
+    pub message: [u8; MESSAGE_BUF_LEN],
 }
 
-// SAFETY: The message pointer is an owned heap allocation; no aliasing.
+// SAFETY: NxrtStatus is a plain value type with no pointers.
 unsafe impl Send for NxrtStatus {}
 unsafe impl Sync for NxrtStatus {}
+
+impl std::fmt::Debug for NxrtStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NxrtStatus")
+            .field("code", &self.code)
+            .field("message", &self.message_str())
+            .finish()
+    }
+}
 
 impl NxrtStatus {
     /// Create a success status.
     pub const fn ok() -> Self {
         Self {
             code: NxrtStatusCode::Ok,
-            _reserved: 0,
-            message: ptr::null_mut(),
+            message_len: 0,
+            message: [0u8; MESSAGE_BUF_LEN],
         }
     }
 
@@ -91,20 +115,25 @@ impl NxrtStatus {
     pub const fn from_code(code: NxrtStatusCode) -> Self {
         Self {
             code,
-            _reserved: 0,
-            message: ptr::null_mut(),
+            message_len: 0,
+            message: [0u8; MESSAGE_BUF_LEN],
         }
     }
 
     /// Create a status from a code and a message string.
+    ///
+    /// Messages longer than [`NXRT_STATUS_MESSAGE_MAX`] bytes are silently
+    /// truncated. Interior NUL bytes cause truncation at the first NUL.
     pub fn from_code_with_message(code: NxrtStatusCode, msg: &str) -> Self {
-        let c_msg =
-            CString::new(msg).unwrap_or_else(|_| CString::new("(invalid message)").unwrap());
-        Self {
-            code,
-            _reserved: 0,
-            message: c_msg.into_raw(),
-        }
+        let mut status = Self::from_code(code);
+        // Truncate at first NUL (if any) and at max length.
+        let bytes = msg.as_bytes();
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let len = end.min(NXRT_STATUS_MESSAGE_MAX);
+        status.message[..len].copy_from_slice(&bytes[..len]);
+        status.message[len] = 0; // NUL terminator
+        status.message_len = len as u32;
+        status
     }
 
     /// Whether this status is success.
@@ -114,41 +143,15 @@ impl NxrtStatus {
 
     /// Get the message as a string slice, if present.
     ///
-    /// # Safety
-    ///
-    /// The message pointer must be valid if non-null.
-    pub unsafe fn message_str(&self) -> Option<&str> {
-        if self.message.is_null() {
-            None
-        } else {
-            // SAFETY: caller guarantees the pointer is valid.
-            let cstr = unsafe { CStr::from_ptr(self.message) };
-            cstr.to_str().ok()
+    /// Returns `None` if `message_len` is zero. Returns `None` if the
+    /// message bytes are not valid UTF-8 (defensive against corrupt data
+    /// from an untrusted plugin).
+    pub fn message_str(&self) -> Option<&str> {
+        let len = (self.message_len as usize).min(NXRT_STATUS_MESSAGE_MAX);
+        if len == 0 {
+            return None;
         }
-    }
-
-    /// Free the message allocation. Idempotent (null is a no-op).
-    ///
-    /// # Safety
-    ///
-    /// Must only be called once per status, and only if the caller owns the
-    /// message pointer.
-    pub unsafe fn free_message(&mut self) {
-        if !self.message.is_null() {
-            // SAFETY: message was allocated with CString::into_raw.
-            let _ = unsafe { CString::from_raw(self.message) };
-            self.message = ptr::null_mut();
-        }
-    }
-}
-
-impl Drop for NxrtStatus {
-    fn drop(&mut self) {
-        if !self.message.is_null() {
-            // SAFETY: we own the message pointer.
-            let _ = unsafe { CString::from_raw(self.message) };
-            self.message = ptr::null_mut();
-        }
+        std::str::from_utf8(&self.message[..len]).ok()
     }
 }
 
@@ -177,7 +180,8 @@ mod tests {
     fn ok_status_is_success() {
         let s = NxrtStatus::ok();
         assert!(s.is_ok());
-        assert!(s.message.is_null());
+        assert_eq!(s.message_len, 0);
+        assert!(s.message_str().is_none());
     }
 
     #[test]
@@ -188,13 +192,13 @@ mod tests {
         );
         assert!(!s.is_ok());
         assert_eq!(s.code, NxrtStatusCode::VersionMismatch);
-        let msg = unsafe { s.message_str() }.unwrap();
+        let msg = s.message_str().unwrap();
         assert!(msg.contains("major version 99"));
     }
 
     #[test]
-    fn drop_frees_message_without_leak() {
-        // Just verify no panic/crash on drop with a message.
+    fn drop_is_trivial_no_heap() {
+        // Pure value type — drop is a no-op. Just verify no panic/crash.
         let _s = NxrtStatus::from_code_with_message(NxrtStatusCode::InternalError, "test drop");
     }
 
@@ -204,7 +208,7 @@ mod tests {
             panic!("deliberate test panic");
         });
         assert_eq!(s.code, NxrtStatusCode::InternalError);
-        let msg = unsafe { s.message_str() }.unwrap();
+        let msg = s.message_str().unwrap();
         assert!(msg.contains("panic"));
     }
 
@@ -217,13 +221,12 @@ mod tests {
     }
 
     #[test]
-    fn free_message_is_idempotent() {
-        let mut s = NxrtStatus::from_code_with_message(NxrtStatusCode::DeviceError, "dev err");
-        unsafe { s.free_message() };
-        assert!(s.message.is_null());
-        // Second call is a no-op.
-        unsafe { s.free_message() };
-        // Message is already null so Drop is safe (no double-free).
+    fn message_truncation_at_max_length() {
+        let long_msg = "x".repeat(500);
+        let s = NxrtStatus::from_code_with_message(NxrtStatusCode::InternalError, &long_msg);
+        assert_eq!(s.message_len as usize, NXRT_STATUS_MESSAGE_MAX);
+        let msg = s.message_str().unwrap();
+        assert_eq!(msg.len(), NXRT_STATUS_MESSAGE_MAX);
     }
 
     #[test]
@@ -231,5 +234,21 @@ mod tests {
         // Simulating a code from a newer plugin — must fail closed.
         let s = NxrtStatus::from_code(NxrtStatusCode::OutOfMemory);
         assert!(!s.is_ok());
+    }
+
+    #[test]
+    fn clone_produces_independent_copy() {
+        let s1 = NxrtStatus::from_code_with_message(NxrtStatusCode::DeviceError, "dev err");
+        let s2 = s1.clone();
+        assert_eq!(s1.message_str(), s2.message_str());
+        assert_eq!(s1.code, s2.code);
+    }
+
+    #[test]
+    fn struct_is_repr_c_fixed_size() {
+        // Verify the struct size is stable (important for ABI).
+        let size = std::mem::size_of::<NxrtStatus>();
+        // code(4) + message_len(4) + message(256) = 264
+        assert_eq!(size, 264);
     }
 }
