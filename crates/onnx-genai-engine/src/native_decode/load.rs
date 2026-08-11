@@ -164,6 +164,18 @@ impl NativeDecodeSession {
                         None
                     }
                 },
+                weight_offload_stable_va: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        options
+                            .cuda_offload_policy
+                            .map(|policy| policy.enabled && policy.managed_no_spill)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
+                },
             },
             options.io,
         )
@@ -220,6 +232,7 @@ impl NativeDecodeSession {
                 metadata_max_len,
                 graph_capture: None,
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
         )
     }
@@ -295,6 +308,15 @@ impl NativeDecodeSession {
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
         }
+        // Issue #716: the managed no-spill authority path installs the VMM arena
+        // and physical granule pool, so weight page-ins run on reserved-once
+        // stable virtual addresses. Record that here — where the effective
+        // offload policy is known — so the decode session can keep whole-step
+        // CUDA graph capture ON while offload is active.
+        #[cfg(feature = "cuda")]
+        if let Some(policy) = cuda_offload_policy {
+            options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
+        }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -350,6 +372,7 @@ impl NativeDecodeSession {
                 metadata_max_len: None,
                 graph_capture: None,
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
             io,
         )
@@ -736,6 +759,11 @@ impl NativeDecodeSession {
                 .unwrap_or_else(|| onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled);
             #[cfg(not(feature = "cuda"))]
             let weight_offload_enabled = false;
+            // Issue #716: offload no longer forces capture OFF when it runs on
+            // the stable-VA VMM paging path. Default to the conservative (unsafe)
+            // assumption so any path that has not proven pointer stability keeps
+            // the old mutual exclusion.
+            let weight_offload_stable_va = cuda_options.weight_offload_stable_va.unwrap_or(false);
             let graph_enabled = resolve_graph_capture_enabled(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,
@@ -745,6 +773,7 @@ impl NativeDecodeSession {
                     kv_ownership,
                 },
                 weight_offload_enabled,
+                weight_offload_stable_va,
             );
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
             span.set_arg("max_len", capacity.max_len as u64);
