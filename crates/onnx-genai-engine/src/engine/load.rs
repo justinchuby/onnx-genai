@@ -634,12 +634,18 @@ impl Engine {
         // Sized at full context because a lease is a reservation: charging the
         // current length would admit a sequence the device cannot carry to its
         // limit and discover that mid-generation.
-        match metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.max_sequence_length)
-        {
-            Some(max_context) => {
+        let native_kv_capacity = native_session
+            .cuda_kv_debug_stats()
+            .map(|stats| (stats.hard_max_len, stats.max_len_source));
+        let native_kv_max_context = native_kv_reservation_max_context(
+            native_kv_capacity,
+            metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.max_sequence_length),
+        );
+        match native_kv_max_context {
+            Some((max_context, max_context_source)) => {
                 let (native_kv_bytes, native_kv_tier) = native_session
                     .kv_reservation(max_context)
                     .context("sizing the decoder's KV tensors")?;
@@ -670,10 +676,9 @@ impl Engine {
                             anyhow::anyhow!(
                                 "cannot reserve {native_kv_bytes} bytes of KV for one sequence at \
                                  {max_context} tokens of context on {native_kv_tier:?}: {error}; \
-                                 {max_context} is the model's declared max_sequence_length, and \
-                                 --max-context will not lower it because the declared value takes \
-                                 precedence -- raise the limit for that tier, or re-export the \
-                                 model with a shorter declared context"
+                                 KV max length source: {max_context_source}; raise the limit for \
+                                 that tier, set ONNX_GENAI_CUDA_KV_MAX_LEN lower when supported, \
+                                 or re-export the model with a shorter declared context"
                             )
                         })?;
                 }
@@ -1161,6 +1166,18 @@ fn weight_access_pattern_from_metadata(
     } else {
         fallback
     }
+}
+
+#[cfg(feature = "native-backend")]
+fn native_kv_reservation_max_context(
+    native_capacity: Option<(usize, String)>,
+    metadata_max_len: Option<usize>,
+) -> Option<(usize, String)> {
+    native_capacity
+        .filter(|(max_len, _)| *max_len != usize::MAX)
+        .or_else(|| {
+            metadata_max_len.map(|max_len| (max_len, "model.max_sequence_length".to_owned()))
+        })
 }
 
 /// The temporary startup reservation, given the package size and offload budget.
@@ -2173,6 +2190,51 @@ mod pool_sizing_tests {
             "the temporary startup claim must leave the governor a one-page KV floor; \
              the CUDA provider later adopts the full offload budget as the real claim"
         );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_uses_runtime_capacity_before_metadata() {
+        let (max_len, source) = native_kv_reservation_max_context(
+            Some((4096, "ONNX_GENAI_CUDA_KV_MAX_LEN".into())),
+            Some(131_072),
+        )
+        .expect("runtime capacity should be available");
+
+        assert_eq!(max_len, 4096);
+        assert_eq!(source, "ONNX_GENAI_CUDA_KV_MAX_LEN");
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_falls_back_to_metadata() {
+        let (max_len, source) = native_kv_reservation_max_context(None, Some(131_072))
+            .expect("metadata capacity should be available");
+
+        assert_eq!(max_len, 131_072);
+        assert_eq!(source, "model.max_sequence_length");
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_ignores_unbounded_runtime_capacity_without_metadata() {
+        assert_eq!(
+            native_kv_reservation_max_context(Some((usize::MAX, "unbounded".into())), None),
+            None
+        );
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_kv_reservation_uses_metadata_after_unbounded_runtime_capacity() {
+        let (max_len, source) = native_kv_reservation_max_context(
+            Some((usize::MAX, "unbounded".into())),
+            Some(131_072),
+        )
+        .expect("metadata capacity should be available");
+
+        assert_eq!(max_len, 131_072);
+        assert_eq!(source, "model.max_sequence_length");
     }
 
     #[test]

@@ -522,6 +522,23 @@ pub trait Kernel: Send {
         let _ = constant_inputs;
     }
 
+    /// Tell the kernel whether all of this node's outputs have fully-static
+    /// (sequence-independent) symbolic shapes, as derived from the graph's IR
+    /// metadata — **not** from runtime shape values.
+    ///
+    /// The session calls this exactly once, immediately after construction. A
+    /// kernel that gates CUDA-graph capture on sequence-independence (the
+    /// pointwise/elementwise/bitwise/prelu family) uses this to admit a
+    /// fully-static head-major decode shape (e.g. `[1,1,heads,dim]`) that the
+    /// runtime-extent heuristic cannot recognize, while a shape carrying a
+    /// symbolic (growing sequence) dimension stays eager. Deriving eligibility
+    /// from metadata is essential: `[heads=32, feat=128]` (capturable) is
+    /// indistinguishable from `[tokens=32, feat=128]` (unsafe) by extent alone.
+    /// Default: no-op.
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        let _ = seq_independent;
+    }
+
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
 

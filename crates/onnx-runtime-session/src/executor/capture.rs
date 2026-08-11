@@ -81,6 +81,15 @@ pub enum SeamReason {
     KernelNotWarmed,
     /// The selected device kernel explicitly opts out of capture.
     KernelCaptureUnsupported,
+    /// The build-time capture classifier disqualified this node: one of its
+    /// input or output shapes references a GROWING symbol (KV/total-sequence
+    /// length that increases each decode step). Capturing such a node bakes a
+    /// stale launch grid/count from the warmed extent into the replayed device
+    /// graph → silent decode corruption. This is an authoritative HARD VETO
+    /// applied centrally, independent of the kernel's own `capture_support()`
+    /// opinion, so no kernel returning `CaptureSupport::Supported` can re-admit
+    /// a disqualified node.
+    ClassifierDisqualified,
     /// The kernel aborted device-graph *recording* (e.g. it advertised capture
     /// support but issued a stream synchronize, which CUDA rejects mid-capture)
     /// and was quarantined to a forced eager seam so the rest of the graph can
@@ -97,6 +106,7 @@ impl SeamReason {
             | Self::UnresolvedInputShape
             | Self::KernelNotWarmed
             | Self::CaptureRecordingFailed
+            | Self::ClassifierDisqualified
             | Self::KernelCaptureUnsupported => CapturePathKind::EagerDeviceSeam,
         }
     }
@@ -586,6 +596,31 @@ impl Executor {
             inputs_resolved && outputs_resolved,
             "EP capture-region policy admitted a node with unresolved shapes"
         );
+        // CENTRAL HARD VETO — the build-time capture classifier is authoritative.
+        // If any input/output shape of this node references a GROWING symbol
+        // (KV/total-sequence length that increases each decode step), the node is
+        // capture-DISQUALIFIED: replaying it would bake a stale launch grid/count
+        // from the warmed extent into the device graph → silent decode
+        // corruption. This veto runs AFTER structural classification
+        // (`plan_capture_region` → host control-flow/sequence and unresolved-shape
+        // declines keep precedence, so a disqualified host node reports the HOST
+        // seam, not a device seam) but BEFORE the kernel admission check below, so
+        // a kernel that returns `CaptureSupport::Supported` unconditionally (and
+        // never stores the classifier flag) can NEVER re-admit a disqualified
+        // node. A node is capture-eligible only if (classifier says
+        // seq-independent) AND (kernel says Supported for the shape);
+        // over-declining is correctness-safe (extra eager nodes), under-declining
+        // is corruption, so we bias to veto.
+        if !node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols) {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                SeamReason::ClassifierDisqualified,
+                "capture classifier disqualified this node: an input or output \
+                 shape depends on a growing (KV/total-sequence-length) symbol, so \
+                 capturing it would replay a stale launch grid — forced eager seam",
+            ));
+        }
         let input_shapes = plan
             .inputs
             .iter()

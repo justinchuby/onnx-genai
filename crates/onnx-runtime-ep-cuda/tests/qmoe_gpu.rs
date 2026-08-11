@@ -739,6 +739,66 @@ activation_path_test!(
 activation_path_test!(qmoe_swiglu_split_gemv_gemm_matches_cpu, "swiglu", 2, false);
 activation_path_test!(qmoe_identity_gemv_gemm_matches_cpu, "identity", 0, false);
 
+fn assert_fused_gate_up_decode_case(case: Case) {
+    assert_eq!(case.rows, 1);
+    assert!(case.rows * case.top_k <= 16);
+    assert!(
+        (case.fc3 && matches!(case.activation, "silu" | "swiglu"))
+            || (!case.fc3 && case.activation == "swiglu" && case.swiglu_fusion != 0),
+        "case must satisfy the qmoe_gate_up_activate launch gate"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_decode_fused_swiglu_interleaved_matches_cpu() {
+    let case = Case {
+        experts: 4,
+        rows: 1,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "swiglu",
+        swiglu_fusion: 1,
+        affine: true,
+        fc3: false,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    assert_fused_gate_up_decode_case(case);
+    compare(case, DataType::Float16);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_decode_fused_silu_fc3_matches_cpu() {
+    let case = Case {
+        experts: 4,
+        rows: 1,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: true,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    assert_fused_gate_up_decode_case(case);
+    compare(case, DataType::Float16);
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"

@@ -524,6 +524,214 @@ impl Kernel for CaptureDecliningKernel {
     }
 }
 
+// Mirrors the bypass kernels Harry flagged (`UnaryMathKernel`, `NotKernel`,
+// `BitwiseNotKernel`): returns `CaptureSupport::Supported` unconditionally and
+// deliberately does NOT override `set_capture_seq_independent`, so the kernel
+// alone would happily admit a classifier-disqualified growing node into capture.
+struct UnconditionalCaptureKernel;
+
+impl Kernel for UnconditionalCaptureKernel {
+    fn execute(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Supported
+    }
+}
+
+// Build a minimal two-node static `Identity` executor whose kernels are warmed,
+// then return it alongside the per-node kernel keys and the fully-resolved
+// concrete shape map. Callers rewrite one node's IR output shape and cached
+// kernel to stage a capture-admission scenario for `node_capture_reason`.
+#[cfg(test)]
+fn build_identity_capture_fixture() -> (Executor, Vec<KernelKey>, HashMap<ValueId, Vec<usize>>) {
+    use onnx_runtime_ir::static_shape;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    for index in 0..2 {
+        let input = graph.create_named_value(
+            format!("input_{index}"),
+            DataType::Float32,
+            static_shape([1]),
+        );
+        let output = graph.create_named_value(
+            format!("output_{index}"),
+            DataType::Float32,
+            static_shape([1]),
+        );
+        graph.add_input(input);
+        graph.add_output(output);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(input)],
+            vec![output],
+        ));
+    }
+
+    let executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().expect("CPU EP"),
+    )
+    .expect("representative static graph");
+    let resolved = executor
+        .value_shapes
+        .iter()
+        .filter_map(|(&value, shape)| as_static_shape(shape).map(|shape| (value, shape)))
+        .collect::<HashMap<_, _>>();
+    let keys = executor
+        .plan
+        .iter()
+        .map(|plan| KernelKey {
+            node: plan.node_id.0,
+            shapes: plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| resolved[&value].clone())
+                        .unwrap_or_default()
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    (executor, keys, resolved)
+}
+
+// Round-7 central capture veto (PR #728): a classifier-DISQUALIFIED node (an
+// output shape references a GROWING KV/total-sequence-length symbol) wired to a
+// kernel that returns `CaptureSupport::Supported` unconditionally MUST still be
+// declined at the real capture-admission chokepoint (`node_capture_reason`). The
+// veto is applied BEFORE the kernel's own `capture_support()` is consulted, so no
+// bypass kernel can re-admit a disqualified node. Fail-pre (veto absent): the
+// node is admitted (`None`) because every structural check passes and the kernel
+// says Supported — silent decode corruption. Pass-post: `ClassifierDisqualified`.
+#[test]
+fn classifier_disqualified_node_is_vetoed_despite_supported_kernel() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // Mint a GROWING KV-length symbol and mark node 0's OUTPUT shape as carrying
+    // it, so the build-time classifier disqualifies the node — independent of the
+    // concrete warmed extent still present in `resolved`.
+    let growing = executor.graph.create_symbol(None);
+    executor.capture_growing_symbols.insert(growing);
+    let disqualified_output = executor.plan[0].outputs[0];
+    executor.graph.value_mut(disqualified_output).shape =
+        vec![Dim::Symbolic(growing), Dim::Static(1)];
+
+    // The kernel alone would admit capture (unconditional Supported, no flag
+    // override) — exactly the bypass path Harry called out.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    let decline = executor
+        .node_capture_reason(&executor.plan[0], &resolved)
+        .expect("classifier-disqualified node must be declined for capture");
+    assert_eq!(
+        decline.seam_reason,
+        Some(SeamReason::ClassifierDisqualified),
+        "the growing-symbol node must be vetoed centrally, not admitted by the kernel"
+    );
+}
+
+// Positive companion: a classifier-QUALIFIED (sequence-independent) node with the
+// same unconditional-`Supported` kernel is still admitted (`None`). The central
+// veto is strictly additive — it only ever declines disqualified nodes and never
+// suppresses a legitimately capturable one.
+#[test]
+fn classifier_qualified_node_with_supported_kernel_is_admitted() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // No growing symbol touches this node's edges; the classifier qualifies it.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    assert!(
+        executor
+            .node_capture_reason(&executor.plan[0], &resolved)
+            .is_none(),
+        "a sequence-independent node with a Supported kernel must remain capture-eligible"
+    );
+}
+
+// Round-8 veto-precedence fix (PR #728): a host control-flow node (`If`) that
+// ALSO references a GROWING symbol is disqualified by the classifier AND
+// classified as `HostControlFlowOrSequence` by the EP structural policy. The
+// structural HOST seam must WIN so the public capture-segmentation report labels
+// it a HOST round trip, not an eager DEVICE seam. Fail-pre (veto placed first, as
+// on HEAD 9555b354): `node_capture_reason` returns `ClassifierDisqualified` whose
+// `path_kind()` is `EagerDeviceSeam` — a host node mislabeled as a device seam.
+// Pass-post (veto reordered after structural): `HostControlFlowOrSequence` whose
+// `path_kind()` is `HostSeam`.
+#[test]
+fn disqualified_control_flow_node_reports_host_seam_not_device_seam() {
+    let (mut executor, keys, resolved) = build_identity_capture_fixture();
+
+    // Turn node 0 into a control-flow (`If`) node the EP structural policy
+    // classifies as `HostControlFlowOrSequence`.
+    executor.graph.node_mut(executor.plan[0].node_id).op_type = "If".to_string();
+    assert!(
+        is_control_flow_op(
+            &executor.graph.node(executor.plan[0].node_id).op_type,
+            &executor.graph.node(executor.plan[0].node_id).domain,
+        ),
+        "fixture node must be recognized as control flow"
+    );
+
+    // Also make it classifier-disqualified: an output shape references a GROWING
+    // KV/total-sequence-length symbol, so the veto would ALSO fire on this node.
+    let growing = executor.graph.create_symbol(None);
+    executor.capture_growing_symbols.insert(growing);
+    let disqualified_output = executor.plan[0].outputs[0];
+    executor.graph.value_mut(disqualified_output).shape =
+        vec![Dim::Symbolic(growing), Dim::Static(1)];
+    assert!(
+        !node_capture_seq_independent(
+            &executor.graph,
+            executor.graph.node(executor.plan[0].node_id),
+            &executor.capture_growing_symbols,
+        ),
+        "the growing-symbol output must make the node classifier-disqualified"
+    );
+
+    // A warmed unconditional-`Supported` kernel is present too; it must not matter
+    // because structural host classification precedes both the veto and the kernel.
+    executor
+        .cache
+        .entries
+        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+
+    let decline = executor
+        .node_capture_reason(&executor.plan[0], &resolved)
+        .expect("control-flow node must be declined for capture");
+    assert_eq!(
+        decline.seam_reason,
+        Some(SeamReason::HostControlFlowOrSequence),
+        "a disqualified control-flow node must report the HOST control-flow seam, \
+         not ClassifierDisqualified"
+    );
+    assert_eq!(
+        decline
+            .seam_reason
+            .expect("seam reason present")
+            .path_kind(),
+        CapturePathKind::HostSeam,
+        "the disqualified control-flow node must land on the HOST seam path, not an \
+         eager DEVICE seam"
+    );
+}
+
 #[test]
 fn kernel_capture_reason_propagates_into_structured_report() {
     let mut node = Node::new(NodeId(9), "MatMulNBits", vec![], vec![]);
@@ -782,6 +990,926 @@ fn only_gqa_cache_inputs_use_physical_capacity_as_kernel_geometry() {
     assert!(kernel_input_uses_physical_capacity(&gqa, 4));
     assert!(!kernel_input_uses_physical_capacity(&gqa, 0));
     assert!(!kernel_input_uses_physical_capacity(&attention, 4));
+}
+
+// C1 (build-time growing-symbol classifier, DENYLIST on BOTH edges): a pointwise
+// op is capture-eligible iff NEITHER any input NOR any output references a symbol
+// in the GROWING set (`compute_capture_growing_symbols`) — the KV/total-sequence
+// length symbols on attention `past`/`present` cache sequence axes. Benign FRESH
+// symbols (warm-decode-seeded non-growing extents) are absent from that set, so
+// ops carrying only batch/query-seq/fresh dims stay capturable, preserving the
+// 154→34 collapse.
+//
+// This test builds a synthetic decode graph (declared `inputs_embeds`/`logits`
+// I/O plus a GQA node minting a growing KV-length symbol) and asserts: an op
+// whose dims are batch/query-seq only is capturable, and an op that carries a
+// growing KV symbol on its OUTPUT stays eager. The first-hop input alias and the
+// harder downstream-consumer alias are covered by their own tests below
+// (`growing_symbol_alias_keeps_downstream_consumer_eager`). No model files, no
+// per-model hardcoding — growing membership, not dim position.
+#[test]
+fn growing_symbol_classifier_admits_pinned_and_rejects_growing_and_aliased_ops() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // Interned symbols. `batch`/`seq` are pinned (never on a KV sequence axis);
+    // `seq_kv` GROWS each decode step (KV penultimate).
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared decode I/O: inputs_embeds `[batch, seq, 512]`, logits
+    // `[batch, seq, vocab]`.
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    // GQA past_key input (index 3): `[batch, kv_heads, seq_kv, head_dim]`.
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_key),
+        ],
+        vec![],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV-length symbol (past_key penultimate) must be collected, got {growing:?}"
+    );
+    assert!(
+        !growing.contains(&batch) && !growing.contains(&seq),
+        "batch/query-seq must NOT be growing, got {growing:?}"
+    );
+
+    // Positive: a pointwise op whose only symbolic dims are batch/seq (no growing
+    // symbol on any edge) is capture-eligible.
+    let pinned_out = graph.create_named_value(
+        "pinned_pointwise_out",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let pinned_op = Node::new(NodeId(1), "Sigmoid", vec![Some(embeds)], vec![pinned_out]);
+    assert!(
+        node_capture_seq_independent(&graph, &pinned_op, &growing),
+        "an op whose only symbolic dims are batch/seq must be capturable"
+    );
+
+    // Negative: a pointwise op whose OUTPUT carries the growing KV-length symbol
+    // MUST stay eager (a different buffer extent every decode step).
+    let kv_out = graph.create_named_value(
+        "kv_pointwise_out",
+        DataType::Float32,
+        vec![sym(seq_kv), st(128)],
+    );
+    let kv_op = Node::new(NodeId(2), "Sigmoid", vec![Some(embeds)], vec![kv_out]);
+    assert!(
+        !node_capture_seq_independent(&graph, &kv_op, &growing),
+        "an op whose output carries the growing KV-length symbol must stay eager"
+    );
+}
+
+// Finding 1 (downstream-consumer alias — the hard case Harry called out).
+// Shape inference substitutes the lower-id representative when broadcasting two
+// distinct symbols (`context.rs::broadcast_dim`), so a growing KV symbol can be
+// unified INTO `batch` on an aliasing op's OUTPUT; a DOWNSTREAM pointwise op then
+// copies that shape, and BOTH its edges show only the pinned-looking `batch`.
+// Exact per-symbol membership on the raw growing set would wrongly admit that
+// consumer (silent decode corruption). `compute_capture_growing_symbols` closes
+// the growing set under that same unification, so `batch` is marked growing and
+// BOTH the aliasing op AND its downstream consumer stay EAGER. This asserts the
+// consumer, not just the first aliasing op — the exact hole the re-review flagged.
+#[test]
+fn growing_symbol_alias_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let embeds =
+        graph.create_named_value("inputs_embeds", DataType::Float32, vec![sym(batch), st(64)]);
+    graph.add_input(embeds);
+    // GQA mints the growing `seq_kv` on past_key's penultimate axis.
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+    let logits = graph.create_named_value("logits", DataType::Float32, vec![sym(batch), st(32000)]);
+    graph.add_output(logits);
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_key),
+        ],
+        vec![],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa);
+
+    // Aliasing broadcast op: input carries the growing `seq_kv`, the other input
+    // carries `batch`; inference unifies them and writes the lower-id
+    // representative (`batch`, created first) onto the OUTPUT `aliased_out`.
+    let kv_shaped =
+        graph.create_named_value("kv_shaped_in", DataType::Float32, vec![sym(seq_kv), st(64)]);
+    graph.add_input(kv_shaped);
+    let batch_shaped = graph.create_named_value(
+        "batch_shaped_in",
+        DataType::Float32,
+        vec![sym(batch), st(64)],
+    );
+    graph.add_input(batch_shaped);
+    let aliased_out =
+        graph.create_named_value("aliased_out", DataType::Float32, vec![sym(batch), st(64)]);
+    let aliased_op = Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(kv_shaped), Some(batch_shaped)],
+        vec![aliased_out],
+    );
+    graph.insert_node(aliased_op.clone());
+
+    // Downstream consumer: reads and re-emits ONLY the representative `batch` on
+    // both edges — no raw `seq_kv` anywhere on this op.
+    let consumer_out = graph.create_named_value(
+        "downstream_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(64)],
+    );
+    let consumer_op = Node::new(
+        NodeId(2),
+        "Sigmoid",
+        vec![Some(aliased_out)],
+        vec![consumer_out],
+    );
+
+    // Drive REAL inference: the `Add` broadcast records union(seq_kv, batch) via
+    // the single `broadcast_dim` chokepoint, persisting it onto
+    // `graph.symbol_unifications` — the authoritative record the closure reads.
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the alias graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&batch),
+        "the representative `batch` unified with a growing symbol must be in the CLOSED growing \
+         set, got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &aliased_op, &growing),
+        "the first-hop aliasing op must stay eager"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer_op, &growing),
+        "the DOWNSTREAM consumer whose edges show only the representative must ALSO stay eager \
+         (this fails on an un-closed exact-membership denylist)"
+    );
+}
+
+// Finding 1, NON-elementwise aliasing (the escape Harry reproduced). Shape
+// inference substitutes the lower-id representative for two distinct symbols not
+// only in elementwise `broadcast`, but wherever any handler broadcasts — here a
+// `MatMul` batch-dim broadcast (`linalg.rs::matmul_shape` → `ctx.broadcast`):
+// `[seq_kv, M, K] @ [batch, K, N] -> [batch, M, N]` ERASES the growing `seq_kv`
+// batch symbol into the pinned-looking `batch`. A downstream pointwise op then
+// copies `[batch, M, N]` onto both edges. An elementwise-only closure (the prior
+// revision) does NOT union MatMul batch dims, so it wrongly admitted that
+// consumer — silent decode corruption. The authoritative
+// `Graph::symbol_unifications` record (populated at the single `broadcast_dim`
+// chokepoint that MatMul also funnels through) closes the growing set over
+// `union(seq_kv, batch)`, so `batch` is marked growing and the consumer stays
+// EAGER — with zero per-op enumeration in the executor. This drives REAL
+// inference so the record→close path is exercised end to end; it FAILS on
+// HEAD 817eee53 (elementwise-only closure ignores the MatMul alias).
+#[test]
+fn matmul_batch_alias_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // `batch` is created first, so its id is lower and it becomes the surviving
+    // representative — the case where the growing symbol is genuinely erased.
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared `past_key` KV boundary mints the growing `seq_kv` (source-2 scan).
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    // MatMul batch-dim broadcast: lhs batch axis = growing `seq_kv`, rhs batch
+    // axis = `batch`; the contraction (last two) axes are static and match.
+    let lhs = graph.create_named_value("qk", DataType::Float32, vec![sym(seq_kv), st(8), st(16)]);
+    graph.add_input(lhs);
+    let rhs = graph.create_named_value("w", DataType::Float32, vec![sym(batch), st(16), st(32)]);
+    graph.add_input(rhs);
+    let matmul_out = graph.create_named_value(
+        "matmul_out",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(32)],
+    );
+    let matmul = Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(lhs), Some(rhs)],
+        vec![matmul_out],
+    );
+    graph.insert_node(matmul);
+
+    // Downstream consumer sees ONLY the representative `batch` on both edges.
+    let consumer_out = graph.create_named_value(
+        "matmul_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(32)],
+    );
+    let consumer = Node::new(
+        NodeId(1),
+        "Sigmoid",
+        vec![Some(matmul_out)],
+        vec![consumer_out],
+    );
+    graph.insert_node(consumer.clone());
+    graph.add_output(consumer_out);
+
+    // Real inference records union(seq_kv, batch) at the MatMul batch broadcast.
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the MatMul-alias graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&batch),
+        "the representative `batch` a MatMul batch-dim broadcast unified with the growing \
+         `seq_kv` must be in the CLOSED growing set — this FAILS on an elementwise-only closure, \
+         got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer whose edges show only the MatMul-aliased representative must \
+         stay EAGER"
+    );
+}
+
+// Round-4 escape (Harry): a DERIVED-symbol lineage loss. `Reshape([seq_kv,8],
+// [-1])` forms the derived expression `seq_kv*8`; `SymbolInterner::lower` interns
+// that non-bare expression to a BRAND-NEW fresh `SymbolId` and (pre-fix) records
+// NOTHING, so `symbol_unifications` carries no edge `seq_kv -> fresh`. A
+// downstream `Sigmoid` carrying only the fresh symbol was wrongly classified
+// capture-safe -> silent decode corruption. The fix records a derivation edge
+// `fresh -> seq_kv` at the `lower` chokepoint and closes the disqualifying set
+// over derivation edges, so the fresh symbol is disqualifying and the `Sigmoid`
+// stays EAGER. This drives REAL inference so the `lower`->record->close path is
+// exercised end to end; it FAILS on HEAD 571ea0d9 (no derivation provenance).
+#[test]
+fn reshape_derived_growing_symbol_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    // Declared `past_key` KV boundary mints the growing `seq_kv` (source-2 scan).
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    // A `[seq_kv, 8]` tensor carrying the growing symbol.
+    let kv2d = graph.create_named_value("kv2d", DataType::Float32, vec![sym(seq_kv), st(8)]);
+    graph.add_input(kv2d);
+
+    // Reshape target `[-1]` as an int64 initializer -> shape-data source. The
+    // derived output dim is `seq_kv*8`, which `lower` interns to a fresh symbol.
+    let target = graph.create_named_value("reshape_target", DataType::Int64, vec![st(1)]);
+    {
+        use onnx_runtime_ir::{TensorData, WeightRef};
+        graph.set_initializer(
+            target,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+    }
+    let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+    let reshape = Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(kv2d), Some(target)],
+        vec![reshaped],
+    );
+    graph.insert_node(reshape);
+
+    // Downstream consumer sees only the derived (fresh) symbol on both edges.
+    let sig_out = graph.create_named_value("reshape_sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(reshaped)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the reshape-derived graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&seq_kv),
+        "the growing KV symbol must be collected, got {growing:?}"
+    );
+    // The reshape output's fresh derived symbol must be in the CLOSED set (it
+    // depends on the growing `seq_kv` via the recorded derivation edge).
+    let reshaped_dim = graph
+        .try_value(reshaped)
+        .and_then(|v| v.shape.first().copied());
+    let Some(Dim::Symbolic(derived)) = reshaped_dim else {
+        panic!("reshape output must be a derived symbolic dim, got {reshaped_dim:?}");
+    };
+    assert!(
+        growing.contains(&derived),
+        "the fresh symbol `seq_kv*8` derived from a growing symbol must be in the CLOSED \
+         disqualifying set (this FAILS on HEAD 571ea0d9 — no derivation provenance), got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer of a growing-derived reshape output must stay EAGER"
+    );
+}
+
+// Same round-4 escape via `Flatten` (`transform.rs::flatten`), whose collapsed
+// axes form the derived product `prod(dims[axis..])`. `Flatten` of `[seq_kv, 8]`
+// at axis=1 keeps outer `seq_kv`, but at axis=0 forms `1 x (seq_kv*8)`; here we
+// flatten `[batch, seq_kv, 8]` at axis=1 so the trailing dim is the derived
+// `seq_kv*8`. Its fresh symbol must be disqualifying and the consumer EAGER.
+#[test]
+fn flatten_derived_growing_symbol_keeps_downstream_consumer_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let past_key = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(seq_kv), st(64)],
+    );
+    graph.add_input(past_key);
+
+    let kv3d = graph.create_named_value(
+        "kv3d",
+        DataType::Float32,
+        vec![sym(batch), sym(seq_kv), st(8)],
+    );
+    graph.add_input(kv3d);
+
+    // Flatten at axis=1 -> `[batch, seq_kv*8]`; the trailing dim is derived.
+    let flat = graph.create_named_value("flat", DataType::Float32, Shape::new());
+    let mut flatten = Node::new(NodeId(0), "Flatten", vec![Some(kv3d)], vec![flat]);
+    flatten.attributes.insert("axis".into(), Attribute::Int(1));
+    graph.insert_node(flatten);
+
+    let sig_out = graph.create_named_value("flatten_sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(flat)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference on the flatten-derived graph must succeed");
+
+    let growing = compute_capture_growing_symbols(&graph);
+    let flat_dim = graph.try_value(flat).and_then(|v| v.shape.get(1).copied());
+    let Some(Dim::Symbolic(derived)) = flat_dim else {
+        panic!("flatten trailing dim must be a derived symbolic dim, got {flat_dim:?}");
+    };
+    assert!(
+        growing.contains(&derived),
+        "the fresh symbol `seq_kv*8` derived by Flatten from a growing symbol must be in the \
+         CLOSED disqualifying set (FAILS on HEAD 571ea0d9), got {growing:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &growing),
+        "the downstream consumer of a growing-derived flatten output must stay EAGER"
+    );
+}
+
+// FAIL-SAFE (Step 2), part 1 — provenance RECOVERS a pinned-derived fresh
+// symbol. `Reshape([batch, 8], [-1])` derives `batch*8`, interned to a fresh
+// symbol whose recorded provenance traces ONLY to the pinned root `batch`. The
+// fail-safe classifier therefore does NOT disqualify it, so the consumer stays
+// CAPTURABLE — this is precisely why the fail-safe (with the Step-1 provenance
+// record) does not regress into the naive pinned-allowlist's segment collapse:
+// a fresh symbol built purely from pinned sources is provably pinned.
+#[test]
+fn failsafe_pinned_derived_fresh_symbol_stays_capturable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+
+    let pinned_2d =
+        graph.create_named_value("pinned_2d", DataType::Float32, vec![sym(batch), st(8)]);
+    graph.add_input(pinned_2d);
+
+    let target = graph.create_named_value("reshape_target", DataType::Int64, vec![st(1)]);
+    {
+        use onnx_runtime_ir::{TensorData, WeightRef};
+        graph.set_initializer(
+            target,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![1],
+                (-1i64).to_le_bytes().to_vec(),
+            )),
+        );
+    }
+    let reshaped = graph.create_named_value("reshaped", DataType::Float32, Shape::new());
+    let reshape = Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(pinned_2d), Some(target)],
+        vec![reshaped],
+    );
+    graph.insert_node(reshape);
+
+    let sig_out = graph.create_named_value("sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(reshaped)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference must succeed");
+
+    let derived = match graph
+        .try_value(reshaped)
+        .and_then(|v| v.shape.first().copied())
+    {
+        Some(Dim::Symbolic(s)) => s,
+        other => panic!("reshape output must be a derived symbolic dim, got {other:?}"),
+    };
+
+    let not_pinned = compute_not_pinned_symbols(&graph);
+    assert!(
+        !not_pinned.contains(&derived),
+        "a fresh symbol derived only from the pinned root `batch` must NOT be disqualifying \
+         under the fail-safe classifier, got {not_pinned:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &consumer, &not_pinned),
+        "a consumer of a pinned-derived reshape output must stay CAPTURABLE under fail-safe"
+    );
+}
+
+// FAIL-SAFE (Step 2), part 2 — the structural win. An inference-minted symbol
+// with NO recorded provenance (here a permissive-broadcast degrade of two
+// unequal static extents `[batch,4] (+) [batch,5]`, standing in for any
+// data-dependent `NonZero`/`Range`/`Slice` fresh dim) is UNTRACEABLE. The
+// DENYLIST admits it (not proven growing ⇒ capturable) — the latent
+// silent-corruption hole. The FAIL-SAFE classifier disqualifies it (unknown ⇒
+// eager ⇒ safe), structurally eliminating the whole "unrecorded lineage site"
+// bug class without a per-site whack-a-mole fix.
+#[test]
+fn failsafe_untraceable_minted_symbol_is_eager_but_denylist_admits_it() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+
+    let a = graph.create_named_value("a", DataType::Float32, vec![sym(batch), st(4)]);
+    let b = graph.create_named_value("b", DataType::Float32, vec![sym(batch), st(5)]);
+    graph.add_input(a);
+    graph.add_input(b);
+    // Permissive broadcast of unequal, non-1 static extents mints an honest
+    // "unknown" fresh symbol with no provenance (context.rs `broadcast_dim`).
+    let added = graph.create_named_value("added", DataType::Float32, Shape::new());
+    let add = Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![added]);
+    graph.insert_node(add);
+
+    let sig_out = graph.create_named_value("sig_out", DataType::Float32, Shape::new());
+    let consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(added)], vec![sig_out]);
+    graph.insert_node(consumer.clone());
+    graph.add_output(sig_out);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("inference must succeed");
+
+    let unknown = match graph.try_value(added).and_then(|v| v.shape.get(1).copied()) {
+        Some(Dim::Symbolic(s)) => s,
+        other => panic!("Add output last dim must be an unknown minted symbol, got {other:?}"),
+    };
+    assert!(
+        unknown.0
+            >= graph
+                .inference_symbol_floor
+                .expect("inference sets the floor"),
+        "the degrade symbol must be inference-minted (id above the floor)"
+    );
+
+    // DENYLIST: not growing, no provenance ⇒ capturable (the latent hole).
+    let denylist = compute_capture_growing_symbols(&graph);
+    assert!(
+        !denylist.contains(&unknown),
+        "the denylist does not disqualify an untraceable minted symbol, got {denylist:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &consumer, &denylist),
+        "under the denylist the consumer of an untraceable symbol is (unsafely) capturable"
+    );
+
+    // FAIL-SAFE: untraceable minted symbol ⇒ disqualifying ⇒ consumer EAGER.
+    let not_pinned = compute_not_pinned_symbols(&graph);
+    assert!(
+        not_pinned.contains(&unknown),
+        "the fail-safe classifier must disqualify an untraceable minted symbol, got {not_pinned:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &consumer, &not_pinned),
+        "under fail-safe the consumer of an untraceable symbol must stay EAGER"
+    );
+}
+
+// Finding 2 (coverage of CompressedSparseAttention): CSA mints a growing
+// cache-record symbol from `total_sequence_length` on `outputs[1]`/`[3]`
+// (`[query[0], records, width]`). The `attention_kv_cache_slots` CSA entry
+// collects that symbol as GROWING, so any pointwise op consuming a CSA cache
+// tensor stays EAGER on the denylist — closing the finding-2 gap that the old
+// 3-op collector left open.
+#[test]
+fn csa_cache_record_symbol_keeps_consuming_ops_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let records = graph.create_symbol(None); // total_sequence_length-derived
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    // CSA output[1] cache record: `[query[0], records, width]`, penultimate =
+    // records (the growing total-sequence-length-derived axis).
+    let attn_out = graph.create_named_value(
+        "csa_attn",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let cache_out = graph.create_named_value(
+        "csa_cache",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let mut csa = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        vec![Some(embeds)],
+        vec![attn_out, cache_out],
+    );
+    csa.domain = "pkg.nxrt".to_string();
+    graph.insert_node(csa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&records),
+        "the CSA total_sequence_length-derived cache-record symbol must be GROWING, got {growing:?}"
+    );
+
+    // A pointwise op consuming the CSA cache tensor stays eager.
+    let cache_pointwise = graph.create_named_value(
+        "csa_cache_pointwise",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let cache_op = Node::new(
+        NodeId(1),
+        "Relu",
+        vec![Some(cache_out)],
+        vec![cache_pointwise],
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &cache_op, &growing),
+        "an op consuming a CSA cache-record tensor must stay eager"
+    );
+}
+
+// Finding 2 (CSA ratio-4 output 5 `selections`): the dynamic ratio-4 variant
+// mints a fresh, growing `selections` symbol on the LAST axis of output 5
+// (`[query[0], index_heads, query_seq, selections]`,
+// custom_ops.rs::compressed_sparse_attention). The penultimate scan that covers
+// outputs 1/3 would miss it, so `KvCacheSlots::last_axis_outputs` collects the
+// trailing axis of output 5. A pointwise op consuming that `selections`-shaped
+// value must therefore stay EAGER.
+#[test]
+fn csa_output5_selections_symbol_keeps_consuming_ops_eager() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let records = graph.create_symbol(None); // total_sequence_length-derived
+    let selections = graph.create_symbol(None); // output-5 last axis (fresh, growing)
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    // Six ratio-4 outputs. Output 0 = attention; outputs 1/3 = cache records
+    // (penultimate `records`); outputs 2/4 = static compressor tensors; output 5
+    // = `[query[0], index_heads, query_seq, selections]` (selections on LAST
+    // axis). Only `records` and `selections` are growing.
+    let out0 = graph.create_named_value(
+        "csa_attn",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    let out1 = graph.create_named_value(
+        "csa_cache",
+        DataType::Float32,
+        vec![sym(batch), sym(records), st(64)],
+    );
+    let out2 = graph.create_named_value(
+        "csa_comp",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(2), st(128)],
+    );
+    let out3 = graph.create_named_value(
+        "csa_index",
+        DataType::Uint8,
+        vec![sym(batch), sym(records), st(8)],
+    );
+    let out4 = graph.create_named_value(
+        "csa_index_comp",
+        DataType::Float32,
+        vec![sym(batch), st(8), st(2), st(64)],
+    );
+    let out5 = graph.create_named_value(
+        "csa_selections",
+        DataType::Int32,
+        vec![sym(batch), st(8), sym(seq), sym(selections)],
+    );
+    let mut csa = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        vec![Some(embeds)],
+        vec![out0, out1, out2, out3, out4, out5],
+    );
+    csa.domain = "pkg.nxrt".to_string();
+    graph.insert_node(csa);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&selections),
+        "the CSA output-5 last-axis `selections` symbol must be GROWING, got {growing:?}"
+    );
+    assert!(
+        growing.contains(&records),
+        "the CSA output-1/3 penultimate `records` symbol must be GROWING, got {growing:?}"
+    );
+
+    // A pointwise op consuming the CSA `selections`-shaped output stays eager.
+    let sel_pointwise = graph.create_named_value(
+        "csa_selections_pointwise",
+        DataType::Int32,
+        vec![sym(batch), st(8), sym(seq), sym(selections)],
+    );
+    let sel_op = Node::new(NodeId(1), "Sign", vec![Some(out5)], vec![sel_pointwise]);
+    assert!(
+        !node_capture_seq_independent(&graph, &sel_op, &growing),
+        "an op consuming the CSA output-5 `selections` axis must stay eager"
+    );
+}
+
+// Finding 2 (generic declared-KV-I/O coverage): even without any recognized
+// attention op, a model that declares a `present…` rank-4 KV output boundary
+// tensor (`[batch, kv_heads, present_seq, head_dim]`) has its growing sequence
+// symbol collected by the generic scan, so a pointwise op sized by it stays
+// eager. This is what makes finding-2 robust against unrecognized attention
+// variants without minting a per-op entry.
+#[test]
+fn generic_declared_present_kv_output_is_collected_as_growing() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let present_seq = graph.create_symbol(None);
+
+    // Declared `present.0.key` KV output with a rank-4 layout and a symbolic
+    // penultimate (sequence) axis — the ONNX GenAI KV-cache contract.
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(present_seq), st(64)],
+    );
+    graph.add_output(present_key);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.contains(&present_seq),
+        "a declared present.* rank-4 KV output's sequence symbol must be GROWING, got {growing:?}"
+    );
+
+    let out = graph.create_named_value(
+        "kv_sized_out",
+        DataType::Float32,
+        vec![sym(batch), sym(present_seq), st(64)],
+    );
+    let op = Node::new(NodeId(0), "Sigmoid", vec![Some(present_key)], vec![out]);
+    assert!(
+        !node_capture_seq_independent(&graph, &op, &growing),
+        "an op sized by a declared present.* KV sequence symbol must stay eager"
+    );
+}
+
+// Design tradeoff of the growing DENYLIST (the accepted fallback): a benign
+// FRESH symbol — one warm-decode-seeded from a data-dependent extent, neither
+// batch/query-seq nor on a KV sequence axis — is NOT in the growing set, so an op
+// carrying it stays CAPTURABLE. This is deliberate and load-bearing: a pinned
+// ALLOWLIST would keep all such ops eager and dissolve the 154→34 collapse. Only
+// a genuinely growing dim disqualifies an op.
+#[test]
+fn benign_fresh_symbol_is_not_growing_and_stays_capturable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let fresh = graph.create_symbol(None); // warm-seeded data-dependent extent
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(512)],
+    );
+    graph.add_input(embeds);
+    let logits = graph.create_named_value(
+        "logits",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(32000)],
+    );
+    graph.add_output(logits);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        !growing.contains(&fresh),
+        "a fresh non-KV symbol must NOT be growing, got {growing:?}"
+    );
+
+    let out = graph.create_named_value(
+        "fresh_out",
+        DataType::Float32,
+        vec![sym(batch), sym(fresh), st(128)],
+    );
+    let op = Node::new(NodeId(0), "Sigmoid", vec![Some(embeds)], vec![out]);
+    assert!(
+        node_capture_seq_independent(&graph, &op, &growing),
+        "an op carrying only a benign fresh (non-growing) symbol must stay capturable"
+    );
+}
+
+// A recurrent-state cache (GatedDeltaNet conv/recurrent state) has a STATIC
+// penultimate axis, so it must NOT contribute a growing symbol — the whole point
+// that lets GDN pointwise ops become capture-eligible. A pure-recurrent graph
+// with no attention KV cache yields an empty growing set (broaden all), which is
+// correct: nothing grows step-to-step.
+#[test]
+fn recurrent_state_shapes_contribute_no_growing_symbols() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let batch = graph.create_symbol(None);
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    // A fixed-capacity recurrent conv state: penultimate axis is STATIC.
+    let conv_state = graph.create_named_value(
+        "conv_state",
+        DataType::Float32,
+        vec![sym(batch), st(16), st(4), st(128)],
+    );
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    // A default-domain `Attention` node with the recurrent state at input 4:
+    // because its penultimate axis is static, no growing symbol is collected.
+    let attention = Node::new(
+        NodeId(0),
+        "Attention",
+        vec![Some(q), Some(q), Some(q), Some(q), Some(conv_state)],
+        vec![],
+    );
+    graph.insert_node(attention);
+
+    let growing = compute_capture_growing_symbols(&graph);
+    assert!(
+        growing.is_empty(),
+        "a static-penultimate recurrent state must contribute no growing symbols, got {growing:?}"
+    );
 }
 
 #[test]
@@ -2822,6 +3950,16 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
     // captures). Disable the now-default-ON memo so this executor records the
     // warm shapes exactly as a capture-capable EP would at runtime.
     exec.set_decode_memo_enabled(false);
+
+    // This test isolates warm-decode SEEDING — the unresolved-shape → resolved
+    // transition that seeding is responsible for. The central classifier veto
+    // (PR #728, exercised by its own tests) is an orthogonal, additional gate:
+    // under the default fail-safe classifier the Range output's untraceable
+    // data-dependent length is disqualifying, which would mask the
+    // unresolved-shape seam this test asserts. Clear the disqualifying set so the
+    // seeding transition is the sole observable, matching the Denylist view in
+    // which a non-growing, replay-guarded extent is capture-safe.
+    exec.capture_growing_symbols.clear();
 
     let zero = Tensor::from_raw(DataType::Int64, vec![], &0i64.to_le_bytes()).unwrap();
     let four = Tensor::from_raw(DataType::Int64, vec![], &4i64.to_le_bytes()).unwrap();

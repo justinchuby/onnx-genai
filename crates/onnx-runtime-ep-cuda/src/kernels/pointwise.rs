@@ -39,7 +39,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::elementwise::{
-    BroadcastMetadataCache, BroadcastMetadataKey, is_fixed_decode_shape,
+    BroadcastMetadataCache, BroadcastMetadataKey, capture_shape_eligible,
     require_matching_capture_signature,
 };
 use crate::error::{driver_err, not_implemented};
@@ -671,6 +671,7 @@ impl KernelFactory for CmpFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -692,6 +693,7 @@ impl KernelFactory for LogicalFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -714,6 +716,10 @@ pub struct BinaryPredKernel {
     /// The exact dtype/shape signature recorded by the most recent successful
     /// fixed-decode call. `Some` iff the op is currently capture-safe.
     last_capture_safe_signature: Mutex<Option<PredCaptureSignature>>,
+    /// Metadata-derived seq-independence: `true` iff all IR output dims are
+    /// statically known (no growing seq axis), making the op capture-eligible
+    /// regardless of the runtime row count.
+    capture_seq_independent: bool,
 }
 
 /// The dtype + operand/broadcast shapes a captured predicate launch is pinned
@@ -787,8 +793,7 @@ impl BinaryPredKernel {
         // a signature, matching the warmed launch, may enter capture (mirroring
         // the elementwise binary kernel). The `If` consumer's branch flip is
         // separately guarded by the executor's control-flow seam invalidation.
-        let capture_eligible =
-            out_shape.iter().product::<usize>() == 1 || is_fixed_decode_shape(&out_shape);
+        let capture_eligible = capture_shape_eligible(self.capture_seq_independent, &out_shape);
         let current_signature = capture_eligible.then(|| PredCaptureSignature {
             dtype: a.dtype,
             shapes: BroadcastMetadataKey {
@@ -860,6 +865,10 @@ impl Kernel for BinaryPredKernel {
                 self.op_name
             )),
         }
+    }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
     }
 }
 

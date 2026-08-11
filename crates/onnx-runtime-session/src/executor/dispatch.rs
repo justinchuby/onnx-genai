@@ -413,6 +413,7 @@ impl Executor {
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
+        let capture_growing = &self.capture_growing_symbols;
         let mut ctx = KernelDispatchContext {
             ep: &ep,
             graph: &self.graph,
@@ -482,6 +483,7 @@ impl Executor {
                         input_dtypes,
                         &constant_inputs,
                         opset,
+                        node_capture_seq_independent(ctx.graph, node, capture_growing),
                         ep.as_ref(),
                     )?;
                     kernel_bindings[pi] = Some(key);
@@ -509,6 +511,7 @@ impl Executor {
                     input_dtypes,
                     &constant_inputs,
                     opset,
+                    node_capture_seq_independent(ctx.graph, node, capture_growing),
                     ep.as_ref(),
                 )?;
                 kernel_bindings[pi] = Some(key);
