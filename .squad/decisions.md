@@ -54,6 +54,16 @@ Archive by SIZE, not age. Age-only no-ops during high-volume campaigns because m
 - Dense prefetch stays eviction-neutral: executor-driven lazy-weight prefetch is scoped to dense MatMulNBits weights, and CUDA admits prefetch only when it fits without eviction or lease growth so MoE behavior and cache-victim selection are unchanged.
 - Native CUDA KV bindings may reserve the full-context VMM address range while exposing bucketed physical strides; growth commits the next bucket and repacks valid prefixes in place. Full-context strides committed one granule per head and worsened arena pressure, so floor claims must wait for #694 because ledger-refusal passes made the sweep non-monotonic.
 
+### 2026-08-11: Whole-step megakernel is the next bounded batch-1 latency lever
+
+**By:** Roper
+
+**What:** Roper's read-only scoping concluded that a whole-step/persistent megakernel is the only remaining lever that attacks the current batch-1 decode regime's GPU-side bubbles after CUDA graph capture. vLLM full CUDA graph and llama.cpp are capture/per-op systems, not true megakernels; Mirage MPK is not directly adoptable for this Rust/ONNX/int4 QMoE stack.
+
+**Why:** Prior FC2 fusion, ILP, and vectorized-int4 attempts show QMoE decode is occupancy/MLP/barrier bound rather than launch or bandwidth bound. Recommendation is Phase 0 only first: a persistent single-op QMoE decode kernel that removes FC1/FC3/activation/FC2/combine scratch round-trips while preserving fp32 accumulation order. Gate continuation on oracle margin `0.09375` and at least a 3% model wall-clock win.
+
+**Detail:** Full feasibility memo archived in `.squad/decisions-archive/2026-08.md` under "Roper megakernel feasibility inbox drop".
+
 ## Extension contract standing directive (#524)
 
 **By:** Justin Chu / contract audit
