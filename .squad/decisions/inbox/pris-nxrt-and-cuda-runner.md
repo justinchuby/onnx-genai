@@ -171,3 +171,21 @@ fixtures; tests passed locally but always failed from a fresh clone.
 **Convention:** after adding any binary test fixture, verify with
 `git ls-files <path>` that it is tracked. If `*.onnx` blocks it, add an explicit
 `!` negation in `.gitignore` following the existing per-file style.
+
+---
+
+## Rule: `extern "C"` function-pointer types must match the real export
+
+**Date:** 2026-08-11T02:35:00Z
+**By:** Pris (tester)
+
+An `extern "C"` function-pointer type alias in a test **must** exactly match the
+signature of the corresponding `#[unsafe(no_mangle)] pub unsafe extern "C" fn`
+in `src/`. A mismatch (e.g. declaring `-> *mut OrtStatus` when the export
+returns `void`) is **undefined behaviour**: the test reads whatever happens to
+sit in the return register. This can pass on one ABI (x86-64 Linux) and fail on
+another (arm64 macOS / Windows ARM64), making the bug invisible on CI until a
+new platform lane is added.
+
+**Rule:** when changing an exported C function's return type, grep every test
+file for the old type alias and update it in the same commit.

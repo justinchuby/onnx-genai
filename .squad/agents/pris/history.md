@@ -566,3 +566,29 @@ cascading `PoisonError` failures in unrelated tests.
 
 **Validation:** 17/17 ORT e2e, 6/6 ABI, 30 nxrt-abi, 4+10 nxrt-host — all green.
 Clippy clean, fmt clean.
+
+## 2026-08-11 — ReleaseEpFactory UB fix + portable L1 symbol tests
+
+**Context:** Three non-Linux CI lanes (Windows ARM64, Windows, macOS arm64)
+all failed `dlopen_and_create_factory` in `plugin_export_abi.rs`. Root cause:
+the test declared `ReleaseEpFactory` as returning `*mut OrtStatus` but the real
+export returns `void`. Calling a void function through a status-returning
+pointer is UB — on x86-64 Linux the garbage in RAX happened to be null (pass),
+on arm64 it was non-null (fail).
+
+**Changes:**
+1. Fixed `ReleaseEpFactory` type alias to `fn(*mut OrtEpFactory)` (no return).
+   Removed the status assertion — there is no status to check.
+2. Audited all other `extern "C"` fn-pointer types in test files:
+   - `CreateEpFactories` (line 62): correct (`-> *mut OrtStatus`), matches export.
+   - `CreateFn` (line 624): correct, same as above.
+   - `GetApiBaseFn` in `plugin_ort_e2e.rs` (line 120): correct (`-> *const OrtApiBase`).
+   No other mismatches found.
+3. Replaced ELF-only `l1_nm_exported_symbols` and `l1_readelf_dyn_syms` with:
+   - `l1_required_symbols_resolve`: portable (libloading/dlsym), runs on all platforms.
+   - `l1_no_symbol_leakage`: Linux-only `nm --dynamic` check, skips with message elsewhere.
+
+**Verified on Linux:** 6/6 ABI tests green, 17/17 ORT e2e green, ep-plugin 154+9,
+clippy clean, fmt clean.
+**CI must confirm:** macOS arm64, Windows, Windows ARM64 — these could not be
+tested locally.
