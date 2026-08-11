@@ -33,6 +33,35 @@ The ORT 1.28 capi directory was combined with CUDA 12.9 libraries because ORT's 
 
 Throughput is steady-state decode after skipping the first 8 generated tokens, matching `profile_native`'s default steady window.
 
+## Follow-up: ORT-GenAI direct parity lock
+
+Harry's review caught that Config C needed a stronger proof that it was running the same greedy decode contract as Config B.  I reran Config C with pre-tokenized raw prompt IDs (`Hello` -> `[9707]`), no chat template, and explicit greedy/no-penalty search options:
+
+```text
+do_sample=False
+temperature=0.0
+top_k=1
+top_p=1.0
+repetition_penalty=1.0
+num_beams=1
+```
+
+I also probed `past_present_share_buffer=False` for DeepSeek; it did not change the sequence.
+
+The ORT-GenAI API confirmed the effective options, e.g.:
+
+```text
+search_options: {... 'do_sample': False, 'repetition_penalty': 1.0, 'temperature': 0.0, 'top_k': 1.0, 'top_p': 1.0}
+prompt_token_ids: [9707]
+```
+
+Parity-locked Config C results:
+
+| Model | A native CUDA EP | B ORT backend | C ORT-GenAI direct, parity-locked | Native vs C | New token parity verdict |
+|---|---:|---:|---:|---:|---|
+| Qwen2.5-0.5B int4 | 559.03 tok/s (1.789 ms/tok) | 101.43 tok/s (9.859 ms/tok) | 227.32 tok/s (4.399 ms/tok) | **2.46x faster** | B=C exact for 128 generated tokens. A diverges from B/C at token index 68 (`2213` vs `8794`). |
+| DeepSeek-R1-Distill-Qwen-1.5B int4 | 593.36 tok/s (1.685 ms/tok) | 226.06 tok/s (4.424 ms/tok) | 485.03 tok/s (2.062 ms/tok) | **1.22x faster** | C still diverges from both A and B at token index 10 (`25` vs `11`), while A and B agree until index 31 (`22756` vs `21495`). This is not sampling or chat-template drift: the run used raw prompt IDs and confirmed greedy/no-penalty options. Probed `past_present_share_buffer=False`, `top_k=0`, and BOS/prompt variants; none matched B. Remaining likely cause is an ORT-GenAI host/runtime path difference for this DeepSeek/Qwen artifact (KV/position/feed semantics or graph/session handling), despite both paths using ORT 1.28. |
+
 ## Section 1: apples-to-apples steady-state decode
 
 Local artifact search found usable CUDA/int4 ONNX artifacts for Qwen2.5-0.5B and DeepSeek-R1-Distill-Qwen-1.5B only.  Qwen2.5-1.5B, Phi-4-mini, and Qwen2.5/Qwen 7B were skipped: local search found HF caches and Olive recipes/QNN configs, but no CUDA ONNX int4 artifact directory with `model.onnx` + tokenizer suitable for these three configs.
@@ -78,16 +107,31 @@ Capability probes used shorter runs (`--warmups 0 --runs 1 --tokens 16 --decode-
 
 | Model | Artifact | A native CUDA EP | B ORT backend (ORT 1.28) | C ORT-GenAI direct |
 |---|---|---|---|---|
-| Qwen3.6-35B-A3B QMoE | `/home/justinchu/qwen36-35b-a3b-qmoe-artifacts` (`--pipeline`) | **Runs**: 90.20 tok/s in short probe; generated 16 tokens. | **Crashes at load**: `Type parameter (T) of Optype (QMoE) bound to different types (tensor(float16) and tensor(float) in node (moe.layer0.qmoe)`. | **Not runnable from this artifact**: `Error opening .../genai_config.json`. Local Olive-recipes contains a Qwen3.5-35B-A3B recipe, but this artifact does not include an ORT-GenAI `genai_config.json`. |
+| Qwen3.6-35B-A3B QMoE | `/home/justinchu/qwen36-35b-a3b-qmoe-artifacts` (`--pipeline`) | **Runs**: 90.20 tok/s in short probe; generated 16 tokens. | **Crashes at load**: `Type parameter (T) of Optype (QMoE) bound to different types (tensor(float16) and tensor(float) in node (moe.layer0.qmoe)`. | Initially missing `genai_config.json`; generated text-only config also fails at ONNX load with the same QMoE type-binding error (details below). |
 | GLM-4-9B int4 | `/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda` | **Unsupported native load**: model needs unsupported native operators. | **Crashes at load**: `Unrecognized attribute: rotary_embedding_dim for operator GroupQueryAttention`. | **Not runnable from this artifact**: missing `genai_config.json`. |
 | DeepSeek-V2-Lite QMoE int4 | `/home/justinchu/ds-e2e-artifacts/deepseek-v2-lite-real-int4` | **Unsupported native load**: model needs unsupported native operators. | **Timed out** after 600 s after ORT session/backend selection; no token generated. | **Not runnable from this artifact**: missing `genai_config.json`. |
 | Qwen3.6-27B int4 | `/home/justinchu/mary-models/qwen3.6-27b-int4-cuda` | **Unsupported native load**: model needs unsupported native operators. | **Loads, then generation setup fails**: `cannot resolve model.io.token_input ... 3 ports match: input_ids, attention_mask, position_ids; declare the exact graph port`. | **Not runnable from this artifact**: missing `genai_config.json`. |
 
+### 35B-A3B ORT-GenAI direct follow-up
+
+The root 35B-A3B artifact still has no `genai_config.json`, so I generated a scratch ORT-GenAI config against the available `merged/model.onnx` using the local HF Qwen3.6-35B-A3B config and the ORT-GenAI model type string present in the installed wheel:
+
+- `model.type = qwen3_5_moe` first proved this is a multimodal/package model type and is not valid for the text-only merged ONNX: `The model path is a directory. Loading a model package from a directory path is not supported.`
+- `model.type = qwen3_5_moe_text` reached ONNX session load and failed with the same ORT 1.28 QMoE type-binding error as Config B:
+
+```text
+RuntimeError: Load model from .bench/og35/model.onnx failed:
+Type Error: Type parameter (T) of Optype (QMoE) bound to different types
+(tensor(float16) and tensor(float) in node (moe.layer0.qmoe).
+```
+
+Verdict: with the available 35B-A3B ONNX artifact, ORT-GenAI direct does **not** bypass the QMoE type-binding failure.  The installed ORT-GenAI package contains Qwen3.5/Qwen3.5-MoE builder support, but running the full Olive export would be a separate long conversion/export job rather than a direct test of the current artifact.  For the current artifact, native CUDA EP remains the only tested runtime path that loads and generates.
+
 ## Headline
 
-For the two locally available Section-1 artifacts, native CUDA EP beats ORT-GenAI direct's full-stack ceiling under greedy decode:
+For the two locally available Section-1 artifacts, native CUDA EP beats ORT-GenAI direct's full-stack ceiling under parity-locked greedy decode:
 
-- Qwen2.5-0.5B: **557.57 vs 203.22 tok/s** (**2.74x faster**) with token caveat: native diverges from ORT after token 68; ORT backend and ORT-GenAI direct match exactly.
-- DeepSeek-R1-Distill-Qwen-1.5B: **599.49 vs 487.26 tok/s** (**1.23x faster**) with token caveat: all three streams eventually diverge; C diverges earliest at token 10.
+- Qwen2.5-0.5B: **559.03 vs 227.32 tok/s** (**2.46x faster**) with token caveat: native diverges from ORT after token 68; ORT backend and ORT-GenAI direct match exactly.
+- DeepSeek-R1-Distill-Qwen-1.5B: **593.36 vs 485.03 tok/s** (**1.22x faster**) with token caveat: ORT-GenAI direct still diverges from both engine paths at token 10 even with raw prompt IDs and explicit greedy/no-penalty options.
 
-Capability check: ORT 1.28 did **not** make the 35B-A3B QMoE artifact runnable through ORT backend; it still fails QMoE type binding at load.  ORT-GenAI direct could not be evaluated on 35B-A3B from the available artifact because no `genai_config.json` was present.
+Capability check: ORT 1.28 did **not** make the 35B-A3B QMoE artifact runnable through ORT backend; it still fails QMoE type binding at load.  A generated text-only ORT-GenAI config reaches the same QMoE type-binding failure, so ORT-GenAI direct does not currently run the available 35B-A3B artifact either.
