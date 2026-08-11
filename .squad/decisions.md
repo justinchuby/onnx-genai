@@ -284,3 +284,36 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 - **A clean control PR is the cheapest way to separate infra from code.** PR #31985 — one line, docs-only, same `main` — reached 86/86 green while ours were red, both refuting and confirming flakiness faster than log-reading alone.
 - **Apple/arm64 fork-PR jobs fail frequently at dependency download** (cpuinfo, XNNPACK, eigen3, protoc), always before compilation. `gh run rerun` refuses fork-PR jobs; only retrigger available is a push.
 - **Reviewer lockout held:** Iran and Pris were barred from fixing the persona-name comments they authored; Chew did it.
+
+## Current active wave — 2026-08-12 (CUDA MatMulNBits upstream workstream)
+
+### Upstream ORT PR #31988 — SM-count-adaptive columns-per-CTA for M=1 MatMulNBits
+
+**By:** Cohaagen (audit + implementation), Sebastian (initial review), Chew (routing guard + lockout revision), Gaff (fresh review), Coordinator (clang-format fix, commit 186b89604c)
+
+**PR:** microsoft/onnxruntime#31988 — open as **draft**, no GPU benchmarks, low-SM evidence gap explicitly disclosed.
+
+**Status:** Keep draft until GPU benchmarks are gathered on ≥2 GPU generations.
+
+**What was done:**
+- Confirmed upstream hardcodes `kColsPerThreadBlock = 8` in `matmul_4bits_m1_impl.cuh:135`; no SM-count adaptation exists in any GEMV path.
+- `SelectColsPerBlock(n, sm_count)` → 8/4/2 templated on `cols_per_block`. Bit-identical: per-column warp reduction is invariant to CTA width.
+- Guard: `n % kColsPerThreadBlock != 0 → return false` preserves upstream's exact accepted-shape set (n%8==0). Chew confirmed Sebastian's "SAFE" on the n%8≠0 path was wrong — `n=12` would have been newly accepted, changing shape routing.
+- Tests: `SelectColsPerBlock_OnlyMod8Accepted` and `SelectColsPerBlock_RoutingInvariance_NMod8Required` pin the routing invariant exhaustively.
+- Template cost: 24 → 72 instantiations (~38 KB), all reachable, documented in PR.
+
+**Performance claims: NONE published.** The "+2.08% on 3 GPUs" claim from an earlier explore pass had no benchmark record, no 3-GPU record, and no low-SM data in this repo. It was kept out of the PR entirely.
+
+**CPU AMX QNBit prefill: no PR.** This host is AMD EPYC 9V74 — no AMX, no VNNI — so the AMX-vs-VNNI comparison cannot be run. No PR without a measured win.
+
+**Split-K: deliberately excluded.** Changes reduction association (not byte-identical); 2-way split-K regressed 7B `o_proj` GEMV by −0.59%.
+
+**Key reviewer lockout:** Cohaagen (author) and Sebastian (reviewer) both barred from the routing-guard revision; Chew revised; Gaff reviewed fresh.
+
+### Durable lessons from this workstream
+
+- **Audit provenance before publishing any performance claim.** "+2.08% on 3 GPUs" had no benchmark record, no 3-GPU record and no low-SM data anywhere in this repo. It was kept out of PR #31988 entirely. If the raw data exists outside the repo it must be supplied and recorded before publication.
+- **A reviewer's "SAFE" is not proof.** Sebastian cleared the `n % 8 != 0` path; the coordinator's own reading found `n = 12` would have been newly accepted, changing shape routing. Chew confirmed and guarded it. Verify reviewer conclusions on the load-bearing claim.
+- **An occupancy change must not become a routing change.** Selecting 4 or 2 columns per CTA silently widened the accepted-shape set. Pin the accepted set with an exhaustive test so it cannot drift.
+- **Hardware absence is a legitimate stop.** No GPU and no AMX on this host (AMD EPYC 9V74), so CUDA numbers cannot be measured and the AMX-vs-VNNI comparison cannot be run — hence no AMX PR.
+- **Reviewer lockout held:** Cohaagen (author) and Sebastian (reviewer) were both barred from the revision; Chew did it; Gaff reviewed fresh.

@@ -43,3 +43,29 @@ Full pre-compaction history in `history-archive.md`.
 **Outcome:** BL1 fix genuine. Challenger's review found residual `filter_map(|d| d.as_static())` at claim time in ep.rs still destroyed rank at two sites. Coco fixed.
 
 **Lesson reinforced:** filter_map is wrong wherever position or rank is load-bearing; use map → Vec<Option<usize>>.
+
+---
+
+### 2026-08-11 — Adversarial review of onnxruntime #31988 (CUDA MatMulNBits SM-adaptive cols)
+
+**Task:** Read-only rubber-duck review of draft PR adding `SelectColsPerBlock(n, sm_count)` to M=1 GEMV path.
+
+**Findings:**
+- Bit-identicality: **confirmed** by kernel trace — per-column reduction invariant to CTA width.
+- Wide-n invariance: **confirmed** — threshold arithmetic sound, no boundary regression.
+- No OOB risk (divisibility gate guards all paths).
+- 3× template instantiation cost — flagged as BLOCKING for PR description.
+- No perf data, no leaked internals — clean.
+- Recommended PR exist as draft with methodology section.
+
+**Output:** `.squad/decisions/inbox/sebastian-review-31988.md`
+
+## 2026-08-12 — PR #31988 review (adversarial, read-only)
+
+- Confirmed bit-identicality by kernel trace.
+- Confirmed wide-n invariance.
+- Flagged template instantiation cost (24 → 72) as BLOCKING for PR description — this was a correct finding.
+- Declared `n % 8 != 0` path "SAFE" — **this was wrong.** `n=12` with `SelectColsPerBlock` returning 4 would have been newly accepted by the M=1 GEMV, changing shape routing.
+- Also claimed benchmark methodology was missing — this was incorrect; it was present in the PR body.
+- Barred from revision under reviewer lockout. Chew revised and confirmed the routing concern was real.
+- Lesson: a reviewer's "SAFE" is not proof; verify the load-bearing claim independently.
