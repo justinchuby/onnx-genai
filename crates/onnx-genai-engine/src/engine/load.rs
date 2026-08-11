@@ -1096,9 +1096,11 @@ fn native_kv_reservation_max_context(
     native_capacity: Option<(usize, String)>,
     metadata_max_len: Option<usize>,
 ) -> Option<(usize, String)> {
-    native_capacity.or_else(|| {
-        metadata_max_len.map(|max_len| (max_len, "model.max_sequence_length".to_owned()))
-    })
+    native_capacity
+        .filter(|(max_len, _)| *max_len != usize::MAX)
+        .or_else(|| {
+            metadata_max_len.map(|max_len| (max_len, "model.max_sequence_length".to_owned()))
+        })
 }
 
 /// The temporary startup reservation, given the package size and offload budget.
@@ -2129,6 +2131,26 @@ mod pool_sizing_tests {
     fn native_kv_reservation_falls_back_to_metadata() {
         let (max_len, source) = native_kv_reservation_max_context(None, Some(131_072))
             .expect("metadata capacity should be available");
+
+        assert_eq!(max_len, 131_072);
+        assert_eq!(source, "model.max_sequence_length");
+    }
+
+    #[test]
+    fn native_kv_reservation_ignores_unbounded_runtime_capacity_without_metadata() {
+        assert_eq!(
+            native_kv_reservation_max_context(Some((usize::MAX, "unbounded".into())), None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_kv_reservation_uses_metadata_after_unbounded_runtime_capacity() {
+        let (max_len, source) = native_kv_reservation_max_context(
+            Some((usize::MAX, "unbounded".into())),
+            Some(131_072),
+        )
+        .expect("metadata capacity should be available");
 
         assert_eq!(max_len, 131_072);
         assert_eq!(source, "model.max_sequence_length");
