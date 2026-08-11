@@ -38,6 +38,17 @@
 
 - Fixed `export_ep_factories!` macro: `ReleaseEpFactory` now returns `*mut OrtStatus` per `onnxruntime_ep_c_api.h:2669`, not `void`.
 - Caught panics now surface as error `OrtStatus` instead of being silently swallowed.
+
+## 2026-08-11 — CUDA plugin: resolve all four B4 implementation defects
+
+Resolved the four implementation defects from the B4 rubber-duck review:
+
+1. **Shared EP**: Added `ExportedFactory::shared_ep` (`Arc<Mutex<..>>`) so allocator, stream, and data transfer share a single `CudaExecutionProvider` and its `CUcontext`/`cudaStream_t`. Components track ownership via `owns_ep` flag.
+2. **CreateDataTransfer**: `factory_create_data_transfer` now creates `DeviceDataTransferFull` for device EPs with ORT API + EP API pointers. `CanCopy` classifies directions via `MemoryDevice_GetDeviceType`.
+3. **GetHandle**: `DeviceSyncStream::stream_handle` returns the real `cudaStream_t` from `CudaRuntime::stream_ptr()`.
+4. **Free size tracking**: `DeviceAllocator::alloc_sizes` (`Mutex<HashMap<usize, usize>>`) tracks allocation sizes across `Alloc`/`Free`.
+
+CPU path unchanged. 9 CUDA plugin tests pass (5 unit + 4 integration). All code compiles with and without `cuda` feature. **Unvalidated on hardware** — #768 tracks GPU validation.
 - Verified `CreateEpFactories` matches header — no second mismatch.
 - CPU and CUDA hand-written shims still return `void` — owners must update (not my files).
 - Told Chew to update ABI test type alias to `-> *mut ort::OrtStatus`.
