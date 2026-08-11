@@ -32,6 +32,7 @@
 //! Skips loudly if ORT or the EP cdylib is absent.
 
 mod cdylib_resolve;
+mod ort_path;
 
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
@@ -220,7 +221,7 @@ fn ort_register_ep_library() {
         check_status(api, status, "CreateEnv");
 
         let reg_name = CString::new("cpu_ep").unwrap();
-        let ep_path_c = CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+        let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
             env,
             reg_name.as_ptr(),
@@ -274,7 +275,7 @@ fn ort_loads_our_ep_and_runs_model() {
 
         // Stage 2: RegisterExecutionProviderLibrary
         let reg_name = CString::new("cpu_ep_e2e").unwrap();
-        let ep_path_c = CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+        let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
             env,
             reg_name.as_ptr(),
@@ -328,7 +329,7 @@ fn ort_loads_our_ep_and_runs_model() {
         eprintln!("✓ Stage 4: EP appended to session options");
 
         // Stage 5: CreateSession
-        let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
+        let model_c = ort_path::OrtPathBuf::new(&model_path);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status =
             ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
@@ -463,7 +464,7 @@ fn ort_unsupported_op_declines_not_crashes() {
         check_status(api, status, "CreateEnv");
 
         let reg_name = CString::new("cpu_ep_neg").unwrap();
-        let ep_path_c = CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+        let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
             env,
             reg_name.as_ptr(),
@@ -508,7 +509,7 @@ fn ort_unsupported_op_declines_not_crashes() {
         check_status(api, status, "SessionOptionsAppendExecutionProvider_V2");
 
         // CreateSession with unsupported-op model: should succeed (ORT falls back to default EP)
-        let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
+        let model_c = ort_path::OrtPathBuf::new(&model_path);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status =
             ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
@@ -671,7 +672,7 @@ unsafe fn conformance_setup(
 
     // Register EP library
     let reg_name_c = std::ffi::CString::new(reg_name).unwrap();
-    let ep_path_c = std::ffi::CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+    let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
     let status = unsafe {
         ((*api).RegisterExecutionProviderLibrary.unwrap())(
             env,
@@ -724,7 +725,7 @@ unsafe fn conformance_setup(
     unsafe { check_status(api, status, "SessionOptionsAppendExecutionProvider_V2") };
 
     // CreateSession
-    let model_c = std::ffi::CString::new(model_path.to_str().unwrap()).unwrap();
+    let model_c = ort_path::OrtPathBuf::new(model_path);
     let mut session: *mut ort::OrtSession = ptr::null_mut();
     let status = unsafe {
         ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session)
@@ -1470,7 +1471,7 @@ fn conformance_two_sessions() {
         check_status(api, status, "CreateEnv");
 
         let reg_name = std::ffi::CString::new("cpu_ep_2sess").unwrap();
-        let ep_path_c = std::ffi::CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+        let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
         let status = ((*api).RegisterExecutionProviderLibrary.unwrap())(
             env,
             reg_name.as_ptr(),
@@ -1512,7 +1513,7 @@ fn conformance_two_sessions() {
             0,
         );
         check_status(api, status, "AppendEP(A)");
-        let model_a_c = std::ffi::CString::new(model_a.to_str().unwrap()).unwrap();
+        let model_a_c = ort_path::OrtPathBuf::new(&model_a);
         let mut sess_a: *mut ort::OrtSession = ptr::null_mut();
         let status = ((*api).CreateSession.unwrap())(env, model_a_c.as_ptr(), opts_a, &mut sess_a);
         check_status(api, status, "CreateSession(A)");
@@ -1532,7 +1533,7 @@ fn conformance_two_sessions() {
             0,
         );
         check_status(api, status, "AppendEP(B)");
-        let model_b_c = std::ffi::CString::new(model_b.to_str().unwrap()).unwrap();
+        let model_b_c = ort_path::OrtPathBuf::new(&model_b);
         let mut sess_b: *mut ort::OrtSession = ptr::null_mut();
         let status = ((*api).CreateSession.unwrap())(env, model_b_c.as_ptr(), opts_b, &mut sess_b);
         check_status(api, status, "CreateSession(B)");
@@ -1751,7 +1752,7 @@ fn stress_register_run_unregister_cycles() {
     // Keep the library loaded for the whole test — dlopen reference-counts.
     let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
     let api = unsafe { get_ort_api(&lib) };
-    let ep_path_c = CString::new(ep_lib_path.to_str().unwrap()).unwrap();
+    let ep_path_c = ort_path::OrtPathBuf::new(&ep_lib_path);
 
     const CYCLES: usize = 25;
     for cycle in 0..CYCLES {
@@ -1812,7 +1813,7 @@ fn stress_register_run_unregister_cycles() {
                 0,
             );
             check_status(api, status, &format!("AppendEP[{cycle}]"));
-            let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
+            let model_c = ort_path::OrtPathBuf::new(&model_path);
             let mut session: *mut ort::OrtSession = ptr::null_mut();
             let status =
                 ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), sess_opts, &mut session);

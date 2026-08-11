@@ -509,3 +509,41 @@ false positive from a stale artifact.
 - `cargo test -p onnx-runtime-ep-plugin` → 154+9; `-p onnx-runtime-ep-nxrt-abi` → 30; `-p onnx-runtime-ep-nxrt-host` → 4+10.
 - `RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets -p onnx-runtime-ep-cpu-plugin` → clean.
 - `cargo fmt --all -- --check` → clean.
+
+---
+
+## 2026-08-11T01:55:00Z — ORTCHAR_T portability fix for Windows
+
+**Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
+
+### Problem
+ORT e2e tests used `CString` for all path arguments, producing `*const i8`.
+On Windows, ORT expects `*const u16` (UTF-16 `wchar_t`) for `ORTCHAR_T*` parameters.
+12 `E0308` type errors on `Rust (Windows ARM64)` CI lane.
+
+### Fix
+Created `crates/onnx-runtime-ep-cpu-plugin/tests/ort_path.rs`:
+- `OrtPathBuf::new(path)` — `#[cfg(windows)]` encodes to NUL-terminated UTF-16 `Vec<u16>`,
+  `#[cfg(not(windows))]` wraps in `CString`.
+- `as_ptr()` returns the platform-correct pointer type.
+- Accepts `impl AsRef<Path>`, owns the buffer (no dangling pointer risk).
+
+### Call sites changed (12 total in `plugin_ort_e2e.rs`)
+- `RegisterExecutionProviderLibrary` path arg: lines 224, 278, 467, 675, 1474, 1755
+- `CreateSession` model_path arg: lines 332, 512, 728, 1516, 1536, 1816
+
+### Audit
+- No other test files pass paths into ORT APIs via CString.
+- nxrt tests use `libloading` which takes `OsStr` — already portable.
+- `plugin_export_abi.rs` loads via `libloading::Library::new` — already portable.
+
+### Verification
+- Windows cross-check (`cargo check --target x86_64-pc-windows-msvc --tests`) failed at
+  `bindgen` (missing Windows SDK `stdlib.h` on Linux host). **Windows compilation unverified
+  locally — CI must confirm.**
+- Code is type-correct by construction: `#[cfg(windows)]` branch returns `*const u16`,
+  `#[cfg(not(windows))]` returns `*const c_char`.
+- Linux: `cargo test -p onnx-runtime-ep-cpu-plugin` → 6 unit + 17 integration = 23 passed.
+- Clippy: clean (`RUSTFLAGS="-D warnings"`).
+- `cargo fmt --all -- --check`: clean.
+- No regressions: ep-plugin 154+9, nxrt-abi 30, nxrt-host 4+10.

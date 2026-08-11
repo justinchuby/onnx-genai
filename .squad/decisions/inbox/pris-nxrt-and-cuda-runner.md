@@ -133,3 +133,29 @@ delegate to the shared helper, eliminating the duplicated hardcoded logic.
 - Use platform-appropriate library extensions
 - Auto-build when absent and fail loudly if the build itself fails
 - Never rely on stale artifacts from prior manual builds
+
+---
+
+## Update 2026-08-11T01:55:00Z — ORTCHAR_T portability rule
+
+### Problem
+
+ORT's path-taking APIs (`CreateSession`, `RegisterExecutionProviderLibrary`) accept
+`ORTCHAR_T*`, which is `wchar_t` (`*const u16`, NUL-terminated UTF-16) on Windows
+and `char` (`*const c_char`) on Unix. The e2e tests used `CString` everywhere,
+which produces `*const i8` — correct on Unix, `E0308` on Windows. Twelve type errors
+on any Windows target.
+
+### Rule
+
+**Every test passing a filesystem path to an ORT `ORTCHAR_T*` parameter MUST use
+`ort_path::OrtPathBuf`** (lives in `crates/onnx-runtime-ep-cpu-plugin/tests/ort_path.rs`).
+The helper:
+- Windows `#[cfg]`: encodes via `OsStrExt::encode_wide`, appends NUL, returns `*const u16`
+- Unix `#[cfg]`: wraps in `CString`, returns `*const c_char`
+- Accepts `impl AsRef<Path>` so both `Path` and `PathBuf` work without `&` gymnastics
+- Owns the buffer — caller must bind to a local that outlives the FFI call
+
+**Do NOT use `CString` for ORT path arguments.** `CString` is correct only for
+non-path arguments like `logid` and `registration_name` which are `*const c_char`
+on all platforms.
