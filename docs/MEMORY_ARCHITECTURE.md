@@ -154,20 +154,20 @@ than copying conclusions, following the anti-staleness rule established in
 
 **Status, as of 2026-08-11:**
 
-- **Implemented:** head-major BNSH remains the default. PR #782 added a
-  per-backend `KvLayout` tag (default `HeadMajorBnsh`) and landed the
-  seq-major BSNH fused fp16 single-token decode append/read pair. Seq-major is
-  hard-gated to those converted paths; unsupported readers and writers fail
-  rather than silently mis-index. It is not yet an end-to-end layout for every
-  attention path.
+- **Implemented:** head-major BNSH remains the default. PR #782 landed the
+  seq-major BSNH fused fp16 single-token decode append/read pair, and #792
+  replaced its layout enum with a symbolic stride descriptor and static
+  per-layout NVRTC specialization. Flash prefill now uses the same descriptor
+  for cache preparation and reads, enabling full seq-major prefill + fp16
+  decode generations when the fused-flash shape gate applies. Unsupported
+  readers and writers still fail rather than silently mis-index.
 - **Measured, not implemented:** token-major across all layers. Its residency
   floor and 192 KiB-stride read cost were measured in #787, but no production
   kernel or binding layout uses it.
-- **Proposed, in progress:** replace the growing layout enum with a stride
-  descriptor and make layout selection a per-EP, per-platform capability
-  (#783). The descriptor, binding views, layout negotiation, prefix multi-map,
-  staggering, and commit-ahead policy described below are design intent, not
-  present-tense capabilities.
+- **Proposed, in progress:** make layout selection a per-EP, per-platform
+  capability (#783). Binding views, layout negotiation, prefix multi-map,
+  staggering, and commit-ahead policy described below remain design intent,
+  not present-tense capabilities.
 
 #### Governing rule: layout controls residency
 

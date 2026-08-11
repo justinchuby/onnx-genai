@@ -52,7 +52,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
-use crate::kernels::kv_stride::KvCacheStrides;
+use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
 use crate::runtime::CudaRuntime;
 
 const ENTRY: &str = "gqa_decode_attention_f16";
@@ -408,7 +408,7 @@ pub(super) fn run(
     kv_strides: &KvCacheStrides,
 ) -> Result<()> {
     runtime.require_nvrtc_half_headers("gqa_decode_attention_f16")?;
-    kv_strides.require_converted_path_support()?;
+    kv_strides.require_converted_path_support(KvCachePath::Fp16DecodeRead)?;
     let module_key = kv_strides.decode_module_key()?;
     let decode_src = format!("{}{}", kv_strides.decode_prelude(), DECODE_SRC);
 

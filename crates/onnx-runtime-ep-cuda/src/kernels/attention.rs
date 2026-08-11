@@ -70,6 +70,7 @@ use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};
+use crate::kernels::kv_stride::KvCacheStrides;
 use crate::runtime::{CudaRuntime, cuptr};
 
 use super::flash_attention;
@@ -733,6 +734,7 @@ impl AttentionKernel {
                 0,
                 0,
                 0.0,
+                &KvCacheStrides::head_major_bnsh(),
             )
         } else {
             // Carve the governed scratch from the executor-prepared workspace
