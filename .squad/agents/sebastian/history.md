@@ -19,4 +19,6 @@
 - 2026-07-28: Pointwise Conv microbench diagnosis was useful, but the initial 5.7–9.8× BNNS headline overstated real impact.
 - 2026-07-28T17:40:00+0000: PR #362 merged (`5a079029`): If/Loop/Scan inference landed; #355 container typing remains deferred.
 
+- 2026-08-11T00:09:00+0000: Wrote `docs/UPSTREAM_ORT_CONTRIB_METHODOLOGY.md` — validation protocol for upstream ORT kernel contributions (reachability, numeric parity, model-level benchmarks, same-artifact methodology). No code; methodology only. Verified upstream ORT requirements from CONTRIBUTING.md and PR_Guidelines.md.
+
 Full pre-compaction history in `history-archive.md`.

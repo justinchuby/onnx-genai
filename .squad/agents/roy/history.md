@@ -30,4 +30,11 @@
 ### 2026-07-28T17:40:00+0000
 Large-model recon documented 27B runtime and GPU-capacity blockers; Granite unfused MoE does not engage offload.
 
+### 2026-08-11T00:09:00+0000 — Upstream ORT contribution plan (planning only)
+
+- Wrote `docs/UPSTREAM_ORT_CONTRIB_PLAN.md`: concrete entry gate (4 checkable conditions), routing table, per-contribution workflow, sequencing (CPU-first pilot → parallel CPU → gated CUDA), risks, and decision points for Justin.
+- Verified upstream requirements from `microsoft/onnxruntime` CONTRIBUTING.md, PR_Guidelines.md, Coding_Conventions_and_Standards.md: CLA, unit tests, Google C++ style, small PRs, lintrunner, perf measurement docs.
+- Filed decision inbox: `roy-upstream-contrib-phase-queued.md`.
+- NO CODE WRITTEN. No fork, no upstream PR, no branch ops.
+
 Full pre-compaction history in `history-archive.md`.

@@ -55,3 +55,19 @@ Inbox drop `batty-reasoning-fixture-revision.md` was lost when the worktree was 
 before Scribe ran; content reconstructed into `.squad/decisions.md`.
 
 Full pre-compaction history in `history-archive.md`.
+
+### 2026-08-11 — Upstream ORT CUDA kernel gap analysis
+
+Delivered `docs/UPSTREAM_ORT_CUDA_KERNEL_GAPS.md`: inventory of 16 nxrt CUDA
+optimizations compared against upstream ORT's CUDA EP via GitHub code/issue search.
+
+Key findings:
+- 5 kernel-level candidates are upstreamable (MatMulNBits block-128 GEMV, SM-fill
+  grid tuning, GQA decode split-K, QMoE parallel routing, accuracy_level=4 GEMV).
+- 6 features are runtime-level (CUDA graph system, VMM paging, tiered KV, CSA, GGUF
+  MoE, device argmax loop) and cannot be ported without ORT architecture changes.
+- Top candidate: MatMulNBits int4 block-128 GEMV — addresses ORT issue #23004,
+  measured +36–60% on H200 for 0.5B–1.5B int4 models.
+- Analysis-only; no implementation until EP-compatibility milestone is stable.
+
+Inbox drop: `batty-upstream-cuda-gaps.md`.

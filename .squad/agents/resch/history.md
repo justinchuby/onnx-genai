@@ -30,3 +30,13 @@ Created `dispatch_manifest.toml` plus `scripts/check_dispatch_manifest.py`: decl
 Backfilled PR #324 claims (MaxPool→BNNS, Add→vDSP, MatMul f16 colmaj→NEON GEMV), added dilated MaxPool and BatchNorm fusion exclusions, and implemented inverse checking so any optimization counter without a manifest row fails CI. Fixed the AtomicU64 blind spot in both reachability and manifest lints. BatchNorm was documented as graph-level fusion elimination, not a dispatch-tier claim. Guard-breaks failed as intended; 973 CPU EP tests, 4 lints, and fmt were green.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-11 — Upstream ORT CPU kernel gap analysis
+
+Completed evidence-backed inventory and gap analysis comparing our CPU EP kernels against upstream `microsoft/onnxruntime`. Used GitHub code search to verify upstream file presence/absence and open issues.
+
+**Top candidates:** (1) f16/bf16 x86 GEMM — upstream has zero x86 support, two open issues requesting it; (2) GatherBlockQuantized CPU — upstream has CUDA/WebGPU/JS but no CPU kernel; (3) AVX-512 activation quantizer — possible vectorization gap in MLAS; (4) Flash-decoding split-KV for CPU GQA — novel technique likely absent; (5) SIMD RMSNorm.
+
+**Key non-candidates:** BlockQuantizedMatMul (pkg.nxrt domain), QMoE offload (coupled to our mmap infra), bounded decode pool (policy not kernel), x86 SGEMM (MLAS already better).
+
+Deliverable: `docs/UPSTREAM_ORT_CPU_KERNEL_GAPS.md`. No code written, no upstream PRs opened.
