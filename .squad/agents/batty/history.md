@@ -133,3 +133,13 @@ using `MemoryDevice_GetDeviceId` for device-id comparison when pointer equality
 fails. Same-device D2D accepted; cross-device fails closed. 6 new tests, all
 non-vacuous. CPU path unaffected. Compiles and type-checks; unvalidated on
 hardware (blocked on #768).
+
+## 2026-08-11 — ARM64 CI diagnosis + B2 fix under lockout
+
+**ARM64 Debug CI diagnosis (#31973):** Build to [1452/1458] with no errors; 29s silence then cleanup. OOM hypothesis: 6 parallel large Debug link targets, 32GB runner, cold ccache. No code bug. Confirmed flake on re-run.
+
+**B2 fix (commit `fb9d757b3`):** `is_same_device()` in `transfer.rs` using `MemoryDevice_GetDeviceId` (verified present in ORT 1.27 `bindings.rs:6309`). Fast path: pointer equality. Null guard: fail-closed. `None` runtime: fail-closed. 6 unit tests; 161+9 tests pass.
+
+**Output dtype B1 / LayerNorm shape:** `output_dtypes: Vec<DataType>` per-output. `ShapeInference::LayerNorm { axis, num_outputs, full_shape_outputs }` — output 0 full shape, 1+ reduced. Negative axis handled. All five norm ops covered.
+
+**CUDA upstream audit:** Both candidates (MatMulNBits int4 block-128 GEMV, QMoE parallel routing) already covered by upstream ORT `main`. No portable gap. Not ready for upstream PR.

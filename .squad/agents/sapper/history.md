@@ -68,3 +68,12 @@ Full pre-compaction history in `history-archive.md`.
 
 - **B2:** Hand-edited `docs/OperatorKernels.md` in `/workspace/upstream/ort-bf16` to add `tensor(bfloat16)` to 5 CPU EP kernel entries. Generator script requires built Python bindings — impractical. Diff: 5 ins / 5 del, zero unrelated churn. U constraint for contrib LayerNorm/SimplifiedLayerNorm updated per current code (N1-dependent — may need revert if Iran rolls back MLFloat16 U=float).
 - **B3:** Swept full branch diff for internal leakage. Only hits are 4 persona references in test files (Luv's domain, already flagged). No leakage in `onnxruntime/core/**`, `onnxruntime/contrib_ops/**`, or `docs/**`. No upstream repo policy changed.
+
+## 2026-08-11 — CUDA B4 defects (claimed fixed; REJECTED by Gaff)
+
+Claimed all four CUDA B4 defects fixed in commits `2ca515eb7`, `f750fe145`, `7aba5cb93`. Gaff's independent review found three blockers:
+- B1: Use-after-free — raw pointer extracted from `MutexGuard` dangling after guard dropped.
+- B2: Pointer equality on opaque `OrtMemoryDevice*` — functional failure for same-GPU D2D.
+- B3: `CopyTensors` not classifying direction — host pointers passed to `cudaMemcpyDeviceToDevice`.
+
+Under reviewer lockout. Nabil assigned B1/B3/S4; Batty assigned B2.

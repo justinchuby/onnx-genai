@@ -53,3 +53,19 @@ Full pre-compaction history in original `history.md` before 2026-07-29 compactio
 ## 2026-08-10 — Clippy lint ep.rs:499 (manual_dangling_ptr)
 
 - Replaced `1usize as *mut ort::OrtEp` with `std::ptr::dangling_mut()`. 82 unit tests, 21 conformance tests pass.
+
+---
+
+## Archive batch 2026-08-10 (ep-plugin-export/parity-cuda wave)
+
+### 2026-08-10 — GetKernelRegistry + NEW-2 Compile cleanup
+NEW-2: `ep_compile_inner` frees/nulls `out_infos[0..i]` on mid-loop failure. `GetKernelRegistry` infrastructure: full ORT 1.24+ kernel-registry machinery. `ExportedEp` holds optional `OrtKernelRegistry*` from `KernelRegistryEntry` slices. f16/bf16 blocker for Pris: `ExecutionProvider` trait lacks `op_entries()` iterator. 120 lib tests pass.
+
+### 2026-08-10 — f16/bf16 kernel-registry entries wired end-to-end
+Blocker resolved: CPU EP plugin passes `KernelRegistryEntry` slices to `create_ep_factories_with_registry`. `build_cpu_registry_with_descriptors` as inherent function (not trait method) avoids circular dep. f16/bf16 advertised for standard ML ops. 127 ep-plugin tests, 21 cpu-plugin tests all pass.
+
+### 2026-08-10 — Dtype-aware GetCapability claim predicate
+`ep_get_capability_inner` now applies `node_passes_dtype_filter()`. Single source of truth (same descriptors as GetKernelRegistry). Fail-closed: reject if no registry entry, Undefined dtype, or dtype not in set. 5 new unit tests. 132 ep-plugin, 23 cpu-plugin tests pass. Clippy clean.
+
+### 2026-08-10 — needless_borrow clippy fixes in ep.rs test helper
+Two `&` removed from `graph_with_node` test helper (`ep.rs:1041,1047`). Assertion sanity check: all five `node_passes_dtype_filter` sites verified non-vacuous. 132 passed. `conformance_add_float16` and `conformance_add_bfloat16` pass.

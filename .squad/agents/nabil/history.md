@@ -67,3 +67,13 @@ Took ownership after Gaff rejected Sapper's CUDA EP commits on #762 (reviewer lo
 Also fixed: S1 (unknown ptr no-op), S2 (no `.unwrap()` across FFI), S3 (CreateEp uses shared_ep), N2 (vendor_id from config). Deferred B2 (pointer equality for same-device — fail-closed, not UB).
 
 Added 3 regression tests: B1 (allocator outlives original Arc), S4 (no panic escape), B3 (direction matrix). All 173 targeted tests pass. Clippy clean. Plugin remains **fail-closed and unvalidated on hardware** — by design, not by circumstance.
+
+## 2026-08-11 — CUDA B1/B3/S4 fixes under lockout (commit `d64a49d59`)
+
+Under reviewer lockout after Sapper's rejection. Fixed:
+- **B1 (use-after-free):** `EpRef::Shared(Arc<Mutex<..>>)` in `device.rs`. `with_ep` locks per-operation; no pointer escapes guard. S2: unwrap → map_err.
+- **B3 (copy direction):** `Value_GetMemoryDevice` + `MemoryDevice_GetDeviceType` classify each tensor. `CopyDirection::classify` exhaustive. Unknown type → fail-closed (CPU path). Unsupported direction → `fail_status`.
+- **S4 (panic bomb):** `create_ep_factories_for_shared_ep` takes `ep_name: &str` directly. Old constructor closure unreachable on shared-EP path.
+- **B2 deferred** citing `MemoryDevice_GetDeviceId` "may not exist" — this was factually wrong (API present at `bindings.rs:6309`). B2 assigned to Batty.
+
+**Durable lesson:** Deferrals must be backed by evidence, not assumption. Verify before deferring.

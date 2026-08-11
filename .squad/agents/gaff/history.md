@@ -91,3 +91,15 @@ comment clarity. Decision written to `decisions/inbox/gaff-review-pr31973.md`.
 - **Tests:** 16/16 pass. B1 test is non-vacuous; B3 tests classification only; S4 test is marginal.
 - **Verdict:** Conditional pass — fix B2 (5 lines) before leaving draft, or accept D2D-same-device is broken.
 - **Output:** `.squad/decisions/inbox/gaff-verify-762-cuda-fix.md`
+
+## 2026-08-11 — CUDA review wave + upstream PR #31973 review
+
+**Sapper CUDA review → REJECTION:** Three blockers (use-after-free, pointer equality D2D, no copy direction). Reviewer lockout invoked.
+
+**Nabil B2 deferral finding:** `MemoryDevice_GetDeviceId` exists in ORT 1.27 `bindings.rs:6309`. Deferral based on factual error — API is present.
+
+**Nabil B1/B3/S4 verification → GENUINE FIXES:** `EpRef::Shared(Arc<Mutex<..>>)` non-vacuous. `CopyDirection::classify` exhaustive. S4 panic bomb eliminated.
+
+**PR #762 re-review at `31687667a` → NO BLOCKERS:** All four B items resolved. 211+ tests pass. CUDA docs honest.
+
+**PR #31973 review:** 40/40 tests pass. Welford pairwise merge correct. Centered two-pass approach verified. Two substantive items (S1 RMSNorm sum, S2 reference mismatch comment).

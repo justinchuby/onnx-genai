@@ -75,3 +75,25 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - Found: git history leakage (commit 58b5d23246 exposes .squad/ path and persona name "pris"). Needs squash before merge.
 - Verdict: **READY FOR REVIEW** — no blockers. 1 substantive (squash leaky commit), 1 nit (NarrowToFloat duplication).
 - Decision: `.squad/decisions/inbox/holden-rereview-pr31974.md`.
+
+## 2026-08-11 — Final sign-off: PR #762 (EP plugin parity CUDA)
+
+- Ran all EP crate tests: 211+ pass, 0 fail. CPU E2E with real ORT: 23 pass. nxrt ABI roundtrip: 10 pass. CUDA plugin: 12 pass.
+- Clippy clean on all EP crates.
+- CPU EP genuinely usable by real ORT — confirmed end-to-end.
+- CUDA is fail-closed by design, not by accident.
+- nxrt ABI is real across a cdylib boundary (version negotiation, panic containment, inline status — no cross-module free).
+- Docs are honest: all CUDA claims say "unvalidated on hardware", reference #768.
+- No blocking issues found.
+- Verdict: **APPROVE — leave draft**.
+- Decision: `.squad/decisions/inbox/holden-final-762.md`.
+
+## 2026-08-11 — PR #31974 re-review + PR #762 final sign-off
+
+**PR #31974 re-review** (after B1-B6 fixes on `nxrt/mlas-bf16-layernorm`):
+- Verdict: READY FOR REVIEW. B5 stat-narrowing fixed (WriteStat<U=float>); B4 test file deletion correct (zero MLAS calls); B6 17/17 BFloat16 tests pass, all 5 op families covered. Anti-fallback `ConfigEp(DefaultCpuExecutionProvider())` confirmed.
+- Flagged `.squad/` leakage in git history of both upstream branches (content reachable after delete commit).
+
+**PR #762 final sign-off** at `fb9d757b3`:
+- Verdict: APPROVE. CPU EP E2E: 23/23 ORT conformance tests. CUDA: zero factories + actionable status, `catch_unwind` at 18+ sites. nxrt ABI: 10/10 roundtrip. Honesty sweep: clean.
+- 211+ tests, 0 failed, 7 ignored. Clippy clean. Cross-platform c_char verified.

@@ -80,3 +80,13 @@ Reviewer flagged duplicated conversion helpers. Confirmed `ConvertMLFloat16ToFlo
 No upstream template helper for dispatching across both narrow types existed. Created `onnxruntime/core/util/narrow_float_utils.h` in `namespace onnxruntime`, included from both sites, removed local defs.
 
 Build clean, 17/17 BFloat16 LayerNorm tests pass, 96/96 `*LayerNorm*` pass, clang-format clean. Pushed as `6dd19a6f56`.
+
+## 2026-08-11 — B4 fail-closed, BF16 stats fix, LayerNorm kernel, NarrowToFloat dedup
+
+**B4 fail-closed gate (#762):** CUDA plugin returns zero factories both feature configs. `CanCopy` returns false for device EPs. Four defects documented for future hardware-gated work.
+
+**B5 stat precision (#31974):** `ComputeJob<BFloat16/MLFloat16>` overloads call `WriteStat<U=float>` directly. `if constexpr` prevents `ComputeImpl<T,T>` for narrow types. 17/17 BFloat16 + 96/96 LayerNorm tests pass.
+
+**LayerNorm B1/B2 kernel fix (#31973):** Welford → centered two-pass + double-precision first-pass sum. Worst-case: 5.95e-03 vs 28.2% for old Welford. 14.3× faster than scalar. `NormSize < 8` gate moved inside x86-only guard (was blocking RVV).
+
+**NarrowToFloat dedup (commit `6dd19a6f56`, #31974):** `onnxruntime/core/util/narrow_float_utils.h` created. Helpers removed from both source files.

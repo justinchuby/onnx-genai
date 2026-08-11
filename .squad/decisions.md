@@ -115,6 +115,13 @@ Assert on what the code did, not summaries. Run new tests in isolation before tr
 
 Fetch large external models only when needed, measure, and delete immediately. Do not leave benchmark models in `models/` or worktrees.
 
+## Testing and CI standing directives (additions 2026-08-11)
+
+- **`cargo test --workspace` silently truncates on failure.** Always use `--no-fail-fast`. A run reporting "1555/2" was really 4580 passed / 20 failed / 436 ignored across 304 binaries. Fail-fast mode exits at the first failing binary and reports wrong totals; this masked real failures across the session.
+- **Never commit `.squad/` files to external repos.** Deleting the files in a follow-up commit does not remove the content — git history retains it and the delete commit's message re-exposes the path. If `.squad/` is accidentally committed, purge via `git filter-branch` or `git-filter-repo` and force-push. This was discovered on upstream ORT PRs #31973 and #31974; both branches required history purge.
+- **An agent's self-report is not evidence.** Sapper reported all four CUDA defects fixed; independent review found a use-after-free, a panic bomb making success unreachable, and a direction classification gap. Nabil's B2 deferral cited an API that did not exist — the API was present in the generated bindings. Verify implementation claims via command output, code reading, and test results; never accept "implemented" on face value.
+- **Reviewer lockout is enforced end-to-end.** Sapper authored CUDA fixes → rejected by Gaff → Nabil fixed B1/B3/S4 → Batty fixed B2. No author revised their own rejected artifact. The chain must close with an independent verifier confirming each fix.
+
 ## Active historical pointers
 
 For detailed per-PR narrative, use archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md` for pre-August ledger, CUDA parity waves, Mac CPU EP/perf methodology, and July CLI/runtime records; `.squad/decisions-archive/2026-08.md` for fused LinearAttention, hetero legalization, 35B-A3B QMoE, #695/#700 hybrid cache fix, and August Scribe batches; older material remains under `.squad/decisions/archive/`.
@@ -175,3 +182,48 @@ A previous session reported the adapter crate as "Implemented (v1)" when it did 
 - CUDA weight offload defaults to async mmap-backed page-in with fence-ordered copy into reusable pinned staging. Synchronous demand-copy path available via `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0`.
 
 Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-memory-authority-contract, copilot-committed-granule-admission, copilot-shared-device-authority, copilot-qmoe-workspace-stage0, copilot-vram-limit-load-enforcement, copilot-705-weight-offload-prefetch, copilot-mapped-growth-grant, copilot-ci-is-asynchronous, copilot-design-autonomy-and-parallel-work).
+
+## Current active wave — 2026-08-11 (EP plugin parity + CUDA + upstream ORT LayerNorm)
+
+### PR #762 — CUDA EP parity wave (branch `squad/ep-plugin-parity-cuda`)
+
+**By:** Sapper (initial CUDA), Gaff (rejection review ×2), Nabil (B1/B3/S4), Batty (B2), Iran (B4 fail-closed), Roy (docs + undraft), Holden (final sign-off), Chew (test repair), Luba (nxrt inline buffer), Deckard (CUDA wiring + clippy), Pris (conformance suite)
+
+**Outcome:** PR #762 undrafted, marked ready for review. 15 CI checks green; coverage job long-running.
+
+**Key resolved defects (B1–B4 in CUDA EP):**
+
+- **B1 — Use-after-free:** Raw pointer escaped `MutexGuard`, dangling on every allocator/stream/transfer callback. Fixed: components now hold `Arc<Mutex<..>>` clones; `with_ep` locks per-operation. Test `shared_ep_allocator_outlives_original_arc` is non-vacuous.
+- **B2 — Pointer equality for same-device D2D:** Fixed via `is_same_device()` using `MemoryDevice_GetDeviceId` (present in ORT 1.27 bindings). Fast path: pointer equality. Null guard: fail-closed. API absent at runtime: fail-closed. 6 unit tests.
+- **B3 — `CopyTensors` no direction classification:** Both src/dst were wrapped as device buffers regardless of actual memory type. Fixed via `Value_GetMemoryDevice` + `MemoryDevice_GetDeviceType` classify path. `CopyDirection::classify` exhaustive; unsupported directions return fail-status.
+- **B4 (S4) — Panic bomb in factory constructor:** `create_ep_factories_for_shared_ep` now takes `ep_name: &str` directly; CUDA plugin extracts name before wrapping in Arc. The old constructor closure is unreachable on the shared-EP path.
+
+**CUDA fail-closed gate:** `CreateEpFactories` returns zero factories in both `cuda`-on and `cuda`-off configs until hardware validation (#768). This replaced the earlier fail-open state that advertised a broken GPU EP.
+
+**Output dtype standing directive:** `CompiledKernelEntry.output_dtypes: Vec<DataType>` — per-output dtypes read from ORT graph IR at Compile time; never inferred from inputs. Nodes with Undefined output dtype are declined at `GetCapability` (fail-closed).
+
+**LayerNorm shape inference:** `ShapeInference::LayerNorm { axis, num_outputs, full_shape_outputs }` — output 0 gets full input shape; outputs 1+ get reduced shape `[d[0]..d[axis-1], 1,..,1]`. Negative axis handled at `for_node` time. Fail-closed: axis resolves outside range → node declined.
+
+**nxrt inline buffer rule:** `NxrtStatus.message` is `[u8; 256]` with `message_len: u32` — a pure value type, no heap allocation. Eliminates cross-CRT allocator-mismatch UB at the cdylib boundary. `c_char` portability: use `*const std::os::raw::c_char`, not `*const i8` (aarch64 has `c_char = u8`).
+
+**Full narrative:** `.squad/decisions/inbox/` (all drops for this wave are merged and deleted by this Scribe session).
+
+### Upstream ORT PRs #31973 and #31974
+
+**By:** Resch (kernel), Iran (fixes + dedup), Chew (BF16 numerics), Deckard (U type constraint), Gaff (reviews), Holden (re-reviews), Batty (ARM64 CI diagnosis), Luba (ARM inventory)
+
+**#31973 — AVX2 MLAS LayerNorm/RMSNorm (`nxrt/mlas-avx2-layernorm`):**
+- Welford SIMD AVX2 was badly inaccurate: per-lane fp32 means at high base/small spread hit 28% relative error. Fixed with centered two-pass + double-precision first-pass sum. The `_mm256_cvtps_pd` + `_mm256_add_pd` loop costs ~10% throughput vs 8-wide fp32 but eliminates variance collapse.
+- AVX2+FMA3 dispatch guard: `platform.cpp:478` CPUID checks. `NormSize < 8` threshold moved inside x86-only guard (was gating RVV/other platforms).
+- ARM64 Debug CI failure at [1452/1458]: strong OOM circumstantial evidence (silent process death, large Debug link targets, 32GB runner). Confirmed flake — went green on re-run. No code bug.
+
+**#31974 — MLAS BFloat16 LayerNorm/RMSNorm (`nxrt/mlas-bf16-layernorm`):**
+- BF16 stat precision fix (B5): `ComputeJob<BFloat16>` overloads now call `WriteStat<U>` (U=float) — stats written at f32 precision, not BF16 (3-digit) precision.
+- Contrib U type constraint: macro changed from `(T)` to `(T, U)` for narrow types with `U=float`. Consistent with CUDA contrib and schema.
+- `NarrowToFloat`/`FloatToNarrow` deduplicated into `onnxruntime/core/util/narrow_float_utils.h` (commit `6dd19a6f56`).
+- BF16 numerics: f32 two-pass accumulation on BF16 inputs produces ≤1 BF16 ULP above quantization floor at N=65536. Recommended kernel tolerance: ≤2 BF16 ULP (≈1.6e-2 at unit scale). Do NOT use f32 tolerance (1e-4) for BF16.
+- CI failures: Gradle CDN timeout, pytorch_cpuinfo FetchContent failure, DNS error in quantization model download — all INFRA FLAKES.
+
+**CUDA upstream candidates dead:** Both MatMulNBits int4 block-128 GEMV and QMoE parallel routing are already covered by upstream ORT `main`. No portable gap found. Our CUDA advantages (graph capture, VMM, tiered KV) are runtime-level and not portable.
+
+**`.squad/` leakage purged from both upstream branches via `filter-branch` + force-push.** Trees verified byte-identical after purge.
