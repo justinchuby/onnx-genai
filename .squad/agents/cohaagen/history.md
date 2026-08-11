@@ -38,3 +38,9 @@ Older detailed dated entries through 2026-08-04T00:40:00Z — PR #625 native loa
 - Fixed GLM-4-9B native CUDA load by honoring runtime CUDA KV capacity instead of reserving metadata `max_sequence_length=131072`; PR #770 auto-merge pending CI.
 - Fixed DeepSeek-V2-Lite QMoE by accepting Cast-backed scale inputs as fp32 scale sources rather than requiring direct initializers; PR #771 auto-merge pending CI.
 - Validation: GLM native greedy lock passes at 93.6 tok/s, DeepSeek lock passes at 52.5 tok/s, CPU/CUDA first-token top-40 sets match; no model-name gates, and root cause was not partial rotary or MLA.
+
+## 2026-08-11T16:03:10Z — 27B hybrid GDN native CUDA shipped
+
+- Enabled Qwen3.5/3.6-27B hybrid GDN native CUDA: the 27B artifact's thin `inference_metadata.yaml` carries no `io` port contract, so `resolve_kv_layers` returned None ("per-layer KV page geometry unknown").
+- Fix `maybe_fill_hybrid_io_from_graph` in `engine/load.rs` auto-derives the decoder io contract from the ONNX graph port inventory, gated on non-empty `state_pairs`; DRY, no model-name gate — unblocks the whole hybrid GDN family.
+- Byte-exact: native argmax 11751 " Paris" == fp32 oracle, top-1 margin 2.549 nats; locked by `qwen35_27b_hybrid_native_cuda_e2e.rs`. PR #779 (auto-merge, awaiting CI).
