@@ -99,3 +99,6 @@ PR*.md
 .issue-*.md
 # Scratch buffers used when moving a block of code between files.
 .block.txt
+
+# seq-major microbenchmark scratch crate
+/bench-seqmajor/target/
