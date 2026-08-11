@@ -150,6 +150,61 @@ def gen_add_dynamic_dim():
     save(model, "add_dynamic_dim")
 
 
+# ── add_1x4 ─────────────────────────────────────────────────────────────────
+# Simple Add with FLOAT tensors, shape [1,4].
+# X = [1.0, 2.0, 3.0, 4.0]  Y = [5.0, 6.0, 7.0, 8.0]  Z = [6.0, 8.0, 10.0, 12.0]
+def gen_add_1x4():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])
+    Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1, 4])
+    node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
+    graph = helper.make_graph([node], "add_1x4", [X, Y], [Z])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "add_1x4")
+
+
+# ── add_float16 ──────────────────────────────────────────────────────────────
+# Add with FLOAT16 tensors, shape [1,4].  Tests half-precision EP routing.
+# X = [1,2,3,4]  Y = [5,6,7,8]  Z = [6,8,10,12]  (all in fp16)
+def gen_add_float16():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT16, [1, 4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT16, [1, 4])
+    Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT16, [1, 4])
+    node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
+    graph = helper.make_graph([node], "add_float16", [X, Y], [Z])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "add_float16")
+
+
+# ── add_bfloat16 ─────────────────────────────────────────────────────────────
+# Add with BFLOAT16 tensors, shape [1,4].  Tests bf16 EP routing.
+# X = [1,2,3,4]  Y = [5,6,7,8]  Z = [6,8,10,12]  (all in bf16)
+def gen_add_bfloat16():
+    X = helper.make_tensor_value_info("X", TensorProto.BFLOAT16, [1, 4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.BFLOAT16, [1, 4])
+    Z = helper.make_tensor_value_info("Z", TensorProto.BFLOAT16, [1, 4])
+    node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
+    graph = helper.make_graph([node], "add_bfloat16", [X, Y], [Z])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "add_bfloat16")
+
+
+# ── nonzero_1x4 ──────────────────────────────────────────────────────────────
+# NonZero on FLOAT tensor, shape [1,4].
+# X = [0, 3, 0, 5]  → Y = [[0,0],[1,3]]  (indices of nonzero elements)
+def gen_nonzero_1x4():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.INT64, [2, None])
+    node = helper.make_node("NonZero", inputs=["X"], outputs=["Y"])
+    graph = helper.make_graph([node], "nonzero_1x4", [X], [Y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "nonzero_1x4")
+
+
 if __name__ == "__main__":
     print("Generating ONNX conformance fixtures …")
     gen_add_broadcast()
@@ -159,4 +214,8 @@ if __name__ == "__main__":
     gen_mixed_partition()
     gen_add_int32()
     gen_add_dynamic_dim()
+    gen_add_1x4()
+    gen_add_float16()
+    gen_add_bfloat16()
+    gen_nonzero_1x4()
     print("Done.")

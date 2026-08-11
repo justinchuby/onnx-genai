@@ -547,3 +547,22 @@ Created `crates/onnx-runtime-ep-cpu-plugin/tests/ort_path.rs`:
 - Clippy: clean (`RUSTFLAGS="-D warnings"`).
 - `cargo fmt --all -- --check`: clean.
 - No regressions: ep-plugin 154+9, nxrt-abi 30, nxrt-host 4+10.
+
+## 2026-08-11 — Committed gitignored ONNX fixtures; fixed mutex poisoning cascade
+
+**Problem:** 11 `.onnx` test fixtures in `crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/`
+were never committed because `*.onnx` in `.gitignore` silently excluded them. The ORT e2e
+suite (`ort_loads_our_ep_and_runs_model`, `stress_register_run_unregister_cycles`) failed
+in CI with missing-file panics, and the shared `ORT_EP_LOCK` mutex got poisoned, causing
+cascading `PoisonError` failures in unrelated tests.
+
+**Fixes:**
+1. Added 11 explicit `!` negation entries in `.gitignore` for the cpu-plugin fixtures.
+2. Added `lock_ort_ep()` helper that recovers from `PoisonError` via `into_inner()` with
+   a warning, preventing one test's panic from masquerading as failures in others.
+3. Extended `generate_fixtures.py` with 4 missing generators (`add_1x4`, `add_float16`,
+   `add_bfloat16`, `nonzero_1x4`) so the script is the complete source of truth.
+4. Audited all crates for untracked test assets — none found beyond the 11 fixed.
+
+**Validation:** 17/17 ORT e2e, 6/6 ABI, 30 nxrt-abi, 4+10 nxrt-host — all green.
+Clippy clean, fmt clean.

@@ -159,3 +159,15 @@ The helper:
 **Do NOT use `CString` for ORT path arguments.** `CString` is correct only for
 non-path arguments like `logid` and `registration_name` which are `*const c_char`
 on all platforms.
+
+## Rule: untracked test assets do not exist in CI
+
+**Date:** 2026-08-11
+
+A test asset (fixture model, generated data, etc.) that is not tracked by git
+does not exist in CI. The `*.onnx` gitignore rule silently hid 11 EP conformance
+fixtures; tests passed locally but always failed from a fresh clone.
+
+**Convention:** after adding any binary test fixture, verify with
+`git ls-files <path>` that it is tracked. If `*.onnx` blocks it, add an explicit
+`!` negation in `.gitignore` following the existing per-file style.

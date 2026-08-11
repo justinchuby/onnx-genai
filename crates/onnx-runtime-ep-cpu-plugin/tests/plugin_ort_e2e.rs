@@ -37,7 +37,7 @@ mod ort_path;
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use onnx_genai_ort_sys as ort;
 
@@ -47,6 +47,18 @@ use onnx_genai_ort_sys as ort;
 /// cycles (factory.rs bug — Nabil).  The lock ensures tests run one at a time so
 /// the cycle count stays below the failure threshold for the default test suite.
 static ORT_EP_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire `ORT_EP_LOCK`, recovering from poisoning so that one test's panic
+/// does not cascade `PoisonError` failures across every subsequent test.
+fn lock_ort_ep() -> MutexGuard<'static, ()> {
+    ORT_EP_LOCK.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "WARNING: ORT_EP_LOCK was poisoned by a prior test panic — recovering. \
+             Investigate the original failure above."
+        );
+        poisoned.into_inner()
+    })
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -201,7 +213,7 @@ fn ort_api_sanity() {
 /// Drive `RegisterExecutionProviderLibrary` + `GetEpDevices` without running a model.
 #[test]
 fn ort_register_ep_library() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let ort_lib_dir =
         skip_if_missing!(find_ort_lib_dir(), "ort_register_ep_library: ORT not found");
     let ep_lib_path = skip_if_missing!(
@@ -242,7 +254,7 @@ fn ort_register_ep_library() {
 /// Same blocking condition as `ort_register_ep_library`.
 #[test]
 fn ort_loads_our_ep_and_runs_model() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let ort_lib_dir = skip_if_missing!(
         find_ort_lib_dir(),
         "ort_loads_our_ep_and_runs_model: ORT not found"
@@ -431,7 +443,7 @@ fn ort_loads_our_ep_and_runs_model() {
 /// fail-closed behaviour and ORT's correct fallback path.
 #[test]
 fn ort_unsupported_op_declines_not_crashes() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let ort_lib_dir = skip_if_missing!(
         find_ort_lib_dir(),
         "ort_unsupported_op_declines_not_crashes: ORT not found"
@@ -887,7 +899,7 @@ unsafe fn make_int32_tensor(
 /// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
 #[test]
 fn conformance_add_broadcast() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
 
@@ -960,7 +972,7 @@ fn conformance_add_broadcast() {
 /// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
 #[test]
 fn conformance_chain_add_mul() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx");
 
@@ -1036,7 +1048,7 @@ fn conformance_chain_add_mul() {
 /// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
 #[test]
 fn conformance_matmul_2d() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/matmul_2d/model.onnx");
 
@@ -1108,7 +1120,7 @@ fn conformance_matmul_2d() {
 /// Also requires NonZero claim-predicate fix in graph_reader.rs (Nabil).
 #[test]
 fn conformance_mixed_partition() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/mixed_partition/model.onnx");
 
@@ -1176,7 +1188,7 @@ fn conformance_mixed_partition() {
 /// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
 #[test]
 fn conformance_add_int32() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_int32/model.onnx");
 
@@ -1246,7 +1258,7 @@ fn conformance_add_int32() {
 /// Blocked by: allocator-registration bug in ep.rs/factory.rs (Nabil).
 #[test]
 fn conformance_add_dynamic_dim() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_dynamic_dim/model.onnx");
 
@@ -1335,7 +1347,7 @@ fn conformance_add_dynamic_dim() {
 /// Call 2: [10,0,10,0] + [0,10,0,10] = [10,10,10,10]
 #[test]
 fn conformance_multiple_run_calls() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
 
@@ -1440,7 +1452,7 @@ fn conformance_multiple_run_calls() {
 /// registration key. The device search must use the factory name "cpu_ep".
 #[test]
 fn conformance_two_sessions() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_a = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
     let model_b = PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
@@ -1638,7 +1650,7 @@ fn conformance_two_sessions() {
 ///     C1[2] = [1*2+1*0+1*2+1*0, 1*0+1*2+1*0+1*2] = [4, 4]
 #[test]
 fn conformance_matmul_batched_nd() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path =
         PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx");
@@ -1719,7 +1731,7 @@ fn conformance_matmul_batched_nd() {
 /// as a DeviceType=-112 panic or a segfault on the device-lookup assertion.
 #[test]
 fn stress_register_run_unregister_cycles() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
 
     let ort_lib_dir = {
         let d = find_ort_lib_dir();
@@ -1883,7 +1895,7 @@ fn stress_register_run_unregister_cycles() {
 /// kernel produces numerically correct output (exact f16 bit-pattern check).
 #[test]
 fn conformance_add_float16() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx");
 
@@ -1956,7 +1968,7 @@ fn conformance_add_float16() {
 /// 3.0=0x4040, 4.0=0x4080.
 #[test]
 fn conformance_add_bfloat16() {
-    let _lock = ORT_EP_LOCK.lock().unwrap();
+    let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx");
 
