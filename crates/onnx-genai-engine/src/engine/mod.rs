@@ -593,6 +593,7 @@ mod tests {
         ModelIoSpec {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
+            kv_layout: None,
             token_input: Some("input_ids".into()),
             inputs_embeds_input: None,
             attention_mask_input: Some("attention_mask".into()),
