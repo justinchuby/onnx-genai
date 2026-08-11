@@ -1214,8 +1214,9 @@ mod tests {
         let api = ort::OrtApi::default();
         let api_ptr: *const ort::OrtApi = &api;
 
-        let transfer =
-            unsafe { DeviceDataTransferFull::new(ep_ptr, support, api_ptr, std::ptr::null(), false) };
+        let transfer = unsafe {
+            DeviceDataTransferFull::new(ep_ptr, support, api_ptr, std::ptr::null(), false)
+        };
         let raw = Box::into_raw(transfer) as *mut ort::OrtDataTransferImpl;
 
         // Release.

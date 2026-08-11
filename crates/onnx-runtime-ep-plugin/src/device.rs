@@ -184,12 +184,7 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
             .unwrap_or(0);
         // Alignment must match what device_alloc used.
         let buf = unsafe {
-            onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
-                p,
-                ep.device_id(),
-                size,
-                16,
-            )
+            onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(p, ep.device_id(), size, 16)
         };
         let _ = ep.deallocate(buf);
     }));
@@ -826,8 +821,9 @@ mod tests {
         let ep = MockGpuEp;
         let sentinel: u8 = 42;
         let fake_mem_info = &sentinel as *const u8 as *const ort::OrtMemoryInfo;
-        let alloc =
-            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, fake_mem_info, true) };
+        let alloc = unsafe {
+            DeviceAllocator::new(&ep as *const dyn ExecutionProvider, fake_mem_info, true)
+        };
         let alloc_ptr = Box::into_raw(alloc);
 
         let info = unsafe { device_info(alloc_ptr.cast()) };

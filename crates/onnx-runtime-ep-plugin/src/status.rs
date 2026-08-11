@@ -62,7 +62,7 @@ pub(crate) fn status_with_code(code: ort::OrtErrorCode, message: &str) -> *mut o
 }
 
 /// Success: null status pointer.
-pub(crate) fn ok_status() -> *mut ort::OrtStatus {
+pub fn ok_status() -> *mut ort::OrtStatus {
     ptr::null_mut()
 }
 
