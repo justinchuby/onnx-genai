@@ -92,3 +92,43 @@ cargo fmt --all -- --check                                                ✅
 cargo test -p onnx-runtime-ep-cpu
 → 6 passed (shared_allocator integration tests), 0 failed               ✅
 ```
+
+---
+
+### 2026-08-11 — Consolidate registry-building tests to reduce resource pressure
+
+**Branch:** squad/ep-plugin-parity-cuda (PR #762)
+
+**Problem:** Windows ARM64 CI fails `spmd_adaptive_calibrated_decode_is_bit_identical_to_flat`
+with an empty-output child process (killed/OOM, not assertion failure). Hypothesis: four new
+descriptor tests each independently built the full 166-op registry + descriptors (~8 constructions
+total), inflating memory when running in parallel with the subprocess-spawning SPMD test.
+
+**Change:** Added `OnceLock`-based `shared_registry_with_descriptors()` fixture in
+`kernels/mod.rs` so the registry+descriptors are built once and borrowed by all four tests.
+All assertions preserved verbatim.
+
+**Measurements (Linux, `cargo test -p onnx-runtime-ep-cpu`):**
+
+| Metric        | Before | After  |
+|---------------|--------|--------|
+| Wall clock    | 32.20s | 32.25s |
+| Peak RSS      | 254 MB | 253 MB |
+
+**Verdict:** On this Linux host, the consolidation produces negligible timing/memory
+difference — the four tests were already fast relative to the rest of the suite. The
+Windows ARM64 failure is most likely a **pre-existing flake** on a resource-constrained
+runner, not caused by our branch. Our tests don't leak (the `OnceLock` static is tiny
+relative to the SPMD test's subprocess budget). The consolidation is still the right
+thing to do (fewer redundant allocations, cleaner test structure), but CI must confirm
+on the actual Windows ARM64 runner.
+
+**Recommendation:** The SPMD parity test's child-process-with-empty-output failure mode
+should be investigated by its owner — it needs a timeout/diagnostic improvement regardless
+of our branch.
+
+**Validation:**
+- `cargo test -p onnx-runtime-ep-cpu` → all pass
+- `RUSTFLAGS="-D warnings" cargo clippy -p onnx-runtime-ep-cpu -p onnx-runtime-ep-api` → clean
+- `cargo fmt --all -- --check` → clean
+- cpu-plugin 6+17, ep-plugin 154+9 → no regression

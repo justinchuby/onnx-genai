@@ -2211,9 +2211,18 @@ mod tests {
 
     // ─── Registry-entry derivation tests ─────────────────────────────────
 
+    /// Shared fixture: build the registry + descriptors once for all
+    /// descriptor-related tests, avoiding ~8 redundant full-registry
+    /// constructions that inflate peak memory and wall-clock time.
+    fn shared_registry_with_descriptors() -> &'static (OpRegistry, Vec<CpuOpDescriptor>) {
+        use std::sync::OnceLock;
+        static FIXTURE: OnceLock<(OpRegistry, Vec<CpuOpDescriptor>)> = OnceLock::new();
+        FIXTURE.get_or_init(build_cpu_registry_with_descriptors)
+    }
+
     #[test]
     fn build_cpu_registry_with_descriptors_returns_nonempty() {
-        let (_reg, descriptors) = build_cpu_registry_with_descriptors();
+        let (_reg, descriptors) = shared_registry_with_descriptors();
         assert!(
             descriptors.len() > 100,
             "expected >100 descriptors, got {}",
@@ -2223,7 +2232,7 @@ mod tests {
 
     #[test]
     fn descriptors_include_add_with_f16_bf16() {
-        let (_reg, descriptors) = build_cpu_registry_with_descriptors();
+        let (_reg, descriptors) = shared_registry_with_descriptors();
         let add_entries: Vec<_> = descriptors
             .iter()
             .filter(|d| d.op_type == "Add" && d.domain.is_empty())
@@ -2243,7 +2252,7 @@ mod tests {
 
     #[test]
     fn descriptors_include_matmul_with_f16_bf16() {
-        let (_reg, descriptors) = build_cpu_registry_with_descriptors();
+        let (_reg, descriptors) = shared_registry_with_descriptors();
         let matmul_entries: Vec<_> = descriptors
             .iter()
             .filter(|d| d.op_type == "MatMul" && d.domain.is_empty())
@@ -2286,7 +2295,7 @@ mod tests {
         // Verify that the descriptor count matches the registry entry count
         // (minus CNN ops that are directly registered without recording).
         let reg = build_cpu_registry();
-        let (_reg2, descriptors) = build_cpu_registry_with_descriptors();
+        let (_reg2, descriptors) = shared_registry_with_descriptors();
         // Descriptors should be close to registry len; CNN ops are the delta.
         let delta = reg.len() as isize - descriptors.len() as isize;
         assert!(
