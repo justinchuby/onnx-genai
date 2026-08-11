@@ -1,21 +1,26 @@
 //! CUDA implementation of `com.microsoft::GroupQueryAttention`.
 //!
-//! BSH query/key/value inputs are prepared into BNSH buffers with NVRTC kernels,
-//! including cache append and optional RoPE. Multi-token prefill then uses the
-//! shared tiled online-softmax flash kernel when its measured shape gate wins;
-//! decode and unsupported/slower shapes retain the existing attention baseline.
-//! Present key/value outputs remain BNSH and preserve a fixed cache capacity.
+//! BSH query/key/value inputs are prepared into descriptor-selected KV buffers
+//! with NVRTC kernels, including cache append and optional RoPE. Multi-token
+//! prefill then uses the shared tiled online-softmax flash kernel when its
+//! measured shape gate wins; decode and unsupported/slower shapes retain the
+//! existing attention baseline. Declared present shapes remain BNSH-compatible
+//! while the native backend may physically store converted paths as BSNH.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
-use crate::kernels::kv_stride::KvCacheStrides;
+use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
 use crate::runtime::{CudaRuntime, cuptr};
 
 use super::attention::{AttentionDtype, run_attention_phase2a};
@@ -24,13 +29,15 @@ use super::gqa_decode;
 use super::gqa_decode_fp16;
 
 const PREP_SRC: &str = r#"
-// Default (head-major BNSH) KV-cache append destination index. A non-default
-// layout (seq-major BSNH) prepends its own `#define GQA_KV_DST` before this
-// source, and this `#ifndef` guard yields to it, so the fused prep write indexes
-// from the KV stride descriptor with no runtime layout branch.
+// Default (head-major BNSH) KV-cache index. A non-default layout prepends its
+// own descriptor-generated definition before this source.
+#ifndef GQA_KV_INDEX
+#define GQA_KV_INDEX(b, h, slot, heads, capacity, dim) \
+    ( ((long)((b) * (heads) + (h)) * (capacity) + (slot)) * (dim) )
+#endif
 #ifndef GQA_KV_DST
 #define GQA_KV_DST(b, h, slot) \
-    ( ((long)((b) * kv_heads + (h)) * present_capacity + (slot)) * dim )
+    GQA_KV_INDEX(b, h, slot, kv_heads, present_capacity, dim)
 #endif
 extern "C" __global__ void gqa_transpose_bsh_to_bnsh(
     const float* src, float* dst, int batch, int seq, int heads, int dim)
@@ -177,12 +184,12 @@ extern "C" __global__ void gqa_build_cache(
     if (past_len < 0) return;
     float value = 0.0f;
     if (s < past_len && past) {
-        value = past[((b * heads + h) * past_capacity + s) * dim + d];
+        value = past[GQA_KV_INDEX(b, h, s, heads, past_capacity, dim) + d];
     } else if (s >= past_len && s < past_len + seq) {
         const int current_s = s - past_len;
         value = current[((b * seq + current_s) * heads + h) * dim + d];
     }
-    present[idx] = value;
+    present[GQA_KV_INDEX(b, h, s, heads, present_capacity, dim) + d] = value;
 }
 
 extern "C" __global__ void gqa_append_cache(
@@ -198,7 +205,7 @@ extern "C" __global__ void gqa_append_cache(
     const int h = x % heads; const int b = x / heads;
     const int target_s = past_lengths[b] + s;
     if (target_s < 0 || target_s >= present_capacity) return;
-    present[((b * heads + h) * present_capacity + target_s) * dim + d] =
+    present[GQA_KV_INDEX(b, h, target_s, heads, present_capacity, dim) + d] =
         current[((b * seq + s) * heads + h) * dim + d];
 }
 
@@ -227,7 +234,9 @@ extern "C" __global__ void gqa_rope_bnsh(
     const int d0 = interleaved ? 2 * k : k;
     const int d1 = interleaved ? 2 * k + 1 : k + half;
     const int tensor_s = current_offset ? past_lengths[b] + s : s;
-    const size_t base = ((size_t)(b * heads + h) * tensor_capacity + tensor_s) * dim;
+    const size_t base = current_offset
+        ? GQA_KV_INDEX(b, h, tensor_s, heads, tensor_capacity, dim)
+        : ((size_t)(b * heads + h) * tensor_capacity + tensor_s) * dim;
     const float x0 = tensor[base + d0];
     const float x1 = tensor[base + d1];
     const float c = cos_cache[pos * half + k];
@@ -437,11 +446,15 @@ const PREP_HALF_SRC: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-// Default (head-major BNSH) KV-cache append destination index; a seq-major
-// layout prepends its own `#define GQA_KV_DST` and this guard yields to it.
+// Default (head-major BNSH) KV-cache index; a non-default layout prepends its
+// descriptor-generated definition and these guards yield to it.
+#ifndef GQA_KV_INDEX
+#define GQA_KV_INDEX(b, h, slot, heads, capacity, dim) \
+    ( ((long)((b) * (heads) + (h)) * (capacity) + (slot)) * (dim) )
+#endif
 #ifndef GQA_KV_DST
 #define GQA_KV_DST(b, h, slot) \
-    ( ((long)((b) * kv_heads + (h)) * present_capacity + (slot)) * dim )
+    GQA_KV_INDEX(b, h, slot, kv_heads, present_capacity, dim)
 #endif
 
 __device__ __forceinline__ int gqa_prepare_metadata_batch1(
@@ -563,12 +576,12 @@ __device__ void gqa_build_cache_body(
     if (past_len < 0) return;
     T result = gqa_store<T>(0.0f);
     if (s < past_len && past) {
-        result = past[((b * heads + h) * past_capacity + s) * dim + d];
+        result = past[GQA_KV_INDEX(b, h, s, heads, past_capacity, dim) + d];
     } else if (s >= past_len && s < past_len + seq) {
         const int current_s = s - past_len;
         result = current[((b * seq + current_s) * heads + h) * dim + d];
     }
-    present[idx] = result;
+    present[GQA_KV_INDEX(b, h, s, heads, present_capacity, dim) + d] = result;
 }
 
 template <typename T>
@@ -585,7 +598,7 @@ __device__ void gqa_append_cache_body(
     const int h = x % heads; const int b = x / heads;
     const int target_s = past_lengths[b] + s;
     if (target_s < 0 || target_s >= present_capacity) return;
-    present[((b * heads + h) * present_capacity + target_s) * dim + d] =
+    present[GQA_KV_INDEX(b, h, target_s, heads, present_capacity, dim) + d] =
         current[((b * seq + s) * heads + h) * dim + d];
 }
 
@@ -614,7 +627,9 @@ __device__ void gqa_rope_bnsh_body(
     const int d0 = interleaved ? 2 * k : k;
     const int d1 = interleaved ? 2 * k + 1 : k + half;
     const int tensor_s = current_offset ? past_lengths[b] + s : s;
-    const size_t base = ((size_t)(b * heads + h) * tensor_capacity + tensor_s) * dim;
+    const size_t base = current_offset
+        ? GQA_KV_INDEX(b, h, tensor_s, heads, tensor_capacity, dim)
+        : ((size_t)(b * heads + h) * tensor_capacity + tensor_s) * dim;
     const float x0 = gqa_load<T>(tensor[base + d0]);
     const float x1 = gqa_load<T>(tensor[base + d1]);
     const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
@@ -784,8 +799,8 @@ DEFINE_GQA_HALF_KERNELS(__half, f16)
 DEFINE_GQA_HALF_KERNELS(__nv_bfloat16, bf16)
 "#;
 
-const PREP_MODULE: &str = "group_query_attention_prep_v3";
-const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v3";
+const PREP_MODULE: &str = "group_query_attention_prep_v4";
+const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v4";
 const BLOCK: u32 = 256;
 const WS_TOTALS: usize = 0;
 const WS_PAST_LENGTHS: usize = 1;
@@ -799,6 +814,58 @@ const WS_PRESENT_K: usize = 8;
 const WS_PRESENT_V: usize = 9;
 const WS_SCORES: usize = 10;
 const WS_COUNT: usize = 11;
+
+/// Device-pointer alignment for the governed GQA reference score buffer (§736).
+const GQA_SCORES_ALIGN: usize = 256;
+
+/// Whether a concrete GQA dispatch materializes an `[B, H, Sq, kv]` device score
+/// matrix. Only the f32 *reference* attention path does: every fused-flash and
+/// capture-safe split-K decode path (fused flash, f32 `gqa_decode`, fp16
+/// `gqa_decode_fp16`) streams softmax through registers/shared memory and needs
+/// no score scratch, and the phase-2a path owns its own scratch inside
+/// `run_attention_phase2a`. The reference branch is reachable only when the
+/// query dtype is f32 and the single-token split-K decode kernel does not cover
+/// the shape (`Sq > 1` prefill, or `head_dim > 128`). This is the static signal
+/// (#751) that keeps the governed reservation off every path that never touches
+/// scores, so no device capacity is charged for scratch it never materializes.
+fn gqa_reference_scores_path(dtype: DataType, q_seq: usize, head_dim: usize) -> bool {
+    dtype == DataType::Float32 && !gqa_decode::supported(q_seq, head_dim)
+}
+
+/// Byte size of the governed GQA reference score buffer for one concrete
+/// geometry. Prepare-only planning (`Kernel::workspace_requirement`) and
+/// execution (the reference branch of `run`) both size the reservation through
+/// this identical helper so the reserved and consumed byte counts cannot drift.
+/// The buffer holds `batch·num_heads·q_seq·kv_capacity` f32 scores, matching the
+/// reference kernel's `score_count · sizeof(f32)` indexing (a degenerate
+/// geometry still reserves one element, as the kernel's `score_count.max(1)`
+/// did).
+fn gqa_reference_scores_bytes(
+    batch: usize,
+    num_heads: usize,
+    q_seq: usize,
+    kv_capacity: usize,
+) -> Result<usize> {
+    let rows = batch
+        .checked_mul(num_heads)
+        .and_then(|value| value.checked_mul(q_seq))
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: attention row count overflow".into(),
+            )
+        })?;
+    let elements = rows.checked_mul(kv_capacity).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep GroupQueryAttention: score scratch size overflow".into())
+    })?;
+    elements
+        .max(1)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: score scratch byte count overflow".into(),
+            )
+        })
+}
 
 /// Bit flags a captured GQA prep kernel `atomicOr`s into the runtime's latching
 /// capture-error word when a decode-metadata invariant is violated during graph
@@ -916,10 +983,9 @@ pub struct GroupQueryAttentionKernel {
     /// KV cache physical layout as a stride descriptor. The default is
     /// head-major BNSH (ORT-compatible), which every reader and writer honors.
     /// The native backend sets this to seq-major BSNH on GQA nodes whose KV it
-    /// exclusively owns; a non-default layout is honored solely on the fused
-    /// fp16 single-token decode path, and any other path rejects it. The
-    /// converted kernels generate their index arithmetic from this descriptor at
-    /// NVRTC module-build time, so there is no runtime layout branch.
+    /// exclusively owns. Converted flash-prefill and fp16 decode kernels
+    /// generate their index arithmetic from this descriptor at NVRTC
+    /// module-build time; every unconverted path rejects it.
     kv_strides: KvCacheStrides,
     workspace: Mutex<GqaWorkspace>,
     last_capture_safe_signature: Mutex<Option<GqaCaptureSignature>>,
@@ -1201,8 +1267,7 @@ impl GroupQueryAttentionKernel {
 
     /// Select the KV cache stride descriptor. The native backend sets a
     /// non-default (seq-major) descriptor on GQA nodes whose KV it exclusively
-    /// owns; a non-default layout is honored solely on the fused fp16 decode
-    /// path (see [`Self::run`]).
+    /// owns; converted paths are selected and hard-gated in [`Self::run`].
     pub(crate) fn with_kv_strides(mut self, kv_strides: KvCacheStrides) -> Self {
         self.kv_strides = kv_strides;
         self
@@ -1291,7 +1356,12 @@ impl GroupQueryAttentionKernel {
         }
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        prepared: Option<WorkspaceView>,
+    ) -> Result<()> {
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
             EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: capture signature lock poisoned".into(),
@@ -1344,8 +1414,8 @@ impl GroupQueryAttentionKernel {
         }
         let element_size = dtype.element_size() as usize;
         let (
-            prep_module,
-            prep_src,
+            base_prep_module,
+            base_prep_src,
             split_entry,
             transpose_in_entry,
             build_entry,
@@ -1798,22 +1868,30 @@ impl GroupQueryAttentionKernel {
             && !self.prep_fusion_disabled;
         let fuse_metadata = fuse_prep && batch == 1;
 
-        // A non-default (seq-major BSNH) KV layout is a native-backend-only
-        // capability wired through exactly one path in this increment: the fused
-        // fp16 single-token decode prep write plus the fp16 split-K decode read.
-        // Every other prep path (unfused append/build/RoPE) and every other
-        // reader (flash / f32 decode / reference / phase2a) still assumes
-        // head-major BNSH, so reject a non-default cache that would reach them
-        // rather than silently corrupt it.
-        if !self.kv_strides.is_head_major() && !(fuse_prep && q.dtype == DataType::Float16) {
-            return Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: seq-major (BSNH) KV requires the fused fp16 \
-                 single-token decode prep path (aliased in-place cache, past==present capacity, \
-                 even head_dim, q_seq==k_seq==1); the requested dtype/shape would route to \
-                 head-major-only append/build/RoPE kernels"
-                    .into(),
-            ));
-        }
+        let attention_sequence_length = valid_sequence_length.unwrap_or(present_capacity);
+        let selected_backend =
+            self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim);
+        let use_fused = selected_backend == GroupQueryAttentionBackend::Fused;
+        let prep_path = if fuse_prep && q.dtype == DataType::Float16 {
+            KvCachePath::FusedDecodePrep
+        } else if q_seq > 1 && use_fused {
+            KvCachePath::FlashPrefillPrep
+        } else {
+            KvCachePath::UnfusedDecodePrep
+        };
+        self.kv_strides.require_converted_path_support(prep_path)?;
+        let prep_src_owned;
+        let (prep_module, prep_src): (&str, &str) = if self.kv_strides.is_head_major() {
+            (base_prep_module, base_prep_src)
+        } else {
+            prep_src_owned = format!("{}{}", self.kv_strides.prep_prelude(), base_prep_src);
+            let module = match q.dtype {
+                DataType::Float32 => self.kv_strides.prep_f32_module_key()?,
+                DataType::Float16 | DataType::BFloat16 => self.kv_strides.prep_half_module_key()?,
+                _ => unreachable!(),
+            };
+            (module, prep_src_owned.as_str())
+        };
         let mut workspace = self.workspace.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
         })?;
@@ -1982,25 +2060,10 @@ impl GroupQueryAttentionKernel {
             let do_rotary_i: i32 = self.do_rotary.into();
             let derive_metadata_i: i32 = fuse_metadata.into();
             let fused_count = batch * (self.num_heads + 2 * self.kv_num_heads) * (dim / 2);
-            // The fused write indexes the KV cache from the stride descriptor.
-            // Head-major reuses the shared prep module (its `#ifndef GQA_KV_DST`
-            // default write formula); a seq-major layout prepends a specialized
-            // `GQA_KV_DST` prelude and loads a distinct, per-layout module.
-            let fuse_src_owned: String;
-            let (fuse_module, fuse_src): (&str, &str) = if self.kv_strides.is_head_major() {
-                (prep_module, prep_src)
-            } else {
-                self.kv_strides.require_converted_path_support()?;
-                fuse_src_owned = format!("{}{}", self.kv_strides.prep_prelude(), prep_src);
-                (
-                    self.kv_strides.prep_half_module_key()?,
-                    fuse_src_owned.as_str(),
-                )
-            };
             launch_1d!(
                 self.runtime,
-                fuse_module,
-                fuse_src,
+                prep_module,
+                prep_src,
                 fuse_entry,
                 fused_count,
                 builder,
@@ -2224,9 +2287,6 @@ impl GroupQueryAttentionKernel {
             .scale
             .filter(|&scale| scale != 0.0)
             .unwrap_or_else(|| 1.0 / (dim as f32).sqrt());
-        let attention_sequence_length = valid_sequence_length.unwrap_or(present_capacity);
-        let selected_backend =
-            self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim);
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let score_elements = (batch as u64)
                 .saturating_mul(self.num_heads as u64)
@@ -2243,17 +2303,18 @@ impl GroupQueryAttentionKernel {
                 .saturating_add(pv_flops)
                 .saturating_add(softmax_flops)
         });
-        let use_fused = selected_backend == GroupQueryAttentionBackend::Fused;
-        if !self.kv_strides.is_head_major()
-            && !(!use_fused && gqa_decode_fp16::supported(q_seq, dim))
-        {
-            return Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: seq-major (BSNH) KV must read through the \
-                 capture-safe fp16 split-K decode kernel; the selected reader (fused flash / \
-                 f32 decode / reference / phase2a) still expects head-major BNSH"
-                    .into(),
-            ));
-        }
+        let read_path = if use_fused {
+            KvCachePath::FlashPrefillRead
+        } else if q.dtype == DataType::Float32 && gqa_decode::supported(q_seq, dim) {
+            KvCachePath::F32DecodeRead
+        } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
+            KvCachePath::Fp16DecodeRead
+        } else if q.dtype == DataType::Float32 {
+            KvCachePath::ReferenceRead
+        } else {
+            KvCachePath::Phase2aRead
+        };
+        self.kv_strides.require_converted_path_support(read_path)?;
         if use_fused {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_flash_fused",
@@ -2288,6 +2349,7 @@ impl GroupQueryAttentionKernel {
                 query_starts_gpu,
                 local_window_i,
                 self.softcap,
+                &self.kv_strides,
             )?;
         } else if q.dtype == DataType::Float32 && gqa_decode::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -2375,14 +2437,33 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: attention row count overflow".into(),
                     )
                 })?;
-            let score_count = attention_rows
-                .checked_mul(present_capacity)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: score scratch size overflow".into(),
-                    )
-                })?;
-            let score_scratch = workspace.reserve(WS_SCORES, score_count.max(1) * 4)?;
+            // The score buffer is `[B, H, Sq, present_capacity]` f32; planning
+            // and execution size it through the same helper so the reserved and
+            // consumed byte counts cannot drift.
+            let scores_bytes =
+                gqa_reference_scores_bytes(batch, self.num_heads, q_seq, present_capacity)?;
+            let score_scratch = match prepared {
+                Some(view) => {
+                    // Governed slice (§736): the executor reserved this
+                    // session-persistent score buffer against the device
+                    // authority during prepare-only planning, sized through the
+                    // same `gqa_reference_scores_bytes` helper. Refuse
+                    // deterministically on a shortfall rather than silently
+                    // under-allocating or reintroducing a raw pooled allocation.
+                    if view.bytes() < scores_bytes {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep GroupQueryAttention: prepared score workspace {} bytes is \
+                             smaller than the {scores_bytes} bytes this f32 reference dispatch \
+                             requires",
+                            view.bytes()
+                        )));
+                    }
+                    cuptr(view.ptr().0.cast_const())
+                }
+                // Compatibility/opt-out path: no executor-prepared workspace, so
+                // the score scratch stays self-owned in the pooled slot.
+                None => workspace.reserve(WS_SCORES, scores_bytes)?,
+            };
             let attention_rows_u32 = u32::try_from(attention_rows).map_err(|_| {
                 EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: attention row count exceeds u32".into(),
@@ -2492,11 +2573,105 @@ impl GroupQueryAttentionKernel {
         *last_signature = capture_candidate;
         Ok(())
     }
+
+    /// Prepare-only planning (#747, §736): report the governed f32 reference
+    /// score buffer so the executor reserves it against the device authority
+    /// before request admission. Every other GQA path (fused flash, f32/fp16
+    /// split-K decode, phase-2a) materializes no device score matrix and reports
+    /// NONE, so no device capacity is charged for scratch it never touches
+    /// (#751). On a shape/dtype this kernel would reject, report NONE and let
+    /// `run` raise the precise error via the compatibility scratch.
+    ///
+    /// The reservation is session-persistent: the reference score buffer is
+    /// grown to the largest geometry seen and retained across decode/prefill
+    /// steps (the pooled slot's contract), so — unlike the step-scoped Attention
+    /// Phase-2a scratch (#753) — it holds a standing claim for the session and is
+    /// charged as `WorkspaceLifetime::SessionPersistent`. Because `Sq · kv` is
+    /// prompt-dependent, the executor grows it transactionally through a
+    /// `MappedGrowthGrant` against the device authority.
+    fn reference_scores_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let Some(q) = inputs.first() else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if q.shape.len() != 3 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let (batch, q_seq, input_hidden) = (q.shape[0], q.shape[1], q.shape[2]);
+        // Packed QKV is signalled by absent key/value inputs, mirroring `run`.
+        let packed_qkv =
+            inputs.get(1).is_none_or(|k| !k.present) && inputs.get(2).is_none_or(|v| !v.present);
+        let head_dim = if packed_qkv {
+            let packed_heads = self.num_heads + 2 * self.kv_num_heads;
+            if packed_heads == 0 || input_hidden == 0 || input_hidden % packed_heads != 0 {
+                return Ok(WorkspaceRequirement::NONE);
+            }
+            input_hidden / packed_heads
+        } else {
+            if self.num_heads == 0 || input_hidden == 0 || input_hidden % self.num_heads != 0 {
+                return Ok(WorkspaceRequirement::NONE);
+            }
+            input_hidden / self.num_heads
+        };
+        if head_dim == 0 || !gqa_reference_scores_path(q.dtype, q_seq, head_dim) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        // KV-capacity proxy from static input metadata. The reference score
+        // buffer is strided by the present-cache capacity; for GQA's
+        // buffer-shared KV cache that equals the past_key capacity
+        // (`inputs[3].shape[2]`), and on a pure prefill with no past it equals
+        // the incoming key length. Both are static input dims. Execution
+        // re-derives the exact present capacity and refuses deterministically on
+        // any shortfall, so this never silently under-allocates.
+        let past_capacity = inputs
+            .get(3)
+            .filter(|past| past.present && past.shape.len() == 4)
+            .map(|past| past.shape[2])
+            .unwrap_or(0);
+        let key_length = if packed_qkv {
+            q_seq
+        } else {
+            inputs
+                .get(1)
+                .filter(|key| key.shape.len() == 3)
+                .map(|key| key.shape[1])
+                .unwrap_or(0)
+        };
+        let kv_capacity = past_capacity.max(key_length);
+        let bytes = gqa_reference_scores_bytes(batch, self.num_heads, q_seq, kv_capacity)?;
+        Ok(WorkspaceRequirement {
+            bytes: u64::try_from(bytes).map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: score workspace does not fit u64".into(),
+                )
+            })?,
+            alignment: GQA_SCORES_ALIGN,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        })
+    }
 }
 
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        // Compatibility/opt-out path: no executor-prepared workspace, so the f32
+        // reference score scratch stays self-owned in the pooled slot.
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.reference_scores_requirement(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -2587,5 +2762,152 @@ mod tests {
         let after = runtime.allocation_counts();
         assert_eq!(after.allocations, before.allocations + 2);
         assert_eq!(after.frees, before.frees + 2);
+    }
+
+    #[test]
+    fn reference_scores_bytes_matches_score_count_formula() {
+        // Planning and execution size the governed score buffer through this
+        // exact helper (§736), so pin its formula: `batch·heads·q_seq·kv` f32
+        // scores. A degenerate geometry still reserves one element, matching the
+        // kernel's historical `score_count.max(1) * 4`.
+        let (batch, heads, q_seq, kv) = (2usize, 4usize, 8usize, 130usize);
+        let bytes = gqa_reference_scores_bytes(batch, heads, q_seq, kv).unwrap();
+        assert_eq!(
+            bytes,
+            batch * heads * q_seq * kv * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            gqa_reference_scores_bytes(0, heads, q_seq, kv).unwrap(),
+            std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn reference_scores_path_gates_on_dtype_and_decode_support() {
+        // f32 prefill (Sq>1) has no split-K decode kernel: reference path runs
+        // and materializes scores.
+        assert!(gqa_reference_scores_path(DataType::Float32, 8, 64));
+        // f32 single-token decode with head_dim<=128 is covered by gqa_decode,
+        // which streams softmax and needs no score scratch.
+        assert!(!gqa_reference_scores_path(DataType::Float32, 1, 64));
+        // f32 single-token with head_dim>128 exceeds gqa_decode: reference path.
+        assert!(gqa_reference_scores_path(DataType::Float32, 1, 192));
+        // fp16/bf16 never take the f32 reference path, so no score buffer is
+        // charged on the common decode/prefill dtypes.
+        assert!(!gqa_reference_scores_path(DataType::Float16, 8, 64));
+        assert!(!gqa_reference_scores_path(DataType::BFloat16, 8, 64));
+    }
+
+    #[test]
+    fn workspace_requirement_governs_f32_reference_scores_only() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA workspace requirement test: CUDA runtime unavailable");
+            return;
+        };
+        let (num_heads, kv_heads, dim) = (4usize, 2usize, 64usize);
+        let kernel = GroupQueryAttentionKernel::new(
+            runtime, num_heads, kv_heads, None, false, false, -1, 0.0,
+        )
+        .expect("kernel");
+        let (batch, q_seq, cache) = (1usize, 8usize, 256usize);
+        let q_shape = [batch, q_seq, num_heads * dim];
+        let kv_shape = [batch, q_seq, kv_heads * dim];
+        let past_shape = [batch, kv_heads, cache, dim];
+        let seqlens_shape = [batch];
+        let total_shape = [1usize];
+        fn meta(dtype: DataType, shape: &[usize]) -> TensorMetadata<'_> {
+            TensorMetadata::new(dtype, shape, true)
+        }
+        let f32_inputs = [
+            meta(DataType::Float32, &q_shape),
+            meta(DataType::Float32, &kv_shape),
+            meta(DataType::Float32, &kv_shape),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Int32, &seqlens_shape),
+            meta(DataType::Int32, &total_shape),
+        ];
+        // f32 prefill routes to the reference path: governed, session-persistent,
+        // and sized through the shared helper against the cache capacity.
+        let req = kernel
+            .workspace_requirement(&f32_inputs)
+            .expect("requirement");
+        let expected = gqa_reference_scores_bytes(batch, num_heads, q_seq, cache).unwrap() as u64;
+        assert_eq!(req.bytes, expected);
+        assert_eq!(req.alignment, GQA_SCORES_ALIGN);
+        assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
+        assert!(matches!(
+            req.role,
+            MemoryRole::Workspace { step_scoped: false }
+        ));
+
+        // The same geometry in fp16 never materializes scores, so the executor
+        // reserves nothing for it (over-reservation guard, #751).
+        let f16_inputs = [
+            meta(DataType::Float16, &q_shape),
+            meta(DataType::Float16, &kv_shape),
+            meta(DataType::Float16, &kv_shape),
+            meta(DataType::Float16, &past_shape),
+            meta(DataType::Float16, &past_shape),
+            meta(DataType::Int32, &seqlens_shape),
+            meta(DataType::Int32, &total_shape),
+        ];
+        let f16_req = kernel
+            .workspace_requirement(&f16_inputs)
+            .expect("fp16 requirement");
+        assert_eq!(f16_req.bytes, 0, "fp16 GQA needs no governed score scratch");
+
+        // f32 single-token decode (head_dim<=128) is covered by the capture-safe
+        // split-K kernel and reserves no scores either.
+        let decode_q = [batch, 1usize, num_heads * dim];
+        let decode_kv = [batch, 1usize, kv_heads * dim];
+        let decode_inputs = [
+            meta(DataType::Float32, &decode_q),
+            meta(DataType::Float32, &decode_kv),
+            meta(DataType::Float32, &decode_kv),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Int32, &seqlens_shape),
+            meta(DataType::Int32, &total_shape),
+        ];
+        let decode_req = kernel
+            .workspace_requirement(&decode_inputs)
+            .expect("decode requirement");
+        assert_eq!(
+            decode_req.bytes, 0,
+            "f32 single-token decode is served by gqa_decode and needs no score scratch"
+        );
+    }
+}
+
+/// Regression guard for issue #736: the governed GQA score buffer (`WS_SCORES`)
+/// is routed through `Kernel::workspace_requirement` + an executor-prepared
+/// session-persistent workspace, consumed via `execute_with_workspace`. This
+/// CPU-only test fails if the f32 reference branch reintroduces an unconditional
+/// raw pooled allocation of the score slot, bypassing the device authority. It
+/// runs on CI without a GPU, matching the #751 bar (a source-scan unit test, not
+/// a `Select-String`-style external scan).
+#[cfg(test)]
+mod raw_allocation_guard {
+    #[test]
+    fn gqa_scores_slot_is_governed_not_raw_allocated() {
+        const SOURCE: &str = include_str!("group_query_attention.rs");
+        assert!(
+            SOURCE.contains("fn execute_with_workspace"),
+            "GroupQueryAttention must stay wired into governed workspace preparation (#736)."
+        );
+        assert!(
+            SOURCE.contains("gqa_reference_scores_bytes"),
+            "the f32 reference score buffer must be sized through the shared helper (#736)."
+        );
+        // The pre-#736 seam reserved the score slot from the self-owned pool
+        // unconditionally. The needle is assembled at runtime so this literal
+        // does not itself match when the file is scanned via `include_str!`.
+        let ungoverned = ["workspace.reserve(WS_SCORES, score_count", ".max(1) * 4)"].concat();
+        assert!(
+            !SOURCE.contains(ungoverned.as_str()),
+            "GroupQueryAttention must not reintroduce an unconditional raw pooled allocation of \
+             the governed score slot (#736); carve it from the executor-prepared workspace."
+        );
     }
 }
