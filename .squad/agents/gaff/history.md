@@ -52,3 +52,14 @@ precision claims confirmed (AVX2 Welford genuinely more accurate than scalar).
 No blocking findings. Two substantive items: (S1) unnecessary sum accumulation
 in RMSNorm path when MeanOut is null, (S2) test reference variance formula
 comment clarity. Decision written to `decisions/inbox/gaff-review-pr31973.md`.
+
+## 2026-08-11 — Independent Re-Review of PR #762 (B1-B4 corrective wave)
+
+- **Task:** Adversarial re-review of PR #762 after B1–B4 blocker fixes
+- **Verdict:** All four blockers resolved. No new blocking findings. 2 nits.
+- **B1 (output dtypes):** ✅ Resolved. `CompiledKernelEntry.output_dtypes` sourced from graph. LayerNorm shapes correct.
+- **B2 (ReleaseEpFactory void):** ✅ Resolved. Returns `*mut OrtStatus` in macro, both shims, and ABI test.
+- **B3 (NxrtStatus cross-allocator):** ✅ Resolved. Inline `[u8; 256]` buffer, no heap, no `c_char`.
+- **B4 (CUDA fail-open):** ✅ Resolved. Zero factories unconditionally, `CanCopy` returns false.
+- **Tests:** 245 passed, 0 failed from clean state. Cast/Where/Shape tests assert real dtypes and values.
+- **Output:** `.squad/decisions/inbox/gaff-rereview-pr762.md`
