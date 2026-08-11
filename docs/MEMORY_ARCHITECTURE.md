@@ -756,6 +756,70 @@ pub trait ExecutionProvider: Send + Sync {
 Every higher layer ultimately calls through these primitives. The EP knows nothing
 about weight tiers, budgets, or other sessions.
 
+### 2.1 Kernel scratch/workspace governance audit (#736)
+
+There are two ways a CUDA kernel can obtain device scratch:
+
+- **Governed** — the kernel reports a size through
+  `Kernel::workspace_requirement` and the session executor reserves it via
+  `ExecutionProvider::{reserve_workspace, prepare_mapped_growth, allocate}`
+  *before execution*. This counts against the device authority, so a
+  capacity shortfall surfaces as a pre-header **HTTP 429** (`MemoryOverload`)
+  through `DriverFailure::from_engine_error`, never as a late 500/OOM.
+  Prepare-only planning (#747) sizes the workspace from resolved shapes at
+  admission; `MappedGrowthGrant` (#748) grows it transactionally against the
+  same authority. Planning and execution size through the *same* helper.
+- **Ungoverned** — the kernel calls `CudaRuntime::alloc_raw` (a thin
+  `cuMemAlloc`/pool wrapper) directly. These bytes are invisible to the
+  authority: under an explicit `--vram-limit` they are the residual
+  `activations_bytes=unknown` (#514) and can drive a late device OOM instead
+  of a clean 429.
+
+The executor plans workspace only for nodes matched by
+`is_planned_workspace_node` (`crates/onnx-runtime-session/src/executor/bindings.rs`):
+`onnx_runtime_ir::RUNTIME_DOMAIN::BlockQuantizedMoE` and
+`com.microsoft::Attention`. It tracks one peak per lifetime class
+(`SessionPersistent` and `StepScoped`) and prepares each slot independently,
+so a graph mixing the two governs both.
+
+**Governed today**
+
+| kernel / node | file · site | byte formula | size class | lifetime | mechanism |
+|---|---|---|---|---|---|
+| `BlockQuantizedMoE` (QMoE) | `block_quantized_moe.rs` `workspace_requirement` | routing + dequant + GEMM staging over `tokens × experts × hidden` | config-derived (static per model) | session-persistent | #747 prepare-only + #748 grant |
+| `com.microsoft::Attention` Phase-2a | `attention.rs` `run_attention_phase2a` (governed branch) | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent (quadratic in seq len) | step-scoped | #747 prepare-only + #748 grant (this PR) |
+
+The Attention **fused** (flash) prefill path uses shared memory only and
+allocates no device scratch, so `workspace_requirement` returns `NONE` for it —
+the executor reserves nothing. The compatibility/opt-out path (direct
+`execute`, e.g. GQA reuse and unit tests) retains the self-owned `alloc_raw`
+scratch inside `run_attention_phase2a`.
+
+**Remaining ungoverned raw allocations** (bytes derived from the byte formula;
+production sites only — test-module allocations excluded):
+
+| kernel / subsystem | file · line | byte formula | size class | lifetime class | notes |
+|---|---|---|---|---|---|
+| `GroupQueryAttention` workspace | `group_query_attention.rs:945` (`GqaWorkspace::reserve`, 11 slots) | packed Q/K/V & Q_BNSH `batch·seq·hidden·elem`; present K/V `∏cache_shape·elem`; **scores `batch·heads·sq·sk·4`** (quadratic); metadata `batch·4` | prompt-dependent (scores) + config-derived (rest) | session-persistent (growable, `Mutex<GqaWorkspace>`, reused across steps) | **recommended next increment** — largest live scratch after Attention Phase-2a; already a slot allocator, so it maps cleanly onto `workspace_requirement` |
+| `StandardAttention` workspace | `standard_attention.rs:602` (slot reserve) | per-slot packed/scores/output like GQA | prompt-dependent + config-derived | session-persistent (growable slots) | same slot pattern as GQA |
+| `StandardAttention` eager scratch | `standard_attention.rs:1269` (owned closure) | per-buffer `bytes.max(1)`, freed after execute | prompt-dependent | step-scoped (owned `Vec`, freed on all exits) | |
+| `PackedVarlenAttention` scratch | `varlen_attention.rs:531` (owned closure) | varlen packing `total_tokens·hidden·elem`, per-buffer, freed after execute | request/prefill-dependent | step-scoped (owned `Vec`) | |
+| `MatMulNBits` cuBLASLt workspace | `matmul.rs:464`, `gemm.rs:268`, `fused_gemm.rs:236` | `WORKSPACE_BYTES` = 32 MiB fixed | static | step-scoped (per execute) | identical 32 MiB blob to the Attention cuBLASLt workspace now governed |
+| `MatMul` plan workspace | `matmul.rs:219` | cuBLASLt heuristic `workspaceSize` (≤ a few MiB) | config-derived | session-persistent (held in the matmul plan) | |
+| `Reduce*` shape metadata | `reduce.rs:711-720` | `base/delta/axes` i64 shape arrays (tens of bytes) | config-derived | step-scoped (freed after execute) | negligible bytes |
+| Broadcast metadata (`Where`, elementwise, nary) | `where_op.rs:123`, `elementwise.rs:699`, `nary.rs` | broadcast index metadata `rank·8` bytes | config-derived | step-scoped | negligible bytes |
+| GQA/GQA-fp16 split-K decode scratch | `gqa_decode.rs`, `gqa_decode_fp16.rs` | split accumulators `rows·splits·(head_dim+2)·elem` | prompt/decode-dependent | step-scoped | decode-path scratch; small relative to prefill |
+| CSA device state | `csa_checkpoint.rs`, `csa_device_state.rs` | compressed-sparse-attention checkpoint/state buffers | config-derived | session-persistent | |
+| Weight paging staging | `weight_paging.rs` | page-sized staging buffers | static (page size) | session-persistent | part of the weight-offload path (§3) |
+
+The next increment should govern the **`GroupQueryAttention` workspace**: its
+`WS_SCORES` slot is `batch·heads·sq·sk·4` — quadratic in sequence length and the
+largest remaining live scratch — and the slot allocator already isolates a clean
+set of lifetimes to route through `workspace_requirement` (session-persistent,
+unlike Attention Phase-2a's step-scoped scratch). The three 32 MiB cuBLASLt GEMM
+workspaces are individually small but numerous and share the exact blob already
+governed for Attention, so they are a cheap follow-up.
+
 ---
 
 ## 3. Layer 2: Weight Residency (Per-Session)
