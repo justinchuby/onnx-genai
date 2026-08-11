@@ -11,8 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::kv_stride::KvCacheStrides;
@@ -800,6 +804,58 @@ const WS_PRESENT_V: usize = 9;
 const WS_SCORES: usize = 10;
 const WS_COUNT: usize = 11;
 
+/// Device-pointer alignment for the governed GQA reference score buffer (§736).
+const GQA_SCORES_ALIGN: usize = 256;
+
+/// Whether a concrete GQA dispatch materializes an `[B, H, Sq, kv]` device score
+/// matrix. Only the f32 *reference* attention path does: every fused-flash and
+/// capture-safe split-K decode path (fused flash, f32 `gqa_decode`, fp16
+/// `gqa_decode_fp16`) streams softmax through registers/shared memory and needs
+/// no score scratch, and the phase-2a path owns its own scratch inside
+/// `run_attention_phase2a`. The reference branch is reachable only when the
+/// query dtype is f32 and the single-token split-K decode kernel does not cover
+/// the shape (`Sq > 1` prefill, or `head_dim > 128`). This is the static signal
+/// (#751) that keeps the governed reservation off every path that never touches
+/// scores, so no device capacity is charged for scratch it never materializes.
+fn gqa_reference_scores_path(dtype: DataType, q_seq: usize, head_dim: usize) -> bool {
+    dtype == DataType::Float32 && !gqa_decode::supported(q_seq, head_dim)
+}
+
+/// Byte size of the governed GQA reference score buffer for one concrete
+/// geometry. Prepare-only planning (`Kernel::workspace_requirement`) and
+/// execution (the reference branch of `run`) both size the reservation through
+/// this identical helper so the reserved and consumed byte counts cannot drift.
+/// The buffer holds `batch·num_heads·q_seq·kv_capacity` f32 scores, matching the
+/// reference kernel's `score_count · sizeof(f32)` indexing (a degenerate
+/// geometry still reserves one element, as the kernel's `score_count.max(1)`
+/// did).
+fn gqa_reference_scores_bytes(
+    batch: usize,
+    num_heads: usize,
+    q_seq: usize,
+    kv_capacity: usize,
+) -> Result<usize> {
+    let rows = batch
+        .checked_mul(num_heads)
+        .and_then(|value| value.checked_mul(q_seq))
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: attention row count overflow".into(),
+            )
+        })?;
+    let elements = rows.checked_mul(kv_capacity).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep GroupQueryAttention: score scratch size overflow".into())
+    })?;
+    elements
+        .max(1)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: score scratch byte count overflow".into(),
+            )
+        })
+}
+
 /// Bit flags a captured GQA prep kernel `atomicOr`s into the runtime's latching
 /// capture-error word when a decode-metadata invariant is violated during graph
 /// replay. Exposed so hosts (and tests) can identify which bound was breached.
@@ -1291,7 +1347,12 @@ impl GroupQueryAttentionKernel {
         }
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        prepared: Option<WorkspaceView>,
+    ) -> Result<()> {
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
             EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: capture signature lock poisoned".into(),
@@ -2375,14 +2436,33 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: attention row count overflow".into(),
                     )
                 })?;
-            let score_count = attention_rows
-                .checked_mul(present_capacity)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: score scratch size overflow".into(),
-                    )
-                })?;
-            let score_scratch = workspace.reserve(WS_SCORES, score_count.max(1) * 4)?;
+            // The score buffer is `[B, H, Sq, present_capacity]` f32; planning
+            // and execution size it through the same helper so the reserved and
+            // consumed byte counts cannot drift.
+            let scores_bytes =
+                gqa_reference_scores_bytes(batch, self.num_heads, q_seq, present_capacity)?;
+            let score_scratch = match prepared {
+                Some(view) => {
+                    // Governed slice (§736): the executor reserved this
+                    // session-persistent score buffer against the device
+                    // authority during prepare-only planning, sized through the
+                    // same `gqa_reference_scores_bytes` helper. Refuse
+                    // deterministically on a shortfall rather than silently
+                    // under-allocating or reintroducing a raw pooled allocation.
+                    if view.bytes() < scores_bytes {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep GroupQueryAttention: prepared score workspace {} bytes is \
+                             smaller than the {scores_bytes} bytes this f32 reference dispatch \
+                             requires",
+                            view.bytes()
+                        )));
+                    }
+                    cuptr(view.ptr().0.cast_const())
+                }
+                // Compatibility/opt-out path: no executor-prepared workspace, so
+                // the score scratch stays self-owned in the pooled slot.
+                None => workspace.reserve(WS_SCORES, scores_bytes)?,
+            };
             let attention_rows_u32 = u32::try_from(attention_rows).map_err(|_| {
                 EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: attention row count exceeds u32".into(),
@@ -2492,11 +2572,105 @@ impl GroupQueryAttentionKernel {
         *last_signature = capture_candidate;
         Ok(())
     }
+
+    /// Prepare-only planning (#747, §736): report the governed f32 reference
+    /// score buffer so the executor reserves it against the device authority
+    /// before request admission. Every other GQA path (fused flash, f32/fp16
+    /// split-K decode, phase-2a) materializes no device score matrix and reports
+    /// NONE, so no device capacity is charged for scratch it never touches
+    /// (#751). On a shape/dtype this kernel would reject, report NONE and let
+    /// `run` raise the precise error via the compatibility scratch.
+    ///
+    /// The reservation is session-persistent: the reference score buffer is
+    /// grown to the largest geometry seen and retained across decode/prefill
+    /// steps (the pooled slot's contract), so — unlike the step-scoped Attention
+    /// Phase-2a scratch (#753) — it holds a standing claim for the session and is
+    /// charged as `WorkspaceLifetime::SessionPersistent`. Because `Sq · kv` is
+    /// prompt-dependent, the executor grows it transactionally through a
+    /// `MappedGrowthGrant` against the device authority.
+    fn reference_scores_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let Some(q) = inputs.first() else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if q.shape.len() != 3 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let (batch, q_seq, input_hidden) = (q.shape[0], q.shape[1], q.shape[2]);
+        // Packed QKV is signalled by absent key/value inputs, mirroring `run`.
+        let packed_qkv =
+            inputs.get(1).is_none_or(|k| !k.present) && inputs.get(2).is_none_or(|v| !v.present);
+        let head_dim = if packed_qkv {
+            let packed_heads = self.num_heads + 2 * self.kv_num_heads;
+            if packed_heads == 0 || input_hidden == 0 || input_hidden % packed_heads != 0 {
+                return Ok(WorkspaceRequirement::NONE);
+            }
+            input_hidden / packed_heads
+        } else {
+            if self.num_heads == 0 || input_hidden == 0 || input_hidden % self.num_heads != 0 {
+                return Ok(WorkspaceRequirement::NONE);
+            }
+            input_hidden / self.num_heads
+        };
+        if head_dim == 0 || !gqa_reference_scores_path(q.dtype, q_seq, head_dim) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        // KV-capacity proxy from static input metadata. The reference score
+        // buffer is strided by the present-cache capacity; for GQA's
+        // buffer-shared KV cache that equals the past_key capacity
+        // (`inputs[3].shape[2]`), and on a pure prefill with no past it equals
+        // the incoming key length. Both are static input dims. Execution
+        // re-derives the exact present capacity and refuses deterministically on
+        // any shortfall, so this never silently under-allocates.
+        let past_capacity = inputs
+            .get(3)
+            .filter(|past| past.present && past.shape.len() == 4)
+            .map(|past| past.shape[2])
+            .unwrap_or(0);
+        let key_length = if packed_qkv {
+            q_seq
+        } else {
+            inputs
+                .get(1)
+                .filter(|key| key.shape.len() == 3)
+                .map(|key| key.shape[1])
+                .unwrap_or(0)
+        };
+        let kv_capacity = past_capacity.max(key_length);
+        let bytes = gqa_reference_scores_bytes(batch, self.num_heads, q_seq, kv_capacity)?;
+        Ok(WorkspaceRequirement {
+            bytes: u64::try_from(bytes).map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: score workspace does not fit u64".into(),
+                )
+            })?,
+            alignment: GQA_SCORES_ALIGN,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        })
+    }
 }
 
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        // Compatibility/opt-out path: no executor-prepared workspace, so the f32
+        // reference score scratch stays self-owned in the pooled slot.
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.reference_scores_requirement(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -2587,5 +2761,152 @@ mod tests {
         let after = runtime.allocation_counts();
         assert_eq!(after.allocations, before.allocations + 2);
         assert_eq!(after.frees, before.frees + 2);
+    }
+
+    #[test]
+    fn reference_scores_bytes_matches_score_count_formula() {
+        // Planning and execution size the governed score buffer through this
+        // exact helper (§736), so pin its formula: `batch·heads·q_seq·kv` f32
+        // scores. A degenerate geometry still reserves one element, matching the
+        // kernel's historical `score_count.max(1) * 4`.
+        let (batch, heads, q_seq, kv) = (2usize, 4usize, 8usize, 130usize);
+        let bytes = gqa_reference_scores_bytes(batch, heads, q_seq, kv).unwrap();
+        assert_eq!(
+            bytes,
+            batch * heads * q_seq * kv * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            gqa_reference_scores_bytes(0, heads, q_seq, kv).unwrap(),
+            std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn reference_scores_path_gates_on_dtype_and_decode_support() {
+        // f32 prefill (Sq>1) has no split-K decode kernel: reference path runs
+        // and materializes scores.
+        assert!(gqa_reference_scores_path(DataType::Float32, 8, 64));
+        // f32 single-token decode with head_dim<=128 is covered by gqa_decode,
+        // which streams softmax and needs no score scratch.
+        assert!(!gqa_reference_scores_path(DataType::Float32, 1, 64));
+        // f32 single-token with head_dim>128 exceeds gqa_decode: reference path.
+        assert!(gqa_reference_scores_path(DataType::Float32, 1, 192));
+        // fp16/bf16 never take the f32 reference path, so no score buffer is
+        // charged on the common decode/prefill dtypes.
+        assert!(!gqa_reference_scores_path(DataType::Float16, 8, 64));
+        assert!(!gqa_reference_scores_path(DataType::BFloat16, 8, 64));
+    }
+
+    #[test]
+    fn workspace_requirement_governs_f32_reference_scores_only() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA workspace requirement test: CUDA runtime unavailable");
+            return;
+        };
+        let (num_heads, kv_heads, dim) = (4usize, 2usize, 64usize);
+        let kernel = GroupQueryAttentionKernel::new(
+            runtime, num_heads, kv_heads, None, false, false, -1, 0.0,
+        )
+        .expect("kernel");
+        let (batch, q_seq, cache) = (1usize, 8usize, 256usize);
+        let q_shape = [batch, q_seq, num_heads * dim];
+        let kv_shape = [batch, q_seq, kv_heads * dim];
+        let past_shape = [batch, kv_heads, cache, dim];
+        let seqlens_shape = [batch];
+        let total_shape = [1usize];
+        fn meta(dtype: DataType, shape: &[usize]) -> TensorMetadata<'_> {
+            TensorMetadata::new(dtype, shape, true)
+        }
+        let f32_inputs = [
+            meta(DataType::Float32, &q_shape),
+            meta(DataType::Float32, &kv_shape),
+            meta(DataType::Float32, &kv_shape),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Int32, &seqlens_shape),
+            meta(DataType::Int32, &total_shape),
+        ];
+        // f32 prefill routes to the reference path: governed, session-persistent,
+        // and sized through the shared helper against the cache capacity.
+        let req = kernel
+            .workspace_requirement(&f32_inputs)
+            .expect("requirement");
+        let expected = gqa_reference_scores_bytes(batch, num_heads, q_seq, cache).unwrap() as u64;
+        assert_eq!(req.bytes, expected);
+        assert_eq!(req.alignment, GQA_SCORES_ALIGN);
+        assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
+        assert!(matches!(
+            req.role,
+            MemoryRole::Workspace { step_scoped: false }
+        ));
+
+        // The same geometry in fp16 never materializes scores, so the executor
+        // reserves nothing for it (over-reservation guard, #751).
+        let f16_inputs = [
+            meta(DataType::Float16, &q_shape),
+            meta(DataType::Float16, &kv_shape),
+            meta(DataType::Float16, &kv_shape),
+            meta(DataType::Float16, &past_shape),
+            meta(DataType::Float16, &past_shape),
+            meta(DataType::Int32, &seqlens_shape),
+            meta(DataType::Int32, &total_shape),
+        ];
+        let f16_req = kernel
+            .workspace_requirement(&f16_inputs)
+            .expect("fp16 requirement");
+        assert_eq!(f16_req.bytes, 0, "fp16 GQA needs no governed score scratch");
+
+        // f32 single-token decode (head_dim<=128) is covered by the capture-safe
+        // split-K kernel and reserves no scores either.
+        let decode_q = [batch, 1usize, num_heads * dim];
+        let decode_kv = [batch, 1usize, kv_heads * dim];
+        let decode_inputs = [
+            meta(DataType::Float32, &decode_q),
+            meta(DataType::Float32, &decode_kv),
+            meta(DataType::Float32, &decode_kv),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Float32, &past_shape),
+            meta(DataType::Int32, &seqlens_shape),
+            meta(DataType::Int32, &total_shape),
+        ];
+        let decode_req = kernel
+            .workspace_requirement(&decode_inputs)
+            .expect("decode requirement");
+        assert_eq!(
+            decode_req.bytes, 0,
+            "f32 single-token decode is served by gqa_decode and needs no score scratch"
+        );
+    }
+}
+
+/// Regression guard for issue #736: the governed GQA score buffer (`WS_SCORES`)
+/// is routed through `Kernel::workspace_requirement` + an executor-prepared
+/// session-persistent workspace, consumed via `execute_with_workspace`. This
+/// CPU-only test fails if the f32 reference branch reintroduces an unconditional
+/// raw pooled allocation of the score slot, bypassing the device authority. It
+/// runs on CI without a GPU, matching the #751 bar (a source-scan unit test, not
+/// a `Select-String`-style external scan).
+#[cfg(test)]
+mod raw_allocation_guard {
+    #[test]
+    fn gqa_scores_slot_is_governed_not_raw_allocated() {
+        const SOURCE: &str = include_str!("group_query_attention.rs");
+        assert!(
+            SOURCE.contains("fn execute_with_workspace"),
+            "GroupQueryAttention must stay wired into governed workspace preparation (#736)."
+        );
+        assert!(
+            SOURCE.contains("gqa_reference_scores_bytes"),
+            "the f32 reference score buffer must be sized through the shared helper (#736)."
+        );
+        // The pre-#736 seam reserved the score slot from the self-owned pool
+        // unconditionally. The needle is assembled at runtime so this literal
+        // does not itself match when the file is scanned via `include_str!`.
+        let ungoverned = ["workspace.reserve(WS_SCORES, score_count", ".max(1) * 4)"].concat();
+        assert!(
+            !SOURCE.contains(ungoverned.as_str()),
+            "GroupQueryAttention must not reintroduce an unconditional raw pooled allocation of \
+             the governed score slot (#736); carve it from the executor-prepared workspace."
+        );
     }
 }

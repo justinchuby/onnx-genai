@@ -67,7 +67,8 @@ call; it owns the governed workspace preparation path
 | `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
 | `kernels/fused_gemm.rs:236` | fused GEMM cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
 | `kernels/gemm.rs:268` | GEMM cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
-| `kernels/group_query_attention.rs:945` | `GroupQueryAttention` pooled slots | slot-specific `bytes.max(1)` (QKV/present/scores/mask helpers) | prompt/cache dependent, then reused | session-persistent growable scratch | raw bypass |
+| `kernels/group_query_attention.rs:804 (WS_SCORES slot)` | `GroupQueryAttention` f32 reference score buffer | `batch * num_heads * sq * present_capacity * sizeof(f32)` | prompt/cache dependent (`sq * present_capacity`) | session-persistent | **governed in this increment** via `workspace_requirement` (SessionPersistent) + prepared workspace, reserved only on the f32 reference path |
+| `kernels/group_query_attention.rs:945` | `GroupQueryAttention` remaining pooled slots (QKV/present/BNSH/metadata) | slot-specific `bytes.max(1)` | prompt/cache dependent, then reused | session-persistent growable scratch | raw bypass (not the largest live slot; see §2.1 next slice) |
 | `kernels/index_share.rs:688` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of `2 * B * kv_heads * cache_seq * head_size * elem_size`, `B * q_heads * q_seq * selected_width * 4`, optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed in this increment** via `workspace_requirement` + prepared workspace |
 | `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
 | `kernels/indexing.rs:410` | indexing metadata | `bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
@@ -120,30 +121,74 @@ sparse `selected_width`, so the live bytes are small. `IndexShare` is also a
 on the hot path for dense models. It was governed first because it cleanly
 mirrors the QMoE contract, not because it is the largest or hottest bypass.
 
-#### Next slice (chosen from this table): dense-attention quadratic score buffers
+The **`GroupQueryAttention` `WS_SCORES` slot** is governed in this increment
+(#736): the f32 reference-attention score buffer — `batch * num_heads * sq *
+present_capacity * sizeof(f32)`, quadratic in `sq * present_capacity` and the
+largest remaining live GQA scratch — now routes through
+`Kernel::workspace_requirement` (reporting the exact bytes), prepare-only
+planning, and a prepared workspace consumed by `execute_with_workspace`. Planning
+and execution size the reservation through the **same** `gqa_reference_scores_bytes`
+helper, so they cannot drift; a shortfall errors deterministically rather than
+under-allocating. Because `sq * present_capacity` is prompt-dependent, the
+executor grows the session-persistent slot transactionally through a
+`MappedGrowthGrant` against the device authority, and capacity refusal surfaces
+as the pre-header **429** typed path (`TierExhausted` / `CapacityUnavailable`,
+#743) rather than a late 500/OOM. The compatibility/opt-out path (no
+executor-prepared workspace) keeps its self-owned pooled scratch.
 
-The genuinely large, always-live non-QMoE bypasses are the dense-attention score
-buffers, which scale **quadratically** with sequence length and are live on
-every dense decode/prefill step:
+**Lifetime, and why it differs from Attention Phase-2a (#753).** GQA's slot
+allocator grows each slot to the largest geometry seen and **retains** it across
+decode/prefill steps — a standing claim held for the whole session — so
+`WS_SCORES` is charged as `WorkspaceLifetime::SessionPersistent`, not the
+`StepScoped` lifetime Phase-2a's per-call scratch used. A graph mixing QMoE,
+IndexShare, Attention Phase-2a (step-scoped) and GQA (session-persistent) now
+exercises both per-lifetime-class peaks; the two classes are reserved into
+separate executor slots so neither peak stands in for the other.
+
+**Over-reservation finding (the #751 defect class).** `WS_SCORES` is materialized
+on **exactly one** GQA route: the f32 *reference* path, reached only when
+`!use_fused && query dtype == f32 && !gqa_decode::supported(q_seq, head_dim)`
+(i.e. f32 prefill `Sq > 1`, or f32 `head_dim > 128`). The fused-flash path, the
+capture-safe f32/fp16 split-K decode kernels, and the phase-2a path **never
+allocate a device score matrix** — they stream softmax through registers/shared
+memory, and phase-2a owns its own scratch. Reserving `WS_SCORES`
+unconditionally would therefore charge the device authority for bytes the common
+fp16 decode path never touches — the same defect #751 found in IndexShare's
+present K/V staging. The governed reservation threads that static signal (query
+dtype + `gqa_decode::supported`) through the shared helper and reports
+`WorkspaceRequirement::NONE` on every fp16/bf16 path and every f32 *decode* path,
+so those charge **zero**. The only residual conservative reservation is f32
+prefill that dynamically fuses on a short (`valid_seq ≤ 128`) sequence: the fused
+win is a runtime measurement, so planning reserves to never under-allocate, and
+that path (a fallback of a fallback) idles the buffer rather than corrupting.
+Derived bytes: `B=1, H=32, Sq=1024, present_capacity=1024, f32` ≈ **128 MiB** on
+the reference path; **0 bytes** on fp16 decode/prefill and f32 decode.
+
+The audit also named three shared 32 MiB cuBLASLt GEMM workspaces
+(`fused_gemm.rs:236`, `gemm.rs:268`, `matmul.rs:464`) as a cheap follow-up; they
+do **not** fall out of this change (they are separate step-scoped cuBLASLt
+workspaces, not GQA slots) and are left for a dedicated slice.
+
+#### Next slice (chosen from this table): the remaining pooled dense-attention scores
+
+With `group_query_attention.rs` `WS_SCORES` governed, the remaining large,
+always-live non-QMoE score bypass is the **default-domain `Attention` pooled
+scores slot**, which shares GQA's quadratic shape and session-persistent
+retention:
 
 | candidate | byte formula | why always live |
 |---|---|---|
+| `kernels/standard_attention.rs:602` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | default-domain `Attention` pooled scratch; grown to the largest score matrix seen and kept session-persistent, so it holds the quadratic peak across steps. |
 | `kernels/attention.rs:711` | `batch * num_heads * sq * sk * elem_size` | legacy `Attention` phase-2 scores; allocated on every `execute`, request/prefill-dependent, quadratic in `sq*sk`. |
-| `kernels/group_query_attention.rs:945` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | `GroupQueryAttention` pooled scratch; grown to the largest score matrix seen and kept session-persistent, so it holds the quadratic peak. |
-| `kernels/standard_attention.rs:602` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | default-domain `Attention` pooled scratch; same quadratic scores slot, session-persistent. |
 
-All three carry the same quadratic `batch * num_heads * sq * sk * elem_size`
-score term (e.g. `B=1, H=32, sq=sk=2048, fp16` ≈ 256 MB), which dwarfs
-`IndexShare`'s live bytes at realistic shapes. On prefill the three are
-comparable in peak bytes; the two pooled variants
-(`group_query_attention.rs:945`, `standard_attention.rs:602`) are the higher-value
-target because their session-persistent growable pools **retain** the quadratic
-peak across steps rather than freeing it each `execute`, so they hold resident
-bytes for the whole session. The recommended next increment is therefore the
-pooled dense-attention scores slot — govern `standard_attention.rs:602` and
-`group_query_attention.rs:945` (which share the pooled-scratch shape) through the
-same `workspace_requirement` + prepared-workspace contract, then fold in the
-legacy `attention.rs:711` per-call path.
+`standard_attention.rs:602` is the higher-value target: its session-persistent
+growable pool **retains** the quadratic peak (e.g. `B=1, H=32, sq=sk=2048, fp16`
+≈ 256 MB) across steps rather than freeing it each `execute`, mirroring exactly
+the GQA slot just governed. The recommended next increment is therefore to
+govern `standard_attention.rs:602` through the same `workspace_requirement` +
+prepared-workspace contract — applying the same over-reservation discipline
+(reserve only on paths that materialize scores) — then fold in the legacy
+`attention.rs:711` per-call path.
 
 ### KV layout and residency
 
